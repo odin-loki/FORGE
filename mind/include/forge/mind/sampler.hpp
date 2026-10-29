@@ -1,5 +1,6 @@
 #pragma once
-// Composable sampler chain: repetition penalty -> temperature -> top-k -> top-p -> min-p -> draw.
+// Composable sampler chain: repetition penalty -> temperature -> top-k -> top-p -> min-p -> typical -> draw,
+// or Mirostat v2 (adaptive surprise truncation) in place of the truncation steps.
 #include <algorithm>
 #include <functional>
 #include <cmath>
@@ -16,6 +17,9 @@ struct sampler_config {
     int top_k = 0;             // 0 = off
     float top_p = 1.f;
     float min_p = 0.f;
+    float typical_p = 1.f;     // locally typical sampling (Meister et al.); 1 = off
+    float mirostat_tau = 0.f;  // Mirostat v2 target surprise in bits; 0 = off
+    float mirostat_eta = 0.1f;
     float repetition_penalty = 1.f;
     int repetition_window = 64;
     std::uint64_t seed = 0;
@@ -47,12 +51,15 @@ public:
         for (std::size_t i = p.size(); i-- > 0;) if (p[i] > 0) return int(i);
         return 0;
     }
+    double mirostat_mu() const { return mu_; }
     double uniform() { return std::uniform_real_distribution<double>(0, 1)(rng_); }
 
     int sample(std::span<const float> logits_in, std::span<const int> history = {}) {
         auto l = prepare(logits_in, history);
         if (c_.temperature <= 0.f) return int(std::max_element(l.begin(), l.end()) - l.begin());
-        std::vector<int> idx; std::vector<double> p; truncate(l, idx, p);
+        std::vector<int> idx; std::vector<double> p;
+        if (c_.mirostat_tau > 0.f) return mirostat(l);
+        truncate(l, idx, p);
         double tot = 0; for (auto x : p) tot += x;
         double u = std::uniform_real_distribution<double>(0, tot)(rng_);
         for (std::size_t i = 0; i < p.size(); ++i) { u -= p[i]; if (u <= 0) return idx[i]; }
@@ -89,13 +96,36 @@ private:
             std::size_t k = 1; while (k < keep && p[k] >= c_.min_p * p[0]) ++k;
             keep = k;
         }
+        if (c_.typical_p < 1.f) {
+            double tot = 0, H = 0; for (std::size_t i = 0; i < keep; ++i) tot += p[i];
+            for (std::size_t i = 0; i < keep; ++i) if (p[i] > 0) H -= p[i] / tot * std::log(p[i] / tot);
+            std::vector<std::size_t> o(keep); std::iota(o.begin(), o.end(), 0);
+            auto dev = [&](std::size_t i) { return p[i] > 0 ? std::fabs(-std::log(p[i] / tot) - H) : 1e300; };
+            std::stable_sort(o.begin(), o.end(), [&](auto a, auto b) { return dev(a) < dev(b); });
+            double cum = 0; std::size_t k = 0; while (k < keep) { cum += p[o[k++]] / tot; if (cum >= c_.typical_p) break; }
+            std::vector<int> i2; std::vector<double> p2; for (std::size_t j = 0; j < k; ++j) { i2.push_back(idx[o[j]]); p2.push_back(p[o[j]]); }
+            std::copy(i2.begin(), i2.end(), idx.begin()); std::copy(p2.begin(), p2.end(), p.begin()); keep = k;
+        }
         // drop -inf (filtered) candidates, keep at least one
         std::size_t k2 = keep; while (k2 > 1 && !(p[k2 - 1] > 0)) --k2;
         keep = k2;
         p.resize(keep); idx.resize(keep);
     }
+    // Mirostat v2: keep tokens with surprise -log2 p <= mu, draw, then mu -= eta * (observed surprise - tau).
+    int mirostat(const std::vector<float>& l) {
+        if (mu_ < 0) mu_ = 2.0 * c_.mirostat_tau;
+        double mx = *std::max_element(l.begin(), l.end()) / c_.temperature, s = 0;
+        std::vector<double> p(l.size()); for (std::size_t i = 0; i < l.size(); ++i) { p[i] = std::exp(double(l[i]) / c_.temperature - mx); s += p[i]; }
+        std::vector<double> q(p.size()); std::size_t best = 0;
+        for (std::size_t i = 0; i < p.size(); ++i) { p[i] /= s; if (p[i] > p[best]) best = i; if (p[i] > 0 && -std::log2(p[i]) <= mu_) q[i] = p[i]; }
+        q[best] = p[best];
+        int t = draw(q);
+        mu_ -= c_.mirostat_eta * (-std::log2(p[std::size_t(t)]) - c_.mirostat_tau);
+        return t;
+    }
     sampler_config c_;
     std::mt19937_64 rng_;
+    double mu_ = -1;
 };
 
 } // namespace forge::mind

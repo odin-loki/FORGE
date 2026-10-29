@@ -155,3 +155,40 @@ TEST(batch_scheduler_threaded) {
     lk.unlock();
     b.stop();
 }
+
+#include <forge/mind/json_schema.hpp>
+TEST(sampler_typical_and_mirostat) {
+    // typical: entropy of {0.5,0.25,0.125,0.125} is 1.75 bits; the 0.25 token (2 bits) is most typical.
+    std::vector<float> l = {std::log(0.5f), std::log(0.25f), std::log(0.125f), std::log(0.125f)};
+    sampler_config c; c.temperature = 1; c.typical_p = 0.2f; sampler s(c);
+    auto p = s.probs(l); CHECK(std::fabs(p[1] - 1.0) < 1e-12);
+    c.typical_p = 0.8f; sampler s2(c); p = s2.probs(l); CHECK(p[1] > 0 && p[0] > 0 && p[2] + p[3] > 0);
+    // mirostat: observed mean surprise converges near tau on a Zipf distribution.
+    std::vector<float> z(1000); for (std::size_t i = 0; i < z.size(); ++i) z[i] = -1.1f * std::log(float(i + 1));
+    sampler_config m; m.temperature = 1; m.mirostat_tau = 5; m.mirostat_eta = 0.1f; m.seed = 7; sampler ms(m);
+    double ls = 0; for (std::size_t i = 0; i < z.size(); ++i) ls += std::exp(double(z[i])); double surp = 0; int N = 4000;
+    for (int i = 0; i < N; ++i) { int t = ms.sample(z); if (i >= 1000) surp += -std::log2(std::exp(double(z[std::size_t(t)])) / ls); }
+    surp /= (N - 1000); CHECK_MSG(std::fabs(surp - 5) < 0.6, "mean surprise %g", surp);
+}
+TEST(json_schema_grammar) {
+    auto sch = json::parse(R"({"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"},
+        "tags":{"type":"array","items":{"enum":["a","b"]},"maxItems":2},"ok":{"type":"boolean"}},"required":["name","age"]})");
+    grammar g(json_schema_to_gbnf(sch));
+    auto run = [&](std::string s) { auto st = g.start(); for (unsigned char ch : s) { st = g.advance(st, ch); if (st.empty()) return false; } return grammar::can_end(st); };
+    CHECK(run(R"({"name":"x\"y","age":-12})"));
+    CHECK(run(R"({"name":"","age":0,"tags":["a","b"],"ok":true})"));
+    CHECK(run(R"({"name":"q","age":3,"ok":false})"));
+    CHECK(run(R"({"name":"q","age":3,"tags":[]})"));
+    CHECK(!run(R"({"age":3,"name":"q"})"));            // order is fixed
+    CHECK(!run(R"({"name":"q"})"));                    // missing required
+    CHECK(!run(R"({"name":"q","age":3,"tags":["a","b","a"]})"));
+    CHECK(!run(R"({"name":"q","age":1.5})"));
+    CHECK(!run(R"({"name":"q","age":3,"tags":["c"]})"));
+    auto sch2 = json::parse(R"({"$defs":{"pt":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":3}},
+        "anyOf":[{"$ref":"#/$defs/pt"},{"type":"null"},{"const":{"k":1}}]})");
+    grammar g2(json_schema_to_gbnf(sch2));
+    auto run2 = [&](std::string s) { auto st = g2.start(); for (unsigned char ch : s) { st = g2.advance(st, ch); if (st.empty()) return false; } return grammar::can_end(st); };
+    CHECK(run2("[1,2.5e3]")); CHECK(run2("[1,2,3]")); CHECK(!run2("[1]")); CHECK(!run2("[1,2,3,4]")); CHECK(run2("null")); CHECK(run2(R"({"k":1})"));
+    CHECK(run2("[1,2]") && !run2("[01,2]"));
+    CHECK_THROWS(json_schema_to_gbnf(json::parse(R"({"$ref":"#/$defs/none"})")));
+}
