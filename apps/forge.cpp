@@ -4,6 +4,7 @@
 #include <forge/mind/mind.hpp>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <set>
 #include <chrono>
@@ -43,9 +44,36 @@ int usage() {
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
+        "      [--grammar file.gbnf] [--draft draft.fpk [--spec-k 4]] [--codec C (for hf/gguf inputs)]\n"
+        "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32");
     return 2;
+}
+
+// `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
+std::string resolve_model(const std::string& path, const std::string& codec) {
+    namespace fs = std::filesystem;
+    if (!fs::is_directory(path) && !path.ends_with(".gguf")) return path;
+    std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(pack::format_version));
+    auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
+                                                            (long long)fs::last_write_time(f).time_since_epoch().count()); };
+    if (fs::is_directory(path)) { std::vector<fs::path> fl; for (auto& e : fs::directory_iterator(path)) if (e.is_regular_file()) fl.push_back(e.path());
+                                  std::sort(fl.begin(), fl.end()); for (auto& f : fl) stamp(f); }
+    else stamp(path);
+    const char* home = std::getenv("HOME");
+    fs::path dir = std::getenv("FORGE_CACHE") ? fs::path(std::getenv("FORGE_CACHE")) : fs::path(home ? home : "/tmp") / ".cache" / "forge";
+    fs::create_directories(dir);
+    auto h = hash::blake3::hex(hash::blake3::of({reinterpret_cast<const std::uint8_t*>(key.data()), key.size()})).substr(0, 24);
+    fs::path out = dir / (fs::path(path).filename().string() + "-" + codec + "-" + h + ".fpk");
+    if (!fs::exists(out)) {
+        import::import_options o; o.codec = codec;
+        auto tmp = out.string() + ".partial";
+        auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : import::import_hf(path, tmp, o);
+        fs::rename(tmp, out);
+        std::fprintf(stderr, "[imported %s (%s, %zu tensors) -> %s]\n", path.c_str(), r.template_name.c_str(), r.tensors, out.c_str());
+    } else std::fprintf(stderr, "[using cached %s]\n", out.c_str());
+    return out.string();
 }
 
 std::vector<int> parse_ids(const std::string& s) {
@@ -101,7 +129,7 @@ int cmd_dump(const args& a) {  // decode one tensor to raw little-endian f32
 int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
     mind::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
-    mind::session s(a.pos[0], so);
+    mind::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
     else if (a.kv.count("prompt")) {
@@ -120,11 +148,30 @@ int cmd_run(const args& a) {
         f.write(reinterpret_cast<const char*>(l.data()), std::streamsize(l.size() * 4));
         s.reset();
     }
-    mind::generate_stats st;
-    std::vector<int> out = s.generate(prompt, int(a.num("n", 32)), smp, [&](int t) {
+    std::unique_ptr<mind::grammar_constraint> gc;
+    if (a.kv.count("grammar")) {
+        if (!s.tokenizer()) raise(errc::unsupported, "--grammar needs a model tokenizer");
+        auto g = std::make_shared<mind::grammar>(import::read_file(a.get("grammar")));
+        gc = std::make_unique<mind::grammar_constraint>(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
+        smp.filter = [&](std::span<float> l) { gc->apply(l); };
+    }
+    auto show = [&](int t) {
+        if (gc && !gc->accept(t)) return false;
         if (ids) std::printf("%d ", t); else std::printf("%s", s.tokenizer()->decode_one(t).c_str());
-        std::fflush(stdout); return true;
-    }, &st);
+        std::fflush(stdout);
+        return !(gc && gc->finished());
+    };
+    if (a.kv.count("draft")) {
+        mind::session d(resolve_model(a.get("draft"), a.get("codec", "f32")), so);
+        mind::speculative_stats sst;
+        mind::speculative_generate(s, d, prompt, int(a.num("n", 32)), smp, int(a.num("spec-k", 4)), show, &sst);
+        std::printf("\n");
+        std::fprintf(stderr, "[speculative: %zu tokens in %.3fs = %.1f tok/s; %zu rounds, acceptance %.0f%%]\n", sst.new_tokens, sst.seconds,
+                     double(sst.new_tokens) / sst.seconds, sst.rounds, 100 * sst.acceptance());
+        return 0;
+    }
+    mind::generate_stats st;
+    std::vector<int> out = s.generate(prompt, int(a.num("n", 32)), smp, show, &st);
     std::printf("\n");
     std::fprintf(stderr, "[%zu prompt tokens in %.3fs, %zu new tokens in %.3fs = %.1f tok/s; plans %zu compiled, %zu reused]\n",
                  st.prompt_tokens, st.prefill_s, st.new_tokens, st.decode_s, st.new_tokens > 1 ? double(st.new_tokens - 1) / st.decode_s : 0.0,
@@ -134,7 +181,7 @@ int cmd_run(const args& a) {
 
 int cmd_bench_gemm(int n) {
     std::vector<float> A(std::size_t(n) * n, 0.5f), B(std::size_t(n) * n, 0.25f), C(std::size_t(n) * n);
-    for (const char* t : {"scalar", "avx2", "avx512"}) {
+    for (const char* t : {"scalar", "avx2", "avx512", "neon"}) {
         auto* k = lane::by_name(t); if (!k) continue;
         k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n));
         auto t0 = std::chrono::steady_clock::now(); int reps = 0;
@@ -154,7 +201,7 @@ int cmd_bench_gemm(int n) {
 int cmd_bench(const args& a) {
     if (a.kv.count("gemm")) return cmd_bench_gemm(int(a.num("gemm", 512)));
     if (a.pos.empty()) return usage();
-    mind::session s(a.pos[0]);
+    mind::session s(resolve_model(a.pos[0], a.get("codec", "f32")));
     int p = int(a.num("p", 32)), n = int(a.num("n", 32));
     std::vector<int> prompt(std::size_t(p), 1);
     mind::sampler smp;

@@ -81,10 +81,12 @@ struct blueprint {
         if (it == params.end()) raise(errc::not_found, "blueprint '{}': no param '{}'", name, k);
         return it->second;
     }
+    double param_or(const std::string& k, double d) const { auto it = params.find(k); return it == params.end() ? d : it->second; }
 };
 
 struct build_options {
     std::map<std::string, i64> dims;  // symbolic dims, e.g. {"seq", 7}
+    bool all_rows = false;            // `last(x, n)` keeps every row (speculative verification, scoring)
     // resolves a weight name (e.g. "layer.0.attn_norm") to shape + f32 data
     std::function<std::pair<shape_t, const float*>(const std::string&)> weight;
 };
@@ -286,6 +288,7 @@ private:
         if (fn == "merge") return T(g_.apply(spec::op::reshape, {as_tensor(pos.at(0))}, {{"shape", std::vector<i64>{-1, i64(expect_num(pos.at(1)))}}}));
         if (fn == "last") {  // last row along axis 0 (needs the symbolic length)
             i64 n = i64(expect_num(pos.at(1)));
+            if (o_.all_rows) return pos.at(0);
             return T(g_.apply(spec::op::slice, {as_tensor(pos.at(0))}, {{"axis", 0.0}, {"start", double(n - 1)}, {"end", double(n)}}));
         }
         auto o = spec::op_from_name(fn);

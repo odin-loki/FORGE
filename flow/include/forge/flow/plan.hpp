@@ -13,7 +13,22 @@ namespace forge::flow {
 struct state_store {
     struct slot { tensor buf; i64 len = 0; i64 capacity = 0; };
     std::map<std::string, slot> slots;
-    i64 capacity = 4096;
+    i64 capacity = 4096;   // maximum rows per slot (context length)
+    // Paged allocation: when > 0, slot storage grows in pages of `page_rows` rows on demand instead of
+    // reserving `capacity` rows up front, so memory tracks the tokens actually held.
+    i64 page_rows = 0;
+    i64 reserved_rows() const { i64 r = 0; for (auto& [k, s] : slots) r += s.capacity; return r; }
+    std::size_t bytes() const { std::size_t b = 0; for (auto& [k, s] : slots) b += s.buf.data.size() * sizeof(float); return b; }
+    // make room for `rows` rows in `sl` (row shape taken from `row_shape`)
+    void ensure(slot& sl, const shape_t& row_shape, i64 rows) {
+        if (rows > capacity) raise(errc::out_of_memory, "state exceeds context capacity {}", capacity);
+        if (rows <= sl.capacity) return;
+        i64 want = page_rows > 0 ? std::min(capacity, (rows + page_rows - 1) / page_rows * page_rows) : capacity;
+        shape_t cap = row_shape; cap[0] = want;
+        tensor nb(cap);
+        if (sl.capacity) std::copy_n(sl.buf.data.data(), std::size_t(numel(sl.buf.shape) / std::max<i64>(sl.capacity, 1) * sl.len), nb.data.data());
+        sl.buf = std::move(nb); sl.capacity = want;
+    }
     std::map<std::string, shape_t> shapes() const {
         std::map<std::string, shape_t> r;
         for (auto& [k, s] : slots) { shape_t sh = s.buf.shape; sh[0] = s.len; r[k] = sh; }
@@ -73,6 +88,7 @@ public:
     memory_plan mem;
     std::vector<step> steps;
     std::vector<tensor_view> views;   // per value
+    std::vector<std::pair<value_id, value_id>> state_aliases;  // (view, state node) pairs rebound at run time
     std::vector<float> arena;
     std::map<std::string, value_id> inputs;
     partition_report part;
@@ -108,17 +124,18 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             if (!st) raise(errc::invalid_argument, "graph uses state slot '{}' but no state store given", n.name);
             auto& sl = st->slots[n.name];
             const auto& xs = G.at(n.inputs[0]).shape;
-            if (sl.capacity == 0) {
-                shape_t cap = xs; cap[0] = st->capacity; sl.buf = tensor(cap); sl.capacity = st->capacity;
-            }
-            if (n.shape[0] > sl.capacity) raise(errc::out_of_memory, "state slot '{}' exceeds capacity {}", n.name, sl.capacity);
-            v.data = sl.buf.data.data();
+            if (n.shape[0] > st->capacity) raise(errc::out_of_memory, "state slot '{}' exceeds capacity {}", n.name, st->capacity);
+            st->ensure(sl, xs, std::max<i64>(n.shape[0], 1));
+            v.data = sl.buf.data.data();   // rebound on every run (pages may move, plans may be shared)
             p->steps.push_back({nullptr, n.inputs, value_id(i), &n.attrs, 1});
         } else {
             value_id r = value_id(i);
             while (p->mem.slots[r].kind == buffer_slot::alias) r = p->mem.slots[r].root;
             const auto& rs = p->mem.slots[r];
-            if (rs.kind == buffer_slot::external) v.data = p->views[r].data;
+            if (rs.kind == buffer_slot::external) {
+                v.data = p->views[r].data;
+                if (G.at(r).kind == node_kind::state_append) p->state_aliases.push_back({value_id(i), r});
+            }
             else v.data = p->arena.data() + rs.offset / sizeof(float);
         }
         (void)s;
@@ -152,9 +169,11 @@ public:
                 auto& node = p_.g.at(s.out);
                 auto& sl = st_->slots[node.name];
                 i64 row = numel(ins[0].shape) / std::max<i64>(ins[0].shape[0], 1);
+                st_->ensure(sl, ins[0].shape, sl.len + ins[0].shape[0]);
                 std::copy_n(ins[0].data, ins[0].size(), sl.buf.data.data() + sl.len * row);
                 sl.len += ins[0].shape[0];
-                if (sl.len > sl.capacity) raise(errc::out_of_memory, "state slot '{}' exceeds capacity", node.name);
+                out.data = sl.buf.data.data();
+                for (auto [a, r] : p_.state_aliases) if (r == s.out) p_.views[a].data = out.data;
                 out.shape[0] = sl.len;   // symbolic length: downstream kernels read it at run time
                 continue;
             }
