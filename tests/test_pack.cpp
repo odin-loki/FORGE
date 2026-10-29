@@ -49,7 +49,7 @@ TEST(fpk_write_read_verify_and_corruption) {
         w.add_tensor("a", {10, 100}, a, "f32");
         w.add_tensor("b", {1000}, a, "q8_0");
         w.add_tensor("c", {7}, std::span<const float>(a.data(), 7), "q4_k");  // falls back to f16
-        w.write(path);
+        w.write(path.string());
     }
     {
         pack::reader r(path.string());
@@ -172,7 +172,7 @@ TEST(fpk_encryption_hook) {
     pack::encrypt_file(src, dst, key);
     auto kp = pack::generate_keypair(); pack::sign_file(dst, dst, kp);
     { pack::reader r(dst); auto rep = pack::verify_signature(r); CHECK(rep.digest_ok && !rep.valid_keys.empty()); }
-    ::setenv("FORGE_MODEL_KEY", pack::detail::hex(key.data(), 32).c_str(), 1);
+    forge_test::set_env("FORGE_MODEL_KEY", pack::detail::hex(key.data(), 32).c_str());
     { mind::session s(dst); auto l = s.forward(std::vector<int>{1, 2}); mind::session p(src); CHECK(l == p.forward(std::vector<int>{1, 2})); }
-    ::unsetenv("FORGE_MODEL_KEY");
+    forge_test::set_env("FORGE_MODEL_KEY", nullptr);
 }

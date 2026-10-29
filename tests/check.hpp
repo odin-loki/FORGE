@@ -5,6 +5,15 @@
 #include <functional>
 #include <string>
 #include <vector>
+namespace forge_test {
+inline void set_env(const char* k, const char* v) {   // v = nullptr unsets
+#if defined(_WIN32)
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) ::setenv(k, v, 1); else ::unsetenv(k);
+#endif
+}
+}
 
 namespace forge_test {
 struct tcase { const char* name; std::function<void()> fn; };

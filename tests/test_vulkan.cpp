@@ -111,7 +111,12 @@ static int pipeline_cache() {
 int main() {
     std::string why;
     auto tmp = std::filesystem::temp_directory_path() / ("forge-vkcache-" + std::to_string(::getpid()));
+    
+#if defined(_WIN32)
+    _putenv_s("FORGE_CACHE_DIR", tmp.c_str());
+#else
     ::setenv("FORGE_CACHE_DIR", tmp.c_str(), 1);
+#endif
     auto rt = grid::vk::runtime::open(&why);
     if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
     std::printf("vulkan device: %s\n", rt->device_name().c_str());

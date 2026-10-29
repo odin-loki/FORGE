@@ -12,12 +12,8 @@
 #include <forge/import/gguf.hpp>
 #include <forge/mind/json_schema.hpp>
 #include <forge/mind/mind.hpp>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <forge/core/net.hpp>
 #include <signal.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -27,7 +23,7 @@ using namespace forge;
 namespace {
 
 struct conn {
-    int fd;
+    forge_sock_t fd;
     bool send(std::string_view s) {
         while (!s.empty()) { auto n = ::send(fd, s.data(), s.size(), MSG_NOSIGNAL); if (n <= 0) return false; s.remove_prefix(std::size_t(n)); }
         return true;
@@ -36,7 +32,7 @@ struct conn {
 
 struct http_request { std::string method, path, body; std::map<std::string, std::string> headers; };
 
-bool read_request(int fd, http_request& r) {
+bool read_request(forge_sock_t fd, http_request& r) {
     std::string buf; char tmp[8192];
     std::size_t hdr_end;
     while ((hdr_end = buf.find("\r\n\r\n")) == std::string::npos) {
@@ -115,13 +111,13 @@ public:
         : m_(std::move(m)), sched_(m_, bo), name_(std::move(name)) { sched_.start(); }
     ~server() { sched_.stop(); }
 
-    void handle(int fd) {
+    void handle(forge_sock_t fd) {
         conn c{fd};
         http_request r;
-        if (!read_request(fd, r)) { ::close(fd); return; }
+        if (!read_request(fd, r)) { forge_sock_close(fd); return; }
         try { route(c, r); }
         catch (const std::exception& e) { c.send(response(400, error_json(e.what()))); }
-        ::close(fd);
+        forge_sock_close(fd);
     }
 private:
     void route(conn& c, const http_request& r) {
@@ -258,7 +254,10 @@ int main(int argc, char** argv) {
         std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32]");
         return 2;
     }
+#if !defined(_WIN32)
     signal(SIGPIPE, SIG_IGN);
+#endif
+    forge::net_init();
     try {
         std::string path = argv[1];
         namespace fs = std::filesystem;
@@ -274,8 +273,8 @@ int main(int argc, char** argv) {
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
         server srv(m, bo, fs::path(argv[1]).filename().string());
-        int s = ::socket(AF_INET, SOCK_STREAM, 0);
-        int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+        forge_sock_t s = ::socket(AF_INET, SOCK_STREAM, 0);
+        int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof one);
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(std::uint16_t(std::stoi(arg(argc, argv, "port", "8080"))));
         if (inet_pton(AF_INET, arg(argc, argv, "host", "127.0.0.1").c_str(), &a.sin_addr) != 1) raise(errc::invalid_argument, "bad --host");
         if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) raise(errc::io_error, "bind failed: {}", std::strerror(errno));
@@ -284,9 +283,9 @@ int main(int argc, char** argv) {
         std::printf("forge-serve: %s on http://%s:%d (max_active %d)\n", path.c_str(), arg(argc, argv, "host", "127.0.0.1").c_str(), ntohs(a.sin_port), bo.max_active);
         std::fflush(stdout);
         for (;;) {
-            int fd = ::accept(s, nullptr, nullptr);
-            if (fd < 0) continue;
-            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            forge_sock_t fd = ::accept(s, nullptr, nullptr);
+            if (fd == FORGE_SOCK_BAD) continue;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
             std::thread([&srv, fd] { srv.handle(fd); }).detach();
         }
     } catch (const std::exception& e) {

@@ -10,31 +10,11 @@
 #include <string>
 #include <thread>
 #include <atomic>
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-using forge_sock_t = SOCKET;
-#define FORGE_SOCK_BAD INVALID_SOCKET
-#define forge_sock_close closesocket
-#else
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
-using forge_sock_t = int;
-#define FORGE_SOCK_BAD (-1)
-#define forge_sock_close ::close
-#endif
+#include <forge/core/net.hpp>
 
 namespace forge::flow::rpc {
 namespace detail {
-#if defined(_WIN32)
-inline void wsa() { static bool ok = [] { WSADATA d; return WSAStartup(MAKEWORD(2, 2), &d) == 0; }(); (void)ok; }
-#else
-inline void wsa() {}
-#endif
+inline void wsa() { forge::net_init(); }
 inline bool send_all(forge_sock_t s, const void* p, std::size_t n) {
     auto* c = static_cast<const char*>(p);
     while (n) { auto r = ::send(s, c, int(std::min<std::size_t>(n, 1 << 30)), 0); if (r <= 0) return false; c += r; n -= std::size_t(r); }
