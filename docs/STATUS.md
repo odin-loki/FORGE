@@ -114,3 +114,11 @@ Add `bindings/apple` as a local Swift package in Xcode and `import Forge` (see `
 ## Test flake (test_vulkan under parallel load)
 
 Concurrent runs shared fixed temp paths in /tmp (`forge_test_vk_e2e.fpk` and others), which caused SIGBUS and bad-magic errors. Temp files are now named per pid in test_vulkan, test_mind and test_pack. After the fix, 120 concurrent runs and `ctest -j8 --repeat until-fail:4` under full CPU load all passed.
+
+### AMX intermittent-failure root cause (resolved)
+The intermittent bf16/s8 AMX mismatches are a host problem: this VM loses tile registers across
+context switches. `tools/amx_state_probe.cpp` loads a tile, spins, stores it back, and sees 42-329 of 3000
+round-trips corrupted, with no FORGE code involved. SDE shows the same failures because on an AMX host it
+runs tile instructions natively. Changes: explicit compiler fences around the tile asm (GCC's intrinsics have
+no memory clobber), reused thread_local pack buffers, and test_tile retries before failing. 0/300 native and
+0/10 SDE failures after the change.
