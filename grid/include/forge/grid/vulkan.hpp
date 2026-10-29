@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <forge/spec/ops.gen.hpp>
@@ -201,7 +202,7 @@ public:
         for (std::size_t i = 0; i < bufs.size(); ++i) es.push_back(acquire(bufs[i], i + 1 == bufs.size()));
         // a later acquisition may have dropped an earlier binding (partially overlapping views): re-check
         bool stable = true;
-        for (std::size_t i = 0; i < bufs.size(); ++i) { auto b = acquire(bufs[i], i + 1 == bufs.size()); if (b.e != es[i].e || b.off != es[i].off) stable = false; }
+        for (std::size_t i = 0; i < bufs.size(); ++i) { auto b = acquire(bufs[i], i + 1 == bufs.size()); if ((b.parent ? b.parent : b.e) != (es[i].parent ? es[i].parent : es[i].e) || b.off + b.poff != es[i].off + es[i].poff) stable = false; }
         if (!stable) {
             lk.unlock();
             for (auto& b : bufs) release(b.data, b.count);
@@ -230,6 +231,10 @@ public:
         vkCmdPushConstants(cb_, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &pc);
         vkCmdDispatch(cb_, (invocations + 63) / 64, 1, 1);
         ++recorded_;
+        if (auto& o = es.back(); o.parent) {   // staged output: copy the result back into its parent buffer
+            open_cb(); VkBufferCopy r{0, o.poff, o.range}; vkCmdCopyBuffer(cb_, o.e->b, o.parent->b, 1, &r); ++recorded_;
+            o.parent->host_valid = false;
+        }
     }
     // Device-side copy of n floats from src into dst_base[off..] (dst_base spans dst_count floats, e.g. a
     // state slot). Both stay resident; nothing touches the host.
@@ -311,7 +316,8 @@ private:
         }
         if (best < 0) return "no compute queue";
         phys_ = pds[std::size_t(best)];
-        { VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys_, &pr); align_ = std::max<VkDeviceSize>(4, pr.limits.minStorageBufferOffsetAlignment); }
+        { VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys_, &pr); align_ = std::max<VkDeviceSize>(4, pr.limits.minStorageBufferOffsetAlignment);
+          if (const char* e = std::getenv("FORGE_VK_SSBO_ALIGN")) align_ = std::max<VkDeviceSize>(align_, std::strtoull(e, nullptr, 10)); }   // emulate stricter drivers (SwiftShader: 256)
         float prio = 1.f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex = fam; qci.queueCount = 1; qci.pQueuePriorities = &prio;
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
@@ -425,10 +431,12 @@ private:
         vkDestroyFence(dev_, f, nullptr); vkFreeCommandBuffers(dev_, pool_, 1, &cb_); cb_ = nullptr;
         for (auto dp : pending_pools_) vkDestroyDescriptorPool(dev_, dp, nullptr);
         pending_pools_.clear(); ++stats_.submits; recorded_ = 0;
+        for (auto& e : scratch_) free_entry(e); scratch_.clear();
     }
     // Find or create the resident buffer for exactly [h.data, h.data+h.count). An overlapping entry of a
     // different extent (arena slot reuse, a view into a bigger buffer) is synced to the host and dropped first.
-    struct bound { entry* e; VkDeviceSize off, range; };
+    // parent/poff: a staged copy of a sub-range whose offset breaks minStorageBufferOffsetAlignment
+    struct bound { entry* e; VkDeviceSize off, range; entry* parent = nullptr; VkDeviceSize poff = 0; };
     bound acquire(const hbuf& h, bool is_out) {
         auto key = reinterpret_cast<std::uintptr_t>(h.data);
         VkDeviceSize range = std::max<VkDeviceSize>(4, h.count * 4);
@@ -439,7 +447,16 @@ private:
         if (it != res_.begin()) {
             auto& c = std::prev(it)->second;
             auto cl = reinterpret_cast<std::uintptr_t>(c.host);
-            if (cl + c.count * 4 >= key + h.count * 4 && (key - cl) % align_ == 0 && h.count) return {&c, key - cl, range};
+            if (cl + c.count * 4 >= key + h.count * 4 && h.count) {
+                if ((key - cl) % align_ == 0) return {&c, key - cl, range};
+                // Misaligned view (e.g. 256-byte SwiftShader limit): stage it through a scratch buffer with
+                // device-side copies instead of dropping the parent, which would force a submit + host sync.
+                scratch_.push_back(make_buffer_(h.count));
+                auto* sc = &scratch_.back();
+                if (c.host_valid) { std::memcpy(sc->map, h.data, h.count * 4); stats_.upload_bytes += h.count * 4; }
+                else { open_cb(); VkBufferCopy r{key - cl, 0, h.count * 4}; vkCmdCopyBuffer(cb_, c.b, sc->b, 1, &r); ++recorded_; }
+                return {sc, 0, range, &c, key - cl};
+            }
         }
         bool stale = false;
         for_overlapping(h.data, std::max<std::size_t>(h.count, 1), [&](entry& e) { if (!e.host_valid) stale = true; });
@@ -466,6 +483,20 @@ private:
         stats_.resident_bytes += h.count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
         return {&res_.emplace(reinterpret_cast<std::uintptr_t>(h.data), e).first->second, 0, range};
     }
+    entry make_buffer_(std::size_t count) {
+        entry e{nullptr, count};
+        VkDeviceSize sz = std::max<VkDeviceSize>(4, count * 4);
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ck(vkCreateBuffer(dev_, &bi, nullptr, &e.b), "vkCreateBuffer");
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev_, e.b, &mr);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = memtype(mr.memoryTypeBits, true);
+        ck(vkAllocateMemory(dev_, &ai, nullptr, &e.m), "vkAllocateMemory");
+        ck(vkBindBufferMemory(dev_, e.b, e.m, 0), "vkBindBufferMemory");
+        ck(vkMapMemory(dev_, e.m, 0, sz, 0, &e.map), "vkMapMemory");
+        stats_.resident_bytes += count * 4;
+        return e;
+    }
+    std::deque<entry> scratch_;   // staged misaligned views; freed after the submit that used them
     std::uintptr_t key_ = 0;
     VkDeviceSize align_ = 256;
     void* lib_ = nullptr;
