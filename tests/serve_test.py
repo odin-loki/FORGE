@@ -33,6 +33,9 @@ try:
     r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 20, "temperature": 0.7, "seed": 2,
                                      "grammar": 'root ::= "ok" | "fine" | "sure"'})
     assert r["choices"][0]["message"]["content"] in ("ok", "fine", "sure"), r
+    r = post("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 40, "temperature": 0.9, "seed": 3,
+                                     "response_format": {"type": "json_schema", "json_schema": {"schema": {"enum": ["yes", "no", 7]}}}})
+    assert json.loads(r["choices"][0]["message"]["content"]) in ("yes", "no", 7), r
     full = post("/v1/completions", {"prompt": "the", "max_tokens": 10})["choices"][0]["text"]
     if len(full) > 3:
         cut = full[2:4]

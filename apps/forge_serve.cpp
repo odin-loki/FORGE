@@ -5,10 +5,12 @@
 //   GET  /health                 -> {"status":"ok"}
 //   GET  /v1/models              -> model list
 //   POST /v1/completions         {"prompt": str | [ids], "max_tokens", "temperature", "top_p", "top_k", "min_p",
-//                                 "repetition_penalty", "seed", "stop": [str], "grammar": GBNF, "stream": bool}
+//                                 "repetition_penalty", "seed", "stop": [str], "grammar": GBNF, "stream": bool,
+//                                 "typical_p", "mirostat_tau", "mirostat_eta", "response_format": {json_schema}}
 //   POST /v1/chat/completions    {"messages": [{"role","content"}], ...same sampling fields}
 //   GET  /metrics                -> scheduler counters
 #include <forge/import/gguf.hpp>
+#include <forge/mind/json_schema.hpp>
 #include <forge/mind/mind.hpp>
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -166,9 +168,15 @@ private:
         q.sampling.top_p = float(j.num_or("top_p", 1));
         q.sampling.top_k = int(j.num_or("top_k", 0));
         q.sampling.min_p = float(j.num_or("min_p", 0));
+        q.sampling.typical_p = float(j.num_or("typical_p", 1));
+        q.sampling.mirostat_tau = float(j.num_or("mirostat_tau", 0));
+        q.sampling.mirostat_eta = float(j.num_or("mirostat_eta", 0.1));
         q.sampling.repetition_penalty = float(j.num_or("repetition_penalty", 1));
         q.sampling.seed = std::uint64_t(j.num_or("seed", 0));
         if (auto* g = j.find("grammar"); g && g->is_str()) q.grammar = std::make_shared<mind::grammar>(g->str());
+        // OpenAI-style structured output: {"response_format": {"type": "json_schema", "json_schema": {"schema": {...}}}}
+        if (auto* rf = j.find("response_format"); rf && rf->str_or("type", "") == "json_schema")
+            if (auto* js = rf->find("json_schema"); js && js->find("schema")) q.grammar = std::make_shared<mind::grammar>(mind::json_schema_to_gbnf((*js)["schema"]));
         std::vector<std::string> stops;
         if (auto* s = j.find("stop")) { if (s->is_str()) stops.push_back(s->str()); else if (s->is_arr()) for (auto& x : s->arr()) stops.push_back(x.str()); }
         bool stream = false; if (auto* s = j.find("stream"); s && s->is_bool()) stream = s->b();
