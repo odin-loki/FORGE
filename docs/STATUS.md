@@ -5,7 +5,7 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 ## Test matrix (ctest)
 | Build | Result |
 |---|---|
-| x86_64 dev | 35/35 (CUDA/HIP device tests skip: no GPU). This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
+| x86_64 dev | 38/38 (CUDA/HIP device tests skip: no GPU). This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
 | aarch64 SVE build (`build/a64sve`), latest run | 27/27 without the fuzz label (3 skip: Vulkan/CUDA/HIP). |
 | riscv64 build (`build/rv64`), latest run | 23/23 without the fuzz label (3 skip). |
 | aarch64, qemu `-cpu max` (VL 512, so the NEON path runs) | 13/13 without the fuzz label. `test_vulkan` skips because the build is static. |
@@ -45,9 +45,14 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 - **pack security**: `.fpk` encryption with XChaCha20-Poly1305 (`forge encrypt`; key from `FORGE_MODEL_KEY` or `FORGE_MODEL_KEY_FILE`). Without the key, metadata still opens.
 - **Vulkan pipeline cache** on disk, keyed by vendor/device/driver/pipelineCacheUUID and a SPIR-V hash (`FORGE_CACHE_DIR`; `FORGE_VK_PIPELINE_CACHE=0` turns it off).
 - **Supply chain**: SPDX 2.3 SBOM (`tools/sbom.py`, deterministic, tested). Release builds are bit-identical (`FORGE_REPRODUCIBLE`, `ci/repro_check.sh`, which compares two builds in different directories). NOTICE lists Monocypher.
+- **support, more**: Threefry4x32-20 (Random123 known-answer tests); linalg sym_eig/SVD (Jacobi) and GMRES; TLSF + pool allocators with leak reports (`mem/tlsf.hpp`); `FORGE_REFLECT` JSON reflection; audio resample/biquad; vision roi_align.
+- **Async I/O** (`io/aio.hpp`): io_uring through raw syscalls (no liburing), falling back to a pread thread pool; short reads are resubmitted (`test_aio` runs both backends).
+- **mind, serving**: prompt-lookup (n-gram) speculation; presence/frequency penalties (also in forge-serve); batch request priority and `cancel(id)`.
+- **Docs/perf**: generated API reference (`tools/gen_docs.py`, `docs/reference.md`, checked by ctest `docs_up_to_date`); perf baselines (`tools/perf_baseline.py`, `perf/baseline-x86_64.json`).
 - **Goldens**: tiny Llama and MoE/MLA, checked against NumPy float64 references.
 
 ## Remaining
+- KV-cache quantisation and host offload are not done: the attention kernels read float KV slots directly, so this needs kernel changes.
 - Not testable on this machine: real CUDA/HIP GPUs, Level Zero, Metal, Windows/macOS/mobile, multi-GPU/NCCL-style collectives, and SDE-validated AMX/SME tiles.
 - Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU.
 - CUDA/HIP have not been run on real hardware (only the mock driver).
