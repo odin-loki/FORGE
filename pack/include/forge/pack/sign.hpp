@@ -10,6 +10,7 @@
 //
 //   "signature" section (JSON): {"alg":"ed25519","scheme":"forge-fpk-v1","digest":hex,
 //                                "signatures":[{"key_id":hex8,"public_key":hex,"sig":hex}]}
+#include <forge/os/os.hpp>
 #include <forge/pack/fpk.hpp>
 #include <fstream>
 
@@ -123,7 +124,7 @@ inline void sign_file(const std::string& in, const std::string& out, const keypa
     std::memcpy(o.data() + 16, &toff, 8); std::memcpy(o.data() + 24, &fsz, 8);
     auto tmp = out + ".tmp";
     { std::ofstream f(tmp, std::ios::binary); f.write(reinterpret_cast<const char*>(o.data()), std::streamsize(o.size())); if (!f) raise(errc::io_error, "cannot write {}", tmp); }
-    std::rename(tmp.c_str(), out.c_str());
+    if (auto rs = forge::os::rename(tmp, out); !rs) { forge::os::remove(tmp); raise(errc::io_error, "cannot replace {}: {}", out, rs.err.what); }
 }
 
 struct signature_report {

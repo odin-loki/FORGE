@@ -156,6 +156,7 @@ output w : f32[8]
 TEST(fpk_encryption_hook) {
     auto src = forge_test::make_tiny_model(tmp("enc_src.fpk")), dst = tmp("enc.fpk");
     auto key = pack::generate_model_key(); pack::encrypt_file(src, dst, key);
+    {   // readers map the file; Windows cannot replace a mapped file, so they close before dst is rewritten
     pack::reader plain(src), locked(dst);
     CHECK(locked.locked()); CHECK(locked.verify().empty()); CHECK_THROWS(locked.load("lm_head"));
     CHECK(locked.manifest().str_or("format", "") == "fpk");                  // metadata stays readable
@@ -168,6 +169,7 @@ TEST(fpk_encryption_hook) {
     { std::fstream f(dst, std::ios::in | std::ios::out | std::ios::binary); auto off = std::streamoff(locked.sections().at("data").offset + 5);
       f.seekg(off); char c; f.get(c); f.seekp(off); f.put(char(c ^ 0x40)); }
     CHECK_THROWS(pack::reader(dst, key));
+    }
     // sign + verify an encrypted file without the key, then load it with the key from the environment
     pack::encrypt_file(src, dst, key);
     auto kp = pack::generate_keypair(); pack::sign_file(dst, dst, kp);

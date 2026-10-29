@@ -1357,6 +1357,7 @@ public:
     }
     ~completion_port() {
 #if defined(FORGE_OS_WINDOWS)
+        for (auto& a : assoc_) CloseHandle(a.second);
         if (h_) CloseHandle(h_);
 #endif
     }
@@ -1379,9 +1380,9 @@ public:
     // Asynchronous positional read into buf; completes with `key`.
     bool read_async(file& f, void* buf, std::size_t n, std::uint64_t off, std::uint64_t key) {
 #if defined(FORGE_OS_WINDOWS)
-        if (!associate_(f.native())) return false;
+        HANDLE h = associate_(f.native()); if (!h) return false;
         auto* op = new op_t{}; op->ov.Offset = DWORD(off); op->ov.OffsetHigh = DWORD(off >> 32); op->key = key;
-        if (!ReadFile(f.native(), buf, DWORD(n), nullptr, &op->ov) && GetLastError() != ERROR_IO_PENDING) {
+        if (!ReadFile(h, buf, DWORD(n), nullptr, &op->ov) && GetLastError() != ERROR_IO_PENDING) {
             int e = int(GetLastError()); delete op; return post_error_(key, e);
         }
         return true;
@@ -1392,9 +1393,9 @@ public:
     }
     bool write_async(file& f, const void* buf, std::size_t n, std::uint64_t off, std::uint64_t key) {
 #if defined(FORGE_OS_WINDOWS)
-        if (!associate_(f.native())) return false;
+        HANDLE h = associate_(f.native()); if (!h) return false;
         auto* op = new op_t{}; op->ov.Offset = DWORD(off); op->ov.OffsetHigh = DWORD(off >> 32); op->key = key;
-        if (!WriteFile(f.native(), buf, DWORD(n), nullptr, &op->ov) && GetLastError() != ERROR_IO_PENDING) {
+        if (!WriteFile(h, buf, DWORD(n), nullptr, &op->ov) && GetLastError() != ERROR_IO_PENDING) {
             int e = int(GetLastError()); delete op; return post_error_(key, e);
         }
         return true;
@@ -1425,13 +1426,20 @@ private:
 #if defined(FORGE_OS_WINDOWS)
     static constexpr ULONG_PTR io_key = ~ULONG_PTR(0);
     struct op_t { OVERLAPPED ov{}; std::uint64_t key = 0; };
-    bool associate_(HANDLE f) {
-        for (auto a : assoc_) if (a == f) return true;
-        if (!CreateIoCompletionPort(f, h_, io_key, 0)) return false;
-        assoc_.push_back(f); return true;
+    // file handles are opened synchronously; IOCP needs FILE_FLAG_OVERLAPPED, so reopen the same file overlapped once.
+    HANDLE associate_(HANDLE f) {
+        for (auto& a : assoc_) if (a.first == f) return a.second;
+        HANDLE o = INVALID_HANDLE_VALUE;
+        for (DWORD acc : {DWORD(GENERIC_READ | GENERIC_WRITE), DWORD(GENERIC_READ), DWORD(GENERIC_WRITE)}) {
+            o = ReOpenFile(f, acc, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OVERLAPPED);
+            if (o != INVALID_HANDLE_VALUE) break;
+        }
+        if (o == INVALID_HANDLE_VALUE) return nullptr;
+        if (!CreateIoCompletionPort(o, h_, io_key, 0)) { CloseHandle(o); return nullptr; }
+        assoc_.push_back({f, o}); return o;
     }
     bool post_error_(std::uint64_t key, int e) { (void)e; return post(key, nullptr, 0) && false; }
-    HANDLE h_ = nullptr; std::vector<HANDLE> assoc_;
+    HANDLE h_ = nullptr; std::vector<std::pair<HANDLE, HANDLE>> assoc_;
 #else
     mutex m_; condvar c_; std::vector<completion> q_;
 #endif

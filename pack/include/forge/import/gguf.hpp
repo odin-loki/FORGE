@@ -12,22 +12,24 @@ public:
     struct tinfo { std::string name; shape_t shape; std::uint32_t type = 0; std::uint64_t offset = 0; };
     explicit gguf_file(const std::string& path) : path_(path) {
         map_ = forge::map_readonly(path, size_);
-        if (!map_) raise(errc::format_error, "{}: empty file", path);
-        if (size_ < 24 || std::memcmp(map_, "GGUF", 4)) raise(errc::format_error, "{}: not a GGUF file", path);
-        auto ver = rd<std::uint32_t>();
-        if (ver < 2 || ver > 3) raise(errc::unsupported, "{}: GGUF version {} unsupported", path, ver);
-        auto nt = rd<std::uint64_t>(), nkv = rd<std::uint64_t>();
-        for (std::uint64_t i = 0; i < nkv; ++i) { auto k = rstr(); auto t = rd<std::uint32_t>(); kv_.emplace_back(k, rval(t)); }
-        for (std::uint64_t i = 0; i < nt; ++i) {
-            tinfo ti; ti.name = rstr();
-            auto nd = rd<std::uint32_t>(); if (nd > 8) raise(errc::format_error, "{}: tensor {} has {} dims", path_, ti.name, nd);
-            std::vector<i64> ne(nd); for (auto& d : ne) d = i64(rd<std::uint64_t>());
-            ti.shape.assign(ne.rbegin(), ne.rend());   // ggml ne0 is the innermost dimension
-            ti.type = rd<std::uint32_t>(); ti.offset = rd<std::uint64_t>();
-            tensors_.push_back(ti);
-        }
-        std::size_t align = std::size_t(get("general.alignment") ? get("general.alignment")->num() : 32);
-        data_ = (p_ + align - 1) / align * align;
+        try {
+            if (!map_) raise(errc::format_error, "{}: empty file", path);
+            if (size_ < 24 || std::memcmp(map_, "GGUF", 4)) raise(errc::format_error, "{}: not a GGUF file", path);
+            auto ver = rd<std::uint32_t>();
+            if (ver < 2 || ver > 3) raise(errc::unsupported, "{}: GGUF version {} unsupported", path, ver);
+            auto nt = rd<std::uint64_t>(), nkv = rd<std::uint64_t>();
+            for (std::uint64_t i = 0; i < nkv; ++i) { auto k = rstr(); auto t = rd<std::uint32_t>(); kv_.emplace_back(k, rval(t)); }
+            for (std::uint64_t i = 0; i < nt; ++i) {
+                tinfo ti; ti.name = rstr();
+                auto nd = rd<std::uint32_t>(); if (nd > 8) raise(errc::format_error, "{}: tensor {} has {} dims", path_, ti.name, nd);
+                std::vector<i64> ne(nd); for (auto& d : ne) d = i64(rd<std::uint64_t>());
+                ti.shape.assign(ne.rbegin(), ne.rend());   // ggml ne0 is the innermost dimension
+                ti.type = rd<std::uint32_t>(); ti.offset = rd<std::uint64_t>();
+                tensors_.push_back(ti);
+            }
+            std::size_t align = std::size_t(get("general.alignment") ? get("general.alignment")->num() : 32);
+            data_ = (p_ + align - 1) / align * align;
+        } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // no dtor on a throwing ctor
     }
     gguf_file(const gguf_file&) = delete;
     ~gguf_file() { forge::unmap_readonly(map_, size_); }

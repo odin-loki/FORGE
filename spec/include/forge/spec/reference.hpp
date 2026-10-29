@@ -1,5 +1,6 @@
 #pragma once
 // Scalar reference implementations — the oracle. Clarity over speed; computed in double where it matters.
+#include <forge/core/fma.hpp>
 #include <forge/spec/op.hpp>
 #include <cmath>
 #include <limits>
@@ -75,7 +76,7 @@ FORGE_REF_BIN(div, a / b)
 FORGE_REF_BIN(maximum, std::isnan(a) || std::isnan(b) ? std::numeric_limits<double>::quiet_NaN() : std::max(a, b))
 FORGE_REF_BIN(minimum, std::isnan(a) || std::isnan(b) ? std::numeric_limits<double>::quiet_NaN() : std::min(a, b))
 FORGE_REF_BIN(pow, std::pow(a, b))
-FORGE_REF_BIN(fma, double(std::fma(float(a), float(b), float(c))))
+FORGE_REF_BIN(fma, double(forge::fmaf_exact(float(a), float(b), float(c))))
 FORGE_REF_BIN(select, c != 0 ? a : b)
 FORGE_REF_BIN(silu_mul, a * detail::sigm(a) * b)
 FORGE_REF_UN(neg, -x)

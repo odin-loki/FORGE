@@ -1,4 +1,5 @@
 #pragma once
+#include <forge/os/os.hpp>
 #include <forge/core/mapped.hpp>
 #include "forge/pack/entropy.hpp"
 // .fpk container: one file holding manifest, blueprint, tokenizer, tensor index and tensor data.
@@ -149,7 +150,7 @@ inline void write_sections(const std::string& out, std::vector<std::pair<std::st
     std::memcpy(o.data() + 16, &toff, 8); std::memcpy(o.data() + 24, &fsz, 8);
     auto tmp = out + ".tmp";
     { std::ofstream f(tmp, std::ios::binary); f.write(reinterpret_cast<const char*>(o.data()), std::streamsize(o.size())); if (!f) raise(errc::io_error, "cannot write {}", tmp); }
-    std::rename(tmp.c_str(), out.c_str());
+    if (auto rs = forge::os::rename(tmp, out); !rs) { forge::os::remove(tmp); raise(errc::io_error, "cannot replace {}: {}", out, rs.err.what); }
 }
 }
 using model_key = std::array<std::uint8_t, 32>;
@@ -168,6 +169,10 @@ class reader {
 public:
     explicit reader(const std::string& path, std::optional<model_key> key = std::nullopt) : path_(path) {
         map_ = forge::map_readonly(path, size_);
+        try { init_(path, key); } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // the dtor does not run on a throwing ctor
+    }
+private:
+    void init_(const std::string& path, std::optional<model_key> key) {
         if (size_ < 64) raise(errc::format_error, "{}: too small to be .fpk", path);
         if (std::memcmp(map_, magic, 8)) raise(errc::format_error, "{}: bad magic", path);
         std::uint32_t ver, n; std::uint64_t toff, fsz;
@@ -191,6 +196,7 @@ public:
             tensors_[e.name] = e;
         }
     }
+public:
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
     ~reader() { forge::unmap_readonly(map_, size_); }

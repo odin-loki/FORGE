@@ -2,6 +2,7 @@
 // Tier P: portable fixed-width vectors and masks over native registers.
 // Native code paths are only instantiated in TUs compiled with the matching -m flags (see lane/src).
 #include <forge/core/dtypes.hpp>
+#include <forge/core/fma.hpp>
 #include <forge/lane/caps.hpp>
 #include <cmath>
 #include <cstddef>
@@ -238,7 +239,7 @@ template <Target Tg> inline vec<float, Tg> fma(vec<float, Tg> a, vec<float, Tg> 
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vfmaq_f32(c.r, a.r, b.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_fmadd_ps(a.r, b.r, c.r);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_fmadd_ps(a.r, b.r, c.r);) }
-    else for (int i = 0; i < vec<float, Tg>::N; ++i) o.r.v[i] = std::fma(a.r.v[i], b.r.v[i], c.r.v[i]);
+    else for (int i = 0; i < vec<float, Tg>::N; ++i) o.r.v[i] = forge::fmaf_exact(a.r.v[i], b.r.v[i], c.r.v[i]);
     return o;
 }
 template <Target Tg> inline vec<float, Tg> load(const float* p) {

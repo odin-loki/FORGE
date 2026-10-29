@@ -171,6 +171,7 @@ TEST(l7_proxy) {
     auto p = std::make_shared<pool>(config{strategy::consistent_hash}); p->add({"A", a.addr()}); p->add({"B", b.addr()}); p->add({"BAD", bad.addr()});
     auto apip = std::make_shared<pool>(config{strategy::round_robin}); apip->add({"API", api.addr()});
     proxy_config pc; pc.mode = proxy_config::l7; pc.routes = {{"/api/", apip}};
+    pc.connect_timeout_ms = 15000;   // slow emulators (TCG): a timed-out dial would legitimately fail over and break stickiness
     proxy px(p, pc); CHECK(px.start());
     std::map<std::string, std::string> owner;
     for (int s = 0; s < 6; ++s) for (int k = 0; k < 3; ++k) {
@@ -178,7 +179,7 @@ TEST(l7_proxy) {
         CHECK(r.rfind("HTTP/1.1 200", 0) == 0);
         std::string up = r.substr(r.find("\r\n\r\n") + 4, 1);
         CHECK(up == "A" || up == "B");   // 503 upstream retried away
-        if (!owner.count("s" + std::to_string(s))) owner["s" + std::to_string(s)] = up; else CHECK(owner["s" + std::to_string(s)] == up);   // sticky
+        if (!owner.count("s" + std::to_string(s))) owner["s" + std::to_string(s)] = up; else { bool same = owner["s" + std::to_string(s)] == up; if (!same) std::printf("  sticky miss s%d: %s then %s\n%s\n", s, owner["s" + std::to_string(s)].c_str(), up.c_str(), r.c_str()); CHECK(same); }   // sticky
     }
     auto r = http(px.port(), "POST /api/v1/infer HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
     CHECK(r.find("API POST /api/v1/infer HTTP/1.1 body=hello") != std::string::npos);
