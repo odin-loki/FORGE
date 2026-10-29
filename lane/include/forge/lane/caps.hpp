@@ -49,13 +49,19 @@ struct neoverse2 : caps<neon, dotprod, i8mm, arm_bf16, arm_fp16, sve, sve2> {
 struct apple_m : caps<neon, dotprod, i8mm, arm_bf16, arm_fp16> {
     using caps_type = caps<neon, dotprod, i8mm, arm_bf16, arm_fp16>; static constexpr const char* name = "apple-m"; };
 struct rvv1 : caps<rvv, zvfh> { using caps_type = caps<rvv, zvfh>; static constexpr const char* name = "rvv1"; };
+// Scalable-vector targets at a fixed register length (bits); one kernel table is compiled per length.
+template <int Bits> struct sve_vl : caps<neon, dotprod, i8mm, arm_bf16, arm_fp16, sve, sve2> {
+    using caps_type = caps<neon, dotprod, i8mm, arm_bf16, arm_fp16, sve, sve2>; static constexpr int vl = Bits; static constexpr const char* name = "sve"; };
+template <int Bits> struct rvv_vl : caps<rvv, zvfh> {
+    using caps_type = caps<rvv, zvfh>; static constexpr int vl = Bits; static constexpr const char* name = "rvv"; };
+template <class T> constexpr int vl_bits() { if constexpr (requires { T::vl; }) return T::vl; else return 256; }
 
 // Widest native f32 register width (in lanes) implied by a target.
 template <Target T> constexpr int native_f32_lanes() {
     if constexpr (Has<T, avx512f>) return 16;
     else if constexpr (Has<T, avx2>) return 8;
-    else if constexpr (Has<T, sve>) return 8;   // SVE / RVV kernels are built for 256-bit registers
-    else if constexpr (Has<T, rvv>) return 8;
+    else if constexpr (Has<T, sve>) return vl_bits<T>() / 32;   // SVE / RVV: fixed length per tag (default 256)
+    else if constexpr (Has<T, rvv>) return vl_bits<T>() / 32;
     else if constexpr (Has<T, neon>) return 4;
     else return 4; // scalar emulation, 4-wide for ILP
 }

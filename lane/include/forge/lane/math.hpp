@@ -81,11 +81,11 @@ template <Target Tg> inline void split_exp(vec<float, Tg> x, vec<float, Tg>& m, 
     } else if constexpr (vec<float, Tg>::K == 5) {
         FORGE_IFRVV(
         vuint32m1_t xi = __riscv_vreinterpret_v_f32m1_u32m1(x.r);
-        vfloat32m1_t ee = __riscv_vfcvt_f_x_v_f32m1(__riscv_vsub_vx_i32m1(__riscv_vreinterpret_v_u32m1_i32m1(__riscv_vsrl_vx_u32m1(xi, 23, 8)), 127, 8), 8);
-        vfloat32m1_t mm = __riscv_vreinterpret_v_u32m1_f32m1(__riscv_vor_vx_u32m1(__riscv_vand_vx_u32m1(xi, 0x007fffff, 8), 0x3f800000, 8));
-        vbool32_t big = __riscv_vmfgt_vf_f32m1_b32(mm, 1.41421356f, 8);
-        mm = __riscv_vmerge_vvm_f32m1(mm, __riscv_vfmul_vf_f32m1(mm, 0.5f, 8), big, 8);
-        ee = __riscv_vmerge_vvm_f32m1(ee, __riscv_vfadd_vf_f32m1(ee, 1.0f, 8), big, 8);
+        vfloat32m1_t ee = __riscv_vfcvt_f_x_v_f32m1(__riscv_vsub_vx_i32m1(__riscv_vreinterpret_v_u32m1_i32m1(__riscv_vsrl_vx_u32m1(xi, 23, FORGE_RVV_VL)), 127, FORGE_RVV_VL), FORGE_RVV_VL);
+        vfloat32m1_t mm = __riscv_vreinterpret_v_u32m1_f32m1(__riscv_vor_vx_u32m1(__riscv_vand_vx_u32m1(xi, 0x007fffff, FORGE_RVV_VL), 0x3f800000, FORGE_RVV_VL));
+        vbool32_t big = __riscv_vmfgt_vf_f32m1_b32(mm, 1.41421356f, FORGE_RVV_VL);
+        mm = __riscv_vmerge_vvm_f32m1(mm, __riscv_vfmul_vf_f32m1(mm, 0.5f, FORGE_RVV_VL), big, FORGE_RVV_VL);
+        ee = __riscv_vmerge_vvm_f32m1(ee, __riscv_vfadd_vf_f32m1(ee, 1.0f, FORGE_RVV_VL), big, FORGE_RVV_VL);
         m.r = mm; e.r = ee;)
     } else if constexpr (vec<float, Tg>::K == 3) {
         FORGE_IFNEON(

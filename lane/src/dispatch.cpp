@@ -17,13 +17,73 @@ namespace mv_avx2 { extern const kernels table; }
 namespace mv_avx512 { extern const kernels table; }
 #if defined(__aarch64__)
 namespace mv_neon { extern const kernels table; }
-#if defined(FORGE_LANE_SVE)
-namespace mv_sve { extern const kernels table; int vector_bytes(); }
 #endif
+// Fixed-length scalable tables, one per built length (FORGE_LANE_SVE<B> / FORGE_LANE_RVV<B> set by CMake).
+#if defined(FORGE_LANE_SVE128)
+namespace mv_sve128 { extern const kernels table; }
 #endif
-#if defined(__riscv) && defined(FORGE_LANE_RVV)
-namespace mv_rvv { extern const kernels table; int vector_bytes(); }
+#if defined(FORGE_LANE_SVE256)
+namespace mv_sve256 { extern const kernels table; }
 #endif
+#if defined(FORGE_LANE_SVE512)
+namespace mv_sve512 { extern const kernels table; }
+#endif
+#if defined(FORGE_LANE_SVE1024)
+namespace mv_sve1024 { extern const kernels table; }
+#endif
+#if defined(FORGE_LANE_RVV128)
+namespace mv_rvv128 { extern const kernels table; }
+#endif
+#if defined(FORGE_LANE_RVV256)
+namespace mv_rvv256 { extern const kernels table; }
+#endif
+#if defined(FORGE_LANE_RVV512)
+namespace mv_rvv512 { extern const kernels table; }
+#endif
+#if defined(FORGE_LANE_RVV1024)
+namespace mv_rvv1024 { extern const kernels table; }
+#endif
+// Read the hardware vector length without SVE/V codegen flags in this TU (raw encodings, numeric CSR).
+#if defined(__aarch64__) && defined(__linux__)
+static int sve_vl_bytes() { long v; __asm__ volatile(".inst 0x04bf5020\n\tmov %0, x0" : "=r"(v) : : "x0"); return int(v); }  // rdvl x0, #1
+#endif
+#if defined(__riscv) && defined(__linux__)
+static int rvv_vlenb() { unsigned long v; __asm__ volatile("csrr %0, 0xc22" : "=r"(v)); return int(v); }  // vlenb
+#endif
+static const kernels* sve_table(int bytes) {
+    switch (bytes * 8) {
+#if defined(FORGE_LANE_SVE128)
+    case 128: return &mv_sve128::table;
+#endif
+#if defined(FORGE_LANE_SVE256)
+    case 256: return &mv_sve256::table;
+#endif
+#if defined(FORGE_LANE_SVE512)
+    case 512: return &mv_sve512::table;
+#endif
+#if defined(FORGE_LANE_SVE1024)
+    case 1024: return &mv_sve1024::table;
+#endif
+    default: (void)bytes; return nullptr;
+    }
+}
+static const kernels* rvv_table(int bytes) {
+    switch (bytes * 8) {
+#if defined(FORGE_LANE_RVV128)
+    case 128: return &mv_rvv128::table;
+#endif
+#if defined(FORGE_LANE_RVV256)
+    case 256: return &mv_rvv256::table;
+#endif
+#if defined(FORGE_LANE_RVV512)
+    case 512: return &mv_rvv512::table;
+#endif
+#if defined(FORGE_LANE_RVV1024)
+    case 1024: return &mv_rvv1024::table;
+#endif
+    default: (void)bytes; return nullptr;
+    }
+}
 
 #if defined(__x86_64__)
 static unsigned long long xgetbv0() {
@@ -90,17 +150,13 @@ static cpu_features do_detect() {
 #if defined(__linux__)
     unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
     f.sve = hw & (1ul << 22); f.sve2 = hw2 & (1ul << 1);
-#if defined(FORGE_LANE_SVE)
-    if (f.sve) f.sve_bytes = mv_sve::vector_bytes();
-#endif
+    if (f.sve) f.sve_bytes = sve_vl_bytes();
 #endif
 #elif defined(__riscv)
     f.vendor = "riscv64";
 #if defined(__linux__)
     f.rvv = getauxval(AT_HWCAP) & (1ul << ('V' - 'A'));
-#if defined(FORGE_LANE_RVV)
-    if (f.rvv) f.rvv_bytes = mv_rvv::vector_bytes();
-#endif
+    if (f.rvv) f.rvv_bytes = rvv_vlenb();
 #endif
 #endif
     return f;
@@ -127,14 +183,10 @@ const kernels* by_name(const char* t) {
     if (n == "scalar") return &mv_scalar::table;
 #if defined(__aarch64__)
     if (n == "neon") return f.neon ? &mv_neon::table : nullptr;
-#if defined(FORGE_LANE_SVE)
-    if (n == "sve") return f.sve && f.sve_bytes == 32 ? &mv_sve::table : nullptr;  // kernels are fixed at 256-bit
-#endif
+    if (n == "sve") return f.sve ? sve_table(f.sve_bytes) : nullptr;  // table built for exactly this VL, if any
     return nullptr;
 #elif defined(__riscv)
-#if defined(FORGE_LANE_RVV)
-    if (n == "rvv") return f.rvv && f.rvv_bytes == 32 ? &mv_rvv::table : nullptr;
-#endif
+    if (n == "rvv") return f.rvv ? rvv_table(f.rvv_bytes) : nullptr;
     return nullptr;
 #else
     if (n == "avx2") return f.avx2 && f.fma ? &mv_avx2::table : nullptr;

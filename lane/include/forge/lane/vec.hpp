@@ -16,23 +16,25 @@
 #define FORGE_IFNEON(...)
 #endif
 
-// Scalable vectors are used at a fixed length (256 bits: -msve-vector-bits=256 / -mrvv-vector-bits=256) so
-// they can live in structs; the dispatcher only selects these tables when the hardware length matches.
-#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE_BITS) && __ARM_FEATURE_SVE_BITS == 256
+// Scalable vectors are used at a fixed length per translation unit (-msve-vector-bits=B / -mrvv-vector-bits=B,
+// B in 128..1024) so they can live in structs. One kernel table is built per length (tags sve_vl<B>, rvv_vl<B>)
+// and the dispatcher picks the table matching the hardware VL/VLEN at run time.
+#if defined(__ARM_FEATURE_SVE) && defined(__ARM_FEATURE_SVE_BITS) && __ARM_FEATURE_SVE_BITS >= 128 && __ARM_FEATURE_SVE_BITS <= 1024
 #include <arm_sve.h>
-#define FORGE_HAVE_SVE256 1
+#define FORGE_HAVE_SVE_FIXED __ARM_FEATURE_SVE_BITS
 #define FORGE_IFSVE(...) __VA_ARGS__
-typedef svfloat32_t forge_sve_f __attribute__((arm_sve_vector_bits(256)));
-typedef svbool_t forge_sve_b __attribute__((arm_sve_vector_bits(256)));
+typedef svfloat32_t forge_sve_f __attribute__((arm_sve_vector_bits(__ARM_FEATURE_SVE_BITS)));
+typedef svbool_t forge_sve_b __attribute__((arm_sve_vector_bits(__ARM_FEATURE_SVE_BITS)));
 #else
 #define FORGE_IFSVE(...)
 #endif
-#if defined(__riscv_v) && defined(__riscv_v_fixed_vlen) && __riscv_v_fixed_vlen == 256
+#if defined(__riscv_v) && defined(__riscv_v_fixed_vlen) && __riscv_v_fixed_vlen >= 128 && __riscv_v_fixed_vlen <= 1024
 #include <riscv_vector.h>
-#define FORGE_HAVE_RVV256 1
+#define FORGE_HAVE_RVV_FIXED __riscv_v_fixed_vlen
+#define FORGE_RVV_VL (__riscv_v_fixed_vlen / 32)
 #define FORGE_IFRVV(...) __VA_ARGS__
-typedef vfloat32m1_t forge_rvv_f __attribute__((riscv_rvv_vector_bits(256)));
-typedef vbool32_t forge_rvv_b __attribute__((riscv_rvv_vector_bits(8)));
+typedef vfloat32m1_t forge_rvv_f __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen)));
+typedef vbool32_t forge_rvv_b __attribute__((riscv_rvv_vector_bits(__riscv_v_fixed_vlen / 32)));
 #else
 #define FORGE_IFRVV(...)
 #endif
@@ -47,12 +49,12 @@ template <int N> struct femu { float v[N]; };
 template <int N> struct iemu { i32 v[N]; };
 
 namespace impl {
-template <Target Tg> constexpr int kind() {   // 5 = rvv256, 4 = sve256, 3 = neon, 2 = avx512, 1 = avx2, 0 = emulated
-#if defined(FORGE_HAVE_SVE256)
-    if constexpr (Has<Tg, sve>) return 4;
+template <Target Tg> constexpr int kind() {   // 5 = rvv (fixed VLEN), 4 = sve (fixed VL), 3 = neon, 2 = avx512, 1 = avx2, 0 = emulated
+#if defined(FORGE_HAVE_SVE_FIXED)
+    if constexpr (Has<Tg, sve> && vl_bits<Tg>() == FORGE_HAVE_SVE_FIXED) return 4;
 #endif
-#if defined(FORGE_HAVE_RVV256)
-    if constexpr (Has<Tg, rvv>) return 5;
+#if defined(FORGE_HAVE_RVV_FIXED)
+    if constexpr (Has<Tg, rvv> && vl_bits<Tg>() == FORGE_HAVE_RVV_FIXED) return 5;
 #endif
 #if defined(__aarch64__) && defined(__ARM_NEON)
     if constexpr (Has<Tg, neon>) return 3;
@@ -77,11 +79,11 @@ template <Target Tg> struct mask<float, Tg> {
 #endif
 #if defined(__AVX2__)
                      std::conditional_t<K == 1, __m256, u32>>;
-#elif defined(FORGE_HAVE_SVE256)
+#elif defined(FORGE_HAVE_SVE_FIXED)
                      std::conditional_t<K == 4, forge_sve_b, std::conditional_t<K == 3, uint32x4_t, u32>>>;
 #elif defined(__aarch64__) && defined(__ARM_NEON)
                      std::conditional_t<K == 3, uint32x4_t, u32>>;
-#elif defined(FORGE_HAVE_RVV256)
+#elif defined(FORGE_HAVE_RVV_FIXED)
                      std::conditional_t<K == 5, forge_rvv_b, u32>>;
 #else
                      u32>;
@@ -101,7 +103,7 @@ template <Target Tg> struct mask<float, Tg> {
         } else if constexpr (K == 4) {
             FORGE_IFSVE(r.m = svwhilelt_b32_u64(0, std::uint64_t(n));)
         } else if constexpr (K == 5) {
-            FORGE_IFRVV(r.m = __riscv_vmsltu_vx_u32m1_b32(__riscv_vid_v_u32m1(8), unsigned(n > 8 ? 8 : n), 8);)
+            FORGE_IFRVV(r.m = __riscv_vmsltu_vx_u32m1_b32(__riscv_vid_v_u32m1(FORGE_RVV_VL), unsigned(n > FORGE_RVV_VL ? FORGE_RVV_VL : n), FORGE_RVV_VL);)
         } else if constexpr (K == 3) {
             FORGE_IFNEON(const uint32_t idx[4] = {0, 1, 2, 3}; r.m = vcltq_u32(vld1q_u32(idx), vdupq_n_u32(uint32_t(n > 4 ? 4 : n)));)
         } else {
@@ -118,14 +120,14 @@ template <Target Tg> struct mask<float, Tg> {
 #if defined(__aarch64__) && defined(__ARM_NEON)
         else if constexpr (K == 3) { const uint32_t w[4] = {1, 2, 4, 8}; return unsigned(vaddvq_u32(vandq_u32(m, vld1q_u32(w)))); }
 #endif
-#if defined(FORGE_HAVE_SVE256)
+#if defined(FORGE_HAVE_SVE_FIXED)
         else if constexpr (K == 4) return unsigned(svaddv_u32(m, svlsl_u32_x(svptrue_b32(), svdup_n_u32(1), svindex_u32(0, 1))));
 #endif
-#if defined(FORGE_HAVE_RVV256)
+#if defined(FORGE_HAVE_RVV_FIXED)
         else if constexpr (K == 5) {
-            auto w = __riscv_vsll_vv_u32m1(__riscv_vmv_v_x_u32m1(1, 8), __riscv_vid_v_u32m1(8), 8);
+            auto w = __riscv_vsll_vv_u32m1(__riscv_vmv_v_x_u32m1(1, FORGE_RVV_VL), __riscv_vid_v_u32m1(FORGE_RVV_VL), FORGE_RVV_VL);
             auto z = __riscv_vmv_s_x_u32m1(0, 1);
-            return unsigned(__riscv_vmv_x_s_u32m1_u32(__riscv_vredsum_vs_u32m1_u32m1_m(m, w, z, 8)));
+            return unsigned(__riscv_vmv_x_s_u32m1_u32(__riscv_vredsum_vs_u32m1_u32m1_m(m, w, z, FORGE_RVV_VL)));
         }
 #endif
         else return unsigned(m);
@@ -148,11 +150,11 @@ template <Target Tg> struct vec<float, Tg> {
 #endif
 #if defined(__AVX2__)
                      std::conditional_t<K == 1, __m256, femu<N>>>;
-#elif defined(FORGE_HAVE_SVE256)
+#elif defined(FORGE_HAVE_SVE_FIXED)
                      std::conditional_t<K == 4, forge_sve_f, std::conditional_t<K == 3, float32x4_t, femu<N>>>>;
 #elif defined(__aarch64__) && defined(__ARM_NEON)
                      std::conditional_t<K == 3, float32x4_t, femu<N>>>;
-#elif defined(FORGE_HAVE_RVV256)
+#elif defined(FORGE_HAVE_RVV_FIXED)
                      std::conditional_t<K == 5, forge_rvv_f, femu<N>>>;
 #else
                      femu<N>>;
@@ -190,7 +192,7 @@ template <Target Tg> struct vec<float, Tg> {
 inline float32x4_t forge_neon_max(float32x4_t a, float32x4_t b) { return vbslq_f32(vcgtq_f32(a, b), a, b); }
 inline float32x4_t forge_neon_min(float32x4_t a, float32x4_t b) { return vbslq_f32(vcltq_f32(a, b), a, b); }
 #endif
-#if defined(FORGE_HAVE_SVE256)
+#if defined(FORGE_HAVE_SVE_FIXED)
 #define FORGE_SVE_PT svptrue_b32()
 inline forge_sve_f forge_sve_add(forge_sve_f a, forge_sve_f b) { return svadd_f32_x(FORGE_SVE_PT, a, b); }
 inline forge_sve_f forge_sve_sub(forge_sve_f a, forge_sve_f b) { return svsub_f32_x(FORGE_SVE_PT, a, b); }
@@ -199,13 +201,13 @@ inline forge_sve_f forge_sve_div(forge_sve_f a, forge_sve_f b) { return svdiv_f3
 inline forge_sve_f forge_sve_max(forge_sve_f a, forge_sve_f b) { return svsel_f32(svcmpgt_f32(FORGE_SVE_PT, a, b), a, b); }
 inline forge_sve_f forge_sve_min(forge_sve_f a, forge_sve_f b) { return svsel_f32(svcmplt_f32(FORGE_SVE_PT, a, b), a, b); }
 #endif
-#if defined(FORGE_HAVE_RVV256)
-inline forge_rvv_f forge_rvv_add(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfadd_vv_f32m1(a, b, 8); }
-inline forge_rvv_f forge_rvv_sub(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfsub_vv_f32m1(a, b, 8); }
-inline forge_rvv_f forge_rvv_mul(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfmul_vv_f32m1(a, b, 8); }
-inline forge_rvv_f forge_rvv_div(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfdiv_vv_f32m1(a, b, 8); }
-inline forge_rvv_f forge_rvv_max(forge_rvv_f a, forge_rvv_f b) { return __riscv_vmerge_vvm_f32m1(b, a, __riscv_vmfgt_vv_f32m1_b32(a, b, 8), 8); }
-inline forge_rvv_f forge_rvv_min(forge_rvv_f a, forge_rvv_f b) { return __riscv_vmerge_vvm_f32m1(b, a, __riscv_vmflt_vv_f32m1_b32(a, b, 8), 8); }
+#if defined(FORGE_HAVE_RVV_FIXED)
+inline forge_rvv_f forge_rvv_add(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfadd_vv_f32m1(a, b, FORGE_RVV_VL); }
+inline forge_rvv_f forge_rvv_sub(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfsub_vv_f32m1(a, b, FORGE_RVV_VL); }
+inline forge_rvv_f forge_rvv_mul(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfmul_vv_f32m1(a, b, FORGE_RVV_VL); }
+inline forge_rvv_f forge_rvv_div(forge_rvv_f a, forge_rvv_f b) { return __riscv_vfdiv_vv_f32m1(a, b, FORGE_RVV_VL); }
+inline forge_rvv_f forge_rvv_max(forge_rvv_f a, forge_rvv_f b) { return __riscv_vmerge_vvm_f32m1(b, a, __riscv_vmfgt_vv_f32m1_b32(a, b, FORGE_RVV_VL), FORGE_RVV_VL); }
+inline forge_rvv_f forge_rvv_min(forge_rvv_f a, forge_rvv_f b) { return __riscv_vmerge_vvm_f32m1(b, a, __riscv_vmflt_vv_f32m1_b32(a, b, FORGE_RVV_VL), FORGE_RVV_VL); }
 #endif
 FORGE_VOP(add, _mm512_add_ps, _mm256_add_ps, vaddq_f32, x + y)
 FORGE_VOP(sub, _mm512_sub_ps, _mm256_sub_ps, vsubq_f32, x - y)
@@ -222,7 +224,7 @@ template <Target Tg> inline vec<float, Tg> operator/(vec<float, Tg> a, vec<float
 template <Target Tg> inline vec<float, Tg> splat(float s) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svdup_n_f32(s);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfmv_v_f_f32m1(s, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfmv_v_f_f32m1(s, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vdupq_n_f32(s);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_set1_ps(s);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_set1_ps(s);) }
@@ -232,7 +234,7 @@ template <Target Tg> inline vec<float, Tg> splat(float s) {
 template <Target Tg> inline vec<float, Tg> fma(vec<float, Tg> a, vec<float, Tg> b, vec<float, Tg> c) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svmla_f32_x(FORGE_SVE_PT, c.r, a.r, b.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfmacc_vv_f32m1(c.r, a.r, b.r, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfmacc_vv_f32m1(c.r, a.r, b.r, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vfmaq_f32(c.r, a.r, b.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_fmadd_ps(a.r, b.r, c.r);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_fmadd_ps(a.r, b.r, c.r);) }
@@ -242,7 +244,7 @@ template <Target Tg> inline vec<float, Tg> fma(vec<float, Tg> a, vec<float, Tg> 
 template <Target Tg> inline vec<float, Tg> load(const float* p) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svld1_f32(FORGE_SVE_PT, p);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vle32_v_f32m1(p, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vle32_v_f32m1(p, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vld1q_f32(p);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_loadu_ps(p);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_loadu_ps(p);) }
@@ -253,7 +255,7 @@ template <Target Tg> inline vec<float, Tg> load(const float* p) {
 template <Target Tg> inline vec<float, Tg> load(const float* p, mask<float, Tg> m) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svld1_f32(m.m, p);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vle32_v_f32m1_mu(m.m, __riscv_vfmv_v_f_f32m1(0.f, 8), p, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vle32_v_f32m1_mu(m.m, __riscv_vfmv_v_f_f32m1(0.f, FORGE_RVV_VL), p, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(for (int i = 0; i < 4; ++i) o.r[i] = (m.bits() >> i) & 1 ? p[i] : 0.f;) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_maskz_loadu_ps(m.m, p);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_maskload_ps(p, _mm256_castps_si256(m.m));) }
@@ -262,7 +264,7 @@ template <Target Tg> inline vec<float, Tg> load(const float* p, mask<float, Tg> 
 }
 template <Target Tg> inline void store(float* p, vec<float, Tg> v) {
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(svst1_f32(FORGE_SVE_PT, p, v.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(__riscv_vse32_v_f32m1(p, v.r, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(__riscv_vse32_v_f32m1(p, v.r, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(vst1q_f32(p, v.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(_mm512_storeu_ps(p, v.r);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(_mm256_storeu_ps(p, v.r);) }
@@ -270,7 +272,7 @@ template <Target Tg> inline void store(float* p, vec<float, Tg> v) {
 }
 template <Target Tg> inline void store(float* p, vec<float, Tg> v, mask<float, Tg> m) {
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(svst1_f32(m.m, p, v.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(__riscv_vse32_v_f32m1_m(m.m, p, v.r, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(__riscv_vse32_v_f32m1_m(m.m, p, v.r, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(for (int i = 0; i < 4; ++i) if ((m.bits() >> i) & 1) p[i] = v.r[i];) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(_mm512_mask_storeu_ps(p, m.m, v.r);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(_mm256_maskstore_ps(p, _mm256_castps_si256(m.m), v.r);) }
@@ -280,7 +282,7 @@ template <Target Tg> inline void store(float* p, vec<float, Tg> v, mask<float, T
 template <Target Tg> inline vec<float, Tg> select(mask<float, Tg> m, vec<float, Tg> a, vec<float, Tg> b) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svsel_f32(m.m, a.r, b.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vmerge_vvm_f32m1(b.r, a.r, m.m, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vmerge_vvm_f32m1(b.r, a.r, m.m, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vbslq_f32(m.m, a.r, b.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_mask_blend_ps(m.m, b.r, a.r);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_blendv_ps(b.r, a.r, m.m);) }
@@ -290,7 +292,7 @@ template <Target Tg> inline vec<float, Tg> select(mask<float, Tg> m, vec<float, 
 template <Target Tg> inline mask<float, Tg> lt(vec<float, Tg> a, vec<float, Tg> b) {
     mask<float, Tg> m;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(m.m = svcmplt_f32(FORGE_SVE_PT, a.r, b.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmflt_vv_f32m1_b32(a.r, b.r, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmflt_vv_f32m1_b32(a.r, b.r, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(m.m = vcltq_f32(a.r, b.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(m.m = _mm512_cmp_ps_mask(a.r, b.r, _CMP_LT_OQ);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(m.m = _mm256_cmp_ps(a.r, b.r, _CMP_LT_OQ);) }
@@ -300,7 +302,7 @@ template <Target Tg> inline mask<float, Tg> lt(vec<float, Tg> a, vec<float, Tg> 
 template <Target Tg> inline mask<float, Tg> isnan(vec<float, Tg> a) {
     mask<float, Tg> m;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(m.m = svcmpuo_f32(FORGE_SVE_PT, a.r, a.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmfne_vv_f32m1_b32(a.r, a.r, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmfne_vv_f32m1_b32(a.r, a.r, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(m.m = vmvnq_u32(vceqq_f32(a.r, a.r));) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(m.m = _mm512_cmp_ps_mask(a.r, a.r, _CMP_UNORD_Q);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(m.m = _mm256_cmp_ps(a.r, a.r, _CMP_UNORD_Q);) }
@@ -310,7 +312,7 @@ template <Target Tg> inline mask<float, Tg> isnan(vec<float, Tg> a) {
 template <Target Tg> inline mask<float, Tg> operator|(mask<float, Tg> a, mask<float, Tg> b) {
     mask<float, Tg> m;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(m.m = svorr_b_z(FORGE_SVE_PT, a.m, b.m);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmor_mm_b32(a.m, b.m, 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmor_mm_b32(a.m, b.m, FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(m.m = vorrq_u32(a.m, b.m);) }
     else if constexpr (vec<float, Tg>::K == 2) m.m = a.m | b.m;
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(m.m = _mm256_or_ps(a.m, b.m);) }
@@ -319,7 +321,7 @@ template <Target Tg> inline mask<float, Tg> operator|(mask<float, Tg> a, mask<fl
 }
 template <Target Tg> inline float reduce_add(vec<float, Tg> v) {
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(return svaddv_f32(FORGE_SVE_PT, v.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(v.r, __riscv_vfmv_s_f_f32m1(0.f, 1), 8));) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredusum_vs_f32m1_f32m1(v.r, __riscv_vfmv_s_f_f32m1(0.f, 1), FORGE_RVV_VL));) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(return vaddvq_f32(v.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(return _mm512_reduce_add_ps(v.r);) }
     else if constexpr (vec<float, Tg>::K == 1) {
@@ -333,7 +335,7 @@ template <Target Tg> inline float reduce_add(vec<float, Tg> v) {
 }
 template <Target Tg> inline float reduce_max(vec<float, Tg> v) {
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(return svmaxv_f32(FORGE_SVE_PT, v.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m1_f32m1(v.r, __riscv_vfmv_s_f_f32m1(-INFINITY, 1), 8));) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(return __riscv_vfmv_f_s_f32m1_f32(__riscv_vfredmax_vs_f32m1_f32m1(v.r, __riscv_vfmv_s_f_f32m1(-INFINITY, 1), FORGE_RVV_VL));) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(return vmaxvq_f32(v.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(return _mm512_reduce_max_ps(v.r);) }
     float tmp[vec<float, Tg>::N]; store(tmp, v);
@@ -344,7 +346,7 @@ template <Target Tg> inline float reduce_max(vec<float, Tg> v) {
 template <Target Tg> inline vec<float, Tg> ldexp_int(vec<float, Tg> x, vec<float, Tg> n) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svscale_f32_x(FORGE_SVE_PT, x.r, svcvt_s32_f32_x(FORGE_SVE_PT, svrintn_f32_x(FORGE_SVE_PT, n.r)));) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfmul_vv_f32m1(x.r, __riscv_vreinterpret_v_i32m1_f32m1(__riscv_vsll_vx_i32m1(__riscv_vadd_vx_i32m1(__riscv_vfcvt_x_f_v_i32m1(n.r, 8), 127, 8), 23, 8)), 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfmul_vv_f32m1(x.r, __riscv_vreinterpret_v_i32m1_f32m1(__riscv_vsll_vx_i32m1(__riscv_vadd_vx_i32m1(__riscv_vfcvt_x_f_v_i32m1(n.r, FORGE_RVV_VL), 127, FORGE_RVV_VL), 23, FORGE_RVV_VL)), FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vmulq_f32(x.r, vreinterpretq_f32_s32(vshlq_n_s32(vaddq_s32(vcvtnq_s32_f32(n.r), vdupq_n_s32(127)), 23)));) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_scalef_ps(x.r, n.r);) }
     else if constexpr (vec<float, Tg>::K == 1) {
@@ -356,7 +358,7 @@ template <Target Tg> inline vec<float, Tg> ldexp_int(vec<float, Tg> x, vec<float
 template <Target Tg> inline vec<float, Tg> round_nearest(vec<float, Tg> x) {
     vec<float, Tg> o;
     if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svrintn_f32_x(FORGE_SVE_PT, x.r);) }
-    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(auto r = __riscv_vfcvt_f_x_v_f32m1(__riscv_vfcvt_x_f_v_i32m1(x.r, 8), 8); o.r = __riscv_vmerge_vvm_f32m1(x.r, __riscv_vfsgnj_vv_f32m1(r, x.r, 8), __riscv_vmflt_vf_f32m1_b32(__riscv_vfabs_v_f32m1(x.r, 8), 8388608.f, 8), 8);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(auto r = __riscv_vfcvt_f_x_v_f32m1(__riscv_vfcvt_x_f_v_i32m1(x.r, FORGE_RVV_VL), FORGE_RVV_VL); o.r = __riscv_vmerge_vvm_f32m1(x.r, __riscv_vfsgnj_vv_f32m1(r, x.r, FORGE_RVV_VL), __riscv_vmflt_vf_f32m1_b32(__riscv_vfabs_v_f32m1(x.r, FORGE_RVV_VL), 8388608.f, FORGE_RVV_VL), FORGE_RVV_VL);) }
     else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vrndnq_f32(x.r);) }
     else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_roundscale_ps(x.r, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);) }
     else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_round_ps(x.r, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);) }
