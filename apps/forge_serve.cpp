@@ -13,6 +13,7 @@
 #include <forge/mind/json_schema.hpp>
 #include <forge/mind/mind.hpp>
 #include <forge/core/net.hpp>
+#include <forge/balance/proxy.hpp>
 #include <signal.h>
 #include <atomic>
 #include <cstdio>
@@ -247,11 +248,52 @@ std::string arg(int argc, char** argv, const std::string& k, const std::string& 
     return d;
 }
 
+// forge-serve proxy --backend host:port [--backend ...] [--mode l4|l7] [--strategy p2c] [--host] [--port]
+//   [--health-ms 2000] [--retries 3] [--route /prefix=host:port,host:port]
+int run_proxy(int argc, char** argv) {
+    using namespace forge::balance;
+    config c; auto st = parse_strategy(arg(argc, argv, "strategy", "p2c"));
+    if (!st) { std::fprintf(stderr, "forge-serve proxy: unknown --strategy\n"); return 2; }
+    c.strat = *st;
+    auto p = std::make_shared<pool>(c);
+    proxy_config pc;
+    for (int i = 2; i + 1 < argc; ++i) {
+        std::string k = argv[i], v = argv[i + 1];
+        if (k == "--backend") p->add({v, v});
+        else if (k == "--route") {
+            auto eq = v.find('='); if (eq == std::string::npos) continue;
+            auto rp = std::make_shared<pool>(c); std::string list = v.substr(eq + 1);
+            for (std::size_t a = 0; a <= list.size();) { auto b = list.find(',', a); if (b == std::string::npos) b = list.size(); if (b > a) rp->add({list.substr(a, b - a), list.substr(a, b - a)}); a = b + 1; }
+            rp->set_health_check(tcp_probe());
+            pc.routes.push_back({v.substr(0, eq), rp});
+        }
+    }
+    if (!p->size() && pc.routes.empty()) { std::fprintf(stderr, "forge-serve proxy: need at least one --backend host:port\n"); return 2; }
+    pc.mode = arg(argc, argv, "mode", "l7") == "l4" ? proxy_config::l4 : proxy_config::l7;
+    pc.listen_host = arg(argc, argv, "host", "127.0.0.1"); pc.listen_port = std::stoi(arg(argc, argv, "port", "8080"));
+    pc.retries = unsigned(std::stoi(arg(argc, argv, "retries", "3")));
+    p->set_health_check(tcp_probe());
+    proxy px(p, pc);
+    if (auto s = px.start(); !s) { std::fprintf(stderr, "forge-serve proxy: %s\n", s.err.what.c_str()); return 1; }
+    std::printf("forge-serve proxy (%s, %s) on %s:%d, %zu backends\n", pc.mode == proxy_config::l4 ? "l4" : "l7", strategy_name(c.strat), pc.listen_host.c_str(), px.port(), p->size());
+    std::fflush(stdout);
+    static std::atomic<bool> quit{false};
+    forge::os::on_signal(forge::os::sig::interrupt, [](int) { quit = true; });
+    forge::os::on_signal(forge::os::sig::terminate, [](int) { quit = true; });
+    health_checker hc(*p, std::uint64_t(std::stoll(arg(argc, argv, "health-ms", "2000"))) * 1000000ull);
+    std::vector<std::unique_ptr<health_checker>> rhc; for (auto& r : pc.routes) rhc.push_back(std::make_unique<health_checker>(*r.target, 2'000'000'000ull));
+    while (!quit) forge::os::sleep_ns(100'000'000);
+    px.stop();
+    std::printf("forge-serve proxy: served %llu, errors %llu\n", (unsigned long long)px.served(), (unsigned long long)px.errors());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)

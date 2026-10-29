@@ -368,7 +368,7 @@ if(FORGE_BUILD_APPS)
   add_executable(forge apps/forge.cpp)
   target_link_libraries(forge PRIVATE forge_mind forge_verify forge_lane_mv)
   add_executable(forge-serve apps/forge_serve.cpp)
-  target_link_libraries(forge-serve PRIVATE forge_mind forge_verify forge_lane_mv)
+  target_link_libraries(forge-serve PRIVATE forge_mind forge_verify forge_lane_mv forge_balance)
 endif()
 
 if(FORGE_BUILD_TESTS)
