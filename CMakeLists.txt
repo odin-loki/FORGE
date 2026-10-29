@@ -57,7 +57,7 @@ target_include_directories(forge_verify INTERFACE verify/include)
 target_link_libraries(forge_verify INTERFACE forge_spec)
 
 add_library(forge_grid INTERFACE)
-target_include_directories(forge_grid INTERFACE grid/include)
+target_include_directories(forge_grid INTERFACE grid/include support/include)
 target_link_libraries(forge_grid INTERFACE forge_lane)
 
 add_library(forge_flow INTERFACE)
