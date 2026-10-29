@@ -520,7 +520,7 @@ if(FORGE_BUILD_TESTS)
       foreach(d ${_jni_md})
         list(APPEND _jni_inc -I${d})
       endforeach()
-      add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -fsyntax-only -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
+      add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -c -o ${CMAKE_BINARY_DIR}/jni_syntax.o -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
         -I${CMAKE_SOURCE_DIR}/mind/include ${CMAKE_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
