@@ -22,6 +22,8 @@ struct session_options {
     i64 context = 0;       // 0 = manifest max_position_embeddings
     bool verify = false;   // check BLAKE3 hashes on open
     i64 page_rows = 256;   // KV page size in rows; 0 = reserve the whole context up front
+    std::string kv_codec;  // "", "f32", "int8" or "fp8"; empty = $FORGE_KV_CODEC or f32
+    int kv_offload = -1;   // 1 = keep KV on the host, drop device copies after each attention; -1 = $FORGE_KV_OFFLOAD
 };
 
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
@@ -114,7 +116,7 @@ public:
 
     // plan for `n` new tokens; all_rows keeps logits for every position
     flow::plan& plan_for(i64 n, bool all_rows, flow::state_store* st, const std::string& adapter = {}) {
-        return cache_.get(std::format("{}:{}:{}", all_rows ? "all" : "seq", n, adapter), [&] {
+        return cache_.get(std::format("{}:{}:{}:{}", all_rows ? "all" : "seq", n, adapter, st ? flow::kv_codec_name(st->codec) : "f32"), [&] {
             pack::build_options bo;
             bo.dims["seq"] = n;
             bo.all_rows = all_rows;
@@ -152,6 +154,12 @@ public:
     explicit session(std::shared_ptr<model> m, session_options o = {}) : m_(std::move(m)), opt_(o) {
         st_.capacity = o.context ? o.context : m_->max_context();
         st_.page_rows = o.page_rows;
+        std::string kc = o.kv_codec;
+        if (kc.empty()) if (const char* e = std::getenv("FORGE_KV_CODEC")) kc = e;
+        st_.codec = flow::kv_codec_from_name(kc);
+        int off = o.kv_offload;
+        if (off < 0) { const char* e = std::getenv("FORGE_KV_OFFLOAD"); off = e && *e && *e != '0'; }
+        st_.offload = off != 0;
     }
     const std::shared_ptr<model>& shared_model() const { return m_; }
     const pack::blueprint& blueprint() const { return m_->blueprint(); }
@@ -176,9 +184,11 @@ public:
     void copy_prefix(const session& o, i64 n) {
         if (o.m_ != m_) raise(errc::invalid_argument, "copy_prefix: sessions use different models");
         n = std::min(n, o.pos_);
+        if (o.st_.codec != st_.codec) raise(errc::invalid_argument, "copy_prefix: sessions use different KV codecs");
         st_.reset();
         for (auto& [k, s] : o.st_.slots) {
             auto& d = st_.slots[k];
+            if (!d.capacity) d.codec = s.codec;
             shape_t row = s.buf.shape;
             st_.ensure(d, row, std::max<i64>(n, 1));
             i64 rw = numel(s.buf.shape) / std::max<i64>(s.capacity, 1);

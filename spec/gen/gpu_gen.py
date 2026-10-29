@@ -126,38 +126,58 @@ void main() {
 }
 """
     if name == "attention":  # q[s,hq,d] k[t,hk,d] v[t,hk,dv]; one invocation per (query, head).
-        # push: rows=s, cols=hq, k=d, a=t, b=hk, c=dv, d=causal | window<<1, alpha=scale
+        # push: rows=s, cols=hq, k=d, a=t, b=hk, c=dv, d=causal | kcodec<<1 | vcodec<<3 | window<<5, alpha=scale
+        # A quantised K/V (codec 1 int8, 2 fp8 e4m3) holds per (row, head) one f32 scale word + ceil(d/4)
+        # words of packed bytes (flow/kv_codec.hpp); it is decoded here on the fly.
         return GLSL_HEAD + """layout(std430, binding = 0) readonly buffer Qb { float q_[]; };
 layout(std430, binding = 1) readonly buffer Kb { float k_[]; };
 layout(std430, binding = 2) readonly buffer Vb { float v_[]; };
 layout(std430, binding = 3) buffer Y { float y_[]; };
+float fp8dec(uint b) {
+  uint e = (b >> 3) & 15u, m = b & 7u;
+  float v = e == 0u ? ldexp(float(m), -9) : ldexp(float(8u + m), int(e) - 10);
+  return (b & 0x80u) != 0u ? -v : v;
+}
+float qdec(uint codec, uint word, uint e) {
+  uint b = (word >> (8u * (e & 3u))) & 255u;
+  return codec == 1u ? float(int(b << 24) >> 24) : fp8dec(b);
+}
+float kat(uint kc, uint base, uint e) {
+  if (kc == 0u) return k_[base + e];
+  return qdec(kc, floatBitsToUint(k_[base + 1u + (e >> 2)]), e) * k_[base];
+}
+float vat(uint vc, uint base, uint e) {
+  if (vc == 0u) return v_[base + e];
+  return qdec(vc, floatBitsToUint(v_[base + 1u + (e >> 2)]), e) * v_[base];
+}
 // 4 partial sums (like the CPU lane dot) keep the score error well inside the oracle's 1e-5.
-float qk(uint qo, uint ko) {
+float qk(uint kc, uint qo, uint ko) {
   vec4 acc = vec4(0.0); uint e = 0;
-  for (; e + 4u <= p.k; e += 4u) acc = fma(vec4(q_[qo+e], q_[qo+e+1u], q_[qo+e+2u], q_[qo+e+3u]), vec4(k_[ko+e], k_[ko+e+1u], k_[ko+e+2u], k_[ko+e+3u]), acc);
+  for (; e + 4u <= p.k; e += 4u) acc = fma(vec4(q_[qo+e], q_[qo+e+1u], q_[qo+e+2u], q_[qo+e+3u]), vec4(kat(kc,ko,e), kat(kc,ko,e+1u), kat(kc,ko,e+2u), kat(kc,ko,e+3u)), acc);
   float s = (acc.x + acc.y) + (acc.z + acc.w);
-  for (; e < p.k; ++e) s = fma(q_[qo + e], k_[ko + e], s);
+  for (; e < p.k; ++e) s = fma(q_[qo + e], kat(kc, ko, e), s);
   return s;
 }
 void main() {
   uint id = gl_GlobalInvocationID.x; if (id >= p.rows * p.cols) return;
   uint i = id / p.cols, h = id % p.cols, kh = h / (p.cols / p.b);
-  bool causal = (p.d & 1u) != 0u; uint window = p.d >> 1;
+  bool causal = (p.d & 1u) != 0u; uint kc = (p.d >> 1) & 3u, vc = (p.d >> 3) & 3u, window = p.d >> 5;
+  uint kw = kc == 0u ? p.k : 1u + (p.k + 3u) / 4u, vw = vc == 0u ? p.c : 1u + (p.c + 3u) / 4u;
   int pos = int(p.a) - int(p.rows) + int(i);
   uint qo = id * p.k, yo = id * p.c;
   float m = -1.0 / 0.0;
   for (uint j = 0; j < p.a; ++j) {
     if (causal && int(j) > pos) continue; if (window > 0u && pos - int(j) >= int(window)) continue;
-    float dot = qk(qo, (j * p.b + kh) * p.k);
+    float dot = qk(kc, qo, (j * p.b + kh) * kw);
     m = max(m, dot * p.alpha);
   }
   for (uint e = 0; e < p.c; ++e) y_[yo + e] = 0.0;
   float sum = 0.0;
   for (uint j = 0; j < p.a; ++j) {
     if (causal && int(j) > pos) continue; if (window > 0u && pos - int(j) >= int(window)) continue;
-    float dot = qk(qo, (j * p.b + kh) * p.k);
+    float dot = qk(kc, qo, (j * p.b + kh) * kw);
     float w = fexp(dot * p.alpha - m); sum += w;
-    for (uint e = 0; e < p.c; ++e) y_[yo + e] += w * v_[(j * p.b + kh) * p.c + e];
+    for (uint e = 0; e < p.c; ++e) y_[yo + e] += w * vat(vc, (j * p.b + kh) * vw, e);
   }
   float inv = sum > 0.0 ? 1.0 / sum : 0.0;
   for (uint e = 0; e < p.c; ++e) y_[yo + e] *= inv;

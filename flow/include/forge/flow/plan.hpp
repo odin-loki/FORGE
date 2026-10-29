@@ -1,22 +1,36 @@
 #pragma once
 // partition -> memory-plan -> lower -> flat plan -> replay. Plans are cached per shape bucket.
 #include <forge/flow/kernels.hpp>
+#include <forge/flow/kv_codec.hpp>
 #include <forge/flow/memplan.hpp>
 #include <forge/flow/passes.hpp>
 #include <forge/grid/grid.hpp>
 #include <chrono>
 #include <cstdlib>
+#include <deque>
 
 namespace forge::flow {
 
 // Per-session state store: slot -> preallocated [capacity, ...] tensor + current length.
 struct state_store {
-    struct slot { tensor buf; i64 len = 0; i64 capacity = 0; };
+    struct slot { tensor buf; i64 len = 0; i64 capacity = 0; kv_codec codec = kv_codec::f32; };
     std::map<std::string, slot> slots;
     i64 capacity = 4096;   // maximum rows per slot (context length)
     // Paged allocation: when > 0, slot storage grows in pages of `page_rows` rows on demand instead of
     // reserving `capacity` rows up front, so memory tracks the tokens actually held.
     i64 page_rows = 0;
+    // KV codec for new slots (rank-3 [rows, heads, d] slots only; others stay f32). Set before the first
+    // plan is compiled against this store. Quantised slots hold [rows, heads, kv_head_words(d)] floats.
+    kv_codec codec = kv_codec::f32;
+    // Host offload: drop the device copy of every slot right after the attention that reads it, so device
+    // memory holds at most one layer's KV at a time (the host copy is authoritative between steps).
+    bool offload = false;
+    // physical row shape for a slot fed by logical rows `xs` ([rows, heads, d])
+    kv_codec codec_for(const shape_t& xs) const { return xs.size() == 3 ? codec : kv_codec::f32; }
+    static shape_t physical(const shape_t& xs, kv_codec c) {
+        if (c == kv_codec::f32) return xs;
+        return {xs[0], xs[1], kv_head_words(xs[2])};
+    }
     i64 reserved_rows() const { i64 r = 0; for (auto& [k, s] : slots) r += s.capacity; return r; }
     std::size_t bytes() const { std::size_t b = 0; for (auto& [k, s] : slots) b += s.buf.data.size() * sizeof(float); return b; }
     // make room for `rows` rows in `sl` (row shape taken from `row_shape`)
@@ -87,6 +101,7 @@ public:
     graph g;
     memory_plan mem;
     std::vector<step> steps;
+    std::deque<spec::attrs> attr_store;   // per-step attribute overrides (stable addresses)
     std::vector<tensor_view> views;   // per value
     std::vector<std::pair<value_id, value_id>> state_aliases;  // (view, state node) pairs rebound at run time
     std::vector<float> arena;
@@ -128,7 +143,10 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             auto& sl = st->slots[n.name];
             const auto& xs = G.at(n.inputs[0]).shape;
             if (n.shape[0] > st->capacity) raise(errc::out_of_memory, "state slot '{}' exceeds capacity {}", n.name, st->capacity);
-            st->ensure(sl, xs, std::max<i64>(n.shape[0], 1));
+            if (!sl.capacity) sl.codec = st->codec_for(xs);
+            auto ps = state_store::physical(xs, sl.codec);
+            st->ensure(sl, ps, std::max<i64>(n.shape[0], 1));
+            v.shape = state_store::physical(n.shape, sl.codec);
             v.data = sl.buf.data.data();   // rebound on every run (pages may move, plans may be shared)
             p->steps.push_back({nullptr, n.inputs, value_id(i), &n.attrs, 1});
         } else {
@@ -151,7 +169,21 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
                     raise(errc::unsupported, "state slot '{}' feeds '{}': only attention may consume a growing state view",
                           G.at(in).name, spec::info(n.op).name);
             std::vector<shape_t> ins; for (auto in : n.inputs) ins.push_back(G.at(in).shape);
-            p->steps.push_back({&reg.select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), &n.attrs, 0});
+            const spec::attrs* at = &n.attrs;
+            if (n.op == spec::op::attention && st && n.inputs.size() == 3) {
+                auto codec_of = [&](value_id in) {
+                    auto& m = G.at(in);
+                    return m.kind == node_kind::state_append ? st->slots[m.name].codec : kv_codec::f32;
+                };
+                auto kc = codec_of(n.inputs[1]), vc = codec_of(n.inputs[2]);
+                if (kc != kv_codec::f32 || vc != kv_codec::f32) {
+                    auto& a2 = p->attr_store.emplace_back(n.attrs);
+                    a2.v["kv_codec_k"] = double(int(kc)); a2.v["kv_codec_v"] = double(int(vc));
+                    a2.v["kv_dv"] = double(G.at(n.inputs[2]).shape[2]);
+                    at = &a2;
+                }
+            }
+            p->steps.push_back({&reg.select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
     return p;
@@ -194,13 +226,20 @@ private:
             if (s.kind == 1) {
                 auto& node = p_.g.at(s.out);
                 auto& sl = st_->slots[node.name];
-                i64 row = numel(ins[0].shape) / std::max<i64>(ins[0].shape[0], 1);
                 i64 rows = ins[0].shape[0];
+                auto ps = state_store::physical(ins[0].shape, sl.codec);
+                i64 row = numel(ps) / std::max<i64>(rows, 1);
                 if (h && sl.capacity && sl.len + rows > sl.capacity) h->release(sl.buf.data.data(), sl.buf.data.size());  // about to move: sync + drop
                 const float* before = sl.buf.data.data();
-                st_->ensure(sl, ins[0].shape, sl.len + rows);
+                st_->ensure(sl, ps, sl.len + rows);
                 float* dst = sl.buf.data.data() + sl.len * row;
-                if (h && h->copy) {
+                std::size_t nphys = std::size_t(rows * row);
+                if (sl.codec != kv_codec::f32) {   // quantise on the host (the device copy of the rows is patched)
+                    if (h) { h->to_host(ins[0].data, ins[0].size()); h->to_host(dst, nphys); if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
+                    i64 heads = ins[0].shape[1], d = ins[0].shape[2], hw = kv_head_words(d);
+                    for (i64 r = 0; r < rows * heads; ++r) kv_encode_head(ins[0].data + r * d, d, sl.codec, dst + r * hw);
+                    if (h) h->host_wrote(dst, nphys);
+                } else if (h && h->copy) {
                     if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size());
                     h->copy(ins[0].data, ins[0].size(), sl.buf.data.data(), sl.buf.data.size(), std::size_t(sl.len * row));
                 } else {
@@ -220,6 +259,11 @@ private:
                 s.low->fn(ins, out, *s.attrs);
                 h->host_wrote(out.data, out.size());
             } else s.low->fn(ins, out, *s.attrs);
+            if (h && st_ && st_->offload && p_.g.at(s.out).op == spec::op::attention)
+                for (auto v : s.in) if (p_.g.at(v).kind == node_kind::state_append) {
+                    auto& sl = st_->slots[p_.g.at(v).name];
+                    h->release(sl.buf.data.data(), sl.buf.data.size());
+                }
         }
     }
 public:

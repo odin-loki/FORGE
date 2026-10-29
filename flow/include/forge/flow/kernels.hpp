@@ -4,6 +4,7 @@
 // Lowerings: implementations of spec ops for a device. Only lowerings that pass the oracle are eligible.
 #include <forge/core/log.hpp>
 #include <forge/flow/ir.hpp>
+#include <forge/flow/kv_codec.hpp>
 #include <forge/grid/prims.hpp>
 #include <forge/lane/dispatch.hpp>
 #include <forge/verify/oracle.hpp>
@@ -159,6 +160,36 @@ inline kernel_fn attention() {
         float sc = float(a.num("scale", 1.0 / std::sqrt(double(d))));
         std::size_t window = std::size_t(a.num("window", 0));
         const auto& ker = lane::active();
+        auto kc = kv_codec(int(a.num("kv_codec_k", 0))), vc = kv_codec(int(a.num("kv_codec_v", 0)));
+        if (vc != kv_codec::f32) dv = std::size_t(a.num("kv_dv", 0));
+        std::size_t kw = kc != kv_codec::f32 ? std::size_t(kv_head_words(i64(d))) : d, vw = vc != kv_codec::f32 ? std::size_t(kv_head_words(i64(dv))) : dv;
+        if (kc != kv_codec::f32 || vc != kv_codec::f32) {   // quantised KV: decode each (row, head) on the fly
+            task::parallel_for(s * hq, 1, [&](std::size_t b, std::size_t e) {
+                std::vector<float> sco(t), acc(dv), kt(d), vt(dv);
+                for (std::size_t w = b; w < e; ++w) {
+                    std::size_t i = w / hq, h = w % hq, kh = h / grp, pos = t - s + i;
+                    std::size_t lo = 0, hi = causal ? pos + 1 : t;
+                    if (window && pos + 1 > window) lo = pos + 1 - window;
+                    const float* qp = q.data + (i * hq + h) * d;
+                    float mx = -INFINITY;
+                    for (std::size_t j = lo; j < hi; ++j) {
+                        const float* kp = k.data + (j * hk + kh) * kw;
+                        if (kc != kv_codec::f32) { kv_decode_head(kp, i64(d), kc, kt.data()); kp = kt.data(); }
+                        sco[j] = ker.dot(qp, kp, d) * sc; mx = std::max(mx, sco[j]);
+                    }
+                    float sum = 0;
+                    for (std::size_t j = lo; j < hi; ++j) { sco[j] = std::exp(sco[j] - mx); sum += sco[j]; }
+                    std::fill(acc.begin(), acc.end(), 0.f);
+                    for (std::size_t j = lo; j < hi; ++j) {
+                        const float* vp = v.data + (j * hk + kh) * vw;
+                        if (vc != kv_codec::f32) { kv_decode_head(vp, i64(dv), vc, vt.data()); vp = vt.data(); }
+                        ker.saxpy(sco[j] / sum, vp, acc.data(), dv);
+                    }
+                    std::copy(acc.begin(), acc.end(), out.data + (i * hq + h) * dv);
+                }
+            });
+            return;
+        }
         task::parallel_for(s * hq, 1, [&](std::size_t b, std::size_t e) {
             std::vector<float> sco(t), acc(dv);
             for (std::size_t w = b; w < e; ++w) {

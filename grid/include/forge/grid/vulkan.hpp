@@ -174,7 +174,7 @@ public:
             ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         for (auto k : ks) { free_entry(res_[k]); res_.erase(k); }
     }
-    struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0; };
+    struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0; };
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
 
     // Record kernel `name` over resident buffers (bound 0..N-1; the last is the output).
@@ -399,7 +399,7 @@ private:
     VkCommandBuffer cb_ = nullptr; std::size_t recorded_ = 0;
     bool in_run_ = false;
     residency_stats stats_;
-    void free_entry(entry& e) { vkUnmapMemory(dev_, e.m); vkDestroyBuffer(dev_, e.b, nullptr); vkFreeMemory(dev_, e.m, nullptr); }
+    void free_entry(entry& e) { stats_.resident_bytes -= e.count * 4; vkUnmapMemory(dev_, e.m); vkDestroyBuffer(dev_, e.b, nullptr); vkFreeMemory(dev_, e.m, nullptr); }
     bool overlaps_any(const float* p, std::size_t n) {
         auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
         auto it = res_.lower_bound(hi);
@@ -460,6 +460,7 @@ private:
         ck(vkMapMemory(dev_, e.m, 0, sz, 0, &e.map), "vkMapMemory");
         for (auto [pp, pn] : pinned_) if (h.data >= pp && h.data + h.count <= pp + pn) e.pinned = true;
         (void)is_out; { std::memcpy(e.map, h.data, h.count * 4); ++stats_.uploads; stats_.upload_bytes += h.count * 4; }
+        stats_.resident_bytes += h.count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
         return {&res_.emplace(reinterpret_cast<std::uintptr_t>(h.data), e).first->second, 0, range};
     }
     std::uintptr_t key_ = 0;
@@ -513,8 +514,10 @@ inline bool run_op(runtime& rt, const std::string& op, const std::vector<tensor_
         pc.rows = std::uint32_t(x.shape[0]); pc.cols = std::uint32_t(x.shape[1]);
     } else if (op == "attention") {
         pc.rows = std::uint32_t(x.shape[0]); pc.cols = std::uint32_t(x.shape[1]); pc.k = std::uint32_t(x.shape[2]);
-        pc.a = std::uint32_t(in[1].shape[0]); pc.b = std::uint32_t(in[1].shape[1]); pc.c = std::uint32_t(in[2].shape[2]);
-        pc.d = (a.num("causal", 1) != 0 ? 1u : 0u) | (std::uint32_t(a.num("window", 0)) << 1);
+        auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
+        pc.a = std::uint32_t(in[1].shape[0]); pc.b = std::uint32_t(in[1].shape[1]);
+        pc.c = vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]);   // quantised V: physical last dim is packed
+        pc.d = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 3) | (std::uint32_t(a.num("window", 0)) << 5);
         pc.alpha = float(a.num("scale", 1.0 / std::sqrt(double(pc.k)))); inv = pc.rows * pc.cols;
     }
     std::vector<hbuf> b; for (auto& v : in) b.push_back({v.data, v.size()}); b.push_back({out.data, out.size()});
