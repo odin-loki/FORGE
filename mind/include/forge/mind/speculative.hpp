@@ -92,4 +92,64 @@ inline std::vector<int> speculative_generate(session& target, session& draft, st
     return out;
 }
 
+// Prompt-lookup ("n-gram") speculation: no draft model. The draft is the continuation of the most recent
+// earlier occurrence of the last `ngram` tokens in the history (prompt + output). The draft distribution is
+// one-hot, so acceptance is u < p(d) and the residual is p with d removed: output stays exactly target-distributed.
+inline std::vector<int> lookup_draft(std::span<const int> hist, int ngram, int k) {
+    std::vector<int> d;
+    for (int n = ngram; n >= 1 && d.empty(); --n) {
+        if (hist.size() <= std::size_t(n)) continue;
+        auto tail = hist.subspan(hist.size() - std::size_t(n));
+        for (std::size_t s = hist.size() - std::size_t(n); s-- > 0;) {
+            if (!std::equal(tail.begin(), tail.end(), hist.begin() + std::ptrdiff_t(s))) continue;
+            for (std::size_t j = s + std::size_t(n); j < hist.size() && d.size() < std::size_t(k); ++j) d.push_back(hist[j]);
+            break;
+        }
+    }
+    return d;
+}
+inline std::vector<int> lookup_generate(session& target, std::span<const int> prompt, int max_new, sampler& s, int k = 4, int ngram = 3,
+                                        const std::function<bool(int)>& on_token = {}, speculative_stats* stats = nullptr) {
+    target.check_generative();
+    if (prompt.empty()) raise(errc::invalid_argument, "lookup_generate: empty prompt");
+    auto t0 = std::chrono::steady_clock::now();
+    speculative_stats st; target.reset();
+    std::vector<int> hist(prompt.begin(), prompt.end()), out;
+    if (prompt.size() > 1) target.forward(prompt.subspan(0, prompt.size() - 1));
+    int cur = prompt.back();
+    int eos = target.tokenizer() ? target.tokenizer()->eos() : -1;
+    std::size_t V = std::size_t(target.vocab());
+    bool done = false;
+    auto emit = [&](int t) { out.push_back(t); hist.push_back(t); if ((on_token && !on_token(t)) || t == eos || int(out.size()) >= max_new) done = true; };
+    while (!done) {
+        i64 P = target.position();
+        int room = int(std::min<i64>(k, std::min<i64>(max_new - i64(out.size()), target.context() - P - 1)));
+        auto d = room > 0 ? lookup_draft(hist, ngram, room) : std::vector<int>{};
+        if (d.empty()) {
+            if (P + 1 > target.context()) break;
+            auto l = target.forward(std::span<const int>(&cur, 1));
+            int t = s.sample(l, hist); emit(t); cur = t; continue;
+        }
+        std::vector<int> batch{cur}; batch.insert(batch.end(), d.begin(), d.end());
+        auto L = target.forward_all(batch);
+        ++st.rounds; st.drafted += d.size();
+        int acc = 0, next = -1; std::vector<int> th = hist;
+        for (std::size_t i = 0; i < d.size() && !done; ++i) {
+            auto p = s.probs(std::span<const float>(L.data() + i * V, V), th);
+            double pi = p[std::size_t(d[i])];
+            if (pi >= 1.0 || s.uniform() < pi) { ++acc; th.push_back(d[i]); emit(d[i]); continue; }
+            p[std::size_t(d[i])] = 0; next = s.draw(p); break;
+        }
+        st.accepted += std::size_t(acc);
+        if (done) { target.rewind(P + 1 + acc); break; }
+        if (next < 0) next = s.draw(s.probs(std::span<const float>(L.data() + d.size() * V, V), th));
+        else target.rewind(P + 1 + acc);
+        emit(next); cur = next;
+    }
+    st.new_tokens = out.size();
+    st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (stats) *stats = st;
+    return out;
+}
+
 } // namespace forge::mind

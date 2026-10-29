@@ -37,6 +37,8 @@ try:
                                      "response_format": {"type": "json_schema", "json_schema": {"schema": {"enum": ["yes", "no", 7]}}}})
     assert json.loads(r["choices"][0]["message"]["content"]) in ("yes", "no", 7), r
     full = post("/v1/completions", {"prompt": "the", "max_tokens": 10})["choices"][0]["text"]
+    pen = post("/v1/completions", {"prompt": "the", "max_tokens": 10, "presence_penalty": 50.0, "frequency_penalty": 5.0})["choices"][0]["tokens"]
+    assert len(pen) == 10 and len(set(pen)) == len(pen), pen   # huge penalties forbid any repeat in greedy decoding
     if len(full) > 3:
         cut = full[2:4]
         s = post("/v1/completions", {"prompt": "the", "max_tokens": 10, "stop": [cut]})["choices"][0]

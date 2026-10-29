@@ -7,6 +7,7 @@
 #include <numeric>
 #include <random>
 #include <span>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -21,6 +22,8 @@ struct sampler_config {
     float mirostat_tau = 0.f;  // Mirostat v2 target surprise in bits; 0 = off
     float mirostat_eta = 0.1f;
     float repetition_penalty = 1.f;
+    float presence_penalty = 0.f;   // OpenAI-style: subtract once if the token appeared in the window
+    float frequency_penalty = 0.f;  // OpenAI-style: subtract per occurrence in the window
     int repetition_window = 64;
     std::uint64_t seed = 0;
 };
@@ -73,6 +76,12 @@ private:
             std::size_t from = history.size() > std::size_t(c_.repetition_window) ? history.size() - std::size_t(c_.repetition_window) : 0;
             for (std::size_t i = from; i < history.size(); ++i) seen.insert(history[i]);
             for (int t : seen) if (t >= 0 && std::size_t(t) < l.size()) l[std::size_t(t)] = l[std::size_t(t)] > 0 ? l[std::size_t(t)] / c_.repetition_penalty : l[std::size_t(t)] * c_.repetition_penalty;
+        }
+        if (c_.presence_penalty != 0.f || c_.frequency_penalty != 0.f) {
+            std::unordered_map<int, int> cnt;
+            std::size_t from = history.size() > std::size_t(c_.repetition_window) ? history.size() - std::size_t(c_.repetition_window) : 0;
+            for (std::size_t i = from; i < history.size(); ++i) ++cnt[history[i]];
+            for (auto [t, n] : cnt) if (t >= 0 && std::size_t(t) < l.size()) l[std::size_t(t)] -= c_.presence_penalty + c_.frequency_penalty * float(n);
         }
         if (filter) filter(l);
         return l;

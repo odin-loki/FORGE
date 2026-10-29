@@ -87,6 +87,39 @@ TEST(speculative_sampling_preserves_distribution) {
     CHECK(tv / 2 < 0.08);
 }
 
+TEST(lookup_speculation_exact) {
+    auto tm = model::open(model_a());
+    std::vector<int> p = {256, 72, 101, 108, 108, 111, 32, 72, 101, 108, 108, 111, 32, 72, 101};
+    session ref(tm); auto want = greedy(ref, p, 40);
+    for (int k : {1, 4, 8}) {
+        session t(tm); sampler g; speculative_stats st;
+        auto got = lookup_generate(t, p, 40, g, k, 3, {}, &st);
+        CHECK_MSG(got == want, "lookup k=%d", k);
+        CHECK(st.drafted > 0);
+        if (k == 4) std::printf("  lookup k=4 rounds=%zu drafted=%zu acceptance=%.2f\n", st.rounds, st.drafted, st.acceptance());
+    }
+    CHECK((lookup_draft(std::vector<int>{1, 2, 3, 9, 1, 2, 3}, 3, 4) == std::vector<int>{9, 1, 2, 3}));
+    CHECK(lookup_draft(std::vector<int>{1, 2, 3}, 2, 4).empty());
+    // Sampling: the first token's distribution must equal the target's even though a draft is always proposed.
+    std::vector<int> q = {256, 65, 66, 256, 65, 66};
+    sampler_config sc{.temperature = 1.0f, .seed = 8};
+    session r2(tm); sampler probe(sc); auto pw = probe.probs(r2.forward(q), q);
+    std::vector<double> cnt(pw.size(), 0); const int N = 3000; sampler s(sc); session t(tm);
+    for (int i = 0; i < N; ++i) { auto o = lookup_generate(t, q, 1, s, 3, 3); cnt[std::size_t(o[0])] += 1; }
+    double tv = 0; for (std::size_t i = 0; i < pw.size(); ++i) tv += std::abs(cnt[i] / N - pw[i]);
+    CHECK_MSG(tv / 2 < 0.08, "lookup tv %.3f", tv / 2);
+}
+TEST(presence_frequency_penalties) {
+    std::vector<float> l = {1.f, 1.f, 1.f, 0.5f};
+    std::vector<int> h = {0, 0, 0, 1};
+    sampler sp({.presence_penalty = 0.5f});
+    auto pp = sp.probs(l, h);   // greedy: argmax after penalty -> token 2
+    CHECK(pp[2] == 1.0);
+    sampler sf({.temperature = 1.f, .frequency_penalty = 0.25f});
+    auto pf = sf.probs(l, h);
+    CHECK(std::fabs(std::log(pf[2] / pf[0]) - 0.75) < 1e-6 && std::fabs(std::log(pf[2] / pf[1]) - 0.25) < 1e-6);
+}
+
 TEST(grammar_parse_and_match) {
     grammar g(R"(
         root ::= "{" ws pair ("," ws pair)* "}"   # comment

@@ -6,7 +6,7 @@
 //   GET  /v1/models              -> model list
 //   POST /v1/completions         {"prompt": str | [ids], "max_tokens", "temperature", "top_p", "top_k", "min_p",
 //                                 "repetition_penalty", "seed", "stop": [str], "grammar": GBNF, "stream": bool,
-//                                 "typical_p", "mirostat_tau", "mirostat_eta", "response_format": {json_schema}}
+//                                 "typical_p", "mirostat_tau", "mirostat_eta", "presence_penalty", "frequency_penalty", "response_format": {json_schema}}
 //   POST /v1/chat/completions    {"messages": [{"role","content"}], ...same sampling fields}
 //   GET  /metrics                -> scheduler counters
 #include <forge/import/gguf.hpp>
@@ -171,6 +171,8 @@ private:
         q.sampling.typical_p = float(j.num_or("typical_p", 1));
         q.sampling.mirostat_tau = float(j.num_or("mirostat_tau", 0));
         q.sampling.mirostat_eta = float(j.num_or("mirostat_eta", 0.1));
+        q.sampling.presence_penalty = float(j.num_or("presence_penalty", 0));
+        q.sampling.frequency_penalty = float(j.num_or("frequency_penalty", 0));
         q.sampling.repetition_penalty = float(j.num_or("repetition_penalty", 1));
         q.sampling.seed = std::uint64_t(j.num_or("seed", 0));
         if (auto* g = j.find("grammar"); g && g->is_str()) q.grammar = std::make_shared<mind::grammar>(g->str());
