@@ -36,6 +36,13 @@ It is a new design, not a fork or wrapper of any of those projects. Code and mod
 | `pack` | `.fpk` model container: blueprint graph, weights, tokenizer, state schema, content hashes, signatures |
 | `mind` | Generic inference engine: sessions, paged KV cache, sampling, batching, speculative decoding, LoRA |
 | `core` · `spec` · `verify` | Types, op definitions and code generators, oracle and differential tests |
+| `os` | Portable OS layer for Linux, Android, Windows, macOS, iOS, FreeBSD — [`docs/os.md`](docs/os.md) |
+| `balance` | Load balancer + L4/L7 proxy — [`docs/balance.md`](docs/balance.md) |
+| `apps` | `forge` CLI and `forge-serve` HTTP server — [`docs/serve.md`](docs/serve.md) |
+| `bindings` | Android (Kotlin/JNI, Gradle) and Apple (Swift package / XCFramework) |
+
+Build, cross-build, Android emulator and wine instructions: [`docs/STATUS.md#build`](docs/STATUS.md#build).
+CI: the workflow lives at `ci/github-actions-ci.yml`; move it to `.github/workflows/ci.yml` by hand (the push token lacks `workflow` scope).
 
 Full detail, repository layout, roadmap and first steps: [`FORGE_PLAN.md`](FORGE_PLAN.md).
 
@@ -55,7 +62,7 @@ Full detail, repository layout, roadmap and first steps: [`FORGE_PLAN.md`](FORGE
 
 ## 🚧 Honest framing
 
-- **Nothing is built yet.** This repository currently holds the plan only.
+- **Work in progress.** See [`docs/STATUS.md`](docs/STATUS.md) for what is implemented and what has actually been tested on each platform.
 - **Scope is large.** The minimum useful version (Convergence 1) is estimated at 60–90k hand-written lines; the full library at roughly 185–275k, plus tests. Breadth comes after Convergence 1, not before.
 - **Clean-room design.** No code is copied from xsimd, llama.cpp or ggml, and nothing from CUDA's headers or libraries. Any third-party code that is used will be recorded in a `NOTICE` file with its licence.
 - **Vendor libraries are optional.** cuBLAS, hipBLASLt and oneMKL may be used where present and faster, but are never required.

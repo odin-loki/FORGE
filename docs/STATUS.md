@@ -151,3 +151,32 @@ no memory clobber), reused thread_local pack buffers, and test_tile retries befo
 
 ## test_vulkan batching on SwiftShader — fixed
 Root cause was a real backend bug. SwiftShader requires a 256-byte minStorageBufferOffsetAlignment. Sub-range views of a resident buffer at misaligned offsets made `acquire` drop the parent buffer, which forced a submit and a host sync (143 submits/571 dispatches). Such views are now staged through scratch buffers with device-side copies, including write-back of outputs. `FORGE_VK_SSBO_ALIGN` emulates stricter drivers, and the `test_vulkan_align256` ctest covers this on lavapipe. Lavapipe (with and without align=256) and the Android emulator now give 63 submits/571 dispatches and test_vulkan passes. Linux dev suite: all pass.
+
+## forge::os extension (16 features) — 2026-10-30
+Code: `os/include/forge/os/*.hpp` (guide: [`docs/os.md`](os.md)); test: `tests/test_os_ext.cpp` (one TEST per feature).
+Wiring: forge-serve `--watch` hot reload, `service::ready`, P-core pinning, `--numa-node`, memory pressure → prefix KV
+eviction (`batch_scheduler::request_kv_eviction`), `FORGE_HUGEPAGES=1` on weight mappings (see [`docs/serve.md`](serve.md)).
+
+| Feature | Linux (native) | Windows (wine64) | Android x86_64 emu | FreeBSD / macOS / musl |
+|---|---|---|---|---|
+| 1 NUMA | pass (1 node) | pass (affinity-mask fallback) | not run | link only |
+| 2 Huge pages | pass (2M via THP; strict 1G ENOMEM) | pass (large pages need privilege → fallback) | not run | link only |
+| 3 Async file I/O | pass (io_uring) | pass (IOCP) | not run | link only |
+| 4 CPU topology P/E | pass (non-hybrid VM) | pass | not run | link only |
+| 5 Power/thermal | pass (no battery) | pass | not run | link only |
+| 6 Memory pressure | pass (PSI) | pass (resource notification) | not run | link only |
+| 7 Shared memory | pass | pass | not run | link only |
+| 8 GPU discovery | pass (no GPU visible) | pass (DXGI via wine) | not run | link only |
+| 9 Unix sockets / pipes | pass | pass (named pipes) | not run | link only |
+| 10 Crash + minidump | pass (.crash) | pass (.dmp) | not run | link only |
+| 11 Sandboxing | pass (seccomp net/exec/write) | exec skipped (wine ignores job limits); net/fs unsupported by design | not run | link only |
+| 12 Key storage | pass (libsecret + file) | pass (DPAPI + file) | not run | link only |
+| 13 File watching | pass (inotify) | pass (ReadDirectoryChangesW) | not run | link only |
+| 14 Timers/perf | pass (TSC fallback; perf_event_paranoid=2) | pass (cycle fallback) | not run | link only |
+| 15 Background hooks | pass (not_required) | pass (execution state) | not run | link only |
+| 16 Service integration | pass (no manager) | pass (not under SCM) | not run | link only |
+
+forge-serve `--watch` verified live on Linux (two reloads, `/health` OK after); `--numa-node 0` verified. Linux dev ctest 73/73.
+Untested: Android run (box was reset mid-run, SDK/emulator lost; Android build of test_os_ext had compiled), iOS (no SDK),
+FreeBSD/macOS execution, hybrid P/E hardware, multi-node NUMA, batteries/thermal sensors, real GPUs, running under
+systemd/SCM, Windows sandbox exec denial on real Windows, macOS kperf (root).
