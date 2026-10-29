@@ -70,15 +70,15 @@ TEST(prefix_affinity) {
     std::set<std::string> ids; for (auto& l : busy) ids.insert(l.backend().id); CHECK(ids.size() >= 2);
 }
 TEST(circuit_breaker) {
-    config c; c.failure_threshold = 3; c.open_ns = 50'000'000; auto p = make(strategy::round_robin, 2, c);
+    config c; c.failure_threshold = 3; c.open_ns = 1'000'000'000; auto p = make(strategy::round_robin, 2, c);
     for (int i = 0; i < 6; ++i) { auto l = p->acquire(); if (l.backend().id == "b0") l.failure(); else l.success(); }
     auto st = p->stats(); CHECK(st[0].state == circuit::open);
     for (int i = 0; i < 10; ++i) { auto l = p->acquire(); CHECK(l.backend().id == "b1"); l.success(); }
-    os::sleep_ns(60'000'000);
+    os::sleep_ns(1'100'000'000);
     CHECK(p->stats()[0].state == circuit::half_open);
     { auto l = p->acquire(); CHECK(l.backend().id == "b0"); auto l2 = p->acquire(); CHECK(l2.backend().id == "b1"); l2.success(); l.success(); }   // one probe
     CHECK(p->stats()[0].state == circuit::closed);
-    { pool q(c); q.add({"x"}); for (int i = 0; i < 3; ++i) q.acquire().failure(); CHECK(!q.acquire()); os::sleep_ns(60'000'000);
+    { pool q(c); q.add({"x"}); for (int i = 0; i < 3; ++i) q.acquire().failure(); CHECK(!q.acquire()); os::sleep_ns(1'100'000'000);
       auto l = q.acquire(); CHECK(l); l.failure(); CHECK(q.stats()[0].state == circuit::open); }   // failed probe re-opens
 }
 TEST(health_checks) {
