@@ -43,4 +43,24 @@ inline std::vector<std::size_t> nms(const std::vector<box>& b, const std::vector
     for (auto i : o) { if (dead[i]) continue; keep.push_back(i); for (auto j : o) if (!dead[j] && j != i && iou(b[i], b[j]) > thr) dead[j] = 1; }
     return keep;
 }
+// ROI-Align (Mask R-CNN): average of `samples`^2 bilinear samples per output bin; box in input pixel coords.
+inline image roi_align(const image& s, const box& b, std::size_t ph, std::size_t pw, int samples = 2) {
+    image o{ph, pw, s.c, std::vector<float>(ph * pw * s.c)};
+    float bh = (b.y1 - b.y0) / float(ph), bw = (b.x1 - b.x0) / float(pw);
+    auto bil = [&](float y, float x, std::size_t k) {
+        if (y < -1 || y > float(s.h) || x < -1 || x > float(s.w)) return 0.f;
+        y = std::max(0.f, y); x = std::max(0.f, x);
+        std::size_t y0 = std::min(std::size_t(y), s.h - 1), x0 = std::min(std::size_t(x), s.w - 1);
+        std::size_t y1 = std::min(y0 + 1, s.h - 1), x1 = std::min(x0 + 1, s.w - 1);
+        float ly = y0 == s.h - 1 ? 0.f : y - float(y0), lx = x0 == s.w - 1 ? 0.f : x - float(x0);
+        return (1 - ly) * ((1 - lx) * s.at(y0, x0, k) + lx * s.at(y0, x1, k)) + ly * ((1 - lx) * s.at(y1, x0, k) + lx * s.at(y1, x1, k));
+    };
+    for (std::size_t i = 0; i < ph; ++i) for (std::size_t j = 0; j < pw; ++j) for (std::size_t k = 0; k < s.c; ++k) {
+        float acc = 0;
+        for (int a = 0; a < samples; ++a) for (int c = 0; c < samples; ++c)
+            acc += bil(b.y0 + bh * (float(i) + (float(a) + .5f) / float(samples)), b.x0 + bw * (float(j) + (float(c) + .5f) / float(samples)), k);
+        o.at(i, j, k) = acc / float(samples * samples);
+    }
+    return o;
+}
 }

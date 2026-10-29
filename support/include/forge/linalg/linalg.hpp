@@ -82,4 +82,84 @@ template <class T> int cg(const csr<T>& A, const std::vector<T>& b, std::vector<
     }
     return maxit;
 }
+// Symmetric eigendecomposition by cyclic Jacobi: A = V diag(w) V^T, eigenvalues ascending.
+template <class T> void sym_eig(mat<T> A, std::vector<T>& w, mat<T>& V, int sweeps = 100) {
+    std::size_t n = A.r; V = mat<T>(n, n); for (std::size_t i = 0; i < n; ++i) V(i, i) = 1;
+    for (int s = 0; s < sweeps; ++s) {
+        T off = 0; for (std::size_t i = 0; i < n; ++i) for (std::size_t j = i + 1; j < n; ++j) off += A(i, j) * A(i, j);
+        if (off < T(1e-30)) break;
+        for (std::size_t p = 0; p < n; ++p) for (std::size_t q = p + 1; q < n; ++q) {
+            if (std::fabs(A(p, q)) < T(1e-300)) continue;
+            T th = (A(q, q) - A(p, p)) / (2 * A(p, q));
+            T t = (th >= 0 ? T(1) : T(-1)) / (std::fabs(th) + std::sqrt(th * th + 1)), c = 1 / std::sqrt(t * t + 1), sn = t * c;
+            for (std::size_t k = 0; k < n; ++k) { T akp = A(k, p), akq = A(k, q); A(k, p) = c * akp - sn * akq; A(k, q) = sn * akp + c * akq; }
+            for (std::size_t k = 0; k < n; ++k) { T apk = A(p, k), aqk = A(q, k); A(p, k) = c * apk - sn * aqk; A(q, k) = sn * apk + c * aqk; }
+            for (std::size_t k = 0; k < n; ++k) { T vkp = V(k, p), vkq = V(k, q); V(k, p) = c * vkp - sn * vkq; V(k, q) = sn * vkp + c * vkq; }
+        }
+    }
+    std::vector<std::size_t> o(n); for (std::size_t i = 0; i < n; ++i) o[i] = i;
+    for (std::size_t i = 0; i < n; ++i) for (std::size_t j = i + 1; j < n; ++j) if (A(o[j], o[j]) < A(o[i], o[i])) std::swap(o[i], o[j]);
+    mat<T> V2(n, n); w.assign(n, 0);
+    for (std::size_t j = 0; j < n; ++j) { w[j] = A(o[j], o[j]); for (std::size_t i = 0; i < n; ++i) V2(i, j) = V(i, o[j]); }
+    V = V2;
+}
+// Thin SVD by one-sided Jacobi (m >= n): A = U diag(s) V^T, singular values descending.
+template <class T> void svd(const mat<T>& A, mat<T>& U, std::vector<T>& s, mat<T>& V, int sweeps = 100) {
+    std::size_t m = A.r, n = A.c; if (m < n) throw std::invalid_argument("svd: needs rows >= cols");
+    U = A; V = mat<T>(n, n); for (std::size_t i = 0; i < n; ++i) V(i, i) = 1;
+    for (int sw = 0; sw < sweeps; ++sw) {
+        bool rot = false;
+        for (std::size_t p = 0; p < n; ++p) for (std::size_t q = p + 1; q < n; ++q) {
+            T a = 0, b = 0, g = 0;
+            for (std::size_t i = 0; i < m; ++i) { a += U(i, p) * U(i, p); b += U(i, q) * U(i, q); g += U(i, p) * U(i, q); }
+            if (std::fabs(g) <= T(1e-15) * std::sqrt(a * b) || g == 0) continue;
+            rot = true;
+            T z = (b - a) / (2 * g), t = (z >= 0 ? T(1) : T(-1)) / (std::fabs(z) + std::sqrt(1 + z * z)), c = 1 / std::sqrt(1 + t * t), sn = c * t;
+            for (std::size_t i = 0; i < m; ++i) { T up = U(i, p), uq = U(i, q); U(i, p) = c * up - sn * uq; U(i, q) = sn * up + c * uq; }
+            for (std::size_t i = 0; i < n; ++i) { T vp = V(i, p), vq = V(i, q); V(i, p) = c * vp - sn * vq; V(i, q) = sn * vp + c * vq; }
+        }
+        if (!rot) break;
+    }
+    s.assign(n, 0);
+    for (std::size_t j = 0; j < n; ++j) { T nn = 0; for (std::size_t i = 0; i < m; ++i) nn += U(i, j) * U(i, j); s[j] = std::sqrt(nn);
+        if (s[j] > 0) for (std::size_t i = 0; i < m; ++i) U(i, j) /= s[j]; }
+    std::vector<std::size_t> o(n); for (std::size_t i = 0; i < n; ++i) o[i] = i;
+    for (std::size_t i = 0; i < n; ++i) for (std::size_t j = i + 1; j < n; ++j) if (s[o[j]] > s[o[i]]) std::swap(o[i], o[j]);
+    mat<T> U2(m, n), V2(n, n); std::vector<T> s2(n);
+    for (std::size_t j = 0; j < n; ++j) { s2[j] = s[o[j]]; for (std::size_t i = 0; i < m; ++i) U2(i, j) = U(i, o[j]); for (std::size_t i = 0; i < n; ++i) V2(i, j) = V(i, o[j]); }
+    U = U2; V = V2; s = s2;
+}
+// Restarted GMRES(k) for general (non-symmetric) CSR systems. Returns iterations used, -1 if not converged.
+template <class T> int gmres(const csr<T>& A, const std::vector<T>& b, std::vector<T>& x, int restart = 30, T tol = T(1e-10), int maxit = 1000) {
+    std::size_t n = b.size(); if (x.size() != n) x.assign(n, 0);
+    auto nrm = [](const std::vector<T>& v) { T s = 0; for (T e : v) s += e * e; return std::sqrt(s); };
+    T bn = nrm(b); if (bn == 0) bn = 1;
+    int it = 0;
+    while (it < maxit) {
+        std::vector<T> r(n); spmv(A, x.data(), r.data()); for (std::size_t i = 0; i < n; ++i) r[i] = b[i] - r[i];
+        T beta = nrm(r); if (beta / bn < tol) return it;
+        std::size_t k = std::size_t(restart);
+        std::vector<std::vector<T>> Vb(k + 1, std::vector<T>(n)); mat<T> H(k + 1, k);
+        std::vector<T> cs(k), sn(k), g(k + 1); g[0] = beta;
+        for (std::size_t i = 0; i < n; ++i) Vb[0][i] = r[i] / beta;
+        std::size_t j = 0;
+        for (; j < k && it < maxit; ++j, ++it) {
+            spmv(A, Vb[j].data(), Vb[j + 1].data());
+            for (std::size_t i = 0; i <= j; ++i) { T h = 0; for (std::size_t q = 0; q < n; ++q) h += Vb[j + 1][q] * Vb[i][q]; H(i, j) = h;
+                for (std::size_t q = 0; q < n; ++q) Vb[j + 1][q] -= h * Vb[i][q]; }
+            H(j + 1, j) = nrm(Vb[j + 1]);
+            if (H(j + 1, j) > 0) for (auto& e : Vb[j + 1]) e /= H(j + 1, j);
+            for (std::size_t i = 0; i < j; ++i) { T t = cs[i] * H(i, j) + sn[i] * H(i + 1, j); H(i + 1, j) = -sn[i] * H(i, j) + cs[i] * H(i + 1, j); H(i, j) = t; }
+            T d = std::sqrt(H(j, j) * H(j, j) + H(j + 1, j) * H(j + 1, j)); cs[j] = H(j, j) / d; sn[j] = H(j + 1, j) / d;
+            H(j, j) = d; H(j + 1, j) = 0; g[j + 1] = -sn[j] * g[j]; g[j] = cs[j] * g[j];
+            if (std::fabs(g[j + 1]) / bn < tol) { ++j; ++it; break; }
+        }
+        std::vector<T> y(j);
+        for (std::size_t i = j; i-- > 0;) { T sum = g[i]; for (std::size_t q = i + 1; q < j; ++q) sum -= H(i, q) * y[q]; y[i] = sum / H(i, i); }
+        for (std::size_t i = 0; i < j; ++i) for (std::size_t q = 0; q < n; ++q) x[q] += y[i] * Vb[i][q];
+        std::vector<T> r2(n); spmv(A, x.data(), r2.data()); for (std::size_t i = 0; i < n; ++i) r2[i] = b[i] - r2[i];
+        if (nrm(r2) / bn < tol) return it;
+    }
+    return -1;
+}
 }
