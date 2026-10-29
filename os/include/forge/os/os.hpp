@@ -1344,4 +1344,97 @@ public:
     void clear() { for (auto* r : regs_) delete r; regs_.clear(); }
 };
 
+// ---------------------------------------------------------------- completion queue
+// Completion-based async I/O: IOCP on Windows. Elsewhere the same API is backed by a worker thread doing
+// blocking pread/pwrite, so callers are portable (readiness polling stays in poller above).
+struct completion { std::uint64_t key = 0; std::size_t bytes = 0; int error = 0; void* user = nullptr; };
+class completion_port {
+public:
+    completion_port() {
+#if defined(FORGE_OS_WINDOWS)
+        h_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+#endif
+    }
+    ~completion_port() {
+#if defined(FORGE_OS_WINDOWS)
+        if (h_) CloseHandle(h_);
+#endif
+    }
+    completion_port(const completion_port&) = delete; completion_port& operator=(const completion_port&) = delete;
+    const char* backend() const {
+#if defined(FORGE_OS_WINDOWS)
+        return "iocp";
+#else
+        return "emulated";
+#endif
+    }
+    // Wake a waiter with a user completion.
+    bool post(std::uint64_t key, void* user = nullptr, std::size_t bytes = 0) {
+#if defined(FORGE_OS_WINDOWS)
+        return PostQueuedCompletionStatus(h_, DWORD(bytes), ULONG_PTR(key), static_cast<LPOVERLAPPED>(user)) != 0;
+#else
+        lock_guard g(m_); q_.push_back({key, bytes, 0, user}); c_.notify_one(); return true;
+#endif
+    }
+    // Asynchronous positional read into buf; completes with `key`.
+    bool read_async(file& f, void* buf, std::size_t n, std::uint64_t off, std::uint64_t key) {
+#if defined(FORGE_OS_WINDOWS)
+        if (!associate_(f.native())) return false;
+        auto* op = new op_t{}; op->ov.Offset = DWORD(off); op->ov.OffsetHigh = DWORD(off >> 32); op->key = key;
+        if (!ReadFile(f.native(), buf, DWORD(n), nullptr, &op->ov) && GetLastError() != ERROR_IO_PENDING) {
+            int e = int(GetLastError()); delete op; return post_error_(key, e);
+        }
+        return true;
+#else
+        auto r = f.pread(buf, n, off);
+        lock_guard g(m_); q_.push_back({key, r.value, r.err.code, nullptr}); c_.notify_one(); return true;
+#endif
+    }
+    bool write_async(file& f, const void* buf, std::size_t n, std::uint64_t off, std::uint64_t key) {
+#if defined(FORGE_OS_WINDOWS)
+        if (!associate_(f.native())) return false;
+        auto* op = new op_t{}; op->ov.Offset = DWORD(off); op->ov.OffsetHigh = DWORD(off >> 32); op->key = key;
+        if (!WriteFile(f.native(), buf, DWORD(n), nullptr, &op->ov) && GetLastError() != ERROR_IO_PENDING) {
+            int e = int(GetLastError()); delete op; return post_error_(key, e);
+        }
+        return true;
+#else
+        auto r = f.pwrite(buf, n, off);
+        lock_guard g(m_); q_.push_back({key, r.value, r.err.code, nullptr}); c_.notify_one(); return true;
+#endif
+    }
+    // Wait up to timeout_ms (-1 forever) for one completion.
+    bool wait(completion& out, int timeout_ms) {
+#if defined(FORGE_OS_WINDOWS)
+        DWORD n = 0; ULONG_PTR k = 0; LPOVERLAPPED ov = nullptr;
+        BOOL ok = GetQueuedCompletionStatus(h_, &n, &k, &ov, timeout_ms < 0 ? INFINITE : DWORD(timeout_ms));
+        if (!ov && !ok) return false;   // timeout
+        if (ov && k == io_key) { auto* op = reinterpret_cast<op_t*>(ov); out = {op->key, n, ok ? 0 : int(GetLastError()), nullptr}; delete op; return true; }
+        out = {std::uint64_t(k), n, ok ? 0 : int(GetLastError()), ov}; return true;
+#else
+        lock_guard g(m_);
+        std::uint64_t end = monotonic_ns() + std::uint64_t(timeout_ms < 0 ? 0 : timeout_ms) * 1000000ull;
+        while (q_.empty()) {
+            if (timeout_ms < 0) c_.wait(m_);
+            else { auto now = monotonic_ns(); if (now >= end) return false; c_.wait_for(m_, end - now); }
+        }
+        out = q_.front(); q_.erase(q_.begin()); return true;
+#endif
+    }
+private:
+#if defined(FORGE_OS_WINDOWS)
+    static constexpr ULONG_PTR io_key = ~ULONG_PTR(0);
+    struct op_t { OVERLAPPED ov{}; std::uint64_t key = 0; };
+    bool associate_(HANDLE f) {
+        for (auto a : assoc_) if (a == f) return true;
+        if (!CreateIoCompletionPort(f, h_, io_key, 0)) return false;
+        assoc_.push_back(f); return true;
+    }
+    bool post_error_(std::uint64_t key, int e) { (void)e; return post(key, nullptr, 0) && false; }
+    HANDLE h_ = nullptr; std::vector<HANDLE> assoc_;
+#else
+    mutex m_; condvar c_; std::vector<completion> q_;
+#endif
+};
+
 } // namespace forge::os

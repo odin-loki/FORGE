@@ -125,3 +125,15 @@ TEST(sockets_and_poller) {
     c->close(); CHECK(s->wait_readable(2000)); CHECK(s->recv(b, 4) == 0);
     CHECK(!os::socket::connect("127.0.0.1", 1, 300));
 }
+TEST(completion_port) {
+    os::completion_port cp; std::printf("  completion backend: %s\n", cp.backend());
+    auto d = scratch(); auto p = os::join(d, "c.bin"); CHECK(os::write_file(p, "0123456789"));
+    // Windows IOCP needs FILE_FLAG_OVERLAPPED handles for true async; positional synchronous handles still complete.
+    auto f = os::file::open(p, os::rdwr); CHECK(f);
+    char b[4] = {}; CHECK(cp.read_async(*f, b, 4, 3, 42));
+    os::completion c; CHECK(cp.wait(c, 2000)); CHECK(c.key == 42 && c.bytes == 4 && c.error == 0); CHECK(std::memcmp(b, "3456", 4) == 0);
+    CHECK(cp.write_async(*f, "XY", 2, 0, 7)); CHECK(cp.wait(c, 2000)); CHECK(c.key == 7 && c.bytes == 2);
+    CHECK(cp.post(99)); CHECK(cp.wait(c, 2000)); CHECK(c.key == 99);
+    CHECK(!cp.wait(c, 20));
+    f->close(); CHECK(os::read_file(p).value == "XY23456789"); os::remove_all(d);
+}
