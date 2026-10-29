@@ -19,6 +19,7 @@ struct request {
     sampler_config sampling;
     std::shared_ptr<const grammar> grammar;    // optional constraint
     std::vector<int> stop_tokens;              // in addition to EOS
+    int priority = 0;                          // higher is admitted first; FIFO within a priority
     std::function<bool(int)> on_token;         // streaming; return false to cancel
     std::function<void(const std::vector<int>&, const std::string& finish_reason)> on_done;
 };
@@ -35,9 +36,18 @@ public:
     std::uint64_t submit(request r) {
         std::lock_guard lk(mu_);
         auto id = ++next_id_;
-        waiting_.push_back({id, std::move(r)});
+        auto pos = std::find_if(waiting_.begin(), waiting_.end(), [&](const pending& w) { return w.r.priority < r.priority; });
+        waiting_.insert(pos, {id, std::move(r)});
         cv_.notify_all();
         return id;
+    }
+    // Cancel a waiting or active request; its on_done gets finish_reason "cancelled". False if unknown/finished.
+    bool cancel(std::uint64_t id) {
+        std::lock_guard lk(mu_);
+        for (auto it = waiting_.begin(); it != waiting_.end(); ++it)
+            if (it->id == id) { auto r = std::move(it->r); waiting_.erase(it); ++stats_.completed; if (r.on_done) r.on_done({}, "cancelled"); return true; }
+        for (auto& a : active_) if (a->id == id && !a->cancelled) { a->cancelled = true; return true; }
+        return false;
     }
     bool idle() { std::lock_guard lk(mu_); return waiting_.empty() && active_.empty(); }
     const batch_stats& stats() const { return stats_; }
@@ -56,7 +66,9 @@ public:
         std::size_t kv = 0;
         for (auto it = active_.begin(); it != active_.end();) {
             auto& a = **it;
-            bool fin = advance(a);
+            bool fin;
+            { std::lock_guard lk(mu_); fin = a.cancelled; }
+            if (fin) finish(a, "cancelled"); else fin = advance(a);
             kv += a.s->state().bytes();
             if (fin) { retire(std::move(*it)); it = active_.erase(it); }
             else ++it;
@@ -97,6 +109,7 @@ private:
         std::vector<int> hist, out;
         std::size_t fed = 0;           // prompt tokens already in the KV state
         std::vector<float> logits;
+        bool cancelled = false;
     };
     std::unique_ptr<active> admit(std::uint64_t id, request r) {
         auto a = std::make_unique<active>();

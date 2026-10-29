@@ -176,6 +176,25 @@ TEST(batch_scheduler_matches_sequential) {
     CHECK(st.prefix_hits >= 1);
 }
 
+TEST(batch_scheduler_priority_and_cancel) {
+    auto m = model::open(model_a());
+    batch_scheduler b(m, {.max_active = 1, .prefix_cache = 0});
+    std::vector<std::string> order;
+    auto done = [&](std::string tag) { return [&order, tag](const std::vector<int>&, const std::string& w) { order.push_back(tag + ":" + w); }; };
+    b.submit({.prompt = {256, 1}, .max_new = 3, .on_done = done("A")});
+    b.submit({.prompt = {256, 2}, .max_new = 3, .on_done = done("B")});
+    b.submit({.prompt = {256, 3}, .max_new = 3, .priority = 5, .on_done = done("C")});
+    auto d = b.submit({.prompt = {256, 4}, .max_new = 3, .priority = 5, .on_done = done("D")});
+    CHECK(b.cancel(d)); CHECK(!b.cancel(d)); CHECK(!b.cancel(999));
+    b.run_until_idle();
+    CHECK((order == std::vector<std::string>{"D:cancelled", "C:length", "A:length", "B:length"}));
+    std::vector<int> partial; std::string why;
+    auto e = b.submit({.prompt = {256, 5}, .max_new = 50, .on_done = [&](const std::vector<int>& o, const std::string& w) { partial = o; why = w; }});
+    for (int i = 0; i < 4; ++i) b.step();
+    CHECK(b.cancel(e)); b.run_until_idle();
+    CHECK(why == "cancelled" && partial.size() == 4);
+}
+
 TEST(batch_scheduler_threaded) {
     auto m = model::open(model_a());
     batch_scheduler b(m, {.max_active = 4});
