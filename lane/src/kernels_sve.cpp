@@ -6,5 +6,5 @@
 #endif
 static_assert(forge::lane::vec<float, forge::lane::neoverse2>::K == 4 && forge::lane::vec<float, forge::lane::neoverse2>::N == 8);
 FORGE_LANE_EXPORT_TABLE(mv_sve, neoverse2, "sve")
-namespace forge::lane::mv_sve { int vector_bytes() { return int(svcntb()); } }  // only called when HWCAP_SVE is set
+namespace forge::lane::mv_sve { int vector_bytes() { long v; __asm__ volatile("rdvl %0, #1" : "=r"(v)); return int(v); } }  // svcntb() folds to 32 under -msve-vector-bits; only called when HWCAP_SVE is set
 #endif
