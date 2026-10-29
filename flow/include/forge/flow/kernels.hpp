@@ -1,4 +1,6 @@
 #pragma once
+#include <functional>
+#include <memory>
 // Lowerings: implementations of spec ops for a device. Only lowerings that pass the oracle are eligible.
 #include <forge/core/log.hpp>
 #include <forge/flow/ir.hpp>
@@ -21,6 +23,15 @@ struct lowering {
     supports_fn supports;
     kernel_fn fn;
     int verified = -1;     // -1 unknown, 0 failed oracle, 1 passed
+    bool on_device = false; // reads/writes device-resident buffers during an executor run (see device_hooks)
+};
+
+// A device backend's residency protocol, driven by the executor: buffers may live on the device for the
+// duration of run(); the executor asks for host copies before CPU work and reports host writes after it.
+struct device_hooks {
+    std::function<void()> begin_run, end_run;
+    std::function<void(const float*, std::size_t)> pin, to_host, host_wrote, release;
+    std::function<void(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off)> copy;  // device-side
 };
 
 inline kernel_fn reference_kernel(spec::op o) {
@@ -50,6 +61,7 @@ public:
         return best ? *best : ref_[std::size_t(o)];
     }
     std::vector<lowering>& lowerings(spec::op o) { return by_op_[std::size_t(o)]; }
+    std::shared_ptr<device_hooks> hooks;  // set by device backends that keep data resident
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);
         if (l.verified >= 0) return l.verified == 1;

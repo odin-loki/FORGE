@@ -36,6 +36,9 @@ public:
     ~runtime() {
         if (dev_) {
             vkDeviceWaitIdle(dev_);
+            if (cb_) vkFreeCommandBuffers(dev_, pool_, 1, &cb_);
+            for (auto dp : pending_pools_) vkDestroyDescriptorPool(dev_, dp, nullptr);
+            for (auto& [k, e] : res_) free_entry(e);
             for (auto& [n, p] : pipes_) { vkDestroyPipeline(dev_, p.pipe, nullptr); vkDestroyPipelineLayout(dev_, p.layout, nullptr);
                                           vkDestroyDescriptorSetLayout(dev_, p.dsl, nullptr); vkDestroyShaderModule(dev_, p.mod, nullptr); }
             if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
@@ -100,6 +103,143 @@ public:
         for (auto& x : d) { vkDestroyBuffer(dev_, x.b, nullptr); vkFreeMemory(dev_, x.m, nullptr); }
     }
 
+    // ---- Resident mode -------------------------------------------------------------------------------
+    // Between begin_run() and end_run() (one executor run), run_resident() keeps every buffer it touches on
+    // the device. Buffers are keyed by host address. Outputs stay on the device (the host copy is stale) and
+    // dispatches are recorded into one command buffer, which is only submitted when the host needs data
+    // (to_host / host_wrote / end_run). Pinned ranges (weights) survive end_run. Everything else is flushed
+    // back to the host and dropped, so memory reused between runs can never alias a stale device copy.
+    void begin_run() { std::lock_guard lk(mu_); in_run_ = true; }
+    void end_run() {
+        std::lock_guard lk(mu_);
+        submit_locked();
+        for (auto it = res_.begin(); it != res_.end();) {
+            auto& e = it->second;
+            if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); e.host_valid = true; ++stats_.downloads; }
+            if (e.pinned) { ++it; continue; }
+            free_entry(e); it = res_.erase(it);
+        }
+        in_run_ = false;
+    }
+    bool resident() { std::lock_guard lk(mu_); return in_run_; }
+    void pin(const float* p, std::size_t n) { std::lock_guard lk(mu_); pinned_.push_back({p, n}); }
+    // The host is about to read [p, p+n): bring any device-only data back.
+    void to_host(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_);
+        if (!overlaps_any(p, n)) return;
+        submit_locked();
+        for_overlapping(p, n, [&](entry& e) { if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); e.host_valid = true; ++stats_.downloads; } });
+    }
+    // The host has written [p, p+n) (after a to_host of the same range): patch the overlapping device copies.
+    void host_wrote(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_);
+        if (!overlaps_any(p, n)) return;
+        submit_locked();
+        auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
+        for_overlapping(p, n, [&](entry& e) {
+            auto el = reinterpret_cast<std::uintptr_t>(e.host), eh = el + e.count * 4;
+            auto a = std::max(lo, el), b = std::min(hi, eh);
+            std::memcpy(static_cast<char*>(e.map) + (a - el), reinterpret_cast<const void*>(a), b - a);
+            stats_.upload_bytes += b - a;
+        });
+    }
+    // [p, p+n) is about to be freed by the host: sync it back and drop every overlapping device copy, so a
+    // later allocation at the same address can never pick up this buffer's device data.
+    void release(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_);
+        if (!overlaps_any(p, n)) return;
+        submit_locked();
+        std::vector<std::uintptr_t> ks;
+        for_overlapping(p, n, [&](entry& e) {
+            if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); ++stats_.downloads; }
+            ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
+        for (auto k : ks) { free_entry(res_[k]); res_.erase(k); }
+    }
+    struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0; };
+    residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
+
+    // Record kernel `name` over resident buffers (bound 0..N-1; the last is the output).
+    void run_resident(const std::string& name, const std::vector<hbuf>& bufs, const push& pc, std::uint32_t invocations) {
+        {   // an output that partially overlaps an input can't share one resident buffer: run it via the host
+            auto& o = bufs.back(); bool clash = false;
+            for (std::size_t i = 0; i + 1 < bufs.size(); ++i) {
+                auto& b = bufs[i];
+                bool ov = b.data < o.data + o.count && o.data < b.data + b.count;
+                if (ov && !(b.data == o.data && b.count == o.count)) clash = true;
+            }
+            if (clash) {
+                for (auto& b : bufs) to_host(b.data, b.count);
+                run(name, bufs, pc, invocations);
+                host_wrote(o.data, o.count);
+                return;
+            }
+        }
+        std::unique_lock lk(mu_);
+        std::vector<bound> es;
+        for (std::size_t i = 0; i < bufs.size(); ++i) es.push_back(acquire(bufs[i], i + 1 == bufs.size()));
+        // a later acquisition may have dropped an earlier binding (partially overlapping views): re-check
+        bool stable = true;
+        for (std::size_t i = 0; i < bufs.size(); ++i) { auto b = acquire(bufs[i], i + 1 == bufs.size()); if (b.e != es[i].e || b.off != es[i].off) stable = false; }
+        if (!stable) {
+            lk.unlock();
+            for (auto& b : bufs) release(b.data, b.count);
+            run(name, bufs, pc, invocations);
+            return;
+        }
+        ++dispatches_[name];
+        auto& p = pipeline(name, std::uint32_t(bufs.size()));
+        es.back().e->host_valid = false;
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, std::uint32_t(bufs.size())};
+        VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets = 1; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+        VkDescriptorPool dp; ck(vkCreateDescriptorPool(dev_, &pi, nullptr, &dp), "vkCreateDescriptorPool");
+        pending_pools_.push_back(dp);
+        VkDescriptorSetAllocateInfo sa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; sa.descriptorPool = dp; sa.descriptorSetCount = 1; sa.pSetLayouts = &p.dsl;
+        VkDescriptorSet ds; ck(vkAllocateDescriptorSets(dev_, &sa, &ds), "vkAllocateDescriptorSets");
+        std::vector<VkDescriptorBufferInfo> dbi(es.size()); std::vector<VkWriteDescriptorSet> w;
+        for (std::size_t i = 0; i < es.size(); ++i) {
+            dbi[i] = {es[i].e->b, es[i].off, es[i].range};
+            VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; x.dstSet = ds; x.dstBinding = std::uint32_t(i); x.descriptorCount = 1;
+            x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; x.pBufferInfo = &dbi[i]; w.push_back(x);
+        }
+        vkUpdateDescriptorSets(dev_, std::uint32_t(w.size()), w.data(), 0, nullptr);
+        open_cb();
+        vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+        vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &ds, 0, nullptr);
+        vkCmdPushConstants(cb_, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &pc);
+        vkCmdDispatch(cb_, (invocations + 63) / 64, 1, 1);
+        ++recorded_;
+    }
+    // Device-side copy of n floats from src into dst_base[off..] (dst_base spans dst_count floats, e.g. a
+    // state slot). Both stay resident; nothing touches the host.
+    void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
+        std::lock_guard lk(mu_);
+        if (!n) return;
+        auto d = acquire({dst_base, dst_count}, false);
+        auto sb = acquire({src, n}, false);
+        d = acquire({dst_base, dst_count}, false);   // src acquisition can't drop dst (disjoint), re-find anyway
+        open_cb();
+        VkBufferCopy r{sb.off, d.off + off * 4, n * 4};
+        vkCmdCopyBuffer(cb_, sb.e->b, d.e->b, 1, &r);
+        d.e->host_valid = false;
+        ++recorded_;
+    }
+private:
+    void open_cb() {
+        if (!cb_) {
+            VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ca.commandPool = pool_; ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
+            ck(vkAllocateCommandBuffers(dev_, &ca, &cb_), "vkAllocateCommandBuffers");
+            VkCommandBufferBeginInfo bb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bb.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            ck(vkBeginCommandBuffer(cb_, &bb), "vkBeginCommandBuffer");
+        } else {
+            VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+            auto st = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+            vkCmdPipelineBarrier(cb_, st, st, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+    }
+public:
+
 private:
     runtime() = default;
     struct pipe { VkShaderModule mod{}; VkDescriptorSetLayout dsl{}; VkPipelineLayout layout{}; VkPipeline pipe{}; };
@@ -113,7 +253,7 @@ private:
     X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines) X(vkDestroyPipeline) \
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkAllocateCommandBuffers) \
     X(vkFreeCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
-    X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateFence) X(vkDestroyFence) X(vkQueueSubmit) X(vkWaitForFences)
+    X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateFence) X(vkDestroyFence) X(vkQueueSubmit) X(vkWaitForFences) X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer)
 #define FORGE_VK_DECL(f) PFN_##f f = nullptr;
     FORGE_VK_FNS(FORGE_VK_DECL)
     FORGE_VK_DEV_FNS(FORGE_VK_DECL)
@@ -148,6 +288,7 @@ private:
         }
         if (best < 0) return "no compute queue";
         phys_ = pds[std::size_t(best)];
+        { VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys_, &pr); align_ = std::max<VkDeviceSize>(4, pr.limits.minStorageBufferOffsetAlignment); }
         float prio = 1.f;
         VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qci.queueFamilyIndex = fam; qci.queueCount = 1; qci.pQueuePriorities = &prio;
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO}; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
@@ -160,9 +301,12 @@ private:
         if (vkCreateCommandPool(dev_, &cp, nullptr, &pool_) != VK_SUCCESS) return "vkCreateCommandPool failed";
         return {};
     }
-    std::uint32_t memtype(std::uint32_t bits) {
+    std::uint32_t memtype(std::uint32_t bits, bool prefer_local = false) {
         VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
         auto want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        if (prefer_local)   // resizable-BAR / UMA memory: device-local and still mappable
+            for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+                if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & (want | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) == (want | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) return i;
         for (std::uint32_t i = 0; i < mp.memoryTypeCount; ++i)
             if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
         throw std::runtime_error("vulkan: no host-visible coherent memory");
@@ -188,6 +332,78 @@ private:
         return pipes_.emplace(name, p).first->second;
     }
 
+    struct entry { float* host; std::size_t count; VkBuffer b{}; VkDeviceMemory m{}; void* map = nullptr; bool host_valid = true, pinned = false; };
+    std::map<std::uintptr_t, entry> res_;   // keyed by host start address; entries never overlap
+    std::vector<std::pair<const float*, std::size_t>> pinned_;
+    std::vector<VkDescriptorPool> pending_pools_;
+    VkCommandBuffer cb_ = nullptr; std::size_t recorded_ = 0;
+    bool in_run_ = false;
+    residency_stats stats_;
+    void free_entry(entry& e) { vkUnmapMemory(dev_, e.m); vkDestroyBuffer(dev_, e.b, nullptr); vkFreeMemory(dev_, e.m, nullptr); }
+    bool overlaps_any(const float* p, std::size_t n) {
+        auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
+        auto it = res_.lower_bound(hi);
+        if (it == res_.begin()) return false;
+        --it; return it->first + it->second.count * 4 > lo;
+    }
+    template<class F> void for_overlapping(const float* p, std::size_t n, F f) {
+        auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
+        auto it = res_.lower_bound(lo);
+        if (it != res_.begin()) { auto pr = std::prev(it); if (pr->first + pr->second.count * 4 > lo) it = pr; }
+        for (; it != res_.end() && it->first < hi; ++it) f(it->second);
+    }
+    void submit_locked() {
+        if (!cb_) return;
+        ck(vkEndCommandBuffer(cb_), "vkEndCommandBuffer");
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; ck(vkCreateFence(dev_, &fi, nullptr, &f), "vkCreateFence");
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb_;
+        ck(vkQueueSubmit(q_, 1, &si, f), "vkQueueSubmit");
+        ck(vkWaitForFences(dev_, 1, &f, VK_TRUE, ~0ull), "vkWaitForFences");
+        vkDestroyFence(dev_, f, nullptr); vkFreeCommandBuffers(dev_, pool_, 1, &cb_); cb_ = nullptr;
+        for (auto dp : pending_pools_) vkDestroyDescriptorPool(dev_, dp, nullptr);
+        pending_pools_.clear(); ++stats_.submits; recorded_ = 0;
+    }
+    // Find or create the resident buffer for exactly [h.data, h.data+h.count). An overlapping entry of a
+    // different extent (arena slot reuse, a view into a bigger buffer) is synced to the host and dropped first.
+    struct bound { entry* e; VkDeviceSize off, range; };
+    bound acquire(const hbuf& h, bool is_out) {
+        auto key = reinterpret_cast<std::uintptr_t>(h.data);
+        VkDeviceSize range = std::max<VkDeviceSize>(4, h.count * 4);
+        auto it = res_.find(key);
+        if (it != res_.end() && it->second.count == h.count) return {&it->second, 0, range};
+        // a sub-range of a bigger resident buffer (e.g. the live prefix of a KV-cache slot): bind at an offset
+        it = res_.upper_bound(key);
+        if (it != res_.begin()) {
+            auto& c = std::prev(it)->second;
+            auto cl = reinterpret_cast<std::uintptr_t>(c.host);
+            if (cl + c.count * 4 >= key + h.count * 4 && (key - cl) % align_ == 0 && h.count) return {&c, key - cl, range};
+        }
+        bool stale = false;
+        for_overlapping(h.data, std::max<std::size_t>(h.count, 1), [&](entry& e) { if (!e.host_valid) stale = true; });
+        if (stale) submit_locked();
+        for (;;) {
+            bool any = false;
+            for_overlapping(h.data, std::max<std::size_t>(h.count, 1), [&](entry& e) {
+                if (!any) { if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); ++stats_.downloads; } any = true; key_ = reinterpret_cast<std::uintptr_t>(e.host); } });
+            if (!any) break;
+            if (cb_) submit_locked();   // the dropped buffer may still be referenced by recorded work
+            free_entry(res_[key_]); res_.erase(key_);
+        }
+        entry e{h.data, h.count};
+        VkDeviceSize sz = std::max<VkDeviceSize>(4, h.count * 4);
+        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        ck(vkCreateBuffer(dev_, &bi, nullptr, &e.b), "vkCreateBuffer");
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev_, e.b, &mr);
+        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = memtype(mr.memoryTypeBits, true);
+        ck(vkAllocateMemory(dev_, &ai, nullptr, &e.m), "vkAllocateMemory");
+        ck(vkBindBufferMemory(dev_, e.b, e.m, 0), "vkBindBufferMemory");
+        ck(vkMapMemory(dev_, e.m, 0, sz, 0, &e.map), "vkMapMemory");
+        for (auto [pp, pn] : pinned_) if (h.data >= pp && h.data + h.count <= pp + pn) e.pinned = true;
+        (void)is_out; { std::memcpy(e.map, h.data, h.count * 4); ++stats_.uploads; stats_.upload_bytes += h.count * 4; }
+        return {&res_.emplace(reinterpret_cast<std::uintptr_t>(h.data), e).first->second, 0, range};
+    }
+    std::uintptr_t key_ = 0;
+    VkDeviceSize align_ = 256;
     void* lib_ = nullptr;
     VkInstance inst_ = nullptr; VkPhysicalDevice phys_ = nullptr; VkDevice dev_ = nullptr; VkQueue q_ = nullptr; VkCommandPool pool_{};
     std::string name_;
@@ -241,7 +457,7 @@ inline bool run_op(runtime& rt, const std::string& op, const std::vector<tensor_
         pc.alpha = float(a.num("scale", 1.0 / std::sqrt(double(pc.k)))); inv = pc.rows * pc.cols;
     }
     std::vector<hbuf> b; for (auto& v : in) b.push_back({v.data, v.size()}); b.push_back({out.data, out.size()});
-    rt.run(op, b, pc, inv);
+    if (rt.resident()) rt.run_resident(op, b, pc, inv); else rt.run(op, b, pc, inv);
     return true;
 }
 inline bool run_op(runtime& rt, const std::string& op, const std::vector<forge::tensor>& in, const spec::attrs& a, forge::tensor& out) {

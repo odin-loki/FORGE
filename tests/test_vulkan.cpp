@@ -79,9 +79,15 @@ static int end_to_end() {
     auto& plan = gpu->plan_for(1, false, const_cast<flow::state_store*>(&b.state()));
     std::printf("%s", plan.describe().c_str());
     int cpu_compute = 0;
-    for (auto& st : plan.steps) if (st.low && st.low->name.rfind("vk.", 0) != 0 && st.low->name != "cpu.reshape") {
+    for (auto& st : plan.steps) if (st.low && st.low->name.rfind("vk.", 0) != 0) {
         ++cpu_compute; std::printf("  on cpu: %s (%s)\n", std::string(spec::info(st.low->op).name).c_str(), st.low->name.c_str()); }
-    bool ok = la.size() == lb.size() && worst < 1e-3f && ta == tb && vk_ops > 0 && cpu_compute == 0;
+    // Residency: weights upload once, and a decode step is one submit, not one per op.
+    auto rs = flow::last_vulkan_runtime()->residency();
+    std::printf("  residency: %zu uploads (%.1f KiB), %zu downloads, %zu submits for %zu dispatches, %zu pinned buffers\n",
+                rs.uploads, double(rs.upload_bytes) / 1024, rs.downloads, rs.submits, vk_ops, rs.resident);
+    bool batched = rs.submits * 4 < vk_ops;
+    if (!batched) std::puts("FAIL residency: dispatches are not batched");
+    bool ok = la.size() == lb.size() && worst < 1e-3f && ta == tb && vk_ops > 0 && cpu_compute == 0 && batched;
     std::printf("%s e2e tiny llama: prefill logits max|err| %.2e, 12 greedy tokens %s, %zu vulkan dispatches, %d CPU compute steps\n",
                 ok ? "ok  " : "FAIL", double(worst), ta == tb ? "identical" : "DIFFER", vk_ops, cpu_compute);
     std::error_code ec; std::filesystem::remove(path, ec);

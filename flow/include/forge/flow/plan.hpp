@@ -92,6 +92,8 @@ public:
     std::vector<float> arena;
     std::map<std::string, value_id> inputs;
     partition_report part;
+    device_hooks* hooks = nullptr;     // device residency protocol (null = everything on the host)
+    bool pinned = false;
     bool deterministic = true;        // CPU kernels use fixed reduction orders
     std::string describe() const {
         std::string s = std::format("plan: {} nodes, {} steps, arena {} bytes (naive {}), {} in-place, {} aliases\n",
@@ -114,6 +116,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
     auto& G = p->g;
     p->views.resize(G.size());
     auto& reg = po.lowerings ? *po.lowerings : registry::cpu();
+    p->hooks = reg.hooks.get();
     for (std::size_t i = 0; i < G.size(); ++i) {
         auto& n = G.nodes()[i];
         auto& s = p->mem.slots[i];
@@ -162,9 +165,27 @@ public:
         if (it == p_.inputs.end()) return; // input eliminated by DCE
         auto& v = p_.views[it->second];
         if (data.size() != v.size()) raise(errc::shape_mismatch, "input {} expects {} elements, got {}", name, v.size(), data.size());
+        auto* h = p_.hooks;
+        if (h) h->to_host(v.data, v.size());
         std::copy(data.begin(), data.end(), v.data);
+        if (h) h->host_wrote(v.data, v.size());
     }
     void run() {
+        auto* h = p_.hooks;
+        if (!h) return run_steps(nullptr);
+        if (!p_.pinned) {   // weights and constants never change: they stay on the device across runs
+            for (std::size_t i = 0; i < p_.g.size(); ++i) {
+                auto k = p_.g.nodes()[i].kind;
+                if (k == node_kind::weight || k == node_kind::constant) h->pin(p_.views[i].data, p_.views[i].size());
+            }
+            p_.pinned = true;
+        }
+        h->begin_run();
+        struct guard { device_hooks* h; ~guard() { h->end_run(); } } g{h};
+        run_steps(h);
+    }
+private:
+    void run_steps(device_hooks* h) {
         std::vector<tensor_view> ins;
         for (auto& s : p_.steps) {
             ins.clear();
@@ -174,17 +195,34 @@ public:
                 auto& node = p_.g.at(s.out);
                 auto& sl = st_->slots[node.name];
                 i64 row = numel(ins[0].shape) / std::max<i64>(ins[0].shape[0], 1);
-                st_->ensure(sl, ins[0].shape, sl.len + ins[0].shape[0]);
-                std::copy_n(ins[0].data, ins[0].size(), sl.buf.data.data() + sl.len * row);
+                i64 rows = ins[0].shape[0];
+                if (h && sl.capacity && sl.len + rows > sl.capacity) h->release(sl.buf.data.data(), sl.buf.data.size());  // about to move: sync + drop
+                const float* before = sl.buf.data.data();
+                st_->ensure(sl, ins[0].shape, sl.len + rows);
+                float* dst = sl.buf.data.data() + sl.len * row;
+                if (h && h->copy) {
+                    if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size());
+                    h->copy(ins[0].data, ins[0].size(), sl.buf.data.data(), sl.buf.data.size(), std::size_t(sl.len * row));
+                } else {
+                    if (h) { h->to_host(ins[0].data, ins[0].size()); h->to_host(dst, ins[0].size()); }
+                    std::copy_n(ins[0].data, ins[0].size(), dst);
+                    if (h) h->host_wrote(dst, ins[0].size());
+                }
                 sl.len += ins[0].shape[0];
                 out.data = sl.buf.data.data();
                 for (auto [a, r] : p_.state_aliases) if (r == s.out) p_.views[a].data = out.data;
                 out.shape[0] = sl.len;   // symbolic length: downstream kernels read it at run time
                 continue;
             }
-            s.low->fn(ins, out, *s.attrs);
+            if (h && !s.low->on_device) {
+                for (auto& v : ins) h->to_host(v.data, v.size());
+                h->to_host(out.data, out.size());
+                s.low->fn(ins, out, *s.attrs);
+                h->host_wrote(out.data, out.size());
+            } else s.low->fn(ins, out, *s.attrs);
         }
     }
+public:
     tensor output(const std::string& name) const {
         for (auto& [nm, v] : p_.g.outputs()) if (nm == name) {
             auto& vw = p_.views[v]; tensor t(vw.shape); std::copy_n(vw.data, t.size(), t.data.data()); return t;
