@@ -17,7 +17,7 @@
 #include <forge/grid/gpu_images.gen.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/spec/ops.gen.hpp>
-#include <dlfcn.h>
+#include <forge/core/dl.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>

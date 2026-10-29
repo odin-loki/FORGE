@@ -14,7 +14,21 @@
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#if defined(_WIN32)
+#include <io.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#else
 #include <unistd.h>
+#endif
 #include <vector>
 #if defined(__linux__) && __has_include(<linux/io_uring.h>)
 #include <linux/io_uring.h>
@@ -80,7 +94,11 @@ public:
     }
     // Convenience: read a whole file with `chunk`-sized requests in flight together.
     std::vector<std::uint8_t> read_file(const std::string& path, std::size_t chunk = 1 << 20) {
+        #if defined(_WIN32)
+        int fd = ::_open(path.c_str(), O_RDONLY | O_BINARY);
+#else
         int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+#endif
         if (fd < 0) throw std::runtime_error("io: cannot open " + path);
         struct stat st{}; fstat(fd, &st);
         std::vector<std::uint8_t> data(std::size_t(st.st_size));
@@ -94,6 +112,16 @@ public:
     }
 
 private:
+    static long long pread_at(int fd, char* b, std::size_t n, std::uint64_t off) {
+#if defined(_WIN32)   // positional read on the CRT fd's handle (no shared file pointer)
+        OVERLAPPED ov{}; ov.Offset = DWORD(off); ov.OffsetHigh = DWORD(off >> 32); DWORD got = 0;
+        HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+        if (!ReadFile(h, b, DWORD(std::min<std::size_t>(n, 1u << 30)), &got, &ov)) { if (GetLastError() == ERROR_HANDLE_EOF) return 0; errno = EIO; return -1; }
+        return got;
+#else
+        return ::pread(fd, b, n, off_t(off));
+#endif
+    }
     struct op { int fd; std::uint64_t off; char* buf; std::size_t len, done; std::uint64_t user; };
     void worker() {
         for (;;) {
@@ -101,7 +129,7 @@ private:
             { std::unique_lock lk(mu_); cv_.wait(lk, [&] { return quit_ || !q_.empty(); }); if (quit_ && q_.empty()) return; o = q_.front(); q_.pop_front(); }
             long r = 0;
             while (o.done < o.len) {
-                ssize_t k = ::pread(o.fd, o.buf + o.done, o.len - o.done, off_t(o.off + o.done));
+                auto k = pread_at(o.fd, o.buf + o.done, o.len - o.done, o.off + o.done);
                 if (k < 0) { if (errno == EINTR) continue; r = -errno; break; }
                 if (k == 0) break;
                 o.done += std::size_t(k);

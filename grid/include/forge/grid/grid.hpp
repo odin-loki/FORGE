@@ -12,7 +12,7 @@
 #include <string>
 #include <vector>
 #if defined(__linux__) || defined(__APPLE__)
-#include <dlfcn.h>
+#include <forge/core/dl.hpp>
 #endif
 
 #define FORGE_KERNEL
@@ -62,8 +62,8 @@ inline std::vector<backend_probe> probe_backends() {
     std::vector<backend_probe> r;
     r.push_back({backend_kind::cpu, true, lane::active().target});
     struct lib { backend_kind k; const char* so; };
-    for (auto [k, so] : {lib{backend_kind::cuda, "libcuda.so.1"}, lib{backend_kind::hip, "libamdhip64.so"},
-                         lib{backend_kind::level_zero, "libze_loader.so.1"}, lib{backend_kind::vulkan, "libvulkan.so.1"}}) {
+    for (auto [k, so] : {lib{backend_kind::cuda, FORGE_DLNAME("libcuda.so.1", "nvcuda.dll")}, lib{backend_kind::hip, FORGE_DLNAME("libamdhip64.so", "amdhip64.dll")},
+                         lib{backend_kind::level_zero, FORGE_DLNAME("libze_loader.so.1", "ze_loader.dll")}, lib{backend_kind::vulkan, FORGE_DLNAME("libvulkan.so.1", "vulkan-1.dll")}}) {
 #if defined(__linux__) || defined(__APPLE__)
         void* h = dlopen(so, RTLD_LAZY | RTLD_LOCAL);
         r.push_back({k, h != nullptr, h ? std::string("loaded ") + so : std::string("runtime not found: ") + so});

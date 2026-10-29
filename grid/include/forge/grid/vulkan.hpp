@@ -8,7 +8,7 @@
 #include <vulkan/vulkan.h>
 #include <forge/grid/spirv.gen.hpp>
 #include <forge/core/tensor.hpp>
-#include <dlfcn.h>
+#include <forge/core/dl.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -280,7 +280,7 @@ private:
 #undef FORGE_VK_DECL
 
     std::string init() {
-        for (const char* so : {"libvulkan.so.1", "libvulkan.so", "libvulkan.1.dylib", "libMoltenVK.dylib"})
+        for (const char* so : {"libvulkan.so.1", "libvulkan.so", "vulkan-1.dll", "libvulkan.1.dylib", "libMoltenVK.dylib"})
             if ((lib_ = dlopen(so, RTLD_NOW | RTLD_LOCAL))) break;
         if (!lib_) return "vulkan loader not found";
         auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib_, "vkGetInstanceProcAddr"));

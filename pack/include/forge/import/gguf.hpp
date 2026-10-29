@@ -1,4 +1,5 @@
 #pragma once
+#include <forge/core/mapped.hpp>
 // GGUF (v2/v3) reader and GGUF -> .fpk importer. Quantised blocks (Q8_0, Q4_K) are copied verbatim:
 // FORGE's codecs use the GGUF block layouts, so no re-quantisation error is introduced.
 #include <forge/import/hf.hpp>
@@ -10,12 +11,8 @@ class gguf_file {
 public:
     struct tinfo { std::string name; shape_t shape; std::uint32_t type = 0; std::uint64_t offset = 0; };
     explicit gguf_file(const std::string& path) : path_(path) {
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) raise(errc::io_error, "cannot open {}", path);
-        struct stat st{}; ::fstat(fd, &st); size_ = std::size_t(st.st_size);
-        map_ = static_cast<const std::uint8_t*>(::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0));
-        ::close(fd);
-        if (map_ == MAP_FAILED) raise(errc::io_error, "mmap failed for {}", path);
+        map_ = forge::map_readonly(path, size_);
+        if (!map_) raise(errc::format_error, "{}: empty file", path);
         if (size_ < 24 || std::memcmp(map_, "GGUF", 4)) raise(errc::format_error, "{}: not a GGUF file", path);
         auto ver = rd<std::uint32_t>();
         if (ver < 2 || ver > 3) raise(errc::unsupported, "{}: GGUF version {} unsupported", path, ver);
@@ -33,7 +30,7 @@ public:
         data_ = (p_ + align - 1) / align * align;
     }
     gguf_file(const gguf_file&) = delete;
-    ~gguf_file() { if (map_ && map_ != MAP_FAILED) ::munmap(const_cast<std::uint8_t*>(map_), size_); }
+    ~gguf_file() { forge::unmap_readonly(map_, size_); }
     const json::value* get(std::string_view k) const { for (auto& [kk, v] : kv_) if (kk == k) return &v; return nullptr; }
     const json::value& need(std::string_view k) const { if (auto* v = get(k)) return *v; raise(errc::not_found, "{}: missing GGUF key {}", path_, k); }
     const std::vector<tinfo>& tensors() const { return tensors_; }

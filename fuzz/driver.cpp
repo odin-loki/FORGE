@@ -36,9 +36,13 @@ static void on_signal(int sig) {
 }
 
 int main(int argc, char** argv) {
+#if defined(_WIN32)
+    for (int s : {SIGSEGV, SIGFPE, SIGILL}) std::signal(s, on_signal);
+#else
     for (int s : {SIGSEGV, SIGBUS, SIGFPE, SIGILL}) std::signal(s, on_signal);
     static char altstack[1 << 16]; stack_t ss{}; ss.ss_sp = altstack; ss.ss_size = sizeof altstack; sigaltstack(&ss, nullptr);
     struct sigaction sa{}; sa.sa_handler = on_signal; sa.sa_flags = SA_ONSTACK; sigaction(SIGSEGV, &sa, nullptr);
+#endif
     long iters = 20000; double seconds = 0; unsigned seed = 1;
     std::vector<std::vector<std::uint8_t>> corpus;
     auto load = [&](const std::filesystem::path& p) {

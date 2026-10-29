@@ -9,7 +9,7 @@
 // by ordinal (all devices of all drivers), host-staged copies between runtimes.
 #include <forge/grid/cuda.hpp>
 #include <level-zero/ze_api.h>
-#include <dlfcn.h>
+#include <forge/core/dl.hpp>
 #include <cstring>
 #include <map>
 #include <memory>

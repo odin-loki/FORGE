@@ -1,4 +1,5 @@
 #pragma once
+#include <forge/core/mapped.hpp>
 // safetensors reader (mmap): 8-byte LE header length, JSON header, raw little-endian tensor bytes.
 #include <forge/core/dtypes.hpp>
 #include <forge/core/tensor.hpp>
@@ -6,7 +7,6 @@
 #include <cstring>
 #include <fcntl.h>
 #include <map>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -16,12 +16,8 @@ class safetensors {
 public:
     struct entry { std::string dtype; shape_t shape; std::uint64_t begin = 0, end = 0; };
     explicit safetensors(const std::string& path) : path_(path) {
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) raise(errc::io_error, "cannot open {}", path);
-        struct stat st{}; ::fstat(fd, &st); size_ = std::size_t(st.st_size);
-        map_ = static_cast<const std::uint8_t*>(::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0));
-        ::close(fd);
-        if (map_ == MAP_FAILED) raise(errc::io_error, "mmap failed for {}", path);
+        map_ = forge::map_readonly(path, size_);
+        if (!map_) raise(errc::format_error, "{}: empty file", path);
         std::uint64_t hl; std::memcpy(&hl, map_, 8);
         if (8 + hl > size_) raise(errc::format_error, "{}: bad safetensors header", path);
         auto h = json::parse({reinterpret_cast<const char*>(map_ + 8), hl});
@@ -36,7 +32,7 @@ public:
         }
     }
     safetensors(const safetensors&) = delete;
-    ~safetensors() { if (map_ && map_ != MAP_FAILED) ::munmap(const_cast<std::uint8_t*>(map_), size_); }
+    ~safetensors() { forge::unmap_readonly(map_, size_); }
     const std::map<std::string, entry>& entries() const { return entries_; }
     bool has(const std::string& n) const { return entries_.count(n) != 0; }
     tensor load(const std::string& n) const {

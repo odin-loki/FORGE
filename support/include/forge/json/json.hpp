@@ -1,4 +1,5 @@
 #pragma once
+#include <cmath>
 #include <functional>
 // Minimal, strict JSON reader/writer (config.json, tokenizer.json, safetensors headers, manifests).
 #include <forge/core/error.hpp>

@@ -1,4 +1,5 @@
 #pragma once
+#include <forge/core/mapped.hpp>
 #include "forge/pack/entropy.hpp"
 // .fpk container: one file holding manifest, blueprint, tokenizer, tensor index and tensor data.
 //
@@ -26,7 +27,6 @@
 #include <optional>
 #include <fcntl.h>
 #include <map>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -167,13 +167,8 @@ inline std::optional<model_key> model_key_from_env() {
 class reader {
 public:
     explicit reader(const std::string& path, std::optional<model_key> key = std::nullopt) : path_(path) {
-        int fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) raise(errc::io_error, "cannot open {}", path);
-        struct stat st{}; ::fstat(fd, &st); size_ = std::size_t(st.st_size);
-        if (size_ < 64) { ::close(fd); raise(errc::format_error, "{}: too small to be .fpk", path); }
-        map_ = static_cast<const std::uint8_t*>(::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0));
-        ::close(fd);
-        if (map_ == MAP_FAILED) raise(errc::io_error, "mmap failed for {}", path);
+        map_ = forge::map_readonly(path, size_);
+        if (size_ < 64) raise(errc::format_error, "{}: too small to be .fpk", path);
         if (std::memcmp(map_, magic, 8)) raise(errc::format_error, "{}: bad magic", path);
         std::uint32_t ver, n; std::uint64_t toff, fsz;
         std::memcpy(&ver, map_ + 8, 4); std::memcpy(&n, map_ + 12, 4); std::memcpy(&toff, map_ + 16, 8); std::memcpy(&fsz, map_ + 24, 8);
@@ -198,7 +193,7 @@ public:
     }
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
-    ~reader() { if (map_ && map_ != MAP_FAILED) ::munmap(const_cast<std::uint8_t*>(map_), size_); }
+    ~reader() { forge::unmap_readonly(map_, size_); }
 
     bool has_section(const std::string& n) const { return sections_.count(n) != 0; }
     std::span<const std::uint8_t> section_bytes(const std::string& n) const {

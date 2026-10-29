@@ -9,7 +9,7 @@
 // to_host/host_wrote/release/copy_resident), recorded "graphs" (captured enqueues replayed with the same
 // arguments; OpenCL has no portable graph object), multiple devices by ordinal, copies between runtimes.
 #include <forge/grid/cuda.hpp>   // kernel_sig / supports / images
-#include <dlfcn.h>
+#include <forge/core/dl.hpp>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -244,7 +244,7 @@ private:
         auto& r = res_.emplace(key, e).first->second; return {&r, 0, count * 4};
     }
     std::string load_lib() {
-        for (auto p : {"libOpenCL.so.1", "libOpenCL.so", "/system/vendor/lib64/libOpenCL.so", "/vendor/lib64/libOpenCL.so",
+        for (auto p : {"libOpenCL.so.1", "libOpenCL.so", "OpenCL.dll", "/System/Library/Frameworks/OpenCL.framework/OpenCL", "/system/vendor/lib64/libOpenCL.so", "/vendor/lib64/libOpenCL.so",
                        "/System/Library/Frameworks/OpenCL.framework/OpenCL", "OpenCL.dll"})
             if ((lib_ = dlopen(p, RTLD_NOW | RTLD_LOCAL))) break;
         if (!lib_) return "libOpenCL not found";
