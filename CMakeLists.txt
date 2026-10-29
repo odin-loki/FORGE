@@ -421,6 +421,23 @@ if(FORGE_BUILD_TESTS)
       endforeach()
     endif()
   endif()
+  # forge::os / forge::balance cross-OS compile+link checks (zig ships FreeBSD, macOS and MinGW libcs).
+  find_program(FORGE_ZIG NAMES zig HINTS $ENV{ZIG_PATH})
+  if(FORGE_ZIG)
+    foreach(tg x86_64-freebsd aarch64-macos x86_64-macos x86_64-windows-gnu aarch64-linux-musl)
+      foreach(src test_os test_balance)
+        set(_lib)
+        if(tg MATCHES windows)
+          set(_lib -lws2_32 -lbcrypt)
+        endif()
+        add_test(NAME xos_${src}_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++20 -O1 -I${CMAKE_SOURCE_DIR}/os/include
+                 -I${CMAKE_SOURCE_DIR}/balance/include -I${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/tests/${src}.cpp ${_lib}
+                 -o ${CMAKE_BINARY_DIR}/xos/${src}.${tg})
+        set_tests_properties(xos_${src}_${tg} PROPERTIES LABELS "cross;slow")
+      endforeach()
+    endforeach()
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/xos)
+  endif()
   # Intel SDE: AMX tiles on an emulated Sapphire Rapids / Granite Rapids, and the skip path on Ice Lake.
   find_program(FORGE_SDE NAMES sde64 HINTS $ENV{SDE_PATH})
   if(FORGE_SDE AND FORGE_CAN_AMX)

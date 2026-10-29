@@ -69,6 +69,7 @@
 #include <sys/sysctl.h>
 #define FORGE_OS_KQUEUE 1
 #define FORGE_OS_FREEBSD 1
+#include <pthread_np.h>
 #elif defined(__linux__)
 #include <sys/epoll.h>
 #include <sys/syscall.h>
