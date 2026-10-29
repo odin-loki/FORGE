@@ -7,6 +7,7 @@ Read the guides in this order. Each guide covers the same four things in turn: *
 | 1 | [README](../README.md) | What FORGE is, quick start, repository layout |
 | 2 | [lane.md](lane.md) | CPU feature detection and SIMD kernel dispatch |
 | 3 | [grid.md](grid.md) | Devices, graphs and parallel primitives |
+| 3c | [flow.md](flow.md) | Graph IR, passes, plans, autodiff, RPC |
 | 4 | [pack.md](pack.md) | The .fpk container, signing, encryption, import |
 | 5 | [format.md](format.md) | .fpk byte layout |
 | 6 | [mind.md](mind.md) | Models, sessions, samplers and generation |
