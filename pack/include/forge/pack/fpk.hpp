@@ -6,13 +6,23 @@
 //   table  : n x { char name[32]; u64 offset; u64 size; u8 blake3[32]; u8 pad[16] }  (96 B each)
 //   "tensors" section is JSON: [{name, codec, shape, offset, bytes, blake3}], offsets relative to "data".
 //   Every section and every tensor carries a BLAKE3 hash; readers verify on demand (`verify()`).
+//   Optional encryption hook: the "data" section may be sealed with XChaCha20-Poly1305 (Monocypher; the
+//   plan's AES-GCM was swapped for an audited, constant-time, dependency-free AEAD). An "encryption"
+//   section records {alg, nonce, mac, key_id}; the tensor index is bound as associated data. Metadata stays
+//   readable, so signing, inspection and verification of section hashes work without the key.
 #include <forge/core/error.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/flow/codecs.hpp>
 #include <forge/hash/blake3.hpp>
 #include <forge/json/json.hpp>
+#include "monocypher.h"
+#include <array>
+#include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <optional>
 #include <fcntl.h>
 #include <map>
 #include <sys/mman.h>
@@ -103,10 +113,59 @@ private:
     std::vector<std::uint8_t> data_;
 };
 
+namespace detail {
+inline std::string hex(const std::uint8_t* p, std::size_t n) { static const char* d = "0123456789abcdef"; std::string s; for (std::size_t i = 0; i < n; ++i) { s += d[p[i] >> 4]; s += d[p[i] & 15]; } return s; }
+inline std::vector<std::uint8_t> unhex(std::string_view s) {
+    auto v = [](char c) -> int { return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1; };
+    if (s.size() % 2) raise(errc::invalid_argument, "bad hex");
+    std::vector<std::uint8_t> o; for (std::size_t i = 0; i < s.size(); i += 2) { int a = v(s[i]), b = v(s[i + 1]); if (a < 0 || b < 0) raise(errc::invalid_argument, "bad hex"); o.push_back(std::uint8_t(a * 16 + b)); }
+    return o;
+}
+inline std::string enc_key_id(const std::array<std::uint8_t, 32>& k) { auto d = hash::blake3::of({k.data(), k.size()}); return hex(d.data(), 8); }
+inline std::string enc_ad(std::string_view tensors_json) { return std::string("forge-fpk-enc-v1\0", 17) + std::string(tensors_json); }
+// Raw container write with sections copied verbatim.
+inline void write_sections(const std::string& out, std::vector<std::pair<std::string, std::string>> secs) {
+    std::sort(secs.begin(), secs.end());
+    std::vector<std::uint8_t> o(64, 0);
+    struct ent { std::string name; std::uint64_t off, size; hash::blake3::digest h; };
+    std::vector<ent> table;
+    for (auto& [nm, sec] : secs) {
+        if (nm.size() >= 32) raise(errc::invalid_argument, "section name too long: {}", nm);
+        while (o.size() % alignment) o.push_back(0);
+        table.push_back({nm, o.size(), sec.size(), hash::blake3::of({reinterpret_cast<const std::uint8_t*>(sec.data()), sec.size()})});
+        o.insert(o.end(), sec.begin(), sec.end());
+    }
+    while (o.size() % alignment) o.push_back(0);
+    std::uint64_t toff = o.size();
+    for (auto& e : table) {
+        std::uint8_t rec[96] = {};
+        std::memcpy(rec, e.name.data(), e.name.size());
+        std::memcpy(rec + 32, &e.off, 8); std::memcpy(rec + 40, &e.size, 8); std::memcpy(rec + 48, e.h.data(), 32);
+        o.insert(o.end(), rec, rec + 96);
+    }
+    std::uint32_t n = std::uint32_t(table.size()); std::uint64_t fsz = o.size();
+    std::memcpy(o.data(), magic, 8); std::memcpy(o.data() + 8, &format_version, 4); std::memcpy(o.data() + 12, &n, 4);
+    std::memcpy(o.data() + 16, &toff, 8); std::memcpy(o.data() + 24, &fsz, 8);
+    auto tmp = out + ".tmp";
+    { std::ofstream f(tmp, std::ios::binary); f.write(reinterpret_cast<const char*>(o.data()), std::streamsize(o.size())); if (!f) raise(errc::io_error, "cannot write {}", tmp); }
+    std::rename(tmp.c_str(), out.c_str());
+}
+}
+using model_key = std::array<std::uint8_t, 32>;
+// Key from FORGE_MODEL_KEY (64 hex chars) or the file named by FORGE_MODEL_KEY_FILE (hex, whitespace ok).
+inline std::optional<model_key> model_key_from_env() {
+    std::string h;
+    if (auto* e = std::getenv("FORGE_MODEL_KEY")) h = e;
+    else if (auto* f = std::getenv("FORGE_MODEL_KEY_FILE")) { std::ifstream in(f); std::string w; while (in >> w) h += w; }
+    else return std::nullopt;
+    auto b = detail::unhex(h); if (b.size() != 32) raise(errc::invalid_argument, "model key must be 32 bytes (64 hex chars)");
+    model_key k; std::memcpy(k.data(), b.data(), 32); crypto_wipe(b.data(), b.size()); return k;
+}
+
 // Memory-mapped reader. Tensors are decoded to f32 on request (and cached by the caller).
 class reader {
 public:
-    explicit reader(const std::string& path) : path_(path) {
+    explicit reader(const std::string& path, std::optional<model_key> key = std::nullopt) : path_(path) {
         int fd = ::open(path.c_str(), O_RDONLY);
         if (fd < 0) raise(errc::io_error, "cannot open {}", path);
         struct stat st{}; ::fstat(fd, &st); size_ = std::size_t(st.st_size);
@@ -126,6 +185,7 @@ public:
             if (s.offset + s.size > size_) raise(errc::format_error, "{}: section {} out of bounds", path, s.name);
             sections_[s.name] = s;
         }
+        if (has_section("encryption")) { auto k = key ? key : model_key_from_env(); if (k) decrypt(k); else locked_ = true; }
         auto idx = json::parse(section_text("tensors"));
         for (auto& t : idx.arr()) {
             tensor_entry e; e.name = t["name"].str(); e.codec = t["codec"].str();
@@ -143,8 +203,19 @@ public:
     std::span<const std::uint8_t> section_bytes(const std::string& n) const {
         auto it = sections_.find(n);
         if (it == sections_.end()) raise(errc::not_found, "{}: no section '{}'", path_, n);
+        if (n == "data" && plain_) return {plain_->data(), plain_->size()};
+        if (n == "data" && locked_) raise(errc::invalid_argument, "{}: model is encrypted (key id {}); set FORGE_MODEL_KEY or FORGE_MODEL_KEY_FILE",
+                                           path_, json::parse(section_text("encryption")).str_or("key_id", "?"));
         return {map_ + it->second.offset, it->second.size};
     }
+    // Section bytes exactly as stored (ciphertext for an encrypted data section).
+    std::span<const std::uint8_t> raw_section_bytes(const std::string& n) const {
+        auto it = sections_.find(n);
+        if (it == sections_.end()) raise(errc::not_found, "{}: no section '{}'", path_, n);
+        return {map_ + it->second.offset, it->second.size};
+    }
+    bool locked() const { return locked_; }
+    bool encrypted() const { return plain_.has_value(); }
     std::string_view section_text(const std::string& n) const {
         auto b = section_bytes(n); return {reinterpret_cast<const char*>(b.data()), b.size()};
     }
@@ -168,6 +239,7 @@ public:
         std::vector<std::string> bad;
         for (auto& [n, s] : sections_)
             if (hash::blake3::of({map_ + s.offset, s.size}) != s.hash) bad.push_back("section " + n);
+        if (locked_) return bad;                       // tensor hashes are over plaintext: need the key
         auto d = section_bytes("data");
         for (auto& [n, e] : tensors_)
             if (hash::blake3::hex(hash::blake3::of({d.data() + e.offset, e.bytes})) != e.blake3) bad.push_back("tensor " + n);
@@ -177,11 +249,49 @@ public:
     struct section { std::string name; std::uint64_t offset = 0, size = 0; hash::blake3::digest hash{}; };
     const std::map<std::string, section>& sections() const { return sections_; }
 private:
+    void decrypt(const std::optional<model_key>& key) {
+        auto e = json::parse(section_text("encryption"));
+        if (e.str_or("alg", "") != "xchacha20-poly1305") raise(errc::unsupported, "{}: unknown encryption {}", path_, e.str_or("alg", "?"));
+        if (detail::enc_key_id(*key) != e.str_or("key_id", "")) raise(errc::integrity_error, "{}: wrong key (file wants key id {})", path_, e.str_or("key_id", "?"));
+        auto nonce = detail::unhex(e["nonce"].str()), mac = detail::unhex(e["mac"].str());
+        if (nonce.size() != 24 || mac.size() != 16) raise(errc::format_error, "{}: bad encryption header", path_);
+        auto& d = sections_.at("data"); auto ad = detail::enc_ad(section_text("tensors"));
+        plain_.emplace(d.size);
+        if (crypto_aead_unlock(plain_->data(), mac.data(), key->data(), nonce.data(), reinterpret_cast<const std::uint8_t*>(ad.data()), ad.size(), map_ + d.offset, d.size))
+            { plain_.reset(); raise(errc::integrity_error, "{}: decryption failed (tampered data or index)", path_); }
+    }
+    std::optional<std::vector<std::uint8_t>> plain_;
+    bool locked_ = false;
     std::string path_;
     const std::uint8_t* map_ = nullptr;
     std::size_t size_ = 0;
     std::map<std::string, section> sections_;
     std::map<std::string, tensor_entry> tensors_;
 };
+
+// Seal the data section of `in` with `key`, writing `out`. Existing signatures are dropped (re-sign after).
+inline void encrypt_file(const std::string& in, const std::string& out, const model_key& key) {
+    std::vector<std::pair<std::string, std::string>> secs; std::string tj; std::vector<std::uint8_t> plain;
+    {
+        reader r(in);
+        if (r.has_section("encryption")) raise(errc::invalid_argument, "{}: already encrypted", in);
+        if (auto bad = r.verify(); !bad.empty()) raise(errc::format_error, "{}: refusing to encrypt a corrupt file ({})", in, bad.front());
+        for (auto& [name, s] : r.sections()) {
+            if (name == "signature") continue;
+            auto b = r.section_bytes(name);
+            if (name == "data") plain.assign(b.begin(), b.end()); else secs.emplace_back(name, std::string(reinterpret_cast<const char*>(b.data()), b.size()));
+            if (name == "tensors") tj.assign(reinterpret_cast<const char*>(b.data()), b.size());
+        }
+    }
+    std::array<std::uint8_t, 24> nonce{}; std::array<std::uint8_t, 16> mac{};
+    if (::getentropy(nonce.data(), nonce.size()) != 0) raise(errc::io_error, "getentropy failed");
+    auto ad = detail::enc_ad(tj); std::string ct(plain.size(), '\0');
+    crypto_aead_lock(reinterpret_cast<std::uint8_t*>(ct.data()), mac.data(), key.data(), nonce.data(), reinterpret_cast<const std::uint8_t*>(ad.data()), ad.size(), plain.data(), plain.size());
+    crypto_wipe(plain.data(), plain.size());
+    secs.emplace_back("data", std::move(ct));
+    secs.emplace_back("encryption", json::dump(json::object{{"alg", "xchacha20-poly1305"}, {"nonce", detail::hex(nonce.data(), 24)}, {"mac", detail::hex(mac.data(), 16)}, {"key_id", detail::enc_key_id(key)}}));
+    detail::write_sections(out, std::move(secs));
+}
+inline model_key generate_model_key() { model_key k; if (::getentropy(k.data(), k.size()) != 0) raise(errc::io_error, "getentropy failed"); return k; }
 
 } // namespace forge::pack

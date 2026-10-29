@@ -4,6 +4,9 @@
 #include <filesystem>
 #include <unistd.h>
 #include <fstream>
+#include "tiny_model.hpp"
+#include <cstring>
+static std::string tmp(const std::string& n) { return (std::filesystem::temp_directory_path() / ("forge_test_pack_" + std::to_string(::getpid()) + "_" + n)).string(); }
 
 using namespace forge;
 
@@ -148,4 +151,28 @@ output w : f32[8]
     CHECK_THROWS(pack::build_graph(pack::parse_blueprint("blueprint \"e\"\nop f(a) { return f(a) }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
     CHECK_THROWS(pack::parse_blueprint("blueprint \"e\"\nop f(a) { return a }\nop f(a) { return a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"));
     CHECK_THROWS(pack::build_graph(pack::parse_blueprint("blueprint \"e\"\nop f(a) { b = a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
+}
+
+TEST(fpk_encryption_hook) {
+    auto src = forge_test::make_tiny_model(tmp("enc_src.fpk")), dst = tmp("enc.fpk");
+    auto key = pack::generate_model_key(); pack::encrypt_file(src, dst, key);
+    pack::reader plain(src), locked(dst);
+    CHECK(locked.locked()); CHECK(locked.verify().empty()); CHECK_THROWS(locked.load("lm_head"));
+    CHECK(locked.manifest().str_or("format", "") == "fpk");                  // metadata stays readable
+    pack::reader open(dst, key); CHECK(open.encrypted()); CHECK(open.verify().empty());
+    for (auto& [n, e] : plain.tensors()) CHECK(open.load(n).data == plain.load(n).data);
+    { auto raw = open.raw_section_bytes("data"), pd = plain.section_bytes("data"); CHECK(raw.size() == pd.size() && std::memcmp(raw.data(), pd.data(), pd.size()) != 0); }
+    auto bad = key; bad[0] ^= 1; CHECK_THROWS(pack::reader(dst, bad));
+    CHECK_THROWS(pack::encrypt_file(dst, tmp("enc2.fpk"), key));
+    // tamper with one ciphertext byte: decryption must fail
+    { std::fstream f(dst, std::ios::in | std::ios::out | std::ios::binary); auto off = std::streamoff(locked.sections().at("data").offset + 5);
+      f.seekg(off); char c; f.get(c); f.seekp(off); f.put(char(c ^ 0x40)); }
+    CHECK_THROWS(pack::reader(dst, key));
+    // sign + verify an encrypted file without the key, then load it with the key from the environment
+    pack::encrypt_file(src, dst, key);
+    auto kp = pack::generate_keypair(); pack::sign_file(dst, dst, kp);
+    { pack::reader r(dst); auto rep = pack::verify_signature(r); CHECK(rep.digest_ok && !rep.valid_keys.empty()); }
+    ::setenv("FORGE_MODEL_KEY", pack::detail::hex(key.data(), 32).c_str(), 1);
+    { mind::session s(dst); auto l = s.forward(std::vector<int>{1, 2}); mind::session p(src); CHECK(l == p.forward(std::vector<int>{1, 2})); }
+    ::unsetenv("FORGE_MODEL_KEY");
 }

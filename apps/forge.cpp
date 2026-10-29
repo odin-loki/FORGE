@@ -1,4 +1,5 @@
 // forge — command-line front end: info | import | inspect | run | bench
+#include <sys/stat.h>
 #include <forge/import/gguf.hpp>
 #include <forge/import/onnx.hpp>
 #include <forge/lane/dispatch.hpp>
@@ -54,6 +55,8 @@ int usage() {
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
         "  sign <model.fpk> --key <name.key> [-o out.fpk]   add/extend the signature section\n"
         "  verify <model.fpk> [--pubkey <name.pub>]...      check hashes + signature (exit 1 on failure)\n"
+        "  encrypt <in.fpk> -o <out.fpk> --key k.mkey | --new-key k.mkey   seal tensor data (XChaCha20-Poly1305);\n"
+        "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
         "  (strict loading: FORGE_REQUIRE_SIGNED=1 and/or FORGE_TRUSTED_KEYS=<hex>[,<hex>])");
     return 2;
 }
@@ -149,6 +152,23 @@ int cmd_sign(const args& a) {
     auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
     pack::sign_file(a.pos[0], out, k);
     std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), pack::key_id(k.pub).c_str(), out.c_str());
+    return 0;
+}
+int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key k.mkey | --new-key k.mkey]
+    if (a.pos.empty() || a.get("o").empty() || (a.get("key").empty() && a.get("new-key").empty())) return usage();
+    pack::model_key k;
+    if (!a.get("new-key").empty()) {
+        k = pack::generate_model_key();
+        std::ofstream f(a.get("new-key")); f << pack::detail::hex(k.data(), 32) << "\n";
+        if (!f) throw std::runtime_error("cannot write " + a.get("new-key"));
+        ::chmod(a.get("new-key").c_str(), 0600);
+    } else {
+        std::ifstream f(a.get("key")); std::string h, w; while (f >> w) h += w;
+        auto b = pack::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
+        std::memcpy(k.data(), b.data(), 32);
+    }
+    pack::encrypt_file(a.pos[0], a.get("o"), k);
+    std::printf("encrypted %s -> %s (key id %s)\n", a.pos[0].c_str(), a.get("o").c_str(), pack::detail::enc_key_id(k).c_str());
     return 0;
 }
 int cmd_verify(const args& a) {
@@ -296,6 +316,7 @@ int main(int argc, char** argv) {
         if (c == "keygen") return cmd_keygen(a);
         if (c == "sign") return cmd_sign(a);
         if (c == "verify") return cmd_verify(a);
+        if (c == "encrypt") return cmd_encrypt(a);
         return usage();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "forge: error: %s\n", e.what());

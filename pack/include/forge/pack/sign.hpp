@@ -66,7 +66,7 @@ inline hash::blake3::digest signing_digest(const reader& r) {
     put(sign_scheme.data(), sign_scheme.size());
     for (auto& [name, s] : r.sections()) {
         if (name == "signature") continue;
-        auto d = hash::blake3::of(r.section_bytes(name));
+        auto d = hash::blake3::of(r.raw_section_bytes(name));
         std::uint64_t ln = name.size(), sz = s.size;
         put(&ln, 8); put(name.data(), name.size()); put(&sz, 8); put(d.data(), d.size());
     }
@@ -97,7 +97,7 @@ inline void sign_file(const std::string& in, const std::string& out, const keypa
             if (old["digest"].str() == dig) for (auto& s : old["signatures"].arr()) if (s["public_key"].str() != detail::to_hex(k.pub)) sigs.push_back(s);
         }
         sigs.push_back(json::object{{"key_id", key_id(k.pub)}, {"public_key", detail::to_hex(k.pub)}, {"sig", sign_digest_hex(d, k)}});
-        for (auto& [name, s] : r.sections()) if (name != "signature") { auto b = r.section_bytes(name); secs.emplace_back(name, std::string(reinterpret_cast<const char*>(b.data()), b.size())); }
+        for (auto& [name, s] : r.sections()) if (name != "signature") { auto b = r.raw_section_bytes(name); secs.emplace_back(name, std::string(reinterpret_cast<const char*>(b.data()), b.size())); }
     }
     secs.emplace_back("signature", json::dump(json::object{{"alg", "ed25519"}, {"scheme", std::string(sign_scheme)}, {"digest", dig}, {"signatures", sigs}}));
     std::sort(secs.begin(), secs.end());
