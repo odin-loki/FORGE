@@ -1,6 +1,6 @@
 // forge-serve — OpenAI-compatible HTTP server over the continuous-batching scheduler.
 //
-//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N]
+//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N]   (see docs/serve.md)
 //
 //   GET  /health                 -> {"status":"ok"}
 //   GET  /v1/models              -> model list

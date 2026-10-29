@@ -4,6 +4,12 @@
                 [--watch] [--no-pin] [--numa-node N]
     forge-serve proxy ...            # see docs/balance.md
 
+Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/completions`, `POST /v1/chat/completions` (OpenAI-style bodies;
+sampling fields `max_tokens temperature top_p top_k min_p typical_p repetition_penalty presence_penalty frequency_penalty
+seed stop grammar (GBNF) response_format (json_schema) mirostat_tau mirostat_eta stream`), `GET /metrics`.
+
+    curl -s localhost:8080/v1/completions -d '{"prompt":"Hello","max_tokens":16}'
+
 HF directories and GGUF files are imported into a temporary `.fpk` first (`--codec` picks the weight codec).
 
 | Flag / env | Effect |

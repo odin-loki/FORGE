@@ -11,4 +11,9 @@
         [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--route /v1/embeddings=host:port,host:port] \
         [--host 127.0.0.1] [--port 8080] [--retries 3] [--health-ms 2000]
 
-Tests: `tests/test_balance.cpp`.
+Strategy names on the command line: `rr`, `wrr`, `lc`, `ewma`, `hash` (alias `ring`), `p2c` (default), `kv` (alias `prefix`).
+L7 mode parses each HTTP request and picks the backend from the affinity key (header `X-Session-Id` by default, else
+the client address); `--route PREFIX=host:port,...` sends matching paths to their own pool. L4 mode forwards raw TCP.
+Failed backends are retried on another one up to `--retries` times; `--health-ms` sets the TCP health-probe period.
+
+Tests: `tests/test_balance.cpp` (Linux, wine, Android emulator).

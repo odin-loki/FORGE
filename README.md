@@ -1,6 +1,6 @@
 # FORGE — intrinsics, GPU compute and AI inference in one library
 
-> **Status: design stage.** The architecture and delivery plan is in [`FORGE_PLAN.md`](FORGE_PLAN.md) (v0.1, 2026-10-29). No code has landed yet. The first target is **Convergence 1**: one model file running on CPU, NVIDIA and AMD with zero model-specific code.
+> **Status: in development.** All layers below have working code and tests on Linux (CPU, Vulkan via lavapipe), Windows (wine), the Android emulator and qemu cross targets; GPU vendor backends have only run against mock drivers. Per-platform results: [`docs/STATUS.md`](docs/STATUS.md). Design and roadmap: [`FORGE_PLAN.md`](FORGE_PLAN.md).
 
 ---
 
@@ -44,7 +44,12 @@ It is a new design, not a fork or wrapper of any of those projects. Code and mod
 Build, cross-build, Android emulator and wine instructions: [`docs/STATUS.md#build`](docs/STATUS.md#build).
 CI: the workflow lives at `ci/github-actions-ci.yml`; move it to `.github/workflows/ci.yml` by hand (the push token lacks `workflow` scope).
 
-Full detail, repository layout, roadmap and first steps: [`FORGE_PLAN.md`](FORGE_PLAN.md).
+Quick start:
+
+    cmake -S . -B build -G Ninja && ninja -C build -j4 && ctest --test-dir build -LE "slow|emu"
+    build/forge-serve model.fpk --port 8080        # OpenAI-style HTTP server, see docs/serve.md
+
+Full design, repository layout and roadmap: [`FORGE_PLAN.md`](FORGE_PLAN.md).
 
 ---
 
@@ -63,7 +68,7 @@ Full detail, repository layout, roadmap and first steps: [`FORGE_PLAN.md`](FORGE
 ## 🚧 Honest framing
 
 - **Work in progress.** See [`docs/STATUS.md`](docs/STATUS.md) for what is implemented and what has actually been tested on each platform.
-- **Scope is large.** The minimum useful version (Convergence 1) is estimated at 60–90k hand-written lines; the full library at roughly 185–275k, plus tests. Breadth comes after Convergence 1, not before.
+- **Untested on real hardware:** CUDA, HIP, Level Zero, OpenCL and Metal devices, iOS, and native FreeBSD/macOS runs (those are cross-linked only). See [`docs/STATUS.md`](docs/STATUS.md).
 - **Clean-room design.** No code is copied from xsimd, llama.cpp or ggml, and nothing from CUDA's headers or libraries. Any third-party code that is used will be recorded in a `NOTICE` file with its licence.
 - **Vendor libraries are optional.** cuBLAS, hipBLASLt and oneMKL may be used where present and faster, but are never required.
 

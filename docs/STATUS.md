@@ -5,7 +5,7 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 ## Test matrix (ctest)
 | Build | Result |
 |---|---|
-| x86_64 dev | 59/59 with `-LE slow` (hardware tests skip with code 77: CUDA/HIP/OpenCL/Level Zero/Metal devices, adb, iOS). With `ANDROID_NDK_HOME` set, `mobile_android_arm64-v8a` and `mobile_android_x86_64` (label `slow`) pass: NDK r27c cross-build plus a check that all 12 JNI exports are present. This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
+| x86_64 dev | 73/73 with `-LE "slow|emu"` (2026-10-30; earlier rounds 59/59 with `-LE slow`) (hardware tests skip with code 77: CUDA/HIP/OpenCL/Level Zero/Metal devices, adb, iOS). With `ANDROID_NDK_HOME` set, `mobile_android_arm64-v8a` and `mobile_android_x86_64` (label `slow`) pass: NDK r27c cross-build plus a check that all 12 JNI exports are present. This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
 | aarch64 SVE build (`build/a64sve`), latest run | 31/31 without the fuzz label (3 skip: Vulkan/CUDA/HIP). |
 | riscv64 build (`build/rv64`), latest run | 27/27 without the fuzz label (3 skip). |
 | aarch64, qemu `-cpu max` (VL 512, so the NEON path runs) | 13/13 without the fuzz label. `test_vulkan` skips because the build is static. |
@@ -114,7 +114,7 @@ On the device, `FORGE_DEVICE=vulkan` selects the Vulkan backend; otherwise the N
 Run one test at a time with a timeout; skip test_mind (OOMs the emulator). `tests/android_emulator.sh` automates this.
 
 ### Windows under wine64
-    cmake -S . -B build/win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=<mingw toolchain>; ninja -C build/win64 -j4
+    cmake -S . -B build/win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64.cmake; ninja -C build/win64 -j4
     WINEPREFIX=~/.wine-forge64 tests/wine_run.sh build/win64     # pure win64 prefix; 77 = skip
 Do not leave `FORGE_OS_EXT_CHILD` exported in the shell — test_os_ext children use it.
 
