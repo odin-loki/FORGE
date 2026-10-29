@@ -1,5 +1,6 @@
 // forge — command-line front end: info | import | inspect | run | bench
 #include <forge/import/gguf.hpp>
+#include <forge/import/onnx.hpp>
 #include <forge/lane/dispatch.hpp>
 #include <forge/mind/mind.hpp>
 #include <cstdio>
@@ -60,7 +61,7 @@ int usage() {
 // `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
 std::string resolve_model(const std::string& path, const std::string& codec) {
     namespace fs = std::filesystem;
-    if (!fs::is_directory(path) && !path.ends_with(".gguf")) return path;
+    if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
     std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(pack::format_version));
     auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
                                                             (long long)fs::last_write_time(f).time_since_epoch().count()); };
@@ -75,7 +76,7 @@ std::string resolve_model(const std::string& path, const std::string& codec) {
     if (!fs::exists(out)) {
         import::import_options o; o.codec = codec;
         auto tmp = out.string() + ".partial";
-        auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : import::import_hf(path, tmp, o);
+        auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
         fs::rename(tmp, out);
         std::fprintf(stderr, "[imported %s (%s, %zu tensors) -> %s]\n", path.c_str(), r.template_name.c_str(), r.tensors, out.c_str());
     } else std::fprintf(stderr, "[using cached %s]\n", out.c_str());
@@ -98,7 +99,7 @@ int cmd_info() {
 int cmd_import(const args& a) {
     if (a.pos.empty() || a.get("o").empty()) return usage();
     import::import_options o; o.codec = a.get("codec", "f32"); o.template_name = a.get("template");
-    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
+    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     return 0;
 }
@@ -164,10 +165,39 @@ int cmd_verify(const args& a) {
     return bad.empty() && rep.trusted ? 0 : 1;
 }
 
+// one_shot models: --input name=file.f32 (raw little-endian f32, repeatable), --out prefix -> prefix.<output>.f32
+int run_one_shot(mind::session& s, const args& a) {
+    std::map<std::string, std::vector<float>> in; i64 seq = 1;
+    const json::value* decl = s.manifest().find("onnx_inputs");
+    for (auto& spec : a.all("input")) {
+        auto eq = spec.find('=');
+        if (eq == std::string::npos) raise(errc::invalid_argument, "--input expects name=file, got '{}'", spec);
+        auto name = spec.substr(0, eq); auto bytes = import::read_file(spec.substr(eq + 1));
+        if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", spec.substr(eq + 1));
+        std::vector<float> v(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        if (decl) for (auto& d : decl->arr()) {
+            if (d["onnx"].str() != name && d["name"].str() != name) continue;
+            name = d["name"].str(); i64 k = 1; bool sym = false;
+            for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= i64(x.num()); }
+            if (sym && k) seq = i64(v.size()) / k;
+        }
+        in[name] = std::move(v);
+    }
+    auto out = s.infer(in, seq);
+    auto prefix = a.get("out");
+    for (auto& [k, v] : out) {
+        if (prefix.empty()) { std::printf("%s:", k.c_str()); for (auto x : v) std::printf(" %.6g", x); std::printf("\n"); continue; }
+        std::ofstream f(prefix + "." + k + ".f32", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+    }
+    return 0;
+}
+
 int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
     mind::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
     mind::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
+    if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
     else if (a.kv.count("prompt")) {

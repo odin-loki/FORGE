@@ -133,6 +133,7 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME pack_signing COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/sign_test.py
              $<TARGET_FILE:forge> ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
     set_tests_properties(pack_signing PROPERTIES DEPENDS golden_tiny_llama)
+    add_test(NAME onnx_import COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/onnx_test.py $<TARGET_FILE:forge>)
     add_test(NAME golden_moe_mla
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_moe.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_moe)
@@ -158,7 +159,7 @@ endif()
 
 # ---- fuzz targets (fuzz/): libFuzzer entry points + a built-in mutational driver for CI ----
 if(FORGE_BUILD_TESTS)
-  foreach(ft json blueprint fpk safetensors gguf tokenizer grammar)
+  foreach(ft json blueprint fpk safetensors gguf tokenizer grammar onnx)
     if(FORGE_LIBFUZZER)
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp)
       target_compile_options(fuzz_${ft} PRIVATE -fsanitize=fuzzer)

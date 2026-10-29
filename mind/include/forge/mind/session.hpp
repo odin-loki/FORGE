@@ -157,6 +157,21 @@ public:
         if (blueprint().session != "generative_sequence") raise(errc::unsupported, "session kind '{}' cannot generate", blueprint().session);
     }
 
+    // one_shot graphs (e.g. imported ONNX): bind named f32 inputs, run once, return every declared output.
+    std::map<std::string, std::vector<float>> infer(const std::map<std::string, std::vector<float>>& in, i64 seq = 1) {
+        std::lock_guard lk(m_->run_mutex());
+        auto& p = m_->plan_for(seq, false, &st_);
+        auto it = execs_.find(&p);
+        if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<flow::executor>(p, &st_)).first;
+        auto& ex = *it->second;
+        for (auto& d : blueprint().inputs)
+            if (!in.count(d.name)) raise(errc::invalid_argument, "infer: missing input '{}'", d.name);
+        for (auto& [k, v] : in) ex.set_input(k, v);
+        ex.run();
+        std::map<std::string, std::vector<float>> out;
+        for (auto& o : blueprint().outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
+        return out;
+    }
 private:
     std::vector<float> run(std::span<const int> ids, bool all) {
         if (ids.empty()) raise(errc::invalid_argument, "forward: no tokens");
