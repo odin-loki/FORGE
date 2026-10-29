@@ -66,6 +66,15 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
   - XCTest (skips without `FORGE_TEST_FPK`) and a SwiftUI example. Metal is the default device.
 - **Goldens**: tiny Llama and MoE/MLA, checked against NumPy float64 references.
 
+- **Multi-GPU pipeline split + socket RPC device** (`flow/rpc.hpp`, `FORGE_DEVICE=pipe:a*w,b` / `rpc:host:port`, `forge rpc-serve`): contiguous stage split balanced by cost; loopback RPC tested (test_rpc). Only CPU/lavapipe stages exercised — no real multi-GPU. RPC has no auth; binds 127.0.0.1 by default.
+- **AMX / SME tiles** (`lane/tile.hpp`): AMX bf16/int8 runs natively and under Intel SDE (`tile_amx_sde_{spr,gnr,icl}`); SME f32 outer products pass under qemu at SVL 128–2048 (`tile_sme_svl*`, weak SME ABI routines for runtimes lacking them). **Open bug:** AMX bf16/s8 gives wrong blocks intermittently (~1.5% native, most SDE runs) after interleaved calls; not yet root-caused.
+- **Graphics interop** (`grid/interop.hpp`): Vulkan external memory export/import round-trip passes on lavapipe (also on the Android emulator); external semaphores optional (lavapipe lacks them); CUDA import code untested (no GPU).
+- **Hardware video decode** (`vision/video.hpp`): Annex-B/SPS parsing tested; NVDEC (built only with nvcuvid.h), MediaCodec, VideoToolbox written but untested; VA-API is probe-only.
+- **Windows**: mingw-w64 cross-build compiles and links all targets (`--preset windows-mingw`; Winsock via `core/net.hpp`, dlopen shim, ReadFile pread). **Not run**: Kron4ek Wine 11.20 crashes/cannot init a prefix on this VM. macOS: osxcross toolchain file only (no SDK on the box) — not built.
+- **App integrations** (`examples/integrations`, `mind/plugin.hpp` custom-session registry): Cypha, seatbelt one_shot, NeuralVFX streaming, FUSE runtime, CameraDetector examples run as ctest `-L integration`.
+- **v1.0 release tooling**: `tools/release.py` (bump/changelog/build/verify/tag), install rules + CPack (TGZ/DEB/ZIP), platform presets and a `release` workflow preset, `docs/RELEASING.md`. The full `build` flow has not been run end to end yet.
+- **Android emulator pass** (`tests/android_emulator.sh`, x86_64 AVD API 34 under TCG — KVM is not usable in this VM): native tests run on device; Kotlin sources compile with kotlinc 2.0.21 + JDK 17.
+
 ## Remaining
 - Not testable on this machine: real CUDA/HIP GPUs, Level Zero, Metal, Windows/macOS/mobile, multi-GPU/NCCL-style collectives, and SDE-validated AMX/SME tiles.
 - Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU.

@@ -22,7 +22,7 @@ TEST(amx_bf16_and_s8) {
         std::vector<std::int8_t> a(m*k), b(n*k); std::vector<std::int32_t> c(m*n);
         for (auto& x : a) x = std::int8_t(g() % 255 - 127); for (auto& x : b) x = std::int8_t(g() % 255 - 127);
         CHECK(tile::amx_gemm_s8(a.data(), b.data(), c.data(), m, n, k));
-        for (std::size_t i = 0; i < m; ++i) for (std::size_t j = 0; j < n; ++j) { std::int32_t s = 0; for (std::size_t p = 0; p < k; ++p) s += a[i*k+p] * b[j*k+p]; CHECK(c[i*n+j] == s); }
+        for (std::size_t i = 0; i < m; ++i) for (std::size_t j = 0; j < n; ++j) { std::int32_t s = 0; for (std::size_t p = 0; p < k; ++p) s += a[i*k+p] * b[j*k+p]; CHECK_MSG(c[i*n+j] == s, "s8 %zux%zux%zu (%zu,%zu) %d vs %d", m, n, k, i, j, c[i*n+j], s); }
     }
 }
 TEST(sme_f32) {
