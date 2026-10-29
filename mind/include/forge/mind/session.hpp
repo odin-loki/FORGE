@@ -52,7 +52,20 @@ public:
             tok_->set_special(int(man_.num_or("bos_token_id", -1)), int(man_.num_or("eos_token_id", -1)));
         }
         vocab_ = i64(bp_.param_or("vocab", 0));
+        if (auto* d = std::getenv("FORGE_DEVICE")) set_device(d);
     }
+    // Select the execution device ("cpu", "vulkan"). Unavailable devices fall back to the CPU with a warning.
+    // Returns the device actually used. Clears cached plans.
+    std::string set_device(const std::string& dev) {
+        std::lock_guard lk(run_mu_);
+        std::string why;
+        reg_ = flow::device_registry(dev, &why);
+        if (!reg_ && !why.empty()) log::warn("{}; using cpu", why);
+        device_ = reg_ ? dev : "cpu";
+        cache_.clear();
+        return device_;
+    }
+    const std::string& device() const { return device_; }
     static std::shared_ptr<model> open(const std::string& p, bool verify = false) { return std::make_shared<model>(p, verify); }
 
     const pack::blueprint& blueprint() const { return bp_; }
@@ -76,7 +89,8 @@ public:
                 if (it == weights_.end()) it = weights_.emplace(name, r_.load(name)).first;
                 return {it->second.shape, it->second.data.data()};
             };
-            return flow::compile(pack::build_graph(bp_, bo), st);
+            flow::pass_options po; po.lowerings = reg_.get();
+            return flow::compile(pack::build_graph(bp_, bo), st, po);
         });
     }
 private:
@@ -87,6 +101,8 @@ private:
     flow::plan_cache cache_;
     std::map<std::string, tensor> weights_;
     std::mutex w_mu_, run_mu_;
+    std::unique_ptr<flow::registry> reg_;
+    std::string device_ = "cpu";
     i64 vocab_ = 0;
 };
 

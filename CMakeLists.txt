@@ -63,6 +63,7 @@ target_link_libraries(forge_verify INTERFACE forge_spec)
 set(FORGE_GPU_DIR ${FORGE_GEN_DIR}/gpu)
 execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR} --list
                 OUTPUT_VARIABLE FORGE_GPU_KERNELS OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _gpu_rc)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py)
 find_program(FORGE_GLSLANG glslangValidator)
 find_program(FORGE_SPIRV_VAL spirv-val)
 find_path(FORGE_VULKAN_INCLUDE vulkan/vulkan.h)
@@ -104,6 +105,9 @@ endif()
 add_library(forge_grid INTERFACE)
 target_include_directories(forge_grid INTERFACE grid/include support/include)
 target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR})
+if(FORGE_HAVE_VULKAN)
+  target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR}/vkinc)
+endif()
 add_dependencies(forge_grid forge_gpu_gen)
 target_link_libraries(forge_grid INTERFACE forge_lane)
 
@@ -236,6 +240,14 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden)
+    if(FORGE_HAVE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
+      # Same goldens with the Vulkan lowerings (ops without a GPU kernel run on the CPU).
+      add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_vk)
+      add_test(NAME golden_moe_mla_vulkan COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_moe.py
+               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_moe_vk)
+      set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+    endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
       set_tests_properties(golden_tiny_llama golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")

@@ -5,6 +5,7 @@
 #include <forge/grid/prims.hpp>
 #include <forge/lane/dispatch.hpp>
 #include <forge/verify/oracle.hpp>
+#include <memory>
 #include <mutex>
 #include <span>
 
@@ -33,6 +34,8 @@ inline kernel_fn reference_kernel(spec::op o) {
 
 class registry {
 public:
+    // A fresh registry with the CPU lowerings (backends add theirs on top, at higher priority).
+    static std::unique_ptr<registry> make() { std::unique_ptr<registry> p(new registry()); make_cpu(*p); return p; }
     static registry& cpu() { static registry* r = [] { auto* p = new registry(); make_cpu(*p); return p; }(); return *r; }
     void add(lowering l) { by_op_[std::size_t(l.op)].push_back(std::move(l)); }
     // Most specific verified lowering that supports the shapes; reference otherwise.

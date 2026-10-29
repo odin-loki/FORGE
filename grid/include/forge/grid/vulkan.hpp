@@ -11,6 +11,9 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <forge/spec/ops.gen.hpp>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -18,7 +21,8 @@
 
 namespace forge::grid::vk {
 
-struct push { std::uint32_t n = 0, rows = 0, cols = 0, k = 0; float alpha = 0; };
+struct push { std::uint32_t n = 0, rows = 0, cols = 0, k = 0; float alpha = 0; std::uint32_t a = 0, b = 0, c = 0, d = 0; float beta = 0; };
+struct hbuf { float* data; std::size_t count; };
 
 class runtime {
 public:
@@ -41,16 +45,19 @@ public:
         if (lib_) dlclose(lib_);
     }
     const std::string& device_name() const { return name_; }
+    std::map<std::string, std::size_t> dispatches() { std::lock_guard lk(mu_); return dispatches_; }
 
     static bool has_kernel(const std::string& n) { for (auto& b : spv::table) if (n == b.name) return true; return false; }
 
     // Run kernel `name` over the given host buffers (bound 0..N-1 in order; the last is written back).
-    void run(const std::string& name, std::vector<std::vector<float>*> bufs, const push& pc, std::uint32_t invocations) {
+    void run(const std::string& name, const std::vector<hbuf>& bufs, const push& pc, std::uint32_t invocations) {
+        std::lock_guard lk(mu_);
+        ++dispatches_[name];
         auto& p = pipeline(name, std::uint32_t(bufs.size()));
         struct dbuf { VkBuffer b; VkDeviceMemory m; VkDeviceSize sz; };
         std::vector<dbuf> d;
-        for (auto* h : bufs) {
-            VkDeviceSize sz = std::max<VkDeviceSize>(4, h->size() * 4);
+        for (auto& h : bufs) {
+            VkDeviceSize sz = std::max<VkDeviceSize>(4, h.count * 4);
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             VkBuffer b; ck(vkCreateBuffer(dev_, &bi, nullptr, &b), "vkCreateBuffer");
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev_, b, &mr);
@@ -58,7 +65,7 @@ public:
             VkDeviceMemory m; ck(vkAllocateMemory(dev_, &ai, nullptr, &m), "vkAllocateMemory");
             ck(vkBindBufferMemory(dev_, b, m, 0), "vkBindBufferMemory");
             void* ptr; ck(vkMapMemory(dev_, m, 0, sz, 0, &ptr), "vkMapMemory");
-            std::memcpy(ptr, h->data(), h->size() * 4); vkUnmapMemory(dev_, m);
+            std::memcpy(ptr, h.data, h.count * 4); vkUnmapMemory(dev_, m);
             d.push_back({b, m, sz});
         }
         VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, std::uint32_t(bufs.size())};
@@ -88,7 +95,7 @@ public:
         ck(vkQueueSubmit(q_, 1, &si, f), "vkQueueSubmit");
         ck(vkWaitForFences(dev_, 1, &f, VK_TRUE, ~0ull), "vkWaitForFences");
         auto& out = d.back(); void* ptr; ck(vkMapMemory(dev_, out.m, 0, out.sz, 0, &ptr), "vkMapMemory");
-        std::memcpy(bufs.back()->data(), ptr, bufs.back()->size() * 4); vkUnmapMemory(dev_, out.m);
+        std::memcpy(bufs.back().data, ptr, bufs.back().count * 4); vkUnmapMemory(dev_, out.m);
         vkDestroyFence(dev_, f, nullptr); vkFreeCommandBuffers(dev_, pool_, 1, &cb); vkDestroyDescriptorPool(dev_, dp, nullptr);
         for (auto& x : d) { vkDestroyBuffer(dev_, x.b, nullptr); vkFreeMemory(dev_, x.m, nullptr); }
     }
@@ -184,34 +191,67 @@ private:
     void* lib_ = nullptr;
     VkInstance inst_ = nullptr; VkPhysicalDevice phys_ = nullptr; VkDevice dev_ = nullptr; VkQueue q_ = nullptr; VkCommandPool pool_{};
     std::string name_;
+    std::mutex mu_;
+    std::map<std::string, std::size_t> dispatches_;
     std::map<std::string, pipe> pipes_;
 };
 
-// Run one spec op on the device. Elementwise ops need same-shape inputs; softmax/rms_norm act on the last axis;
-// matmul_t is a[..., m, k] @ b[n, k]^T. Returns false if this op/shape has no Vulkan lowering.
-inline bool run_op(runtime& rt, const std::string& op, const std::vector<forge::tensor>& in, float alpha, forge::tensor& out) {
+// Run one spec op on the device over host views (out.shape must already be the op's output shape).
+// Elementwise ops need same-shape inputs; softmax/rms_norm act on the last axis; matmul_t is a[..., m, k] @ b[n, k]^T.
+// Returns false if this op/shape/attrs combination has no Vulkan lowering (the caller falls back to the CPU).
+inline bool supports(const std::string& op, const std::vector<shape_t>& in, const spec::attrs& a) {
     if (!runtime::has_kernel(op) || in.empty()) return false;
     auto& x = in[0];
-    std::uint32_t n = std::uint32_t(x.data.size());
-    std::vector<std::vector<float>> h; for (auto& t : in) h.push_back(t.data);
-    push pc; pc.n = n; pc.alpha = alpha;
-    std::uint32_t inv = n;
-    if (op == "softmax" || op == "rms_norm") {
-        if (x.shape.empty()) return false;
-        pc.cols = std::uint32_t(x.shape.back()); pc.rows = pc.cols ? n / pc.cols : 0; inv = pc.rows;
-        if (op == "rms_norm" && (in.size() != 2 || in[1].data.size() != pc.cols)) return false;
-        out = forge::tensor(x.shape);
+    if (op == "softmax") return !x.empty() && (a.num("axis", -1) == -1 || a.num("axis", -1) == double(x.size()) - 1);
+    if (op == "rms_norm") return in.size() == 2 && !x.empty() && in[1].size() == 1 && in[1][0] == x.back();
+    if (op == "matmul_t") return in.size() == 2 && x.size() >= 2 && in[1].size() == 2 && in[1][1] == x.back();
+    if (op == "rope") return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0];
+    if (op == "gather") return in.size() == 2 && x.size() == 2;
+    if (op == "slice") return in.size() == 1 && !x.empty() && a.num("step", 1) == 1;
+    if (op == "attention") return in.size() == 3 && x.size() == 3 && in[1].size() == 3 && in[2].size() == 3 && in[1][1] > 0 && x[1] % in[1][1] == 0;
+    for (auto& t : in) if (t != x) return false;
+    return true;
+}
+inline bool run_op(runtime& rt, const std::string& op, const std::vector<tensor_view>& in, const spec::attrs& a, tensor_view out) {
+    std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
+    if (!supports(op, ss, a)) return false;
+    auto& x = in[0];
+    push pc; pc.n = std::uint32_t(out.size());
+    std::uint32_t inv = pc.n;
+    if (op == "scale") pc.alpha = float(a.num("alpha", 1.0));
+    else if (op == "softmax" || op == "rms_norm") {
+        pc.cols = std::uint32_t(x.shape.back()); pc.rows = pc.cols ? std::uint32_t(x.size()) / pc.cols : 0; inv = pc.rows;
+        if (op == "rms_norm") pc.alpha = float(a.num("eps", 1e-6));
     } else if (op == "matmul_t") {
-        if (in.size() != 2 || x.shape.size() < 2 || in[1].shape.size() != 2 || in[1].shape[1] != x.shape.back()) return false;
-        pc.k = std::uint32_t(x.shape.back()); pc.rows = n / pc.k; pc.cols = std::uint32_t(in[1].shape[0]); inv = pc.rows * pc.cols;
-        auto s = x.shape; s.back() = in[1].shape[0]; out = forge::tensor(s);
-    } else {
-        for (auto& t : in) if (t.shape != x.shape) return false;
-        out = forge::tensor(x.shape);
+        pc.k = std::uint32_t(x.shape.back()); pc.rows = std::uint32_t(x.size()) / pc.k; pc.cols = std::uint32_t(in[1].shape[0]); inv = pc.rows * pc.cols;
+    } else if (op == "rope") {
+        pc.rows = std::uint32_t(x.shape[0]); pc.cols = std::uint32_t(x.shape[1]); pc.k = std::uint32_t(x.shape[2]);
+        pc.alpha = float(a.num("base", 10000.0)); pc.a = a.num("neox", 1) != 0; inv = pc.rows * pc.cols * (pc.k / 2);
+    } else if (op == "slice") {
+        auto ax = std::size_t(spec::norm_axis(i64(a.num("axis", 0)), x.shape.size()));
+        i64 inner = 1; for (std::size_t d = ax + 1; d < x.shape.size(); ++d) inner *= x.shape[d];
+        i64 st = i64(a.num("start", 0)); if (st < 0) st += x.shape[ax];
+        pc.cols = std::uint32_t(x.shape[ax]); pc.k = std::uint32_t(inner); pc.a = std::uint32_t(st); pc.b = std::uint32_t(out.shape[ax]);
+    } else if (op == "gather") {
+        pc.rows = std::uint32_t(x.shape[0]); pc.cols = std::uint32_t(x.shape[1]);
+    } else if (op == "attention") {
+        pc.rows = std::uint32_t(x.shape[0]); pc.cols = std::uint32_t(x.shape[1]); pc.k = std::uint32_t(x.shape[2]);
+        pc.a = std::uint32_t(in[1].shape[0]); pc.b = std::uint32_t(in[1].shape[1]); pc.c = std::uint32_t(in[2].shape[2]);
+        pc.d = (a.num("causal", 1) != 0 ? 1u : 0u) | (std::uint32_t(a.num("window", 0)) << 1);
+        pc.alpha = float(a.num("scale", 1.0 / std::sqrt(double(pc.k)))); inv = pc.rows * pc.cols;
     }
-    std::vector<std::vector<float>*> b; for (auto& v : h) b.push_back(&v); b.push_back(&out.data);
+    std::vector<hbuf> b; for (auto& v : in) b.push_back({v.data, v.size()}); b.push_back({out.data, out.size()});
     rt.run(op, b, pc, inv);
     return true;
+}
+inline bool run_op(runtime& rt, const std::string& op, const std::vector<forge::tensor>& in, const spec::attrs& a, forge::tensor& out) {
+    auto o = spec::op_from_name(op);
+    if (!o) return false;
+    std::vector<shape_t> ss; std::vector<tensor_view> vs;
+    for (auto& t : in) { ss.push_back(t.shape); vs.push_back({const_cast<float*>(t.data.data()), t.shape}); }
+    if (!supports(op, ss, a)) return false;
+    out = forge::tensor(spec::infer_shape(spec::info(*o).shape, ss, a));
+    return run_op(rt, op, vs, a, out.view());
 }
 
 } // namespace forge::grid::vk

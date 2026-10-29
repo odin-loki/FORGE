@@ -140,7 +140,8 @@ inline graph fuse(graph g) {
     return g;
 }
 
-struct pass_options { bool cse = true, fold = true, simplify = true, fuse = true; };
+class registry;
+struct pass_options { bool cse = true, fold = true, simplify = true, fuse = true; registry* lowerings = nullptr; /* null = CPU */ };
 
 inline graph optimise(graph g, const pass_options& o = {}, const std::map<std::string, shape_t>& st = {}) {
     verify_graph(g, st);

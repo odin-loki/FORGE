@@ -113,7 +113,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
     p->arena.assign(p->mem.arena_bytes / sizeof(float) + 1, 0.f);
     auto& G = p->g;
     p->views.resize(G.size());
-    auto& reg = registry::cpu();
+    auto& reg = po.lowerings ? *po.lowerings : registry::cpu();
     for (std::size_t i = 0; i < G.size(); ++i) {
         auto& n = G.nodes()[i];
         auto& s = p->mem.slots[i];
