@@ -148,3 +148,6 @@ no memory clobber), reused thread_local pack buffers, and test_tile retries befo
 - test_vulkan: the 33 kernel oracles and vk.rope now pass with the relative 2^-11 bound. Still failing on SwiftShader: "residency: dispatches are not batched" and the e2e tiny llama step, which only fails on that batching flag (logits err 8.8e-4, greedy tokens identical). Not investigated yet.
 - test_mind: exceeds 10–20 min under TCG with 2 threads and has taken the emulator down from memory twice. Treated as too heavy for this box; it passes on Linux and wine.
 - `tests/android_emulator.sh` accepts FORGE_TEST_TIMEOUT and FORGE_THREADS, and retries when adb drops.
+
+## test_vulkan batching on SwiftShader — fixed
+Root cause was a real backend bug. SwiftShader requires a 256-byte minStorageBufferOffsetAlignment. Sub-range views of a resident buffer at misaligned offsets made `acquire` drop the parent buffer, which forced a submit and a host sync (143 submits/571 dispatches). Such views are now staged through scratch buffers with device-side copies, including write-back of outputs. `FORGE_VK_SSBO_ALIGN` emulates stricter drivers, and the `test_vulkan_align256` ctest covers this on lavapipe. Lavapipe (with and without align=256) and the Android emulator now give 63 submits/571 dispatches and test_vulkan passes. Linux dev suite: all pass.
