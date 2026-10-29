@@ -29,7 +29,7 @@
 forge::mind::session_options opt; opt.context = 256;
 forge::mind::session s(path, opt);
 auto prompt = s.tokenizer()->encode("Hello");
-forge::mind::sampler smp({});                 // greedy
+forge::mind::sampler smp;                     // default config = greedy
 auto out = s.generate(prompt, 16, smp);
 ```
 
