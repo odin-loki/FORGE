@@ -1,4 +1,6 @@
 #pragma once
+// Error model: errc codes, forge::error values, and forge_exception (thrown by raise(errc, fmt, ...)).
+// Library code throws forge_exception; the C ABI converts it to forge_last_error(), and forge::os returns result<T> instead.
 #include <expected>
 #include <format>
 #include <stdexcept>

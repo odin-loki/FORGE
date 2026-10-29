@@ -1,4 +1,6 @@
 #pragma once
+// Umbrella header for flow: IR, passes, codecs, memory planning, CPU and Vulkan lowerings, and plans/executor.
+// autodiff.hpp, kv_codec.hpp and rpc.hpp are included separately. Guide: docs/flow.md.
 #include <forge/flow/codecs.hpp>
 #include <forge/flow/ir.hpp>
 #include <forge/flow/passes.hpp>

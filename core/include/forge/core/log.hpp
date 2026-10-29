@@ -1,4 +1,6 @@
 #pragma once
+// Leveled stderr logging. The threshold comes from FORGE_LOG (first letter: t[race] d[ebug] i[nfo] w[arn] e[rror];
+// default warn).
 #include <cstdio>
 #include <cstdlib>
 #include <format>

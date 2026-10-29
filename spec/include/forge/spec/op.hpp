@@ -1,4 +1,6 @@
 #pragma once
+// Op metadata types (class, shape rule, tolerance, fusion) used by the table generated from spec/ops/*.fspec.
+// See spec/README.md.
 #include <forge/core/tensor.hpp>
 #include <algorithm>
 #include <map>
