@@ -167,3 +167,45 @@ TEST(codecs_roundtrip) {
         CHECK_MSG(maxe <= bound, "%s", std::string(c.name).c_str());
     }
 }
+
+#include <forge/flow/autodiff.hpp>
+// Reverse-mode gradients vs central finite differences (double-precision forward via the same plan in f32,
+// so the tolerance is loose but the check catches wrong formulas immediately).
+TEST(autodiff_matches_finite_differences) {
+    using namespace forge::flow; using spec::op;
+    auto build = [](graph& g, std::vector<value_id>& ins) {
+        auto x = g.input("x", {3, 4}), W = g.input("W", {5, 4}), V = g.input("V", {5, 2}), bvec = g.input("b", {5}), nw = g.input("nw", {4}), c = g.input("c", {3, 1});
+        ins = {x, W, V, bvec, nw, c};
+        auto h = g.apply(op::rms_norm, {x, nw}, {{"eps", 1e-5}});
+        auto z = g.add(g.apply(op::matmul_t, {h, W}), bvec);                       // [3,5]
+        auto t = g.apply(op::tanh, {z}), s = g.apply(op::silu, {z}), sg = g.apply(op::sigmoid, {t});
+        auto sm = g.apply(op::softmax, {g.add(t, s)});
+        auto m = g.matmul(g.mul(sm, sg), V);                                         // [3,2]
+        auto q = g.apply(op::div, {g.apply(op::square, {m}), g.add(g.apply(op::exp, {c}), g.scalar(1.f))});
+        auto r = g.apply(op::relu, {g.apply(op::sub, {q, g.scalar(0.01f)})});
+        auto lse = g.apply(op::logsumexp, {g.apply(op::transpose, {g.add(r, g.apply(op::log, {g.add(g.apply(op::abs, {m}), g.scalar(1.f))}))}, {{"perm", std::vector<i64>{1, 0}}})}, {{"axis", 1.0}});
+        auto loss = g.apply(op::reduce_mean, {g.apply(op::sqrt, {g.add(g.apply(op::reshape, {lse}, {{"shape", std::vector<i64>{2}}}), g.scalar(4.f))})}, {{"axis", 0.0}});
+        return loss;
+    };
+    std::mt19937 rng(11); std::normal_distribution<float> N(0, 1);
+    std::vector<std::vector<float>> data; for (i64 n : {12, 20, 10, 5, 4, 3}) { std::vector<float> v(static_cast<std::size_t>(n)); for (auto& e : v) e = N(rng); data.push_back(v); }
+    const char* names[] = {"x", "W", "V", "b", "nw", "c"};
+    graph g; std::vector<value_id> ins; auto loss = build(g, ins);
+    auto gr = grad(g, loss, ins);
+    g.output("loss", loss); for (std::size_t i = 0; i < ins.size(); ++i) g.output(std::string("d") + names[i], gr[ins[i]]);
+    auto p = compile(g); executor ex(*p);
+    auto run = [&](const std::vector<std::vector<float>>& d) { for (std::size_t i = 0; i < d.size(); ++i) ex.set_input(names[i], d[i]); ex.run(); return double(ex.output_view("loss").data[0]); };
+    run(data);
+    std::vector<std::vector<float>> an; for (auto nm : names) { auto v = ex.output_view(std::string("d") + nm); an.emplace_back(v.data, v.data + v.size()); }
+    double worst = 0;
+    for (std::size_t i = 0; i < data.size(); ++i) for (std::size_t j = 0; j < data[i].size(); ++j) {
+        auto d2 = data; float h = 2e-3f; d2[i][j] += h; double fp = run(d2); d2[i][j] -= 2 * h; double fm = run(d2);
+        double fd = (fp - fm) / (2 * h), e = std::fabs(fd - an[i][j]) / std::max(1e-2, std::fabs(fd));
+        worst = std::max(worst, e); CHECK_MSG(e < 3e-2, "d%s[%zu]: analytic %g fd %g", names[i], j, double(an[i][j]), fd);
+    }
+    std::printf("  autodiff worst relative error vs finite differences: %.2e\n", worst);
+    graph g2; auto a = g2.input("a", {4}); auto am = g2.apply(op::argmax, {a}, {{"axis", 0.0}});
+    CHECK_THROWS(grad(g2, am, {a}));
+    graph g3; auto u = g3.input("u", {2}), v = g3.input("v", {2}); auto l3 = g3.apply(op::reduce_sum, {g3.apply(op::exp, {u})}, {{"axis", 0.0}});
+    auto z3 = grad(g3, l3, {u, v}); CHECK(g3.at(z3[v]).kind == node_kind::constant);
+}
