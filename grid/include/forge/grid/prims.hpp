@@ -4,6 +4,8 @@
 #include <forge/rand/philox.hpp>
 #include <algorithm>
 #include <numeric>
+#include <limits>
+#include <stdexcept>
 
 namespace forge::grid::prims {
 
@@ -70,6 +72,43 @@ inline void radix_sort(span<std::uint32_t> keys, span<std::uint32_t> vals = {}) 
 inline void histogram(span<const std::uint32_t> x, span<std::uint32_t> bins) {
     for (auto v : x) if (v < bins.size()) ++bins[v];
 }
+
+// Segmented inclusive sum: seg_start[i] != 0 begins a new segment at i.
+template <class T> void segmented_scan(span<const T> x, span<const std::uint8_t> seg_start, span<T> out) {
+    T acc{}; for (std::size_t i = 0; i < x.size(); ++i) { acc = (i == 0 || seg_start[i]) ? x[i] : acc + x[i]; out[i] = acc; }
+}
+// Per-segment sums given CSR-style offsets (offsets.size() == segments + 1).
+template <class T> void segmented_reduce(span<const T> x, span<const std::uint32_t> offsets, span<T> out) {
+    for (std::size_t s = 0; s + 1 < offsets.size(); ++s) { T a{}; for (auto i = offsets[s]; i < offsets[s + 1]; ++i) a += x[i]; out[s] = a; }
+}
+// Bitonic sorting network (ascending); the data-independent compare/exchange sequence that GPU kernels use.
+// Any length: pads to a power of two with +inf internally.
+inline void bitonic_sort(span<float> x) {
+    std::size_t n = 1; while (n < x.size()) n <<= 1;
+    std::vector<float> a(n, std::numeric_limits<float>::infinity()); std::copy(x.begin(), x.end(), a.begin());
+    for (std::size_t k = 2; k <= n; k <<= 1)
+        for (std::size_t j = k >> 1; j > 0; j >>= 1)
+            for (std::size_t i = 0; i < n; ++i) { std::size_t l = i ^ j; if (l > i) { bool up = (i & k) == 0; if ((a[i] > a[l]) == up) std::swap(a[i], a[l]); } }
+    std::copy(a.begin(), a.begin() + std::ptrdiff_t(x.size()), x.begin());
+}
+// Open-addressing hash map, u64 keys -> u32 values, linear probing, power-of-two capacity, grows at 50% load.
+class hash_map {
+public:
+    explicit hash_map(std::size_t cap = 16) { std::size_t c = 16; while (c < cap * 2) c <<= 1; k_.assign(c, empty); v_.assign(c, 0); }
+    void insert(std::uint64_t key, std::uint32_t val) {
+        if (key == empty) throw std::invalid_argument("hash_map: reserved key");
+        if ((n_ + 1) * 2 > k_.size()) grow();
+        std::size_t i = slot(key); if (k_[i] == empty) { k_[i] = key; ++n_; } v_[i] = val;
+    }
+    const std::uint32_t* find(std::uint64_t key) const { std::size_t i = slot(key); return k_[i] == key ? &v_[i] : nullptr; }
+    std::size_t size() const { return n_; }
+    static constexpr std::uint64_t empty = ~std::uint64_t(0);
+private:
+    static std::uint64_t mix(std::uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; return x ^ (x >> 33); }
+    std::size_t slot(std::uint64_t key) const { std::size_t m = k_.size() - 1, i = std::size_t(mix(key)) & m; while (k_[i] != empty && k_[i] != key) i = (i + 1) & m; return i; }
+    void grow() { auto k = std::move(k_); auto v = std::move(v_); k_.assign(k.size() * 2, empty); v_.assign(k.size() * 2, 0); n_ = 0; for (std::size_t i = 0; i < k.size(); ++i) if (k[i] != empty) insert(k[i], v[i]); }
+    std::vector<std::uint64_t> k_; std::vector<std::uint32_t> v_; std::size_t n_ = 0;
+};
 
 // Top-k (values descending) returning indices.
 inline std::vector<std::uint32_t> top_k(span<const float> x, std::size_t k) {
