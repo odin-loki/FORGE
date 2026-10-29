@@ -7,6 +7,7 @@
 #include <forge/mind/grammar.hpp>
 #include <forge/mind/session.hpp>
 #include <condition_variable>
+#include <atomic>
 #include <deque>
 #include <list>
 #include <thread>
@@ -53,9 +54,15 @@ public:
     const batch_stats& stats() const { return stats_; }
 
     // One scheduling iteration. Returns false when there was nothing to do.
+    // Memory pressure: drop cached prefix sessions (their KV state) down to `keep`, applied on the worker at the
+    // next step. Safe from any thread (e.g. a forge::os::memory_pressure callback). Returns immediately.
+    void request_kv_eviction(std::size_t keep = 0) { evict_keep_.store(keep); evict_.store(true); std::lock_guard lk(mu_); cv_.notify_all(); }
+    std::size_t evictions() const { return evictions_.load(); }
+
     bool step() {
         {
             std::lock_guard lk(mu_);
+            if (evict_.exchange(false)) { auto k = evict_keep_.load(); while (cache_.size() > k) { cache_.pop_back(); ++evictions_; } }
             while (!waiting_.empty() && int(active_.size()) < o_.max_active) {
                 auto w = std::move(waiting_.front()); waiting_.pop_front();
                 active_.push_back(admit(w.id, std::move(w.r)));
@@ -87,7 +94,7 @@ public:
             for (;;) {
                 {
                     std::unique_lock lk(mu_);
-                    cv_.wait(lk, [&] { return quit_ || !waiting_.empty() || !active_.empty(); });
+                    cv_.wait(lk, [&] { return quit_ || evict_.load() || !waiting_.empty() || !active_.empty(); });
                     if (quit_) return;
                 }
                 try { step(); } catch (const std::exception& e) { fail_all(e.what()); }
@@ -181,6 +188,8 @@ private:
     batch_stats stats_;
     std::thread worker_;
     bool quit_ = false;
+    std::atomic<bool> evict_{false};
+    std::atomic<std::size_t> evict_keep_{0}, evictions_{0};
 };
 
 } // namespace forge::mind

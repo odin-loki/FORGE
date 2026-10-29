@@ -14,6 +14,10 @@
 #include <forge/mind/mind.hpp>
 #include <forge/core/net.hpp>
 #include <forge/balance/proxy.hpp>
+#include <forge/os/cpu_topology.hpp>
+#include <forge/os/file_watch.hpp>
+#include <forge/os/memory_pressure.hpp>
+#include <forge/os/service.hpp>
 #include <signal.h>
 #include <atomic>
 #include <cstdio>
@@ -111,6 +115,7 @@ public:
     server(std::shared_ptr<mind::model> m, mind::batch_options bo, std::string name)
         : m_(std::move(m)), sched_(m_, bo), name_(std::move(name)) { sched_.start(); }
     ~server() { sched_.stop(); }
+    void evict_kv(std::size_t keep) { sched_.request_kv_eviction(keep); }
 
     void handle(forge_sock_t fd) {
         conn c{fd};
@@ -243,6 +248,10 @@ private:
     std::atomic<std::uint64_t> counter_{0};
 };
 
+bool has_flag(int argc, char** argv, const std::string& k) {
+    for (int i = 1; i < argc; ++i) if (argv[i] == "--" + k) return true;
+    return false;
+}
 std::string arg(int argc, char** argv, const std::string& k, const std::string& d) {
     for (int i = 1; i + 1 < argc; ++i) if (argv[i] == "--" + k) return argv[i + 1];
     return d;
@@ -293,7 +302,7 @@ int run_proxy(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)
@@ -314,7 +323,20 @@ int main(int argc, char** argv) {
         mind::batch_options bo;
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
+        namespace fos = forge::os;
+        // P-core pinning: on hybrid CPUs keep the main thread (and the scheduler/request threads it spawns, which
+        // inherit the mask) on performance cores. --no-pin disables.
+        if (!has_flag(argc, argv, "no-pin")) if (auto t = fos::cpu_topology_query(); t.hybrid) {
+            auto r = fos::pin_thread_to_kind(fos::core_kind::performance);
+            std::printf("forge-serve: hybrid CPU, pinned to %zu P-cores%s\n", t.of_kind(fos::core_kind::performance).size(), r ? "" : " (failed)");
+        }
         server srv(m, bo, fs::path(argv[1]).filename().string());
+        // Memory pressure -> drop cached prefix KV sessions (moderate: keep 1, critical: keep none).
+        fos::memory_pressure::instance().subscribe([&srv](fos::pressure_level l) {
+            if (l == fos::pressure_level::normal) return;
+            srv.evict_kv(l == fos::pressure_level::critical ? 0 : 1);
+            fos::service::log(fos::log_level::warning, std::string("memory pressure ") + fos::pressure_name(l) + ": evicting prefix KV cache", "forge-serve");
+        });
         forge_sock_t s = ::socket(AF_INET, SOCK_STREAM, 0);
         int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof one);
         sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(std::uint16_t(std::stoi(arg(argc, argv, "port", "8080"))));
@@ -324,6 +346,26 @@ int main(int argc, char** argv) {
         socklen_t al = sizeof a; getsockname(s, reinterpret_cast<sockaddr*>(&a), &al);
         std::printf("forge-serve: %s on http://%s:%d (max_active %d)\n", path.c_str(), arg(argc, argv, "host", "127.0.0.1").c_str(), ntohs(a.sin_port), bo.max_active);
         std::fflush(stdout);
+        fos::service::ready("serving " + path);
+        // Hot reload: --watch re-execs forge-serve when the model file changes (systemd sees RELOADING=1 then READY=1).
+        std::thread watcher;
+        if (has_flag(argc, argv, "watch")) watcher = std::thread([&, s] {
+            fos::file_watcher w; if (auto st = w.add(argv[1]); !st) { std::fprintf(stderr, "forge-serve: --watch: %s\n", st.err.what.c_str()); return; }
+            for (;;) for (auto& e : w.poll(1000)) if (e.kind != fos::watch_kind::removed) {
+                fos::sleep_ns(500'000'000);   // let the writer finish
+                std::printf("forge-serve: %s changed, reloading\n", e.path.c_str()); std::fflush(stdout);
+                fos::service::reloading();
+#if !defined(_WIN32)
+                forge_sock_close(s);
+                std::vector<char*> av(argv, argv + argc); av.push_back(nullptr);
+                ::execv(fos::exe_path().c_str(), av.data());
+                std::fprintf(stderr, "forge-serve: re-exec failed: %s\n", std::strerror(errno));
+#else
+                std::fprintf(stderr, "forge-serve: hot reload re-exec is not supported on Windows; restart the service\n");
+#endif
+            }
+        });
+        if (watcher.joinable()) watcher.detach();
         for (;;) {
             forge_sock_t fd = ::accept(s, nullptr, nullptr);
             if (fd == FORGE_SOCK_BAD) continue;
