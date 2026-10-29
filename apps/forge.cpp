@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fstream>
 #include <set>
+#include <chrono>
+#include <forge/grid/prims.hpp>
 
 using namespace forge;
 
@@ -41,7 +43,7 @@ int usage() {
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
-        "  bench <model.fpk> [-p 32] [-n 32]\n"
+        "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32");
     return 2;
 }
@@ -130,7 +132,27 @@ int cmd_run(const args& a) {
     return 0;
 }
 
+int cmd_bench_gemm(int n) {
+    std::vector<float> A(std::size_t(n) * n, 0.5f), B(std::size_t(n) * n, 0.25f), C(std::size_t(n) * n);
+    for (const char* t : {"scalar", "avx2", "avx512"}) {
+        auto* k = lane::by_name(t); if (!k) continue;
+        k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n));
+        auto t0 = std::chrono::steady_clock::now(); int reps = 0;
+        do { k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n)); ++reps; }
+        while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
+        std::printf("lane::%-7s gemm_nt %d^3: %8.2f GFLOP/s (1 thread)\n", t, n, 2.0 * n * n * n / s / 1e9);
+    }
+    auto t0 = std::chrono::steady_clock::now(); int reps = 0;
+    do { grid::prims::gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n)); ++reps; }
+    while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
+    std::printf("grid::prims gemm_nt %d^3: %8.2f GFLOP/s (all threads)\n", n, 2.0 * n * n * n / s / 1e9);
+    return 0;
+}
+
 int cmd_bench(const args& a) {
+    if (a.kv.count("gemm")) return cmd_bench_gemm(int(a.num("gemm", 512)));
     if (a.pos.empty()) return usage();
     mind::session s(a.pos[0]);
     int p = int(a.num("p", 32)), n = int(a.num("n", 32));
