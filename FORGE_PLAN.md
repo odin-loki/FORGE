@@ -719,6 +719,7 @@ Parallelism: Phase 2's CPU backend can start alongside Phase 1, and the `.fpk` r
 - **Vendor churn.** New GPU generations arrive yearly and support lists change. Keep backends thin; put intelligence in `flow` and `spec`.
 - **Blueprint expressiveness.** Some new architectures will need ops the engine lacks. Mitigation: **composite ops** — a file can define a new op as a composition of existing primitives, so new models run (slower) on older engines, and a fused kernel can be registered later without changing the file.
 - **Licensing and provenance.** xsimd (BSD-3) and llama.cpp (MIT) permit reuse with notices retained, but a clean-room implementation of a new pattern gives clean provenance for government customers; record anything derived in `NOTICE`. CUDA's headers and libraries are under NVIDIA's licence — mirror concepts, never code. Model weights carry their own licences; `pack` records them and the importer never strips them.
+- **Project licence.** FORGE is dual licensed: AGPL-3.0-or-later plus a commercial licence (see `LICENSE` and `COMMERCIAL-LICENCE.md`). Dual licensing only works while all copyright is held by the author, so any outside contributions need a contributor licence agreement before they are merged.
 - **Export obligations.** Shipping encryption and high-performance AI software to overseas government customers can bring the cryptography and dual-use categories of the Defence and Strategic Goods List into play. Check obligations with Defence Export Controls before exporting builds with the encryption hook enabled.
 
 ---
