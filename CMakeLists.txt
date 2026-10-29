@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(FORGE VERSION 0.1.0 LANGUAGES CXX)
+project(FORGE VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -71,6 +71,10 @@ target_link_libraries(forge_pack INTERFACE forge_flow)
 add_library(forge_mind INTERFACE)
 target_include_directories(forge_mind INTERFACE mind/include)
 target_link_libraries(forge_mind INTERFACE forge_pack)
+target_include_directories(forge_mind INTERFACE mind/include)
+add_library(forge_c SHARED mind/capi/forge_c.cpp)
+target_link_libraries(forge_c PRIVATE forge_mind forge_verify forge_lane_mv)
+set_target_properties(forge_c PROPERTIES OUTPUT_NAME forge VERSION 0.1.0 SOVERSION 1 CXX_VISIBILITY_PRESET default)
 target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Multiversioned lane kernels: one TU per target, own flags, own namespace.
@@ -101,9 +105,14 @@ if(FORGE_BUILD_TESTS)
     endif()
     add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
+  add_executable(capi_smoke tests/capi_smoke.c)
+  target_include_directories(capi_smoke PRIVATE mind/include)
+  target_link_libraries(capi_smoke PRIVATE forge_c)
   if(FORGE_BUILD_APPS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden)
+    add_test(NAME capi_smoke COMMAND capi_smoke ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+    set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
   endif()
 endif()

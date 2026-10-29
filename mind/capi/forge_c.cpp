@@ -1,0 +1,66 @@
+#include <forge.h>
+#include <forge/mind/mind.hpp>
+#include <cstring>
+
+namespace { thread_local std::string g_err; }
+struct forge_model { forge::mind::session s; explicit forge_model(const char* p, forge::mind::session_options o) : s(p, o) {} };
+
+#define FORGE_TRY(fail) catch (const std::exception& e) { g_err = e.what(); return fail; } catch (...) { g_err = "unknown error"; return fail; }
+
+extern "C" {
+uint32_t forge_abi_version(void) { return FORGE_ABI_VERSION; }
+const char* forge_version(void) { return "0.1.0"; }
+const char* forge_last_error(void) { return g_err.c_str(); }
+
+forge_model* forge_open(const char* path, int64_t ctx, int verify) {
+    try { return new forge_model(path, {ctx, verify != 0}); } FORGE_TRY(nullptr)
+}
+void forge_close(forge_model* m) { delete m; }
+void forge_reset(forge_model* m) { if (m) m->s.reset(); }
+int64_t forge_vocab_size(const forge_model* m) {
+    try { return int64_t(m->s.blueprint().param("vocab")); } FORGE_TRY(-1)
+}
+int64_t forge_tokenize(const forge_model* m, const char* text, int add_bos, int32_t* out, int64_t cap) {
+    try {
+        auto* t = m->s.tokenizer();
+        if (!t) { g_err = "model has no tokenizer"; return -1; }
+        auto ids = t->encode(text);
+        if (add_bos && t->bos() >= 0) ids.insert(ids.begin(), t->bos());
+        for (int64_t i = 0; i < int64_t(ids.size()) && i < cap; ++i) out[i] = ids[std::size_t(i)];
+        return int64_t(ids.size());
+    } FORGE_TRY(-1)
+}
+int64_t forge_detokenize(const forge_model* m, const int32_t* ids, int64_t n, char* out, int64_t cap) {
+    try {
+        auto* t = m->s.tokenizer();
+        if (!t) { g_err = "model has no tokenizer"; return -1; }
+        std::string s = t->decode(std::vector<int>(ids, ids + n));
+        if (out && cap > 0) { auto k = std::min<std::size_t>(s.size(), std::size_t(cap - 1)); std::memcpy(out, s.data(), k); out[k] = 0; }
+        return int64_t(s.size());
+    } FORGE_TRY(-1)
+}
+int forge_forward(forge_model* m, const int32_t* ids, int64_t n, float* logits, int64_t cap) {
+    try {
+        auto l = m->s.forward(std::span<const int>(ids, std::size_t(n)));
+        std::memcpy(logits, l.data(), std::min<std::size_t>(l.size(), std::size_t(cap)) * 4);
+        return 0;
+    } FORGE_TRY(-1)
+}
+int64_t forge_generate(forge_model* m, const int32_t* prompt, int64_t np, int32_t max_new, const forge_sampling* s,
+                       int32_t* out, int64_t cap, forge_token_cb cb, void* user) {
+    try {
+        forge::mind::sampler_config c;
+        if (s) { c.temperature = s->temperature; c.top_k = s->top_k; c.top_p = s->top_p > 0 ? s->top_p : 1.f; c.min_p = s->min_p;
+                 c.repetition_penalty = s->repetition_penalty > 0 ? s->repetition_penalty : 1.f; c.seed = s->seed; }
+        forge::mind::sampler smp(c);
+        auto* tok = m->s.tokenizer();
+        auto r = m->s.generate(std::span<const int>(prompt, std::size_t(np)), max_new, smp, [&](int t) {
+            if (!cb) return true;
+            std::string txt = tok ? tok->decode_one(t) : std::string();
+            return cb(t, txt.c_str(), user) == 0;
+        });
+        for (int64_t i = 0; i < int64_t(r.size()) && i < cap; ++i) out[i] = r[std::size_t(i)];
+        return int64_t(r.size());
+    } FORGE_TRY(-1)
+}
+}
