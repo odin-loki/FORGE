@@ -106,6 +106,22 @@ The emulators are `qemu-aarch64 -cpu max,sve256=on` and `qemu-riscv64 -cpu rv64,
     gradle :forge:connectedAndroidTest                       # on a device; set FORGE_TEST_FPK for the model test
 On the device, `FORGE_DEVICE=vulkan` selects the Vulkan backend; otherwise the NEON CPU lanes run. The ctest entries are `mobile_android_<abi>` and `mobile_android_device`.
 
+### Android emulator (low-memory settings used on the shared box)
+    emulator -avd forge -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect \
+      -memory 2048 -cores 2 -no-metrics -accel off -feature -Netsim     # TCG boot: 4–12 min
+    adb push build/android-x64/test_os_ext $NDK/.../x86_64-linux-android/libc++_shared.so /data/local/tmp/forge/
+    adb shell 'cd /data/local/tmp/forge && FORGE_THREADS=2 LD_LIBRARY_PATH=. TMPDIR=. ./test_os_ext'
+Run one test at a time with a timeout; skip test_mind (OOMs the emulator). `tests/android_emulator.sh` automates this.
+
+### Windows under wine64
+    cmake -S . -B build/win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=<mingw toolchain>; ninja -C build/win64 -j4
+    WINEPREFIX=~/.wine-forge64 tests/wine_run.sh build/win64     # pure win64 prefix; 77 = skip
+Do not leave `FORGE_OS_EXT_CHILD` exported in the shell — test_os_ext children use it.
+
+### zig cross compile+link (FreeBSD, macOS, MinGW, musl)
+`ctest -L cross` runs `zig c++ -target <x86_64-freebsd|aarch64-macos|x86_64-macos|x86_64-windows-gnu|aarch64-linux-musl>`
+on test_os, test_balance and test_os_ext. Use `ninja -j4` or lower on shared machines.
+
 ### iOS / macOS (Xcode 15+)
     tools/build_xcframework.sh                 # iOS device + simulator + macOS -> bindings/apple/FORGE.xcframework
     cd bindings/apple && swift test            # XCTest; set FORGE_TEST_FPK=/path/model.fpk
