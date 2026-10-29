@@ -57,6 +57,15 @@ add_library(forge_core INTERFACE)
 target_include_directories(forge_core INTERFACE core/include)
 add_library(forge::core ALIAS forge_core)
 
+add_library(forge_os INTERFACE)   # unified OS layer
+target_include_directories(forge_os INTERFACE os/include)
+if(WIN32)
+  target_link_libraries(forge_os INTERFACE ws2_32 bcrypt)
+elseif(UNIX AND NOT APPLE)
+  target_link_libraries(forge_os INTERFACE ${CMAKE_DL_LIBS})
+endif()
+target_link_libraries(forge_core INTERFACE forge_os)
+
 add_library(forge_spec INTERFACE)
 target_include_directories(forge_spec INTERFACE spec/include ${FORGE_GEN_DIR})
 target_link_libraries(forge_spec INTERFACE forge_core)

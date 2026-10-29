@@ -1,5 +1,6 @@
 #pragma once
-// BSD sockets on every platform (Winsock2 on Windows). Call forge::net_init() before the first socket.
+// BSD-socket compatibility names for code that uses raw sockets; new code should use forge::os::socket.
+#include <forge/os/os.hpp>
 #if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -27,9 +28,5 @@ using forge_sock_t = int;
 using socklen_t = int;
 #endif
 namespace forge {
-inline void net_init() {
-#if defined(_WIN32)
-    static bool ok = [] { WSADATA d; return WSAStartup(MAKEWORD(2, 2), &d) == 0; }(); (void)ok;
-#endif
-}
+inline void net_init() { os::net_init(); }
 } // namespace forge
