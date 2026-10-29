@@ -19,9 +19,12 @@ TEST(paged_kv_matches_preallocated) {
     auto m = model::open(model_a());
     session flat(m, {.page_rows = 0}), paged(m, {.page_rows = 4});
     std::vector<int> p = {1, 5, 9, 33, 70, 101, 7};
-    CHECK(greedy(flat, p, 20) == greedy(paged, p, 20));
-    // paged storage tracks usage: 27 rows held -> 28 rows reserved per slot (7 pages of 4)
-    for (auto& [k, sl] : paged.state().slots) CHECK_MSG(sl.capacity == 28, "%s cap %lld", k.c_str(), (long long)sl.capacity);
+    auto gf = greedy(flat, p, 20), gp = greedy(paged, p, 20);
+    CHECK(gf == gp);
+    // generation may stop early at EOS: the random tiny model differs between libstdc++ and libc++ (normal_distribution)
+    // paged storage tracks usage: prompt+generated rows held -> rounded up to whole pages of 4 (27 -> 28)
+    const long long want = (long long)(p.size() + gp.size() + 3) / 4 * 4;
+    for (auto& [k, sl] : paged.state().slots) CHECK_MSG(sl.capacity == want, "%s cap %lld", k.c_str(), (long long)sl.capacity);
     for (auto& [k, sl] : flat.state().slots) CHECK(sl.capacity == 512);
     CHECK(paged.state().bytes() * 10 < flat.state().bytes());
 }

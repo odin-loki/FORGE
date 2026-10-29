@@ -187,8 +187,11 @@ TEST(autodiff_matches_finite_differences) {
         auto loss = g.apply(op::reduce_mean, {g.apply(op::sqrt, {g.add(g.apply(op::reshape, {lse}, {{"shape", std::vector<i64>{2}}}), g.scalar(4.f))})}, {{"axis", 0.0}});
         return loss;
     };
-    std::mt19937 rng(11); std::normal_distribution<float> N(0, 1);
-    std::vector<std::vector<float>> data; for (i64 n : {12, 20, 10, 5, 4, 3}) { std::vector<float> v(static_cast<std::size_t>(n)); for (auto& e : v) e = N(rng); data.push_back(v); }
+    // std::normal_distribution differs between libstdc++/libc++/MSVC; Box-Muller on raw mt19937 output is portable,
+    // so every platform checks the same point (away from the relu/abs kinks where finite differences are meaningless).
+    std::mt19937 rng(11);
+    auto N = [&] { double u1 = (double(rng()) + 1.0) / 4294967297.0, u2 = double(rng()) / 4294967296.0; return float(std::sqrt(-2 * std::log(u1)) * std::cos(6.283185307179586 * u2)); };
+    std::vector<std::vector<float>> data; for (i64 n : {12, 20, 10, 5, 4, 3}) { std::vector<float> v(static_cast<std::size_t>(n)); for (auto& e : v) e = N(); data.push_back(v); }
     const char* names[] = {"x", "W", "V", "b", "nw", "c"};
     graph g; std::vector<value_id> ins; auto loss = build(g, ins);
     auto gr = grad(g, loss, ins);
