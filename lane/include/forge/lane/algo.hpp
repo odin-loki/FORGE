@@ -73,6 +73,43 @@ FORGE_LANE_UNARY(silu_n, lane::silu<P>(v))
 FORGE_LANE_UNARY(gelu_n, lane::gelu<P>(v))
 #undef FORGE_LANE_UNARY
 
+template <Target Tg, Policy P = precise> vec<float, Tg> apply1(fn1 f, vec<float, Tg> v) {
+    switch (f) {
+    case fn1::exp2: return lane::exp2<P>(v);     case fn1::expm1: return lane::expm1<P>(v);
+    case fn1::log2: return lane::log2<P>(v);     case fn1::log10: return lane::log10<P>(v);
+    case fn1::log1p: return lane::log1p<P>(v);   case fn1::sqrt: return lane::sqrt(v);
+    case fn1::rsqrt: return lane::rsqrt<P>(v);   case fn1::cbrt: return lane::cbrt<P>(v);
+    case fn1::sin: return lane::sin<P>(v);       case fn1::cos: return lane::cos<P>(v);
+    case fn1::tan: return lane::tan<P>(v);       case fn1::asin: return lane::asin<P>(v);
+    case fn1::acos: return lane::acos<P>(v);     case fn1::atan: return lane::atan<P>(v);
+    case fn1::sinh: return lane::sinh<P>(v);     case fn1::cosh: return lane::cosh<P>(v);
+    case fn1::erf: return lane::erf<P>(v);       case fn1::erfc: return lane::erfc<P>(v);
+    case fn1::gelu_erf: return lane::gelu_erf<P>(v); case fn1::softplus: return lane::softplus<P>(v);
+    case fn1::lgamma: return lane::lgamma<P>(v);
+    default: return splat<Tg>(NAN);
+    }
+}
+// Dispatched entry: one function pointer covers the whole extended libm; the switch is hoisted per call.
+template <Target Tg> void math1_n(int f, const float* x, float* y, std::size_t n) {
+    strip<Tg, float>(n, [&](std::size_t i, auto m) { store(y + i, apply1<Tg>(fn1(f), load(x + i, m)), m); });
+}
+template <Target Tg> void math2_n(int f, const float* a, const float* b, float* y, std::size_t n) {
+    strip<Tg, float>(n, [&](std::size_t i, auto m) {
+        auto va = load(a + i, m), vb = load(b + i, m);
+        auto r = fn2(f) == fn2::pow ? lane::pow(va, vb) : fn2(f) == fn2::atan2 ? lane::atan2(va, vb) : lane::hypot(va, vb);
+        store(y + i, r, m);
+    });
+}
+// Fused log-sum-exp row: max + log(sum exp(x - max)).
+template <Target Tg> float logsumexp_row(const float* x, std::size_t n) {
+    float mx = algo::max<Tg>(x, n);
+    if (!(mx > -INFINITY && mx < INFINITY)) return mx;
+    auto vm = splat<Tg>(mx);
+    auto acc = splat<Tg>(0.f);
+    strip<Tg, float>(n, [&](std::size_t i, auto m) { acc = acc + select(m, lane::exp(load(x + i, m) - vm), splat<Tg>(0.f)); });
+    return mx + std::log(reduce_add(acc));
+}
+
 template <Target Tg> void silu_mul_n(const float* a, const float* b, float* y, std::size_t n) {
     strip<Tg, float>(n, [&](std::size_t i, auto m) {
         auto va = load(a + i, m);

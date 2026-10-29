@@ -326,9 +326,9 @@ if(FORGE_BUILD_TESTS)
   # CUDA / HIP: compile the generated kernels to PTX / AMDGCN with clang (no SDK needed); hardware runs need a GPU.
   if(FORGE_GPU_CLANG)
     add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib
-             --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu)
+             --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_sm80.ptx ${FORGE_GPU_DIR}/kernels.cu)
     add_test(NAME gpu_compile_hip COMMAND ${FORGE_GPU_CLANG} -x hip --cuda-device-only -nogpuinc -nogpulib
-             --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.amdgcn.s ${FORGE_GPU_DIR}/kernels.cu)
+             --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_gfx90a.s ${FORGE_GPU_DIR}/kernels.cu)
     set_tests_properties(gpu_compile_cuda gpu_compile_hip PROPERTIES LABELS gpu)
   endif()
   # Cross builds (e.g. aarch64 under qemu) are typically static: skip the shared-library smoke test there.

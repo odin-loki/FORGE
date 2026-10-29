@@ -79,6 +79,34 @@ TEST(int4_packing_exhaustive) {
     }
     CHECK(i4x2::pack(100, -100).get(0) == 7 && i4x2::pack(100, -100).get(1) == -8);
 }
+TEST(mx_element_formats_exhaustive) {
+    // every code round-trips; known maxima; RNE ties go to the even code; saturation
+    auto all = []<class T>(T, float mx, int n) {
+        for (int b = 0; b < n; ++b) { float f = float(T::from_bits(u8(b))); if (f == 0 && b) continue; CHECK_MSG(T(f).bits == b, "code %d", b); }
+        CHECK(T::max_value() == mx); CHECK(float(T(1e9f)) == mx); CHECK(float(T(-1e9f)) == -mx);
+    };
+    all(fp4_e2m1{}, 6.f, 16); all(fp6_e2m3{}, 7.5f, 64); all(fp6_e3m2{}, 28.f, 64);
+    CHECK(float(fp4_e2m1(2.5f)) == 2.f);   // tie between 2 (even code) and 3
+    CHECK(float(fp4_e2m1(5.f)) == 4.f);    // tie between 4 (even code) and 6
+    CHECK(float(fp4_e2m1(0.25f)) == 0.f);
+    CHECK(float(fp4_e2m1(1.75f)) == 2.f);
+}
+TEST(stochastic_rounding_unbiased) {
+    // E[stochastic_round(x)] == x: the mean over many draws converges to x, unlike RNE
+    u32 st = 12345;
+    auto rnd = [&] { st ^= st << 13; st ^= st >> 17; st ^= st << 5; return st; };
+    for (float x : {1.0001f, 3.3f, -0.77f, 100.3f}) {
+        double sum = 0; int n = 200000;
+        for (int i = 0; i < n; ++i) sum += float(stochastic_round<bf16>(x, rnd()));
+        double ulp = std::fabs(float(bf16(x, rounding::toward_zero)) - float(bf16::from_bits(u16(bf16(x, rounding::toward_zero).bits + 1))));
+        CHECK_MSG(std::fabs(sum / n - x) < ulp * 0.02, "bf16 sr mean %g vs %g", sum / n, double(x));
+        sum = 0;
+        for (int i = 0; i < n; ++i) sum += float(stochastic_round<f16>(x, rnd()));
+        CHECK_MSG(std::fabs(sum / n - x) < std::fabs(x) * 2e-5, "f16 sr mean %g vs %g", sum / n, double(x));
+    }
+    CHECK(float(stochastic_round<fp8_e4m3>(1e6f, 0)) == 448.f);   // saturates
+    CHECK(float(stochastic_round<f16>(1.5f, 0xffffffffu)) == 1.5f); // exact stays exact
+}
 TEST(dtype_names) {
     for (int i = 0; i < int(dtype::invalid); ++i) CHECK(dtype_from_name(name(dtype(i))) == dtype(i));
 }

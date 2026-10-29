@@ -109,6 +109,132 @@ inline void dec_q4_k(const u8* in, std::size_t n, float* x) {
         std::copy_n(out, std::min<std::size_t>(256, n - b), x + b);
     }
 }
+
+// FP8 E5M2 per element
+inline void enc_e5m2(const float* x, std::size_t n, u8* o) { for (std::size_t i = 0; i < n; ++i) o[i] = fp8_e5m2(x[i]).bits; }
+inline void dec_e5m2(const u8* in, std::size_t n, float* x) { for (std::size_t i = 0; i < n; ++i) x[i] = float(fp8_e5m2::from_bits(in[i])); }
+
+inline void put16(u8* o, float v) { u16 b = f16(v).bits; std::memcpy(o, &b, 2); }
+inline float get16(const u8* i) { u16 b; std::memcpy(&b, i, 2); return float(f16::from_bits(b)); }
+
+// Group-wise asymmetric weight-only quantisation (AWQ / GPTQ style), group 32:
+// { f16 scale; f16 min; q[32] } with x = q * scale + min, q in [0, 2^bits - 1].
+template <int BITS> inline void enc_qg(const float* x, std::size_t n, u8* o) {
+    constexpr int L = (1 << BITS) - 1;
+    constexpr std::size_t BB = 4 + 32 * BITS / 8;
+    for (std::size_t b = 0; b < n; b += 32, o += BB) {
+        std::size_t m = std::min<std::size_t>(32, n - b);
+        float lo = x[b], hi = x[b];
+        for (std::size_t i = 0; i < m; ++i) { lo = std::min(lo, x[b + i]); hi = std::max(hi, x[b + i]); }
+        float sc = (hi - lo) / float(L);
+        float mn = float(f16(lo));                          // the stored min is what decode sees
+        float scs = float(f16(sc));
+        if (scs * float(L) + mn < hi) scs = float(f16(sc * 1.001f + 1e-7f));
+        put16(o, scs); put16(o + 2, mn);
+        float id = scs > 0 ? 1.f / scs : 0.f;
+        std::memset(o + 4, 0, BB - 4);
+        for (std::size_t i = 0; i < m; ++i) {
+            int q = int(std::lround((x[b + i] - mn) * id)); q = std::clamp(q, 0, L);
+            if constexpr (BITS == 8) o[4 + i] = u8(q);
+            else o[4 + i / 2] |= u8(q << (4 * (i & 1)));
+        }
+    }
+}
+template <int BITS> inline void dec_qg(const u8* in, std::size_t n, float* x) {
+    constexpr std::size_t BB = 4 + 32 * BITS / 8;
+    for (std::size_t b = 0; b < n; b += 32, in += BB) {
+        float sc = get16(in), mn = get16(in + 2);
+        for (std::size_t i = 0; i < 32 && b + i < n; ++i) {
+            int q = BITS == 8 ? in[4 + i] : (in[4 + i / 2] >> (4 * (i & 1))) & 0xf;
+            x[b + i] = float(q) * sc + mn;
+        }
+    }
+}
+
+// OCP Microscaling (MX v1.0): blocks of 32 elements share an E8M0 scale X (a power of two, bias 127).
+// X = floor(log2(amax)) - emax_elem; elements store x / 2^X in the element format.
+inline int e8m0_exp(float amax, int emax) {
+    if (!(amax > 0) || std::isinf(amax)) return 0;
+    int e; std::frexp(amax, &e);                   // amax = f * 2^e, f in [0.5, 1)
+    return std::clamp(e - 1 - emax, -127, 127);
+}
+template <class EL, int EMAX, int ELBITS> inline void enc_mx(const float* x, std::size_t n, u8* o) {
+    constexpr std::size_t BB = 1 + 32 * ELBITS / 8;
+    for (std::size_t b = 0; b < n; b += 32, o += BB) {
+        std::size_t m = std::min<std::size_t>(32, n - b);
+        float amax = 0; for (std::size_t i = 0; i < m; ++i) amax = std::max(amax, std::fabs(x[b + i]));
+        int X = e8m0_exp(amax, EMAX);
+        o[0] = u8(X + 127);
+        std::memset(o + 1, 0, BB - 1);
+        for (std::size_t i = 0; i < m; ++i) {
+            float v = std::ldexp(x[b + i], -X);
+            u32 code;
+            if constexpr (std::is_same_v<EL, i8>) code = u8(i8(std::clamp<long>(std::lround(v * 64.f), -127, 127)));   // MXINT8: 1.6 fixed point
+            else code = EL(v).bits;
+            std::size_t bit = i * ELBITS;
+            for (int k = 0; k < ELBITS; ++k) if ((code >> k) & 1) o[1 + (bit + k) / 8] |= u8(1u << ((bit + k) % 8));
+        }
+    }
+}
+template <class EL, int EMAX, int ELBITS> inline void dec_mx(const u8* in, std::size_t n, float* x) {
+    constexpr std::size_t BB = 1 + 32 * ELBITS / 8;
+    for (std::size_t b = 0; b < n; b += 32, in += BB) {
+        int X = int(in[0]) - 127;
+        for (std::size_t i = 0; i < 32 && b + i < n; ++i) {
+            u32 code = 0; std::size_t bit = i * ELBITS;
+            for (int k = 0; k < ELBITS; ++k) code |= u32((in[1 + (bit + k) / 8] >> ((bit + k) % 8)) & 1) << k;
+            float v;
+            if constexpr (std::is_same_v<EL, i8>) v = float(i8(u8(code))) / 64.f;
+            else v = float(EL::from_bits(u8(code)));
+            x[b + i] = std::ldexp(v, X);
+        }
+    }
+}
+
+// NVFP4: blocks of 16 E2M1 elements with an FP8 E4M3 block scale (amax / 6).
+// (The optional per-tensor f32 second-level scale is folded to 1 here.)
+inline void enc_nvfp4(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 16, o += 9) {
+        std::size_t m = std::min<std::size_t>(16, n - b);
+        float amax = 0; for (std::size_t i = 0; i < m; ++i) amax = std::max(amax, std::fabs(x[b + i]));
+        fp8_e4m3 sc(amax / 6.f);
+        if (float(sc) * 6.f < amax && sc.bits < 0x7e) sc = fp8_e4m3::from_bits(u8(sc.bits + 1));
+        o[0] = sc.bits;
+        float s = float(sc), is = s > 0 ? 1.f / s : 0.f;
+        std::memset(o + 1, 0, 8);
+        for (std::size_t i = 0; i < m; ++i) o[1 + i / 2] |= u8(fp4_e2m1(x[b + i] * is).bits << (4 * (i & 1)));
+    }
+}
+inline void dec_nvfp4(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 16, in += 9) {
+        float s = float(fp8_e4m3::from_bits(in[0]));
+        for (std::size_t i = 0; i < 16 && b + i < n; ++i) x[b + i] = s * float(fp4_e2m1::from_bits(u8((in[1 + i / 2] >> (4 * (i & 1))) & 0xf)));
+    }
+}
+
+// Ternary (BitNet b1.58 style): blocks of 64, f16 absmean scale, values in {-1, 0, +1} packed 2 bits each.
+inline void enc_tq2(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 64, o += 18) {
+        std::size_t m = std::min<std::size_t>(64, n - b);
+        double sa = 0; for (std::size_t i = 0; i < m; ++i) sa += std::fabs(x[b + i]);
+        float g0 = float(sa / double(m)), ig = g0 > 0 ? 1.f / g0 : 0.f;
+        int q[64] = {};
+        double nz = 0, cnt = 0;
+        for (std::size_t i = 0; i < m; ++i) {
+            q[i] = std::clamp(int(std::lround(x[b + i] * ig)), -1, 1);   // absmean quantisation (BitNet b1.58)
+            if (q[i]) { nz += std::fabs(x[b + i]); cnt += 1; }
+        }
+        put16(o, float(cnt > 0 ? nz / cnt : 0.0));                       // least-squares scale for the chosen signs
+        std::memset(o + 2, 0, 16);
+        for (std::size_t i = 0; i < m; ++i) o[2 + i / 4] |= u8(u8(q[i] + 1) << (2 * (i & 3)));
+    }
+}
+inline void dec_tq2(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 64, in += 18) {
+        float g = get16(in);
+        for (std::size_t i = 0; i < 64 && b + i < n; ++i) x[b + i] = g * float(int((in[2 + i / 4] >> (2 * (i & 3))) & 3) - 1);
+    }
+}
 } // namespace detail
 
 inline const std::vector<codec>& all() {
@@ -119,6 +245,15 @@ inline const std::vector<codec>& all() {
         {"fp8_e4m3", dtype::fp8_e4m3, 1, 1, detail::enc_e4m3, detail::dec_e4m3},
         {"q8_0", dtype::q8_0, 32, 34, detail::enc_q8_0, detail::dec_q8_0},
         {"q4_k", dtype::q4_k, 256, 144, detail::enc_q4_k, detail::dec_q4_k},
+        {"fp8_e5m2", dtype::fp8_e5m2, 1, 1, detail::enc_e5m2, detail::dec_e5m2},
+        {"q4_g32", dtype::q4_g32, 32, 20, detail::enc_qg<4>, detail::dec_qg<4>},
+        {"q8_g32", dtype::q8_g32, 32, 36, detail::enc_qg<8>, detail::dec_qg<8>},
+        {"mxfp8", dtype::mxfp8, 32, 33, detail::enc_mx<fp8_e4m3, 8, 8>, detail::dec_mx<fp8_e4m3, 8, 8>},
+        {"mxfp6", dtype::mxfp6, 32, 25, detail::enc_mx<fp6_e2m3, 2, 6>, detail::dec_mx<fp6_e2m3, 2, 6>},
+        {"mxfp4", dtype::mxfp4, 32, 17, detail::enc_mx<fp4_e2m1, 2, 4>, detail::dec_mx<fp4_e2m1, 2, 4>},
+        {"mxint8", dtype::mxint8, 32, 33, detail::enc_mx<i8, 0, 8>, detail::dec_mx<i8, 0, 8>},
+        {"nvfp4", dtype::nvfp4, 16, 9, detail::enc_nvfp4, detail::dec_nvfp4},
+        {"tq2", dtype::tq2, 64, 18, detail::enc_tq2, detail::dec_tq2},
     };
     return c;
 }

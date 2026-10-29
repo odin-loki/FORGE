@@ -43,6 +43,9 @@ struct kernels {
     void (*mul)(const float*, const float*, float*, std::size_t);
     void (*gemm_nt)(const float*, const float*, float*, std::size_t, std::size_t, std::size_t);
     void (*gemm_nn)(const float*, const float*, float*, std::size_t, std::size_t, std::size_t);
+    void (*math1)(int fn, const float*, float*, std::size_t);              // lane::fn1 ids
+    void (*math2)(int fn, const float*, const float*, float*, std::size_t); // lane::fn2 ids
+    float (*logsumexp)(const float*, std::size_t);
 };
 
 const kernels& active();                // best target for this machine (FORGE_LANE_TARGET overrides)
@@ -57,5 +60,5 @@ const kernels* by_name(const char* t);  // "scalar", "avx2", "avx512"; nullptr i
         &algo::saxpy<TG>, &algo::dot<TG>, &algo::sum<TG>, &algo::softmax_row<TG>, &algo::rms_norm_row<TG>, \
         &algo::exp_n<TG>, &algo::log_n<TG>, &algo::tanh_n<TG>, &algo::sigmoid_n<TG>, &algo::silu_n<TG>, \
         &algo::gelu_n<TG>, &algo::silu_mul_n<TG>, &algo::add_n<TG>, &algo::sub_n<TG>, &algo::mul_n<TG>, \
-        &algo::gemm_nt<TG>, &algo::gemm_nn<TG>};                                                    \
+        &algo::gemm_nt<TG>, &algo::gemm_nn<TG>, &algo::math1_n<TG>, &algo::math2_n<TG>, &algo::logsumexp_row<TG>};                                                    \
     }

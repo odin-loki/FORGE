@@ -36,7 +36,7 @@ class writer {
 public:
     void set_section(std::string name, std::string bytes) { sections_[std::move(name)] = std::move(bytes); }
     void set_manifest(const json::value& m) { set_section("manifest", json::dump(m)); }
-    // Encodes f32 data with the named codec (f32,f16,bf16,fp8_e4m3,q8_0,q4_k).
+    // Encodes f32 data with the named codec (any of flow::codecs::all()).
     void add_tensor(std::string name, const shape_t& shape, std::span<const float> data, std::string_view codec = "f32") {
         auto* c = flow::codecs::find(codec);
         if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);

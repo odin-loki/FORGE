@@ -366,6 +366,29 @@ template <Target Tg> inline vec<float, Tg> round_nearest(vec<float, Tg> x) {
     return o;
 }
 
+template <Target Tg> inline vec<float, Tg> sqrt(vec<float, Tg> x) {
+    vec<float, Tg> o;
+    if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(o.r = svsqrt_f32_x(FORGE_SVE_PT, x.r);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(o.r = __riscv_vfsqrt_v_f32m1(x.r, FORGE_RVV_VL);) }
+    else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(o.r = vsqrtq_f32(x.r);) }
+    else if constexpr (vec<float, Tg>::K == 2) { FORGE_IF512(o.r = _mm512_sqrt_ps(x.r);) }
+    else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(o.r = _mm256_sqrt_ps(x.r);) }
+    else for (int i = 0; i < vec<float, Tg>::N; ++i) o.r.v[i] = std::sqrt(x.r.v[i]);
+    return o;
+}
+template <Target Tg> inline mask<float, Tg> operator&(mask<float, Tg> a, mask<float, Tg> b) {
+    mask<float, Tg> m;
+    if constexpr (vec<float, Tg>::K == 4) { FORGE_IFSVE(m.m = svand_b_z(FORGE_SVE_PT, a.m, b.m);) }
+    else if constexpr (vec<float, Tg>::K == 5) { FORGE_IFRVV(m.m = __riscv_vmand_mm_b32(a.m, b.m, FORGE_RVV_VL);) }
+    else if constexpr (vec<float, Tg>::K == 3) { FORGE_IFNEON(m.m = vandq_u32(a.m, b.m);) }
+    else if constexpr (vec<float, Tg>::K == 2) m.m = a.m & b.m;
+    else if constexpr (vec<float, Tg>::K == 1) { FORGE_IF256(m.m = _mm256_and_ps(a.m, b.m);) }
+    else m.m = a.m & b.m;
+    return m;
+}
+template <Target Tg> inline vec<float, Tg> abs(vec<float, Tg> x) { return select(lt(x, splat<Tg>(0.0f)), x * splat<Tg>(-1.0f), x); }
+template <Target Tg> inline vec<float, Tg> operator-(vec<float, Tg> x) { return x * splat<Tg>(-1.0f); }
+
 // strip: strip-mining loop hiding width and tail. f(i, mask) is called with a full mask for
 // full vectors and a partial native predicate for the tail (no scalar epilogue).
 template <Target Tg, class T, class F> inline void strip(std::size_t n, F&& f) {

@@ -5,7 +5,7 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 ## Test matrix (ctest)
 | Build | Result |
 |---|---|
-| x86_64 dev | 27/27. This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
+| x86_64 dev | 32/32. This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
 | aarch64, qemu `-cpu max` (VL 512, so the NEON path runs) | 13/13 without the fuzz label. `test_vulkan` skips because the build is static. |
 | aarch64 SVE, qemu `-cpu max,sveN=on`, N = 128/256/512 (1024 requested; qemu caps `max` at 512) | 13/13 at each length without the fuzz label. The `sve` lane is active at each VL. |
 | riscv64 RVV, qemu `-cpu rv64,v=true,vlen=N`, N = 128/256/512/1024 | 13/13 at each length without the fuzz label. The `rvv` lane is active at each VLEN. |
@@ -21,7 +21,11 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
     - GLSL is compiled to SPIR-V with glslangValidator, validated with spirv-val, and embedded in the binary.
     - The **Vulkan backend** (`grid/vulkan.hpp`) dlopens libvulkan, so there is no link dependency. Every kernel is checked against the spec reference (`test_vulkan`, max relative error 3e-7).
     - The same source compiles to **CUDA PTX (sm_80) and HIP AMDGCN (gfx90a)** with clang, without an SDK (`gpu_compile_cuda`, `gpu_compile_hip`).
-- **flow**: IR, verifier, CSE/fold/fuse/DCE passes, memory planner, quant codecs (q8_0, q4_k).
+- **flow**: IR, verifier, CSE/fold/fuse/DCE passes, memory planner, quant codecs: f16, bf16, fp8 e4m3/e5m2, q8_0, q4_k, groupwise q4_g32/q8_g32 (AWQ/GPTQ style), OCP MX (mxfp8, mxfp6, mxfp4, mxint8), nvfp4 and ternary tq2 (BitNet absmean). All are usable via `forge import --codec`.
+- **core dtypes**: FP4 E2M1 / FP6 E2M3 / E3M2 element formats (checked exhaustively), stochastic rounding (checked for bias), complex c32/c64.
+- **lane extended libm**: exp2, expm1, log2/10/1p, sqrt, rsqrt, cbrt, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh, erf/erfc, gelu_erf, softplus, lgamma, pow, hypot, logsumexp. Written on portable vec ops so every lowering gets them; worst error is 4 ulp (`math_extended_ulp`).
+- **Vulkan residency**: tensors stay on the device across ops; submits are batched (571 dispatches in 63 submits for the e2e golden).
+- **CUDA/HIP host runtime**: dlopens libcuda/libamdhip64 at run time and loads the embedded PTX/HSACO. Tested against a mock driver library; the hardware tests skip when there is no device.
 - **pack**:
   - `.fpk` container (mmap, BLAKE3) and **Ed25519 signing** (`forge keygen/sign/verify`, vendored Monocypher, cross-checked against pyca/cryptography).
   - JSON, BPE tokenizer, blueprint language, GBNF grammars.
@@ -35,10 +39,9 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 - **Goldens**: tiny Llama and MoE/MLA, checked against NumPy float64 references.
 
 ## Remaining
-- Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU. Host↔device copies are made per op, not kept resident on the device.
-- The CUDA/HIP kernels are compiled but have not been run: there is no GPU hardware, and the CUDA/HIP host runtime is not written.
+- Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU.
+- CUDA/HIP have not been run on real hardware (only the mock driver).
 - Level Zero and Metal: only probes exist.
-- Non-power-of-two SVE lengths (e.g. 384) have no table and fall back to NEON.
 - CI: the workflow file is at `ci/github-actions-ci.yml`. The push token lacks `workflow` scope, so it has to be moved to `.github/workflows/ci.yml` by hand.
 
 ## Build

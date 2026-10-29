@@ -1,3 +1,4 @@
+#include <map>
 #include "check.hpp"
 #include <forge/flow/flow.hpp>
 #include <random>
@@ -128,6 +129,25 @@ TEST(state_append_symbolic_length) {
     for (float v : y.data) CHECK(std::fabs(v - 0.5f) < 1e-6f);
 }
 
+TEST(codecs_exact_and_layout) {
+    // values exactly representable in a codec survive the round trip bit-for-bit
+    auto rt = [](std::string_view name, std::vector<float> x) {
+        auto* c = codecs::find(name);
+        std::vector<u8> b(c->bytes(x.size())); std::vector<float> y(x.size());
+        c->encode(x.data(), x.size(), b.data()); c->decode(b.data(), x.size(), y.data());
+        for (std::size_t i = 0; i < x.size(); ++i) CHECK_MSG(y[i] == x[i], "%s[%zu] %g -> %g", std::string(name).c_str(), i, x[i], y[i]);
+    };
+    std::vector<float> t(64); for (int i = 0; i < 64; ++i) t[i] = float((i % 3) - 1) * 0.5f;
+    rt("tq2", t);                                                    // ternary data at one magnitude is exact
+    std::vector<float> m4(32); const float e2m1[8] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6};
+    for (int i = 0; i < 32; ++i) m4[i] = e2m1[i % 8] * (i & 8 ? -1.f : 1.f) * 0.25f;
+    rt("mxfp4", m4);                                                  // amax 1.5 -> X = -2, so every value is an exact E2M1 * 2^-2
+    std::vector<float> g(32); for (int i = 0; i < 32; ++i) g[i] = float(i % 16) * 0.125f - 1.f;
+    rt("q4_g32", g);                                                  // 16 levels, step 0.125, min -1
+    CHECK(codecs::find("mxfp8")->bytes(64) == 66 && codecs::find("nvfp4")->bytes(16) == 9 && codecs::find("q4_g32")->bytes(33) == 40);
+    for (auto& c : codecs::all()) CHECK(dtype_from_name(c.name) == c.tag);
+}
+
 TEST(codecs_roundtrip) {
     std::mt19937 r(4);
     auto x = verify::random_tensor({1000}, r, -3, 3);
@@ -137,7 +157,12 @@ TEST(codecs_roundtrip) {
         c.encode(x.data.data(), x.size(), buf.data());
         c.decode(buf.data(), x.size(), y.data());
         double maxe = 0; for (std::size_t i = 0; i < y.size(); ++i) maxe = std::max(maxe, double(std::fabs(y[i] - x.data[i])));
-        double bound = c.name == "f32" ? 0 : c.name == "f16" ? 2e-3 : c.name == "bf16" ? 2e-2 : c.name == "fp8_e4m3" ? 0.13 : c.name == "q8_0" ? 0.013 : 0.25;
+        static const std::map<std::string_view, double> bounds = {
+            {"f32", 0}, {"f16", 2e-3}, {"bf16", 2e-2}, {"fp8_e4m3", 0.13}, {"fp8_e5m2", 0.26}, {"q8_0", 0.013}, {"q4_k", 0.25},
+            {"q4_g32", 0.21}, {"q8_g32", 0.013}, {"mxfp8", 0.126}, {"mxfp6", 0.126}, {"mxfp4", 0.51}, {"mxint8", 0.016},
+            {"nvfp4", 0.51}, {"tq2", 3.0}};
+        CHECK_MSG(bounds.count(c.name), "no bound for %s", std::string(c.name).c_str());
+        double bound = bounds.count(c.name) ? bounds.at(c.name) : 0;
         std::printf("  %-9s %5zu bytes  max err %.5f\n", std::string(c.name).c_str(), buf.size(), maxe);
         CHECK_MSG(maxe <= bound, "%s", std::string(c.name).c_str());
     }
