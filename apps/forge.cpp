@@ -1,5 +1,5 @@
 // forge — command-line front end: info | import | inspect | run | bench
-#include <forge/import/hf.hpp>
+#include <forge/import/gguf.hpp>
 #include <forge/lane/dispatch.hpp>
 #include <forge/mind/mind.hpp>
 #include <cstdio>
@@ -37,11 +37,12 @@ int usage() {
     std::puts(
         "usage: forge <command> [options]\n"
         "  info                                   CPU features, lane target, grid backends\n"
-        "  import <hf_dir> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|q8_0|q4_k] [--template llama]\n"
+        "  import <hf_dir|model.gguf> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|q8_0|q4_k] [--template llama]\n"
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
-        "  bench <model.fpk> [-p 32] [-n 32]");
+        "  bench <model.fpk> [-p 32] [-n 32]\n"
+        "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32");
     return 2;
 }
 
@@ -61,7 +62,7 @@ int cmd_info() {
 int cmd_import(const args& a) {
     if (a.pos.empty() || a.get("o").empty()) return usage();
     import::import_options o; o.codec = a.get("codec", "f32"); o.template_name = a.get("template");
-    auto r = import::import_hf(a.pos[0], a.get("o"), o);
+    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     return 0;
 }
@@ -82,6 +83,16 @@ int cmd_inspect(const args& a) {
         if (bad.empty()) std::puts("verify    ok (all sections and tensors match BLAKE3)");
         else { for (auto& b : bad) std::printf("verify    MISMATCH %s\n", b.c_str()); return 1; }
     }
+    return 0;
+}
+
+int cmd_dump(const args& a) {  // decode one tensor to raw little-endian f32
+    if (a.pos.size() < 3) return usage();
+    pack::reader r(a.pos[0]);
+    auto t = r.load(a.pos[1]);
+    std::ofstream f(a.pos[2], std::ios::binary);
+    f.write(reinterpret_cast<const char*>(t.data.data()), std::streamsize(t.size() * 4));
+    std::printf("%s %s %s -> %s\n", a.pos[1].c_str(), r.entry(a.pos[1]).codec.c_str(), shape_str(t.shape).c_str(), a.pos[2].c_str());
     return 0;
 }
 
@@ -144,6 +155,7 @@ int main(int argc, char** argv) {
         if (c == "inspect") return cmd_inspect(a);
         if (c == "run") return cmd_run(a);
         if (c == "bench") return cmd_bench(a);
+        if (c == "dump") return cmd_dump(a);
         return usage();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "forge: error: %s\n", e.what());

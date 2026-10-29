@@ -49,6 +49,17 @@ public:
         e.blake3 = hash::blake3::hex(hash::blake3::of({data_.data() + e.offset, e.bytes}));
         tensors_.push_back(std::move(e));
     }
+    // Stores already-encoded blocks (e.g. Q8_0 / Q4_K straight from a GGUF file) without re-quantising.
+    void add_raw(std::string name, const shape_t& shape, std::string_view codec, std::span<const std::uint8_t> bytes) {
+        auto* c = flow::codecs::find(codec);
+        if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
+        if (c->bytes(std::size_t(numel(shape))) != bytes.size()) raise(errc::format_error, "tensor {}: {} bytes do not match {} {}", name, bytes.size(), codec, shape_str(shape));
+        while (data_.size() % alignment) data_.push_back(0);
+        tensor_entry e{std::move(name), std::string(c->name), shape, data_.size(), bytes.size(), {}};
+        data_.insert(data_.end(), bytes.begin(), bytes.end());
+        e.blake3 = hash::blake3::hex(hash::blake3::of(bytes));
+        tensors_.push_back(std::move(e));
+    }
     void write(const std::string& path) {
         json::array idx;
         for (auto& t : tensors_) {

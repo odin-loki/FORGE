@@ -54,6 +54,49 @@ def make_model(d, seed=1234):
     json.dump(tok, open(os.path.join(d, "tokenizer.json"), "w"))
     return {k: v.astype(np.float64) for k, v in W.items()}
 
+def write_gguf(path, W, hf_dir, qtype):
+    import gguf
+    T = gguf.GGMLQuantizationType
+    nh, nk = CFG["num_attention_heads"], CFG["num_key_value_heads"]
+    def permute(w, n):  # as llama.cpp convert_hf_to_gguf.py does for llama Q/K
+        return w.reshape(n, 2, w.shape[0] // n // 2, *w.shape[1:]).swapaxes(1, 2).reshape(w.shape)
+    wr = gguf.GGUFWriter(path, "llama")
+    wr.add_context_length(CFG["max_position_embeddings"]); wr.add_embedding_length(CFG["hidden_size"])
+    wr.add_block_count(CFG["num_hidden_layers"]); wr.add_feed_forward_length(CFG["intermediate_size"])
+    wr.add_head_count(nh); wr.add_head_count_kv(nk); wr.add_layer_norm_rms_eps(CFG["rms_norm_eps"]); wr.add_rope_freq_base(CFG["rope_theta"])
+    tok = json.load(open(os.path.join(hf_dir, "tokenizer.json")))
+    inv = {i: t for t, i in tok["model"]["vocab"].items()}
+    for a in tok["added_tokens"]: inv[a["id"]] = a["content"]
+    toks = [inv.get(i, f"<unused{i}>") for i in range(CFG["vocab_size"])]
+    types = [3 if t in ("<s>", "</s>") else 1 for t in toks]
+    wr.add_tokenizer_model("gpt2"); wr.add_token_list(toks); wr.add_token_types(types); wr.add_token_merges(tok["model"]["merges"])
+    wr.add_bos_token_id(CFG["bos_token_id"]); wr.add_eos_token_id(CFG["eos_token_id"])
+    names = {"model.embed_tokens.weight": "token_embd.weight", "model.norm.weight": "output_norm.weight", "lm_head.weight": "output.weight"}
+    hf2g = {"input_layernorm": "attn_norm", "post_attention_layernorm": "ffn_norm", "self_attn.q_proj": "attn_q", "self_attn.k_proj": "attn_k",
+            "self_attn.v_proj": "attn_v", "self_attn.o_proj": "attn_output", "mlp.gate_proj": "ffn_gate", "mlp.up_proj": "ffn_up", "mlp.down_proj": "ffn_down"}
+    for k, v in W.items():
+        v = v.astype(np.float32)
+        if k in names: g = names[k]
+        else:
+            l = k.split(".")[2]; mid = ".".join(k.split(".")[3:-1]); g = f"blk.{l}.{hf2g[mid]}.weight"
+            if mid == "self_attn.q_proj": v = permute(v, nh)
+            if mid == "self_attn.k_proj": v = permute(v, nk)
+        try: can_q = qtype != "F32" and v.ndim == 2 and v.shape[-1] % gguf.GGML_QUANT_SIZES[getattr(T, qtype)][0] == 0 and gguf.quants.quantize(v[:1], getattr(T, qtype)) is not None
+        except NotImplementedError: can_q = False
+        if can_q:
+            q = gguf.quants.quantize(v, getattr(T, qtype)); wr.add_tensor(g, q, raw_shape=q.shape, raw_dtype=getattr(T, qtype))
+        else: wr.add_tensor(g, v)
+    if qtype != "F32":  # a block-aligned probe tensor to check FORGE's decoder bit-for-bit against gguf-py
+        probe = np.random.default_rng(5).normal(size=(4, 512)).astype(np.float32)
+        try: q = gguf.quants.quantize(probe, getattr(T, qtype))
+        except NotImplementedError:  # gguf-py has no Q4_K quantiser: use random blocks with sane f16 scales
+            bs, bb = gguf.GGML_QUANT_SIZES[getattr(T, qtype)]
+            q = np.random.default_rng(6).integers(0, 256, size=(4, 512 // bs * bb), dtype=np.uint8)
+            blk = q.reshape(-1, bb); blk[:, 0:2] = np.frombuffer(np.float16(0.01).tobytes(), np.uint8); blk[:, 2:4] = np.frombuffer(np.float16(0.002).tobytes(), np.uint8)
+        wr.add_tensor("probe", q, raw_shape=q.shape, raw_dtype=getattr(T, qtype))
+        np.save(path + ".probe.npy", gguf.quants.dequantize(q, getattr(T, qtype)))
+    wr.write_header_to_file(); wr.write_kv_data_to_file(); wr.write_tensors_to_file(); wr.close()
+
 def rms(x, w, eps): return x / np.sqrt((x * x).mean(-1, keepdims=True) + eps) * w
 
 def rope(x, pos, base):  # x [s, h, d], neox / rotate_half
@@ -122,6 +165,29 @@ def main():
             lg = np.sort(forward(W, prompt + ref_gen[:i])[-1]); same = lg[-1] - lg[-2] < 1e-3
         print(f"[{'ok' if same else 'FAIL'}] greedy decode (KV cache) matches reference: forge {fg[:10]}... ref {ref_gen[:10]}...")
         fails += not same
+    # GGUF import (llama.cpp layout: permuted Q/K + interleaved RoPE; quantised blocks copied verbatim)
+    try:
+        import gguf  # noqa: F401
+        have_gguf = True
+    except ImportError:
+        have_gguf = False; print("[skip] gguf python package not installed")
+    for qt, thr in (("F32", 1e-3), ("Q8_0", 0.999), ("Q4_K", 0.99)) if have_gguf else ():
+        gp = os.path.join(a.work, f"tiny_{qt}.gguf"); fp = os.path.join(a.work, f"tiny_gguf_{qt}.fpk")
+        write_gguf(gp, W, hf, qt)
+        run([a.forge, "import", gp, "-o", fp])
+        lf = os.path.join(a.work, f"logits_gguf_{qt}.f32")
+        run([a.forge, "run", fp, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lf])
+        got = np.fromfile(lf, dtype=np.float32)
+        err = np.abs(got - ref).max(); cos = got @ ref / np.linalg.norm(got) / np.linalg.norm(ref)
+        ok = err < thr if qt == "F32" else cos > thr
+        print(f"[{'ok' if ok else 'FAIL'}] gguf {qt}: prefill logits max|err| {err:.2e}, cosine {cos:.6f}")
+        fails += not ok
+        if qt != "F32":
+            pf = os.path.join(a.work, f"probe_{qt}.f32")
+            run([a.forge, "dump", fp, "extra.probe", pf])
+            d = np.abs(np.fromfile(pf, dtype=np.float32) - np.load(gp + ".probe.npy").reshape(-1)).max()
+            print(f"[{'ok' if d == 0 else 'FAIL'}] gguf {qt}: block decoder matches gguf-py exactly (max diff {d:g})")
+            fails += d != 0
     # tokenizer + text path
     out = os.path.join(a.work, "tiny_f32.fpk")
     txt = run([a.forge, "run", out, "--prompt", "the theory of things", "-n", "4"])

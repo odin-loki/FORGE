@@ -18,8 +18,8 @@ graph {
   x = embed(W.tok_emb, tokens)
   repeat l in 0..n_layers {
     h = rms_norm(x, W.layer[l].attn_norm, eps)
-    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: true)
-    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: true)
+    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: {{rope_neox}})
+    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: {{rope_neox}})
     v = heads(linear(h, W.layer[l].wv), n_kv, head_dim)
     kk, vv = kv[l].append(k, v)
     a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv)

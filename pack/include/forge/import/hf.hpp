@@ -63,6 +63,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     set("num_key_value_heads", num("num_key_value_heads", heads));
     set("rope_theta", num("rope_theta", 10000.0));
     set("rms_norm_eps", num("rms_norm_eps", 1e-6));
+    set("rope_neox", 1.0);  // HF checkpoints use rotate_half (NeoX) RoPE
     json::value cv(c);
     auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), cv);
     auto bp = pack::parse_blueprint(bp_text);  // validate before writing anything
