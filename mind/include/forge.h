@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define FORGE_ABI_VERSION 2   /* 2 = v1 + position/rewind/forward_all/generate_ex (additive) */
+#define FORGE_ABI_VERSION 3   /* 2 = v1 + position/rewind/forward_all/generate_ex; 3 = + generate_ex2 / forge_sampling_ext (additive) */
 
 typedef struct forge_model forge_model;
 
@@ -58,6 +58,17 @@ typedef struct forge_generate_options {
 int64_t forge_generate_ex(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new,
                           const forge_sampling* s, const forge_generate_options* o,
                           int32_t* out, int64_t cap, forge_token_cb cb, void* user);
+
+/* ABI 3: extra samplers. Size-prefixed so fields can be appended later: set size = sizeof(forge_sampling_ext). */
+typedef struct forge_sampling_ext {
+    uint32_t size;
+    float typical_p;          /* locally typical sampling; 1 (or 0) = off */
+    float mirostat_tau;       /* Mirostat v2 target surprise (bits); 0 = off */
+    float mirostat_eta;       /* Mirostat learning rate; 0 = default 0.1 */
+} forge_sampling_ext;
+int64_t forge_generate_ex2(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new,
+                           const forge_sampling* s, const forge_generate_options* o, const forge_sampling_ext* ext,
+                           int32_t* out, int64_t cap, forge_token_cb cb, void* user);
 
 #ifdef __cplusplus
 }

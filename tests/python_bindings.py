@@ -27,4 +27,9 @@ try:
     forge.Model("/nonexistent.fpk"); raise SystemExit("expected error")
 except forge.ForgeError as e:
     assert "nonexistent" in str(e)
+assert forge.abi_version() >= 3
+a = m.generate(ids, max_tokens=10, temperature=0.8, seed=5, typical_p=0.5)
+assert a == m.generate(ids, max_tokens=10, temperature=0.8, seed=5, typical_p=0.5) and len(a) == 10
+b = m.generate(ids, max_tokens=10, temperature=1.0, seed=5, mirostat_tau=3.0, mirostat_eta=0.2)
+assert len(b) == 10
 print("python bindings ok:", forge.version(), "abi", forge.abi_version(), "grammar ->", txt)

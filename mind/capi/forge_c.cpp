@@ -1,3 +1,4 @@
+#include <cstddef>
 #include <forge.h>
 #include <forge/mind/mind.hpp>
 #include <cstring>
@@ -61,10 +62,21 @@ int forge_forward_all(forge_model* m, const int32_t* ids, int64_t n, float* logi
 }
 int64_t forge_generate_ex(forge_model* m, const int32_t* prompt, int64_t np, int32_t max_new, const forge_sampling* s,
                           const forge_generate_options* o, int32_t* out, int64_t cap, forge_token_cb cb, void* user) {
+    return forge_generate_ex2(m, prompt, np, max_new, s, o, nullptr, out, cap, cb, user);
+}
+int64_t forge_generate_ex2(forge_model* m, const int32_t* prompt, int64_t np, int32_t max_new, const forge_sampling* s,
+                           const forge_generate_options* o, const forge_sampling_ext* ext, int32_t* out, int64_t cap,
+                           forge_token_cb cb, void* user) {
     try {
         forge::mind::sampler_config c;
         if (s) { c.temperature = s->temperature; c.top_k = s->top_k; c.top_p = s->top_p > 0 ? s->top_p : 1.f; c.min_p = s->min_p;
                  c.repetition_penalty = s->repetition_penalty > 0 ? s->repetition_penalty : 1.f; c.seed = s->seed; }
+        if (ext) {
+            auto has = [&](std::size_t end) { return ext->size >= end; };
+            if (has(offsetof(forge_sampling_ext, typical_p) + sizeof(float)) && ext->typical_p > 0) c.typical_p = ext->typical_p;
+            if (has(offsetof(forge_sampling_ext, mirostat_tau) + sizeof(float))) c.mirostat_tau = ext->mirostat_tau;
+            if (has(offsetof(forge_sampling_ext, mirostat_eta) + sizeof(float)) && ext->mirostat_eta > 0) c.mirostat_eta = ext->mirostat_eta;
+        }
         forge::mind::sampler smp(c);
         auto* tok = m->s.tokenizer();
         std::unique_ptr<forge::mind::grammar_constraint> gc;

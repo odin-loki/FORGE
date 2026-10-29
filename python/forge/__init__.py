@@ -57,6 +57,14 @@ _fwd_all = _sig("forge_forward_all", c_int, c_void_p, POINTER(c_int32), c_int64,
 _gen = _sig("forge_generate_ex", c_int64, c_void_p, POINTER(c_int32), c_int64, c_int32, POINTER(_Sampling), POINTER(_GenOpts),
             POINTER(c_int32), c_int64, _CB, c_void_p)
 
+class _SamplingExt(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("typical_p", c_float), ("mirostat_tau", c_float), ("mirostat_eta", c_float)]
+
+_gen2 = None
+if _abi() >= 3:
+    _gen2 = _sig("forge_generate_ex2", c_int64, c_void_p, POINTER(c_int32), c_int64, c_int32, POINTER(_Sampling), POINTER(_GenOpts),
+                 POINTER(_SamplingExt), POINTER(c_int32), c_int64, _CB, c_void_p)
+
 if _abi() < 2:
     raise ForgeError(f"libforge ABI {_abi()} is too old (need >= 2)")
 
@@ -119,7 +127,7 @@ class Model:
         return r.reshape(n, self.vocab_size) if hasattr(r, "reshape") else [r[i * self.vocab_size:(i + 1) * self.vocab_size] for i in range(n)]
 
     def generate(self, prompt, max_tokens=32, temperature=0.0, top_k=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0,
-                 seed=0, grammar=None, draft=None, spec_k=4, on_token=None):
+                 seed=0, grammar=None, draft=None, spec_k=4, on_token=None, typical_p=1.0, mirostat_tau=0.0, mirostat_eta=0.1):
         """Generate from token ids (resets state first). on_token(id, text) -> True to stop early. Returns new ids."""
         if isinstance(prompt, str): prompt = self.tokenize(prompt)
         self.reset()
@@ -131,7 +139,12 @@ class Model:
             if on_token is None: return 0
             try: return 1 if on_token(int(t), txt.decode(errors="replace") if txt else "") else 0
             except BaseException as e: err.append(e); return 1
-        k = _gen(self._h, arr, n, max_tokens, ctypes.byref(s), ctypes.byref(o), out, max_tokens, _CB(cb), None)
+        if typical_p != 1.0 or mirostat_tau:
+            if _gen2 is None: raise ForgeError("typical_p / mirostat need libforge ABI >= 3")
+            x = _SamplingExt(ctypes.sizeof(_SamplingExt), typical_p, mirostat_tau, mirostat_eta)
+            k = _gen2(self._h, arr, n, max_tokens, ctypes.byref(s), ctypes.byref(o), ctypes.byref(x), out, max_tokens, _CB(cb), None)
+        else:
+            k = _gen(self._h, arr, n, max_tokens, ctypes.byref(s), ctypes.byref(o), out, max_tokens, _CB(cb), None)
         if err: raise err[0]
         _check(k >= 0)
         return list(out[:k])

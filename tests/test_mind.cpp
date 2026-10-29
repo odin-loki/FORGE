@@ -222,3 +222,18 @@ TEST(lora_hot_swap) {
     session s1(m), s2(m); s1.set_adapter("one"); s2.set_adapter("two");
     auto a = s1.forward(ids), c = s2.forward(ids); CHECK(a == L1 && c == L2);
 }
+TEST(lora_adapter_file) {
+    auto m = model::open(model_a());
+    auto vocab = m->vocab(); i64 d = 0; { pack::reader r(model_a()); d = r.load("lm_head").shape[1]; }
+    std::mt19937 g(9); std::normal_distribution<float> N(0, 0.05f); const i64 r = 2;
+    model::lora l; l.a.shape = {r, d}; l.b.shape = {vocab, r};
+    for (i64 i = 0; i < r * d; ++i) l.a.data.push_back(N(g)); for (i64 i = 0; i < vocab * r; ++i) l.b.data.push_back(N(g));
+    auto path = (std::filesystem::temp_directory_path() / ("forge_lora_" + std::to_string(::getpid()) + ".fpk")).string();
+    { pack::writer w; w.set_manifest(json::object{{"format", "fpk"}, {"lora_alpha", 3.0}});
+      w.add_tensor("lm_head.lora_a", l.a.shape, l.a.data); w.add_tensor("lm_head.lora_b", l.b.shape, l.b.data); w.write(path); }
+    m->add_adapter_file("file", path); m->add_adapter("mem", {{"lm_head", l}}, 3.f);
+    std::filesystem::remove(path);
+    std::vector<int> ids{4, 5, 6};
+    session a(m), b(m); a.set_adapter("file"); b.set_adapter("mem");
+    CHECK(a.forward(ids) == b.forward(ids));
+}
