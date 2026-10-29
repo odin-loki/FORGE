@@ -6,8 +6,8 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 | Build | Result |
 |---|---|
 | x86_64 dev | 39/39 (CUDA/HIP device tests skip: no GPU). This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
-| aarch64 SVE build (`build/a64sve`), latest run | 27/27 without the fuzz label (3 skip: Vulkan/CUDA/HIP). |
-| riscv64 build (`build/rv64`), latest run | 23/23 without the fuzz label (3 skip). |
+| aarch64 SVE build (`build/a64sve`), latest run | 31/31 without the fuzz label (3 skip: Vulkan/CUDA/HIP). |
+| riscv64 build (`build/rv64`), latest run | 27/27 without the fuzz label (3 skip). |
 | aarch64, qemu `-cpu max` (VL 512, so the NEON path runs) | 13/13 without the fuzz label. `test_vulkan` skips because the build is static. |
 | aarch64 SVE, qemu `-cpu max,sveN=on`, N = 128/256/512 (1024 requested; qemu caps `max` at 512) | 13/13 at each length without the fuzz label. The `sve` lane is active at each VL. |
 | riscv64 RVV, qemu `-cpu rv64,v=true,vlen=N`, N = 128/256/512/1024 | 13/13 at each length without the fuzz label. The `rvv` lane is active at each VLEN. |
