@@ -192,3 +192,33 @@ TEST(json_schema_grammar) {
     CHECK(run2("[1,2]") && !run2("[01,2]"));
     CHECK_THROWS(json_schema_to_gbnf(json::parse(R"({"$ref":"#/$defs/none"})")));
 }
+
+TEST(lora_hot_swap) {
+    auto m = model::open(model_a());
+    session base(m); auto L0 = base.forward(std::vector<int>{1, 2, 3});
+    std::size_t w0 = m->loaded_weights();
+    auto vocab = m->vocab(); i64 d = 0; { pack::reader r(model_a()); d = r.load("lm_head").shape[1]; }
+    std::mt19937 g(4); std::normal_distribution<float> N(0, 0.05f); const i64 r = 4;
+    model::lora l; l.a.shape = {r, d}; l.b.shape = {vocab, r};
+    for (i64 i = 0; i < r * d; ++i) l.a.data.push_back(N(g)); for (i64 i = 0; i < vocab * r; ++i) l.b.data.push_back(N(g));
+    m->add_adapter("one", {{"lm_head", l}}, float(r)); m->add_adapter("two", {{"lm_head", l}}, float(2 * r));
+    { pack::reader rr(model_a()); auto wq = rr.load("layer.0.wq"); model::lora z; z.a.shape = {r, wq.shape[1]}; z.a.data.assign(std::size_t(r * wq.shape[1]), 0.f);
+      z.b.shape = {wq.shape[0], r}; z.b.data.assign(std::size_t(wq.shape[0] * r), 1.f); m->add_adapter("zero", {{"layer.0.wq", z}}, 8); }
+    CHECK_THROWS(m->add_adapter("one", {{"lm_head", l}}, 1.f));
+    model::lora bad = l; bad.b.shape = {vocab + 1, r}; CHECK_THROWS(m->add_adapter("bad", {{"lm_head", bad}}, 1.f));
+    session s(m); std::vector<int> ids{1, 2, 3};
+    s.set_adapter("one"); auto L1 = s.forward(ids);
+    s.set_adapter("two"); auto L2 = s.forward(ids);
+    s.set_adapter("zero"); auto Lz = s.forward(ids);
+    s.set_adapter(""); auto Lb = s.forward(ids);
+    CHECK_THROWS(s.set_adapter("nope"));
+    double lin = 0, diff = 0, z = 0, b = 0;
+    for (std::size_t i = 0; i < L0.size(); ++i) { lin = std::max(lin, double(std::fabs((L2[i] - L0[i]) - 2 * (L1[i] - L0[i]))));
+        diff = std::max(diff, double(std::fabs(L1[i] - L0[i]))); z = std::max(z, double(std::fabs(Lz[i] - L0[i]))); b = std::max(b, double(std::fabs(Lb[i] - L0[i]))); }
+    CHECK_MSG(diff > 1e-3, "adapter had no effect"); CHECK_MSG(lin < 1e-4, "delta not linear in alpha: %g", lin);
+    CHECK(z == 0); CHECK(b == 0);
+    CHECK(m->loaded_weights() == w0);                         // base weights were not reloaded or copied
+    // Two sessions with different adapters on one model.
+    session s1(m), s2(m); s1.set_adapter("one"); s2.set_adapter("two");
+    auto a = s1.forward(ids), c = s2.forward(ids); CHECK(a == L1 && c == L2);
+}

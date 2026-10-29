@@ -77,14 +77,53 @@ public:
     flow::plan_cache& plans() { return cache_; }
     std::mutex& run_mutex() { return run_mu_; }
 
+    // LoRA adapters: W' = W + (alpha / r) * B @ A for each named weight (A: [r, in], B: [out, r], PEFT layout).
+    // Only the targeted matrices are materialised per adapter; base weights stay mapped and shared, and each
+    // adapter gets its own plans, so sessions switch adapters per request without reloading anything.
+    struct lora { tensor a, b; };
+    void add_adapter(const std::string& name, const std::map<std::string, lora>& deltas, float alpha) {
+        if (name.empty() || adapters_.count(name)) raise(errc::invalid_argument, "adapter: empty or duplicate name '{}'", name);
+        std::map<std::string, tensor> merged;
+        for (auto& [w, d] : deltas) {
+            tensor base = r_.load(w);
+            if (d.a.shape.size() != 2 || d.b.shape.size() != 2 || base.shape.size() != 2 || d.b.shape[1] != d.a.shape[0] ||
+                d.b.shape[0] != base.shape[0] || d.a.shape[1] != base.shape[1])
+                raise(errc::invalid_argument, "adapter {}: shape mismatch for {}", name, w);
+            i64 r = d.a.shape[0], O = base.shape[0], I = base.shape[1]; float sc = alpha / float(r);
+            for (i64 o = 0; o < O; ++o) for (i64 k = 0; k < r; ++k) {
+                float bk = sc * d.b.data[std::size_t(o * r + k)];
+                for (i64 i = 0; i < I; ++i) base.data[std::size_t(o * I + i)] += bk * d.a.data[std::size_t(k * I + i)];
+            }
+            merged.emplace(w, std::move(base));
+        }
+        std::lock_guard lk(w_mu_);
+        // Plans (possibly held by live sessions) point at the merged data, so an adapter name is immutable.
+        if (!adapters_.emplace(name, std::move(merged)).second) raise(errc::invalid_argument, "adapter '{}' already loaded", name);
+    }
+    // Load an adapter from a .fpk holding "<weight>.lora_a" / "<weight>.lora_b" tensors; alpha from the manifest.
+    void add_adapter_file(const std::string& name, const std::string& path) {
+        pack::reader ar(path); std::map<std::string, lora> d;
+        for (auto& [n, e] : ar.tensors()) {
+            auto cut = n.rfind(".lora_"); if (cut == std::string::npos) continue;
+            auto& l = d[n.substr(0, cut)]; (n.substr(cut) == ".lora_a" ? l.a : l.b) = ar.load(n);
+        }
+        add_adapter(name, d, float(ar.manifest().num_or("lora_alpha", 1)));
+    }
+    bool has_adapter(const std::string& n) const { return n.empty() || adapters_.count(n); }
+    std::size_t loaded_weights() const { return weights_.size(); }
+
     // plan for `n` new tokens; all_rows keeps logits for every position
-    flow::plan& plan_for(i64 n, bool all_rows, flow::state_store* st) {
-        return cache_.get(std::format("{}:{}", all_rows ? "all" : "seq", n), [&] {
+    flow::plan& plan_for(i64 n, bool all_rows, flow::state_store* st, const std::string& adapter = {}) {
+        return cache_.get(std::format("{}:{}:{}", all_rows ? "all" : "seq", n, adapter), [&] {
             pack::build_options bo;
             bo.dims["seq"] = n;
             bo.all_rows = all_rows;
             bo.weight = [&](const std::string& name) -> std::pair<shape_t, const float*> {
                 std::lock_guard lk(w_mu_);
+                if (!adapter.empty()) {
+                    auto& m = adapters_.at(adapter);
+                    if (auto a = m.find(name); a != m.end()) return {a->second.shape, a->second.data.data()};
+                }
                 auto it = weights_.find(name);
                 if (it == weights_.end()) it = weights_.emplace(name, r_.load(name)).first;
                 return {it->second.shape, it->second.data.data()};
@@ -100,6 +139,7 @@ private:
     std::optional<pack::bpe_tokenizer> tok_;
     flow::plan_cache cache_;
     std::map<std::string, tensor> weights_;
+    std::map<std::string, std::map<std::string, tensor>> adapters_;
     std::mutex w_mu_, run_mu_;
     std::unique_ptr<flow::registry> reg_;
     std::string device_ = "cpu";
@@ -123,6 +163,13 @@ public:
     i64 context() const { return st_.capacity; }
     const flow::state_store& state() const { return st_; }
     void reset() { st_.reset(); pos_ = 0; }
+    // Select a LoRA adapter registered on the model ("" = base). The KV cache is cleared, since cached
+    // keys/values were computed with the previous weights.
+    void set_adapter(const std::string& a) {
+        if (!m_->has_adapter(a)) raise(errc::not_found, "adapter '{}' not loaded", a);
+        if (a != adapter_) { adapter_ = a; execs_.clear(); reset(); }
+    }
+    const std::string& adapter() const { return adapter_; }
     // roll back to `pos` tokens (speculative rejection, prefix reuse)
     void rewind(i64 pos) { if (pos < pos_) { st_.truncate(pos); pos_ = pos; } }
     // copy the first `n` tokens of another session's state (prefix sharing across sequences)
@@ -194,7 +241,7 @@ private:
         if (pos_ + i64(ids.size()) > st_.capacity) raise(errc::out_of_memory, "context {} exceeded", st_.capacity);
         i64 n = i64(ids.size());
         std::lock_guard lk(m_->run_mutex());
-        auto& p = m_->plan_for(n, all, &st_);
+        auto& p = m_->plan_for(n, all, &st_, adapter_);
         auto it = execs_.find(&p);
         if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<flow::executor>(p, &st_)).first;
         auto& ex = *it->second;
@@ -212,6 +259,7 @@ private:
     flow::state_store st_;
     std::map<flow::plan*, std::unique_ptr<flow::executor>> execs_;
     i64 pos_ = 0;
+    std::string adapter_;
 };
 
 } // namespace forge::mind
