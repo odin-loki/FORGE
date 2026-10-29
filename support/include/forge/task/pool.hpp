@@ -1,5 +1,6 @@
 #pragma once
 // task: a small shared work pool with parallel_for (one scheduler for every layer; no oversubscription).
+#include <cstdlib>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -13,6 +14,7 @@ namespace forge::task {
 class pool {
 public:
     explicit pool(unsigned n = 0) {
+        if (!n) if (const char* e = std::getenv("FORGE_THREADS")) n = unsigned(std::strtoul(e, nullptr, 10));   // cap for constrained hosts/emulators
         if (!n) n = std::max(1u, std::thread::hardware_concurrency());
         for (unsigned i = 1; i < n; ++i) workers_.emplace_back([this] { loop(); });
         size_ = n;
