@@ -5,6 +5,8 @@
 #include <forge/flow/kernels.hpp>
 #include <forge/grid/vulkan.hpp>
 #include <forge/grid/cuda.hpp>
+#include <forge/grid/opencl.hpp>
+#include <forge/grid/levelzero.hpp>
 
 namespace forge::flow {
 #ifdef FORGE_GRID_VULKAN
@@ -46,15 +48,14 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<grid::vk::runti
 #endif
 // CUDA / HIP lowerings ("cuda.<op>" / "hip.<op>"), oracle-gated. With the residency hooks, buffers stay on the
 // device for a whole executor run (weights across runs), like the Vulkan backend.
-inline std::shared_ptr<grid::gpu::runtime>& last_gpu_runtime() { static std::shared_ptr<grid::gpu::runtime> r; return r; }
-inline std::unique_ptr<registry> gpu_registry(std::shared_ptr<grid::gpu::runtime> rt) {
-    last_gpu_runtime() = rt;
+// The same registry serves every runtime with the cuda.hpp contract: CUDA, HIP, OpenCL, Level Zero.
+template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt) {
     auto r = registry::make();
-    std::string pre = grid::gpu::api_name(rt->which());
+    std::string pre = rt->backend();
     bool resident = !std::getenv("FORGE_GPU_NO_RESIDENCY");
     if (resident) {
         auto h = std::make_shared<device_hooks>();
-        grid::gpu::runtime* raw = rt.get();
+        RT* raw = rt.get();
         h->begin_run = [raw] { raw->begin_run(); };
         h->end_run = [raw] { raw->end_run(); };
         h->pin = [raw](const float* p, std::size_t n) { raw->pin(p, n); };
@@ -73,11 +74,11 @@ inline std::unique_ptr<registry> gpu_registry(std::shared_ptr<grid::gpu::runtime
                     return grid::gpu::supports(name, std::vector<shape_t>(in.begin(), in.end()), a); },
                 [rt, name](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
                     if (!rt->run_op(name, std::vector<tensor_view>(in.begin(), in.end()), a, out))
-                        raise(errc::unsupported, "{}: {} rejected its inputs", grid::gpu::api_name(rt->which()), name); }, -1, resident});
+                        raise(errc::unsupported, "{}: {} rejected its inputs", rt->backend(), name); }, -1, resident});
     }
     return r;
 }
-// Registry for a device name ("cpu", "vulkan", "cuda" or "hip"); null = CPU. `why` explains a fallback.
+// Registry for a device name ("cpu", "vulkan", "cuda[:N]", "hip[:N]", "opencl[:N]", "level_zero[:N]"); null = CPU. `why` explains a fallback.
 inline std::unique_ptr<registry> device_registry(const std::string& dev, std::string* why = nullptr) {
     if (dev.empty() || dev == "cpu") return nullptr;
 #ifdef FORGE_GRID_VULKAN
@@ -94,6 +95,20 @@ inline std::unique_ptr<registry> device_registry(const std::string& dev, std::st
         std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
         auto rt = grid::gpu::runtime::open(base == "cuda" ? grid::gpu::api::cuda : grid::gpu::api::hip, &e, ord);
         if (rt) return gpu_registry(std::shared_ptr<grid::gpu::runtime>(std::move(rt)));
+        if (why) *why = e;
+        return nullptr;
+    }
+    if (base == "opencl") {   // "opencl:N" = Nth device over all platforms (GPUs first)
+        std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
+        auto rt = grid::ocl::runtime::open(&e, ord);
+        if (rt) return gpu_registry(std::shared_ptr<grid::ocl::runtime>(std::move(rt)));
+        if (why) *why = e;
+        return nullptr;
+    }
+    if (base == "level_zero" || base == "ze") {
+        std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
+        auto rt = grid::ze::runtime::open(&e, ord);
+        if (rt) return gpu_registry(std::shared_ptr<grid::ze::runtime>(std::move(rt)));
         if (why) *why = e;
         return nullptr;
     }

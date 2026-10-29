@@ -2,6 +2,7 @@
 // `test_gpu cuda|hip` runs every kernel on the device against the reference (exit 77 = skip, no device).
 #include <forge/flow/flow.hpp>
 #include <forge/grid/cuda.hpp>
+#include <forge/flow/vulkan.hpp>
 #include <cstdio>
 #include <cmath>
 #include <cstring>
@@ -43,28 +44,30 @@ static int images() {
     return fails ? 1 : 0;
 }
 
-static int device(gpu::api a) {
-    std::string why; auto rt = gpu::runtime::open(a, &why);
+// Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
+template<class RT, class Open> static int device_t(Open open) {
+    std::string why; auto rt = open(&why, 0);
     if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
-    std::printf("%s device: %s (image %s)\n", gpu::api_name(a), rt->device_name().c_str(), rt->image_arch().c_str());
-    auto reg = flow::gpu_registry(std::shared_ptr<gpu::runtime>(std::move(rt)));
+    const std::string api = rt->backend();
+    std::printf("%s device: %s (image %s)\n", api.c_str(), rt->device_name().c_str(), rt->image_arch().c_str());
+    auto reg = flow::gpu_registry(std::shared_ptr<RT>(std::move(rt)));
     int fails = 0, n = 0;
     for (std::size_t i = 0; i < spec::op_count; ++i) for (auto& l : reg->lowerings(spec::op(i))) {
-        if (l.name.rfind(gpu::api_name(a), 0) != 0) continue;
+        if (l.name.rfind(api + ".", 0) != 0) continue;
         std::string msg; ++n;
         if (!flow::registry::oracle_check(l, &msg)) { std::printf("FAIL %s: %s\n", l.name.c_str(), msg.c_str()); ++fails; }
     }
-    std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, gpu::api_name(a));
+    std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails ? 1 : 0;
 }
 
 // Streams, residency, graphs, multi-device and peer copies (runs on hardware or the mock drivers).
-static int features(gpu::api a) {
-    std::string why; auto rt = gpu::runtime::open(a, &why);
+template<class Open, class Count> static int features_t(Open open, Count device_count) {
+    std::string why; auto rt = open(&why, 0);
     if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
     int fails = 0;
     auto chk = [&](bool c, const char* what) { std::printf("%s %s\n", c ? "ok  " : "FAIL", what); fails += !c; };
-    std::printf("%s: %d device(s), streams %d, graphs %d\n", gpu::api_name(a), gpu::runtime::device_count(a), rt->has_streams(), rt->has_graphs());
+    std::printf("%s: %d device(s), streams %d, graphs %d\n", rt->backend(), device_count(), rt->has_streams(), rt->has_graphs());
     // residency: a chain of ops inside one run touches the host only at the end
     std::vector<float> x(1000), y(1000), z(1000);
     for (int i = 0; i < 1000; ++i) x[std::size_t(i)] = float(i % 17) * 0.25f - 2;
@@ -96,8 +99,8 @@ static int features(gpu::api a) {
         rt->end_run();
     } else std::puts("note: driver has no graph API");
     // multi-device + peer copy
-    if (gpu::runtime::device_count(a) > 1) {
-        auto r1 = gpu::runtime::open(a, &why, 1);
+    if (device_count() > 1) {
+        auto r1 = open(&why, 1);
         chk(r1 != nullptr, "open device 1");
         if (r1) {
             auto s0 = rt->device_alloc(4000), s1 = r1->device_alloc(4000);
@@ -107,7 +110,7 @@ static int features(gpu::api a) {
             rt->device_free(s0); r1->device_free(s1);
         }
     }
-    chk(!gpu::runtime::open(a, &why, 99) && !why.empty(), "an out-of-range ordinal fails with a reason");
+    chk(!open(&why, 99) && !why.empty(), "an out-of-range ordinal fails with a reason");
     auto m = rt->memory(); std::printf("     memory: %zu / %zu bytes free\n", m.free, m.total);
     return fails ? 1 : 0;
 }
@@ -115,8 +118,19 @@ static int features(gpu::api a) {
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
-    if (mode == "cuda") return device(gpu::api::cuda);
-    if (mode == "hip") return device(gpu::api::hip);
-    if (mode == "features") return features(argc > 2 && std::string(argv[2]) == "hip" ? gpu::api::hip : gpu::api::cuda);
-    std::fprintf(stderr, "usage: test_gpu [images|cuda|hip]\n"); return 2;
+    auto cu = [](gpu::api a) { return [a](std::string* w, int o) { return gpu::runtime::open(a, w, o); }; };
+    auto cl = [](std::string* w, int o) { return forge::grid::ocl::runtime::open(w, o); };
+    auto ze = [](std::string* w, int o) { return forge::grid::ze::runtime::open(w, o); };
+    if (mode == "cuda") return device_t<gpu::runtime>(cu(gpu::api::cuda));
+    if (mode == "hip") return device_t<gpu::runtime>(cu(gpu::api::hip));
+    if (mode == "opencl") return device_t<forge::grid::ocl::runtime>(cl);
+    if (mode == "ze") return device_t<forge::grid::ze::runtime>(ze);
+    if (mode == "features") {
+        std::string w = argc > 2 ? argv[2] : "cuda";
+        if (w == "opencl") return features_t(cl, [] { return forge::grid::ocl::runtime::device_count(); });
+        if (w == "ze") return features_t(ze, [] { return forge::grid::ze::runtime::device_count(); });
+        auto a = w == "hip" ? gpu::api::hip : gpu::api::cuda;
+        return features_t(cu(a), [a] { return gpu::runtime::device_count(a); });
+    }
+    std::fprintf(stderr, "usage: test_gpu [images|cuda|hip|opencl|ze|features <api>]\n"); return 2;
 }

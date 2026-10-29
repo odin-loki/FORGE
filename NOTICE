@@ -9,3 +9,6 @@ This is a clean-room implementation, with one vendored third-party library:
 A machine-readable SPDX 2.3 SBOM is produced by tools/sbom.py.
 spec/intrinsics/x86.json is a hand-curated subset of intrinsic signatures (facts about the
 public Intel ISA interface), not copied from the Intel Intrinsics Guide data files.
+
+Level Zero API header (third_party/level-zero/ze_api.h)
+Copyright (C) 2019-2026 Intel Corporation. SPDX-License-Identifier: MIT

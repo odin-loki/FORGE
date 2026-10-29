@@ -74,6 +74,47 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     return false;
 }
 
+// Scalar arguments and launch size for a kernel, shared by the OpenCL and Level Zero runtimes (cuda.hpp's own
+// run_op packs the same values). Buffers come first in kernel order (inputs, the rope table after pos, output).
+struct scalar { bool is_float; std::uint32_t u; float f; };
+struct launch_args { sig s{}; std::uint32_t threads = 0; std::vector<scalar> scalars; std::vector<float> rope_inv; };
+inline launch_args kernel_args(const std::string& op, const std::vector<tensor_view>& in, const spec::attrs& a, const tensor_view& out) {
+    launch_args L; kernel_sig(op, L.s);
+    auto& x = in[0];
+    std::uint32_t n = std::uint32_t(out.size()); L.threads = n;
+    auto U = [&](std::uint32_t v) { L.scalars.push_back({false, v, 0.f}); };
+    auto F = [&](float v) { L.scalars.push_back({true, 0, v}); };
+    switch (L.s) {
+    case sig::unary: case sig::binary: U(n); break;
+    case sig::scale: U(n); F(float(a.num("alpha", 1.0))); break;
+    case sig::rows: case sig::rms: {
+        std::uint32_t cols = std::uint32_t(x.shape.back()), rows = cols ? std::uint32_t(x.size()) / cols : 0;
+        L.threads = rows; U(rows); U(cols); if (L.s == sig::rms) F(float(a.num("eps", 1e-6))); break; }
+    case sig::matmul: {
+        std::uint32_t k = std::uint32_t(x.shape.back()), rows = std::uint32_t(x.size()) / k, cols = std::uint32_t(in[1].shape[0]);
+        L.threads = rows * cols; U(rows); U(cols); U(k); break; }
+    case sig::rope: {
+        std::uint32_t rows = std::uint32_t(x.shape[0]), cols = std::uint32_t(x.shape[1]), k = std::uint32_t(x.shape[2]);
+        double base = a.num("base", 10000.0); L.rope_inv.resize(k / 2);
+        for (std::uint32_t j = 0; j < k / 2; ++j) L.rope_inv[j] = float(std::pow(base, -2.0 * double(j) / double(k)));
+        L.threads = rows * cols * (k / 2); U(rows); U(cols); U(k); U(a.num("neox", 1) != 0); break; }
+    case sig::gather: U(n); U(std::uint32_t(x.shape[0])); U(std::uint32_t(x.shape[1])); break;
+    case sig::slice: {
+        auto ax = std::size_t(spec::norm_axis(i64(a.num("axis", 0)), x.shape.size()));
+        i64 inner = 1; for (std::size_t d = ax + 1; d < x.shape.size(); ++d) inner *= x.shape[d];
+        i64 st = i64(a.num("start", 0)); if (st < 0) st += x.shape[ax];
+        U(n); U(std::uint32_t(x.shape[ax])); U(std::uint32_t(inner)); U(std::uint32_t(st)); U(std::uint32_t(out.shape[ax])); break; }
+    case sig::attention: {
+        auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
+        std::uint32_t s = std::uint32_t(x.shape[0]), hq = std::uint32_t(x.shape[1]), d = std::uint32_t(x.shape[2]);
+        U(s); U(hq); U(d); U(std::uint32_t(in[1].shape[0])); U(std::uint32_t(in[1].shape[1]));
+        U(vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]));
+        U((a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 3) | (std::uint32_t(a.num("window", 0)) << 5));
+        F(float(a.num("scale", 1.0 / std::sqrt(double(d))))); L.threads = s * hq; break; }
+    }
+    return L;
+}
+
 class runtime {
 public:
     static int device_count(api a) {
@@ -98,6 +139,7 @@ public:
         if (lib_) dlclose(lib_);
     }
     api which() const { return api_; }
+    const char* backend() const { return api_name(api_); }
     int ordinal() const { return ordinal_; }
     const std::string& device_name() const { return name_; }
     const std::string& image_arch() const { return arch_; }

@@ -76,7 +76,7 @@ set(FORGE_GPU_SOURCES)
 foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
-add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu
+add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
   DEPENDS ${FORGE_FSPECS} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
@@ -122,7 +122,16 @@ if(NOT FORGE_LLD)
   endif()
 endif()
 set(FORGE_HIP_ARCHS gfx90a gfx942 gfx1100 CACHE STRING "AMDGPU targets embedded for the HIP runtime")
-set(FORGE_GPU_IMAGES)
+set(FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.cl)   # OpenCL C, built by the driver at run time
+# Level Zero wants SPIR-V: OpenCL C -> LLVM IR (clang, spir64) -> SPIR-V (llvm-spirv), when the translator exists.
+find_program(FORGE_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-19 llvm-spirv-18 llvm-spirv-20)
+if(FORGE_GPU_CLANG AND FORGE_LLVM_SPIRV)
+  add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.spv
+    COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -O2 -emit-llvm -c -o ${FORGE_GPU_DIR}/kernels.cl.bc ${FORGE_GPU_DIR}/kernels.cl
+    COMMAND ${FORGE_LLVM_SPIRV} ${FORGE_GPU_DIR}/kernels.cl.bc -o ${FORGE_GPU_DIR}/kernels.spv
+    DEPENDS ${FORGE_GPU_DIR}/kernels.cl COMMENT "SPIR-V for Level Zero")
+  list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.spv)
+endif()
 if(FORGE_GPU_CLANG)
   add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.ptx
     COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_70 -O3 -Werror
@@ -159,7 +168,7 @@ add_custom_target(forge_gpu_images ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/gpu_i
 add_dependencies(forge_gpu_images forge_gpu_gen)
 message(STATUS "FORGE: CUDA/HIP images: ${FORGE_GPU_IMAGES}")
 add_library(forge_grid INTERFACE)
-target_include_directories(forge_grid INTERFACE grid/include support/include)
+target_include_directories(forge_grid INTERFACE grid/include support/include third_party)
 target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR})
 if(FORGE_HAVE_VULKAN)
   target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR}/vkinc)
@@ -311,6 +320,11 @@ if(FORGE_BUILD_TESTS)
   add_test(NAME test_gpu_hip COMMAND test_gpu hip)
   add_test(NAME test_gpu_features_cuda COMMAND test_gpu features cuda)
   add_test(NAME test_gpu_features_hip COMMAND test_gpu features hip)
+  foreach(m opencl ze)   # real runtimes: skip (77) without a driver/device
+    add_test(NAME test_gpu_${m} COMMAND test_gpu ${m})
+    add_test(NAME test_gpu_features_${m} COMMAND test_gpu features ${m})
+    set_tests_properties(test_gpu_${m} test_gpu_features_${m} PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  endforeach()
   set_tests_properties(test_gpu_features_cuda test_gpu_features_hip PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   set_tests_properties(test_gpu_cuda test_gpu_hip PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   if(NOT CMAKE_CROSSCOMPILING)
@@ -326,6 +340,24 @@ if(FORGE_BUILD_TESTS)
     set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/mockhip)
     target_link_libraries(mock_hip PRIVATE m)
     add_dependencies(test_gpu mock_hip)
+    foreach(m opencl ze)
+      if(m STREQUAL "opencl")
+        add_library(mock_${m} SHARED tests/mock_opencl.c)
+        set_target_properties(mock_${m} PROPERTIES OUTPUT_NAME OpenCL SOVERSION 1)
+      else()
+        add_library(mock_${m} SHARED tests/mock_ze.c)
+        set_target_properties(mock_${m} PROPERTIES OUTPUT_NAME ze_loader SOVERSION 1)
+      endif()
+      set_target_properties(mock_${m} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/mock${m})
+      target_include_directories(mock_${m} PRIVATE ${FORGE_GPU_DIR} ${CMAKE_SOURCE_DIR}/third_party)
+      target_link_libraries(mock_${m} PRIVATE m)
+      add_dependencies(mock_${m} forge_gpu_gen)
+      add_dependencies(test_gpu mock_${m})
+      add_test(NAME test_gpu_${m}_mock COMMAND test_gpu ${m})
+      add_test(NAME test_gpu_features_${m}_mock COMMAND test_gpu features ${m})
+      set_tests_properties(test_gpu_${m}_mock test_gpu_features_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mock${m};MOCK_DEVICES=2;FORGE_ZE_TEST_IMAGE=opencl-c")
+    endforeach()
     add_test(NAME test_gpu_hip_mock COMMAND test_gpu hip)
     set_tests_properties(test_gpu_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockhip" LABELS gpu SKIP_RETURN_CODE 77)
     add_test(NAME test_gpu_features_cuda_mock COMMAND test_gpu features cuda)
@@ -337,6 +369,14 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_cumock)
       set_tests_properties(golden_tiny_llama_cuda_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockcuda")
+      add_test(NAME golden_tiny_llama_opencl_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_clmock)
+      set_tests_properties(golden_tiny_llama_opencl_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=opencl;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockopencl")
+      add_test(NAME golden_tiny_llama_ze_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_zemock)
+      set_tests_properties(golden_tiny_llama_ze_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=level_zero;FORGE_ZE_TEST_IMAGE=opencl-c;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockze")
       add_test(NAME golden_tiny_llama_hip_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
@@ -352,7 +392,10 @@ if(FORGE_BUILD_TESTS)
              --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_sm80.ptx ${FORGE_GPU_DIR}/kernels.cu)
     add_test(NAME gpu_compile_hip COMMAND ${FORGE_GPU_CLANG} -x hip --cuda-device-only -nogpuinc -nogpulib
              --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_gfx90a.s ${FORGE_GPU_DIR}/kernels.cu)
-    set_tests_properties(gpu_compile_cuda gpu_compile_hip PROPERTIES LABELS gpu)
+    add_test(NAME gpu_compile_opencl COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
+    add_test(NAME gpu_compile_opencl_nofp64 COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL3.0 --target=spir64 -Xclang -cl-ext=-cl_khr_fp64,-__opencl_c_fp64
+             -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
+    set_tests_properties(gpu_compile_cuda gpu_compile_hip gpu_compile_opencl gpu_compile_opencl_nofp64 PROPERTIES LABELS gpu)
   endif()
   # Cross builds (e.g. aarch64 under qemu) are typically static: skip the shared-library smoke test there.
   if(NOT CMAKE_CROSSCOMPILING)
