@@ -25,7 +25,7 @@ struct lowering {
     kernel_fn fn;
     int verified = -1;     // -1 unknown, 0 failed oracle, 1 passed
     bool on_device = false;
-    double tol = 0;         // >0 widens the spec tolerance (e.g. Vulkan sin/cos: spec allows 2^-11 abs error)
+    double tol = 0;         // >0 replaces the spec tolerance with a relative bound (e.g. Vulkan sin/cos: spec allows 2^-11 error)
     // on_device: reads/writes device-resident buffers during an executor run (see device_hooks)
 };
 
@@ -87,7 +87,7 @@ public:
             std::vector<tensor_view> vs; for (auto& t : c.in) vs.push_back(t.view());
             tensor out(ref.shape, NAN);
             l.fn(vs, out.view(), c.a);
-            auto r = verify::compare(out, ref, l.tol > 0 ? spec::tolerance{spec::tol_kind::abs, l.tol} : spec::info(l.op).tol);
+            auto r = verify::compare(out, ref, l.tol > 0 ? spec::tolerance{spec::tol_kind::rel, l.tol} : spec::info(l.op).tol);
             if (!r.ok) { if (msg) *msg = r.message; return false; }
         }
         return true;
