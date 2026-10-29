@@ -11,7 +11,7 @@ sdk=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}; adb=${ADB:-$sdk/platform-tools/adb}
 b=$(cd "$2" && pwd); abi=$("$adb" shell getprop ro.product.cpu.abi | tr -d '\r')
 case "$1" in
 native)
-  libcxx=$(find "$ANDROID_NDK_HOME" -path "*$( [ "$abi" = x86_64 ] && echo x86_64-linux-android || echo aarch64-linux-android)/libc++_shared.so" | head -1)
+  libcxx=$(find -L "$ANDROID_NDK_HOME/" -path "*$( [ "$abi" = x86_64 ] && echo x86_64-linux-android || echo aarch64-linux-android)/libc++_shared.so" | head -1)
   d=/data/local/tmp/forge; "$adb" shell "rm -rf $d && mkdir -p $d"
   "$adb" push "$libcxx" $d/ >/dev/null
   for f in "$b"/lib*.so; do [ -f "$f" ] && "$adb" push "$f" $d/ >/dev/null; done
@@ -36,7 +36,7 @@ apk)
   "$bt/d8" --min-api 26 --lib "$jar" --output "$w" $(find "$w/classes" -name '*.class') "$ktstd"
   mkdir -p "$w/apk/lib/$abi"
   cp "$b/libforge_jni.so" "$b/libforge.so" "$w/apk/lib/$abi/"
-  cp "$(find "$ANDROID_NDK_HOME" -path "*$( [ "$abi" = x86_64 ] && echo x86_64-linux-android || echo aarch64-linux-android)/libc++_shared.so" | head -1)" "$w/apk/lib/$abi/"
+  cp "$(find -L "$ANDROID_NDK_HOME/" -path "*$( [ "$abi" = x86_64 ] && echo x86_64-linux-android || echo aarch64-linux-android)/libc++_shared.so" | head -1)" "$w/apk/lib/$abi/"
   sed 's/<manifest /<manifest package="dev.forge.example" /' "$src/bindings/android/example/src/main/AndroidManifest.xml" > "$w/AndroidManifest.xml"
   "$bt/aapt2" link -o "$w/base.apk" -I "$jar" --manifest "$w/AndroidManifest.xml" --min-sdk-version 26 --target-sdk-version 34
   (cd "$w" && cp classes.dex apk/ && cd apk && zip -qr ../base.apk classes.dex lib -0)
