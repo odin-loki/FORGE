@@ -103,7 +103,8 @@ public:
         backend_ = "kperf"; return {};
 #elif defined(FORGE_OS_WINDOWS)
         for (auto e : evs) if (e != perf_event::cycles) return {{}, unsupported(std::string("windows perf event ") + perf_event_name(e))};
-        backend_ = "QueryThreadCycleTime"; return {};
+        { ULONG64 c = 0; backend_ = QueryThreadCycleTime(GetCurrentThread(), &c) && c ? "QueryThreadCycleTime" : "cycle_counter"; }   // wine reports 0
+        return {};
 #else
         for (auto e : evs) if (e != perf_event::cycles) return {{}, unsupported(std::string("perf event ") + perf_event_name(e))};
         backend_ = "cycle_counter"; return {};
@@ -143,6 +144,7 @@ private:
 #if defined(FORGE_OS_MACOS)
         std::uint64_t c[32] = {}; if (get_thread_ && get_thread_(0, 32, c) == 0) return {c[0], c[1]}; return {};
 #elif defined(FORGE_OS_WINDOWS)
+        if (std::string(backend_) == "cycle_counter") return {cycle_counter()};
         ULONG64 c = 0; QueryThreadCycleTime(GetCurrentThread(), &c); return {c};
 #else
         return {cycle_counter()};

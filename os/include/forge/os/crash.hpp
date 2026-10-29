@@ -167,7 +167,7 @@ private:
         }
         char what[64]; std::snprintf(what, sizeof what, "exception 0x%08lx", ep && ep->ExceptionRecord ? (unsigned long)ep->ExceptionRecord->ExceptionCode : 0ul);
         write_report_(what, ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr, -1);
-        return EXCEPTION_CONTINUE_SEARCH;
+        return EXCEPTION_EXECUTE_HANDLER;   // terminate with the exception code; no WER / JIT debugger hang
     }
 #else
     static void sig_(int sg, siginfo_t* si, void*) {

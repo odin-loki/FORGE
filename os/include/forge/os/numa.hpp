@@ -89,9 +89,10 @@ inline status bind_thread_to_node(unsigned node) {
     return {};
 #elif defined(FORGE_OS_WINDOWS)
     GROUP_AFFINITY ga{};
-    if (!GetNumaNodeProcessorMaskEx(USHORT(node), &ga)) return {{}, last_error("GetNumaNodeProcessorMaskEx")};
-    if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return {{}, last_error("SetThreadGroupAffinity")};
-    return {};
+    if (GetNumaNodeProcessorMaskEx(USHORT(node), &ga) && ga.Mask && SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return {};
+    DWORD_PTR m = 0; for (auto c : n->cpus) if (c < sizeof(DWORD_PTR) * 8) m |= DWORD_PTR(1) << c;   // group-0 fallback (wine, old kernels)
+    if (m && SetThreadAffinityMask(GetCurrentThread(), m)) return {};
+    return {{}, last_error("SetThreadAffinityMask")};
 #elif defined(FORGE_OS_FREEBSD)
     if (ns.size() > 1) {
         domainset_t d; DOMAINSET_ZERO(&d); DOMAINSET_SET(node, &d);

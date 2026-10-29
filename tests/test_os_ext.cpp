@@ -21,6 +21,7 @@ static int child_main(const std::string& mode) {
         std::memcpy(s->data() + 64, "child-was-here", 15); return 0;
     }
     os::sandbox_policy p;
+    if (mode == "noop") return 0;
     if (mode == "sandbox_net") p.deny_network = true;
     else if (mode == "sandbox_exec") p.deny_exec = true;
     else if (mode.rfind("sandbox_write", 0) == 0) p.deny_fs_write = true;
@@ -34,7 +35,7 @@ static int child_main(const std::string& mode) {
 #endif
         return 0;
     }
-    if (p.deny_exec) { auto r = os::run({os::exe_path()}); return r && r->exit_code == 0 ? 4 : 0; }
+    if (p.deny_exec) { os::setenv("FORGE_OS_EXT_CHILD", "noop"); auto r = os::run({os::exe_path()}); return r && r->exit_code == 0 ? 4 : 0; }
     if (p.deny_fs_write) {
         if (os::write_file(os::join(arg, "nope.txt"), "x")) return 4;
         if (!os::read_file(os::exe_path())) return 5;
@@ -43,6 +44,7 @@ static int child_main(const std::string& mode) {
     return 9;
 }
 static const int child_dispatch = [] {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     auto m = os::getenv("FORGE_OS_EXT_CHILD"); if (m.empty()) return 0;
     os::unsetenv("FORGE_OS_EXT_CHILD"); std::fflush(stdout); std::exit(child_main(m));
 }();
@@ -206,6 +208,9 @@ TEST(sandboxing) {
         if (rc == 77) { skip(m.c_str(), "unsupported here"); continue; }
 #if defined(__FreeBSD__)
         if (rc != 0) { skip(m.c_str(), "capsicum is all-or-nothing"); continue; }
+#endif
+#if defined(_WIN32)
+        if (rc == 4 && GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version")) { skip(m.c_str(), "wine does not enforce job limits"); continue; }
 #endif
         CHECK_MSG(rc == 0, "%s rc=%d", m.c_str(), rc);
     }
