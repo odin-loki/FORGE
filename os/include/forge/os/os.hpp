@@ -2,6 +2,10 @@
 // forge::os: one OS-call API for Windows, Linux, Android, macOS, iOS and FreeBSD.
 // Files and fs, mmap, processes, threads, sync, time, sockets and polling (epoll / kqueue / WSAPoll), dynamic
 // libraries, environment, signals, memory, system and CPU info, paths, and entropy.
+// Extension modules (numa, hugepages, async_file, cpu_topology, power, memory_pressure, shared_memory, gpu_devices,
+// local_ipc, crash, sandbox, keystore, file_watch, perf, background, service) live beside this header; include
+// <forge/os/all.hpp> for all of them. Missing OS features return an error where os::is_unsupported(err) is true.
+// Guide: docs/os.md.
 // Errors: calls return os::result<T> (value or a native error code with a message); nothing throws.
 #include <atomic>
 #include <chrono>
