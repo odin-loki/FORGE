@@ -116,6 +116,10 @@ template <class T> struct result {
 };
 struct ok_t {};
 using status = result<ok_t>;
+// A feature this OS (or this build) does not provide: callers get a clean error instead of a crash.
+inline constexpr int unsupported_code = 0x0F0E5;
+inline error unsupported(std::string_view what) { return {unsupported_code, std::string(what) + ": unsupported on this platform"}; }
+inline bool is_unsupported(const error& e) { return e.code == unsupported_code; }
 
 // ---------------------------------------------------------------- platform identity
 enum class platform { windows, linux, android, macos, ios, freebsd, other };
@@ -172,6 +176,7 @@ public:
     ~file() { close(); }
     bool valid() const { return h_ != bad(); }
     native_t native() const { return h_; }
+    native_t release() { return std::exchange(h_, bad()); }   // give up ownership
     void close() {
         if (!valid()) return;
 #if defined(FORGE_OS_WINDOWS)
