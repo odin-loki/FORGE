@@ -16,11 +16,12 @@ native)
   "$adb" push "$libcxx" $d/ >/dev/null
   for f in "$b"/lib*.so; do [ -f "$f" ] && "$adb" push "$f" $d/ >/dev/null; done
   "$adb" push "$src/tests/data" $d/tests/ >/dev/null 2>&1 || true
+  "$adb" push "$src/import/templates" $d/templates >/dev/null
   fail=0; skip=0; pass=0
   for t in "$b"/test_* "$b"/example_*; do
     [ -x "$t" ] && [ -f "$t" ] || continue; n=$(basename "$t")
     "$adb" push "$t" $d/ >/dev/null
-    out=$("$adb" shell "cd $d && LD_LIBRARY_PATH=$d timeout 600 ./$n; echo RC=\$?" 2>&1 | tr -d '\r')
+    out=$("$adb" shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_TEMPLATES=$d/templates timeout 600 ./$n; echo RC=\$?" 2>&1 | tr -d '\r')
     rc=$(echo "$out" | sed -n 's/^RC=//p' | tail -1)
     case "$rc" in 0) pass=$((pass+1)); echo "PASS $n";; 77) skip=$((skip+1)); echo "SKIP $n";;
       *) fail=$((fail+1)); echo "FAIL $n (rc=$rc)"; echo "$out" | grep -E "FAIL|fail|error|Error|abort" | head -8;; esac

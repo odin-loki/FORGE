@@ -1,3 +1,4 @@
+#include <filesystem>
 #include "forge/io/aio.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +29,7 @@ static void run(bool uring, const std::string& path, const std::vector<std::uint
     ::close(fd);
 }
 int main() {
-    std::string path = "/tmp/forge_aio_test.bin";
+    std::string path = (std::filesystem::temp_directory_path() / "forge_aio_test.bin").string();
     std::vector<std::uint8_t> ref(3 * 1024 * 1024 + 777);
     std::mt19937 g(7); for (auto& b : ref) b = std::uint8_t(g());
     FILE* f = std::fopen(path.c_str(), "wb"); std::fwrite(ref.data(), 1, ref.size(), f); std::fclose(f);

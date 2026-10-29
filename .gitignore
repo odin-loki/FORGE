@@ -1,3 +1,7 @@
 build/
 *.fpk
 __pycache__/
+bindings/android/local.properties
+bindings/android/.gradle/
+bindings/android/**/build/
+bindings/android/**/.cxx/
