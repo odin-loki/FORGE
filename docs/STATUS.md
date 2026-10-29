@@ -76,10 +76,10 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 - **Android emulator pass** (`tests/android_emulator.sh`, x86_64 AVD API 34 under TCG — KVM is not usable in this VM): native tests run on device; Kotlin sources compile with kotlinc 2.0.21 + JDK 17.
 
 ## Remaining
-- Not testable on this machine: real CUDA/HIP GPUs, Level Zero, Metal, Windows/macOS/mobile, multi-GPU/NCCL-style collectives, and SDE-validated AMX/SME tiles.
+- Not testable on this machine: real CUDA/HIP GPUs, Level Zero, Metal, native Windows/macOS/iOS (Windows runs under wine, Android under the x86_64 emulator), multi-GPU/NCCL-style collectives, and SDE-validated AMX/SME tiles.
 - Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU.
 - CUDA/HIP/OpenCL/Level Zero/Metal have not been run on real hardware; only the mock drivers have run them.
-- Android: has not run on a device, and the Kotlin/Gradle files have not been compiled. iOS/Swift: not compiled at all.
+- Android: native tests run on the x86_64 emulator (see below), not on a physical device; the Kotlin/Gradle files have not been compiled. iOS/Swift: not compiled at all.
 - CI: the workflow file is at `ci/github-actions-ci.yml`. The push token lacks `workflow` scope, so it has to be moved to `.github/workflows/ci.yml` by hand.
 
 ## Build

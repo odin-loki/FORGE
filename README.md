@@ -39,7 +39,7 @@ It is a new design, not a fork or wrapper of any of those projects. Code and mod
 | `os` | Portable OS layer for Linux, Android, Windows, macOS, iOS, FreeBSD — [`docs/os.md`](docs/os.md) |
 | `balance` | Load balancer + L4/L7 proxy — [`docs/balance.md`](docs/balance.md) |
 | `apps` | `forge` CLI and `forge-serve` HTTP server — [`docs/serve.md`](docs/serve.md) |
-| `bindings` | Android (Kotlin/JNI, Gradle) and Apple (Swift package / XCFramework) |
+| `bindings` | Android (Kotlin/JNI, Gradle) and Apple (Swift package / XCFramework) — [`docs/bindings.md`](docs/bindings.md) |
 
 Build, cross-build, Android emulator and wine instructions: [`docs/STATUS.md#build`](docs/STATUS.md#build).
 CI: the workflow lives at `ci/github-actions-ci.yml`; move it to `.github/workflows/ci.yml` by hand (the push token lacks `workflow` scope).
