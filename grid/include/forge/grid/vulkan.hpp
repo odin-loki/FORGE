@@ -2,7 +2,7 @@
 // grid Vulkan backend: loads libvulkan at run time (no link dependency), runs the compute kernels that
 // spec/gen/gpu_gen.py generates from spec/ops (embedded as SPIR-V). Tested on Mesa lavapipe in CI.
 // Available when <vulkan/vulkan.h> and the generated SPIR-V header are both present at build time.
-#if __has_include(<vulkan/vulkan.h>) && __has_include(<forge/grid/spirv.gen.hpp>) && (defined(__linux__) || defined(__APPLE__))
+#if __has_include(<vulkan/vulkan.h>) && __has_include(<forge/grid/spirv.gen.hpp>) && (defined(__linux__) || defined(__APPLE__) || defined(_WIN32))
 #define FORGE_GRID_VULKAN 1
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
