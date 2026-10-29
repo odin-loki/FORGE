@@ -48,10 +48,10 @@ Each preset in `CMakePresets.json` has its own build directory:
 | `dev`, `release`, `asan` | `build/dev`, `build/release`, `build/asan` | host | yes (Linux) |
 | `windows-mingw` | `build/win64` | `cmake/toolchains/mingw-w64.cmake` | runs under wine |
 | `android-arm64` | `build/android-arm64` | `cmake/toolchains/android-arm64.cmake` (needs `ANDROID_NDK_HOME`) | x86_64 emulator |
-| `macos-osxcross` | `build/macos` | `cmake/toolchains/macos-osxcross.cmake` | link only |
+| `macos-osxcross` | `build/macos` | `cmake/toolchains/macos-osxcross.cmake` | not run (the zig `xos_*` cross-link tests cover macOS) |
 | `ios` | `build/ios` | `cmake/toolchains/ios.cmake` | not built |
 
-The `aarch64-sve-qemu` and `riscv64-rvv-qemu` toolchains run their tests under qemu. Emulator and wine steps: [docs/STATUS.md](docs/STATUS.md).
+The `aarch64-sve-qemu` and `riscv64-rvv-qemu` toolchains run their tests under qemu. Wine, emulator and qemu steps are in [docs/building.md](docs/building.md).
 
 ## Repository layout
 
