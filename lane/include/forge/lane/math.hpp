@@ -68,6 +68,15 @@ template <Target Tg> inline void split_exp(vec<float, Tg> x, vec<float, Tg>& m, 
         mm = _mm256_blendv_ps(mm, _mm256_mul_ps(mm, _mm256_set1_ps(0.5f)), big);
         ee = _mm256_blendv_ps(ee, _mm256_add_ps(ee, _mm256_set1_ps(1.0f)), big);
         m.r = mm; e.r = ee;)
+    } else if constexpr (vec<float, Tg>::K == 3) {
+        FORGE_IFNEON(
+        uint32x4_t xi = vreinterpretq_u32_f32(x.r);
+        float32x4_t ee = vcvtq_f32_s32(vsubq_s32(vreinterpretq_s32_u32(vshrq_n_u32(xi, 23)), vdupq_n_s32(127)));
+        float32x4_t mm = vreinterpretq_f32_u32(vorrq_u32(vandq_u32(xi, vdupq_n_u32(0x007fffff)), vdupq_n_u32(0x3f800000)));
+        uint32x4_t big = vcgtq_f32(mm, vdupq_n_f32(1.41421356f));
+        mm = vbslq_f32(big, vmulq_f32(mm, vdupq_n_f32(0.5f)), mm);
+        ee = vbslq_f32(big, vaddq_f32(ee, vdupq_n_f32(1.0f)), ee);
+        m.r = mm; e.r = ee;)
     } else {
         for (int i = 0; i < vec<float, Tg>::N; ++i) {
             int ex; float mm = std::frexp(x.r.v[i], &ex); mm *= 2; --ex;

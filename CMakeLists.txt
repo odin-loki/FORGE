@@ -78,14 +78,20 @@ set_target_properties(forge_c PROPERTIES OUTPUT_NAME forge VERSION 0.1.0 SOVERSI
 target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Multiversioned lane kernels: one TU per target, own flags, own namespace.
-add_library(forge_lane_mv STATIC
-  lane/src/kernels_scalar.cpp
-  lane/src/kernels_avx2.cpp
-  lane/src/kernels_avx512.cpp
-  lane/src/dispatch.cpp)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+  set(FORGE_ARCH aarch64)
+  add_library(forge_lane_mv STATIC lane/src/kernels_scalar.cpp lane/src/kernels_neon.cpp lane/src/dispatch.cpp)
+else()
+  set(FORGE_ARCH x86_64)
+  add_library(forge_lane_mv STATIC
+    lane/src/kernels_scalar.cpp
+    lane/src/kernels_avx2.cpp
+    lane/src/kernels_avx512.cpp
+    lane/src/dispatch.cpp)
+  set_source_files_properties(lane/src/kernels_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+  set_source_files_properties(lane/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
+endif()
 target_link_libraries(forge_lane_mv PUBLIC forge_lane)
-set_source_files_properties(lane/src/kernels_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-set_source_files_properties(lane/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
 
 if(FORGE_BUILD_APPS)
   add_executable(forge apps/forge.cpp)
@@ -97,6 +103,9 @@ if(FORGE_BUILD_TESTS)
   file(GLOB FORGE_TESTS CONFIGURE_DEPENDS tests/test_*.cpp)
   foreach(t ${FORGE_TESTS})
     get_filename_component(n ${t} NAME_WE)
+    if(n STREQUAL "test_lane_raw" AND NOT FORGE_ARCH STREQUAL "x86_64")
+      continue()
+    endif()
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE forge_mind forge_verify forge_lane_mv)
     target_include_directories(${n} PRIVATE tests)
@@ -105,14 +114,23 @@ if(FORGE_BUILD_TESTS)
     endif()
     add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
-  add_executable(capi_smoke tests/capi_smoke.c)
-  target_include_directories(capi_smoke PRIVATE mind/include)
-  target_link_libraries(capi_smoke PRIVATE forge_c)
+  # Cross builds (e.g. aarch64 under qemu) are typically static: skip the shared-library smoke test there.
+  if(NOT CMAKE_CROSSCOMPILING)
+    add_executable(capi_smoke tests/capi_smoke.c)
+    target_include_directories(capi_smoke PRIVATE mind/include)
+    target_link_libraries(capi_smoke PRIVATE forge_c)
+  endif()
   if(FORGE_BUILD_APPS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden)
-    add_test(NAME capi_smoke COMMAND capi_smoke ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
-    set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
+    if(CMAKE_CROSSCOMPILING_EMULATOR)
+      list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
+      set_tests_properties(golden_tiny_llama PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+    endif()
+    if(TARGET capi_smoke)
+      add_test(NAME capi_smoke COMMAND capi_smoke ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+      set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
+    endif()
   endif()
 endif()

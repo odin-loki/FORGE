@@ -130,6 +130,8 @@ def forward(W, ids):
     return rms(x, W["model.norm.weight"], eps) @ W["lm_head.weight"].T
 
 def run(cmd):
+    runner = os.environ.get("FORGE_RUNNER", "").split()  # e.g. qemu-aarch64 for cross builds
+    if runner and cmd and cmd[0].endswith("forge"): cmd = runner + list(cmd)
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         print("FAILED:", " ".join(cmd), "\n", r.stdout, r.stderr); sys.exit(1)

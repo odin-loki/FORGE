@@ -14,6 +14,9 @@ namespace forge::lane {
 namespace mv_scalar { extern const kernels table; }
 namespace mv_avx2 { extern const kernels table; }
 namespace mv_avx512 { extern const kernels table; }
+#if defined(__aarch64__)
+namespace mv_neon { extern const kernels table; }
+#endif
 
 #if defined(__x86_64__)
 static unsigned long long xgetbv0() {
@@ -97,16 +100,21 @@ const kernels* by_name(const char* t) {
     const auto& f = detect();
     std::string_view n = t;
     if (n == "scalar") return &mv_scalar::table;
+#if defined(__aarch64__)
+    if (n == "neon") return f.neon ? &mv_neon::table : nullptr;
+    return nullptr;
+#else
     if (n == "avx2") return f.avx2 && f.fma ? &mv_avx2::table : nullptr;
     if (n == "avx512") return f.avx512f && f.avx512bw && f.avx512dq && f.avx512vl ? &mv_avx512::table : nullptr;
     return nullptr;
+#endif
 }
 
 const kernels& active() {
     static const kernels* k = [] {
         if (const char* e = std::getenv("FORGE_LANE_TARGET"))
             if (auto* p = by_name(e)) return p;
-        for (const char* t : {"avx512", "avx2"}) if (auto* p = by_name(t)) return p;
+        for (const char* t : {"avx512", "avx2", "neon"}) if (auto* p = by_name(t)) return p;
         return &mv_scalar::table;
     }();
     return *k;

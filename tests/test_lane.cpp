@@ -21,14 +21,18 @@ static_assert(!Has<neoverse2, avx2> && Has<neoverse2, sve2>);
 
 static std::vector<const kernels*> tables() {
     std::vector<const kernels*> v;
-    for (const char* t : {"scalar", "avx2", "avx512"}) if (auto* k = by_name(t)) v.push_back(k);
+    for (const char* t : {"scalar", "avx2", "avx512", "neon"}) if (auto* k = by_name(t)) v.push_back(k);
     return v;
 }
 
 TEST(detection_reports) {
     auto& f = detect();
     std::printf("  cpu: %s\n  active: %s\n", f.summary().c_str(), active().target);
+#if defined(__x86_64__)
     CHECK(f.sse2);
+#elif defined(__aarch64__)
+    CHECK(f.neon);
+#endif
 }
 
 // strip/masks: every length 0..100, results must match scalar and never touch past the end.
