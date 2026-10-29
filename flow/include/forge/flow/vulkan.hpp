@@ -4,6 +4,7 @@
 // op/shape without a GPU kernel runs on the CPU, so a whole model runs with the GPU doing what it can.
 #include <forge/flow/kernels.hpp>
 #include <forge/grid/vulkan.hpp>
+#include <forge/grid/cuda.hpp>
 
 namespace forge::flow {
 #ifdef FORGE_GRID_VULKAN
@@ -43,7 +44,26 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<grid::vk::runti
     return r;
 }
 #endif
-// Registry for a device name ("cpu" or "vulkan"); null = CPU. `why` explains a fallback.
+// CUDA / HIP lowerings ("cuda.<op>" / "hip.<op>"): one host<->device round trip per op, oracle-gated.
+inline std::shared_ptr<grid::gpu::runtime>& last_gpu_runtime() { static std::shared_ptr<grid::gpu::runtime> r; return r; }
+inline std::unique_ptr<registry> gpu_registry(std::shared_ptr<grid::gpu::runtime> rt) {
+    last_gpu_runtime() = rt;
+    auto r = registry::make();
+    std::string pre = grid::gpu::api_name(rt->which());
+    for (std::size_t i = 0; i < spec::op_count; ++i) {
+        auto o = spec::op(i);
+        std::string name(spec::info(o).name);
+        grid::gpu::sig sg; if (!grid::gpu::kernel_sig(name, sg)) continue;
+        r->add({pre + "." + name, o, 20,
+                [name](std::span<const shape_t> in, const shape_t&, const spec::attrs& a) {
+                    return grid::gpu::supports(name, std::vector<shape_t>(in.begin(), in.end()), a); },
+                [rt, name](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
+                    if (!rt->run_op(name, std::vector<tensor_view>(in.begin(), in.end()), a, out))
+                        raise(errc::unsupported, "{}: {} rejected its inputs", grid::gpu::api_name(rt->which()), name); }});
+    }
+    return r;
+}
+// Registry for a device name ("cpu", "vulkan", "cuda" or "hip"); null = CPU. `why` explains a fallback.
 inline std::unique_ptr<registry> device_registry(const std::string& dev, std::string* why = nullptr) {
     if (dev.empty() || dev == "cpu") return nullptr;
 #ifdef FORGE_GRID_VULKAN
@@ -55,6 +75,13 @@ inline std::unique_ptr<registry> device_registry(const std::string& dev, std::st
         return nullptr;
     }
 #endif
+    if (dev == "cuda" || dev == "hip") {
+        std::string e;
+        auto rt = grid::gpu::runtime::open(dev == "cuda" ? grid::gpu::api::cuda : grid::gpu::api::hip, &e);
+        if (rt) return gpu_registry(std::shared_ptr<grid::gpu::runtime>(std::move(rt)));
+        if (why) *why = e;
+        return nullptr;
+    }
     if (why) *why = "device '" + dev + "' not available in this build";
     return nullptr;
 }

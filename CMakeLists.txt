@@ -102,13 +102,64 @@ else()
   add_custom_target(forge_gpu_gen ALL DEPENDS ${FORGE_GPU_DIR}/kernels.cu)
   message(STATUS "FORGE: Vulkan backend disabled (need glslangValidator + vulkan/vulkan.h)")
 endif()
+# CUDA / HIP kernel images, built from the generated kernels.cu with clang (no SDK) and embedded for the
+# dlopen-based host runtime (grid/cuda.hpp). HIP code objects need lld; zig's bundled ld.lld works too.
+find_program(FORGE_GPU_CLANG NAMES clang-19 clang-18 clang-20 clang)
+find_program(FORGE_LLD NAMES ld.lld ld.lld-19 ld.lld-18 lld)
+if(NOT FORGE_LLD)
+  find_program(FORGE_ZIG NAMES zig)
+  if(NOT FORGE_ZIG)
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import ziglang, os; print(os.path.join(os.path.dirname(ziglang.__file__), 'zig'))"
+                    OUTPUT_VARIABLE _zig OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _zr)
+    if(_zr EQUAL 0 AND EXISTS "${_zig}")
+      set(FORGE_ZIG ${_zig} CACHE FILEPATH "zig (for ld.lld)" FORCE)
+    endif()
+  endif()
+endif()
+set(FORGE_HIP_ARCHS gfx90a gfx942 gfx1100 CACHE STRING "AMDGPU targets embedded for the HIP runtime")
+set(FORGE_GPU_IMAGES)
+if(FORGE_GPU_CLANG)
+  add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.ptx
+    COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_70 -O3 -Werror
+            -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu
+    DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "PTX (sm_70)")
+  list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.ptx)
+  set(_ld)
+  if(FORGE_LLD)
+    get_filename_component(_lldir ${FORGE_LLD} DIRECTORY)
+    set(_ld --ld-path=${FORGE_LLD})
+    set(_ldpath ${_lldir})
+  elseif(FORGE_ZIG)
+    # clang only accepts an --ld-path for AMDGPU whose file is named like lld
+    file(COPY ${CMAKE_SOURCE_DIR}/cmake/tools/zig/lld DESTINATION ${CMAKE_BINARY_DIR}/tools
+         FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
+    set(_ld --ld-path=${CMAKE_BINARY_DIR}/tools/lld)
+    set(_ldpath ${CMAKE_BINARY_DIR}/tools)   # clang runs "lld" from PATH for the LTO link at -O3
+  endif()
+  if(_ld)
+    foreach(arch ${FORGE_HIP_ARCHS})
+      add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.${arch}.hsaco
+        COMMAND ${CMAKE_COMMAND} -E env FORGE_ZIG=${FORGE_ZIG} "PATH=${_ldpath}:$ENV{PATH}" ${FORGE_GPU_CLANG} -x hip --cuda-device-only --no-gpu-bundle-output
+                -nogpuinc -nogpulib --offload-arch=${arch} -O3 -Werror ${_ld} -o ${FORGE_GPU_DIR}/kernels.${arch}.hsaco ${FORGE_GPU_DIR}/kernels.cu
+        DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "HIP code object (${arch})")
+      list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.${arch}.hsaco)
+    endforeach()
+  endif()
+endif()
+add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+          --embed-images ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp ${FORGE_GPU_IMAGES}
+  DEPENDS ${FORGE_GPU_IMAGES} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding CUDA/HIP kernel images")
+add_custom_target(forge_gpu_images ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp)
+add_dependencies(forge_gpu_images forge_gpu_gen)
+message(STATUS "FORGE: CUDA/HIP images: ${FORGE_GPU_IMAGES}")
 add_library(forge_grid INTERFACE)
 target_include_directories(forge_grid INTERFACE grid/include support/include)
 target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR})
 if(FORGE_HAVE_VULKAN)
   target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR}/vkinc)
 endif()
-add_dependencies(forge_grid forge_gpu_gen)
+add_dependencies(forge_grid forge_gpu_gen forge_gpu_images)
 target_link_libraries(forge_grid INTERFACE forge_lane)
 
 add_library(forge_flow INTERFACE)
@@ -250,11 +301,29 @@ if(FORGE_BUILD_TESTS)
     endforeach()
   endif()
   set_tests_properties(test_vulkan PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  set_tests_properties(test_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  add_test(NAME test_gpu_cuda COMMAND test_gpu cuda)
+  add_test(NAME test_gpu_hip COMMAND test_gpu hip)
+  set_tests_properties(test_gpu_cuda test_gpu_hip PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  if(NOT CMAKE_CROSSCOMPILING)
+    # The CUDA host runtime against a CPU mock of libcuda.so.1 (argument packing, memcpy, launch sizing).
+    add_library(mock_cuda SHARED tests/mock_cuda.c)
+    set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/mockcuda)
+    target_link_libraries(mock_cuda PRIVATE m)
+    add_test(NAME test_gpu_cuda_mock COMMAND test_gpu cuda)
+    set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockcuda" LABELS gpu)
+    add_dependencies(test_gpu mock_cuda)
+    if(FORGE_BUILD_APPS)
+      add_test(NAME golden_tiny_llama_cuda_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_cumock)
+      set_tests_properties(golden_tiny_llama_cuda_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockcuda")
+    endif()
+  endif()
   if(FORGE_HAVE_VULKAN)
     target_include_directories(test_vulkan PRIVATE ${FORGE_GEN_DIR}/vkinc)
   endif()
   # CUDA / HIP: compile the generated kernels to PTX / AMDGCN with clang (no SDK needed); hardware runs need a GPU.
-  find_program(FORGE_GPU_CLANG NAMES clang-19 clang-18 clang-20 clang)
   if(FORGE_GPU_CLANG)
     add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib
              --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu)
