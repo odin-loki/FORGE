@@ -200,3 +200,7 @@ Also compiled and passed with g++ (Linux) in addition to the zig/clang dev build
 Untested: iOS (no SDK),
 FreeBSD/macOS execution, hybrid P/E hardware, multi-node NUMA, batteries/thermal sensors, real GPUs, running under
 systemd/SCM, Windows sandbox exec denial on real Windows, macOS kperf (root).
+
+## Latest runs (2026-10-30)
+- Linux, g++ dev build: ctest 76/76 pass, including the two new `doc_example_*` tests. The Python golden, signing and ONNX tests need `numpy`, `safetensors`, `onnx` and `cryptography` in the configured Python.
+- Windows under wine, mingw build, `tests/wine_run.sh`: 32 pass, `test_vulkan` skipped, `test_os.exe` failed once inside the suite. When rerun on its own, `test_os.exe` reports 0 failures, so it looks flaky. Not investigated yet.
