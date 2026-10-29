@@ -42,5 +42,5 @@ forge_close(m);
 After generation, `forge_position` equals the prompt length plus the generated tokens minus 1. This is because the last sampled token has not been fed through the model yet. In the example, 6 + 16 - 1 gives 21.
 
 ## Platform notes and limits
-- Cross builds that are static (for example under qemu) skip both `capi_smoke` and this example.
-- On Android, the shared library is packaged by the JNI binding. See [bindings.md](bindings.md).
+- Cross builds (any `CMAKE_CROSSCOMPILING` configuration) do not build `capi_smoke` or this example.
+- With `-DFORGE_JNI=ON` (the default in the `android-arm64` preset), the build also produces `libforge_jni`. This is a JNI shim over this ABI, used by the Kotlin binding: see [bindings.md](bindings.md).
