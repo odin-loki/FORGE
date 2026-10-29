@@ -161,11 +161,7 @@ TEST(gpu_discovery) {
 }
 // ---------------------------------------------------------------- 9 local IPC
 TEST(local_ipc) {
-#if defined(__linux__)
-    auto ep = os::local_endpoint("@osx" + std::to_string(os::pid()));   // abstract: SELinux blocks socket files in app/shell dirs on Android
-#else
-    auto ep = os::local_endpoint("osx" + std::to_string(os::pid()));
-#endif
+    auto ep = os::local_endpoint("osx" + std::to_string(os::pid()));   // abstract "@forge-osx<pid>" on Linux/Android
     auto l = os::local_listener::listen(ep); CHECK_MSG(l, "%s", l.err.what.c_str()); if (!l) return;
     std::thread cl([&] {
         auto c = os::local_stream::connect(ep); CHECK(c); if (!c) return;
