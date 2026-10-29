@@ -5,6 +5,23 @@
 #include <vector>
 #if defined(__aarch64__) && defined(FORGE_HAVE_SME)
 #include <arm_sme.h>
+// Weak fallbacks for the SME ABI support routines (AAPCS64 SME support routines) for runtimes that lack them.
+// FORGE's ZA users are all __arm_new("za") entry points called from ZA-free code, so a pending lazy save
+// (TPIDR2_EL0 != 0) is never expected here: it traps rather than silently corrupting a caller's ZA.
+// They use only x16/x17 and x0/x1 as the ABI's custom preservation rules allow.
+extern "C" {
+__attribute__((weak, naked)) void __arm_tpidr2_save() __arm_streaming_compatible {
+    asm("mrs x16, tpidr2_el0\n cbz x16, 1f\n brk #0x5e\n1: ret");
+}
+__attribute__((weak, naked)) void __arm_za_disable() __arm_streaming_compatible {
+    asm("mrs x16, tpidr2_el0\n cbz x16, 1f\n brk #0x5e\n1: .inst 0xd503447f\n ret");   // smstop za
+}
+__attribute__((weak, naked)) void __arm_tpidr2_restore() __arm_streaming_compatible { asm("brk #0x5f"); }
+__attribute__((weak, naked)) void __arm_get_current_vg() __arm_streaming_compatible { asm(".inst 0x04e0e3e0\n ret"); }  // cntd x0
+__attribute__((weak, naked)) void __arm_sme_state() __arm_streaming_compatible {
+    asm("mov x0, #1\n lsl x0, x0, #63\n .inst 0xd53b4250\n and x16, x16, #3\n orr x0, x0, x16\n mrs x1, tpidr2_el0\n ret");  // mrs x16, svcr
+}
+}
 #if defined(__linux__)
 #include <sys/auxv.h>
 #ifndef HWCAP2_SME
