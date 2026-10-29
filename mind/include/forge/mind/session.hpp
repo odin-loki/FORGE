@@ -8,6 +8,7 @@
 #include <forge/mind/sampler.hpp>
 #include <forge/pack/blueprint.hpp>
 #include <forge/pack/fpk.hpp>
+#include <forge/pack/sign.hpp>
 #include <forge/pack/tokenizer.hpp>
 #include <chrono>
 #include <functional>
@@ -28,9 +29,21 @@ struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double pr
 class model {
 public:
     explicit model(const std::string& fpk_path, bool verify = false) : r_(fpk_path) {
-        if (verify) {
+        // Strict mode (FORGE_PLAN: "verify before load; refuse unsigned files"): FORGE_REQUIRE_SIGNED=1
+        // and/or FORGE_TRUSTED_KEYS=<hex pubkey>[,<hex pubkey>...] require a valid (trusted) signature.
+        std::vector<std::string> trusted;
+        if (auto* e = std::getenv("FORGE_TRUSTED_KEYS")) {
+            std::string s = e;
+            for (std::size_t p = 0, q; p < s.size(); p = q + 1) { q = s.find(',', p); if (q == std::string::npos) q = s.size(); if (q > p) trusted.push_back(s.substr(p, q - p)); }
+        }
+        bool strict = !trusted.empty() || (std::getenv("FORGE_REQUIRE_SIGNED") && std::string(std::getenv("FORGE_REQUIRE_SIGNED")) == "1");
+        if (verify || strict) {
             auto bad = r_.verify();
             if (!bad.empty()) raise(errc::integrity_error, "{}: hash mismatch in {}", fpk_path, bad.front());
+        }
+        if (strict || (verify && r_.has_section("signature"))) {
+            auto rep = pack::verify_signature(r_, trusted);
+            if (!rep.trusted && (strict || rep.signed_)) raise(errc::integrity_error, "{}: signature check failed: {}", fpk_path, rep.message);
         }
         man_ = r_.manifest();
         bp_ = pack::parse_blueprint(r_.section_text("blueprint"));

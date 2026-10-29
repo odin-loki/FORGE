@@ -18,6 +18,8 @@ struct args {
     std::vector<std::string> pos;
     std::map<std::string, std::string> kv;
     std::set<std::string> flags;
+    std::map<std::string, std::vector<std::string>> multi;  // repeated options (e.g. --pubkey a --pubkey b)
+    std::vector<std::string> all(const std::string& k) const { auto it = multi.find(k); return it == multi.end() ? std::vector<std::string>{} : it->second; }
     std::string get(const std::string& k, const std::string& d = "") const { auto it = kv.find(k); return it == kv.end() ? d : it->second; }
     double num(const std::string& k, double d) const { auto it = kv.find(k); return it == kv.end() ? d : std::stod(it->second); }
     bool has(const std::string& f) const { return flags.count(f) || kv.count(f); }
@@ -29,8 +31,8 @@ args parse(int argc, char** argv, int from, std::set<std::string> boolean) {
         std::string s = argv[i];
         if (s.rfind("--", 0) == 0 || (s.size() == 2 && s[0] == '-')) {
             std::string k = s.substr(s[1] == '-' ? 2 : 1);
-            if (auto eq = k.find('='); eq != std::string::npos) { a.kv[k.substr(0, eq)] = k.substr(eq + 1); continue; }
-            if (boolean.count(k) || i + 1 >= argc) a.flags.insert(k); else a.kv[k] = argv[++i];
+            if (auto eq = k.find('='); eq != std::string::npos) { a.kv[k.substr(0, eq)] = k.substr(eq + 1); a.multi[k.substr(0, eq)].push_back(k.substr(eq + 1)); continue; }
+            if (boolean.count(k) || i + 1 >= argc) a.flags.insert(k); else { a.kv[k] = argv[++i]; a.multi[k].push_back(a.kv[k]); }
         } else a.pos.push_back(s);
     }
     return a;
@@ -47,7 +49,11 @@ int usage() {
         "      [--grammar file.gbnf] [--draft draft.fpk [--spec-k 4]] [--codec C (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512\n"
-        "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32");
+        "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
+        "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
+        "  sign <model.fpk> --key <name.key> [-o out.fpk]   add/extend the signature section\n"
+        "  verify <model.fpk> [--pubkey <name.pub>]...      check hashes + signature (exit 1 on failure)\n"
+        "  (strict loading: FORGE_REQUIRE_SIGNED=1 and/or FORGE_TRUSTED_KEYS=<hex>[,<hex>])");
     return 2;
 }
 
@@ -124,6 +130,38 @@ int cmd_dump(const args& a) {  // decode one tensor to raw little-endian f32
     f.write(reinterpret_cast<const char*>(t.data.data()), std::streamsize(t.size() * 4));
     std::printf("%s %s %s -> %s\n", a.pos[1].c_str(), r.entry(a.pos[1]).codec.c_str(), shape_str(t.shape).c_str(), a.pos[2].c_str());
     return 0;
+}
+
+int cmd_keygen(const args& a) {
+    if (a.get("o").empty()) return usage();
+    auto k = pack::generate_keypair();
+    auto base = a.get("o");
+    { std::ofstream f(base + ".key"); f << pack::detail::to_hex(k.seed) << "\n"; }
+    std::filesystem::permissions(base + ".key", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    { std::ofstream f(base + ".pub"); f << pack::detail::to_hex(k.pub) << "\n"; }
+    std::printf("key id %s\npublic %s\nwrote %s.key (keep secret) and %s.pub\n", pack::key_id(k.pub).c_str(), pack::detail::to_hex(k.pub).c_str(), base.c_str(), base.c_str());
+    return 0;
+}
+int cmd_sign(const args& a) {
+    if (a.pos.empty() || a.get("key").empty()) return usage();
+    auto k = pack::load_secret_key(a.get("key"));
+    auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
+    pack::sign_file(a.pos[0], out, k);
+    std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), pack::key_id(k.pub).c_str(), out.c_str());
+    return 0;
+}
+int cmd_verify(const args& a) {
+    if (a.pos.empty()) return usage();
+    pack::reader r(a.pos[0]);
+    auto bad = r.verify();
+    for (auto& b : bad) std::printf("hash MISMATCH %s\n", b.c_str());
+    std::vector<std::string> trusted;
+    for (auto& p : a.all("pubkey")) trusted.push_back(pack::load_public_key(p));
+    auto rep = pack::verify_signature(r, trusted);
+    for (auto& k : rep.valid_keys) std::printf("signature ok   key %s\n", k.c_str());
+    for (auto& k : rep.invalid_keys) std::printf("signature BAD  key %s\n", k.c_str());
+    std::printf("%s: %s\n", a.pos[0].c_str(), bad.empty() && rep.trusted ? "VERIFIED" : rep.message.c_str());
+    return bad.empty() && rep.trusted ? 0 : 1;
 }
 
 int cmd_run(const args& a) {
@@ -225,6 +263,9 @@ int main(int argc, char** argv) {
         if (c == "run") return cmd_run(a);
         if (c == "bench") return cmd_bench(a);
         if (c == "dump") return cmd_dump(a);
+        if (c == "keygen") return cmd_keygen(a);
+        if (c == "sign") return cmd_sign(a);
+        if (c == "verify") return cmd_verify(a);
         return usage();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "forge: error: %s\n", e.what());

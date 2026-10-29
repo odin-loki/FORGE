@@ -64,9 +64,14 @@ add_library(forge_flow INTERFACE)
 target_include_directories(forge_flow INTERFACE flow/include)
 target_link_libraries(forge_flow INTERFACE forge_spec forge_lane forge_grid)
 
+# Vendored Monocypher 4.0.2 (BSD-2-Clause / CC0): Ed25519 for .fpk signing.
+add_library(forge_trust STATIC third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c)
+target_include_directories(forge_trust PUBLIC third_party/monocypher)
+set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+
 add_library(forge_pack INTERFACE)
 target_include_directories(forge_pack INTERFACE pack/include)
-target_link_libraries(forge_pack INTERFACE forge_flow)
+target_link_libraries(forge_pack INTERFACE forge_flow forge_trust)
 
 add_library(forge_mind INTERFACE)
 target_include_directories(forge_mind INTERFACE mind/include)
@@ -123,6 +128,9 @@ if(FORGE_BUILD_TESTS)
     target_link_libraries(capi_smoke PRIVATE forge_c)
   endif()
   if(FORGE_BUILD_APPS)
+    add_test(NAME pack_signing COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/sign_test.py
+             $<TARGET_FILE:forge> ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+    set_tests_properties(pack_signing PROPERTIES DEPENDS golden_tiny_llama)
     add_test(NAME golden_moe_mla
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_moe.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_moe)
