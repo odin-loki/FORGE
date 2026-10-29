@@ -2,6 +2,7 @@
 #include <forge/mind/mind.hpp>
 #include <cstdio>
 #include <filesystem>
+#include <unistd.h>
 #include <fstream>
 
 using namespace forge;
@@ -36,7 +37,7 @@ TEST(json_roundtrip_and_errors) {
 }
 
 TEST(fpk_write_read_verify_and_corruption) {
-    auto path = std::filesystem::temp_directory_path() / "forge_test.fpk";
+    auto path = std::filesystem::temp_directory_path() / ("forge_test_" + std::to_string(::getpid()) + ".fpk");
     std::vector<float> a(1000); for (std::size_t i = 0; i < a.size(); ++i) a[i] = float(i) * 0.01f - 3.f;
     {
         pack::writer w;

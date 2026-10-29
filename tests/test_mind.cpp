@@ -2,11 +2,12 @@
 #include "tiny_model.hpp"
 #include <forge/mind/mind.hpp>
 #include <filesystem>
+#include <unistd.h>
 
 using namespace forge;
 using namespace forge::mind;
 
-static std::string tmp(const std::string& n) { return (std::filesystem::temp_directory_path() / ("forge_test_" + n)).string(); }
+static std::string tmp(const std::string& n) { return (std::filesystem::temp_directory_path() / ("forge_test_" + std::to_string(::getpid()) + "_" + n)).string(); }
 static const std::string& model_a() { static std::string p = forge_test::make_tiny_model(tmp("a.fpk")); return p; }
 static const std::string& model_b() { static std::string p = forge_test::make_tiny_model(tmp("b.fpk"), {.seed = 99}); return p; }
 static const std::string& model_q() { static std::string p = forge_test::make_tiny_model(tmp("q.fpk"), {.codec = "q8_0"}); return p; }
