@@ -2,8 +2,9 @@
 
 `balance/include/forge/balance/balance.hpp`: `pool` of backends with `strategy` = `round_robin`, `weighted` (smooth WRR),
 `least_connections`, `least_latency` (EWMA), `consistent_hash` (vnodes + bounded load), `power_of_two` (P2C) and
-`prefix_affinity` (KV-cache affinity with load spill). Health checks (`health_checker`), a per-backend circuit breaker
-(closed/open/half-open), retries (`pool::call` with `retry_policy`) and a backpressure queue.
+`prefix_affinity` (KV-cache affinity with load spill). Passive and active health checks (`health_checker`), per-backend circuit breakers (closed/open/half-open), outlier
+ejection, retries with exponential backoff + jitter on a different backend (`pool::call` with `retry_policy`), and
+per-backend concurrency limits with a bounded, deadline-aware wait queue (backpressure). Thread-safe, header-only.
 
 `proxy.hpp`: L4 (TCP splice) or L7 (HTTP) proxy used by `forge-serve proxy`:
 
