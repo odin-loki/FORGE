@@ -52,7 +52,10 @@ TEST(time_and_sleep) {
     auto t0 = os::monotonic_ns(); os::sleep_ns(20'000'000); auto dt = os::monotonic_ns() - t0;
     CHECK(dt >= 15'000'000 && dt < 2'000'000'000);
     CHECK(os::wall_ns() > 1'700'000'000'000'000'000LL);
-    volatile double x = 0; for (int i = 0; i < 2'000'000; ++i) x = x + i; CHECK(os::cpu_time_ns() > 0);
+    // Busy-spin >= 100 ms of wall time: Windows process times tick at ~15.6 ms, so a short loop can read 0.
+    volatile double x = 0; auto s0 = os::monotonic_ns();
+    while (os::monotonic_ns() - s0 < 100'000'000) for (int i = 0; i < 10'000; ++i) x = x + i;
+    CHECK(os::cpu_time_ns() > 0);
 }
 TEST(threads_and_sync) {
     os::mutex m; os::condvar cv; int counter = 0; std::atomic<std::uint64_t> other{0};
