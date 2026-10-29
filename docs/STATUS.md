@@ -132,7 +132,13 @@ no memory clobber), reused thread_local pack buffers, and test_tile retries befo
   - Android x86_64 emulator (TCG): test_os and test_balance pass; the l7 stickiness check is occasionally flaky under TCG.
   - zig cross compile+link (`xos_*` ctests): x86_64-freebsd, aarch64/x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl all OK.
 - Android full-suite run: everything passes except test_vulkan. SwiftShader's sin/cos come in at about 1.9e-4 abs error, which the Vulkan spec allows (bound 2^-11). Fix: vk lowerings for sin/cos/rope now carry `lowering::tol = 5e-4`. test_mind and example_seatbelt hit `adb device offline` because the emulator ran out of memory; that is not a test failure.
+- Windows under wine (`tests/wine_run.sh`): the earlier `kernel32.dll c0000135` came from a wow64 prefix. A pure 64-bit prefix (`WINEARCH=win64`, `/usr/lib/wine/wine64 wineboot -i`) works. All 19 win64 tests, 5 examples and 8 fuzzers pass; test_vulkan skips (no ICD). Real Windows bugs this run exposed and fixed:
+  - IOCP: `completion_port` now reopens the file handle with `FILE_FLAG_OVERLAPPED` (`ReOpenFile`); sync handles never completed.
+  - msvcrt/mingw `fmaf` is unfused (2.4M of 10M random inputs wrong), which broke the scalar lane math (asin/erfc 1 ulp over). New `forge::fmaf_exact` (TwoSum + round-to-odd, or the hardware FMA) is used by the lane scalar backend and the spec reference.
+  - `std::rename` does not replace on Windows, so fpk write/sign silently kept the old file. They now use `os::rename` (MoveFileEx REPLACE_EXISTING) and raise on failure.
+  - `pack::reader`, `safetensors` and `gguf_file` leaked their mapping when the constructor threw (bad key, corrupt or fuzzed input), which held files open on Windows.
+  - Tests: autodiff data is now portable Box-Muller (std::normal_distribution differs between libstdc++ and libc++). The paged-KV capacity check now allows for EOS.
+- All platform code now goes through forge::os: rpc (os::socket), aio (os::file; CRT fds kept on Windows), video/interop (os::library), and the dl.hpp shim (UTF-8 LoadLibraryW).
 - Not done:
-  - wine: still fails with `kernel32.dll c0000135` (wow64 prefix), so Windows is verified by mingw/zig link only.
   - FreeBSD qemu VM: not run (memory limits on the shared box); only cross-linked.
   - iOS: no SDK (zig lacks iOS libc headers, and there is no osxcross/darling), so iOS paths are unverified beyond review.
