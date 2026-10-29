@@ -79,6 +79,10 @@ struct blueprint {
     std::string session = "one_shot";
     std::vector<bp_token> toks;
     std::size_t graph_begin = 0, graph_end = 0;     // token range of the graph body
+    // Composite ops: `op name(a, b) { t = ...  return expr }`. A spec op of the same name wins when the
+    // engine has one, so files keep working on old engines and pick up fused kernels on new ones.
+    struct composite { std::vector<std::string> args; std::size_t body_begin = 0, body_end = 0; };
+    std::map<std::string, composite> composites;
     double param(const std::string& k) const {
         auto it = params.find(k);
         if (it == params.end()) raise(errc::not_found, "blueprint '{}': no param '{}'", name, k);
@@ -299,7 +303,11 @@ private:
             return T(g_.apply(spec::op::slice, {as_tensor(pos.at(0))}, {{"axis", 0.0}, {"start", double(n - 1)}, {"end", double(n)}}));
         }
         auto o = spec::op_from_name(fn);
-        if (!o) raise(errc::parse_error, "blueprint:{}: unknown function '{}'", line, fn);
+        if (!o) {
+            auto cit = bp_.composites.find(fn);
+            if (cit == bp_.composites.end()) raise(errc::parse_error, "blueprint:{}: unknown function '{}'", line, fn);
+            return expand_composite(fn, cit->second, pos, line);
+        }
         const auto& inf = spec::info(*o);
         std::vector<std::string> anames;
         for (std::size_t s = 0, e; s < inf.attrs.size(); s = e + 1) {
@@ -324,6 +332,24 @@ private:
         return T(g_.apply(*o, ins, a));
     }
 
+    bp_val expand_composite(const std::string& fn, const blueprint::composite& c, const std::vector<bp_val>& pos, int line) {
+        if (pos.size() != c.args.size()) raise(errc::parse_error, "blueprint:{}: {} expects {} arguments, got {}", line, fn, c.args.size(), pos.size());
+        if (++expansions_ > 100000) raise(errc::parse_error, "blueprint:{}: too many composite expansions", line);
+        if (++depth_ > 64) raise(errc::parse_error, "blueprint:{}: composite '{}' recursion too deep", line, fn);
+        auto saved_env = env_; auto back = ps_.pos();
+        for (std::size_t i = 0; i < pos.size(); ++i) env_[c.args[i]] = pos[i];   // lexical: args shadow outer names
+        ps_.seek(c.body_begin);
+        bp_val r; bool got = false;
+        while (ps_.pos() < c.body_end) {
+            if (ps_.accept("return")) { r = expr(); got = true; break; }
+            stmt();
+        }
+        if (!got) raise(errc::parse_error, "blueprint:{}: composite '{}' has no return", line, fn);
+        env_ = std::move(saved_env); ps_.seek(back); --depth_;
+        return r;
+    }
+
+    int depth_ = 0; std::size_t expansions_ = 0;
     const blueprint& bp_;
     const build_options& o_;
     flow::graph& g_;
@@ -396,13 +422,20 @@ inline blueprint parse_blueprint(std::string_view src) {
         } else if (ps.accept("input")) bp.inputs.push_back(detail::parse_io(ps));
         else if (ps.accept("output")) bp.outputs.push_back(detail::parse_io(ps));
         else if (ps.accept("session")) bp.session = ps.ident();
+        else if (ps.accept("op")) {
+            auto nm = ps.ident(); blueprint::composite c; ps.expect("(");
+            while (!ps.accept(")")) { c.args.push_back(ps.ident()); ps.accept(","); }
+            if (!ps.is("{")) ps.fail("expected '{' after op signature");
+            c.body_begin = ps.pos() + 1; ps.skip_block(); c.body_end = ps.pos() - 1;
+            if (!bp.composites.emplace(nm, c).second) ps.fail("op '" + nm + "' defined twice");
+        }
         else if (ps.accept("graph")) {
             if (!ps.is("{")) ps.fail("expected '{'");
             bp.graph_begin = ps.pos() + 1;
             ps.skip_block();
             bp.graph_end = ps.pos() - 1;
             have_graph = true;
-        } else ps.fail("expected params/state/input/graph/output/session");
+        } else ps.fail("expected params/state/input/graph/output/session/op");
     }
     if (!have_graph) raise(errc::parse_error, "blueprint '{}': no graph block", bp.name);
     if (bp.outputs.empty()) raise(errc::parse_error, "blueprint '{}': no outputs declared", bp.name);

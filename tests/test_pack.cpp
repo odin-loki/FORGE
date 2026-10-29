@@ -118,3 +118,34 @@ TEST(sampler_chain) {
     CHECK(c[0] == 0 && c[3] == 0 && c[1] > c[2] && c[2] > 700);
     mind::sampler mp({.temperature = 1.f, .min_p = 0.95f, .seed = 1}); for (int i = 0; i < 20; ++i) CHECK(mp.sample(l) == 1);
 }
+
+TEST(blueprint_composite_ops) {
+    auto src = R"(blueprint "c"
+op cube(x) { return x * x * x }
+op my_gelu(x) {
+  inner = 0.7978845608 * (x + 0.044715 * cube(x))
+  return 0.5 * x * (1 + tanh(inner))
+}
+op silu(x) { return x * 0 }
+op twice(a, b) { s = my_gelu(a) + b  return s * 2 }
+input x : f32[8]
+graph { y = my_gelu(x)  z = silu(x)  w = twice(x, x) }
+output y : f32[8]
+output z : f32[8]
+output w : f32[8]
+)";
+    auto bp = pack::parse_blueprint(src); CHECK(bp.composites.size() == 4);
+    auto p = flow::compile(pack::build_graph(bp, {})); flow::executor ex(*p);
+    std::vector<float> x = {-3, -1, -0.5f, 0, 0.25f, 1, 2, 4}; ex.set_input("x", x); ex.run();
+    auto y = ex.output_view("y"), z = ex.output_view("z"), w = ex.output_view("w");
+    for (std::size_t i = 0; i < 8; ++i) {
+        double gt = 0.5 * x[i] * (1 + std::tanh(0.7978845608 * (x[i] + 0.044715 * x[i] * x[i] * x[i])));
+        CHECK(std::fabs(y.data[i] - gt) < 1e-5);
+        CHECK(std::fabs(z.data[i] - x[i] / (1 + std::exp(-x[i]))) < 1e-5);   // spec op wins over the composite
+        CHECK(std::fabs(w.data[i] - 2 * (gt + x[i])) < 1e-4);
+    }
+    CHECK_THROWS(pack::build_graph(pack::parse_blueprint("blueprint \"e\"\nop f(a, b) { return a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
+    CHECK_THROWS(pack::build_graph(pack::parse_blueprint("blueprint \"e\"\nop f(a) { return f(a) }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
+    CHECK_THROWS(pack::parse_blueprint("blueprint \"e\"\nop f(a) { return a }\nop f(a) { return a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"));
+    CHECK_THROWS(pack::build_graph(pack::parse_blueprint("blueprint \"e\"\nop f(a) { b = a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
+}
