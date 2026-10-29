@@ -17,6 +17,7 @@
 #include <forge/os/cpu_topology.hpp>
 #include <forge/os/file_watch.hpp>
 #include <forge/os/memory_pressure.hpp>
+#include <forge/os/numa.hpp>
 #include <forge/os/service.hpp>
 #include <signal.h>
 #include <atomic>
@@ -302,7 +303,7 @@ int run_proxy(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)
@@ -317,6 +318,11 @@ int main(int argc, char** argv) {
             import::import_options o; o.codec = arg(argc, argv, "codec", "f32");
             if (path.ends_with(".gguf")) import::import_gguf(path, out, o); else import::import_hf(path, out, o);
             path = out;
+        }
+        // --numa-node N: bind to a node before loading so weights/KV are first-touched node-local.
+        if (auto nn = arg(argc, argv, "numa-node", ""); !nn.empty()) {
+            auto r = forge::os::bind_thread_to_node(unsigned(std::stoul(nn)));
+            std::printf("forge-serve: numa node %s%s\n", nn.c_str(), r ? "" : (" (bind failed: " + r.err.what + ")").c_str());
         }
         auto m = mind::model::open(path);
         m->blueprint().session == "generative_sequence" || (raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session), true);
