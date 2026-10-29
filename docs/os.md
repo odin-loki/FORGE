@@ -1,17 +1,23 @@
-# `forge::os` — portable OS layer
+# os: the portable OS layer
 
-Header-only (`forge_os` is an INTERFACE target). Include `<forge/os/os.hpp>` for the core or `<forge/os/all.hpp>` for everything.
-Targets: Linux, Android, Windows, macOS, iOS and FreeBSD. Apple frameworks (CoreFoundation, IOKit, Security, objc, kperf,
-libdispatch) and Windows DLLs (dbghelp, crypt32, powrprof, dxgi) are late-bound with `dlopen`/`LoadLibrary`, so no extra link
-flags are needed. Every call returns `result<T>`/`status`; when the OS lacks a feature the error satisfies
-`os::is_unsupported(err)` (code `0x0F0E5`) instead of crashing.
+## Concepts
+`forge::os` is header-only (`forge_os` is an INTERFACE target). Include `<forge/os/os.hpp>` for the core, or `<forge/os/all.hpp>` for everything.
+- **Targets:** Linux, Android, Windows, macOS, iOS and FreeBSD.
+- **No extra link flags:** Apple frameworks (CoreFoundation, IOKit, Security, objc, kperf, libdispatch) and Windows DLLs (dbghelp, crypt32, powrprof, dxgi) are loaded late with `dlopen` or `LoadLibrary`.
+- **Errors:** every call returns `result<T>` or `status`. If the OS lacks a feature, the error satisfies `os::is_unsupported(err)` (`unsupported_code = 0x0F0E5`) instead of crashing.
 
-## Core (`os.hpp`)
-Files and filesystem, `mapping` (mmap / file mapping), processes (`run`, `exe_path`; `run` unsupported on iOS), threads and sync,
-time, TCP `socket`, `poller` (epoll / kqueue / WSAPoll), `completion_port` (IOCP, emulated elsewhere), `library` (dl), env,
-signals (`on_signal`), memory, sysinfo, paths and entropy.
+## API reference
 
-## Extension modules
+### Core (`os.hpp`)
+- Files and filesystem, and `mapping` (mmap or Windows file mapping).
+- Processes: `run` and `exe_path`. `run` is unsupported on iOS.
+- Threads and sync, time (`monotonic_ns`, `wall_ns`, `cpu_time_ns`, `sleep_ns`).
+- Networking: TCP `socket`, `poller` (epoll, kqueue or WSAPoll) and `completion_port` (IOCP, emulated on other platforms).
+- Dynamic libraries (`library`), env, signals (`on_signal`), memory, sysinfo, paths and entropy.
+
+### Extension modules (one header each, all included by `all.hpp`)
+Each column shows the backend used on that platform.
+
 | # | Header | API | Linux | Android | Windows | macOS | iOS | FreeBSD |
 |---|---|---|---|---|---|---|---|---|
 | 1 | `numa.hpp` | `numa_nodes`, `bind_thread_to_node`, `numa_alloc/free`, `numa_node_of_address` | sysfs + mbind + move_pages | same | `VirtualAllocExNuma`, group affinity | single node | single node | `cpuset_setdomain` |
@@ -31,11 +37,28 @@ signals (`on_signal`), memory, sysinfo, paths and entropy.
 | 15 | `background.hpp` | `background::begin/end`, `background_scope` | not required | JNI hooks (`set_hooks`), else unsupported | `SetThreadExecutionState` | IOPMAssertion | `beginBackgroundTask` | not required |
 | 16 | `service.hpp` | `service::ready/reloading/stopping/watchdog`, `log`, `run_as_service` | sd_notify + journald (else syslog) | liblog | SCM + Event Log | launchd detection + syslog (→ os_log) | syslog (→ os_log) | rc.d detection + syslog |
 
-Environment knobs: `FORGE_AIO=threads` (force the thread backend), `FORGE_KEYSTORE=file`, `FORGE_KEYSTORE_DIR`.
-The file keystore stores 0600 files obfuscated with a per-store pad; it is a fallback, not real secret storage.
-Android/iOS hooks (`power_hooks`, `memory_pressure::on_trim_memory`, `background::set_hooks`) are plain C++ entry points
-for the app's JNI or Swift glue to call.
+### Environment variables
+- `FORGE_AIO=threads` forces the thread backend for `async_file_io`.
+- `FORGE_KEYSTORE=file` forces the file keystore.
+- `FORGE_KEYSTORE_DIR` sets the file keystore's directory.
 
-Tests: `tests/test_os.cpp` (core), `tests/test_os_ext.cpp` (one TEST per feature above; child-process modes via
-`FORGE_OS_EXT_CHILD`). Cross compile+link checks: the `xos_*` ctests (label `cross;slow`). See `docs/STATUS.md` for which
-platforms were actually run.
+## Example
+`docs/examples/os_features.cpp` runs as the ctest `doc_example_os_features`:
+
+```cpp
+auto t = os::cpu_topology_query();
+auto shm = os::shared_memory::create(name, 4096);   // result<shared_memory>
+if (!shm) std::puts(shm.err.what.c_str());
+auto pin = os::pin_thread_to_kind(os::core_kind::performance);
+if (!pin && os::is_unsupported(pin.err)) { /* fine: the platform lacks it */ }
+```
+
+## Platform notes and limits
+- **Local IPC names:** on Linux and Android, `local_endpoint(name)` produces an abstract socket name (`@forge-<name>`), because SELinux on Android refuses socket files in `/data/local/tmp`. Other POSIX systems use a `.sock` file in the temp directory unless the name is absolute.
+- **File keystore:** stores files with mode 0600, obfuscated with a per-store pad. It is a fallback, not real secret storage.
+- **Mobile hooks:** `power_hooks`, `memory_pressure::on_trim_memory` and `background::set_hooks` are plain C++ entry points for the app's JNI or Swift code to call.
+- **Tests:**
+  - `tests/test_os.cpp` covers the core.
+  - `tests/test_os_ext.cpp` has one TEST per extension module. Its child-process modes are selected with `FORGE_OS_EXT_CHILD`; never export that variable in a shell.
+  - The `xos_*` ctests (label `cross`) cross-compile and link the tests for other platforms.
+- **Where it has actually run:** Linux, wine and the Android emulator. FreeBSD and macOS are link-only, and iOS has not been built. See [STATUS.md](STATUS.md).
