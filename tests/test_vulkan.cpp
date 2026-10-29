@@ -10,6 +10,7 @@ int main() { std::puts("vulkan backend not built (no vulkan headers / glslangVal
 #include <forge/mind/mind.hpp>
 #include <cmath>
 #include <filesystem>
+#include <unistd.h>
 #include <random>
 using namespace forge;
 
@@ -50,7 +51,7 @@ static int kernels(grid::vk::runtime& rt) {
 }
 
 static int end_to_end() {
-    auto path = (std::filesystem::temp_directory_path() / "forge_test_vk_e2e.fpk").string();
+    auto path = (std::filesystem::temp_directory_path() / ("forge_test_vk_e2e_" + std::to_string(::getpid()) + ".fpk")).string();
     forge_test::make_tiny_model(path);
     auto cpu = mind::model::open(path), gpu = mind::model::open(path);
     cpu->set_device("cpu");
@@ -83,6 +84,7 @@ static int end_to_end() {
     bool ok = la.size() == lb.size() && worst < 1e-3f && ta == tb && vk_ops > 0 && cpu_compute == 0;
     std::printf("%s e2e tiny llama: prefill logits max|err| %.2e, 12 greedy tokens %s, %zu vulkan dispatches, %d CPU compute steps\n",
                 ok ? "ok  " : "FAIL", double(worst), ta == tb ? "identical" : "DIFFER", vk_ops, cpu_compute);
+    std::error_code ec; std::filesystem::remove(path, ec);
     return ok ? 0 : 1;
 }
 
