@@ -12,7 +12,7 @@ namespace forge::spec {
 
 enum class op_class : u8 { elementwise, reduction, contraction, data_movement, stateful };
 enum class shape_rule : u8 { same, broadcast, reduce, matmul, matmul_t, attention, transpose, reshape,
-                             gather, concat, slice };
+                             gather, concat, slice, expand };
 enum class tol_kind : u8 { exact, ulp, rel, abs };
 enum class fusion : u8 { none, elementwise, epilogue };
 
@@ -115,10 +115,15 @@ inline shape_t infer_shape(shape_rule r, const std::vector<shape_t>& in, const a
     case shape_rule::attention: {
         need(3); const auto& q = in[0]; const auto& k = in[1]; const auto& v = in[2];
         if (q.size() != 3 || k.size() != 3 || v.size() != 3) raise(errc::shape_mismatch, "attention expects [s,h,d]");
-        if (k != v) raise(errc::shape_mismatch, "attention k/v shapes differ");
+        if (k[0] != v[0] || k[1] != v[1]) raise(errc::shape_mismatch, "attention k/v shapes differ");
         if (q[2] != k[2]) raise(errc::shape_mismatch, "attention head dims differ");
         if (q[1] % k[1]) raise(errc::shape_mismatch, "q heads not multiple of kv heads");
-        return q;
+        return shape_t{q[0], q[1], v[2]};  // value head dim may differ (MLA)
+    }
+    case shape_rule::expand: {  // repeat a size-1 axis n times
+        need(1); shape_t s = in[0]; i64 ax = norm_axis(i64(a.num("axis", 0)), s.size());
+        if (s[std::size_t(ax)] != 1) raise(errc::shape_mismatch, "expand: axis {} has size {}, need 1", ax, s[std::size_t(ax)]);
+        s[std::size_t(ax)] = i64(a.num("n", 1)); return s;
     }
     case shape_rule::transpose: {
         need(1); auto p = a.ints("perm"); shape_t s = in[0];

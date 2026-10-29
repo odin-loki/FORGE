@@ -138,14 +138,14 @@ inline kernel_fn matmul() {
 inline kernel_fn attention() {
     return [](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
         const auto &q = in[0], &k = in[1], &v = in[2];
-        std::size_t s = std::size_t(q.shape[0]), hq = std::size_t(q.shape[1]), d = std::size_t(q.shape[2]);
+        std::size_t s = std::size_t(q.shape[0]), hq = std::size_t(q.shape[1]), d = std::size_t(q.shape[2]), dv = std::size_t(v.shape[2]);
         std::size_t t = std::size_t(k.shape[0]), hk = std::size_t(k.shape[1]), grp = hq / hk;
         bool causal = a.num("causal", 1) != 0;
         float sc = float(a.num("scale", 1.0 / std::sqrt(double(d))));
         std::size_t window = std::size_t(a.num("window", 0));
         const auto& ker = lane::active();
         task::parallel_for(s * hq, 1, [&](std::size_t b, std::size_t e) {
-            std::vector<float> sco(t), acc(d);
+            std::vector<float> sco(t), acc(dv);
             for (std::size_t w = b; w < e; ++w) {
                 std::size_t i = w / hq, h = w % hq, kh = h / grp, pos = t - s + i;
                 std::size_t lo = 0, hi = causal ? pos + 1 : t;
@@ -156,8 +156,8 @@ inline kernel_fn attention() {
                 float sum = 0;
                 for (std::size_t j = lo; j < hi; ++j) { sco[j] = std::exp(sco[j] - mx); sum += sco[j]; }
                 std::fill(acc.begin(), acc.end(), 0.f);
-                for (std::size_t j = lo; j < hi; ++j) ker.saxpy(sco[j] / sum, v.data + (j * hk + kh) * d, acc.data(), d);
-                std::copy(acc.begin(), acc.end(), out.data + (i * hq + h) * d);
+                for (std::size_t j = lo; j < hi; ++j) ker.saxpy(sco[j] / sum, v.data + (j * hk + kh) * dv, acc.data(), dv);
+                std::copy(acc.begin(), acc.end(), out.data + (i * hq + h) * dv);
             }
         });
     };

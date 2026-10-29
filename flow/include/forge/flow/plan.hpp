@@ -142,6 +142,11 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
         p->views[i] = v;
         if (n.kind == node_kind::input) p->inputs[n.name] = value_id(i);
         if (n.kind == node_kind::op) {
+            // state views grow at run time; only consumers that read the live length are allowed
+            for (auto in : n.inputs)
+                if (G.at(in).kind == node_kind::state_append && n.op != spec::op::attention)
+                    raise(errc::unsupported, "state slot '{}' feeds '{}': only attention may consume a growing state view",
+                          G.at(in).name, spec::info(n.op).name);
             std::vector<shape_t> ins; for (auto in : n.inputs) ins.push_back(G.at(in).shape);
             p->steps.push_back({&reg.select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), &n.attrs, 0});
         }

@@ -180,6 +180,23 @@ inline tensor layer_norm(const tv& in, const attrs& a) {
         for (i64 i = 0; i < n; ++i) y[i] = float((x[i] - m) * r * w.data[std::size_t(i)] + b.data[std::size_t(i)]);
     });
 }
+// Mixture-of-experts router: softmax over experts, keep the top-k per row, optionally renormalise.
+// Ties break toward the lower expert index. Output has the same shape; dropped experts are 0.
+inline tensor moe_gate(const tv& in, const attrs& a) {
+    i64 k = i64(a.num("k", 2)); bool renorm = a.num("norm", 1) != 0;
+    return last_axis_rows(in.at(0), [&](const float* x, float* y, i64 n) {
+        double m = -INFINITY; for (i64 i = 0; i < n; ++i) m = std::max(m, double(x[i]));
+        std::vector<double> p(static_cast<std::size_t>(n)); double s = 0;
+        for (i64 i = 0; i < n; ++i) { p[std::size_t(i)] = std::exp(double(x[i]) - m); s += p[std::size_t(i)]; }
+        std::vector<i64> idx(static_cast<std::size_t>(n)); for (i64 i = 0; i < n; ++i) idx[std::size_t(i)] = i;
+        i64 kk = std::min(k, n);
+        std::partial_sort(idx.begin(), idx.begin() + kk, idx.end(), [&](i64 a1, i64 b1) {
+            return x[a1] != x[b1] ? x[a1] > x[b1] : a1 < b1; });
+        double ks = 0; for (i64 j = 0; j < kk; ++j) ks += p[std::size_t(idx[std::size_t(j)])];
+        for (i64 i = 0; i < n; ++i) y[i] = 0;
+        for (i64 j = 0; j < kk; ++j) { auto e = idx[std::size_t(j)]; y[e] = float(p[std::size_t(e)] / (renorm ? ks : s)); }
+    });
+}
 inline tensor cumsum(const tv& in, const attrs& a) {
     const auto& x = in.at(0);
     auto v = detail::split_axis(x.shape, norm_axis(i64(a.num("axis", -1)), x.shape.size()));
@@ -221,7 +238,8 @@ inline tensor attention(const tv& in, const attrs& a) {
     bool causal = a.num("causal", 1) != 0;
     double sc = a.num("scale", 1.0 / std::sqrt(double(d)));
     i64 window = i64(a.num("window", 0));
-    tensor o(q.shape);
+    i64 dv = v.shape[2];
+    tensor o(shape_t{s, hq, dv});
     std::vector<double> sco(static_cast<std::size_t>(t));
     for (i64 i = 0; i < s; ++i) {
         i64 pos = t - s + i;
@@ -236,10 +254,10 @@ inline tensor attention(const tv& in, const attrs& a) {
                 sco[std::size_t(j)] = dot * sc; mx = std::max(mx, sco[std::size_t(j)]);
             }
             double sum = 0; for (auto& x : sco) { x = std::isinf(x) ? 0 : std::exp(x - mx); sum += x; }
-            for (i64 e = 0; e < d; ++e) {
+            for (i64 e = 0; e < dv; ++e) {
                 double acc = 0;
-                for (i64 j = 0; j < t; ++j) acc += sco[std::size_t(j)] * v.data[std::size_t((j * hk + kh) * d + e)];
-                o.data[std::size_t((i * hq + h) * d + e)] = float(acc / sum);
+                for (i64 j = 0; j < t; ++j) acc += sco[std::size_t(j)] * v.data[std::size_t((j * hk + kh) * dv + e)];
+                o.data[std::size_t((i * hq + h) * dv + e)] = float(acc / sum);
             }
         }
     }
@@ -320,4 +338,19 @@ inline tensor rope(const tv& in, const attrs& a) {
     return o;
 }
 
+} // namespace forge::spec::ref
+
+namespace forge::spec::ref {
+inline tensor expand(const tv& in, const attrs& a) {
+    const auto& x = in.at(0);
+    auto os = infer_shape(shape_rule::expand, {x.shape}, a);
+    i64 ax = norm_axis(i64(a.num("axis", 0)), x.shape.size()), n = os[std::size_t(ax)];
+    i64 outer = 1, inner = 1;
+    for (i64 i = 0; i < ax; ++i) outer *= x.shape[std::size_t(i)];
+    for (std::size_t i = std::size_t(ax) + 1; i < x.shape.size(); ++i) inner *= x.shape[i];
+    tensor o(os);
+    for (i64 p = 0; p < outer; ++p) for (i64 r = 0; r < n; ++r)
+        std::copy_n(&x.data[std::size_t(p * inner)], inner, &o.data[std::size_t((p * n + r) * inner)]);
+    return o;
+}
 } // namespace forge::spec::ref
