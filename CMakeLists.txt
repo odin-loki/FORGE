@@ -71,6 +71,7 @@ target_link_libraries(forge_pack INTERFACE forge_flow)
 add_library(forge_mind INTERFACE)
 target_include_directories(forge_mind INTERFACE mind/include)
 target_link_libraries(forge_mind INTERFACE forge_pack)
+target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Multiversioned lane kernels: one TU per target, own flags, own namespace.
 add_library(forge_lane_mv STATIC
@@ -84,7 +85,7 @@ set_source_files_properties(lane/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIO
 
 if(FORGE_BUILD_APPS)
   add_executable(forge apps/forge.cpp)
-  target_link_libraries(forge PRIVATE forge_mind forge_lane_mv)
+  target_link_libraries(forge PRIVATE forge_mind forge_verify forge_lane_mv)
 endif()
 
 if(FORGE_BUILD_TESTS)
