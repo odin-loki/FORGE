@@ -142,3 +142,9 @@ no memory clobber), reused thread_local pack buffers, and test_tile retries befo
 - Not done:
   - FreeBSD qemu VM: not run (memory limits on the shared box); only cross-linked.
   - iOS: no SDK (zig lacks iOS libc headers, and there is no osxcross/darling), so iOS paths are unverified beyond review.
+
+### Android emulator re-run (FORGE_THREADS cap, one test at a time) — 2026-10-29
+- 21 pass (aio, balance, dtypes, flow, grid, interop, kvquant, lane, lane_raw, os, pack, rpc, sessions, support, support2, tile, video, plus 5 examples); test_gpu skips.
+- test_vulkan: the 33 kernel oracles and vk.rope now pass with the relative 2^-11 bound. Still failing on SwiftShader: "residency: dispatches are not batched" and the e2e tiny llama step, which only fails on that batching flag (logits err 8.8e-4, greedy tokens identical). Not investigated yet.
+- test_mind: exceeds 10–20 min under TCG with 2 threads and has taken the emulator down from memory twice. Treated as too heavy for this box; it passes on Linux and wine.
+- `tests/android_emulator.sh` accepts FORGE_TEST_TIMEOUT and FORGE_THREADS, and retries when adb drops.

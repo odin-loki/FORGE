@@ -24,7 +24,7 @@ native)
     for attempt in 1 2 3; do   # adb on a TCG emulator drops under memory pressure: wait and retry, not a test failure
       timeout 300 "$adb" wait-for-device
       "$adb" push "$t" $d/ >/dev/null || { sleep 10; continue; }
-      out=$("$adb" shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_TEMPLATES=$d/templates FORGE_THREADS=${FORGE_THREADS:-2} timeout 600 ./$n; echo RC=\$?" 2>&1 | tr -d '\r')
+      out=$("$adb" shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_TEMPLATES=$d/templates FORGE_THREADS=${FORGE_THREADS:-2} timeout ${FORGE_TEST_TIMEOUT:-600} ./$n; echo RC=\$?" 2>&1 | tr -d '\r')
       rc=$(echo "$out" | sed -n 's/^RC=//p' | tail -1)
       [ -n "$rc" ] && break; echo "  (adb lost during $n, retry $attempt)"; sleep 10
     done
