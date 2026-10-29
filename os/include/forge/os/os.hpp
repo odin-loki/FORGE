@@ -924,13 +924,21 @@ inline result<exec_result> run(const std::vector<std::string>& argv, bool merge_
     return {std::move(res), {}};
 #else
     int fds[2]; if (::pipe(fds)) return {{}, last_error("pipe")};
+    std::vector<char*> av; for (auto& a : argv) av.push_back(const_cast<char*>(a.c_str())); av.push_back(nullptr);
+    pid_t p; int rc = 0;
+#if defined(FORGE_OS_ANDROID) && __ANDROID_API__ < 28   // posix_spawn arrives in API 28
+    p = ::fork();
+    if (p == 0) { ::dup2(fds[1], 1); if (merge_stderr) ::dup2(fds[1], 2); ::close(fds[0]); ::close(fds[1]); ::execvp(av[0], av.data()); ::_exit(127); }
+    if (p < 0) rc = errno;
+    ::close(fds[1]);
+#else
     posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);
     posix_spawn_file_actions_adddup2(&fa, fds[1], 1);
     if (merge_stderr) posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
     posix_spawn_file_actions_addclose(&fa, fds[0]); posix_spawn_file_actions_addclose(&fa, fds[1]);
-    std::vector<char*> av; for (auto& a : argv) av.push_back(const_cast<char*>(a.c_str())); av.push_back(nullptr);
-    pid_t p; int rc = ::posix_spawnp(&p, av[0], &fa, nullptr, av.data(), environ);
+    rc = ::posix_spawnp(&p, av[0], &fa, nullptr, av.data(), environ);
     posix_spawn_file_actions_destroy(&fa); ::close(fds[1]);
+#endif
     if (rc) { ::close(fds[0]); return {{}, {rc, "spawn " + argv[0] + ": " + error_text(rc)}}; }
     exec_result res; char buf[4096];
     for (;;) { auto n = ::read(fds[0], buf, sizeof buf); if (n > 0) res.out.append(buf, std::size_t(n)); else if (n == 0 || errno != EINTR) break; }
