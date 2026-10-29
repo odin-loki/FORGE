@@ -10,6 +10,10 @@ option(FORGE_BUILD_TESTS "Build FORGE tests" ON)
 option(FORGE_BUILD_APPS  "Build FORGE apps"  ON)
 option(FORGE_SANITIZE    "Build with ASan/UBSan" OFF)
 option(FORGE_REPRODUCIBLE "Strip build paths and timestamps from artefacts (bit-identical rebuilds)" ON)
+option(FORGE_JNI          "Build libforge_jni (Android / JVM Kotlin bindings, bindings/android)" OFF)
+if(ANDROID OR IOS OR CMAKE_SYSTEM_NAME MATCHES "iOS|tvOS|visionOS")
+  set(FORGE_MOBILE ON)
+endif()
 option(FORGE_LIBFUZZER   "Link fuzz targets with libFuzzer (clang -fsanitize=fuzzer) instead of the built-in driver" OFF)
 set(FORGE_FUZZ_ITERS 4000 CACHE STRING "Mutated inputs per fuzz target in ctest")
 
@@ -122,17 +126,22 @@ if(NOT FORGE_LLD)
   endif()
 endif()
 set(FORGE_HIP_ARCHS gfx90a gfx942 gfx1100 CACHE STRING "AMDGPU targets embedded for the HIP runtime")
-set(FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels.metal)   # OpenCL C, built by the driver at run time
+set(FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels.metal)
+if(FORGE_MOBILE)   # no CUDA/HIP/Level Zero on phones; the NDK's lld can't link AMDGPU either
+  set(FORGE_GPU_CLANG_IMAGES OFF)
+else()
+  set(FORGE_GPU_CLANG_IMAGES ${FORGE_GPU_CLANG})
+endif()   # OpenCL C, built by the driver at run time
 # Level Zero wants SPIR-V: OpenCL C -> LLVM IR (clang, spir64) -> SPIR-V (llvm-spirv), when the translator exists.
 find_program(FORGE_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-19 llvm-spirv-18 llvm-spirv-20)
-if(FORGE_GPU_CLANG AND FORGE_LLVM_SPIRV)
+if(FORGE_GPU_CLANG_IMAGES AND FORGE_LLVM_SPIRV)
   add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.spv
     COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -O2 -emit-llvm -c -o ${FORGE_GPU_DIR}/kernels.cl.bc ${FORGE_GPU_DIR}/kernels.cl
     COMMAND ${FORGE_LLVM_SPIRV} ${FORGE_GPU_DIR}/kernels.cl.bc -o ${FORGE_GPU_DIR}/kernels.spv
     DEPENDS ${FORGE_GPU_DIR}/kernels.cl COMMENT "SPIR-V for Level Zero")
   list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.spv)
 endif()
-if(FORGE_GPU_CLANG)
+if(FORGE_GPU_CLANG_IMAGES)
   add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.ptx
     COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_70 -O3 -Werror
             -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu
@@ -206,6 +215,18 @@ target_include_directories(forge_mind INTERFACE mind/include)
 add_library(forge_c SHARED mind/capi/forge_c.cpp)
 target_link_libraries(forge_c PRIVATE forge_mind forge_verify forge_lane_mv)
 set_target_properties(forge_c PROPERTIES OUTPUT_NAME forge VERSION 0.1.0 SOVERSION 1 CXX_VISIBILITY_PRESET default)
+if(FORGE_JNI)
+  find_package(JNI QUIET)
+  add_library(forge_jni SHARED bindings/android/jni/forge_jni.c)
+  target_include_directories(forge_jni PRIVATE mind/include)
+  if(NOT ANDROID AND JNI_FOUND)
+    target_include_directories(forge_jni PRIVATE ${JNI_INCLUDE_DIRS})
+  endif()
+  target_link_libraries(forge_jni PRIVATE forge_c)
+  if(ANDROID)
+    target_link_libraries(forge_jni PRIVATE log)
+  endif()
+endif()
 target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 # Multiversioned lane kernels: one TU per target, own flags, own namespace.
@@ -407,6 +428,25 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME gpu_compile_opencl COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
     add_test(NAME gpu_compile_opencl_nofp64 COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL3.0 --target=spir64 -Xclang -cl-ext=-cl_khr_fp64,-__opencl_c_fp64
              -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
+    # Mobile: NDK cross-builds (skip without ANDROID_NDK_HOME), device + iOS runs (skip without adb/Xcode).
+    foreach(abi arm64-v8a x86_64)
+      add_test(NAME mobile_android_${abi} COMMAND sh ${CMAKE_SOURCE_DIR}/tests/mobile_build.sh android ${abi})
+      set_tests_properties(mobile_android_${abi} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 LABELS "mobile;slow"
+        ENVIRONMENT "FORGE_MOBILE_BUILD_DIR=${CMAKE_BINARY_DIR}/mobile")
+    endforeach()
+    add_test(NAME mobile_android_device COMMAND sh ${CMAKE_SOURCE_DIR}/tests/mobile_build.sh android-device)
+    add_test(NAME mobile_ios COMMAND sh ${CMAKE_SOURCE_DIR}/tests/mobile_build.sh ios)
+    set_tests_properties(mobile_android_device mobile_ios PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS "mobile;slow")
+    find_path(FORGE_JNI_H jni.h HINTS $ENV{JAVA_HOME}/include NO_CMAKE_SYSTEM_PATH)  # JDK only; the NDK path is covered by mobile_android_*
+    if(FORGE_JNI_H)  # host syntax check of the JNI bridge
+      file(GLOB _jni_md "${FORGE_JNI_H}/linux" "${FORGE_JNI_H}/darwin" "${FORGE_JNI_H}/win32")
+      set(_jni_inc -I${FORGE_JNI_H})
+      foreach(d ${_jni_md})
+        list(APPEND _jni_inc -I${d})
+      endforeach()
+      add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -fsyntax-only -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
+        -I${CMAKE_SOURCE_DIR}/mind/include ${CMAKE_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+    endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
              -include ${CMAKE_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
     find_program(FORGE_XCRUN xcrun)

@@ -1,4 +1,5 @@
 #pragma once
+#include "forge/pack/entropy.hpp"
 // .fpk signing (FORGE_PLAN Part E: "[SIGN] signatures over manifest + hashes").
 //
 // Ed25519 (RFC 8032) via vendored Monocypher -- no home-grown crypto. A signature covers a
@@ -11,7 +12,6 @@
 //                                "signatures":[{"key_id":hex8,"public_key":hex,"sig":hex}]}
 #include <forge/pack/fpk.hpp>
 #include <fstream>
-#include <sys/random.h>
 
 extern "C" {
 #include "monocypher-ed25519.h"
@@ -52,7 +52,7 @@ inline keypair keypair_from_seed(std::span<const std::uint8_t> seed) {
 }
 inline keypair generate_keypair() {
     std::array<std::uint8_t, 32> seed{};
-    if (::getrandom(seed.data(), seed.size(), 0) != ssize_t(seed.size())) raise(errc::io_error, "getrandom failed");
+    if (forge::pack::os_entropy(seed.data(), seed.size()) != 0) raise(errc::io_error, "getrandom failed");
     auto k = keypair_from_seed(seed); crypto_wipe(seed.data(), 32); return k;
 }
 inline std::string key_id(std::span<const std::uint8_t> pub) {

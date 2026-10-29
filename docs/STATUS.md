@@ -5,7 +5,7 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 ## Test matrix (ctest)
 | Build | Result |
 |---|---|
-| x86_64 dev | 39/39 (CUDA/HIP device tests skip: no GPU). This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
+| x86_64 dev | 59/59 with `-LE slow` (hardware tests skip with code 77: CUDA/HIP/OpenCL/Level Zero/Metal devices, adb, iOS). With `ANDROID_NDK_HOME` set, `mobile_android_arm64-v8a` and `mobile_android_x86_64` (label `slow`) pass: NDK r27c cross-build plus a check that all 12 JNI exports are present. This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
 | aarch64 SVE build (`build/a64sve`), latest run | 31/31 without the fuzz label (3 skip: Vulkan/CUDA/HIP). |
 | riscv64 build (`build/rv64`), latest run | 27/27 without the fuzz label (3 skip). |
 | aarch64, qemu `-cpu max` (VL 512, so the NEON path runs) | 13/13 without the fuzz label. `test_vulkan` skips because the build is static. |
@@ -50,13 +50,27 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 - **mind, serving**: prompt-lookup (n-gram) speculation; presence/frequency penalties (also in forge-serve); batch request priority and `cancel(id)`.
 - **Docs/perf**: generated API reference (`tools/gen_docs.py`, `docs/reference.md`, checked by ctest `docs_up_to_date`); perf baselines (`tools/perf_baseline.py`, `perf/baseline-x86_64.json`).
 - **KV-cache quantisation + host offload** (`flow/kv_codec.hpp`): int8 (symmetric) and fp8 E4M3 per (row, head) with an f32 scale; `state_append` quantises, the CPU and Vulkan attention kernels decode on the fly. Select with `session_options.kv_codec` or `FORGE_KV_CODEC`. Measured on the tiny model: max logit error vs f32 KV is 6.8e-3 (int8) and 3.1e-2 (fp8) relative to max |logit|; Vulkan int8 matches CPU int8 to 4e-7. `kv_offload` / `FORGE_KV_OFFLOAD=1` drops device KV after each attention (peak device bytes 153 KB vs 219 KB). Tested by `test_kvquant`.
+- **GPU runtimes sharing one contract** (`grid/cuda.hpp`): run_op, residency, graph capture/replay, peer copy, multiple devices (`cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]`, `metal[:N]`), and one kernel-argument packer.
+  - **OpenCL** (`grid/opencl.hpp`): kernels.cl is generated from the CUDA bodies.
+  - **Level Zero** (`grid/levelzero.hpp`): vendored MIT `ze_api.h`; SPIR-V is built when llvm-spirv is available.
+  - **Metal** (`grid/metal.hpp` + `src/metal.mm`): MSL is generated; unified memory.
+  - **Mock-tested only.** For OpenCL and Level Zero, mock drivers run the real generated OpenCL C as C, and all 31 lowerings pass the oracle plus golden_tiny_llama. The MSL passes a host syntax check. **None of these have run on real hardware.**
+- **Android** (*cross-compiled, never run on a device*):
+  - NDK CMake build for arm64-v8a (NEON + Vulkan) and x86_64. The CUDA/HIP image builds are disabled on mobile. Portable entropy (`pack/entropy.hpp`, arc4random_buf on Bionic/Apple) because API 26 lacks getentropy.
+  - JNI bridge at `bindings/android/jni/forge_jni.c` (CMake `-DFORGE_JNI=ON` builds `libforge_jni.so`).
+  - Kotlin `dev.forge.ForgeModel`, a Gradle library module `:forge` (externalNativeBuild on the root CMakeLists), and an example app `:example`.
+  - The Kotlin and Gradle files have **not been compiled**: there is no JDK on the build box.
+- **iOS / macOS** (*written without a Mac; never compiled*):
+  - `cmake/toolchains/ios.cmake` (device, or simulator with `-DFORGE_IOS_SIMULATOR=ON`) and `tools/build_xcframework.sh`, which produces FORGE.xcframework.
+  - SwiftPM package `bindings/apple`: a binaryTarget, a `CForge` module map over forge.h, and a `Forge` Swift API (ForgeModel/Sampling, streaming callback).
+  - XCTest (skips without `FORGE_TEST_FPK`) and a SwiftUI example. Metal is the default device.
 - **Goldens**: tiny Llama and MoE/MLA, checked against NumPy float64 references.
 
 ## Remaining
 - Not testable on this machine: real CUDA/HIP GPUs, Level Zero, Metal, Windows/macOS/mobile, multi-GPU/NCCL-style collectives, and SDE-validated AMX/SME tiles.
 - Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU.
-- CUDA/HIP have not been run on real hardware (only the mock driver).
-- Level Zero and Metal: only probes exist.
+- CUDA/HIP/OpenCL/Level Zero/Metal have not been run on real hardware; only the mock drivers have run them.
+- Android: has not run on a device, and the Kotlin/Gradle files have not been compiled. iOS/Swift: not compiled at all.
 - CI: the workflow file is at `ci/github-actions-ci.yml`. The push token lacks `workflow` scope, so it has to be moved to `.github/workflows/ci.yml` by hand.
 
 ## Build
@@ -73,6 +87,20 @@ To compile with zig instead (`-DFORGE_CROSS_CXX=<wrapper running "zig c++ -targe
 - RVV: `-mcpu=baseline_rv64+v+zvl<B>b -mrvv-vector-bits=B`
 
 The emulators are `qemu-aarch64 -cpu max,sve256=on` and `qemu-riscv64 -cpu rv64,v=true,vlen=256`.
+
+### Android (NDK r26+)
+    export ANDROID_NDK_HOME=/path/to/android-ndk-r27c
+    cmake -S . -B build/android-arm64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DFORGE_JNI=ON
+    ninja -C build/android-arm64 forge_jni      # libforge.so + libforge_jni.so; use ANDROID_ABI=x86_64 for the emulator
+    cd bindings/android && gradle :example:assembleDebug     # AAR + APK (Gradle invokes the same CMake per ABI)
+    gradle :forge:connectedAndroidTest                       # on a device; set FORGE_TEST_FPK for the model test
+On the device, `FORGE_DEVICE=vulkan` selects the Vulkan backend; otherwise the NEON CPU lanes run. The ctest entries are `mobile_android_<abi>` and `mobile_android_device`.
+
+### iOS / macOS (Xcode 15+)
+    tools/build_xcframework.sh                 # iOS device + simulator + macOS -> bindings/apple/FORGE.xcframework
+    cd bindings/apple && swift test            # XCTest; set FORGE_TEST_FPK=/path/model.fpk
+Add `bindings/apple` as a local Swift package in Xcode and `import Forge` (see `Example/ForgeExample`). ctest `mobile_ios` runs both steps on macOS and skips elsewhere.
 
 ## Test flake (test_vulkan under parallel load)
 

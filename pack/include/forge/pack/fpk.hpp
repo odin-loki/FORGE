@@ -1,4 +1,5 @@
 #pragma once
+#include "forge/pack/entropy.hpp"
 // .fpk container: one file holding manifest, blueprint, tokenizer, tensor index and tensor data.
 //
 //   [header 64B] [sections ... each aligned to 64B] [section table]
@@ -284,7 +285,7 @@ inline void encrypt_file(const std::string& in, const std::string& out, const mo
         }
     }
     std::array<std::uint8_t, 24> nonce{}; std::array<std::uint8_t, 16> mac{};
-    if (::getentropy(nonce.data(), nonce.size()) != 0) raise(errc::io_error, "getentropy failed");
+    if (forge::pack::os_entropy(nonce.data(), nonce.size()) != 0) raise(errc::io_error, "getentropy failed");
     auto ad = detail::enc_ad(tj); std::string ct(plain.size(), '\0');
     crypto_aead_lock(reinterpret_cast<std::uint8_t*>(ct.data()), mac.data(), key.data(), nonce.data(), reinterpret_cast<const std::uint8_t*>(ad.data()), ad.size(), plain.data(), plain.size());
     crypto_wipe(plain.data(), plain.size());
@@ -292,6 +293,6 @@ inline void encrypt_file(const std::string& in, const std::string& out, const mo
     secs.emplace_back("encryption", json::dump(json::object{{"alg", "xchacha20-poly1305"}, {"nonce", detail::hex(nonce.data(), 24)}, {"mac", detail::hex(mac.data(), 16)}, {"key_id", detail::enc_key_id(key)}}));
     detail::write_sections(out, std::move(secs));
 }
-inline model_key generate_model_key() { model_key k; if (::getentropy(k.data(), k.size()) != 0) raise(errc::io_error, "getentropy failed"); return k; }
+inline model_key generate_model_key() { model_key k; if (forge::pack::os_entropy(k.data(), k.size()) != 0) raise(errc::io_error, "getentropy failed"); return k; }
 
 } // namespace forge::pack
