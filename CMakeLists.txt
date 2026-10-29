@@ -76,7 +76,7 @@ set(FORGE_GPU_SOURCES)
 foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
-add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc
+add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels.metal
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
   DEPENDS ${FORGE_FSPECS} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
@@ -122,7 +122,7 @@ if(NOT FORGE_LLD)
   endif()
 endif()
 set(FORGE_HIP_ARCHS gfx90a gfx942 gfx1100 CACHE STRING "AMDGPU targets embedded for the HIP runtime")
-set(FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.cl)   # OpenCL C, built by the driver at run time
+set(FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels.metal)   # OpenCL C, built by the driver at run time
 # Level Zero wants SPIR-V: OpenCL C -> LLVM IR (clang, spir64) -> SPIR-V (llvm-spirv), when the translator exists.
 find_program(FORGE_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-19 llvm-spirv-18 llvm-spirv-20)
 if(FORGE_GPU_CLANG AND FORGE_LLVM_SPIRV)
@@ -174,6 +174,16 @@ if(FORGE_HAVE_VULKAN)
   target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR}/vkinc)
 endif()
 add_dependencies(forge_grid forge_gpu_gen forge_gpu_images)
+if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
+  enable_language(OBJCXX)
+  add_library(forge_metal STATIC grid/src/metal.mm)
+  target_compile_options(forge_metal PRIVATE -fobjc-arc)
+  target_compile_definitions(forge_metal PUBLIC FORGE_GRID_METAL=1)
+  target_include_directories(forge_metal PUBLIC grid/include support/include third_party ${FORGE_GEN_DIR} core/include spec/include lane/include)
+  add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
+  target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
+  target_link_libraries(forge_grid INTERFACE forge_metal)
+endif()
 target_link_libraries(forge_grid INTERFACE forge_lane)
 
 add_library(forge_flow INTERFACE)
@@ -320,6 +330,8 @@ if(FORGE_BUILD_TESTS)
   add_test(NAME test_gpu_hip COMMAND test_gpu hip)
   add_test(NAME test_gpu_features_cuda COMMAND test_gpu features cuda)
   add_test(NAME test_gpu_features_hip COMMAND test_gpu features hip)
+  add_test(NAME test_gpu_metal COMMAND test_gpu metal)
+  set_tests_properties(test_gpu_metal PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   foreach(m opencl ze)   # real runtimes: skip (77) without a driver/device
     add_test(NAME test_gpu_${m} COMMAND test_gpu ${m})
     add_test(NAME test_gpu_features_${m} COMMAND test_gpu features ${m})
@@ -395,7 +407,14 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME gpu_compile_opencl COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
     add_test(NAME gpu_compile_opencl_nofp64 COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL3.0 --target=spir64 -Xclang -cl-ext=-cl_khr_fp64,-__opencl_c_fp64
              -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
-    set_tests_properties(gpu_compile_cuda gpu_compile_hip gpu_compile_opencl gpu_compile_opencl_nofp64 PROPERTIES LABELS gpu)
+    add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
+             -include ${CMAKE_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
+    find_program(FORGE_XCRUN xcrun)
+    if(FORGE_XCRUN)   # real Metal compiler (macOS with Xcode)
+      add_test(NAME gpu_compile_metal COMMAND ${FORGE_XCRUN} -sdk macosx metal -c ${FORGE_GPU_DIR}/kernels.metal -o ${CMAKE_BINARY_DIR}/kernels.air)
+      set_tests_properties(gpu_compile_metal PROPERTIES LABELS gpu)
+    endif()
+    set_tests_properties(gpu_compile_metal_syntax gpu_compile_cuda gpu_compile_hip gpu_compile_opencl gpu_compile_opencl_nofp64 PROPERTIES LABELS gpu)
   endif()
   # Cross builds (e.g. aarch64 under qemu) are typically static: skip the shared-library smoke test there.
   if(NOT CMAKE_CROSSCOMPILING)

@@ -125,6 +125,7 @@ int main(int argc, char** argv) {
     if (mode == "hip") return device_t<gpu::runtime>(cu(gpu::api::hip));
     if (mode == "opencl") return device_t<forge::grid::ocl::runtime>(cl);
     if (mode == "ze") return device_t<forge::grid::ze::runtime>(ze);
+    if (mode == "metal") return device_t<forge::grid::metal::runtime>([](std::string* w, int o) { return forge::grid::metal::runtime::open(w, o); });
     if (mode == "features") {
         std::string w = argc > 2 ? argv[2] : "cuda";
         if (w == "opencl") return features_t(cl, [] { return forge::grid::ocl::runtime::device_count(); });

@@ -7,6 +7,7 @@
 #include <forge/grid/cuda.hpp>
 #include <forge/grid/opencl.hpp>
 #include <forge/grid/levelzero.hpp>
+#include <forge/grid/metal.hpp>
 
 namespace forge::flow {
 #ifdef FORGE_GRID_VULKAN
@@ -102,6 +103,13 @@ inline std::unique_ptr<registry> device_registry(const std::string& dev, std::st
         std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
         auto rt = grid::ocl::runtime::open(&e, ord);
         if (rt) return gpu_registry(std::shared_ptr<grid::ocl::runtime>(std::move(rt)));
+        if (why) *why = e;
+        return nullptr;
+    }
+    if (base == "metal") {
+        std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
+        auto rt = grid::metal::runtime::open(&e, ord);
+        if (rt) return gpu_registry(std::shared_ptr<grid::metal::runtime>(std::move(rt)));
         if (why) *why = e;
         return nullptr;
     }
