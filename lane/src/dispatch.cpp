@@ -1,3 +1,6 @@
+#if defined(__aarch64__) && defined(__linux__)
+#include <sys/prctl.h>
+#endif
 #include <forge/lane/dispatch.hpp>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +70,27 @@ static const kernels* sve_table(int bytes) {
     default: (void)bytes; return nullptr;
     }
 }
+// SVE hardware can have any VL that is a multiple of 128 bits (384, 640, ...), but fixed-length kernels exist
+// only for powers of two. Linux lets a process shorten its own VL, so at load time (before main, before
+// any thread exists; new threads copy it) a VL with no table (384, 640, 2048, ...) is lowered to the largest
+// power of two we have a table for. FORGE_SVE_KEEP_VL=1 disables this (the sve lane then falls back to NEON).
+#if defined(__aarch64__) && defined(__linux__)
+#ifndef PR_SVE_SET_VL
+#define PR_SVE_SET_VL 50
+#endif
+static int g_sve_hw_bytes = 0;   // VL before any adjustment (0 = no SVE / not adjusted)
+__attribute__((constructor)) static void forge_sve_normalise_vl() {
+    if (!(getauxval(AT_HWCAP) & (1ul << 22))) return;
+    int vl = sve_vl_bytes();
+    g_sve_hw_bytes = vl;
+    if (sve_table(vl)) return;
+    if (const char* e = std::getenv("FORGE_SVE_KEEP_VL"); e && *e == '1') return;
+    int want = 0;
+    for (int b : {16, 32, 64, 128}) if (b <= vl && sve_table(b)) want = b;
+    // Threads created later copy the caller's VL; PR_SVE_VL_INHERIT (keep it across execve) is not needed.
+    if (want) prctl(PR_SVE_SET_VL, want, 0, 0, 0);
+}
+#endif
 static const kernels* rvv_table(int bytes) {
     switch (bytes * 8) {
 #if defined(FORGE_LANE_RVV128)
@@ -150,7 +174,7 @@ static cpu_features do_detect() {
 #if defined(__linux__)
     unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
     f.sve = hw & (1ul << 22); f.sve2 = hw2 & (1ul << 1);
-    if (f.sve) f.sve_bytes = sve_vl_bytes();
+    if (f.sve) { f.sve_bytes = sve_vl_bytes(); f.sve_hw_bytes = g_sve_hw_bytes ? g_sve_hw_bytes : f.sve_bytes; }
 #endif
 #elif defined(__riscv)
     f.vendor = "riscv64";
@@ -173,6 +197,7 @@ std::string cpu_features::summary() const {
     add(avx512ifma, "avx512ifma"); add(avx512vbmi, "avx512vbmi"); add(avxvnni, "avxvnni"); add(avx10, "avx10");
     add(amx_tile, "amx-tile"); add(amx_permitted, "(amx-permitted)"); add(hybrid, "hybrid"); add(neon, "neon");
     add(sve, "sve"); add(sve2, "sve2"); if (sve_bytes) s += std::format("(vl={}b)", sve_bytes * 8);
+    if (sve_hw_bytes && sve_hw_bytes != sve_bytes) s += std::format("(hw vl={}b, lowered)", sve_hw_bytes * 8);
     add(rvv, "rvv"); if (rvv_bytes) s += std::format("(vlen={}b)", rvv_bytes * 8);
     return s;
 }
