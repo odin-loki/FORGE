@@ -317,6 +317,7 @@ else()
   set_source_files_properties(lane/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
 endif()
 target_link_libraries(forge_lane_mv PUBLIC forge_lane)
+set_target_properties(forge_lane_mv PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Matrix tile units (lane/tile.hpp): AMX on x86_64, SME on aarch64. Each file stubs out when its unit can't be compiled.
 include(CheckCXXSourceCompiles)
 target_sources(forge_lane_mv PRIVATE lane/src/tile_amx.cpp lane/src/tile_sme.cpp)

@@ -18,7 +18,7 @@ struct request {
     std::vector<int> prompt;
     int max_new = 64;
     sampler_config sampling;
-    std::shared_ptr<const grammar> grammar;    // optional constraint
+    std::shared_ptr<const forge::mind::grammar> grammar;    // optional constraint
     std::vector<int> stop_tokens;              // in addition to EOS
     int priority = 0;                          // higher is admitted first; FIFO within a priority
     std::function<bool(int)> on_token;         // streaming; return false to cancel

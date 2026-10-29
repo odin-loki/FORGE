@@ -161,7 +161,7 @@ TEST(gpu_discovery) {
 }
 // ---------------------------------------------------------------- 9 local IPC
 TEST(local_ipc) {
-    auto ep = os::local_endpoint("osx" + std::to_string(os::pid()));   // abstract "@forge-osx<pid>" on Linux/Android
+    auto ep = os::local_endpoint("osx" + std::to_string(os::pid()));
     auto l = os::local_listener::listen(ep); CHECK_MSG(l, "%s", l.err.what.c_str()); if (!l) return;
     std::thread cl([&] {
         auto c = os::local_stream::connect(ep); CHECK(c); if (!c) return;
@@ -299,15 +299,15 @@ TEST(service_integration) {
     std::printf("  manager '%s'\n", os::service::manager().c_str());
     CHECK(os::service::ready());   // no-op outside a service manager
 #if defined(__linux__)
-    auto path = "@osx-notify-" + std::to_string(os::pid());   // abstract socket, as systemd may use
-    int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0); sockaddr_un a{}; a.sun_family = AF_UNIX; std::memcpy(a.sun_path + 1, path.data() + 1, path.size() - 1);
-    CHECK(::bind(fd, reinterpret_cast<sockaddr*>(&a), socklen_t(offsetof(sockaddr_un, sun_path) + path.size())) == 0);
+    auto path = os::join(os::temp_dir(), "osx-notify-" + std::to_string(os::pid()));
+    int fd = ::socket(AF_UNIX, SOCK_DGRAM, 0); sockaddr_un a{}; a.sun_family = AF_UNIX; std::strcpy(a.sun_path, path.c_str()); ::unlink(path.c_str());
+    CHECK(::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof a) == 0);
     os::setenv("NOTIFY_SOCKET", path); os::setenv("WATCHDOG_USEC", "2000000");
     CHECK(os::service::ready("loaded")); char b[256] = {}; auto n = ::recv(fd, b, sizeof b - 1, 0);
     CHECK(n > 0 && std::string(b) == "READY=1\nSTATUS=loaded"); CHECK(os::service::watchdog_interval_us() == 1000000);
     CHECK(os::service::watchdog()); std::memset(b, 0, sizeof b); ::recv(fd, b, sizeof b - 1, 0); CHECK(std::string(b) == "WATCHDOG=1");
     CHECK(os::service::manager() == "systemd" || os::platform_name() == std::string("android"));
-    os::unsetenv("NOTIFY_SOCKET"); os::unsetenv("WATCHDOG_USEC"); ::close(fd);
+    os::unsetenv("NOTIFY_SOCKET"); os::unsetenv("WATCHDOG_USEC"); ::close(fd); ::unlink(path.c_str());
 #endif
     auto l = os::service::log(os::log_level::info, "forge test_os_ext service log line");
     if (!l) skip("service log", l.err.what);

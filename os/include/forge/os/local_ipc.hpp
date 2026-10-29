@@ -12,12 +12,8 @@ namespace forge::os {
 inline std::string local_endpoint(const std::string& name) {
 #if defined(FORGE_OS_WINDOWS)
     return name;
-#elif defined(__linux__)
-    // Abstract namespace on Linux/Android: no socket file, so it also works where SELinux forbids creating one
-    // (Android shell/app data dirs). Pass "@name" explicitly, or a bare name to get "@forge-<name>".
-    return name.size() && (name[0] == '@' || name[0] == '/') ? name : "@forge-" + name;
 #else
-    return name.size() && name[0] == '/' ? name : join(temp_dir(), name + ".sock");
+    return join(temp_dir(), name + ".sock");
 #endif
 }
 class local_stream {

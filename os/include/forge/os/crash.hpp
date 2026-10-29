@@ -1,7 +1,7 @@
 #pragma once
 // Crash handling: stack traces and crash dumps.
 //   stack_trace(): _Unwind_Backtrace + dladdr on POSIX; CaptureStackBackTrace + DbgHelp SymFromAddr on Windows.
-//   crash_handler::install({dir, app, minidump, after}): Windows writes a real minidump (<dir>/<app>-<pid>.dmp, MiniDumpWriteDump) plus a
+//   install_crash_handler(dir): Windows writes a real minidump (<dir>/<app>-<pid>.dmp, MiniDumpWriteDump) plus a
 //   text report; POSIX catches SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT/SIGTRAP on an alternate stack and writes
 //   <dir>/<app>-<pid>.crash (signal, fault address, backtrace, and on Linux/Android the module map), then
 //   re-raises so the OS core dump / tombstone / ReportCrash still happens.
