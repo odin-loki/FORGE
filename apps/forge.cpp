@@ -300,6 +300,18 @@ int cmd_bench(const args& a) {
     return 0;
 }
 
+// forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]  (no auth: keep it on a trusted network)
+int cmd_rpc_serve(const args& a) {
+    std::string why, dev = a.get("device", "cpu");
+    auto reg = flow::device_registry(dev, &why, false);
+    if (!reg && dev != "cpu") std::fprintf(stderr, "forge: %s; serving on cpu\n", why.c_str());
+    flow::rpc::server srv(reg.get(), int(a.num("port", 7000)), a.get("bind", "127.0.0.1"));
+    std::printf("forge rpc: listening on %s:%d (%s)\n", a.get("bind", "127.0.0.1").c_str(), srv.port(), reg ? dev.c_str() : "cpu");
+    std::fflush(stdout);
+    srv.run();
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -317,6 +329,7 @@ int main(int argc, char** argv) {
         if (c == "sign") return cmd_sign(a);
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
+        if (c == "rpc-serve") return cmd_rpc_serve(a);
         return usage();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "forge: error: %s\n", e.what());

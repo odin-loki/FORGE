@@ -107,6 +107,7 @@ public:
     std::vector<float> arena;
     std::map<std::string, value_id> inputs;
     partition_report part;
+    std::vector<int> stage_of_node;    // pipeline stage per node (empty = single device)
     device_hooks* hooks = nullptr;     // device residency protocol (null = everything on the host)
     bool pinned = false;
     bool deterministic = true;        // CPU kernels use fixed reduction orders
@@ -131,7 +132,25 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
     auto& G = p->g;
     p->views.resize(G.size());
     auto& reg = po.lowerings ? *po.lowerings : registry::cpu();
-    p->hooks = reg.hooks.get();
+    p->hooks = reg.stages.empty() ? reg.hooks.get() : nullptr;
+    // Pipeline split: contiguous node ranges per stage, balanced by spec cost x output size.
+    std::vector<registry*> stage_of(G.size(), &reg);
+    if (!reg.stages.empty()) {
+        std::vector<double> c(G.size(), 0.0); double tot = 0;
+        for (std::size_t i = 0; i < G.size(); ++i) { auto& n = G.nodes()[i]; if (n.kind != node_kind::op) continue;
+            double e = double(std::max<i64>(numel(n.shape), 1)); for (auto in : n.inputs) e = std::max(e, double(numel(G.at(in).shape)));
+            c[i] = std::max(spec::info(n.op).cost, 1.0) * e; tot += c[i]; }
+        auto k = reg.stages.size(); std::vector<double> w(reg.stage_weight);
+        w.resize(k, 1.0); double ws = 0; for (auto x : w) ws += x;
+        double acc = 0, edge = w[0] / ws * tot; std::size_t st = 0;
+        for (std::size_t i = 0; i < G.size(); ++i) {
+            while (st + 1 < k && acc >= edge) { ++st; edge += w[st] / ws * tot; }
+            auto* r = reg.stages[st].get(); stage_of[i] = r ? r : &registry::cpu(); acc += c[i];
+        }
+        p->stage_of_node.resize(G.size()); for (std::size_t i = 0; i < G.size(); ++i) {
+            std::size_t s = 0; for (; s < k; ++s) if ((reg.stages[s] ? reg.stages[s].get() : &registry::cpu()) == stage_of[i]) break;
+            p->stage_of_node[i] = int(s); }
+    }
     for (std::size_t i = 0; i < G.size(); ++i) {
         auto& n = G.nodes()[i];
         auto& s = p->mem.slots[i];
@@ -183,7 +202,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
                     at = &a2;
                 }
             }
-            p->steps.push_back({&reg.select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
+            p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
     return p;

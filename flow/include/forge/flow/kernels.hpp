@@ -63,6 +63,11 @@ public:
     }
     std::vector<lowering>& lowerings(spec::op o) { return by_op_[std::size_t(o)]; }
     std::shared_ptr<device_hooks> hooks;  // set by device backends that keep data resident
+    // Pipeline split ("pipe:a,b,..."): when non-empty, compile() cuts the graph into contiguous stages of about
+    // equal cost (weights in stage_weight) and selects each node's lowering from its stage's registry
+    // (null entry = CPU). Stage registries must be non-resident; activations cross stages through host memory.
+    std::vector<std::unique_ptr<registry>> stages;
+    std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);
         if (l.verified >= 0) return l.verified == 1;

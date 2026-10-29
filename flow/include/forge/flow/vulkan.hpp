@@ -8,6 +8,7 @@
 #include <forge/grid/opencl.hpp>
 #include <forge/grid/levelzero.hpp>
 #include <forge/grid/metal.hpp>
+#include <forge/flow/rpc.hpp>
 
 namespace forge::flow {
 #ifdef FORGE_GRID_VULKAN
@@ -50,10 +51,10 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<grid::vk::runti
 // CUDA / HIP lowerings ("cuda.<op>" / "hip.<op>"), oracle-gated. With the residency hooks, buffers stay on the
 // device for a whole executor run (weights across runs), like the Vulkan backend.
 // The same registry serves every runtime with the cuda.hpp contract: CUDA, HIP, OpenCL, Level Zero.
-template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt) {
+template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt, bool resident = true) {
     auto r = registry::make();
     std::string pre = rt->backend();
-    bool resident = !std::getenv("FORGE_GPU_NO_RESIDENCY");
+    resident = resident && !std::getenv("FORGE_GPU_NO_RESIDENCY");
     if (resident) {
         auto h = std::make_shared<device_hooks>();
         RT* raw = rt.get();
@@ -80,13 +81,46 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
     return r;
 }
 // Registry for a device name ("cpu", "vulkan", "cuda[:N]", "hip[:N]", "opencl[:N]", "level_zero[:N]"); null = CPU. `why` explains a fallback.
-inline std::unique_ptr<registry> device_registry(const std::string& dev, std::string* why = nullptr) {
+inline std::unique_ptr<registry> device_registry(const std::string& dev, std::string* why = nullptr, bool resident = true);
+// "pipe:<dev>[*w],<dev>[*w],..." e.g. "pipe:cuda:0,cuda:1" or "pipe:vulkan*3,cpu" or "pipe:rpc:host:7000,cpu".
+inline std::unique_ptr<registry> pipeline_registry(const std::string& list, std::string* why) {
+    auto r = registry::make();
+    std::size_t i = 0;
+    while (i <= list.size()) {
+        // device names contain ':' but never ',' -> split on ','
+        auto j = list.find(',', i); if (j == std::string::npos) j = list.size();
+        auto d = list.substr(i, j - i); double w = 1;
+        if (auto st = d.rfind('*'); st != std::string::npos) { w = std::atof(d.c_str() + st + 1); d = d.substr(0, st); }
+        if (d.empty()) { if (why) *why = "pipe: empty stage"; return nullptr; }
+        std::string e; auto sr = device_registry(d, &e, false);
+        if (!sr && d != "cpu") { if (why) *why = "pipe stage '" + d + "': " + e; return nullptr; }
+        r->stages.push_back(std::move(sr)); r->stage_weight.push_back(w > 0 ? w : 1);
+        i = j + 1;
+    }
+    if (r->stages.size() < 2 && why) *why = "pipe: single stage";
+    return r;
+}
+#ifdef FORGE_GRID_VULKAN
+// Non-resident Vulkan (pipeline stages / RPC servers): every op round-trips host memory.
+inline std::unique_ptr<registry> vulkan_registry_flat(std::shared_ptr<grid::vk::runtime> rt) {
+    auto r = vulkan_registry(rt); r->hooks.reset();
+    for (std::size_t i = 0; i < spec::op_count; ++i) for (auto& l : r->lowerings(spec::op(i))) if (l.on_device) {
+        auto fn = l.fn; l.on_device = false;
+        l.fn = [rt, fn](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
+            rt->begin_run(); try { fn(in, out, a); rt->to_host(out.data, out.size()); rt->end_run(); } catch (...) { rt->end_run(); throw; } };
+    }
+    return r;
+}
+#endif
+inline std::unique_ptr<registry> device_registry(const std::string& dev, std::string* why, bool resident) {
     if (dev.empty() || dev == "cpu") return nullptr;
+    if (dev.rfind("pipe:", 0) == 0) return pipeline_registry(dev.substr(5), why);
+    if (dev.rfind("rpc:", 0) == 0) return rpc::open(dev.substr(4), why);
 #ifdef FORGE_GRID_VULKAN
     if (dev == "vulkan") {
         std::string e;
         auto rt = grid::vk::runtime::open(&e);
-        if (rt) return vulkan_registry(std::shared_ptr<grid::vk::runtime>(std::move(rt)));
+        if (rt) return resident ? vulkan_registry(std::shared_ptr<grid::vk::runtime>(std::move(rt))) : vulkan_registry_flat(std::shared_ptr<grid::vk::runtime>(std::move(rt)));
         if (why) *why = "vulkan unavailable: " + e;
         return nullptr;
     }
@@ -95,28 +129,28 @@ inline std::unique_ptr<registry> device_registry(const std::string& dev, std::st
     if (base == "cuda" || base == "hip") {
         std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
         auto rt = grid::gpu::runtime::open(base == "cuda" ? grid::gpu::api::cuda : grid::gpu::api::hip, &e, ord);
-        if (rt) return gpu_registry(std::shared_ptr<grid::gpu::runtime>(std::move(rt)));
+        if (rt) return gpu_registry(std::shared_ptr<grid::gpu::runtime>(std::move(rt)), resident);
         if (why) *why = e;
         return nullptr;
     }
     if (base == "opencl") {   // "opencl:N" = Nth device over all platforms (GPUs first)
         std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
         auto rt = grid::ocl::runtime::open(&e, ord);
-        if (rt) return gpu_registry(std::shared_ptr<grid::ocl::runtime>(std::move(rt)));
+        if (rt) return gpu_registry(std::shared_ptr<grid::ocl::runtime>(std::move(rt)), resident);
         if (why) *why = e;
         return nullptr;
     }
     if (base == "metal") {
         std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
         auto rt = grid::metal::runtime::open(&e, ord);
-        if (rt) return gpu_registry(std::shared_ptr<grid::metal::runtime>(std::move(rt)));
+        if (rt) return gpu_registry(std::shared_ptr<grid::metal::runtime>(std::move(rt)), resident);
         if (why) *why = e;
         return nullptr;
     }
     if (base == "level_zero" || base == "ze") {
         std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
         auto rt = grid::ze::runtime::open(&e, ord);
-        if (rt) return gpu_registry(std::shared_ptr<grid::ze::runtime>(std::move(rt)));
+        if (rt) return gpu_registry(std::shared_ptr<grid::ze::runtime>(std::move(rt)), resident);
         if (why) *why = e;
         return nullptr;
     }
