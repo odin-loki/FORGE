@@ -44,12 +44,26 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<grid::vk::runti
     return r;
 }
 #endif
-// CUDA / HIP lowerings ("cuda.<op>" / "hip.<op>"): one host<->device round trip per op, oracle-gated.
+// CUDA / HIP lowerings ("cuda.<op>" / "hip.<op>"), oracle-gated. With the residency hooks, buffers stay on the
+// device for a whole executor run (weights across runs), like the Vulkan backend.
 inline std::shared_ptr<grid::gpu::runtime>& last_gpu_runtime() { static std::shared_ptr<grid::gpu::runtime> r; return r; }
 inline std::unique_ptr<registry> gpu_registry(std::shared_ptr<grid::gpu::runtime> rt) {
     last_gpu_runtime() = rt;
     auto r = registry::make();
     std::string pre = grid::gpu::api_name(rt->which());
+    bool resident = !std::getenv("FORGE_GPU_NO_RESIDENCY");
+    if (resident) {
+        auto h = std::make_shared<device_hooks>();
+        grid::gpu::runtime* raw = rt.get();
+        h->begin_run = [raw] { raw->begin_run(); };
+        h->end_run = [raw] { raw->end_run(); };
+        h->pin = [raw](const float* p, std::size_t n) { raw->pin(p, n); };
+        h->to_host = [raw](const float* p, std::size_t n) { raw->to_host(p, n); };
+        h->host_wrote = [raw](const float* p, std::size_t n) { raw->host_wrote(p, n); };
+        h->release = [raw](const float* p, std::size_t n) { raw->release(p, n); };
+        h->copy = [raw](float* s, std::size_t n, float* d, std::size_t dn, std::size_t off) { raw->copy_resident(s, n, d, dn, off); };
+        r->hooks = h;
+    }
     for (std::size_t i = 0; i < spec::op_count; ++i) {
         auto o = spec::op(i);
         std::string name(spec::info(o).name);
@@ -59,7 +73,7 @@ inline std::unique_ptr<registry> gpu_registry(std::shared_ptr<grid::gpu::runtime
                     return grid::gpu::supports(name, std::vector<shape_t>(in.begin(), in.end()), a); },
                 [rt, name](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
                     if (!rt->run_op(name, std::vector<tensor_view>(in.begin(), in.end()), a, out))
-                        raise(errc::unsupported, "{}: {} rejected its inputs", grid::gpu::api_name(rt->which()), name); }});
+                        raise(errc::unsupported, "{}: {} rejected its inputs", grid::gpu::api_name(rt->which()), name); }, -1, resident});
     }
     return r;
 }
@@ -75,9 +89,10 @@ inline std::unique_ptr<registry> device_registry(const std::string& dev, std::st
         return nullptr;
     }
 #endif
-    if (dev == "cuda" || dev == "hip") {
-        std::string e;
-        auto rt = grid::gpu::runtime::open(dev == "cuda" ? grid::gpu::api::cuda : grid::gpu::api::hip, &e);
+    auto base = dev.substr(0, dev.find(':'));   // "cuda:1" selects device ordinal 1
+    if (base == "cuda" || base == "hip") {
+        std::string e; int ord = dev.size() > base.size() ? std::atoi(dev.c_str() + base.size() + 1) : 0;
+        auto rt = grid::gpu::runtime::open(base == "cuda" ? grid::gpu::api::cuda : grid::gpu::api::hip, &e, ord);
         if (rt) return gpu_registry(std::shared_ptr<grid::gpu::runtime>(std::move(rt)));
         if (why) *why = e;
         return nullptr;

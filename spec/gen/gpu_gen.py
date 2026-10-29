@@ -219,6 +219,17 @@ FORGE_DEV float flog(float x) { return flog2(x) * 0.6931471805599453f; }
 FORGE_DEV float ftanh(float x) { float e = fexp(-2.0f * fabs_(x)); float t = (1.0f - e) / (1.0f + e); return x < 0.0f ? -t : t; }
 """
 
+CU_MATH = r"""// sin/cos in double after reduction by pi/2 (no libdevice/ocml needed); |x| up to ~1e9 is exact enough.
+FORGE_DEV void fsincos(double x, float* s, float* c) {
+  double k = __builtin_rint(x * 0.63661977236758134); double r = x - k * 1.5707963267341256; r -= k * 6.077100506506192e-11;
+  double r2 = r * r;
+  double sp = r * (1.0 + r2 * (-1.0/6 + r2 * (1.0/120 + r2 * (-1.0/5040 + r2 * (1.0/362880 + r2 * (-1.0/39916800 + r2 * (1.0/6227020800.0)))))));
+  double cp = 1.0 + r2 * (-0.5 + r2 * (1.0/24 + r2 * (-1.0/720 + r2 * (1.0/40320 + r2 * (-1.0/3628800 + r2 * (1.0/479001600.0))))));
+  long q = (long)k & 3;
+  double so = q == 0 ? sp : q == 1 ? cp : q == 2 ? -sp : -cp, co = q == 0 ? cp : q == 1 ? -sp : q == 2 ? -cp : sp;
+  *s = (float)so; *c = (float)co; }
+"""
+
 def cuda(names):
     out = [CU_PRELUDE]
     for n in names:
@@ -240,6 +251,49 @@ def cuda(names):
     out.append("""FORGE_GLOBAL void forge_matmul_t(const float* a, const float* b, float* y, unsigned rows, unsigned cols, unsigned k) {
   unsigned i = gid(); if (i >= rows * cols) return; unsigned r = i / cols, c = i % cols; float s = 0.0f;
   for (unsigned t = 0; t < k; ++t) s = fma_(a[r * k + t], b[c * k + t], s); y[i] = s; }""")
+    out.append(CU_MATH)
+    out.append("""FORGE_GLOBAL void forge_rope(const float* x, const float* pos, const float* inv, float* y, unsigned rows, unsigned cols, unsigned d, unsigned neox) {
+  unsigned half_ = d / 2u, i = gid(); if (i >= rows * cols * half_) return;
+  unsigned j = i % half_, row = i / half_, s = row / cols, o = row * d;
+  double th = (double)pos[s] * (double)inv[j]; float c, sn; fsincos(th, &sn, &c);
+  unsigned i0 = neox ? j : 2u * j, i1 = neox ? j + half_ : 2u * j + 1u;
+  float x0 = x[o + i0], x1 = x[o + i1];
+  y[o + i0] = x0 * c - x1 * sn; y[o + i1] = x0 * sn + x1 * c; }""")
+    out.append("""FORGE_GLOBAL void forge_gather(const float* t, const float* idx, float* y, unsigned n, unsigned rows, unsigned cols) {
+  unsigned i = gid(); if (i >= n) return; unsigned r = (unsigned)idx[i / cols]; y[i] = r < rows ? t[r * cols + i % cols] : 0.0f; }""")
+    out.append("""FORGE_GLOBAL void forge_slice(const float* x, float* y, unsigned n, unsigned len_in, unsigned inner, unsigned start, unsigned len) {
+  unsigned i = gid(); if (i >= n) return; unsigned in_ = i % inner, r = (i / inner) % len, o = i / (inner * len);
+  y[i] = x[(o * len_in + start + r) * inner + in_]; }""")
+    out.append("""FORGE_DEV float fp8dec(unsigned b) {
+  unsigned e = (b >> 3) & 15u, m = b & 7u; float v = e == 0u ? (float)m * (1.0f / 512.0f) : (float)(8u + m) * fexp2((float)((int)e - 10));
+  return (b & 0x80u) ? -v : v; }
+FORGE_DEV float kvat(const float* base, unsigned codec, unsigned e) {
+  if (codec == 0u) return base[e];
+  unsigned w = __builtin_bit_cast(unsigned, base[1u + (e >> 2)]), b = (w >> (8u * (e & 3u))) & 255u;
+  return (codec == 1u ? (float)(signed char)b : fp8dec(b)) * base[0]; }
+// q[s,hq,d] k[t,hk,d] v[t,hk,dv]; flags = causal | kcodec<<1 | vcodec<<3 | window<<5 (see flow/kv_codec.hpp)
+FORGE_GLOBAL void forge_attention(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq, unsigned d,
+                                  unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
+  unsigned id = gid(); if (id >= s * hq) return;
+  unsigned i = id / hq, h = id % hq, kh = h / (hq / hk);
+  unsigned causal = flags & 1u, kc = (flags >> 1) & 3u, vc = (flags >> 3) & 3u, window = flags >> 5;
+  unsigned kw = kc ? 1u + (d + 3u) / 4u : d, vw = vc ? 1u + (dv + 3u) / 4u : dv;
+  int pos = (int)t - (int)s + (int)i; const float* qp = q + id * d; float* yp = y + id * dv;
+  float m = -__builtin_inff();
+  for (unsigned j = 0; j < t; ++j) {
+    if (causal && (int)j > pos) continue; if (window && pos - (int)j >= (int)window) continue;
+    const float* kp = k + (j * hk + kh) * kw; float dot = 0.0f;
+    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kvat(kp, kc, e), dot);
+    m = dot * scale > m ? dot * scale : m; }
+  for (unsigned e = 0; e < dv; ++e) yp[e] = 0.0f;
+  float sum = 0.0f;
+  for (unsigned j = 0; j < t; ++j) {
+    if (causal && (int)j > pos) continue; if (window && pos - (int)j >= (int)window) continue;
+    const float* kp = k + (j * hk + kh) * kw; const float* vp = v + (j * hk + kh) * vw; float dot = 0.0f;
+    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kvat(kp, kc, e), dot);
+    float w = fexp(dot * scale - m); sum += w;
+    for (unsigned e = 0; e < dv; ++e) yp[e] = fma_(w, kvat(vp, vc, e), yp[e]); }
+  float inv = sum > 0.0f ? 1.0f / sum : 0.0f; for (unsigned e = 0; e < dv; ++e) yp[e] *= inv; }""")
     return "\n".join(out) + "\n"
 
 def main():
