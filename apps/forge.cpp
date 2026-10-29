@@ -249,7 +249,7 @@ int cmd_run(const args& a) {
 
 int cmd_bench_gemm(int n) {
     std::vector<float> A(std::size_t(n) * n, 0.5f), B(std::size_t(n) * n, 0.25f), C(std::size_t(n) * n);
-    for (const char* t : {"scalar", "avx2", "avx512", "neon"}) {
+    for (const char* t : {"scalar", "avx2", "avx512", "neon", "sve", "rvv"}) {
         auto* k = lane::by_name(t); if (!k) continue;
         k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n));
         auto t0 = std::chrono::steady_clock::now(); int reps = 0;

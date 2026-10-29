@@ -54,6 +54,8 @@ struct rvv1 : caps<rvv, zvfh> { using caps_type = caps<rvv, zvfh>; static conste
 template <Target T> constexpr int native_f32_lanes() {
     if constexpr (Has<T, avx512f>) return 16;
     else if constexpr (Has<T, avx2>) return 8;
+    else if constexpr (Has<T, sve>) return 8;   // SVE / RVV kernels are built for 256-bit registers
+    else if constexpr (Has<T, rvv>) return 8;
     else if constexpr (Has<T, neon>) return 4;
     else return 4; // scalar emulation, 4-wide for ILP
 }

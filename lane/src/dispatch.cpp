@@ -6,6 +6,7 @@
 #include <cpuid.h>
 #endif
 #if defined(__linux__)
+#include <sys/auxv.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -16,6 +17,12 @@ namespace mv_avx2 { extern const kernels table; }
 namespace mv_avx512 { extern const kernels table; }
 #if defined(__aarch64__)
 namespace mv_neon { extern const kernels table; }
+#if defined(FORGE_LANE_SVE)
+namespace mv_sve { extern const kernels table; int vector_bytes(); }
+#endif
+#endif
+#if defined(__riscv) && defined(FORGE_LANE_RVV)
+namespace mv_rvv { extern const kernels table; int vector_bytes(); }
 #endif
 
 #if defined(__x86_64__)
@@ -78,7 +85,23 @@ static cpu_features do_detect() {
         f.brand = br;
     }
 #elif defined(__aarch64__)
-    f.neon = true; // mandatory in AArch64; SVE via getauxval(AT_HWCAP) left to the AArch64 port
+    f.neon = true; // mandatory in AArch64
+    f.vendor = "aarch64";
+#if defined(__linux__)
+    unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+    f.sve = hw & (1ul << 22); f.sve2 = hw2 & (1ul << 1);
+#if defined(FORGE_LANE_SVE)
+    if (f.sve) f.sve_bytes = mv_sve::vector_bytes();
+#endif
+#endif
+#elif defined(__riscv)
+    f.vendor = "riscv64";
+#if defined(__linux__)
+    f.rvv = getauxval(AT_HWCAP) & (1ul << ('V' - 'A'));
+#if defined(FORGE_LANE_RVV)
+    if (f.rvv) f.rvv_bytes = mv_rvv::vector_bytes();
+#endif
+#endif
 #endif
     return f;
 }
@@ -93,6 +116,8 @@ std::string cpu_features::summary() const {
     add(avx512vnni, "avx512vnni"); add(avx512bf16, "avx512bf16"); add(avx512fp16, "avx512fp16");
     add(avx512ifma, "avx512ifma"); add(avx512vbmi, "avx512vbmi"); add(avxvnni, "avxvnni"); add(avx10, "avx10");
     add(amx_tile, "amx-tile"); add(amx_permitted, "(amx-permitted)"); add(hybrid, "hybrid"); add(neon, "neon");
+    add(sve, "sve"); add(sve2, "sve2"); if (sve_bytes) s += std::format("(vl={}b)", sve_bytes * 8);
+    add(rvv, "rvv"); if (rvv_bytes) s += std::format("(vlen={}b)", rvv_bytes * 8);
     return s;
 }
 
@@ -102,6 +127,14 @@ const kernels* by_name(const char* t) {
     if (n == "scalar") return &mv_scalar::table;
 #if defined(__aarch64__)
     if (n == "neon") return f.neon ? &mv_neon::table : nullptr;
+#if defined(FORGE_LANE_SVE)
+    if (n == "sve") return f.sve && f.sve_bytes == 32 ? &mv_sve::table : nullptr;  // kernels are fixed at 256-bit
+#endif
+    return nullptr;
+#elif defined(__riscv)
+#if defined(FORGE_LANE_RVV)
+    if (n == "rvv") return f.rvv && f.rvv_bytes == 32 ? &mv_rvv::table : nullptr;
+#endif
     return nullptr;
 #else
     if (n == "avx2") return f.avx2 && f.fma ? &mv_avx2::table : nullptr;
@@ -114,7 +147,7 @@ const kernels& active() {
     static const kernels* k = [] {
         if (const char* e = std::getenv("FORGE_LANE_TARGET"))
             if (auto* p = by_name(e)) return p;
-        for (const char* t : {"avx512", "avx2", "neon"}) if (auto* p = by_name(t)) return p;
+        for (const char* t : {"avx512", "avx2", "sve", "rvv", "neon"}) if (auto* p = by_name(t)) return p;
         return &mv_scalar::table;
     }();
     return *k;
