@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define FORGE_ABI_VERSION 1
+#define FORGE_ABI_VERSION 2   /* 2 = v1 + position/rewind/forward_all/generate_ex (additive) */
 
 typedef struct forge_model forge_model;
 
@@ -43,6 +43,21 @@ int forge_forward(forge_model* m, const int32_t* ids, int64_t n, float* logits, 
 /* Prefill + decode. Returns number of generated tokens written to out (or -1). */
 int64_t forge_generate(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new,
                        const forge_sampling* s, int32_t* out, int64_t cap, forge_token_cb cb, void* user);
+
+/* ---- ABI 2 ---- */
+int64_t forge_position(const forge_model* m);
+int forge_rewind(forge_model* m, int64_t position);  /* roll KV state back to `position` tokens */
+/* Logits for every position of ids: writes n * vocab floats. */
+int forge_forward_all(forge_model* m, const int32_t* ids, int64_t n, float* logits, int64_t cap);
+
+typedef struct forge_generate_options {
+    const char* grammar;   /* GBNF text constraining the output, or NULL */
+    forge_model* draft;    /* speculative-decoding draft model (same vocab), or NULL */
+    int32_t spec_k;        /* draft tokens per round (default 4) */
+} forge_generate_options;
+int64_t forge_generate_ex(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new,
+                          const forge_sampling* s, const forge_generate_options* o,
+                          int32_t* out, int64_t cap, forge_token_cb cb, void* user);
 
 #ifdef __cplusplus
 }

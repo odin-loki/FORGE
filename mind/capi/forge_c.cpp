@@ -13,7 +13,7 @@ const char* forge_version(void) { return "0.1.0"; }
 const char* forge_last_error(void) { return g_err.c_str(); }
 
 forge_model* forge_open(const char* path, int64_t ctx, int verify) {
-    try { return new forge_model(path, {ctx, verify != 0}); } FORGE_TRY(nullptr)
+    try { return new forge_model(path, {.context = ctx, .verify = verify != 0}); } FORGE_TRY(nullptr)
 }
 void forge_close(forge_model* m) { delete m; }
 void forge_reset(forge_model* m) { if (m) m->s.reset(); }
@@ -48,17 +48,41 @@ int forge_forward(forge_model* m, const int32_t* ids, int64_t n, float* logits, 
 }
 int64_t forge_generate(forge_model* m, const int32_t* prompt, int64_t np, int32_t max_new, const forge_sampling* s,
                        int32_t* out, int64_t cap, forge_token_cb cb, void* user) {
+    return forge_generate_ex(m, prompt, np, max_new, s, nullptr, out, cap, cb, user);
+}
+int64_t forge_position(const forge_model* m) { return m ? m->s.position() : -1; }
+int forge_rewind(forge_model* m, int64_t p) { try { m->s.rewind(p); return 0; } FORGE_TRY(-1) }
+int forge_forward_all(forge_model* m, const int32_t* ids, int64_t n, float* logits, int64_t cap) {
+    try {
+        auto l = m->s.forward_all(std::span<const int>(ids, std::size_t(n)));
+        std::memcpy(logits, l.data(), std::min<std::size_t>(l.size(), std::size_t(cap)) * 4);
+        return 0;
+    } FORGE_TRY(-1)
+}
+int64_t forge_generate_ex(forge_model* m, const int32_t* prompt, int64_t np, int32_t max_new, const forge_sampling* s,
+                          const forge_generate_options* o, int32_t* out, int64_t cap, forge_token_cb cb, void* user) {
     try {
         forge::mind::sampler_config c;
         if (s) { c.temperature = s->temperature; c.top_k = s->top_k; c.top_p = s->top_p > 0 ? s->top_p : 1.f; c.min_p = s->min_p;
                  c.repetition_penalty = s->repetition_penalty > 0 ? s->repetition_penalty : 1.f; c.seed = s->seed; }
         forge::mind::sampler smp(c);
         auto* tok = m->s.tokenizer();
-        auto r = m->s.generate(std::span<const int>(prompt, std::size_t(np)), max_new, smp, [&](int t) {
-            if (!cb) return true;
-            std::string txt = tok ? tok->decode_one(t) : std::string();
-            return cb(t, txt.c_str(), user) == 0;
-        });
+        std::unique_ptr<forge::mind::grammar_constraint> gc;
+        if (o && o->grammar) {
+            if (!tok) { g_err = "grammar needs a tokenizer"; return -1; }
+            gc = std::make_unique<forge::mind::grammar_constraint>(std::make_shared<forge::mind::grammar>(o->grammar), *tok, int(m->s.vocab()), tok->eos());
+            smp.filter = [&](std::span<float> l) { gc->apply(l); };
+        }
+        std::vector<int> r;
+        auto on = [&](int t) {
+            if (gc && !gc->accept(t)) return false;
+            r.push_back(t);
+            if (cb) { std::string txt = tok ? tok->decode_one(t) : std::string(); if (cb(t, txt.c_str(), user) != 0) return false; }
+            return !(gc && gc->finished());
+        };
+        std::span<const int> pr(prompt, std::size_t(np));
+        if (o && o->draft) forge::mind::speculative_generate(m->s, o->draft->s, pr, max_new, smp, o->spec_k > 0 ? o->spec_k : 4, on);
+        else m->s.generate(pr, max_new, smp, on);
         for (int64_t i = 0; i < int64_t(r.size()) && i < cap; ++i) out[i] = r[std::size_t(i)];
         return int64_t(r.size());
     } FORGE_TRY(-1)
