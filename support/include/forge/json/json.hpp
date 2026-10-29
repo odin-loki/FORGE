@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 // Minimal, strict JSON reader/writer (config.json, tokenizer.json, safetensors headers, manifests).
 #include <forge/core/error.hpp>
 #include <cstdint>
@@ -107,7 +108,10 @@ struct parser {
             }
         }
     }
+    int depth = 0;
     value parse() {
+        struct guard { int& d; ~guard() { --d; } } g{++depth};
+        if (depth > 512) fail("nesting too deep");
         char c = peek();
         if (c == '{') {
             ++p; object o;
@@ -138,7 +142,10 @@ struct parser {
         if (s[p] == '-' || s[p] == '+') ++p;
         while (p < s.size() && (std::isdigit((unsigned char)s[p]) || s[p] == '.' || s[p] == 'e' || s[p] == 'E' || s[p] == '-' || s[p] == '+')) ++p;
         if (st == p) fail("unexpected character");
-        return std::stod(std::string(s.substr(st, p - st)));
+        std::string txt(s.substr(st, p - st)); char* end = nullptr;
+        double v = std::strtod(txt.c_str(), &end);
+        if (end != txt.c_str() + txt.size()) fail("bad number");
+        return v;
     }
 };
 inline void esc(std::string& o, const std::string& s) {

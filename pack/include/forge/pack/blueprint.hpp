@@ -19,6 +19,7 @@
 // Built-in composites: linear(x, W) = x @ W^T, embed(W, ids) = gather, heads(x, n) / merge(x) reshapes.
 #include <forge/flow/ir.hpp>
 #include <forge/spec/ops.gen.hpp>
+#include <charconv>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -48,7 +49,9 @@ inline std::vector<bp_token> bp_lex(std::string_view s) {
                                     ((s[q] == '-' || s[q] == '+') && (s[q - 1] == 'e' || s[q - 1] == 'E'))))
                 ++q;
             auto txt = std::string(s.substr(p, q - p));
-            t.push_back({bp_token::k_num, txt, std::stod(txt), line}); p = q; continue;
+            char* end = nullptr; double v = std::strtod(txt.c_str(), &end);
+            if (end != txt.c_str() + txt.size() || !std::isfinite(v)) raise(errc::parse_error, "blueprint:{}: bad number '{}'", line, txt);
+            t.push_back({bp_token::k_num, txt, v, line}); p = q; continue;
         }
         if (c == '"') {
             std::size_t q = p + 1; while (q < s.size() && s[q] != '"') ++q;
@@ -106,7 +109,8 @@ class bp_parser {
 public:
     bp_parser(const std::vector<bp_token>& t, std::size_t p = 0) : t_(t), p_(p) {}
     const bp_token& cur() const { return t_[p_]; }
-    const bp_token& next() { return t_[p_++]; }
+    const bp_token& next() { const auto& t = t_[p_]; if (t.kind != bp_token::k_end) ++p_; return t; }
+    double number() { if (cur().kind != bp_token::k_num) fail("expected number"); return next().num; }
     bool is(std::string_view s) const { return (cur().kind == bp_token::k_punct || cur().kind == bp_token::k_ident) && cur().text == s; }
     bool accept(std::string_view s) { if (is(s)) { ++p_; return true; } return false; }
     [[noreturn]] void fail(const std::string& m) const { raise(errc::parse_error, "blueprint:{}: {} (near '{}')", cur().line, m, cur().text); }
@@ -145,7 +149,10 @@ private:
     i64 dim(const std::string& d) {
         if (auto it = o_.dims.find(d); it != o_.dims.end()) return it->second;
         if (auto it = bp_.params.find(d); it != bp_.params.end()) return i64(it->second);
-        if (!d.empty() && std::isdigit((unsigned char)d[0])) return std::stoll(d);
+        if (!d.empty() && std::isdigit((unsigned char)d[0])) {
+            i64 v = 0; auto [e, ec] = std::from_chars(d.data(), d.data() + d.size(), v);
+            if (ec == std::errc() && e == d.data() + d.size()) return v;
+        }
         raise(errc::invalid_argument, "blueprint: unbound dimension '{}'", d);
     }
     void stmt() {
@@ -339,7 +346,7 @@ inline void parse_params(bp_parser& ps, blueprint& bp, const std::string& prefix
             if (v == "true" || v == "false") { bp.params[k] = v == "true"; }
             else if (ps.is("(")) {  // e.g. yarn(factor: 8, orig_ctx: 8192) -> k = "yarn", k.factor = 8
                 bp.str_params[k] = v; ps.next();
-                while (!ps.accept(")")) { auto a = ps.ident(); ps.expect(":"); bp.params[k + "." + a] = ps.next().num; ps.accept(","); }
+                while (!ps.accept(")")) { auto a = ps.ident(); ps.expect(":"); bp.params[k + "." + a] = ps.number(); ps.accept(","); }
             } else bp.str_params[k] = v;
         } else ps.fail("bad param value");
         ps.accept(",");
@@ -364,7 +371,7 @@ inline blueprint parse_blueprint(std::string_view src) {
     ps.expect("blueprint");
     if (ps.cur().kind != bp_token::k_str) ps.fail("expected blueprint name string");
     bp.name = ps.next().text;
-    if (ps.accept("opset")) bp.opset = int(ps.next().num);
+    if (ps.accept("opset")) bp.opset = int(ps.number());
     bool have_graph = false;
     while (ps.cur().kind != bp_token::k_end) {
         if (ps.accept("params")) detail::parse_params(ps, bp, "");

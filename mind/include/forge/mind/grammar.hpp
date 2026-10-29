@@ -1,4 +1,5 @@
 #pragma once
+#include <charconv>
 // Grammar-constrained sampling with a GBNF-style grammar (the llama.cpp dialect, byte-level):
 //
 //   root   ::= object
@@ -181,7 +182,8 @@ private:
         char e = s_[i_++];
         switch (e) {
         case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
-        case 'x': { if (i_ + 2 > s_.size()) fail("bad \\x"); auto v = std::stoi(std::string(s_.substr(i_, 2)), nullptr, 16); i_ += 2; return static_cast<unsigned char>(v); }
+        case 'x': { if (i_ + 2 > s_.size()) fail("bad \\x"); int v = 0; auto [e, ec] = std::from_chars(s_.data() + i_, s_.data() + i_ + 2, v, 16);
+            if (ec != std::errc() || e != s_.data() + i_ + 2) fail("bad \\x"); i_ += 2; return static_cast<unsigned char>(v); }
         default: return static_cast<unsigned char>(e);
         }
     }

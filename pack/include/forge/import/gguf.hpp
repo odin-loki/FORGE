@@ -23,7 +23,7 @@ public:
         for (std::uint64_t i = 0; i < nkv; ++i) { auto k = rstr(); auto t = rd<std::uint32_t>(); kv_.emplace_back(k, rval(t)); }
         for (std::uint64_t i = 0; i < nt; ++i) {
             tinfo ti; ti.name = rstr();
-            auto nd = rd<std::uint32_t>();
+            auto nd = rd<std::uint32_t>(); if (nd > 8) raise(errc::format_error, "{}: tensor {} has {} dims", path_, ti.name, nd);
             std::vector<i64> ne(nd); for (auto& d : ne) d = i64(rd<std::uint64_t>());
             ti.shape.assign(ne.rbegin(), ne.rend());   // ggml ne0 is the innermost dimension
             ti.type = rd<std::uint32_t>(); ti.offset = rd<std::uint64_t>();
@@ -44,13 +44,14 @@ public:
     std::span<const std::uint8_t> bytes(const tinfo& t) const {
         auto* c = codec_of(t.type);
         if (!c) raise(errc::unsupported, "tensor {}: ggml type {} not supported (supported: F32 F16 BF16 Q8_0 Q4_K)", t.name, t.type);
+        for (auto d : t.shape) if (d < 0 || d > (i64(1) << 40)) raise(errc::format_error, "tensor {}: bad shape", t.name);
         std::size_t n = flow::codecs::find(c)->bytes(std::size_t(numel(t.shape)));
-        if (data_ + t.offset + n > size_) raise(errc::format_error, "tensor {} out of bounds", t.name);
+        if (t.offset > size_ || n > size_ || data_ + t.offset + n > size_) raise(errc::format_error, "tensor {} out of bounds", t.name);
         return {map_ + data_ + t.offset, n};
     }
 private:
     template <class T> T rd() { if (p_ + sizeof(T) > size_) raise(errc::format_error, "{}: truncated", path_); T v; std::memcpy(&v, map_ + p_, sizeof(T)); p_ += sizeof(T); return v; }
-    std::string rstr() { auto n = rd<std::uint64_t>(); if (p_ + n > size_) raise(errc::format_error, "{}: truncated", path_); std::string s(reinterpret_cast<const char*>(map_ + p_), n); p_ += n; return s; }
+    std::string rstr() { auto n = rd<std::uint64_t>(); if (n > size_ - p_) raise(errc::format_error, "{}: truncated", path_); std::string s(reinterpret_cast<const char*>(map_ + p_), n); p_ += n; return s; }
     json::value rval(std::uint32_t t) {
         switch (t) {
         case 0: return double(rd<std::uint8_t>()); case 1: return double(rd<std::int8_t>());
@@ -58,7 +59,7 @@ private:
         case 4: return double(rd<std::uint32_t>()); case 5: return double(rd<std::int32_t>());
         case 6: return double(rd<float>()); case 7: return rd<std::uint8_t>() != 0;
         case 8: return rstr();
-        case 9: { auto et = rd<std::uint32_t>(); auto n = rd<std::uint64_t>(); json::array a; a.reserve(n); for (std::uint64_t i = 0; i < n; ++i) a.push_back(rval(et)); return a; }
+        case 9: { auto et = rd<std::uint32_t>(); auto n = rd<std::uint64_t>(); if (n > size_ - p_ || ++adepth_ > 8) raise(errc::format_error, "{}: bad GGUF array", path_); json::array a; a.reserve(n); for (std::uint64_t i = 0; i < n; ++i) a.push_back(rval(et)); --adepth_; return a; }
         case 10: return double(rd<std::uint64_t>()); case 11: return double(rd<std::int64_t>());
         case 12: return rd<double>();
         default: raise(errc::format_error, "{}: bad GGUF value type {}", path_, t);
@@ -66,7 +67,7 @@ private:
     }
     std::string path_;
     const std::uint8_t* map_ = nullptr;
-    std::size_t size_ = 0, p_ = 4, data_ = 0;
+    std::size_t size_ = 0, p_ = 4, data_ = 0; int adepth_ = 0;
     std::vector<std::pair<std::string, json::value>> kv_;
     std::vector<tinfo> tensors_;
 };
