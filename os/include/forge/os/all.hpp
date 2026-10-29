@@ -1,0 +1,19 @@
+#pragma once
+// Every forge::os module.
+#include <forge/os/os.hpp>
+#include <forge/os/numa.hpp>
+#include <forge/os/hugepages.hpp>
+#include <forge/os/async_file.hpp>
+#include <forge/os/cpu_topology.hpp>
+#include <forge/os/power.hpp>
+#include <forge/os/memory_pressure.hpp>
+#include <forge/os/shared_memory.hpp>
+#include <forge/os/gpu_devices.hpp>
+#include <forge/os/local_ipc.hpp>
+#include <forge/os/crash.hpp>
+#include <forge/os/sandbox.hpp>
+#include <forge/os/keystore.hpp>
+#include <forge/os/file_watch.hpp>
+#include <forge/os/perf.hpp>
+#include <forge/os/background.hpp>
+#include <forge/os/service.hpp>

@@ -70,7 +70,7 @@ inline void* mmap_aligned(std::size_t n, std::size_t a, int extra_flags = 0) {
 inline result<huge_region> huge_alloc(std::size_t n, page_kind want = page_kind::huge_2m, bool fallback = true) {
     huge_region r; if (!n) return {r, {22, "huge_alloc: size 0"}};
     const std::size_t two = std::size_t(2) << 20, gig = std::size_t(1) << 30;
-    error last = unsupported("huge pages");
+    error last = unsupported("huge pages"); (void)two; (void)gig;
 #if defined(__linux__)
     if (want == page_kind::huge_1g) {
         std::size_t len = detail::round_up(n, gig);

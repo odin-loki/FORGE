@@ -57,8 +57,8 @@ inline void cpuid_caches(std::vector<cpu_cache>& out) {   // deterministic cache
 #endif
 inline void classify_by_capacity(cpu_topology& t) {   // heterogeneous capacity/frequency => big.LITTLE
     std::uint64_t hi = 0, lo = ~0ull; bool cap = false;
-    for (auto& c : t.cpus) { std::uint64_t v = c.capacity ? c.capacity : c.max_khz; if (c.capacity) cap = true; if (!v) return; hi = std::max(hi, v); lo = std::min(lo, v); }
-    if (t.cpus.empty() || hi == lo || (!cap && hi < lo * 11 / 10)) {
+    for (auto& c : t.cpus) { std::uint64_t v = c.capacity ? c.capacity : c.max_khz; if (c.capacity) cap = true; if (!v) { hi = 0; break; } hi = std::max(hi, v); lo = std::min(lo, v); }
+    if (t.cpus.empty() || !hi || hi == lo || (!cap && hi < lo * 11 / 10)) {
         for (auto& c : t.cpus) c.kind = core_kind::performance; return;
     }
     t.hybrid = true;
