@@ -9,9 +9,9 @@ for d in "$a" "$b"; do
   ninja -C "$d" forge forge-serve forge_c >/dev/null
 done
 rc=0
-for f in forge forge-serve libforge_c.so; do
+for f in forge forge-serve libforge.so; do
   ha=$(sha256sum "$a/$f" | cut -d' ' -f1); hb=$(sha256sum "$b/$f" | cut -d' ' -f1)
   if [ "$ha" = "$hb" ]; then echo "identical  $f  $ha"; else echo "DIFFERENT  $f  $ha  $hb"; rc=1; fi
 done
-rm -rf "$a" "$b"
+if [ $rc = 0 ]; then rm -rf "$a" "$b"; else echo "kept $a $b"; fi
 exit $rc

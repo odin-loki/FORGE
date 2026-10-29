@@ -94,13 +94,32 @@ static int end_to_end() {
     return ok ? 0 : 1;
 }
 
+static int pipeline_cache() {
+    // A second runtime must pick up the cache file written by the first one.
+    std::string path;
+    { auto a = grid::vk::runtime::open(); if (!a) return 1;
+      path = a->pipeline_cache_path();
+      std::vector<float> x(64, 1.f), y(64, 2.f), o(64);
+      if (grid::vk::runtime::has_kernel("add")) a->run("add", {{x.data(), 64}, {y.data(), 64}, {o.data(), 64}}, {}, 64); }
+    if (path.empty() || !std::filesystem::exists(path)) { std::printf("FAIL pipeline cache not written (%s)\n", path.c_str()); return 1; }
+    auto b = grid::vk::runtime::open(); if (!b) return 1;
+    if (b->pipeline_cache_path() != path || b->pipeline_cache_loaded_bytes() == 0) { std::printf("FAIL pipeline cache not reloaded\n"); return 1; }
+    std::printf("pipeline cache: %s (%zu bytes reloaded)\n", path.c_str(), b->pipeline_cache_loaded_bytes());
+    return 0;
+}
+
 int main() {
     std::string why;
+    auto tmp = std::filesystem::temp_directory_path() / ("forge-vkcache-" + std::to_string(::getpid()));
+    ::setenv("FORGE_CACHE_DIR", tmp.c_str(), 1);
     auto rt = grid::vk::runtime::open(&why);
     if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
     std::printf("vulkan device: %s\n", rt->device_name().c_str());
     int f = kernels(*rt);
     f += end_to_end();
+    rt.reset();
+    f += pipeline_cache();
+    std::error_code ec; std::filesystem::remove_all(tmp, ec);
     return f ? 1 : 0;
 }
 #endif

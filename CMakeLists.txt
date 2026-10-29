@@ -145,7 +145,7 @@ if(FORGE_GPU_CLANG)
     foreach(arch ${FORGE_HIP_ARCHS})
       add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.${arch}.hsaco
         COMMAND ${CMAKE_COMMAND} -E env FORGE_ZIG=${FORGE_ZIG} "PATH=${_ldpath}:$ENV{PATH}" ${FORGE_GPU_CLANG} -x hip --cuda-device-only --no-gpu-bundle-output
-                -nogpuinc -nogpulib --offload-arch=${arch} -O3 -Werror ${_ld} -o ${FORGE_GPU_DIR}/kernels.${arch}.hsaco ${FORGE_GPU_DIR}/kernels.cu
+                -nogpuinc -nogpulib -cuid=forge_kernels --offload-arch=${arch} -O3 -Werror ${_ld} -o ${FORGE_GPU_DIR}/kernels.${arch}.hsaco ${FORGE_GPU_DIR}/kernels.cu
         DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "HIP code object (${arch})")
       list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.${arch}.hsaco)
     endforeach()

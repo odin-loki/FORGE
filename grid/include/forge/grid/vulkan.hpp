@@ -9,6 +9,10 @@
 #include <forge/grid/spirv.gen.hpp>
 #include <forge/core/tensor.hpp>
 #include <dlfcn.h>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -42,12 +46,27 @@ public:
             for (auto& [n, p] : pipes_) { vkDestroyPipeline(dev_, p.pipe, nullptr); vkDestroyPipelineLayout(dev_, p.layout, nullptr);
                                           vkDestroyDescriptorSetLayout(dev_, p.dsl, nullptr); vkDestroyShaderModule(dev_, p.mod, nullptr); }
             if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
+            if (pcache_) { save_pipeline_cache(); vkDestroyPipelineCache(dev_, pcache_, nullptr); }
             vkDestroyDevice(dev_, nullptr);
         }
         if (inst_) vkDestroyInstance(inst_, nullptr);
         if (lib_) dlclose(lib_);
     }
     const std::string& device_name() const { return name_; }
+    // On-disk pipeline cache: keyed by vendor/device/driver version, the pipelineCacheUUID and a hash of
+    // the embedded SPIR-V, under $FORGE_CACHE_DIR (else $XDG_CACHE_HOME/forge, else ~/.cache/forge).
+    // FORGE_VK_PIPELINE_CACHE=0 disables it. Written atomically at destruction.
+    const std::string& pipeline_cache_path() const { return pcache_path_; }
+    std::size_t pipeline_cache_loaded_bytes() const { return pcache_loaded_; }
+    void save_pipeline_cache() {
+        if (!pcache_ || pcache_path_.empty()) return;
+        std::size_t n = 0; if (vkGetPipelineCacheData(dev_, pcache_, &n, nullptr) != VK_SUCCESS || !n) return;
+        std::vector<char> d(n); if (vkGetPipelineCacheData(dev_, pcache_, &n, d.data()) != VK_SUCCESS) return;
+        std::error_code ec; std::filesystem::create_directories(std::filesystem::path(pcache_path_).parent_path(), ec);
+        std::string tmp = pcache_path_ + ".tmp" + std::to_string(reinterpret_cast<std::uintptr_t>(this));
+        { std::ofstream o(tmp, std::ios::binary); if (!o) return; o.write(d.data(), std::streamsize(n)); if (!o) return; }
+        std::filesystem::rename(tmp, pcache_path_, ec); if (ec) std::filesystem::remove(tmp, ec);
+    }
     std::map<std::string, std::size_t> dispatches() { std::lock_guard lk(mu_); return dispatches_; }
 
     static bool has_kernel(const std::string& n) { for (auto& b : spv::table) if (n == b.name) return true; return false; }
@@ -253,7 +272,8 @@ private:
     X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout) X(vkCreateComputePipelines) X(vkDestroyPipeline) \
     X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkUpdateDescriptorSets) X(vkAllocateCommandBuffers) \
     X(vkFreeCommandBuffers) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
-    X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateFence) X(vkDestroyFence) X(vkQueueSubmit) X(vkWaitForFences) X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer)
+    X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCreateFence) X(vkDestroyFence) X(vkQueueSubmit) X(vkWaitForFences) X(vkCmdPipelineBarrier) X(vkCmdCopyBuffer) \
+    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData)
 #define FORGE_VK_DECL(f) PFN_##f f = nullptr;
     FORGE_VK_FNS(FORGE_VK_DECL)
     FORGE_VK_DEV_FNS(FORGE_VK_DECL)
@@ -299,7 +319,47 @@ private:
         vkGetDeviceQueue(dev_, fam, 0, &q_);
         VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cp.queueFamilyIndex = fam; cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         if (vkCreateCommandPool(dev_, &cp, nullptr, &pool_) != VK_SUCCESS) return "vkCreateCommandPool failed";
+        init_pipeline_cache();
         return {};
+    }
+    void init_pipeline_cache() {
+        const char* off = std::getenv("FORGE_VK_PIPELINE_CACHE");
+        std::vector<char> data;
+        if (!(off && std::string(off) == "0")) {
+            std::string dir;
+            if (const char* e = std::getenv("FORGE_CACHE_DIR"); e && *e) dir = e;
+            else if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x) dir = std::string(x) + "/forge";
+            else if (const char* h = std::getenv("HOME"); h && *h) dir = std::string(h) + "/.cache/forge";
+            if (!dir.empty()) {
+                VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys_, &pr);
+                std::uint64_t hsh = 1469598103934665603ull;   // FNV-1a over every embedded SPIR-V blob
+                for (auto& b : spv::table) { for (const char* c = b.name; *c; ++c) hsh = (hsh ^ std::uint8_t(*c)) * 1099511628211ull;
+                    auto* by = reinterpret_cast<const std::uint8_t*>(b.words);
+                    for (std::size_t i = 0; i < b.count * 4; ++i) hsh = (hsh ^ by[i]) * 1099511628211ull; }
+                char buf[160]; std::string uuid;
+                for (auto u : pr.pipelineCacheUUID) { std::snprintf(buf, sizeof buf, "%02x", u); uuid += buf; }
+                std::snprintf(buf, sizeof buf, "/vk-pipelines-%04x-%04x-%08x-%s-%016llx.bin", pr.vendorID, pr.deviceID,
+                              pr.driverVersion, uuid.c_str(), static_cast<unsigned long long>(hsh));
+                pcache_path_ = dir + buf;
+                std::ifstream in(pcache_path_, std::ios::binary);
+                if (in) data.assign(std::istreambuf_iterator<char>(in), {});
+                // Header check (VkPipelineCacheHeaderVersionOne): the driver also validates, but a stale file
+                // from another device must never be handed over.
+                if (data.size() >= 32) {
+                    std::uint32_t hl, ver, ven, devid; std::memcpy(&hl, data.data(), 4); std::memcpy(&ver, data.data() + 4, 4);
+                    std::memcpy(&ven, data.data() + 8, 4); std::memcpy(&devid, data.data() + 12, 4);
+                    if (hl < 32 || ver != 1 || ven != pr.vendorID || devid != pr.deviceID ||
+                        std::memcmp(data.data() + 16, pr.pipelineCacheUUID, 16) != 0) data.clear();
+                } else data.clear();
+            }
+        }
+        VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        ci.initialDataSize = data.size(); ci.pInitialData = data.empty() ? nullptr : data.data();
+        if (vkCreatePipelineCache(dev_, &ci, nullptr, &pcache_) != VK_SUCCESS) {
+            ci.initialDataSize = 0; ci.pInitialData = nullptr; data.clear();
+            if (vkCreatePipelineCache(dev_, &ci, nullptr, &pcache_) != VK_SUCCESS) pcache_ = VK_NULL_HANDLE;
+        }
+        pcache_loaded_ = data.size();
     }
     std::uint32_t memtype(std::uint32_t bits, bool prefer_local = false) {
         VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
@@ -328,7 +388,7 @@ private:
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, p.mod, "main", nullptr};
         ci.layout = p.layout;
-        ck(vkCreateComputePipelines(dev_, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe), "vkCreateComputePipelines");
+        ck(vkCreateComputePipelines(dev_, pcache_, 1, &ci, nullptr, &p.pipe), "vkCreateComputePipelines");
         return pipes_.emplace(name, p).first->second;
     }
 
@@ -407,6 +467,7 @@ private:
     void* lib_ = nullptr;
     VkInstance inst_ = nullptr; VkPhysicalDevice phys_ = nullptr; VkDevice dev_ = nullptr; VkQueue q_ = nullptr; VkCommandPool pool_{};
     std::string name_;
+    VkPipelineCache pcache_ = VK_NULL_HANDLE; std::string pcache_path_; std::size_t pcache_loaded_ = 0;
     std::mutex mu_;
     std::map<std::string, std::size_t> dispatches_;
     std::map<std::string, pipe> pipes_;
