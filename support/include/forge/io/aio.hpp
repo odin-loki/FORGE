@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <fcntl.h>
+#include <forge/os/os.hpp>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -94,19 +95,21 @@ public:
     }
     // Convenience: read a whole file with `chunk`-sized requests in flight together.
     std::vector<std::uint8_t> read_file(const std::string& path, std::size_t chunk = 1 << 20) {
-        #if defined(_WIN32)
-        int fd = ::_open(path.c_str(), O_RDONLY | O_BINARY);
-#else
-        int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-#endif
+#if defined(_WIN32)   // the public API takes CRT fds; size via forge::os (UTF-8 path aware)
+        int fd = ::_wopen(os::widen(path).c_str(), O_RDONLY | O_BINARY);
         if (fd < 0) throw std::runtime_error("io: cannot open " + path);
-        struct stat st{}; fstat(fd, &st);
-        std::vector<std::uint8_t> data(std::size_t(st.st_size));
+        auto sz = os::stat(path).size;
+        struct closer { int fd; ~closer() { ::_close(fd); } } guard{fd};
+#else
+        auto f = os::file::open(path, os::rd);
+        if (!f) throw std::runtime_error("io: cannot open " + path + ": " + f.err.what);
+        int fd = f->native(); auto sz = f->size().value;
+#endif
+        std::vector<std::uint8_t> data(static_cast<std::size_t>(sz));
         std::size_t n = 0;
         for (std::size_t off = 0; off < data.size(); off += chunk, ++n) read(fd, off, data.data() + off, std::min(chunk, data.size() - off), off);
         std::size_t got = 0; long err = 0;
         while (got < n) for (auto& c : wait(1)) { ++got; if (c.result < 0) err = c.result; }
-        ::close(fd);
         if (err) throw std::runtime_error("io: read failed (" + std::to_string(-err) + ")");
         return data;
     }

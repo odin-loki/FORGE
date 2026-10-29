@@ -2,6 +2,8 @@
 #include <forge/vision/video.hpp>
 #include <algorithm>
 #include <deque>
+#include <forge/core/dl.hpp>
+#include <forge/os/os.hpp>
 #if defined(FORGE_HAVE_NVCUVID)
 #include <cuda.h>
 #include <nvcuvid.h>
@@ -20,19 +22,17 @@ std::unique_ptr<decoder> open_videotoolbox(codec c, frame_cb cb, std::string* wh
 // ---- NVDEC: cuvid parser drives sequence/decode/display callbacks; frames copied DtoH as NV12 ----
 namespace nv {
 struct api {
-    void* cu = nullptr; void* cv = nullptr;
+    os::library cu, cv;
     decltype(&cuInit) Init; decltype(&cuDeviceGet) DeviceGet; decltype(&cuCtxCreate) CtxCreate; decltype(&cuCtxDestroy) CtxDestroy;
     decltype(&cuCtxPushCurrent) Push; decltype(&cuCtxPopCurrent) Pop; decltype(&cuMemcpy2D) Memcpy2D;
     decltype(&cuvidCreateVideoParser) CreateParser; decltype(&cuvidParseVideoData) Parse; decltype(&cuvidDestroyVideoParser) DestroyParser;
     decltype(&cuvidCreateDecoder) CreateDecoder; decltype(&cuvidDestroyDecoder) DestroyDecoder; decltype(&cuvidDecodePicture) DecodePicture;
     decltype(&cuvidMapVideoFrame64) Map; decltype(&cuvidUnmapVideoFrame64) Unmap;
     bool load(std::string* why) {
-#if defined(_WIN32)
-        if (why) *why = "nvdec: dlopen path not wired on Windows yet"; return false;
-#else
-        cu = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL); cv = dlopen("libnvcuvid.so.1", RTLD_NOW | RTLD_LOCAL);
-        if (!cu || !cv) { if (why) *why = "nvdec: libcuda/libnvcuvid not found"; return false; }
-#define L(h, f, s) f = reinterpret_cast<decltype(f)>(dlsym(h, s)); if (!f) { if (why) *why = std::string("nvdec: missing ") + s; return false; }
+        cu = os::library::open(FORGE_DLNAME("libcuda.so.1", "nvcuda.dll")).value);
+        cv = os::library::open(FORGE_DLNAME("libnvcuvid.so.1", "nvcuvid.dll")).value);
+        if (!cu.valid() || !cv.valid()) { if (why) *why = "nvdec: libcuda/libnvcuvid not found"; return false; }
+#define L(h, f, s) f = h.get<decltype(f)>(s); if (!f) { if (why) *why = std::string("nvdec: missing ") + s; return false; }
         L(cu, Init, "cuInit") L(cu, DeviceGet, "cuDeviceGet") L(cu, CtxCreate, "cuCtxCreate_v2") L(cu, CtxDestroy, "cuCtxDestroy_v2")
         L(cu, Push, "cuCtxPushCurrent_v2") L(cu, Pop, "cuCtxPopCurrent_v2") L(cu, Memcpy2D, "cuMemcpy2D_v2")
         L(cv, CreateParser, "cuvidCreateVideoParser") L(cv, Parse, "cuvidParseVideoData") L(cv, DestroyParser, "cuvidDestroyVideoParser")
@@ -40,7 +40,6 @@ struct api {
         L(cv, Map, "cuvidMapVideoFrame64") L(cv, Unmap, "cuvidUnmapVideoFrame64")
 #undef L
         return true;
-#endif
     }
 };
 class dec final : public decoder {

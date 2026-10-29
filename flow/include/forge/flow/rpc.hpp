@@ -10,21 +10,15 @@
 #include <string>
 #include <thread>
 #include <atomic>
-#include <forge/core/net.hpp>
+#include <cstdlib>
+#include <memory>
+#include <forge/os/os.hpp>
 
 namespace forge::flow::rpc {
 namespace detail {
-inline void wsa() { forge::net_init(); }
-inline bool send_all(forge_sock_t s, const void* p, std::size_t n) {
-    auto* c = static_cast<const char*>(p);
-    while (n) { auto r = ::send(s, c, int(std::min<std::size_t>(n, 1 << 30)), 0); if (r <= 0) return false; c += r; n -= std::size_t(r); }
-    return true;
-}
-inline bool recv_all(forge_sock_t s, void* p, std::size_t n) {
-    auto* c = static_cast<char*>(p);
-    while (n) { auto r = ::recv(s, c, int(std::min<std::size_t>(n, 1 << 30)), 0); if (r <= 0) return false; c += r; n -= std::size_t(r); }
-    return true;
-}
+inline void wsa() { os::net_init(); }
+inline bool send_all(os::socket& s, const void* p, std::size_t n) { return s.send_all(p, n); }
+inline bool recv_all(os::socket& s, void* p, std::size_t n) { return s.recv_all(p, n); }
 struct writer {
     std::vector<char> b;
     void raw(const void* p, std::size_t n) { auto* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }
@@ -34,7 +28,7 @@ struct writer {
     void shape(const shape_t& s) { u32(std::uint32_t(s.size())); for (auto d : s) i64(d); }
 };
 struct reader {
-    forge_sock_t s; bool ok = true;
+    os::socket& s; bool ok = true;
     void raw(void* p, std::size_t n) { if (ok) ok = recv_all(s, p, n); }
     std::uint32_t u32() { std::uint32_t v = 0; raw(&v, 4); return v; }
     std::int64_t i64() { std::int64_t v = 0; raw(&v, 8); return v; }
@@ -73,21 +67,12 @@ class client {
 public:
     static std::shared_ptr<client> connect(const std::string& host, const std::string& port, std::string* why) {
         detail::wsa();
-        addrinfo hints{}, *res = nullptr; hints.ai_socktype = SOCK_STREAM; hints.ai_family = AF_UNSPEC;
-        if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res) { if (why) *why = "rpc: cannot resolve " + host; return nullptr; }
-        forge_sock_t s = FORGE_SOCK_BAD;
-        for (auto* p = res; p; p = p->ai_next) {
-            s = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-            if (s == FORGE_SOCK_BAD) continue;
-            if (::connect(s, p->ai_addr, int(p->ai_addrlen)) == 0) break;
-            forge_sock_close(s); s = FORGE_SOCK_BAD;
-        }
-        ::freeaddrinfo(res);
-        if (s == FORGE_SOCK_BAD) { if (why) *why = "rpc: cannot connect to " + host + ":" + port; return nullptr; }
-        int one = 1; ::setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof one);
-        auto c = std::shared_ptr<client>(new client); c->s_ = s; return c;
+        int pn = std::atoi(port.c_str());
+        auto r = os::socket::connect(host, pn, 10000);
+        if (!r) { if (why) *why = "rpc: cannot connect to " + host + ":" + port + " (" + r.err.what + ")"; return nullptr; }
+        r->set_nodelay();
+        auto c = std::shared_ptr<client>(new client); c->s_ = std::move(r.value); return c;
     }
-    ~client() { if (s_ != FORGE_SOCK_BAD) forge_sock_close(s_); }
     std::uint64_t calls() const { return calls_; }
     void run(std::string_view op, std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
         std::lock_guard g(m_);
@@ -106,7 +91,7 @@ public:
     }
 private:
     client() = default;
-    forge_sock_t s_ = FORGE_SOCK_BAD; std::mutex m_; std::uint64_t calls_ = 0;
+    os::socket s_; std::mutex m_; std::uint64_t calls_ = 0;
 };
 
 // Registry whose every op runs remotely ("rpc.<op>", priority 20). Ops the server lacks a lowering for run there on its reference.
@@ -135,12 +120,9 @@ public:
     // port 0 = ephemeral; see port(). bind = "127.0.0.1" by default (pass "0.0.0.0" to expose; there is no auth).
     server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1") : reg_(reg ? reg : &registry::cpu()) {
         detail::wsa();
-        ls_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        int one = 1; ::setsockopt(ls_, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&one), sizeof one);
-        sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(std::uint16_t(port));
-        ::inet_pton(AF_INET, bind.c_str(), &a.sin_addr);
-        if (::bind(ls_, reinterpret_cast<sockaddr*>(&a), sizeof a) != 0 || ::listen(ls_, 8) != 0) raise(errc::io_error, "rpc: cannot listen on {}:{}", bind, port);
-        socklen_t l = sizeof a; ::getsockname(ls_, reinterpret_cast<sockaddr*>(&a), &l); port_ = ntohs(a.sin_port);
+        auto l = os::socket::listen(bind, port, 8);
+        if (!l) raise(errc::io_error, "rpc: cannot listen on {}:{}: {}", bind, port, l.err.what);
+        ls_ = std::move(l.value); port_ = ls_.local_port();
     }
     ~server() { stop(); }
     int port() const { return port_; }
@@ -148,27 +130,23 @@ public:
     // Accepts connections until stop(); one thread per connection.
     void run() {
         while (!stop_) {
-            auto s = ::accept(ls_, nullptr, nullptr);
-            if (s == FORGE_SOCK_BAD) { if (stop_) break; continue; }
+            auto c = ls_.accept();
+            if (!c) { if (stop_) break; continue; }
+            auto sp = std::make_shared<os::socket>(std::move(c.value));
             std::lock_guard g(m_);
-            workers_.emplace_back([this, s] { serve_conn(s); forge_sock_close(s); });
+            workers_.emplace_back([this, sp] { serve_conn(*sp); sp->close(); });
         }
     }
     void start() { th_ = std::thread([this] { run(); }); }
     void stop() {
         if (stop_.exchange(true)) return;
-#if defined(_WIN32)
-        ::shutdown(ls_, SD_BOTH);
-#else
-        ::shutdown(ls_, SHUT_RDWR);
-#endif
-        forge_sock_close(ls_);
+        ls_.shutdown_both(); ls_.close();
         if (th_.joinable()) th_.join();
         std::lock_guard g(m_);
         for (auto& w : workers_) if (w.joinable()) w.detach();   // connections end when their clients close
     }
 private:
-    void serve_conn(forge_sock_t s) {
+    void serve_conn(os::socket& s) {
         for (;;) {
             detail::reader r{s};
             char magic[4]; r.raw(magic, 4);
@@ -199,7 +177,7 @@ private:
             if (!detail::send_all(s, w.b.data(), w.b.size())) return;
         }
     }
-    registry* reg_; forge_sock_t ls_ = FORGE_SOCK_BAD; int port_ = 0;
+    registry* reg_; os::socket ls_; int port_ = 0;
     std::atomic<bool> stop_{false}; std::atomic<std::uint64_t> ops_{0};
     std::thread th_; std::mutex m_, dev_m_; std::vector<std::thread> workers_;
 };

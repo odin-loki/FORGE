@@ -6,6 +6,7 @@
 //                read/write the renderer's buffer without a copy.
 // Tested: Vulkan export -> import round trip on lavapipe. CUDA import: HARDWARE-UNTESTED.
 #include <forge/core/dl.hpp>
+#include <forge/os/os.hpp>
 #include <forge/core/error.hpp>
 #include <cstdint>
 #include <cstring>
@@ -174,9 +175,9 @@ public:
     static constexpr int CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD = 1, CU_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32 = 2;
 
     bool open(std::string* why) {
-        lib_ = dlopen(FORGE_DLNAME("libcuda.so.1", "nvcuda.dll"), RTLD_NOW | RTLD_LOCAL);
-        if (!lib_) { if (why) *why = "interop: libcuda not found"; return false; }
-        auto s = [&](auto& f, const char* n) { f = reinterpret_cast<std::remove_reference_t<decltype(f)>>(dlsym(lib_, n)); return f != nullptr; };
+        lib_ = std::move(os::library::open(FORGE_DLNAME("libcuda.so.1", "nvcuda.dll")).value);
+        if (!lib_.valid()) { if (why) *why = "interop: libcuda not found"; return false; }
+        auto s = [&](auto& f, const char* n) { f = lib_.get<std::remove_reference_t<decltype(f)>>(n); return f != nullptr; };
         if (!(s(init_, "cuInit") && s(imp_, "cuImportExternalMemory") && s(map_, "cuExternalMemoryGetMappedBuffer") && s(destroy_, "cuDestroyExternalMemory")
               && s(simp_, "cuImportExternalSemaphore") && s(swait_, "cuWaitExternalSemaphoresAsync") && s(ssig_, "cuSignalExternalSemaphoresAsync") && s(sdestroy_, "cuDestroyExternalSemaphore"))) {
             if (why) *why = "interop: libcuda lacks external memory API"; return false; }
@@ -210,7 +211,7 @@ public:
     void signal(void* sem, void* stream) { sem_wait_params p{}; ssig_(&sem, &p, 1, stream); }
     void release_semaphore(void* s) { if (s) sdestroy_(s); }
 private:
-    void* lib_ = nullptr;
+    os::library lib_;
     int (*init_)(unsigned) = nullptr;
     int (*imp_)(void**, const ext_mem_desc*) = nullptr;
     int (*map_)(unsigned long long*, void*, const ext_buf_desc*) = nullptr;
