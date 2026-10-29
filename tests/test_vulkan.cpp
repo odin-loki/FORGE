@@ -42,7 +42,7 @@ static int kernels(grid::vk::runtime& rt) {
             double e = std::fabs(double(got.data[i]) - ref.data[i]) / std::max(1.0, std::fabs(double(ref.data[i])));
             if (!(e <= worst)) worst = std::isnan(e) ? 1e30 : e;
         }
-        bool ok = got.shape == ref.shape && worst <= 2e-5;
+        bool ok = got.shape == ref.shape && worst <= std::max(2e-5, grid::vk::transcendental_tol(name));
         std::printf("%s %-10s max err %.2e\n", ok ? "ok  " : "FAIL", b.name, worst);
         fails += !ok; ++n;
     }

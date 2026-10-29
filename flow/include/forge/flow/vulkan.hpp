@@ -36,7 +36,8 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<grid::vk::runti
                     bool ok = grid::vk::supports(name, std::vector<shape_t>(in.begin(), in.end()), a); if (!ok && std::getenv("FORGE_VK_DEBUG")) { std::string s; for (auto& x : in) { for (auto d : x) s += std::to_string(d) + ","; s += "| "; } log::warn("vk: {} unsupported for {}", name, s); } return ok; },
                 [rt, name](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
                     if (!grid::vk::run_op(*rt, name, std::vector<tensor_view>(in.begin(), in.end()), a, out))
-                        raise(errc::unsupported, "vulkan: {} rejected its inputs", name); }, -1, true});
+                        raise(errc::unsupported, "vulkan: {} rejected its inputs", name); }, -1, true,
+                grid::vk::transcendental_tol(name)});
     }
     // reshape on the device: a no-op when the planner aliased it in place, else a copy (scale by 1 is exact).
     r->add({"vk.reshape", spec::op::reshape, 20, nullptr,

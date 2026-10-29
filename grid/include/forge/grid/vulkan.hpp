@@ -24,6 +24,9 @@
 #include <vector>
 
 namespace forge::grid::vk {
+// GLSL sin/cos are not correctly rounded; the Vulkan spec bounds them at 2^-11 absolute error on [-pi,pi],
+// which SwiftShader (Android emulator) actually uses. Ops built on them get that bound.
+inline double transcendental_tol(const std::string& n) { return (n == "sin" || n == "cos" || n == "rope") ? 5e-4 : 0.0; }
 
 struct push { std::uint32_t n = 0, rows = 0, cols = 0, k = 0; float alpha = 0; std::uint32_t a = 0, b = 0, c = 0, d = 0; float beta = 0; };
 struct hbuf { float* data; std::size_t count; };

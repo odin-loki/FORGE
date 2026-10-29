@@ -122,3 +122,17 @@ round-trips corrupted, with no FORGE code involved. SDE shows the same failures 
 runs tile instructions natively. Changes: explicit compiler fences around the tile asm (GCC's intrinsics have
 no memory clobber), reused thread_local pack buffers, and test_tile retries before failing. 0/300 native and
 0/10 SDE failures after the change.
+
+## OS wrapper (`forge::os`) + load balancer (`forge::balance`) — 2026-10-29
+
+- `os/include/forge/os/os.hpp`: one header that wraps files and the filesystem, mmap, processes, threads and sync, time, sockets, polling (epoll, kqueue, or WSAPoll), IOCP `completion_port` (emulated off Windows), dl, env, signals, memory, sysinfo, paths and entropy. It targets Linux, Android, Windows, macOS, iOS (`run` unsupported there) and FreeBSD. `core/mapped`, `core/net` and `pack/entropy` now go through it. Not yet converted: dl.hpp, rpc.hpp, aio.hpp, video.cpp, interop.hpp.
+- `balance/`: strategies are RR, smooth-weighted, least-conn, EWMA, consistent hash (vnodes + bounded load), P2C and prefix/KV affinity with load spill. Also includes health checks, a circuit breaker, retries, and a backpressure queue. `proxy.hpp` provides the L4/L7 proxy behind `forge-serve proxy`.
+- Verification:
+  - Linux native: test_os (12 tests) and test_balance (13 tests) pass, as does the full dev ctest.
+  - Android x86_64 emulator (TCG): test_os and test_balance pass; the l7 stickiness check is occasionally flaky under TCG.
+  - zig cross compile+link (`xos_*` ctests): x86_64-freebsd, aarch64/x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl all OK.
+- Android full-suite run: everything passes except test_vulkan. SwiftShader's sin/cos come in at about 1.9e-4 abs error, which the Vulkan spec allows (bound 2^-11). Fix: vk lowerings for sin/cos/rope now carry `lowering::tol = 5e-4`. test_mind and example_seatbelt hit `adb device offline` because the emulator ran out of memory; that is not a test failure.
+- Not done:
+  - wine: still fails with `kernel32.dll c0000135` (wow64 prefix), so Windows is verified by mingw/zig link only.
+  - FreeBSD qemu VM: not run (memory limits on the shared box); only cross-linked.
+  - iOS: no SDK (zig lacks iOS libc headers, and there is no osxcross/darling), so iOS paths are unverified beyond review.
