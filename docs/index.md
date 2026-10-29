@@ -6,7 +6,8 @@ Read the guides in this order. Each guide covers the same four things in turn: *
 |---|-------|----------------|
 | 1 | [README](../README.md) | What FORGE is, quick start, repository layout |
 | 2 | [lane.md](lane.md) | CPU feature detection and SIMD kernel dispatch |
-| 3 | [mind.md](mind.md) | Models, sessions, samplers and generation |
+| 3 | [grid.md](grid.md) | Devices, graphs and parallel primitives |
+| 3b | [mind.md](mind.md) | Models, sessions, samplers and generation |
 | 4 | [os.md](os.md) | `forge::os` portability layer (16 extension features) |
 | 5 | [balance.md](balance.md) | Load-balancing strategies |
 | 6 | [serve.md](serve.md) | `forge-serve` HTTP server and its flags |
@@ -15,7 +16,7 @@ Read the guides in this order. Each guide covers the same four things in turn: *
 | 9 | [STATUS.md](STATUS.md) | What has been tested, on which platform |
 | 10 | [RELEASING.md](RELEASING.md) | Release procedure |
 
-The grid, flow, pack, C ABI, file format, building and testing guides are **not written yet**. Until they are, use [reference.md](reference.md) and the header comments.
+The flow, pack, C ABI, file format, building and testing guides are **not written yet**. Until they are, use [reference.md](reference.md) and the header comments.
 
 ## Compiled examples
 
