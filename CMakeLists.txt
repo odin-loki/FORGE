@@ -58,8 +58,53 @@ add_library(forge_verify INTERFACE)
 target_include_directories(forge_verify INTERFACE verify/include)
 target_link_libraries(forge_verify INTERFACE forge_spec)
 
+
+# ---- GPU kernels generated from spec/ops (FORGE_PLAN B.4): GLSL -> SPIR-V (embedded), CUDA/HIP compile checks ----
+set(FORGE_GPU_DIR ${FORGE_GEN_DIR}/gpu)
+execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR} --list
+                OUTPUT_VARIABLE FORGE_GPU_KERNELS OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _gpu_rc)
+find_program(FORGE_GLSLANG glslangValidator)
+find_program(FORGE_SPIRV_VAL spirv-val)
+find_path(FORGE_VULKAN_INCLUDE vulkan/vulkan.h)
+set(FORGE_GPU_SOURCES)
+foreach(k ${FORGE_GPU_KERNELS})
+  list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
+endforeach()
+add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+  DEPENDS ${FORGE_FSPECS} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
+if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
+  set(FORGE_SPV)
+  foreach(k ${FORGE_GPU_KERNELS})
+    set(_val "")
+    if(FORGE_SPIRV_VAL)
+      set(_val COMMAND ${FORGE_SPIRV_VAL} --target-env vulkan1.1 ${FORGE_GPU_DIR}/${k}.spv)
+    endif()
+    add_custom_command(OUTPUT ${FORGE_GPU_DIR}/${k}.spv
+      COMMAND ${FORGE_GLSLANG} -V --target-env vulkan1.1 -o ${FORGE_GPU_DIR}/${k}.spv ${FORGE_GPU_DIR}/${k}.comp ${_val}
+      DEPENDS ${FORGE_GPU_DIR}/${k}.comp COMMENT "SPIR-V ${k}")
+    list(APPEND FORGE_SPV ${FORGE_GPU_DIR}/${k}.spv)
+  endforeach()
+  add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+            --embed ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp
+    DEPENDS ${FORGE_SPV} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding SPIR-V kernels")
+  add_custom_target(forge_gpu_gen ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp)
+  # Copy only the Vulkan headers so the system include dir is not put ahead of the C++ standard library.
+  file(COPY ${FORGE_VULKAN_INCLUDE}/vulkan DESTINATION ${FORGE_GEN_DIR}/vkinc)
+  if(EXISTS ${FORGE_VULKAN_INCLUDE}/vk_video)
+    file(COPY ${FORGE_VULKAN_INCLUDE}/vk_video DESTINATION ${FORGE_GEN_DIR}/vkinc)
+  endif()
+  set(FORGE_HAVE_VULKAN ON)
+  message(STATUS "FORGE: Vulkan backend enabled (${FORGE_GLSLANG})")
+else()
+  add_custom_target(forge_gpu_gen ALL DEPENDS ${FORGE_GPU_DIR}/kernels.cu)
+  message(STATUS "FORGE: Vulkan backend disabled (need glslangValidator + vulkan/vulkan.h)")
+endif()
 add_library(forge_grid INTERFACE)
 target_include_directories(forge_grid INTERFACE grid/include support/include)
+target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR})
+add_dependencies(forge_grid forge_gpu_gen)
 target_link_libraries(forge_grid INTERFACE forge_lane)
 
 add_library(forge_flow INTERFACE)
@@ -161,6 +206,19 @@ if(FORGE_BUILD_TESTS)
     endif()
     add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
   endforeach()
+  set_tests_properties(test_vulkan PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  if(FORGE_HAVE_VULKAN)
+    target_include_directories(test_vulkan PRIVATE ${FORGE_GEN_DIR}/vkinc)
+  endif()
+  # CUDA / HIP: compile the generated kernels to PTX / AMDGCN with clang (no SDK needed); hardware runs need a GPU.
+  find_program(FORGE_GPU_CLANG NAMES clang-19 clang-18 clang-20 clang)
+  if(FORGE_GPU_CLANG)
+    add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib
+             --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu)
+    add_test(NAME gpu_compile_hip COMMAND ${FORGE_GPU_CLANG} -x hip --cuda-device-only -nogpuinc -nogpulib
+             --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.amdgcn.s ${FORGE_GPU_DIR}/kernels.cu)
+    set_tests_properties(gpu_compile_cuda gpu_compile_hip PROPERTIES LABELS gpu)
+  endif()
   # Cross builds (e.g. aarch64 under qemu) are typically static: skip the shared-library smoke test there.
   if(NOT CMAKE_CROSSCOMPILING)
     add_executable(capi_smoke tests/capi_smoke.c)
