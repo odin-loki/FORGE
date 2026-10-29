@@ -1200,6 +1200,13 @@ public:
         }
     }
     int so_error() const { int e = 0; socklen_t l = sizeof e; ::getsockopt(s_, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&e), &l); return e; }
+    void shutdown_both() {
+#if defined(FORGE_OS_WINDOWS)
+        ::shutdown(s_, SD_BOTH);
+#else
+        ::shutdown(s_, SHUT_RDWR);
+#endif
+    }
     void shutdown_write() {
 #if defined(FORGE_OS_WINDOWS)
         ::shutdown(s_, SD_SEND);
