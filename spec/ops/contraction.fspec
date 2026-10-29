@@ -1,0 +1,3 @@
+op matmul     class contraction  inputs 2  shape matmul     tol rel:1e-4  fuse epilogue  cost 2  doc "batched a[..., m, k] @ b[k, n] or b[..., k, n]"
+op matmul_t   class contraction  inputs 2  shape matmul_t   tol rel:1e-4  fuse epilogue  cost 2  doc "a[..., m, k] @ b[n, k]^T (weight layout of HF linear layers)"
+op attention  class contraction  inputs 3  shape attention  tol abs:1e-5  fuse no  cost 4  attrs "causal,groups,scale,window" doc "naive scaled-dot-product attention; q[s,hq,d] k[t,hk,d] v[t,hk,d] -> [s,hq,d]; GQA via groups"

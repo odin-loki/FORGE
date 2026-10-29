@@ -1,0 +1,6 @@
+FORGE
+Copyright (c) 2026 Odin Loch (Imortek). Dual licensed: AGPL-3.0-or-later or commercial.
+
+This is a clean-room implementation. No third-party source code is vendored at present.
+spec/intrinsics/x86.json is a hand-curated subset of intrinsic signatures (facts about the
+public Intel ISA interface), not copied from the Intel Intrinsics Guide data files.

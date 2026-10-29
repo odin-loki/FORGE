@@ -1,0 +1,12 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  linux-x86:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 python3-numpy
+      - run: cmake --preset dev -DCMAKE_CXX_COMPILER=g++-14
+      - run: cmake --build --preset dev -j
+      - run: ctest --preset dev
+  # Planned: Intel SDE (AVX-512/AMX), QEMU AArch64 (NEON/SVE), QEMU RISC-V, MSVC, macOS, Android/iOS, GPU lab.
