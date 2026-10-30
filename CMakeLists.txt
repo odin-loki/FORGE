@@ -541,8 +541,10 @@ if(FORGE_BUILD_TESTS)
     # The script emitter + shell backends (host_shell() has per-OS branches): syntax-checked for every target.
     file(GLOB _emit_srcs ${CMAKE_SOURCE_DIR}/script/src/emit.cpp ${CMAKE_SOURCE_DIR}/script/src/shells/*.cpp)
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
-      add_test(NAME xos_emit_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++23 -fsyntax-only -I${CMAKE_SOURCE_DIR}/script/include
-               -I${CMAKE_SOURCE_DIR}/script/src -I${CMAKE_SOURCE_DIR}/os/include -I${CMAKE_BINARY_DIR} ${_emit_srcs})
+      string(REPLACE ";" "|" _emit_list "${_emit_srcs}")
+      add_test(NAME xos_emit_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${CMAKE_BINARY_DIR}/xos/emit_${tg}
+               "-DINCS=-I${CMAKE_SOURCE_DIR}/script/include|-I${CMAKE_SOURCE_DIR}/script/src|-I${CMAKE_SOURCE_DIR}/os/include|-I${CMAKE_BINARY_DIR}"
+               "-DSRCS=${_emit_list}" -P ${CMAKE_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_emit_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
     file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/xos)
