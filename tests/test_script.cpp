@@ -647,7 +647,7 @@ TEST(emit_errors_and_host_shell) {
     refuse("class A { int x; };\nint main() { return 0; }", "bash", "class");
     refuse("int f() { return 1; }\nint main() { return f(); }", "tcsh", "functions");
     refuse("int main() { auto s = fs.read(\"x\"); return 0; }", "tcsh", "fs.read");
-    refuse("int main() { return 0; }", "rc", "no emitter");
+    refuse("int main() { std::string a = \"x\"; if (a < \"y\") return 1; return 0; }", "rc", "string ordering");
     refuse("int main() { return 0; }", "nope", "");
     auto bash = script::emit("int main() { std::println(\"hi\"); return 0; }", "x.cpp", "bash");
     CHECK(bash.starts_with("#!"));

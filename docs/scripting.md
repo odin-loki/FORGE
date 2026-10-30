@@ -284,15 +284,16 @@ be expressed in bash`. Unsupported constructs include classes, lambdas, containe
 | elvish | `.elv` | none |
 | nu | `.nu` | functions that read or write script-level variables (nu `def` can't capture) |
 | tcsh, csh | `.csh` | functions (only `int main()` is inlined), `fs.read`, `forge::sh` results (csh drops newlines) |
-| cmd (**untested**) | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |
-| ysh, rc, es | | no emitter yet |
+| cmd (golden-tested under wine) | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |
+| rc (Byron rc), es | `.rc`, `.es` | string ordering. Integers go through `expr(1)`, and locals use dynamic-scope blocks |
+| ysh | | no emitter (osh covers Oils) |
 
 **Tests.** `emit_golden_all_shells` in `tests/test_script.cpp` emits `tests/data/emit/functions.cpp` and `flat.cpp` for every
 installed backend. It runs each output with the real shell and requires exactly the interpreter's stdout and exit code. Shells that
 are missing are skipped. ctest sets `FORGE_TEST_SHELL_PATH` from the `FORGE_TEST_SHELL_PATH` cache variable, which defaults to
 `../opt/shells/bin` when that directory exists. **Golden-tested on Linux**: sh, bash, zsh, dash, ash (busybox), yash, fish, tcsh,
-pwsh, xonsh, elvish and nu, plus csh and powershell through tcsh and pwsh. **Untested**: ksh, mksh/android, oksh, posh, hush, osh,
-real csh, Windows PowerShell 5.1, and cmd. Wine segfaults on this box.
+pwsh, xonsh, elvish, nu, ksh, mksh, oksh, osh, hush, rc and es, plus csh and powershell through tcsh and pwsh, and cmd under wine
+(`batch.cpp`). **Untested**: posh, real csh, Windows PowerShell 5.1, and mksh as Android's /system/bin/sh.
 
 **OS targets.**
 

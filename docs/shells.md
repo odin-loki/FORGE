@@ -12,9 +12,10 @@ A backend can also provide an emitter (`b.emitter`), which `forge script --emit`
 | sh, bash, zsh, dash | | `-c` | yes |
 | ash | busybox | `busybox sh -c` | yes |
 | yash | | `-c` | yes |
-| ksh | ksh93 | `-c` | **untested** (not installed on the box) |
-| mksh, oksh (pdksh), posh, hush | | `-c` | **untested** |
-| osh / ysh | oils | `-c` | **untested** |
+| ksh | ksh93 | `-c` | yes |
+| mksh, oksh (pdksh), hush | | `-c` | yes |
+| posh | | `-c` | **untested** |
+| osh / ysh | oils | `-c` | yes |
 | fish | | `-c` | yes |
 | tcsh | | `-f -c`, `!` escaped | yes |
 | csh | | falls back to tcsh | yes, via tcsh; real BSD csh **untested** |
@@ -24,7 +25,7 @@ A backend can also provide an emitter (`b.emitter`), which `forge script --emit`
 | pwsh (PowerShell 7) | ps | `-NoProfile -Command` | yes |
 | powershell (Windows PowerShell 5.1) | powershell5, winps | prefers `powershell.exe` | **untested** on 5.1 (on Linux it falls back to pwsh) |
 | cmd | | `cmd /c` | **untested** (Windows/wine only) |
-| rc, es | | `-c` | **untested** |
+| rc, es | | `-c` | yes (Byron rc 1.7 from source, es 0.10.0) |
 
 Golden test: `shell_backends_golden` in `tests/test_script.cpp`. It round-trips a hostile literal through each available
 shell and skips any that are missing. ctest sets `FORGE_TEST_SHELL_PATH` automatically from the CMake cache variable of the same name. It defaults to `../opt/shells/bin` when that directory exists.
