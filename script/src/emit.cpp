@@ -397,10 +397,12 @@ struct Emitter {
             if (!lit.empty()) { parts.push_back(D.s_lit(lit)); lit.clear(); }
             parts.push_back(str(x));
         }
-        if (!lit.empty()) parts.push_back(D.s_lit(lit));
-        if (parts.empty()) return;
         // print without newline unless the stream ends with one we can peel off
-        D.print(parts.size() == 1 ? parts[0] : D.concat(parts), false, err);
+        bool nl = !lit.empty() && lit.back() == '\n';
+        if (nl) lit.pop_back();
+        if (!lit.empty()) parts.push_back(D.s_lit(lit));
+        if (parts.empty()) { if (nl) D.print(D.s_lit(""), true, err); return; }
+        D.print(parts.size() == 1 ? parts[0] : D.concat(parts), nl, err);
     }
     void assign(const Node& n) {
         const Node& lhs = *n.kids[0];
