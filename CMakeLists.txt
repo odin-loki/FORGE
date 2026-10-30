@@ -67,6 +67,10 @@ add_library(forge::core ALIAS forge_core)
 
 add_library(forge_os INTERFACE)   # unified OS layer
 target_include_directories(forge_os INTERFACE os/include)
+find_package(Threads)   # FreeBSD/older glibc need -pthread for std::thread users of the OS layer
+if(Threads_FOUND)
+  target_link_libraries(forge_os INTERFACE Threads::Threads)
+endif()
 if(WIN32)
   target_link_libraries(forge_os INTERFACE ws2_32 bcrypt)
 elseif(UNIX AND NOT APPLE)
@@ -161,6 +165,21 @@ if(FORGE_MOBILE)   # no CUDA/HIP/Level Zero on phones; the NDK's lld can't link 
 else()
   set(FORGE_GPU_CLANG_IMAGES ${FORGE_GPU_CLANG})
 endif()   # OpenCL C, built by the driver at run time
+# Distro clangs (e.g. FreeBSD base clang) may be built without the NVPTX/AMDGPU backends.
+set(FORGE_GPU_HAS_NVPTX OFF)
+set(FORGE_GPU_HAS_AMDGPU OFF)
+if(FORGE_GPU_CLANG_IMAGES)
+  execute_process(COMMAND ${FORGE_GPU_CLANG} -print-targets OUTPUT_VARIABLE _gpu_targets ERROR_QUIET)
+  if(_gpu_targets MATCHES "nvptx64")
+    set(FORGE_GPU_HAS_NVPTX ON)
+  endif()
+  if(_gpu_targets MATCHES "amdgcn")
+    set(FORGE_GPU_HAS_AMDGPU ON)
+  endif()
+  if(NOT FORGE_GPU_HAS_NVPTX OR NOT FORGE_GPU_HAS_AMDGPU)
+    message(STATUS "FORGE: ${FORGE_GPU_CLANG} lacks GPU backends (nvptx=${FORGE_GPU_HAS_NVPTX} amdgpu=${FORGE_GPU_HAS_AMDGPU}); skipping those images")
+  endif()
+endif()
 # Level Zero wants SPIR-V: OpenCL C -> LLVM IR (clang, spir64) -> SPIR-V (llvm-spirv), when the translator exists.
 find_program(FORGE_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-19 llvm-spirv-18 llvm-spirv-20)
 if(FORGE_GPU_CLANG_IMAGES AND FORGE_LLVM_SPIRV)
@@ -170,12 +189,14 @@ if(FORGE_GPU_CLANG_IMAGES AND FORGE_LLVM_SPIRV)
     DEPENDS ${FORGE_GPU_DIR}/kernels.cl COMMENT "SPIR-V for Level Zero")
   list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.spv)
 endif()
-if(FORGE_GPU_CLANG_IMAGES)
+if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_NVPTX)
   add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.ptx
     COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_70 -O3 -Werror
             -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu
     DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "PTX (sm_70)")
   list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.ptx)
+endif()
+if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_AMDGPU)
   set(_ld)
   if(FORGE_LLD)
     get_filename_component(_lldir ${FORGE_LLD} DIRECTORY)

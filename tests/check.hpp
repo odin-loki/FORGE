@@ -36,3 +36,23 @@ int main() {
     std::printf("%d failure(s)\n", forge_test::failures());
     return forge_test::failures() ? 1 : 0;
 }
+
+// POSIX shims so the tests also build for Windows (mingw) and run under wine.
+#if defined(_WIN32)
+#include <cstdlib>
+#include <cstdio>
+#include <process.h>
+inline int setenv(const char* k, const char* v, int overwrite) { if (!overwrite && std::getenv(k)) return 0; return ::_putenv_s(k, v); }
+inline int unsetenv(const char* k) { return ::_putenv_s(k, ""); }
+#ifndef popen
+#define popen _popen
+#define pclose _pclose
+#endif
+#ifndef WIFEXITED
+#define WIFEXITED(st) (true)
+#define WEXITSTATUS(st) (st)
+#endif
+#ifndef getpid
+#define getpid _getpid
+#endif
+#endif

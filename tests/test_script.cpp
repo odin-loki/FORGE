@@ -570,8 +570,10 @@ TEST(shell_backends_golden) {
 // "Write once, emit anywhere": every golden script is emitted for every backend that has an emitter and is
 // installed, run by that shell without FORGE, and must match the interpreter's output and exit code.
 #include <array>
+#if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 namespace {
 std::string slurp_file(const std::string& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), {}}; }
 std::pair<std::string, int> sh_capture(const std::string& cmd) {

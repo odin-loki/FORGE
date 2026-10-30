@@ -1,3 +1,7 @@
+#include <cerrno>
+#include <cctype>
+#include <cstdlib>
+#include <version>
 // C++ standard-library surface for FORGE script: std::cout/println/format, containers' C++ method
 // names, iterators, smart-pointer helpers, and the forge:: runtime helpers the parser lowers to.
 #include "interp.hpp"
@@ -313,7 +317,15 @@ void install_cpp_std(Shared& sh) {
     for (auto n : {"std::stod", "std::stof", "std::stold"}) def(n, 1, 1, [n = std::string(n)](Interp& in, Args& a) -> Value {
         const std::string& s = sref(in, a[0], n.c_str()); std::size_t b = s.find_first_not_of(" \t\n\r");
         if (b == std::string::npos) in.raise("ValueError", n + ": invalid_argument");
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
         double v = 0; auto [e, ec] = std::from_chars(s.data() + b + (s[b] == '+'), s.data() + s.size(), v);
+#else   // older libc++ (e.g. FreeBSD 14 base, LLVM 18) has no floating-point from_chars
+        std::string tmp(s.data() + b + (s[b] == '+'), s.data() + s.size());
+        std::errc ec{}; double v = 0;
+        if (tmp.empty() || tmp[0] == '+' || (tmp[0] == '-' && tmp.size() > 1 && tmp[1] == '+') || std::isspace(static_cast<unsigned char>(tmp[0]))) ec = std::errc::invalid_argument;
+        else { char* end = nullptr; errno = 0; v = std::strtod(tmp.c_str(), &end);
+               if (end == tmp.c_str()) ec = std::errc::invalid_argument; else if (errno == ERANGE) ec = std::errc::result_out_of_range; }
+#endif
         if (ec == std::errc::result_out_of_range) in.raise("OverflowError", n + ": out_of_range");
         if (ec != std::errc{}) in.raise("ValueError", n + ": invalid_argument ('" + s + "')");
         return v;
