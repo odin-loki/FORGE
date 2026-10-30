@@ -593,6 +593,7 @@ const char* runner(const std::string& s) {
     if (s == "ash" || s == "busybox") return "busybox sh"; if (s == "nu") return "nu --no-config-file"; if (s == "xonsh") return "xonsh --no-rc";
     if (s == "elvish") return "elvish -norc"; if (s == "pwsh") return "pwsh -NoProfile -NonInteractive -File";
     if (s == "powershell") return "powershell -NoProfile -File"; if (s == "tcsh" || s == "csh") return "tcsh -f";
+    if (s == "cmd.exe" || s == "cmd") return "cmd.exe /d /c";
     return nullptr;
 }
 }
@@ -603,7 +604,7 @@ TEST(emit_golden_all_shells) {
     stdfs::create_directories(dir);
     auto avail = run("for (auto& s : forge::shells()) if (s[\"available\"] && s[\"emit\"]) std::print(\" {}={} \", s[\"name\"], s[\"exe\"]);");
     std::string tested, refused;
-    for (const char* g : {"functions", "flat"}) {
+    for (const char* g : {"functions", "flat", "batch"}) {
         std::string src = slurp_file("tests/data/emit/" + std::string(g) + ".cpp");
         CHECK_MSG(!src.empty(), "missing golden %s", g);
         auto old = stdfs::current_path(); stdfs::current_path(dir);
@@ -627,6 +628,7 @@ TEST(emit_golden_all_shells) {
 #else
             auto [got, rc] = sh_capture("cd '" + dir.string() + "' && " + (rn ? std::string(rn) : exe) + " '" + path + "' 2>&1");
 #endif
+            if (name == "cmd") std::erase(got, '\r');   // batch output is CRLF
             CHECK_MSG(got == want, "%s/%s output:\n%s\nwant:\n%s", g, name.c_str(), got.c_str(), want.c_str());
             CHECK_MSG(rc == r.exit_code, "%s/%s exit %d want %d", g, name.c_str(), rc, r.exit_code);
             tested += " " + std::string(g) + "/" + name + (exe != name ? "(via " + exe + ")" : "");
