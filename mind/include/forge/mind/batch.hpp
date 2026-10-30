@@ -6,6 +6,7 @@
 // sequence copies those KV rows instead of recomputing them.
 #include <forge/mind/grammar.hpp>
 #include <forge/mind/session.hpp>
+#include <forge/core/memory.hpp>
 #include <condition_variable>
 #include <atomic>
 #include <deque>
@@ -25,14 +26,22 @@ struct request {
     std::function<void(const std::vector<int>&, const std::string& finish_reason)> on_done;
 };
 
-struct batch_options { int max_active = 8; i64 prefill_chunk = 256; std::size_t prefix_cache = 4; session_options session; };
+// budget: when set, live KV bytes are reported to it (tag "kv"), the prefix cache registers as an evictable
+// cache, and new requests wait in the queue while the budget is over its soft watermark (at least one request
+// always runs, so the queue drains). See docs/memory.md.
+struct batch_options { int max_active = 8; i64 prefill_chunk = 256; std::size_t prefix_cache = 4; session_options session; mem::budget* budget = nullptr; };
 
-struct batch_stats { std::size_t steps = 0, completed = 0, prefix_hits = 0, prefix_tokens_reused = 0, peak_active = 0, peak_kv_bytes = 0; };
+struct batch_stats { std::size_t steps = 0, completed = 0, prefix_hits = 0, prefix_tokens_reused = 0, peak_active = 0, peak_kv_bytes = 0, deferred = 0; };
 
 class batch_scheduler {
 public:
-    batch_scheduler(std::shared_ptr<model> m, batch_options o = {}) : m_(std::move(m)), o_(o) {}
-    ~batch_scheduler() { stop(); }
+    batch_scheduler(std::shared_ptr<model> m, batch_options o = {}) : m_(std::move(m)), o_(o) {
+        if (o_.budget) cache_id_ = o_.budget->add_cache("prefix_kv", [this] { return cache_bytes_.load(); },
+                                                        [this](std::uint64_t) { auto b = cache_bytes_.load(); request_kv_eviction(0); return b; }, 10);
+    }
+    ~batch_scheduler() { stop(); if (o_.budget) { o_.budget->remove_cache(cache_id_); o_.budget->set_usage("kv", 0); } }
+    std::size_t waiting() { std::lock_guard lk(mu_); return waiting_.size(); }
+    std::size_t active_count() { std::lock_guard lk(mu_); return active_.size(); }
 
     std::uint64_t submit(request r) {
         std::lock_guard lk(mu_);
@@ -62,25 +71,35 @@ public:
     bool step() {
         {
             std::lock_guard lk(mu_);
-            if (evict_.exchange(false)) { auto k = evict_keep_.load(); while (cache_.size() > k) { cache_.pop_back(); ++evictions_; } }
+            if (evict_.exchange(false)) { auto k = evict_keep_.load(); while (cache_.size() > k) { cache_.pop_back(); ++evictions_; } update_cache_bytes_(); }
+            std::uint64_t admitted = 0;
             while (!waiting_.empty() && int(active_.size()) < o_.max_active) {
+                // Admission control: project this request at the KV size observed per running request (unknown
+                // counts as 1 byte), drop cached prefixes first, then leave it queued while anything else runs.
+                std::uint64_t est = std::max<std::uint64_t>(kv_per_req_, 1) * (admitted + 1);
+                if (o_.budget && o_.budget->under_pressure(est)) {
+                    while (!cache_.empty() && o_.budget->under_pressure(est)) { cache_.pop_back(); ++evictions_; update_cache_bytes_(); }
+                    if (!active_.empty() && o_.budget->under_pressure(est)) { ++stats_.deferred; break; }
+                }
+                ++admitted;
                 auto w = std::move(waiting_.front()); waiting_.pop_front();
                 active_.push_back(admit(w.id, std::move(w.r)));
             }
             if (active_.empty()) return false;
         }
         stats_.peak_active = std::max(stats_.peak_active, active_.size());
-        std::size_t kv = 0;
+        std::size_t kv = 0, ran = 0, live = 0;
         for (auto it = active_.begin(); it != active_.end();) {
             auto& a = **it;
             bool fin;
             { std::lock_guard lk(mu_); fin = a.cancelled; }
             if (fin) finish(a, "cancelled"); else fin = advance(a);
-            kv += a.s->state().bytes();
+            auto sb = a.s->state().bytes(); kv += sb; ++ran; if (!fin) live += sb;
             if (fin) { retire(std::move(*it)); it = active_.erase(it); }
             else ++it;
         }
         stats_.peak_kv_bytes = std::max(stats_.peak_kv_bytes, kv);
+        if (o_.budget) { o_.budget->set_usage("kv", live); if (ran) kv_per_req_ = std::max(kv_per_req_, kv / ran); }
         ++stats_.steps;
         return true;
     }
@@ -170,6 +189,7 @@ private:
         std::vector<int> toks(a->hist.begin(), a->hist.begin() + std::min<std::size_t>(a->hist.size(), std::size_t(a->s->position())));
         cache_.push_front({std::move(toks), std::move(a->s)});
         while (cache_.size() > o_.prefix_cache) cache_.pop_back();
+        update_cache_bytes_();
     }
     void fail_all(const std::string& msg) {
         std::lock_guard lk(mu_);
@@ -184,6 +204,8 @@ private:
     std::deque<pending> waiting_;
     std::list<std::unique_ptr<active>> active_;
     std::list<cached> cache_;
+    std::atomic<std::uint64_t> cache_bytes_{0}; std::uint64_t kv_per_req_ = 0; int cache_id_ = 0;
+    void update_cache_bytes_() { std::uint64_t b = 0; for (auto& c : cache_) if (c.s) b += c.s->state().bytes(); cache_bytes_.store(b); }
     std::uint64_t next_id_ = 0;
     batch_stats stats_;
     std::thread worker_;
