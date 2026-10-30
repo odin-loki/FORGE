@@ -243,7 +243,7 @@ target_link_libraries(forge_mind INTERFACE forge_pack)
 target_include_directories(forge_mind INTERFACE mind/include)
 # forge::script managed scripting runtime (docs/scripting.md). Safe C++23; libc++ hardening when available.
 add_library(forge_script STATIC script/src/heap.cpp script/src/parser.cpp script/src/runtime.cpp script/src/tree.cpp
-  script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/debug.cpp script/src/engine.cpp)
+  script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/ai.cpp script/src/debug.cpp script/src/engine.cpp)
 target_include_directories(forge_script PUBLIC script/include PRIVATE script/src)
 target_link_libraries(forge_script PUBLIC forge_pack)
 find_package(Threads)

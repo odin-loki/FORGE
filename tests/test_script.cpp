@@ -491,3 +491,32 @@ std::println("{}", service.status({{"name", "forge-t"}, {"argv", std::vector<std
 fs.remove(d);
 )CPP", "[\"created x\", \"created f.txt\"]\nh 81 q=1\ntrue\nnot_installed\n");
 }
+
+TEST(ai_assisted_commands) {
+    auto fake = [](const std::string& sys, const std::string& p) -> std::string {
+        if (sys.find("JSON") != std::string::npos) return "{\"n\": 3, \"tags\": [\"a\"]}";
+        if (sys.find("write a FORGE script") != std::string::npos) return "```cpp\nstd::println(\"from ai\");\n```";
+        if (sys.find("shell command") != std::string::npos) return "```sh\necho {hi}\n```";
+        return "reply:" + p;
+    };
+    script::options o; o.ai = fake;   // no host confirm: drafted code never runs unless the script confirms
+    auto got = run(R"CPP(
+std::println("{}", forge::ask("ping"));
+std::println("{}", forge::suggest_cmd("say hi"));
+auto j = forge::ask_json("x"); std::println("{} {}", j["n"], j["tags"]);
+auto r = forge::ai_run("say hi");
+std::println("{} {}", r["ran"], r["command"]);
+std::string seen;
+auto r2 = forge::ai_run("say hi", {{"confirm", [&](auto c) { seen = c; return true; }}});
+std::println("{} {} [{}]", r2["ran"], seen, r2["result"].out);
+auto r3 = forge::ai_eval("print", {{"confirm", [](auto c) { return true; }}});
+std::println("{}", r3["ran"]);
+auto r4 = forge::ai_run("say hi", {{"confirm", [](auto c) { return false; }}});
+std::println("{}", r4["ran"]);
+)CPP", o);
+    CHECK_MSG(got == "reply:ping\necho {hi}\n3 [\"a\"]\nfalse echo {hi}\ntrue echo {hi} [{hi}\n]\nfrom ai\ntrue\nfalse\n", "got:\n%s", got.c_str());
+    script::options none; auto e = run(R"CPP(
+try { forge::ask("x"); } catch (const AIError& e) { std::println("AIError"); }
+)CPP", none);
+    CHECK_MSG(e == "AIError\n", "got:\n%s", e.c_str());
+}

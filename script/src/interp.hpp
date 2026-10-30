@@ -32,7 +32,8 @@ struct Shared {
     std::unordered_map<std::string, Ref<Class>> errors;        // Error hierarchy by name
     Limits limits; Caps caps;
     std::function<void(std::string_view)> out = [](std::string_view s) { std::fwrite(s.data(), 1, s.size(), stdout); };
-    std::function<bool(const std::string&)> confirm;           // y/N prompt for ai.do; null = never confirm
+    std::function<bool(const std::string&)> confirm;           // y/N prompt for ai.run; null = never confirm
+    std::function<std::string(const std::string&, const std::string&)> ai;   // (system, prompt) -> completion
     std::atomic<bool> interrupt{false};
     std::atomic<std::uint64_t> steps{0};
     std::uint64_t start_ns = 0;
@@ -144,6 +145,7 @@ struct NodeIter;   // runtime iterator
 void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
 void install_automation(Shared& sh);
+void install_ai(Shared& sh);
 std::vector<std::string> module_search_path(const Interp& in);
 bool is_native_module(const std::string& p);
 std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Value>& args, std::size_t first);

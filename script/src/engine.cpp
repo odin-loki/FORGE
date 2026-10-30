@@ -66,6 +66,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     sh.argv = o.argv;
     script_argv() = o.argv;
     if (o.out) sh.out = o.out;
+    sh.ai = o.ai; sh.confirm = o.confirm;
     if (o.heap_bytes) Heap::instance().set_soft_cap(Heap::instance().live_bytes() + o.heap_bytes);
     install_builtins(sh);
     auto l = make<List>(); for (auto& a : o.argv) l->push(obj(make<String>(a)));

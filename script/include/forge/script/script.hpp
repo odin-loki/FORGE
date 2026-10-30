@@ -23,6 +23,11 @@ struct options {
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
     std::vector<std::string> argv;      // visible to scripts as `args`
     std::function<void(std::string_view)> out;   // print(); default stdout
+    // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = use FORGE_AI_ENDPOINT
+    // (OpenAI-compatible /v1/chat/completions over http) if set. `confirm` is shown AI-drafted code and
+    // returns true to run it; null = AI code never runs (unless the script passes its own confirm callback).
+    std::function<std::string(const std::string& system, const std::string& prompt)> ai;
+    std::function<bool(const std::string& code)> confirm;
 };
 
 struct result {

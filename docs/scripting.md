@@ -280,6 +280,27 @@ release, uptime, loadavg, memory, is_tty, term_size, devices, clipboard), `proc.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
 9. **Sandboxed runs** — run untrusted scripts with fs/net capabilities off, using `sandbox.hpp`.
 
+## AI-assisted commands (implemented)
+
+`script/src/ai.cpp`. Drafted code never runs without confirmation.
+
+```cpp
+std::println("{}", forge::ask("summarise this log", fs.read("build.log")));
+auto cmd = forge::suggest_cmd("find the 5 largest files here");     // string only, never run
+auto r = forge::ai_run("find the 5 largest files here");            // {command, ran, result}
+auto c = forge::ai_eval("list files changed today");                 // drafts script code -> eval on yes
+auto j = forge::ask_json("give {name, version} for this package", fs.read("package.json"));
+std::println("{}", forge::explain(forge::sh("make").err));
+```
+
+- Backend: the host's `options::ai` callback, else `FORGE_AI_ENDPOINT` — any OpenAI-compatible
+  `/v1/chat/completions` server, normally FORGE's own `forge-serve` (`FORGE_AI_MODEL`, `FORGE_AI_KEY`
+  optional). Endpoint calls need the `net` capability; plain `http://` only.
+- Confirmation: `{{"confirm", fn}}` per call, else `options::confirm`. `forge script` prompts
+  `Run it? [y/N]` on the terminal. With no confirmer, `ran` is `false` and nothing executes.
+- `ai_run` takes `{{"shell", "sh"|"bash"|"pwsh"|"cmd"}}`; it runs through `forge::<shell>` so sandbox
+  caps and child limits still apply. Failures raise `AIError`.
+
 ## Automation (implemented)
 
 C++-shaped library calls rather than new keywords (`script/src/automation.cpp`):

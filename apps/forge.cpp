@@ -341,6 +341,12 @@ int cmd_script(int argc, char** argv) {
         else { file = s; ++i; break; }
     }
     for (; i < argc; ++i) o.argv.push_back(argv[i]);
+    // AI-drafted code (forge::ai_run / ai_eval) runs only after an explicit "y" on the terminal.
+    o.confirm = [](const std::string& code) {
+        std::fprintf(stderr, "\nAI drafted:\n%s\nRun it? [y/N] ", code.c_str()); std::fflush(stderr);
+        char buf[16] = {}; if (!std::fgets(buf, sizeof buf, stdin)) return false;
+        return buf[0] == 'y' || buf[0] == 'Y';
+    };
     forge::script::engine e(o);
     if (!have_code && file.empty()) return e.repl();
     auto r = have_code ? e.run(code, "<-e>") : e.run_file(file);
