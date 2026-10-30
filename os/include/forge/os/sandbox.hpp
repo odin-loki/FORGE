@@ -92,7 +92,10 @@ inline status apply_seccomp(const sandbox_policy& p) {
 #ifdef __NR_openat2
         deny_nr(__NR_openat2);   // flags live in a struct the filter cannot read
 #endif
-        for (long nr : {long(__NR_unlinkat), long(__NR_renameat), long(__NR_mkdirat), long(__NR_truncate), long(__NR_ftruncate)}) deny_nr(nr);
+        for (long nr : {long(__NR_unlinkat), long(__NR_mkdirat), long(__NR_truncate), long(__NR_ftruncate)}) deny_nr(nr);
+#ifdef __NR_renameat   // absent on riscv64 (renameat2 only)
+        deny_nr(__NR_renameat);
+#endif
 #ifdef __NR_unlink
         deny_nr(__NR_unlink); deny_nr(__NR_rename); deny_nr(__NR_mkdir); deny_nr(__NR_rmdir);
 #endif
