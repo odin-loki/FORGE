@@ -788,11 +788,15 @@ private:
         if (at(T::Str)) path = take().s;
         else { path = ident(); while (accept_op(".")) path += "/" + ident(); }
         bool splice = accept_op("*");
+        std::string alias;
+        if (!splice && at(T::Ident) && cur().s == "as") { take(); alias = ident(); }
         semi();
         if (splice) { auto n = mk(NK::Import, line); n->s = path; n->flag = true; return n; }
         std::string name = path;
         if (auto p = name.find_last_of('/'); p != std::string::npos) name = name.substr(p + 1);
         if (auto p = name.find('.'); p != std::string::npos) name = name.substr(0, p);
+        if (name.rfind("lib", 0) == 0 && name.size() > 3 && (path.ends_with(".so") || path.ends_with(".dylib") || path.ends_with(".dll"))) name = name.substr(3);
+        if (!alias.empty()) name = alias;
         auto n = mk(NK::Import, line); n->s = path; n->var = declare(name, true);
         return n;
     }

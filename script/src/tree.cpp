@@ -172,6 +172,7 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
         Value m = import_module(n.s);
         if (!n.flag) { store(n.var, env, m, true, true); return Flow::Normal; }
         if (auto* g = as<Globals>(m)) for (auto& [k, v] : g->vars) if (!globals->vars.count(k)) { globals->vars[k] = v; if (g->consts.count(k)) globals->consts.insert(k); }
+        if (auto* pm = as<Map>(m)) for (auto& [k, v] : pm->entries) if (auto* ks = as<String>(k); ks && !globals->vars.count(ks->s)) { globals->vars[ks->s] = v; globals->consts.insert(ks->s); }
         return Flow::Normal;
     }
     case NK::Block: return exec_block(n, env);

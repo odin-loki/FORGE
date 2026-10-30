@@ -315,6 +315,49 @@ TEST(modules) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(modules_and_plugins) {
+    auto dir = std::filesystem::temp_directory_path() / "forge_script_pkg";
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "lib" / "geom");
+    { std::ofstream(dir / "lib" / "geom" / "mod.cpp") << "double area(double w, double h) { return w * h; }\nconst int SIDES = 4;\n"; }
+    { std::ofstream(dir / "lib" / "strs.fs") << "std::string shout(std::string s) { return s + \"!\"; }\n"; }
+    std::string code = R"CPP(
+import "geom" as g;
+import "strs";
+std::println("{} {}", g.area(2, 3), g.SIDES);
+auto m = forge::import("strs");
+std::println("{}", m.shout("hi"));
+std::println("{}", forge::modules().size());
+try { forge::import("nope_missing"); } catch (const ImportError& e) { std::println("missing"); }
+)CPP";
+#ifdef FORGE_TEST_PLUGIN
+    code += std::string("auto h = forge::plugin(\"") + FORGE_TEST_PLUGIN + "\");\n" + R"CPP(
+std::println("{} {} {}", h.add(2, 3.5), h.greet("forge"), h.VERSION);
+try { h.fail(1, 2); } catch (const PluginError& e) { std::println("{}", e.message); }
+try { h.add(1); } catch (const TypeError& e) { std::println("arity"); }
+)CPP";
+#endif
+    std::string text; script::options o; o.out = [&](std::string_view s) { text += s; };
+    ::setenv("FORGE_SCRIPT_PATH", (dir / "lib").string().c_str(), 1);
+    script::engine e(o);
+    auto r = e.eval(code);
+    ::unsetenv("FORGE_SCRIPT_PATH");
+    CHECK_MSG(r.ok, "%s", r.error.c_str());
+    std::string want = "6 4\nhi!\n2\nmissing\n";
+#ifdef FORGE_TEST_PLUGIN
+    want += "5.5 hello, forge 1.0\nhello_plugin.fail: this always fails\narity\n";
+#endif
+    CHECK_MSG(text == want, "%s", text.c_str());
+    // Sandboxed runs refuse native code.
+#ifdef FORGE_TEST_PLUGIN
+    script::options so; so.allow_proc = false; std::string t2; so.out = [&](std::string_view s) { t2 += s; };
+    script::engine se(so);
+    auto r2 = se.eval(std::string("forge::plugin(\"") + FORGE_TEST_PLUGIN + "\");");
+    CHECK(!r2.ok); CHECK_MSG(r2.error_type == "PermissionError", "%s", r2.error_type.c_str());
+#endif
+    std::filesystem::remove_all(dir);
+}
+
 TEST(repl_eval_keeps_state) {
     std::string text; script::options o; o.out = [&](std::string_view s) { text += s; };
     script::engine e(o);

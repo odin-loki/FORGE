@@ -2,8 +2,8 @@
 
 Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
 cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
-Automation (pipelines, file-watch triggers, schedules) implemented. Still to come: modules/plugins, AI
-commands, remote execution. See *Phasing* at the end.
+Automation (pipelines, file-watch triggers, schedules) and modules/native plugins implemented.
+Still to come: AI commands, remote execution. See *Phasing* at the end.
 
 ## Purpose
 
@@ -315,6 +315,30 @@ forge::cron_next(expr[, unix_s]);  forge::duration_ms("1h30m");
 - Callbacks are stored in the handle's props, which the cycle collector traces (handles are tracked),
   so a lambda capturing its own pipeline/scheduler does not leak.
 
+## Modules and plugins (implemented)
+
+```cpp
+#include "util.cpp"            // splice another script's names in (C++ style)
+import "geom" as g;            // module object: g.area(2, 3); finds geom.fs, geom.cpp, geom/mod.fs, geom/mod.cpp
+import tools.strings;          // dotted form = tools/strings
+auto m = forge::import("strs");                 // at run time
+import "libhello_plugin.so" as hello;           // native plugin (also .dylib / .dll), or forge::plugin(path)
+hello.add(2, 3.5); hello.VERSION;
+forge::module_path(); forge::modules();
+```
+
+- Search order: the importing script's directory, the engine base dir, `FORGE_SCRIPT_PATH`
+  (`:`/`;` separated; `;` on Windows), `~/.forge/modules`, then the current directory. Absolute paths
+  are used as is. Modules load once per engine (cached by canonical path); import cycles raise
+  `ImportError`.
+- Native plugins use the C ABI in `script/include/forge/script/plugin.h`: export
+  `forge_script_plugin_init(const forge_plugin_api*)`, register functions with `def(reg, name, min, max,
+  fn, user)` and constants with `constant(reg, name, json)`. Arguments/results cross as JSON;
+  a non-zero return raises `PluginError` with the message from `*out`. Example:
+  `examples/script_plugin/hello_plugin.c` (built as `hello_plugin` by CMake and used by tests).
+- Plugins run native code, so they are refused unless all capabilities (fs, net, proc, env) are on.
+  Loaded libraries stay loaded for the life of the process.
+
 ## Safety
 
 - Scripts run with the user's privileges; nothing is sandboxed unless asked.
@@ -337,7 +361,7 @@ All phases are in scope.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).
    Features 1-2 (parallel tasks, resource-limited runs).
-4. **Automation**: features 3-5 (done) and 8 (job pipelines, file-watch triggers, scheduled tasks, modules
+4. **Automation**: features 3-5 and 8 (done) (job pipelines, file-watch triggers, scheduled tasks, modules
    and plugins).
 5. **Advanced**: features 6, 7 and 9 (AI-assisted commands, remote execution once rpc-serve has
    auth/TLS, sandboxed runs).

@@ -1014,25 +1014,48 @@ Value Interp::await(const Value& tv) {
 }
 
 // ---------------------------------------------------------------- modules
+bool is_native_module(const std::string& p) {
+    auto e = std::filesystem::path(p).extension().string();
+    return e == ".so" || e == ".dylib" || e == ".dll";
+}
+
+std::vector<std::string> module_search_path(const Interp& in) {
+    std::vector<std::string> out;
+    if (!in.file.empty()) out.push_back(std::filesystem::path(in.file).parent_path().string());
+    if (!in.sh->base_dir.empty()) out.push_back(in.sh->base_dir);
+    auto mp = os::getenv("FORGE_SCRIPT_PATH");
+    std::size_t i = 0;
+#if defined(_WIN32)
+    const char* seps = ";";
+#else
+    const char* seps = ":;";
+#endif
+    while (!mp.empty() && i <= mp.size()) { auto j = mp.find_first_of(seps, i); if (j == std::string::npos) j = mp.size(); if (j > i) out.push_back(mp.substr(i, j - i)); i = j + 1; }
+    auto home = os::getenv("HOME"); if (home.empty()) home = os::getenv("USERPROFILE");
+    if (!home.empty()) out.push_back((std::filesystem::path(home) / ".forge" / "modules").string());
+    std::error_code ec; out.push_back(std::filesystem::current_path(ec).string());
+    return out;
+}
+
 Value Interp::import_module(const std::string& path) {
     namespace fs = std::filesystem;
     if (!caps.fs) raise("PermissionError", "import needs file access, which this sandbox disables");
     fs::path p(path);
-    if (p.extension().empty()) p += ".fs";
+    // Names without an extension try `name.fs`, `name.cpp`, then a package directory `name/mod.fs|mod.cpp`.
+    std::vector<fs::path> forms;
+    if (p.extension().empty()) for (auto f : {p.string() + ".fs", p.string() + ".cpp", (p / "mod.fs").string(), (p / "mod.cpp").string()}) forms.emplace_back(f);
+    else forms.push_back(p);
     std::vector<fs::path> cand;
-    if (p.is_absolute()) cand.push_back(p);
-    else {
-        if (!file.empty()) cand.push_back(fs::path(file).parent_path() / p);
-        if (!sh->base_dir.empty()) cand.push_back(fs::path(sh->base_dir) / p);
-        auto mp = os::getenv("FORGE_SCRIPT_PATH");
-        std::size_t i = 0;
-        while (!mp.empty() && i <= mp.size()) { auto j = mp.find_first_of(":;", i); if (j == std::string::npos) j = mp.size(); cand.push_back(fs::path(mp.substr(i, j - i)) / p); i = j + 1; }
-        cand.push_back(fs::current_path() / p);
-    }
+    if (p.is_absolute()) cand = forms;
+    else for (auto& dir : module_search_path(*this)) for (auto& f : forms) cand.push_back(fs::path(dir) / f);
     fs::path found;
     for (auto& c : cand) { std::error_code ec; if (fs::is_regular_file(c, ec)) { found = fs::weakly_canonical(c, ec); break; } }
-    if (found.empty()) raise("ImportError", "module '" + path + "' not found");
+    if (found.empty()) raise("ImportError", "module '" + path + "' not found (search path: FORGE_SCRIPT_PATH, script dir, ~/.forge/modules, cwd)");
     std::string key = found.string();
+    if (is_native_module(key)) {
+        if (!sh->load_plugin) raise("ImportError", "native plugins are not available in this build");
+        return sh->load_plugin(*this, key);
+    }
     {
         std::lock_guard g(sh->mod_m);
         if (auto it = sh->modules.find(key); it != sh->modules.end()) {

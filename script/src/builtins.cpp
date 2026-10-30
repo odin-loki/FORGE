@@ -6,6 +6,7 @@
 #include "vm.hpp"
 #include "parser.hpp"
 #include <forge/hash/blake3.hpp>
+#include <forge/script/plugin.h>
 #include <forge/json/json.hpp>
 #include <forge/os/clipboard.hpp>
 #include <forge/os/console.hpp>
@@ -185,7 +186,7 @@ void install_builtins(Shared& sh) {
     for (auto n : {"IOError", "OSError", "TypeError", "IndexError", "KeyError", "OverflowError", "OutOfMemoryError", "TimeoutError",
                    "CancelledError", "ObjectDisposedError", "ShellError", "PermissionError", "LimitExceededError", "NameError",
                    "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError", "RuntimeError", "LogicError",
-                   "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError", "PipelineError"})
+                   "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError", "PipelineError", "PluginError"})
         mkclass(n, err);
     sh.errors["ZeroDivisionError"] = sh.errors["ArithmeticError"];
 
@@ -815,6 +816,67 @@ void install_builtins(Shared& sh) {
         if (auto* f = as<Function>(a[0])) return strv(f->decl->name); if (auto* n = as<Native>(a[0])) return strv(n->name); return strv("<bound>");
     });
 
+
+    // ------------------------------------------------ native plugins (script/include/forge/script/plugin.h) and modules
+    sh.load_plugin = [](Interp& in, const std::string& path) -> Value {
+        if (!(in.caps.fs && in.caps.net && in.caps.proc && in.caps.env)) in.raise("PermissionError", "native plugins are refused in sandboxed runs");
+        {
+            std::lock_guard g(in.sh->mod_m);
+            if (auto it = in.sh->plugins.find(path); it != in.sh->plugins.end()) return it->second;
+        }
+        auto lib = os::library::open(path);
+        if (!lib) in.raise("PluginError", "cannot load '" + path + "': " + lib.err.what);
+        auto L = std::make_shared<os::library>(std::move(lib.value));
+        using init_t = int (*)(const forge_plugin_api*);
+        auto init = reinterpret_cast<init_t>(L->symbol("forge_script_plugin_init"));
+        if (!init) in.raise("PluginError", "'" + path + "' does not export forge_script_plugin_init");
+        struct Reg { std::shared_ptr<os::library> lib; Ref<Map> m; std::string base, err; std::shared_ptr<forge_plugin_api> api; };
+        std::string base = std::filesystem::path(path).stem().string(); if (base.rfind("lib", 0) == 0 && base.size() > 3) base = base.substr(3);
+        // The api table outlives init (plugins may keep the pointer for alloc); natives keep it alive.
+        auto apip = std::make_shared<forge_plugin_api>(); auto& api = *apip;
+        Reg reg{L, make<Map>(), base, {}, apip};
+        api.abi = FORGE_SCRIPT_PLUGIN_ABI; api.reg = &reg;
+        api.alloc = [](std::size_t n) -> char* { return static_cast<char*>(std::malloc(n ? n : 1)); };
+        api.def = [](void* r, const char* name, int lo, int hi, forge_plugin_fn fn, void* user) {
+            if (!r) return;
+            auto& R = *static_cast<Reg*>(r);
+            if (!name || !fn) { R.err = "def() with a null name or function"; return; }
+            std::string full = R.base + "." + name; auto keep = std::make_pair(R.lib, R.api);
+            R.m->set_str(name, native(full, std::max(0, lo), hi < 0 ? -1 : hi, [fn, user, full, keep](Interp& in, Args& a) -> Value {
+                json::array arr; for (auto& x : a) arr.push_back(to_json(in, x));
+                auto args = json::dump(json::value(std::move(arr)));
+                char* out = nullptr; int rc = fn(args.c_str(), &out, user);
+                std::string res = out ? std::string(out) : std::string(); std::free(out);
+                if (rc != 0) in.raise("PluginError", full + ": " + (res.empty() ? "failed (" + std::to_string(rc) + ")" : res));
+                if (res.empty()) return Nil{};
+                try { return from_json(json::parse(res)); }
+                catch (const forge_exception& e) { in.raise("PluginError", full + ": bad JSON result: " + e.what()); }
+            }));
+        };
+        api.constant = [](void* r, const char* name, const char* js) {
+            if (!r || !name) return;
+            auto& R = *static_cast<Reg*>(r);
+            try { R.m->set_str(name, from_json(json::parse(js ? js : "null"))); } catch (const forge_exception& e) { R.err = std::string("constant ") + name + ": " + e.what(); }
+        };
+        int rc = init(&api);
+        api.reg = nullptr;   // def()/constant() are only valid during init
+        if (rc != 0) in.raise("PluginError", "'" + path + "' refused to load (init returned " + std::to_string(rc) + ")");
+        if (!reg.err.empty()) in.raise("PluginError", path + ": " + reg.err);
+        reg.m->frozen = true;
+        Value v = obj(reg.m);
+        std::lock_guard g(in.sh->mod_m); in.sh->plugins[path] = v; return v;
+    };
+    B["forge::plugin"] = native("forge::plugin", 1, 1, [](Interp& in, Args& a) -> Value {
+        auto p = s_of(in, a[0], "forge::plugin");
+        if (!is_native_module(p)) in.raise("ValueError", "forge::plugin: '" + p + "' is not a .so/.dylib/.dll");
+        return in.import_module(p);
+    });
+    B["forge::import"] = native("forge::import", 1, 1, [](Interp& in, Args& a) -> Value { return in.import_module(s_of(in, a[0], "forge::import")); });
+    B["forge::module_path"] = native("forge::module_path", 0, 0, [](Interp& in, Args&) -> Value { auto l = make<List>(); for (auto& d : module_search_path(in)) l->push(strv(d)); return obj(l); });
+    B["forge::modules"] = native("forge::modules", 0, 0, [](Interp& in, Args&) -> Value {
+        std::vector<std::string> v; { std::lock_guard g(in.sh->mod_m); for (auto& [k, m] : in.sh->modules) if (m) v.push_back(k); for (auto& [k, m] : in.sh->plugins) v.push_back(k); }
+        std::sort(v.begin(), v.end()); auto l = make<List>(); for (auto& x : v) l->push(strv(x)); return obj(l);
+    });
     install_cpp_std(sh); install_automation(sh);
     for (auto& [k, v] : B) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) (*r)->frozen = true;
 }

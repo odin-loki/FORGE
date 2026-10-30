@@ -40,6 +40,8 @@ struct Shared {
     std::string base_dir;                                      // for import resolution
     bool use_vm = true; int jit_threshold = 2;
     std::mutex mod_m; std::unordered_map<std::string, Ref<Globals>> modules;
+    std::function<Value(Interp&, const std::string&)> load_plugin;
+    std::unordered_map<std::string, Value> plugins;                  // path -> frozen map of natives   // native plugin loader (builtins.cpp)
     std::mutex trace_m; bool trace_calls = false;
     std::vector<std::shared_ptr<const FnDecl>> keep;           // programs whose AST must outlive globals
     std::unordered_map<std::string, std::unordered_map<std::string, Value>> methods;   // built-in methods by receiver type
@@ -142,6 +144,8 @@ struct NodeIter;   // runtime iterator
 void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
 void install_automation(Shared& sh);
+std::vector<std::string> module_search_path(const Interp& in);
+bool is_native_module(const std::string& p);
 std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Value>& args, std::size_t first);
 std::vector<std::string>& script_argv();   // forge::args()
 
