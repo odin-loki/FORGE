@@ -199,7 +199,9 @@ inline result<std::vector<std::string>> glob(const std::string& pattern, const s
     walk_opts wo; wo.max_depth = deep ? -1 : depth;
     auto w = walk(root, wo);
     if (!w) { if (!exists(root)) return {std::move(out), {}}; return {{}, w.err}; }
-    std::string rootn = u8str(u8path(root).lexically_normal()); if (!rootn.empty() && rootn.back() != '/') rootn += '/';
+    std::string rootn = u8str(u8path(root).lexically_normal());
+    for (auto& c : rootn) if (c == '\\') c = '/';   // Windows: lexically_normal gives '\\', entries below are compared with '/'
+    if (!rootn.empty() && rootn.back() != '/') rootn += '/';
     for (auto& e : *w) {
         std::string p = u8str(u8path(e.path).lexically_normal());
         for (auto& c : p) if (c == '\\') c = '/';
