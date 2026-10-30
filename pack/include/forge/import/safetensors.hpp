@@ -29,7 +29,9 @@ public:
                 if (k == "__metadata__") continue;
                 entry e; e.dtype = v["dtype"].str();
                 for (auto& d : v["shape"].arr()) e.shape.push_back(d.i());
-                e.begin = std::uint64_t(v["data_offsets"][0].num()); e.end = std::uint64_t(v["data_offsets"][1].num());
+                const auto& off = v["data_offsets"].arr();   // exactly [begin, end]; [n] threw std::out_of_range (fuzz, libc++)
+                if (off.size() != 2) raise(errc::format_error, "{}: tensor {} needs 2 data_offsets", path, k);
+                e.begin = std::uint64_t(off[0].num()); e.end = std::uint64_t(off[1].num());
                 if (e.begin > e.end || e.end > size_ - base_) raise(errc::format_error, "{}: tensor {} out of bounds", path, k);
                 entries_[k] = e;
             }

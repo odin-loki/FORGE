@@ -24,7 +24,10 @@ runcmd:
   - mkdir -p /usr/local/etc/pkg/repos
   - |
     printf 'FreeBSD: { url: "https://pkg.FreeBSD.org/\${ABI}/quarterly", mirror_type: "none" }\nFreeBSD-kmods: { enabled: no }\n' > /usr/local/etc/pkg/repos/FreeBSD.conf
-  - env ASSUME_ALWAYS_YES=yes pkg install -y cmake ninja python3 bash zsh tcsh mksh fish
+  # the first pkg run only upgrades pkg itself; refresh the catalogue and install for real (tcsh is base csh;
+  # cmake is packaged as cmake-core since 2026Q4).
+  - env ASSUME_ALWAYS_YES=yes pkg update -f
+  - env ASSUME_ALWAYS_YES=yes pkg install -y cmake-core ninja python3 py312-numpy bash zsh mksh fish
   - mkdir -p /workspace
   - chown ci /workspace
   - touch /var/ci-ready
@@ -38,7 +41,10 @@ ssh_() { ssh -i "$key" -p "$port" -o StrictHostKeyChecking=no -o UserKnownHostsF
 i=0; until ssh_ true 2>/dev/null; do i=$((i+1)); [ $i -lt 180 ] || { echo "VM did not come up"; tail -30 serial.log; exit 1; }; sleep 10; done
 echo "VM up after $((i*10))s"; ssh_ uname -a
 i=0; until ssh_ test -f /var/ci-ready; do i=$((i+1)); [ $i -lt 360 ] || { echo "cloud-init runcmd (pkg install) did not finish"; exit 1; }; sleep 10; done
-ssh_ "pkg info -q cmake ninja bash zsh tcsh mksh fish python3 && mkdir -p '$src' '$b'"
+ssh_ "pkg info -q cmake-core ninja bash zsh mksh fish python3 && mkdir -p '$src' '$b'"
 (cd "$src" && git ls-files -z | tar --null -T - -cf -) | ssh_ "tar xf - -C '$src'"
+# ctest names the host's python (golden/sign/onnx/docs tests); point that path at the guest's python3.
+hp=$(sed -n 's/^Python3_EXECUTABLE:[A-Z]*=//p' "$b/CMakeCache.txt")
+[ -z "$hp" ] || ssh_ "echo | su root -c 'mkdir -p $(dirname "$hp") && ln -sf /usr/local/bin/python3 $hp'"
 tar cf - -C "$b" --exclude='*.o' --exclude='*.a' . | ssh_ "tar xf - -C '$b'"
 ssh_ "cd '$b' && env CTEST_OUTPUT_ON_FAILURE=1 FORGE_THREADS=2 ctest -LE 'slow|emu|gpu' -j2 --timeout 1200 --output-on-failure"
