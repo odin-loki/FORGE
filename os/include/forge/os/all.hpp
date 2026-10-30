@@ -29,3 +29,5 @@
 #include <forge/os/net.hpp>
 #include <forge/os/service_control.hpp>
 #include <forge/os/registry.hpp>
+#include <forge/os/devices.hpp>
+#include <forge/os/clipboard.hpp>

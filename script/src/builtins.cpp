@@ -7,7 +7,9 @@
 #include "parser.hpp"
 #include <forge/hash/blake3.hpp>
 #include <forge/json/json.hpp>
+#include <forge/os/clipboard.hpp>
 #include <forge/os/console.hpp>
+#include <forge/os/devices.hpp>
 #include <forge/os/file_watch.hpp>
 #include <forge/os/file_watch_tree.hpp>
 #include <forge/os/fs.hpp>
@@ -551,6 +553,25 @@ void install_builtins(Shared& sh) {
         })
         .def("is_tty", 0, 1, [](Interp& in, Args& a) -> Value { int s = a.empty() ? 1 : int(i_of(in, a[0], "os.is_tty")); return os::console::is_tty(os::console::stream(s < 0 || s > 2 ? 1 : s)); })
         .def("term_size", 0, 0, [](Interp&, Args&) -> Value { auto s = os::console::size(); auto l = make<List>(); l->push(std::int64_t(s.value.cols)); l->push(std::int64_t(s.value.rows)); return obj(l); })
+        .def("devices", 1, 1, [](Interp& in, Args& a) -> Value {
+            auto k = s_of(in, a[0], "os.devices"); auto l = make<List>();
+            if (k == "block") for (auto& d : ok(in, os::devices::block(), "OSError")) {
+                auto m = make<Map>(); m->set_str("name", strv(d.name)); m->set_str("model", strv(d.model)); m->set_str("size", std::int64_t(d.size_bytes));
+                m->set_str("removable", d.removable); m->set_str("rotational", d.rotational); auto ps = make<List>(); for (auto& p : d.partitions) ps->push(strv(p)); m->set_str("partitions", obj(ps)); l->push(obj(m));
+            }
+            else if (k == "pci") for (auto& d : ok(in, os::devices::pci(), "OSError")) {
+                auto m = make<Map>(); m->set_str("address", strv(d.address)); m->set_str("vendor", strv(d.vendor_id)); m->set_str("device", strv(d.device_id)); m->set_str("class", strv(d.class_id)); m->set_str("driver", strv(d.driver)); l->push(obj(m));
+            }
+            else if (k == "usb") for (auto& d : ok(in, os::devices::usb(), "OSError")) {
+                auto m = make<Map>(); m->set_str("vendor", strv(d.vendor_id)); m->set_str("product_id", strv(d.product_id)); m->set_str("manufacturer", strv(d.manufacturer)); m->set_str("product", strv(d.product)); m->set_str("bus", std::int64_t(d.bus)); l->push(obj(m));
+            }
+            else in.raise("ValueError", "os.devices: kind must be block, pci or usb");
+            return obj(l);
+        })
+        .def("clipboard", 0, 1, [](Interp& in, Args& a) -> Value {
+            if (a.empty()) return strv(ok(in, os::clipboard::get(), "OSError"));
+            ok(in, os::clipboard::set(in.str(a[0])), "OSError"); return Nil{};
+        })
         .def("signal", 2, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.proc, "signals");
             os::signal_id sg{}; if (!os::sig_from_name(s_of(in, a[1], "os.signal"), sg)) in.raise("ValueError", "unknown signal " + in.str(a[1]));

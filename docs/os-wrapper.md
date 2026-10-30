@@ -1,6 +1,6 @@
 # OS wrapper design (forge::os, full surface)
 
-Status: **partially implemented** — process spawning with captured out/err/code, fs, env and json are exposed to scripts as `forge::sh/pwsh/cmd`, `forge::fs`, `forge::os`, `forge::json`; the remaining modules below are still design. This extends the existing header-only `forge::os` layer
+Status: **implemented** (phases 1–4 below; remaining platform gaps are listed at the end of Phasing). Scripts reach it through `forge::sh/pwsh/cmd`, `fs`, `os`, `time`, `net`, `service`, `proc` and `json`. This extends the existing header-only `forge::os` layer
 (`os/include/forge/os/`) into a complete, portable wrapper over the operating system. It is the
 foundation for the scripting layer in [scripting.md](scripting.md).
 
@@ -82,4 +82,10 @@ can branch on features rather than on platform names.
    - `registry.hpp` (`forge::os::registry`): `get`/`set` (string or 64-bit integer), `remove_value`, `remove_key`, `list` on Windows; unsupported elsewhere.
    - Scripts: `fs.watch_tree(root, opts)` → handle with `poll(ms)` and `backend()`; `net.resolve/interfaces/port_open/http/parse_url`; `service.unit/install/uninstall/start/stop/status`. Option bags may be maps or `{{"key", value}, ...}` lists.
    - Tests: `tests/test_os_net.cpp` (native and polling tree watch, local HTTP server, service units in a temp dir; also cross-compiled) and `os_phase3_surface` in `tests/test_script.cpp`.
-4. `devices`, `clipboard`, remaining platform gaps.
+4. **Done:** `devices`, `clipboard`.
+   - `devices.hpp` (`forge::os::devices`): `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver) and `usb()` (vendor/product ids, strings, bus/devnum) from sysfs on Linux/Android; unsupported elsewhere.
+   - `clipboard.hpp` (`forge::os::clipboard`): `available`, `get`, `set` — Win32 clipboard on Windows, pbcopy/pbpaste on macOS, wl-copy/wl-paste or xclip/xsel on Linux/FreeBSD; unsupported without a display or helper and on mobile.
+   - Scripts: `os.devices("block"|"pci"|"usb")`, `os.clipboard()` / `os.clipboard(text)`.
+   - Tests: `tests/test_os_dev.cpp` (cross-compiled too).
+
+Remaining platform gaps (tracked, not blocking): Windows/macOS device enumeration (SetupAPI / IOKit), Windows `interfaces()` (GetAdaptersAddresses), per-CPU times off Linux, `mounts()` on macOS/FreeBSD, user lookup by SID on Windows, and HTTPS in `net::http`.
