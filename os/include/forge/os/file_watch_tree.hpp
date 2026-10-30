@@ -20,7 +20,7 @@ public:
         if (!stat(root).is_dir) return {{}, {2, "watch: not a directory " + root}};
         auto w = std::unique_ptr<tree_watcher>(new tree_watcher(root, std::move(o)));
         w->polling_ = w->opts_.force_polling;
-        if (!w->polling_ && !w->native_.add(w->root_)) w->polling_ = true;
+        if (!w->polling_) { w->subtree_ = w->native_.add_tree(w->root_); if (!w->subtree_ && !w->native_.add(w->root_)) w->polling_ = true; }
         w->scan_(w->root_, nullptr);
         return {std::move(w), {}};
     }
@@ -73,7 +73,7 @@ private:
     // Record (and, when out != null, report as created) everything under dir; register dirs natively.
     void scan_(const std::string& dir, std::vector<watch_event>* out) {
         if (!dirs_.insert(dir).second && out) {}
-        if (dir != root_ && !polling_) native_.add(dir);
+        if (dir != root_ && !polling_ && !subtree_) native_.add(dir);
         auto ls = list_dir(dir); if (!ls) return;
         for (auto& e : ls.value) {
             auto p = join(dir, e.name); if (ignored_(p)) continue;
@@ -130,7 +130,7 @@ private:
         }
         return out;
     }
-    std::string root_; tree_watch_opts opts_; bool polling_ = false;
+    std::string root_; tree_watch_opts opts_; bool polling_ = false, subtree_ = false;
     file_watcher native_; std::map<std::string, entry> snap_; std::set<std::string> dirs_;
 };
 } // namespace forge::os

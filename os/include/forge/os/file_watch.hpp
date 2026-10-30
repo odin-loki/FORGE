@@ -72,6 +72,21 @@ public:
         return {{}, unsupported("file watching")};
 #endif
     }
+    // Windows: watch a whole tree through one handle on its root. Per-directory handles would keep a deleted
+    // subdirectory delete-pending (still visible) until the watch closed. Returns false where unsupported,
+    // and the caller then watches each directory with add().
+    bool add_tree(const std::string& dir) {
+#if defined(FORGE_OS_WINDOWS)
+        auto d = std::make_unique<wdir>(); d->dir = dir; d->names.push_back({}); d->subtree = true;
+        d->h = CreateFileW(widen(dir).c_str(), FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+        if (d->h == INVALID_HANDLE_VALUE) return false;
+        d->ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!arm_(*d)) { CloseHandle(d->h); CloseHandle(d->ov.hEvent); return false; }
+        dirs_.push_back(std::move(d)); return true;
+#else
+        (void)dir; return false;
+#endif
+    }
     // Watch one file's own contents where the backend needs per-file handles (kqueue: directory events do
     // not fire for in-place writes). A no-op elsewhere, where the parent directory's watch already covers it.
     status add_file(const std::string& path) {
@@ -140,6 +155,7 @@ public:
             for (DWORD off = 0; got;) {
                 auto* fi = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(d->buf + off);
                 std::string nm = narrow({fi->FileName, fi->FileNameLength / sizeof(wchar_t)});
+                if (d->subtree) for (auto& c : nm) if (c == '\\') c = '/';
                 for (auto& want : d->names) if (want.empty() || want == nm) {
                     watch_kind k = fi->Action == FILE_ACTION_ADDED ? (want.empty() ? watch_kind::created : watch_kind::modified) : fi->Action == FILE_ACTION_REMOVED ? watch_kind::removed
                                  : fi->Action == FILE_ACTION_RENAMED_OLD_NAME ? watch_kind::renamed : fi->Action == FILE_ACTION_RENAMED_NEW_NAME ? (want.empty() ? watch_kind::created : watch_kind::modified) : watch_kind::modified;
@@ -174,9 +190,9 @@ private:
     }
     std::vector<kwatch> kw_; int fd_ = -1;
 #elif defined(FORGE_OS_WINDOWS)
-    struct wdir { std::string dir; std::vector<std::string> names; HANDLE h = INVALID_HANDLE_VALUE; OVERLAPPED ov{}; alignas(DWORD) std::uint8_t buf[32768]; };
+    struct wdir { std::string dir; std::vector<std::string> names; bool subtree = false; HANDLE h = INVALID_HANDLE_VALUE; OVERLAPPED ov{}; alignas(DWORD) std::uint8_t buf[32768]; };
     static bool arm_(wdir& d) {
-        return ReadDirectoryChangesW(d.h, d.buf, sizeof d.buf, FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        return ReadDirectoryChangesW(d.h, d.buf, sizeof d.buf, d.subtree ? TRUE : FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
                                      nullptr, &d.ov, nullptr) != 0;
     }
     std::vector<std::unique_ptr<wdir>> dirs_;
