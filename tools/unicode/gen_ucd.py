@@ -34,7 +34,7 @@ LB = ['XX','BK','CR','LF','CM','NL','SG','WJ','ZW','GL','SP','ZWJ','B2','BA','BB
 EAW = ['N','A','F','H','Na','W']
 BIDI = ['L','R','AL','EN','ES','ET','AN','CS','NSM','BN','B','S','WS','ON','LRE','LRO','RLE','RLO','PDF','LRI','RLI','FSI','PDI']
 INCB = ['None','Linker','Consonant','Extend']
-FLAGS = ['Alphabetic','Lowercase','Uppercase','White_Space','Default_Ignorable_Code_Point','Cased','Case_Ignorable','Emoji','Emoji_Presentation','Extended_Pictographic','Emoji_Modifier','Emoji_Modifier_Base','Math','Hex_Digit','Dash','Ideographic','Noncharacter_Code_Point','Variation_Selector']
+FLAGS = ['Alphabetic','Lowercase','Uppercase','White_Space','Default_Ignorable_Code_Point','Cased','Case_Ignorable','Emoji','Emoji_Presentation','Extended_Pictographic','Emoji_Modifier','Emoji_Modifier_Base','Math','Hex_Digit','Dash','Ideographic','Noncharacter_Code_Point','Variation_Selector','Unified_Ideograph']
 
 gc = [0]*N; ccc = [0]*N; name_first = None
 ud = {}
@@ -183,13 +183,13 @@ def pairs(name, d):
 pairs('upper', up); pairs('lower', lo); pairs('title', ti); pairs('fold', fold_s)
 def multi(name, d):
     ks = sorted(d); off = []; pool = []
-    for k in ks: off.append(len(pool) << 5 | len(d[k]) << 1); pool += d[k]
+    for k in ks: off.append(len(pool) << 6 | len(d[k]) << 1); pool += d[k]
     arr('unsigned', name + '_k', ks); arr('unsigned', name + '_o', off); arr('unsigned', name + '_pool', pool or [0])
 multi('sp_lower', sp_lo); multi('sp_title', sp_ti); multi('sp_upper', sp_up); multi('fold_full', fold_f)
 # decomposition: off = pool<<5 | len<<1 | compat
 ks = sorted(decomp); off = []; pool = []
 for k in ks:
-    c, d = decomp[k]; off.append(len(pool) << 5 | len(d) << 1 | (1 if c else 0)); pool += d
+    c, d = decomp[k]; off.append(len(pool) << 6 | len(d) << 1 | (1 if c else 0)); pool += d
 arr('unsigned', 'decomp_k', ks); arr('unsigned', 'decomp_o', off); arr('unsigned', 'decomp_pool', pool)
 ck = sorted(comp)
 arr('unsigned long long', 'comp_k', [a << 21 | b for a, b in ck], 12); arr('unsigned', 'comp_v', [comp[k] for k in ck])
