@@ -230,6 +230,7 @@ inline bool is_moved(const Value& v) { auto* r = std::get_if<Ref<Obj>>(&v); retu
 // access takes its lock automatically; in debug mode lock order is tracked to report deadlocks.
 struct SharedBox final : Obj {
     std::recursive_timed_mutex m;
+    const std::uint64_t id = [] { static std::atomic<std::uint64_t> n{0}; return ++n; }();   // lock-order graph key
     Value v;
     explicit SharedBox(Value x) : v(std::move(x)) { own = Own::Shared; Heap::instance().track(*this); }
     ~SharedBox() override { Heap::instance().untrack(*this); }

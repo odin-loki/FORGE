@@ -2,8 +2,7 @@
 
 Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
 cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
-Still to come: debug race/deadlock
-detection, pipelines/watch/schedules, AI commands, remote execution. See *Phasing* at the end.
+Still to come: pipelines/watch/schedules, AI commands, remote execution. See *Phasing* at the end.
 
 ## Purpose
 
@@ -78,6 +77,9 @@ Standard library surface (implemented natively, `std::` prefix optional after `u
 - **Borrows while iterating.** A range-`for` borrows its container; structural changes to it
   (`push_back`, `insert`, `erase`, `clear`, `resize`, inserting a new key with `operator[]`, ...)
   throw `BorrowError` instead of invalidating iterators. Changing elements in place is allowed.
+- **References.** Non-const `T&` parameters (functions, methods, lambdas, `std::for_each`,
+  `forge::shared::with`) and `for (T& x : c)` loops write through to the caller's variable, element or
+  member, for scalars and strings as well as objects; `const T&` and by-value parameters never do.
 
 ### Shell calls, threads and FORGE built-ins
 
@@ -88,6 +90,15 @@ Standard library surface (implemented natively, `std::` prefix optional after `u
   `get()`/`join()` wait and rethrow. Arguments cross threads only deep-copied, frozen
   (`forge::freeze`), moved, or as `forge::shared<T>` (locked on every access: `with(fn)`, `load`,
   `store`). `forge::channel<T> ch(cap)` has `send`, `recv`, `close` and works in range-`for`.
+- **Debug mode** (`forge script --debug`, `options::debug`) adds concurrency checks:
+  - *race detector*: every mutable object belongs to the thread that created or received it (task
+    arguments, channel messages and task results are adopted by the receiver); modifying one from
+    another thread without holding its `forge::shared` lock raises `RaceError`;
+  - *lock order*: nested `forge::shared::with` calls record lock-order edges; acquiring locks in an
+    order that closes a cycle raises `DeadlockError` (before the threads can actually deadlock);
+  - *stall detector*: if every script thread is blocked (channel send/recv, `get`/`join`, a shared
+    lock) for `options::deadlock_ms` (default 1000 ms), the waiting thread raises `DeadlockError`.
+  CI additionally builds the runtime with ThreadSanitizer (`-DFORGE_TSAN=ON`, job `linux-tsan`).
 - `forge::args()`, `forge::fs::...`, `forge::os::...`, `forge::json::...`, `forge::gc::collect()`
   and the other built-in modules (see below) are reachable as `forge::<module>::<name>`.
 

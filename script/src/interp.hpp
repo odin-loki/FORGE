@@ -75,6 +75,13 @@ struct Interp {
     // ---- shared runtime (used by both the tree-walker and the VM)
     void step();
     void run_finalizers();
+    // Non-const reference parameters: call_function leaves (argument index, final value) here for the caller.
+    const Function* ref_back_fn = nullptr;
+    std::vector<std::pair<std::size_t, Value>> ref_back;
+    Value call_writeback(const Node& n, const Ref<Env>& env);
+    // Call f(args...) and copy the final values of its non-const T& parameters back into args.
+    Value call_ref(const Value& f, std::vector<Value>& args);
+    void iter_writeback(Obj& it, const Value& a, const Value* b);
     bool in_finalizers_ = false;
     Value load(const VarRef& v, const Ref<Env>& env);
     void store(const VarRef& v, const Ref<Env>& env, Value x, bool define = false, bool is_const = false);
@@ -136,5 +143,23 @@ void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
 std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Value>& args, std::size_t first);
 std::vector<std::string>& script_argv();   // forge::args()
+
+namespace debug {
+bool on();
+void check_write(Interp& in, const Obj* o);          // RaceError if o belongs to another thread
+void adopt(const Value& v);                            // receiver takes ownership of a transferred graph
+void lock_acquire(Interp& in, std::uint64_t lock);       // lock-order graph; DeadlockError on inversion
+void lock_release(std::uint64_t lock) noexcept;
+void thread_started() noexcept;
+void thread_finished() noexcept;
+inline std::uint64_t stall_ms = 1000;
+struct Blocked {                                        // RAII: this thread is waiting on another one
+    Interp& in; const char* what;
+    Blocked(Interp& i, const char* w);
+    ~Blocked();
+    Blocked(const Blocked&) = delete; Blocked& operator=(const Blocked&) = delete;
+    void poll();                                        // DeadlockError when every thread is blocked
+};
+}
 
 } // namespace forge::script

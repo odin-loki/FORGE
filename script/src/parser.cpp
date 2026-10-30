@@ -253,7 +253,44 @@ public:
         while (!at(T::End)) { if (auto s = statement()) body->kids.push_back(s); flush_extra(*body); }
         fd->body = body; fd->nslots = fns_.back().nslots; fns_.pop_back();
         fd->has_main = has_main_;
+        mark_ref_calls(*fd);
         return fd;
+    }
+    // Calls that may bind an lvalue argument to a non-const `T&` parameter are flagged so the runtime
+    // writes the parameter's final value back to the caller's variable/element (C++ reference semantics
+    // for values held by value: ints, doubles, strings rebound by assignment, ...).
+    static std::string last_seg(const std::string& s) { auto p = s.rfind("::"); return p == std::string::npos ? s : s.substr(p + 2); }
+    static bool lvalue(const Node& n) { return n.k == NK::Var || n.k == NK::Field || n.k == NK::Index; }
+    template <class F> static void walk_fn(const FnDecl& f, F&& fn) {
+        for (auto& p : f.params) if (p.dflt) walk(*p.dflt, fn);
+        if (f.body) walk(*f.body, fn);
+    }
+    template <class F> static void walk(const Node& cn, F&& fn) {
+        Node& n = const_cast<Node&>(cn);   // every Node is created non-const by mk(); the tree is still being finalised
+        fn(n);
+        for (auto& k : n.kids) if (k) walk(*k, fn);
+        if (n.extra) walk(*n.extra, fn);
+        if (n.fn) walk_fn(*n.fn, fn);
+        if (n.cls) { for (auto& [nm, d] : n.cls->fields) if (d) walk(*d, fn); for (auto& m : n.cls->methods) walk_fn(*m, fn); }
+    }
+    static void mark_ref_calls(FnDecl& top) {
+        std::set<std::string> names;
+        auto note = [&](const FnDecl& f) { for (auto& p : f.params) if (p.out) { const_cast<FnDecl&>(f).has_out = true; names.insert(last_seg(f.name)); break; } };
+        note(top);
+        walk_fn(top, [&](Node& n) {
+            if (n.fn) note(*n.fn);
+            if (n.fn && n.fn->has_out && (n.k == NK::FnStmt)) names.insert(last_seg(n.var.name.empty() ? n.fn->name : n.var.name));
+            if (n.k == NK::Let && !n.kids.empty() && n.kids[0]->k == NK::Lambda && n.kids[0]->fn) { note(*n.kids[0]->fn); if (n.kids[0]->fn->has_out) names.insert(n.s); }
+            if (n.cls) for (auto& m : n.cls->methods) { note(*m); if (m->has_out) { auto nm = m->name; if (auto p = nm.find('/'); p != std::string::npos) nm = nm.substr(0, p); names.insert(last_seg(nm)); } }
+        });
+        if (names.empty()) return;
+        walk_fn(top, [&](Node& n) {
+            if (n.k != NK::Call || n.kids.empty()) return;
+            const Node& c = *n.kids[0];
+            std::string nm = c.k == NK::Var ? last_seg(c.s) : c.k == NK::Field ? c.s : std::string();
+            if (nm.empty() || !names.count(nm)) return;
+            for (std::size_t i = 1; i < n.kids.size(); ++i) if (lvalue(*n.kids[i])) { n.wb = true; return; }
+        });
     }
 private:
     // ---- token helpers
@@ -524,6 +561,7 @@ private:
             return call_node(var_node(ti.name, line), {}, line);
         }
         case TK::Channel: return builtin_call("forge::channel", {}, line);
+        case TK::Shared: return builtin_call("forge::shared", {ti.args.empty() ? mk(NK::Nil, line) : default_value(ti.args[0], line)}, line);
         default: return mk(NK::Nil, line);
         }
     }
@@ -580,6 +618,10 @@ private:
             if (args.empty()) return mk(NK::Nil, line);
             return builtin_call("forge::spawn", args, line);   // std::thread t(f, args...)
         case TK::Channel: return builtin_call("forge::channel", args, line);
+        case TK::Shared: {   // forge::shared<T>(init...) / forge::shared<T> s{...}: T is built from the arguments
+            NodeP inner = ti.args.empty() || (ti.args[0].smart && args.size() == 1) ? (args.empty() ? mk(NK::Nil, line) : args[0]) : construct(ti.args[0], args, brace, line);
+            return builtin_call("forge::shared", {inner}, line);
+        }
         case TK::Weak:
             if (args.empty()) return mk(NK::Nil, line);
             return builtin_call("forge::__weak", {args[0]}, line);
@@ -839,6 +881,7 @@ private:
             while (accept_op("[")) { if (!is_op("]")) expr(); expect_op("]"); ti = TI{TK::List}; ti.ref = true; }
             if (!ti.ref && (ti.k == TK::Int || ti.k == TK::Float)) p.conv = ti.k == TK::Int ? 'i' : 'f';
             p.by_ref = ti.ref;   // const T& binds without copying (const-ness is not enforced at run time)
+            p.out = ti.ref && !ti.cnst;
             if (ti.k != TK::Auto && ti.k != TK::Any && ti.k != TK::Fn && ti.k != TK::Class && ti.k != TK::Enum && ti.k != TK::Float && ti.k != TK::Int) p.type = ti.ann();
             if (accept_op("=")) p.dflt = is_op("{") ? construct(ti, brace_list(), true, cur().line) : assign_expr();
             if (types) types->push_back(ti);

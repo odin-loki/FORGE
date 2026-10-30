@@ -433,7 +433,7 @@ void install_cpp_std(Shared& sh) {
         pred("any_of", 0); pred("all_of", 1); pred("none_of", 2);
         def(pre + "for_each", 2, 3, [](Interp& in, Args& a) -> Value {
             std::size_t nx; Span s = range_args(in, a, nx, "std::for_each");
-            for (auto k = s.lo; k < s.hi; ++k) { Args c{elem(in, s.c, k)}; in.call(a[nx], c); } return Nil{};
+            for (auto k = s.lo; k < s.hi; ++k) { Args c{elem(in, s.c, k)}; in.call_ref(a[nx], c); if (auto* l = as<List>(s.c); l && std::size_t(k) < l->items.size()) l->items[std::size_t(k)] = c[0]; } return Nil{};
         });
         auto ext = [&](const std::string& n, bool mx) {
             def(pre + n, 1, 3, [mx, with_cmp](Interp& in, Args& a) -> Value {
@@ -746,7 +746,13 @@ void install_cpp_std(Shared& sh) {
     meth("task", "get", 1, 1, [](Interp& in, Args& a) -> Value { return in.await(a[0]); });
     meth("task", "join", 1, 1, [](Interp& in, Args& a) -> Value { in.await(a[0]); return Nil{}; });
     meth("shared", "with", 2, 2, [](Interp& in, Args& a) -> Value {   // s.with([](auto& v) { ... }): runs under the lock
-        auto* b = as<SharedBox>(a[0]); std::lock_guard g(b->m); Args x{b->v}; Value r = in.call(a[1], x); return r;
+        auto* b = as<SharedBox>(a[0]);
+        debug::lock_acquire(in, b->id);
+        struct Rel { std::uint64_t id; ~Rel() { debug::lock_release(id); } } rel{b->id};
+        std::unique_lock g(b->m, std::defer_lock);
+        if (debug::on()) { debug::Blocked w(in, "forge::shared::with"); while (!g.try_lock_for(std::chrono::milliseconds(20))) { w.poll(); in.step(); } }
+        else g.lock();
+        Args x{b->v}; Value r = in.call_ref(a[1], x); b->v = x[0]; return r;
     });
     meth("shared", "load", 1, 1, [](Interp& in, Args& a) -> Value { auto* b = as<SharedBox>(a[0]); std::lock_guard g(b->m); return in.copy_value(b->v); });
     meth("shared", "store", 2, 2, [](Interp& in, Args& a) -> Value { auto* b = as<SharedBox>(a[0]); std::lock_guard g(b->m); b->v = in.copy_value(a[1]); return Nil{}; });
@@ -767,8 +773,10 @@ void install_cpp_std(Shared& sh) {
             auto* nat = as<Native>(f->second); if (!nat) continue;
             auto inner = nat->fn; std::string what = ty == "list" ? "vector" : ty;
             nat->fn = [inner, what, nm](Interp& in, Args& a) -> Value {
-                if (auto* r = std::get_if<Ref<Obj>>(&a[0]); r && *r && (*r)->borrows.load() > 0)
-                    in.raise("BorrowError", "cannot call " + nm + "() on a " + what + " while it is being iterated");
+                if (auto* r = std::get_if<Ref<Obj>>(&a[0]); r && *r) {
+                    if ((*r)->borrows.load() > 0) in.raise("BorrowError", "cannot call " + nm + "() on a " + what + " while it is being iterated");
+                    debug::check_write(in, r->get());
+                }
                 return inner(in, a);
             };
         }

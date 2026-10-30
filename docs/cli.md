@@ -84,6 +84,7 @@ forge script <file.cpp> [args...]     # run a script; int main()'s return value 
 forge script -e '<code>' [args...]    # run a snippet
 forge script                          # interactive REPL (:help, :type, :dis, :mem, :gc, :vm on|off)
   --tree          tree-walker only (default: compile to verified bytecode)
+  --debug         race detector + lock-order / stall deadlock detection
   --timeout MS    wall-clock limit      --max-steps N   instruction budget
   --heap BYTES    managed heap cap      --no-proc / --no-fs / --no-net   capability sandbox
 ```

@@ -51,7 +51,7 @@ Instance::~Instance() { Heap::instance().untrack(*this); }
 // ---------------------------------------------------------------- iterators
 namespace {
 struct Iter final : Obj {
-    Value src; std::size_t i = 0; std::int64_t a = 0, b = 0, stp = 1; int kind = 0;   // 0 list, 1 map, 2 string, 3 range, 4 channel
+    Value src; std::size_t i = 0; std::int64_t a = 0, b = 0, stp = 1; std::size_t last = 0; int kind = 0;   // 0 list, 1 map, 2 string, 3 range, 4 channel
     std::vector<Value> keys;
     const char* type_name() const override { return "iterator"; }
     Iter() { Heap::instance().track(*this); }
@@ -75,6 +75,24 @@ Ref<Obj> Interp::iterate(const Value& v) {
     if (auto* r = std::get_if<Ref<Obj>>(&it->src); r && *r && it->kind <= 2) (*r)->borrows.fetch_add(1);   // range-for borrow
     return Ref<Obj>(it);
 }
+void Interp::iter_writeback(Obj& o, const Value& a, const Value* b) {
+    auto* it = dynamic_cast<Iter*>(&o);
+    if (!it || it->i == 0) return;
+    if (it->kind == 0) {
+        auto* l = as<List>(it->src); if (!l || it->last >= l->items.size()) return;
+        if (b) { if (auto* p = as<List>(l->items[it->last]); p && p->items.size() >= 2) { p->items[0] = a; p->items[1] = *b; } }
+        else l->items[it->last] = a;
+    } else if (it->kind == 1) {
+        auto* m = as<Map>(it->src); if (!m || m->is_set) return;
+        const Value& k = it->keys[it->i - 1];
+        if (b) { if (m->find(k)) m->set(k, *b); }
+        else if (auto* p = as<List>(a); p && p->items.size() >= 2 && m->find(k)) m->set(k, p->items[1]);
+    } else if (it->kind == 2) {
+        auto* s = as<String>(it->src); auto* c = as<String>(b ? *b : a);
+        if (s && c && it->last < s->s.size() && !c->s.empty()) s->s[it->last] = c->s[0];
+        else if (s && it->last < s->s.size()) if (auto* x = std::get_if<std::int64_t>(b ? b : &a)) s->s[it->last] = char(*x);
+    }
+}
 bool Interp::iter_next(Obj& o, Value& out, Value* out2) {
     auto* it = dynamic_cast<Iter*>(&o);
     if (!it) raise("TypeError", "not an iterator");
@@ -85,7 +103,7 @@ bool Interp::iter_next(Obj& o, Value& out, Value* out2) {
                   if (!p || p->items.size() < 2) raise("TypeError", "structured binding needs a pair/tuple element, got " + type_of(l->items[it->i]));
                   out = p->items[0]; *out2 = p->items[1];
               } else out = l->items[it->i];
-              ++it->i; return true; }
+              it->last = it->i; ++it->i; return true; }
     case 1: { auto* m = as<Map>(it->src);
               while (it->i < it->keys.size()) {
                   auto& k = it->keys[it->i++];
@@ -101,16 +119,17 @@ bool Interp::iter_next(Obj& o, Value& out, Value* out2) {
               std::size_t n = 1; unsigned char c = static_cast<unsigned char>(s->s[it->i]);
               if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
               n = std::min(n, s->s.size() - it->i);
-              Value ch = new_string(s->s.substr(it->i, n));
+              Value ch = new_string(s->s.substr(it->i, n)); it->last = it->i;
               if (out2) { out = std::int64_t(it->i); *out2 = ch; } else out = ch;
               it->i += n; return true; }
     case 3: { if ((it->stp > 0 && it->a >= it->b) || (it->stp < 0 && it->a <= it->b)) return false;
               if (out2) { out = std::int64_t(it->i); *out2 = it->a; } else out = it->a; it->a += it->stp; ++it->i; return true; }
     case 4: { auto* ch = as<Channel>(it->src); auto& st = *ch->st;
               std::unique_lock g(st.m);
-              while (st.q.empty() && !st.closed) { st.cv.wait_for(g, std::chrono::milliseconds(50)); if (sh->interrupt) { g.unlock(); step(); g.lock(); } }
+              { debug::Blocked w(*this, "channel receive");
+                while (st.q.empty() && !st.closed) { st.cv.wait_for(g, std::chrono::milliseconds(50)); if (sh->interrupt) { g.unlock(); step(); g.lock(); } if (st.q.empty() && !st.closed) w.poll(); } }
               if (st.q.empty()) return false;
-              Value x = std::move(st.q.front()); st.q.pop_front(); st.cv.notify_all();
+              Value x = std::move(st.q.front()); st.q.pop_front(); st.cv.notify_all(); debug::adopt(x);
               if (out2) { out = std::int64_t(it->i); *out2 = std::move(x); } else out = std::move(x); ++it->i; return true; }
     }
     return false;
@@ -293,6 +312,7 @@ Value Interp::load_qualified(const std::string& name) {
 }
 void Interp::store(const VarRef& v, const Ref<Env>& env, Value x, bool define, bool is_const) {
     if (v.global()) {
+        debug::check_write(*this, globals.get());
         if (define) { globals->vars[v.name] = share(x); if (is_const) globals->consts.insert(v.name); else globals->consts.erase(v.name); return; }
         auto it = globals->vars.find(v.name);
         if (it == globals->vars.end()) raise("NameError", "'" + v.name + "' is not defined (declare it with let)");
@@ -522,6 +542,7 @@ Value Interp::get_field(const Value& o, const std::string& name, bool optional) 
     raise("AttributeError", t + " has no member '" + name + "'");
 }
 void Interp::set_field(const Value& o, const std::string& name, Value v) {
+    if (auto* r = std::get_if<Ref<Obj>>(&o)) debug::check_write(*this, r->get());
     if (auto* i = as<Instance>(o)) {
         if (i->frozen) raise("TypeError", "object is frozen");
         if (!i->cls->is_dynamic && !i->cls->has_field(name)) raise("AttributeError", i->cls->name + " has no field '" + name + "' (declare it in the class, or mark the class dynamic)");
@@ -554,6 +575,7 @@ Value Interp::get_index(const Value& o, const Value& i) {
     raise("TypeError", "cannot index " + type_of(o));
 }
 void Interp::set_index(const Value& o, const Value& i, Value v) {
+    if (auto* r = std::get_if<Ref<Obj>>(&o)) debug::check_write(*this, r->get());
     if (auto* l = as<List>(o)) { if (l->frozen) raise("TypeError", "list is frozen"); auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "list index must be int"); l->items.at(norm_index(*this, *k, l->items.size())) = share(v); return; }
     if (auto* m = as<Map>(o)) { if (m->frozen) raise("TypeError", "map is frozen");
         if (m->borrows.load() > 0 && !m->find(i)) raise("BorrowError", "operator[] would insert a key into a map while it is being iterated");
@@ -584,6 +606,7 @@ bool Interp::conforms(const Value& v, const TypeAnn& t) {
     if (n == "channel") return as<Channel>(v) != nullptr;
     if (n == "handle") return as<Handle>(v) != nullptr;
     if (n == "weak") return as<WeakRef>(v) != nullptr;
+    if (n == "shared") return as<SharedBox>(v) != nullptr;
     if (n == "class") return as<Class>(v) != nullptr;
     if (n == "Disposable") { if (as<Handle>(v)) return true; if (auto* i = as<Instance>(v)) return i->cls->find_method("dispose") || i->cls->derives("Disposable"); return false; }
     if (auto* i = as<Instance>(v)) {
@@ -678,6 +701,11 @@ Value Interp::call_function(const Ref<Function>& f, std::vector<Value>& args, co
         ret = Nil{};
     }
     if (d.ret) check_type(result, *d.ret, d.name + "() return value");
+    if (d.has_out) {
+        ref_back.clear(); ref_back_fn = f.get();
+        for (std::size_t i = 0; i < d.params.size() && i < args.size(); ++i)
+            if (d.params[i].out) ref_back.emplace_back(i, env->slots.at(std::size_t(d.params[i].slot)));
+    }
     return result;
 }
 Value Interp::make_closure(const std::shared_ptr<const FnDecl>& fd, const Ref<Env>& env) {
@@ -880,7 +908,12 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
     if (auto* m = dynamic_cast<const Map*>(o)) { auto n = make<Map>(); memo[o] = obj(n); for (auto& [k, x] : m->entries) n->set(deep_copy(in, k, memo), deep_copy(in, x, memo)); return obj(n); }
     if (auto* e = dynamic_cast<const Env*>(o)) {
         auto n = make<Env>(e->slots.size(), Ref<Env>()); memo[o] = obj(n);
-        for (std::size_t i = 0; i < e->slots.size(); ++i) n->slots[i] = deep_copy(in, e->slots[i], memo);
+        for (std::size_t i = 0; i < e->slots.size(); ++i) {
+            // A closure's frame may also hold thread-bound handles it never uses (e.g. the std::future of a
+            // sibling task). They are not copied; touching one from the new thread raises BorrowError.
+            if (as<Task>(e->slots[i]) || as<Handle>(e->slots[i])) { n->slots[i] = Value(Ref<Obj>(moved_sentinel())); continue; }
+            n->slots[i] = deep_copy(in, e->slots[i], memo);
+        }
         if (e->parent) n->parent = as_ref<Env>(deep_copy(in, obj(e->parent), memo));
         return obj(n);
     }
@@ -903,7 +936,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         n->is_interface = c->is_interface; n->required = c->required;
         if (c->base) n->base = as_ref<Class>(deep_copy(in, obj(c->base), memo));
         for (auto& d : c->field_defaults) n->field_defaults.push_back(deep_copy(in, d, memo));
-        n->field_inits = c->field_inits; n->def_env = c->def_env;
+        n->field_inits = c->field_inits; if (c->def_env) n->def_env = as_ref<Env>(deep_copy(in, obj(c->def_env), memo));
         for (auto& [k, x] : c->methods) n->methods[k] = deep_copy(in, x, memo);
         for (auto& [k, x] : c->statics) n->statics[k] = deep_copy(in, x, memo);
         return obj(n);
@@ -915,6 +948,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         return obj(n);
     }
     if (auto* b = dynamic_cast<const Bound*>(o)) { auto n = make<Bound>(deep_copy(in, b->self, memo), deep_copy(in, b->fn, memo)); memo[o] = obj(n); return obj(n); }
+    if (dynamic_cast<const SharedBox*>(o) && o->own == Own::Shared) return v;   // forge::shared<T>: one locked object for all tasks
     if (auto* c = dynamic_cast<const Channel*>(o)) { auto n = make<Channel>(0); n->st = c->st; memo[o] = obj(n); return obj(n); }
     if (dynamic_cast<const WeakRef*>(o)) return Nil{};
     in.raise("TypeError", std::string("a ") + o->type_name() + " cannot be sent to another task (only data, functions and channels can)");
@@ -934,6 +968,8 @@ Value Interp::spawn(const Value& f, std::vector<Value> args) {
     auto pl = std::make_shared<Payload>(Payload{std::move(g), std::move(fc), std::move(ac)});
     t->th = std::thread([st, shared, pl, c, cm, cc, ct, dl, fl]() mutable {
         {
+            debug::thread_started();
+            debug::adopt(pl->g); debug::adopt(pl->f); for (auto& x : pl->a) debug::adopt(x);
             Interp child(shared, as_ref<Globals>(pl->g));
             child.task = st; child.caps = c; child.child_mem = cm; child.child_cpu_s = cc; child.child_timeout_ms = ct; child.deadline_ns = dl; child.file = fl;
             Value result; bool failed = false; std::string et, em;
@@ -948,6 +984,7 @@ Value Interp::spawn(const Value& f, std::vector<Value> args) {
             std::lock_guard lk(st->m);
             st->result = std::move(result); st->failed = failed; st->error_type = et; st->error_msg = em; st->done = true;
         }
+        debug::thread_finished();
         Heap::instance().active_tasks.fetch_sub(1);
         st->cv.notify_all();
     });
@@ -958,8 +995,10 @@ Value Interp::await(const Value& tv) {
     if (!t) { if (auto* l = as<List>(tv)) { auto out = make<List>(); for (auto& x : l->items) out->push(await(x)); return obj(out); } return tv; }
     {
         std::unique_lock g(t->st->m);
-        while (!t->st->done) { t->st->cv.wait_for(g, std::chrono::milliseconds(20)); if (sh->interrupt.load() || (task && task->cancel.load())) { t->st->cancel = true; } }
+        debug::Blocked w(*this, "await");
+        while (!t->st->done) { t->st->cv.wait_for(g, std::chrono::milliseconds(20)); if (sh->interrupt.load() || (task && task->cancel.load())) { t->st->cancel = true; } if (!t->st->done) w.poll(); }
     }
+    debug::adopt(t->st->result);
     if (t->th.joinable()) t->th.join();
     if (t->st->failed) {
         std::string ty = sh->errors.count(t->st->error_type) ? t->st->error_type : "Error";

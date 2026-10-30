@@ -118,6 +118,7 @@ private:
             return;
         }
         case NK::For: {
+            if (n.s == "ref") { exec_node(n); return; }   // write-through element references: tree-walker
             emit(Opc::Line, n.line);
             expr(*n.kids[0]);
             emit(Opc::Iter);
@@ -178,7 +179,8 @@ private:
             if (n.k != NK::Coalesce) emit(Opc::Unary, 2);   // && and || yield bool
             return;
         }
-        case NK::Call: for (auto& k : n.kids) expr(*k); emit(Opc::Call, int(n.kids.size()) - 1, 0, line); return;
+        case NK::Call: if (n.wb) { emit(Opc::EvalNode, node(keep(n)), 0, line); return; }
+            for (auto& k : n.kids) expr(*k); emit(Opc::Call, int(n.kids.size()) - 1, 0, line); return;
         case NK::Index: expr(*n.kids[0]); expr(*n.kids[1]); emit(Opc::GetIndex, 0, 0, line); return;
         case NK::Field: expr(*n.kids[0]); emit(Opc::GetField, name(n.s), 0, line); return;
         case NK::OptField: expr(*n.kids[0]); emit(Opc::OptField, name(n.s), 0, line); return;

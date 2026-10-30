@@ -6,3 +6,4 @@ bindings/android/.gradle/
 bindings/android/**/build/
 bindings/android/**/.cxx/
 build-asan/
+build-tsan/

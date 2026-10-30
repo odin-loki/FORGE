@@ -59,6 +59,7 @@ struct Node {
     std::string s;               // op / name / string literal / shell kind
     std::int64_t i = 0; double d = 0;
     bool flag = false;           // let: const; using: declares var; field: optional
+    bool wb = false;             // Call: may bind lvalue arguments to non-const T& parameters (write back after the call)
     VarRef var;                  // Var, Let, For, FnStmt, Using, Import, catch var
     std::shared_ptr<TypeAnn> type;
     std::vector<NodeP> kids;
@@ -70,7 +71,7 @@ struct Node {
     std::vector<int> locals;     // Block: slots declared here, released in reverse order at block exit (RAII)
 };
 
-struct Param { std::string name; int slot = 0; std::shared_ptr<TypeAnn> type; NodeP dflt; bool by_ref = false; char conv = 0; };   // conv: 'i' int, 'f' double (implicit arithmetic conversion)
+struct Param { std::string name; int slot = 0; std::shared_ptr<TypeAnn> type; NodeP dflt; bool by_ref = false; bool out = false; char conv = 0; };   // out: non-const T& (written back to the caller's lvalue)   // conv: 'i' int, 'f' double (implicit arithmetic conversion)
 
 struct FnDecl {
     std::string name; int line = 0;
@@ -79,6 +80,7 @@ struct FnDecl {
     NodeP body;
     int nslots = 0;
     bool is_method = false;      // slot 0 = self
+    bool has_out = false;        // some parameter is a non-const reference
     bool is_top = false;         // program / module / REPL entry
     bool has_main = false;       // program defines int main(): run it after the top-level statements
     std::string file;

@@ -62,6 +62,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     sh.limits.max_steps = o.max_steps; sh.limits.timeout_ms = o.timeout_ms; sh.limits.heap_bytes = o.heap_bytes; sh.limits.max_depth = o.max_depth;
     sh.caps = Caps{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
     sh.use_vm = o.use_vm; sh.jit_threshold = std::max(1, o.jit_threshold);
+    Heap::instance().debug = o.debug; debug::stall_ms = o.deadlock_ms;
     sh.argv = o.argv;
     script_argv() = o.argv;
     if (o.out) sh.out = o.out;

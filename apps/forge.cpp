@@ -60,7 +60,7 @@ int usage() {
         "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
-        "      [--tree] tree-walker only  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
+        "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
         "  (strict loading: FORGE_REQUIRE_SIGNED=1 and/or FORGE_TRUSTED_KEYS=<hex>[,<hex>])");
     return 2;
 }
@@ -329,6 +329,7 @@ int cmd_script(int argc, char** argv) {
         auto val = [&](const char* what) -> std::string { if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + what); return argv[++i]; };
         if (s == "-e") { code = val("-e"); have_code = true; ++i; break; }
         else if (s == "--tree") o.use_vm = false;
+        else if (s == "--debug") o.debug = true;
         else if (s == "--timeout") o.timeout_ms = std::stoull(val("--timeout"));
         else if (s == "--max-steps") o.max_steps = std::stoull(val("--max-steps"));
         else if (s == "--heap") o.heap_bytes = std::stoull(val("--heap"));

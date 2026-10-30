@@ -17,6 +17,8 @@ struct options {
     std::uint64_t heap_bytes = 0;       // managed heap cap; 0 = forge::mem budget only
     int max_depth = 800;
     bool use_vm = true;                 // compile hot functions and whole scripts to bytecode
+    bool debug = false;                 // race detector + lock-order / stall deadlock detector (slower)
+    std::uint64_t deadlock_ms = 1000;   // debug: how long every thread may be blocked before DeadlockError
     int jit_threshold = 2;              // calls before a function is compiled
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
     std::vector<std::string> argv;      // visible to scripts as `args`

@@ -216,6 +216,47 @@ TEST(borrow_rules_while_iterating) {
     EXPECT("std::vector<int> v{1, 2, 3};\nfor (int& x : v) { if (x == 2) break; }\nv.erase(v.begin()); std::println(\"{}\", v.size());", "2\n");
 }
 
+TEST(references_write_through) {
+    EXPECT("void inc(int& x) { ++x; }\nvoid set(std::string& s) { s = \"new\"; }\nstruct P { int v = 0; };\nint a = 1; inc(a); inc(a);\nstd::string s = \"old\"; set(s);\nstd::vector<int> v{1, 2}; inc(v[1]);\nP p; inc(p.v);\nstd::println(\"{} {} {} {}\", a, s, v[1], p.v);",
+           "3 new 3 1\n");
+    EXPECT("auto twice = [](double& d) { d *= 2; };\ndouble x = 1.5; twice(x);\nstd::vector<int> v{1, 2, 3};\nfor (int& e : v) e *= 10;\nstd::for_each(v.begin(), v.end(), [](int& e) { e += 1; });\nstd::map<std::string, int> m{{\"a\", 1}};\nfor (auto& [k, n] : m) n += 5;\nstd::string w = \"abc\"; for (char& c : w) c = std::toupper(c);\nstd::println(\"{} {} {} {}\", x, v, m[\"a\"], w);",
+           "3 [11, 21, 31] 6 ABC\n");
+    EXPECT("void by_value(int x) { x = 9; }\nvoid by_cref(const int& x) { }\nint a = 1; by_value(a); by_cref(a); std::println(\"{}\", a);", "1\n");
+}
+
+TEST(debug_race_and_deadlock_detection) {
+    script::options o; o.debug = true; o.deadlock_ms = 200;
+    auto got = run(R"CPP(
+int main() {
+    forge::shared<std::shared_ptr<std::vector<int>>> s(std::make_shared<std::vector<int>>());
+    auto t = std::async([&]() {
+        std::shared_ptr<std::vector<int>> leaked;
+        s.with([&](auto& p) { leaked = p; });
+        leaked->push_back(1);   // outside the lock
+        return 0;
+    });
+    try { t.get(); } catch (const RaceError&) { std::println("race"); }
+    auto a = forge::shared<int>(0); auto b = forge::shared<int>(0);
+    auto t1 = std::async([&]() { a.with([&](auto& x) { std::this_thread::sleep_for(std::chrono::milliseconds(50)); b.with([](auto& y) { y = y + 1; }); }); });
+    auto t2 = std::async([&]() { std::this_thread::sleep_for(std::chrono::milliseconds(10)); b.with([&](auto& y) { a.with([](auto& x) { x = x + 1; }); }); });
+    int dl = 0;
+    try { t1.get(); } catch (const DeadlockError&) { ++dl; }
+    try { t2.get(); } catch (const DeadlockError&) { ++dl; }
+    std::println("inversions {}", dl);
+    forge::channel<int> ch(0);
+    try { ch.recv(); } catch (const DeadlockError&) { std::println("stall"); }
+    auto ok = std::async([](forge::channel<int> c) { c.send(7); return 0; }, ch);
+    std::println("recv {}", ch.recv());
+    ok.get();
+    return 0;
+}
+)CPP", o);
+    CHECK_MSG(got == "race\ninversions 1\nstall\nrecv 7\n", "got:\n%s", got.c_str());
+    // Without --debug the same leak is not checked (and the program still runs).
+    auto plain = run("forge::shared<int> s(1);\nstd::println(\"{}\", s.with([](auto& x) { return x + 1; }));");
+    CHECK(plain == "2\n");
+}
+
 TEST(arc_weak_and_cycles) {
     EXPECT(R"CPP(
 struct Node { std::shared_ptr<Node> other; };

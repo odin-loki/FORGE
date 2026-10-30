@@ -611,7 +611,8 @@ void install_builtins(Shared& sh) {
         auto st = as<Channel>(a[0])->st;
         std::unordered_map<const Obj*, Value> memo; Value v = deep_copy(in, a[1], memo);
         std::unique_lock g(st->m);
-        while (!st->closed && st->cap && st->q.size() >= st->cap) { st->cv.wait_for(g, std::chrono::milliseconds(20)); g.unlock(); in.step(); g.lock(); }
+        { debug::Blocked w(in, "channel send");
+          while (!st->closed && st->cap && st->q.size() >= st->cap) { st->cv.wait_for(g, std::chrono::milliseconds(20)); g.unlock(); in.step(); g.lock(); if (st->q.size() >= st->cap) w.poll(); } }
         if (st->closed) in.raise("ValueError", "send on a closed channel");
         st->q.push_back(std::move(v)); st->cv.notify_all(); return Nil{};
     });
@@ -619,12 +620,14 @@ void install_builtins(Shared& sh) {
         auto st = as<Channel>(a[0])->st;
         std::uint64_t end = a.size() > 1 && !is_nil(a[1]) ? os::monotonic_ns() + std::uint64_t(f_of(in, a[1], "timeout") * 1e6) : 0;
         std::unique_lock g(st->m);
+        std::optional<debug::Blocked> w; if (!end) w.emplace(in, "channel receive");
         while (st->q.empty() && !st->closed) {
             if (end && os::monotonic_ns() >= end) return Nil{};
             st->cv.wait_for(g, std::chrono::milliseconds(20)); g.unlock(); in.step(); g.lock();
+            if (w && st->q.empty() && !st->closed) w->poll();
         }
         if (st->q.empty()) return Nil{};
-        Value v = std::move(st->q.front()); st->q.pop_front(); st->cv.notify_all(); return v;
+        Value v = std::move(st->q.front()); st->q.pop_front(); st->cv.notify_all(); debug::adopt(v); return v;
     });
     C["close"] = native("channel.close", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     C["get_len"] = native("channel.len", 1, 1, [](Interp&, Args& a) -> Value { auto st = as<Channel>(a[0])->st; std::lock_guard g(st->m); return std::int64_t(st->q.size()); });

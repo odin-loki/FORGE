@@ -130,6 +130,19 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
         while (iter_next(*it, a, n.flag ? &b : nullptr)) {
             store(n.var, env, a);
             if (n.flag) store(second, env, b);
+            if (n.s == "ref") {   // for (T& x : c): assignments to x write through to the element
+                // Only a changed binding is written back, so writes made through the container itself
+                // (m[k] = x + 1) are not overwritten by the stale reference value.
+                auto same = [&](const Value& x, const Value& y) { auto* p = std::get_if<Ref<Obj>>(&x); auto* q = std::get_if<Ref<Obj>>(&y); return (p && q) ? p->get() == q->get() : (!p && !q && x == y); };
+                Value a0 = a, b0 = b;
+                Flow f = exec_block(*n.kids[1], env);   // (block locals are cleared; the loop variables live in the outer block)
+                Value a1 = load(n.var, env), b1 = n.flag ? load(second, env) : Value(Nil{});
+                if (!same(a0, a1) || (n.flag && !same(b0, b1))) iter_writeback(*it, a1, n.flag ? &b1 : nullptr);
+                if (f == Flow::Break) break;
+                if (f == Flow::Return) return f;
+                step();
+                continue;
+            }
             Flow f = exec_block(*n.kids[1], env);
             if (f == Flow::Break) break;
             if (f == Flow::Return) return f;
@@ -195,6 +208,7 @@ Value Interp::eval(const Node& n, const Ref<Env>& env) {
     case NK::Move: return move_from(*n.kids[0], env);
     case NK::Coalesce: { Value a = eval(*n.kids[0], env); return is_nil(a) ? eval(*n.kids[1], env) : a; }
     case NK::Call: {
+        if (n.wb) return call_writeback(n, env);
         Value f = eval(*n.kids[0], env);
         std::vector<Value> args; args.reserve(n.kids.size() - 1);
         for (std::size_t i = 1; i < n.kids.size(); ++i) args.push_back(eval(*n.kids[i], env));
@@ -254,6 +268,46 @@ Value Interp::move_from(const Node& t, const Ref<Env>& env) {
         else if (auto* mp = as<Map>(o)) mp->set(k, m);
     }
     return v;
+}
+
+Value Interp::call_ref(const Value& f, std::vector<Value>& args) {
+    const Function* target = nullptr;
+    if (auto* fn = as<Function>(f)) target = fn; else if (auto* b = as<Bound>(f)) target = as<Function>(b->fn);
+    std::vector<Value> keep = args;   // call() may consume the argument vector
+    ref_back_fn = nullptr; ref_back.clear();
+    Value r = call(f, keep);
+    if (target && ref_back_fn == target) for (auto& [i, v] : ref_back) if (i < args.size()) args[i] = v;
+    ref_back.clear(); ref_back_fn = nullptr;
+    return r;
+}
+// f(x, v[i], o.m) where f takes `T&`: lvalue arguments are evaluated once (object and index cached) and
+// receive the parameter's final value after the call, so `void inc(int& x) { ++x; }` works on scalars.
+Value Interp::call_writeback(const Node& n, const Ref<Env>& env) {
+    Value f = eval(*n.kids[0], env);
+    struct LV { const Node* n; Value o, i; };
+    std::vector<LV> lv; std::vector<Value> args;
+    for (std::size_t k = 1; k < n.kids.size(); ++k) {
+        const Node& a = *n.kids[k];
+        if (a.k == NK::Field) { Value o = eval(*a.kids[0], env); line = a.line; args.push_back(get_field(o, a.s)); lv.push_back({&a, o, Nil{}}); }
+        else if (a.k == NK::Index) { Value o = eval(*a.kids[0], env), i = eval(*a.kids[1], env); line = a.line; args.push_back(get_index(o, i)); lv.push_back({&a, o, i}); }
+        else { args.push_back(eval(a, env)); lv.push_back({&a, Nil{}, Nil{}}); }
+    }
+    const Function* target = nullptr;
+    if (auto* fn = as<Function>(f)) target = fn;
+    else if (auto* b = as<Bound>(f)) target = as<Function>(b->fn);
+    ref_back_fn = nullptr; ref_back.clear();
+    Value r = call(f, args, n.line);
+    if (!target || ref_back_fn != target) return r;
+    auto back = std::move(ref_back); ref_back.clear(); ref_back_fn = nullptr;
+    for (auto& [i, v] : back) {
+        if (i >= lv.size()) continue;
+        auto& l = lv[i];
+        auto same = [&](const Value& cur) { auto* a = std::get_if<Ref<Obj>>(&cur); auto* b = std::get_if<Ref<Obj>>(&v); return a && b && a->get() == b->get(); };
+        if (l.n->k == NK::Var) { if (!same(load(l.n->var, env))) store(l.n->var, env, v); }
+        else if (l.n->k == NK::Field) { if (!same(get_field(l.o, l.n->s))) set_field(l.o, l.n->s, v); }
+        else if (l.n->k == NK::Index) { if (!same(get_index(l.o, l.i))) set_index(l.o, l.i, v); }
+    }
+    return r;
 }
 
 } // namespace forge::script
