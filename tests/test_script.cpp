@@ -333,3 +333,22 @@ TEST(errors_carry_lines_and_traces) {
     CHECK(!r.ok); CHECK(r.error_type == "IndexError");
     CHECK_MSG(r.error.find("inner") != std::string::npos && r.error.find("outer") != std::string::npos, "%s", r.error.c_str());
 }
+TEST(os_phase2_surface) {
+    EXPECT(R"CPP(
+auto d = fs.make_temp_dir("fst-");
+fs.write_atomic(path.join(d, "a.cpp"), "x");
+fs.mkdir(path.join(d, "s"));
+fs.write(path.join(d, "s/b.cpp"), "yy");
+fs.copy(path.join(d, "s"), path.join(d, "t"));
+std::println("{}", fs.glob("**/*.cpp", d));
+std::println("{} {}", fs.walk(d).size(), fs.match("**/*.cpp", "x/y.cpp"));
+auto l = fs.lock(path.join(d, ".lock"));
+std::println("{}", fs.lock(path.join(d, ".lock"), false) == nullptr);
+l.unlock();
+std::println("{}", fs.lock(path.join(d, ".lock"), false) != nullptr);
+std::println("{} {}", time.iso(0), time.parse("2026-10-30T11:00:00+11:00"));
+std::println("{} {}", os.user()["name"].size() > 0, os.memory()["total"] > 0);
+fs.remove(d);
+std::println("{}", fs.exists(d));
+)CPP", "[\"a.cpp\", \"s/b.cpp\", \"t/b.cpp\"]\n5 true\ntrue\ntrue\n1970-01-01T00:00:00.000Z 1793318400\ntrue true\nfalse\n");
+}

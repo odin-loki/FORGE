@@ -20,3 +20,8 @@
 #include <forge/os/process.hpp>
 #include <forge/os/pipe.hpp>
 #include <forge/os/signal.hpp>
+#include <forge/os/fs.hpp>
+#include <forge/os/users.hpp>
+#include <forge/os/time.hpp>
+#include <forge/os/sysinfo.hpp>
+#include <forge/os/console.hpp>

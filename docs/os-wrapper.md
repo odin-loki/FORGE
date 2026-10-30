@@ -67,6 +67,13 @@ can branch on features rather than on platform names.
 ## Phasing
 
 1. **Done:** `process` + `pipe` + `signal` (needed by scripting `sh {}` blocks and `run`). `process.hpp`: `spawn_wait(spawn_spec)` (argv/env/cwd, stdin data, separate or merged stdout/stderr, output cap, timeout with process-group / Job Object kill, memory/CPU/open-file limits), RAII `child` (stream, wait, kill; POSIX), `find_executable`, `list_processes`/`process_info` (Linux). `pipe.hpp`: RAII `pipe_end`, `make_pipe` (POSIX). `signal.hpp`: `signal_id`, `send_signal` (process or group). Tests: `tests/test_os_process.cpp`, plus cross compile/link checks for FreeBSD, macOS, Windows and musl.
-2. `fs` extensions, `users`, `time`, `sysinfo`, `console`.
+2. **Done:** `fs` extensions, `users`, `time`, `sysinfo`, `console`.
+   - `fs.hpp` (`forge::os::fs`): `copy`/`copy_tree`/`move` (moves across devices fall back to copy then remove), `remove_all`, `symlink`/`hardlink`/`read_link`, `mode`/`chmod`/`chown`, `mtime_ns`/`set_mtime_ns`/`touch`, `glob_match` (`*`, `?`, `**`, `[a-z]`, `[!x]`, `\` escapes) and `glob(pattern, base)`, recursive `walk` (depth limit, hidden filter, symlink following), RAII `file_lock` (flock / LockFileEx, shared or exclusive, wait or try), `disk_usage`, `mounts` (Linux and Windows), `make_temp_file`/`make_temp_dir`, `write_file_atomic` (temp file, fsync, rename).
+   - `users.hpp`: `current_user`, `lookup_user`/`lookup_uid` with groups (POSIX), `is_elevated` (root or an elevated token), and `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` following XDG, `~/Library` or `%APPDATA%`.
+   - `time.hpp`: `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name`, `format_iso8601`/`format_local_iso8601`/`parse_iso8601` (RFC 3339 with offsets and fractions up to ns), and `timer_queue` (`after`, `every`, `cancel` on one worker thread).
+   - `sysinfo.hpp`: `release_info` (os-release / sysctl / RtlGetVersion), `uptime_seconds`, `load_average`, `memory()` (available, swap, cgroup v1/v2 limit), `per_cpu_times` + `cpu_usage` (Linux), `self_usage` (rusage / GetProcessTimes).
+   - `console.hpp` (`forge::os::console`): `is_tty`, `size`, `enable_vt`, `color_enabled` (NO_COLOR / FORCE_COLOR / TERM=dumb), `paint`, RAII `mode_guard` (raw or no-echo), `read_password`, `confirm`.
+   - Scripts: `fs.copy/move/glob/walk/match/symlink/readlink/chmod/mode/touch/set_mtime/write_atomic/temp_file/make_temp_dir/disk_usage/lock`, `os.user/dir/release/uptime/loadavg/memory/is_tty/term_size`, `time.iso/parse/utc_offset/zone`.
+   - Tests: `tests/test_os_sys.cpp` (also cross-compiled for FreeBSD, macOS, Windows and musl) and `os_phase2_surface` in `tests/test_script.cpp`.
 3. `net` extensions, `file_watch` recursive, `service`, `registry`.
 4. `devices`, `clipboard`, remaining platform gaps.

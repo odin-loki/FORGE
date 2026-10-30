@@ -7,7 +7,12 @@
 #include "parser.hpp"
 #include <forge/hash/blake3.hpp>
 #include <forge/json/json.hpp>
+#include <forge/os/console.hpp>
 #include <forge/os/file_watch.hpp>
+#include <forge/os/fs.hpp>
+#include <forge/os/sysinfo.hpp>
+#include <forge/os/time.hpp>
+#include <forge/os/users.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
 #include <forge/os/signal.hpp>
@@ -392,6 +397,42 @@ void install_builtins(Shared& sh) {
             as<Handle>(h)->props["path"] = a[0];
             return h;
         })
+        .def("copy", 2, 3, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.fs, "file access"); bool ow = a.size() > 2 && in.truthy(a[2]);
+            ok(in, os::fs::copy(s_of(in, a[0], "fs.copy"), s_of(in, a[1], "fs.copy"), {ow, true, false, !ow})); return Nil{};
+        })
+        .def("move", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::move(s_of(in, a[0], "fs.move"), s_of(in, a[1], "fs.move"))); return Nil{}; })
+        .def("glob", 1, 2, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.fs, "file access"); auto r = ok(in, os::fs::glob(s_of(in, a[0], "fs.glob"), a.size() > 1 ? s_of(in, a[1], "fs.glob base") : "."));
+            auto l = make<List>(); for (auto& p : r) l->push(strv(p)); return obj(l);
+        })
+        .def("walk", 1, 2, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.fs, "file access"); os::fs::walk_opts o; if (a.size() > 1) o.max_depth = int(i_of(in, a[1], "fs.walk depth"));
+            auto r = ok(in, os::fs::walk(s_of(in, a[0], "fs.walk"), o)); auto l = make<List>();
+            for (auto& e : r) { auto m = make<Map>(); m->set_str("path", strv(e.path)); m->set_str("is_dir", e.is_dir); m->set_str("is_link", e.is_link); m->set_str("size", std::int64_t(e.size)); m->set_str("depth", std::int64_t(e.depth)); l->push(obj(m)); }
+            return obj(l);
+        })
+        .def("match", 2, 2, [](Interp& in, Args& a) -> Value { return os::fs::glob_match(s_of(in, a[0], "fs.match"), s_of(in, a[1], "fs.match")); })
+        .def("symlink", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::symlink(s_of(in, a[0], "fs.symlink"), s_of(in, a[1], "fs.symlink"))); return Nil{}; })
+        .def("readlink", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::read_link(s_of(in, a[0], "fs.readlink")))); })
+        .def("chmod", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::chmod(s_of(in, a[0], "fs.chmod"), unsigned(i_of(in, a[1], "fs.chmod mode")))); return Nil{}; })
+        .def("mode", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return std::int64_t(ok(in, os::fs::mode(s_of(in, a[0], "fs.mode")))); })
+        .def("touch", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::touch(s_of(in, a[0], "fs.touch"))); return Nil{}; })
+        .def("set_mtime", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::set_mtime_ns(s_of(in, a[0], "fs.set_mtime"), std::int64_t(f_of(in, a[1], "mtime") * 1e9))); return Nil{}; })
+        .def("write_atomic", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); auto d = in.str(a[1]); ok(in, os::fs::write_file_atomic(s_of(in, a[0], "fs.write_atomic"), d)); return std::int64_t(d.size()); })
+        .def("temp_file", 0, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::make_temp_file(a.empty() ? "forge-" : s_of(in, a[0], "fs.temp_file")))); })
+        .def("make_temp_dir", 0, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::make_temp_dir(a.empty() ? "forge-" : s_of(in, a[0], "fs.make_temp_dir")))); })
+        .def("disk_usage", 1, 1, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.fs, "file access"); auto d = ok(in, os::fs::disk_usage(s_of(in, a[0], "fs.disk_usage"))); auto m = make<Map>();
+            m->set_str("total", std::int64_t(d.total)); m->set_str("free", std::int64_t(d.free)); m->set_str("available", std::int64_t(d.available)); return obj(m);
+        })
+        .def("lock", 1, 2, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.fs, "file access"); bool wait = a.size() < 2 || in.truthy(a[1]);
+            auto r = os::fs::file_lock::acquire(s_of(in, a[0], "fs.lock"), true, wait);
+            if (!r) { if (!wait) return Nil{}; in.raise("IOError", r.err.what); }
+            auto l = std::make_shared<os::fs::file_lock>(std::move(r.value));
+            return make_handle("lock", l, [l]() { l->unlock(); });
+        })
         .def("watch", 1, 1, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access");
             auto w = std::make_shared<os::file_watcher>();
@@ -416,6 +457,7 @@ void install_builtins(Shared& sh) {
         for (auto& e : w->poll(to)) { auto m = make<Map>(); m->set_str("path", strv(e.path)); m->set_str("kind", strv(os::watch_kind_name(e.kind))); l->push(obj(m)); }
         return obj(l);
     });
+    M["handle:lock"]["unlock"] = native("lock.unlock", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     M["handle"]["dispose"] = native("handle.dispose", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     M["handle"]["get_disposed"] = native("handle.disposed", 1, 1, [](Interp&, Args& a) -> Value { return as<Handle>(a[0])->disposed; });
     M["handle"]["get_kind"] = native("handle.kind", 1, 1, [](Interp&, Args& a) -> Value { return strv(as<Handle>(a[0])->kind); });
@@ -454,6 +496,33 @@ void install_builtins(Shared& sh) {
             for (auto& p : ps.value) { auto m = make<Map>(); m->set_str("pid", std::int64_t(p.pid)); m->set_str("ppid", std::int64_t(p.ppid)); m->set_str("name", strv(p.name)); m->set_str("rss", std::int64_t(p.rss_bytes)); l->push(obj(m)); }
             return obj(l);
         })
+        .def("user", 0, 0, [](Interp&, Args&) -> Value {
+            auto u = os::current_user(); auto m = make<Map>();
+            m->set_str("name", strv(u.name)); m->set_str("home", strv(u.home)); m->set_str("shell", strv(u.shell)); m->set_str("uid", std::int64_t(u.uid)); m->set_str("gid", std::int64_t(u.gid));
+            auto g = make<List>(); for (auto& x : u.groups) g->push(strv(x)); m->set_str("groups", obj(g)); m->set_str("elevated", os::is_elevated());
+            return obj(m);
+        })
+        .def("dir", 1, 1, [](Interp& in, Args& a) -> Value {
+            auto k = s_of(in, a[0], "os.dir"); using D = os::user_dir;
+            static const std::pair<const char*, D> t[] = {{"config", D::config}, {"cache", D::cache}, {"data", D::data}, {"state", D::state}, {"runtime", D::runtime}, {"documents", D::documents}, {"downloads", D::downloads}, {"desktop", D::desktop}};
+            for (auto& [n, d] : t) if (k == n) return strv(os::user_directory(d));
+            in.raise("ValueError", "os.dir: unknown directory '" + k + "' (config, cache, data, state, runtime, documents, downloads, desktop)"); return Nil{};
+        })
+        .def("release", 0, 0, [](Interp&, Args&) -> Value {
+            auto r = os::release_info(); auto m = make<Map>();
+            m->set_str("name", strv(r.name)); m->set_str("version", strv(r.version)); m->set_str("id", strv(r.id)); m->set_str("kernel", strv(r.kernel)); m->set_str("kernel_version", strv(r.kernel_version)); m->set_str("arch", strv(r.arch)); m->set_str("pretty", strv(r.pretty));
+            return obj(m);
+        })
+        .def("uptime", 0, 0, [](Interp& in, Args&) -> Value { return ok(in, os::uptime_seconds()); })
+        .def("loadavg", 0, 0, [](Interp& in, Args&) -> Value { auto l = ok(in, os::load_average()); auto v = make<List>(); v->push(l.one); v->push(l.five); v->push(l.fifteen); return obj(v); })
+        .def("memory", 0, 0, [](Interp&, Args&) -> Value {
+            auto x = os::memory(); auto m = make<Map>();
+            m->set_str("total", std::int64_t(x.total)); m->set_str("available", std::int64_t(x.available)); m->set_str("free", std::int64_t(x.free));
+            m->set_str("swap_total", std::int64_t(x.swap_total)); m->set_str("swap_free", std::int64_t(x.swap_free)); m->set_str("cgroup_limit", std::int64_t(x.cgroup_limit));
+            return obj(m);
+        })
+        .def("is_tty", 0, 1, [](Interp& in, Args& a) -> Value { int s = a.empty() ? 1 : int(i_of(in, a[0], "os.is_tty")); return os::console::is_tty(os::console::stream(s < 0 || s > 2 ? 1 : s)); })
+        .def("term_size", 0, 0, [](Interp&, Args&) -> Value { auto s = os::console::size(); auto l = make<List>(); l->push(std::int64_t(s.value.cols)); l->push(std::int64_t(s.value.rows)); return obj(l); })
         .def("signal", 2, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.proc, "signals");
             os::signal_id sg{}; if (!os::sig_from_name(s_of(in, a[1], "os.signal"), sg)) in.raise("ValueError", "unknown signal " + in.str(a[1]));
@@ -462,6 +531,13 @@ void install_builtins(Shared& sh) {
     B["time"] = Lib("time")
         .def("now", 0, 0, [](Interp&, Args&) -> Value { return double(os::wall_ns()) / 1e9; })
         .def("ms", 0, 0, [](Interp&, Args&) -> Value { return double(os::monotonic_ns()) / 1e6; })
+        .def("iso", 0, 2, [](Interp& in, Args& a) -> Value {
+            std::int64_t ns = a.empty() ? os::unix_time_ns() : std::int64_t(f_of(in, a[0], "time") * 1e9);
+            bool local = a.size() > 1 && in.truthy(a[1]); return strv(local ? os::format_local_iso8601(ns) : os::format_iso8601(ns));
+        })
+        .def("parse", 1, 1, [](Interp& in, Args& a) -> Value { auto r = os::parse_iso8601(s_of(in, a[0], "time.parse")); if (!r) in.raise("ValueError", r.err.what); return double(r.value) / 1e9; })
+        .def("utc_offset", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::utc_offset_seconds()); })
+        .def("zone", 0, 0, [](Interp&, Args&) -> Value { return strv(os::timezone_name()); })
         .def("ns", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::monotonic_ns()); }).done();
 
     // ------------------------------------------------ processes (forge::os::process)

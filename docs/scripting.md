@@ -250,8 +250,9 @@ let procs = pwsh { Get-Process | ConvertTo-Json }.json   # parsed into lists/map
 
 ## Built-ins (from the OS wrapper)
 
-`fs.*` (read, write, glob, walk, copy, remove, watch), `os.*` (env, cwd, platform, caps, sysinfo,
-user), `proc.*` (spawn, kill, list), `net.*` (resolve, http_get, tcp), `time.*`, `json.*`, `path.*`,
+`fs.*` (read, write, append, open, copy, move, glob, walk, match, symlink, chmod, touch, write_atomic,
+temp_file, make_temp_dir, disk_usage, lock, remove, watch), `os.*` (env, cwd, platform, caps, user, dir,
+release, uptime, loadavg, memory, is_tty, term_size), `proc.*` (spawn, kill, list), `net.*` (resolve, http_get, tcp), `time.*`, `json.*`, `path.*`,
 `str.*`, `re.*` (regex), `reg.*` (Windows).
 
 ## FORGE built-ins

@@ -504,6 +504,8 @@ Value Interp::get_field(const Value& o, const std::string& name, bool optional) 
         return get_field(e, name, optional);
     }
     if (auto* m = as<Map>(o)) {
+        // Library maps (frozen, holding natives) resolve their own members first: fs.remove is the library call.
+        if (m->frozen) if (auto* v = m->find_str(name); v && as<Native>(*v)) return *v;
         if (auto* f = find_method_in(*sh, "map", name)) return bind(*f);
         if (auto* v = m->find_str(name)) return *v;
         if (auto* f = find_method_in(*sh, "any", name)) return bind(*f);
