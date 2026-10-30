@@ -138,7 +138,7 @@ struct collation_options {
 class collator {
 public:
     // locale: "" / "root" = DUCET; tailorings for sv, fi, da, nb, nn, no, de-phonebook (de-u-co-phonebk),
-    // es, tr, az, pl, cs, sk, hr, et, lt, lv, hu, is, ro, cy and ja/zh/ko (script reordering only).
+    // es, tr, az, pl, cs, sk, hr, et, lt, lv, hu, is, ro, cy; fr-CA uses backwards secondary.
     explicit collator(std::string_view locale = {}, collation_options o = {});
     ~collator();
     collator(collator&&) noexcept;
@@ -198,8 +198,9 @@ public:
     // Backtracking budget per search (default 1e7 steps); exceeding it fails the match and sets this flag.
     void set_step_limit(std::uint64_t n);
     bool step_limit_hit() const;
+    struct impl;   // engine state (opaque)
 private:
-    struct impl; std::shared_ptr<impl> p_;
+    std::shared_ptr<impl> p_;
 };
 
 // ---------------------------------------------------------------- legacy encodings
