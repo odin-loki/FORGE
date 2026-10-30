@@ -1,0 +1,55 @@
+#pragma once
+// forge::script — the FORGE managed scripting runtime (see docs/scripting.md).
+// ARC + backup cycle collector, RAII handles, hybrid tree-walker / verified bytecode VM, written in safe
+// ISO C++23 (no raw owning pointers, no unsafe escape hatch in the language).
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace forge::script {
+
+struct options {
+    std::uint64_t max_steps = 0;        // 0 = unlimited
+    std::uint64_t timeout_ms = 0;       // whole-run wall clock; 0 = unlimited
+    std::uint64_t heap_bytes = 0;       // managed heap cap; 0 = forge::mem budget only
+    int max_depth = 800;
+    bool use_vm = true;                 // compile hot functions and whole scripts to bytecode
+    int jit_threshold = 2;              // calls before a function is compiled
+    bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
+    std::vector<std::string> argv;      // visible to scripts as `args`
+    std::function<void(std::string_view)> out;   // print(); default stdout
+};
+
+struct result {
+    bool ok = true;
+    std::string value;                  // repr of the result (eval / REPL); empty for nil
+    std::string error_type, error;      // e.g. "TypeError", "TypeError: ... \n  at f (x.fs:3)"
+    int line = 0;
+    int exit_code = 0;                  // int main()'s return value / std::exit(n); 1 on an uncaught error
+};
+
+class engine {
+public:
+    explicit engine(options o = {});
+    ~engine();
+    engine(const engine&) = delete; engine& operator=(const engine&) = delete;
+
+    result run_file(const std::string& path);
+    result run(std::string_view src, const std::string& name = "<string>");   // VM path if enabled
+    result eval(std::string_view src);                                       // tree-walker, keeps globals (REPL)
+    std::string disassemble(std::string_view src);                           // bytecode listing of a program
+    std::string type_of(std::string_view expr);
+    void interrupt();                                                          // async-safe: cancels the running script
+    void reset();                                                              // drop all globals
+    int repl();                                                                // interactive loop on stdin/stdout
+    std::string stats();
+
+    struct impl;
+private:
+    std::unique_ptr<impl> p_;
+};
+
+} // namespace forge::script

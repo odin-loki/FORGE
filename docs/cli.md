@@ -76,3 +76,17 @@ $B/forge verify s.fpk --pubkey dk.pub                 # ... s.fpk: VERIFIED
 $B/forge encrypt s.fpk -o sealed.fpk --new-key k.mkey
 FORGE_MODEL_KEY_FILE=k.mkey $B/forge inspect sealed.fpk
 ```
+
+## `forge script`
+
+```
+forge script <file.cpp> [args...]     # run a script; int main()'s return value is the exit status
+forge script -e '<code>' [args...]    # run a snippet
+forge script                          # interactive REPL (:help, :type, :dis, :mem, :gc, :vm on|off)
+  --tree          tree-walker only (default: compile to verified bytecode)
+  --timeout MS    wall-clock limit      --max-steps N   instruction budget
+  --heap BYTES    managed heap cap      --no-proc / --no-fs / --no-net   capability sandbox
+```
+
+Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md).
+Arguments after the file are available as `forge::args()`.

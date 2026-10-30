@@ -5,3 +5,4 @@ bindings/android/local.properties
 bindings/android/.gradle/
 bindings/android/**/build/
 bindings/android/**/.cxx/
+build-asan/

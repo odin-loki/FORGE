@@ -1,6 +1,6 @@
 # OS wrapper design (forge::os, full surface)
 
-Status: **design, not implemented.** This extends the existing header-only `forge::os` layer
+Status: **partially implemented** — process spawning with captured out/err/code, fs, env and json are exposed to scripts as `forge::sh/pwsh/cmd`, `forge::fs`, `forge::os`, `forge::json`; the remaining modules below are still design. This extends the existing header-only `forge::os` layer
 (`os/include/forge/os/`) into a complete, portable wrapper over the operating system. It is the
 foundation for the scripting layer in [scripting.md](scripting.md).
 

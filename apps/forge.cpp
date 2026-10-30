@@ -11,6 +11,7 @@
 #include <set>
 #include <chrono>
 #include <forge/grid/prims.hpp>
+#include <forge/script/script.hpp>
 
 using namespace forge;
 
@@ -57,6 +58,9 @@ int usage() {
         "  verify <model.fpk> [--pubkey <name.pub>]...      check hashes + signature (exit 1 on failure)\n"
         "  encrypt <in.fpk> -o <out.fpk> --key k.mkey | --new-key k.mkey   seal tensor data (XChaCha20-Poly1305);\n"
         "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
+        "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
+        "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
+        "      [--tree] tree-walker only  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
         "  (strict loading: FORGE_REQUIRE_SIGNED=1 and/or FORGE_TRUSTED_KEYS=<hex>[,<hex>])");
     return 2;
 }
@@ -315,9 +319,42 @@ int cmd_rpc_serve(const args& a) {
 
 } // namespace
 
+// forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
+int cmd_script(int argc, char** argv) {
+    forge::script::options o;
+    std::string file, code; bool have_code = false;
+    int i = 2;
+    for (; i < argc; ++i) {
+        std::string s = argv[i];
+        auto val = [&](const char* what) -> std::string { if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + what); return argv[++i]; };
+        if (s == "-e") { code = val("-e"); have_code = true; ++i; break; }
+        else if (s == "--tree") o.use_vm = false;
+        else if (s == "--timeout") o.timeout_ms = std::stoull(val("--timeout"));
+        else if (s == "--max-steps") o.max_steps = std::stoull(val("--max-steps"));
+        else if (s == "--heap") o.heap_bytes = std::stoull(val("--heap"));
+        else if (s == "--no-proc") o.allow_proc = false;
+        else if (s == "--no-fs") o.allow_fs = false;
+        else if (s == "--no-net") o.allow_net = false;
+        else if (s == "--") { ++i; if (i < argc) file = argv[i++]; break; }
+        else if (s.starts_with("--")) throw std::runtime_error("unknown script option " + s);
+        else { file = s; ++i; break; }
+    }
+    for (; i < argc; ++i) o.argv.push_back(argv[i]);
+    forge::script::engine e(o);
+    if (!have_code && file.empty()) return e.repl();
+    auto r = have_code ? e.run(code, "<-e>") : e.run_file(file);
+    std::fflush(stdout);
+    if (!r.ok) std::fprintf(stderr, "%s\n", r.error.c_str());
+    return r.exit_code;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     std::string c = argv[1];
+    if (c == "script") {
+        try { return cmd_script(argc, argv); }
+        catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
+    }
     try {
         auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos"});
         if (c == "info") return cmd_info();

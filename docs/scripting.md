@@ -1,6 +1,9 @@
 # FORGE scripting design (`forge script`)
 
-Status: **design, not implemented.** All higher-level features below are approved and in scope.
+Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
+cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
+Still to come: destructors at scope exit, borrow tracking beyond use-after-move, debug race/deadlock
+detection, pipelines/watch/schedules, AI commands, remote execution. See *Phasing* at the end.
 
 ## Purpose
 
@@ -9,41 +12,94 @@ Windows, Linux and macOS, because built-ins go through the [OS wrapper](os-wrapp
 a real shell, embedded blocks call it and give back structured results.
 
 ```
-forge script build.fs [args...]   # run a file
-forge script -e 'print(os.cpu_count())'
-forge script                      # REPL
+forge script build.cpp [args...]                  # run a file (int main() return value = exit status)
+forge script -e 'std::println("{}", 6 * 7);'      # run a snippet
+forge script                                      # REPL (`x + 2` without ';' prints the value)
+forge script --tree | --timeout MS | --max-steps N | --heap BYTES | --no-proc | --no-fs | --no-net ...
 ```
 
 ## Language
 
-A small managed language in the style of the .NET Micro Framework: dynamic by default, memory-safe by
-construction, with deterministic cleanup. There is **no `unsafe` keyword**, no pointers, no address-of,
-no pointer arithmetic and no way to reinterpret memory. Native code is reachable only through built-ins
-and vetted plugins.
+Scripts are written in an **interpreted, memory-safe subset of ISO C++23**. A script is ordinary-looking
+C++: top-level statements run first (like a REPL), then `int main()` if present. `#include <...>` lines
+are accepted and ignored; `#include "util.cpp"` loads another script and brings its names in.
 
-### Syntax
+Not allowed (rejected by the parser with a message saying what to use instead): raw pointers (`T*`),
+`new`/`delete`, address-of, `reinterpret_cast`/`const_cast`/C-style casts, pointer arithmetic, explicit
+destructor calls. Everything else that a typical tool script needs is supported:
 
-- `let x = 1` (rebindable), `const y = 2`, `if/elif/else`, `while`, `for x in xs`, `match`,
-  `fn name(a, b) { ... }`, closures, `return`, `break`, `continue`.
-- String interpolation `"hello ${name}"`, list/map literals `[1, 2]`, `{a: 1}`.
-- Pipes: `a |> f(b)` means `f(a, b)`; works for values and for command output.
-- `eval(src)` and `load(file)` for runtime code; `import "mod"` for modules.
+- Declarations: `int`/`long long`/`double`/`bool`/`char`/`std::string`/`auto`, `const`/`constexpr`,
+  several declarators, brace/paren initialisation, structured bindings `auto [k, v] = ...`.
+  Narrowing (`int x = 3.5;`) and assigning to a `const` are compile-time errors.
+- Control flow: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (incl. bindings), `switch`
+  with fall-through, `break`/`continue`, `try`/`catch`/`throw`/`throw;`, `catch (...)`.
+- Functions with defaults, by-value (copied) and by-reference parameters, recursion, templates
+  (type-erased), lambdas with `[=]`, `[&]`, `[x]`, `[&x]` captures and `mutable`.
+- Classes and structs with value semantics, constructors with init lists and delegation to base
+  constructors, `using Base::Base;`, virtual/override/pure virtual (abstract classes cannot be
+  instantiated), static members, operator overloading (`operator+`, `==`, `<`, `<=>`, `()`,
+  `= default` comparisons), `friend` free operators.
+- `enum`/`enum class`, `namespace` (nested, `using namespace`), `typedef`/`using` aliases.
+- Integer semantics match C++ (`/` truncates, `%` keeps the sign of the dividend) except that 64-bit
+  overflow throws `OverflowError` instead of being UB; division by zero throws `ArithmeticError`.
 
-### Type system
+Standard library surface (implemented natively, `std::` prefix optional after `using namespace std;`):
+`std::cout`/`cerr` with `endl`, `boolalpha`, `fixed`, `setprecision`, `setw`; `std::print`/`println`/
+`format` (full format specs); `std::string` (mutable, value semantics: `size`, `substr`, `find`,
+`rfind`, `find_first_of`, `push_back`, `append`, `insert`, `erase`, `replace`, `starts_with`, ...);
+`std::vector`, `std::map`/`unordered_map` (`operator[]` inserts a default), `std::set`/`unordered_set`,
+`std::pair`/`tuple`/`get<N>`, `std::optional`; iterators (`begin`/`end`, `find`, `it - v.begin()`,
+`it->first`); `<algorithm>`/`<numeric>`: `sort`, `stable_sort`, `reverse`, `find(_if)`, `count(_if)`,
+`any_of`/`all_of`/`none_of`, `for_each`, `min/max_element`, `fill`, `iota`, `binary_search`,
+`transform`, `accumulate`, and the `std::ranges::` forms; `<cmath>`, `<cctype>`, `to_string`, `stoi`,
+`stod`, `numeric_limits`; exceptions `std::exception`, `runtime_error`, `logic_error`,
+`invalid_argument`, `out_of_range`, ... with `what()`.
 
-- **Dynamic with optional annotations** (gradual typing): `fn add(a: int, b: int) -> int`. Annotations
-  are checked at call/assignment boundaries at run time and used by the compiler to pick specialised
-  opcodes; unannotated code stays fully dynamic.
-- Built-in types: `nil`, `bool`, `int` (64-bit, overflow throws `OverflowError`), `float`, `string`
-  (immutable UTF-8), `bytes`, `list`, `map`, `set`, `fn`, `handle` (opaque OS resource), `task`.
-- **Classes**: reference types, single inheritance, `init`/`dispose`, fields declared up front (no
-  ad-hoc field creation unless the class is marked `dynamic`).
-- **Structs**: value types, copied on assignment, no inheritance; good for small records.
-- **Interfaces**: named method sets; `implements` is checked when the class is defined; `x is Disposable`.
-- **Generics-lite**: type parameters on annotations only (`list<int>`, `map<string, Job>`,
-  `fn first<T>(xs: list<T>) -> T`). Erased at run time, checked at boundaries; no specialisation or
-  variance rules. Enough to document intent and catch mistakes without a heavy type checker.
-- `nil` safety: `T?` marks nullable annotations; `?.` and `??` operators.
+### Memory model
+
+- **Value types** (`std::string`, containers, structs/classes held by value) are copied on
+  copy-initialisation, by-value parameters and insertion into containers, exactly like C++.
+- `std::make_shared<T>` / `std::shared_ptr` share one object (ARC); `std::weak_ptr` (`lock`,
+  `expired`) does not keep it alive; the cycle collector reclaims `shared_ptr` cycles.
+- `std::make_unique<T>` / `std::unique_ptr` cannot be copied (`BorrowError`); `std::move` transfers it.
+- `std::move(x)` leaves `x` moved-from: any later read of `x` throws `BorrowError` (use-after-move is a
+  checked error, not UB). Scalars are unaffected, as in C++.
+- Dereferencing an empty pointer/optional or an `end()` iterator throws `NullPointerError` /
+  `IndexError`; `at()`, `substr`, `erase` etc. are bounds-checked.
+- All allocation is charged to `forge::mem`; exhaustion throws `OutOfMemoryError`.
+
+### Shell calls, threads and FORGE built-ins
+
+- `forge::sh(fmt, args...)`, `forge::bash`, `forge::pwsh`, `forge::cmd` run a command; each `{}` is
+  replaced by the argument **quoted for that shell**. They return a result with `out`, `err`,
+  `code`, `ok`, `ms` plus `lines()` and `json()`.
+- `std::async(f, args...)` / `std::thread t(f, args...)` / `forge::spawn` run on another thread;
+  `get()`/`join()` wait and rethrow. Arguments cross threads only deep-copied, frozen
+  (`forge::freeze`), moved, or as `forge::shared<T>` (locked on every access: `with(fn)`, `load`,
+  `store`). `forge::channel<T> ch(cap)` has `send`, `recv`, `close` and works in range-`for`.
+- `forge::args()`, `forge::fs::...`, `forge::os::...`, `forge::json::...`, `forge::gc::collect()`
+  and the other built-in modules (see below) are reachable as `forge::<module>::<name>`.
+
+Example:
+
+```cpp
+#include <vector>
+#include <map>
+
+struct Job { std::string name; std::string cmd; };
+
+int main() {
+    std::vector<Job> jobs{{"kernel", "uname -r"}, {"files", "ls / | wc -l"}};
+    std::map<std::string, std::string> out;
+    for (const auto& j : jobs) {
+        auto r = forge::sh(j.cmd);                  // no {} placeholders: run as written
+        if (!r.ok) { std::println(stderr, "{} failed: {}", j.name, r.err); return 1; }
+        out[j.name] = r.lines().front();
+    }
+    for (const auto& [k, v] : out) std::println("{:>8}: {}", k, v);
+    return 0;
+}
+```
 
 ### Execution model (hybrid)
 
