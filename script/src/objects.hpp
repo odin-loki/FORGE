@@ -105,7 +105,9 @@ struct Class final : Obj {
     std::string name;
     Ref<Class> base;
     std::vector<std::string> fields;                  // declared fields in order
-    std::vector<Value> field_defaults;                // evaluated when the class is defined
+    std::vector<Value> field_defaults;                // evaluated when the class is defined (literals)
+    std::vector<const struct Node*> field_inits;      // non-literal default member initialisers: evaluated per object
+    Ref<Env> def_env;
     std::unordered_map<std::string, Value> methods;   // name -> Function
     std::unordered_map<std::string, Value> statics;
     std::vector<std::string> interfaces;
@@ -128,11 +130,12 @@ struct Class final : Obj {
     }
     void trace(const Visit& f) const override {
         if (base) f(*base);
+        if (def_env) f(*def_env);
         for (auto& v : field_defaults) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) f(**r);
         for (auto& [k, v] : methods) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) f(**r);
         for (auto& [k, v] : statics) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) f(**r);
     }
-    void clear() override { base.reset(); methods.clear(); statics.clear(); field_defaults.clear(); }
+    void clear() override { base.reset(); def_env.reset(); methods.clear(); statics.clear(); field_defaults.clear(); }
 };
 
 struct Instance final : Obj {

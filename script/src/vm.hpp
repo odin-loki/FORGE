@@ -10,7 +10,7 @@ enum class Opc : std::uint8_t {
     Binary, Unary, Jump, JumpIfFalse, JumpIfFalseKeep, JumpIfTrueKeep, JumpIfNotNilKeep,
     Call, GetField, OptField, SetField, GetIndex, SetIndex, MakeList, MakeMap, Closure, Interp,
     Iter, IterNext, IterNext2, Return, ReturnNil, CheckType, ExecNode, Is, Spawn, Await, Shell, Throw, Line, Super,
-    Copy, EvalNode,
+    Copy, EvalNode, ClearLocal,
 };
 
 struct Instr { Opc op; std::int32_t a = 0, b = 0; };

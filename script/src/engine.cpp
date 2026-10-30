@@ -40,6 +40,7 @@ struct engine::impl {
         std::string saved = in->file; in->file = name;
         try {
             Value v = in->run_top(top, vm);
+            in->run_finalizers();   // destructors of main()'s locals
             if (top->has_main) { if (auto* c = std::get_if<std::int64_t>(&v)) r.exit_code = int(*c); }
             else if (want_value && !is_nil(v)) r.value = in->repr(v);
         } catch (...) {

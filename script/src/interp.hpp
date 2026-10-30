@@ -74,6 +74,8 @@ struct Interp {
 
     // ---- shared runtime (used by both the tree-walker and the VM)
     void step();
+    void run_finalizers();
+    bool in_finalizers_ = false;
     Value load(const VarRef& v, const Ref<Env>& env);
     void store(const VarRef& v, const Ref<Env>& env, Value x, bool define = false, bool is_const = false);
     static bool truthy(const Value& v) {

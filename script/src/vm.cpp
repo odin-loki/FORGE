@@ -47,6 +47,10 @@ private:
     void block_inline(const Node& b) {
         if (has_defer(b)) { exec_node(b); return; }
         for (auto& s : b.kids) stmt(*s);
+        clear_locals(b.locals);
+    }
+    void clear_locals(const std::vector<int>& ls) {   // RAII: destroy block locals in reverse declaration order
+        for (auto it = ls.rbegin(); it != ls.rend(); ++it) emit(Opc::ClearLocal, 0, *it);
     }
     void store(const VarRef& v, bool define, bool is_const, int line) {
         if (v.global()) emit(define ? (is_const ? Opc::DefineConst : Opc::DefineGlobal) : Opc::StoreGlobal, name(v.name), 0, line);
@@ -204,7 +208,7 @@ const char* opname(Opc o) {
         "DEFINE_GLOBAL", "DEFINE_CONST", "BINARY", "UNARY", "JUMP", "JUMP_IF_FALSE", "JUMP_IF_FALSE_KEEP", "JUMP_IF_TRUE_KEEP",
         "JUMP_IF_NOT_NIL_KEEP", "CALL", "GET_FIELD", "OPT_FIELD", "SET_FIELD", "GET_INDEX", "SET_INDEX", "MAKE_LIST", "MAKE_MAP",
         "CLOSURE", "INTERP", "ITER", "ITER_NEXT", "ITER_NEXT2", "RETURN", "RETURN_NIL", "CHECK_TYPE", "EXEC_NODE", "IS", "SPAWN",
-        "AWAIT", "SHELL", "THROW", "LINE", "SUPER", "COPY", "EVAL_NODE"};
+        "AWAIT", "SHELL", "THROW", "LINE", "SUPER", "COPY", "EVAL_NODE", "CLEAR_LOCAL"};
     return n[int(o)];
 }
 
@@ -283,6 +287,7 @@ void verify(const Chunk& c) {
         case Opc::Line: flow(pc, nx, d); break;
         case Opc::Super: case Opc::EvalNode: idx(i.a, c.nodes.size(), "node"); flow(pc, nx, d + 1); break;
         case Opc::Copy: need(1); flow(pc, nx, d); break;
+        case Opc::ClearLocal: if (i.b < 0 || i.b >= c.nslots) bad(pc, "local slot out of range"); flow(pc, nx, d); break;
         default: bad(pc, "unknown opcode");
         }
     }
@@ -436,6 +441,7 @@ Value vm_run(Interp& in, const Chunk& c, const Ref<Env>& env) {
         case Opc::Line: in.line = i.a; in.step(); break;
         case Opc::Super: case Opc::EvalNode: in.line = c.lines[pc - 1]; st.push_back(in.eval(*c.nodes[std::size_t(i.a)], env)); break;
         case Opc::Copy: { Value v = pop(); st.push_back(in.copy_value(v, -1)); break; }
+        case Opc::ClearLocal: { Value dead = std::move(env->slots.at(std::size_t(i.b))); env->slots[std::size_t(i.b)] = Nil{}; dead = Nil{}; if (finalizers_pending()) in.run_finalizers(); break; }
         }
     }
     return Nil{};

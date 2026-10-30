@@ -108,6 +108,7 @@ Value Interp::copy_value(const Value& v, int depth) {
         if (!i->cls->is_struct) return v;
         auto c = make<Instance>(i->cls);
         for (auto& [k, x] : i->fields) c->fields[k] = copy_value(x, depth + 1);
+        c->finalize = i->cls->find_method("~") != nullptr;   // a copy is a distinct object with its own destructor run
         return obj(c);
     }
     return v;
@@ -753,6 +754,24 @@ void install_cpp_std(Shared& sh) {
         auto& ms = c->second->methods;
         if (ms.count("get_lines")) ms["lines"] = ms["get_lines"];
         if (ms.count("get_json")) ms["json"] = ms["get_json"];
+    }
+    // Borrow rule: a container that is being iterated by a range-for cannot be structurally modified.
+    static const std::map<std::string, std::vector<std::string>> mut = {
+        {"list", {"push_back", "emplace_back", "pop_back", "resize", "insert", "erase", "swap", "assign", "clear", "push", "pop", "extend", "remove", "append"}},
+        {"map", {"insert", "emplace", "try_emplace", "insert_or_assign", "erase", "clear", "remove", "set", "swap"}},
+        {"string", {"push_back", "append", "pop_back", "clear", "erase", "insert", "replace", "resize", "swap"}}};
+    for (auto& [ty, names] : mut) {
+        auto t = M.find(ty); if (t == M.end()) continue;
+        for (auto& nm : names) {
+            auto f = t->second.find(nm); if (f == t->second.end()) continue;
+            auto* nat = as<Native>(f->second); if (!nat) continue;
+            auto inner = nat->fn; std::string what = ty == "list" ? "vector" : ty;
+            nat->fn = [inner, what, nm](Interp& in, Args& a) -> Value {
+                if (auto* r = std::get_if<Ref<Obj>>(&a[0]); r && *r && (*r)->borrows.load() > 0)
+                    in.raise("BorrowError", "cannot call " + nm + "() on a " + what + " while it is being iterated");
+                return inner(in, a);
+            };
+        }
     }
 }
 

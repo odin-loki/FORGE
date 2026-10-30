@@ -187,6 +187,35 @@ std::println("{}", twice(1));
 )CPP", "7 2 9\n2\n");
 }
 
+TEST(destructors_raii) {
+    EXPECT(R"CPP(
+struct G { std::string n; G(std::string s) : n(s) { std::println("+{}", n); } ~G() { std::println("-{}", n); } };
+struct Base { virtual ~Base() { std::println("~Base"); } };
+struct Derived : Base { G g{"member"}; ~Derived() override { std::println("~Derived"); } };
+void f() { G a("f"); throw std::runtime_error("boom"); }
+int main() {
+    { G a("a"); G b("b"); std::println("body"); }
+    for (int i = 0; i < 2; ++i) { G l("l" + std::to_string(i)); }
+    try { f(); } catch (const std::exception& e) { std::println("caught {}", e.what()); }
+    { auto u = std::make_unique<G>("u"); auto v = std::move(u); std::println("moved"); }
+    { G x("x"); G y = x; y.n = "y"; }
+    { std::unique_ptr<Base> p = std::make_unique<Derived>(); }
+    { auto s = std::make_shared<G>("s"); auto t = s; s = nullptr; std::println("still shared"); }
+    G last("last");
+    std::println("end");
+    return 0;
+}
+)CPP", "+a\n+b\nbody\n-b\n-a\n+l0\n-l0\n+l1\n-l1\n+f\n-f\ncaught boom\n+u\nmoved\n-u\n+x\n-y\n-x\n+member\n~Derived\n~Base\n-member\n+s\nstill shared\n-s\n+last\nend\n-last\n");
+}
+
+TEST(borrow_rules_while_iterating) {
+    EXPECT("std::vector<int> v{1, 2};\ntry { for (int x : v) v.push_back(x); } catch (const BorrowError& e) { std::println(\"{}\", e.what()); }\nv.push_back(3); std::println(\"{}\", v.size());",
+           "cannot call push_back() on a vector while it is being iterated\n3\n");
+    EXPECT("std::map<std::string, int> m{{\"a\", 1}};\nfor (auto& [k, x] : m) m[k] = x + 1;\ntry { for (auto& [k, x] : m) m[\"new\"] = 1; } catch (const BorrowError&) { std::println(\"blocked\"); }\nstd::println(\"{}\", m[\"a\"]);",
+           "blocked\n2\n");
+    EXPECT("std::vector<int> v{1, 2, 3};\nfor (int& x : v) { if (x == 2) break; }\nv.erase(v.begin()); std::println(\"{}\", v.size());", "2\n");
+}
+
 TEST(arc_weak_and_cycles) {
     EXPECT(R"CPP(
 struct Node { std::shared_ptr<Node> other; };

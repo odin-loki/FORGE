@@ -12,6 +12,14 @@ Flow Interp::exec_block(const Node& n, const Ref<Env>& env) {
             ret = saved;
         }
     };
+    struct Scope {   // RAII: destroy block locals in reverse declaration order on every exit path
+        Interp& in; const Node& n; const Ref<Env>& env;
+        ~Scope() {
+            if (n.locals.empty() || !env) return;
+            for (auto it = n.locals.rbegin(); it != n.locals.rend(); ++it)
+                if (std::size_t(*it) < env->slots.size()) { Value dead = std::move(env->slots[std::size_t(*it)]); env->slots[std::size_t(*it)] = Nil{}; }
+        }
+    } scope{*this, n, env};
     Flow f = Flow::Normal;
     try {
         for (auto& s : n.kids) {

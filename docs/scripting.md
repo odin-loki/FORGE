@@ -2,7 +2,7 @@
 
 Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
 cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
-Still to come: destructors at scope exit, borrow tracking beyond use-after-move, debug race/deadlock
+Still to come: debug race/deadlock
 detection, pipelines/watch/schedules, AI commands, remote execution. See *Phasing* at the end.
 
 ## Purpose
@@ -67,6 +67,17 @@ Standard library surface (implemented natively, `std::` prefix optional after `u
 - Dereferencing an empty pointer/optional or an `end()` iterator throws `NullPointerError` /
   `IndexError`; `at()`, `substr`, `erase` etc. are bounds-checked.
 - All allocation is charged to `forge::mem`; exhaustion throws `OutOfMemoryError`.
+- **Destructors (RAII).** `~T()` runs deterministically when the last reference goes away: block locals
+  are destroyed at the closing brace in reverse declaration order (also on `break`, `return` and
+  exceptions), `unique_ptr` on reset/scope exit, `shared_ptr` when the last owner drops. Order is
+  most-derived destructor, then bases, then members. A constructor that throws destroys nothing.
+  Destructors run on the owning thread at the next statement boundary, so they may print, call
+  functions and throw (an exception from a destructor propagates from that statement). Prvalue
+  initialisation (`G g("x");`, `G g = make();`) elides the copy as in C++17; default member
+  initialisers (`G g{"m"};`) are evaluated for each object.
+- **Borrows while iterating.** A range-`for` borrows its container; structural changes to it
+  (`push_back`, `insert`, `erase`, `clear`, `resize`, inserting a new key with `operator[]`, ...)
+  throw `BorrowError` instead of invalidating iterators. Changing elements in place is allowed.
 
 ### Shell calls, threads and FORGE built-ins
 

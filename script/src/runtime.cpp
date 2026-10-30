@@ -55,7 +55,7 @@ struct Iter final : Obj {
     std::vector<Value> keys;
     const char* type_name() const override { return "iterator"; }
     Iter() { Heap::instance().track(*this); }
-    ~Iter() override { Heap::instance().untrack(*this); }
+    ~Iter() override { if (auto* r = std::get_if<Ref<Obj>>(&src); r && *r && kind <= 2) (*r)->borrows.fetch_sub(1); Heap::instance().untrack(*this); }
     void trace(const Visit& f) const override { if (auto* r = std::get_if<Ref<Obj>>(&src)) if (*r) f(**r); for (auto& k : keys) if (auto* r = std::get_if<Ref<Obj>>(&k)) if (*r) f(**r); }
     void clear() override { src = Nil{}; keys.clear(); }
 };
@@ -72,6 +72,7 @@ Ref<Obj> Interp::iterate(const Value& v) {
     else if (as<Channel>(v)) { it->kind = 4; it->src = v; }
     else if (auto* g = as<Globals>(v)) { it->kind = 1; auto m = make<Map>(); for (auto& [k, x] : g->vars) m->set_str(k, x); it->src = obj(m); for (auto& [k, x] : m->entries) it->keys.push_back(k); }
     else raise("TypeError", "cannot iterate over " + type_of(v));
+    if (auto* r = std::get_if<Ref<Obj>>(&it->src); r && *r && it->kind <= 2) (*r)->borrows.fetch_add(1);   // range-for borrow
     return Ref<Obj>(it);
 }
 bool Interp::iter_next(Obj& o, Value& out, Value* out2) {
@@ -228,6 +229,7 @@ ScriptError Interp::from_cpp(std::exception_ptr ep) {
 
 // ---------------------------------------------------------------- limits
 void Interp::step() {
+    if (finalizers_pending()) run_finalizers();
     auto n = sh->steps.fetch_add(1, std::memory_order_relaxed);
     if (sh->limits.max_steps && n >= sh->limits.max_steps) raise("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
     if ((n & 255) == 0) {
@@ -305,6 +307,7 @@ void Interp::store(const VarRef& v, const Ref<Env>& env, Value x, bool define, b
 Value Interp::share(const Value& v) {
     auto* i = as<Instance>(v);
     if (!i || !i->cls->is_struct || i->own != Own::Value) return v;
+    if (i->rc.load(std::memory_order_acquire) <= 1) return v;   // sole reference: a temporary, elide the copy (C++17 guaranteed elision)
     return copy_value(v);
 }
 
@@ -541,6 +544,7 @@ Value Interp::get_index(const Value& o, const Value& i) {
         if (m->has_dflt && !m->frozen) {   // std::map::operator[] inserts a value-initialised element
             std::vector<Value> none; Value d = is_nil(m->dflt) ? Value(Nil{}) : call(m->dflt, none);
             if (!key_of(i)) raise("TypeError", "unsupported map key type " + type_of(i));
+            if (m->borrows.load() > 0) raise("BorrowError", "operator[] would insert a key into a map while it is being iterated");
             m->set(i, d); return *m->find(i);
         }
         raise("KeyError", "key " + repr(i) + " not found");
@@ -551,7 +555,9 @@ Value Interp::get_index(const Value& o, const Value& i) {
 }
 void Interp::set_index(const Value& o, const Value& i, Value v) {
     if (auto* l = as<List>(o)) { if (l->frozen) raise("TypeError", "list is frozen"); auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "list index must be int"); l->items.at(norm_index(*this, *k, l->items.size())) = share(v); return; }
-    if (auto* m = as<Map>(o)) { if (m->frozen) raise("TypeError", "map is frozen"); try { m->set(i, share(v)); } catch (const std::invalid_argument& e) { raise("TypeError", e.what()); } return; }
+    if (auto* m = as<Map>(o)) { if (m->frozen) raise("TypeError", "map is frozen");
+        if (m->borrows.load() > 0 && !m->find(i)) raise("BorrowError", "operator[] would insert a key into a map while it is being iterated");
+        try { m->set(i, share(v)); } catch (const std::invalid_argument& e) { raise("TypeError", e.what()); } return; }
     if (auto* s = as<String>(o)) {   // s[i] = 'c'
         if (s->frozen) raise("TypeError", "string is frozen");
         auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int");
@@ -724,7 +730,13 @@ Value Interp::define_class(const ClassDecl& cd, const Ref<Env>& env) {
         c->base = Ref<Class>(b);
         if (b->is_dynamic) c->is_dynamic = true;
     }
-    for (auto& [n, d] : cd.fields) { c->fields.push_back(n); c->field_defaults.push_back(d ? eval(*d, env) : Value(Nil{})); }
+    c->def_env = env;
+    for (auto& [n, d] : cd.fields) {
+        c->fields.push_back(n);
+        bool lit = !d || d->k == NK::Nil || d->k == NK::True || d->k == NK::False || d->k == NK::Int || d->k == NK::Float || d->k == NK::Str;
+        c->field_defaults.push_back(lit && d ? eval(*d, env) : Value(Nil{}));
+        c->field_inits.push_back(lit ? nullptr : d.get());   // `G g{"x"};` constructs a fresh member for every object
+    }
     for (auto& m : cd.methods) {
         auto fn = make<Function>(m, env, globals); fn->owner = c;
         c->methods[m->name] = obj(fn);
@@ -745,6 +757,7 @@ Value Interp::instantiate(const Ref<Class>& c, std::vector<Value>& args) {
     std::vector<const Class*> chain; for (const Class* k = c.get(); k; k = k->base.get()) chain.push_back(k);
     for (auto it = chain.rbegin(); it != chain.rend(); ++it)
         for (std::size_t i = 0; i < (*it)->fields.size(); ++i) {
+            if (i < (*it)->field_inits.size() && (*it)->field_inits[i]) { inst->fields[(*it)->fields[i]] = share(eval(*(*it)->field_inits[i], (*it)->def_env)); continue; }
             Value d = (*it)->field_defaults[i];
             if (auto* l = as<List>(d)) d = obj(make<List>(l->items));
             else if (auto* m = as<Map>(d)) { auto n = make<Map>(); for (auto& [k, v] : m->entries) n->set(k, v); d = obj(n); }
@@ -761,13 +774,35 @@ Value Interp::instantiate(const Ref<Class>& c, std::vector<Value>& args) {
     }
     if (init) {
         Value b = obj(make<Bound>(self, *init));
-        call(b, args);
+        call(b, args);   // a constructor that throws leaves no object to destroy (finalize is set below)
     } else if (!args.empty()) {
         std::vector<std::string> all; for (auto it = chain.rbegin(); it != chain.rend(); ++it) for (auto& f : (*it)->fields) all.push_back(f);
         if (args.size() > all.size()) raise("TypeError", c->name + "() takes at most " + std::to_string(all.size()) + " argument(s)");
         for (std::size_t i = 0; i < args.size(); ++i) inst->fields[all[i]] = share(args[i]);
     }
+    inst->finalize = c->find_method("~") != nullptr;
     return self;
+}
+// Run script destructors (~T) of objects whose last reference just went away. Most-derived first, then
+// bases; members are released afterwards (which may queue more destructors, handled by the loop).
+void Interp::run_finalizers() {
+    if (in_finalizers_) return;
+    in_finalizers_ = true;
+    struct Reset { bool& b; ~Reset() { b = false; } } reset{in_finalizers_};
+    while (finalizers_pending()) {
+        auto objs = take_finalizers();
+        for (auto& o : objs) {
+            auto* i = dynamic_cast<Instance*>(o.get());
+            if (!i) continue;
+            Value self = obj(o);
+            for (const Class* k = i->cls.get(); k; k = k->base.get()) {
+                auto m = k->methods.find("~");
+                if (m == k->methods.end()) continue;
+                std::vector<Value> a; Value b = obj(make<Bound>(self, m->second));
+                call(b, a);
+            }
+        }
+    }
 }
 void Interp::dispose(const Value& v) {
     if (is_nil(v)) return;
@@ -868,6 +903,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         n->is_interface = c->is_interface; n->required = c->required;
         if (c->base) n->base = as_ref<Class>(deep_copy(in, obj(c->base), memo));
         for (auto& d : c->field_defaults) n->field_defaults.push_back(deep_copy(in, d, memo));
+        n->field_inits = c->field_inits; n->def_env = c->def_env;
         for (auto& [k, x] : c->methods) n->methods[k] = deep_copy(in, x, memo);
         for (auto& [k, x] : c->statics) n->statics[k] = deep_copy(in, x, memo);
         return obj(n);
