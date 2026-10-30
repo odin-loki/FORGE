@@ -19,8 +19,10 @@ public:
         map_ = forge::map_readonly(path, size_);
         try {
             if (!map_) raise(errc::format_error, "{}: empty file", path);
+            if (size_ < 8) raise(errc::format_error, "{}: bad safetensors header", path);
             std::uint64_t hl; std::memcpy(&hl, map_, 8);
-            if (8 + hl > size_) raise(errc::format_error, "{}: bad safetensors header", path);
+            // hl > size_ - 8, not 8 + hl > size_: that overflows for hl near 2^64 (fuzz finding, FreeBSD libc++ trap)
+            if (hl > size_ - 8) raise(errc::format_error, "{}: bad safetensors header", path);
             auto h = json::parse({reinterpret_cast<const char*>(map_ + 8), hl});
             base_ = 8 + hl;
             for (auto& [k, v] : h.obj()) {
@@ -28,7 +30,7 @@ public:
                 entry e; e.dtype = v["dtype"].str();
                 for (auto& d : v["shape"].arr()) e.shape.push_back(d.i());
                 e.begin = std::uint64_t(v["data_offsets"][0].num()); e.end = std::uint64_t(v["data_offsets"][1].num());
-                if (base_ + e.end > size_) raise(errc::format_error, "{}: tensor {} out of bounds", path, k);
+                if (e.begin > e.end || e.end > size_ - base_) raise(errc::format_error, "{}: tensor {} out of bounds", path, k);
                 entries_[k] = e;
             }
         } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // no dtor on a throwing ctor

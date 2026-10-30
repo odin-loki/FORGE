@@ -78,8 +78,10 @@ TEST(env_and_dl) {
     auto k = os::library::open("/usr/lib/libSystem.B.dylib"); CHECK(k); CHECK(k->symbol("malloc") != nullptr);
 #else
     auto k = os::library::open(
-#if defined(__ANDROID__) || defined(__FreeBSD__)
+#if defined(__ANDROID__)
         "libc.so"
+#elif defined(__FreeBSD__)
+        "libc.so.7"   // /usr/lib/libc.so is a linker script that dlopen rejects
 #else
         "libc.so.6"
 #endif

@@ -27,6 +27,9 @@ struct posix_dialect : emit_dialect {
         if (need.count("platform")) h += "_platform() { case $(uname -s) in Linux) if [ -n \"${ANDROID_ROOT-}\" ]; then echo android; else echo linux; fi;; Darwin) echo macos;; FreeBSD) echo freebsd;; MINGW*|MSYS*|CYGWIN*) echo windows;; *) echo other;; esac; }\n";
         return h;
     }
+    // AT&T ksh93 has no `local`: locals need `typeset` inside `function f { }` (POSIX f() shares scope).
+    bool ksh93() const { return cx->target == "ksh"; }
+    std::string loc() const { return ksh93() ? "typeset " : "local "; }
     void open(const std::string& s) { L(s); opens.push_back(cx->lines.size()); in(); }
     void close(const std::string& s) { if (cx->lines.size() == opens.back()) L(":"); opens.pop_back(); out(); L(s); }
     void mid(const std::string& s) { if (cx->lines.size() == opens.back()) L(":"); out(); L(s); in(); opens.back() = cx->lines.size(); }
@@ -53,7 +56,7 @@ struct posix_dialect : emit_dialect {
     std::string c_not(const std::string& a) override { return "! { " + a + "; }"; }
     std::string c_bool(bool v) override { return v ? "true" : "false"; }
     void let(const std::string& n, const std::string& v, ety, bool global, bool decl) override {
-        if (decl && !global && cx->in_fn) L("local " + n + "; " + n + "=" + v);
+        if (decl && !global && cx->in_fn) L(loc() + n + "; " + n + "=" + v);
         else L(n + "=" + v);
     }
     void print(const std::string& v, bool nl, bool err) override { L(std::string("printf '%s") + (nl ? "\\n" : "") + "' " + v + (err ? " >&2" : "")); }
@@ -67,8 +70,8 @@ struct posix_dialect : emit_dialect {
     void brk() override { L("break"); }
     void cont() override { L("continue"); }
     void fn_(const std::string& name, const std::vector<std::string>& ps) override {
-        open(name + "() {");
-        for (std::size_t i = 0; i < ps.size(); ++i) L("local " + ps[i] + "; " + ps[i] + "=$" + std::to_string(i + 1));
+        open(ksh93() ? "function " + name + " {" : name + "() {");
+        for (std::size_t i = 0; i < ps.size(); ++i) L(loc() + ps[i] + "; " + ps[i] + "=$" + std::to_string(i + 1));
     }
     void end_fn() override { close("}"); }
     void ret(const std::string& v) override { if (!v.empty()) L("_r=" + v); L("return 0"); }
@@ -111,18 +114,20 @@ void forge_shell_register_posix(fs::shell_registry& r) {
         {"zsh", {}, {"zsh"}, true, ""},
         {"dash", {}, {"dash"}, true, "Debian Almquist shell"},
         {"ash", {"busybox"}, {"ash", "busybox"}, true, "BusyBox ash (runs `busybox sh` when no ash binary)"},
-        {"ksh", {"ksh93"}, {"ksh", "ksh93"}, false, "AT&T ksh93"},
-        {"mksh", {"android", "toybox"}, {"mksh"}, false, "MirBSD Korn shell (Android's /system/bin/sh)"},
-        {"oksh", {"pdksh"}, {"oksh", "pdksh"}, false, "OpenBSD ksh"},
+        {"ksh", {"ksh93"}, {"ksh", "ksh93"}, true, "AT&T ksh93"},
+        {"mksh", {"android", "toybox"}, {"mksh"}, true, "MirBSD Korn shell (Android's /system/bin/sh)"},
+        {"oksh", {"pdksh"}, {"oksh", "pdksh"}, true, "OpenBSD ksh"},
         {"yash", {}, {"yash"}, true, ""},
         {"posh", {}, {"posh"}, false, "Policy-compliant Ordinary SHell"},
-        {"osh", {"oils"}, {"osh"}, false, "Oils, POSIX/bash-compatible mode"},
-        {"ysh", {}, {"ysh"}, false, "Oils new shell; accepts '...' literals"},
-        {"hush", {}, {"hush"}, false, "BusyBox hush"},
+        {"osh", {"oils"}, {"osh"}, true, "Oils, POSIX/bash-compatible mode"},
+        {"ysh", {}, {"ysh"}, true, "Oils new shell; accepts '...' literals"},
+        {"hush", {}, {"hush"}, true, "BusyBox hush"},
     };
     for (auto& s : list) {
         fs::shell_backend b; b.name = s.name; b.aliases = s.aliases; b.exes = s.exes; b.family = "posix"; b.golden_tested = s.tested; b.notes = s.notes;
         b.quote = fs::shellq::posix;
+        if (std::string(s.name) == "ysh")   // YSH rejects the POSIX '\'' idiom; J8 b'...' takes \\ and \' escapes
+            b.quote = [](const std::string& v) { std::string o = "b'"; for (char c : v) { if (c == '\\' || c == '\'') o += '\\'; o += c; } return o + "'"; };
         b.argv = [](const std::string& exe, const std::string& sc) -> std::vector<std::string> {
             if (exe.ends_with("busybox")) return {exe, "sh", "-c", sc};
             return {exe, "-c", sc};

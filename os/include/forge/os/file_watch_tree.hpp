@@ -81,6 +81,7 @@ private:
             bool fresh = !snap_.count(p);
             snap_[p] = en;
             if (fresh && out) out->push_back({p, watch_kind::created});
+            if (!en.is_dir && !polling_) native_.add_file(p);
             if (en.is_dir && !dirs_.count(p)) scan_(p, out);
         }
     }
@@ -110,7 +111,7 @@ private:
         bool ex = false; auto en = entry_of_(p, ex);
         auto it = snap_.find(p);
         if (!ex) { gone_(p, out); return; }
-        if (it == snap_.end()) { snap_[p] = en; out.push_back({p, watch_kind::created}); if (en.is_dir) scan_(p, &out); return; }
+        if (it == snap_.end()) { snap_[p] = en; out.push_back({p, watch_kind::created}); if (en.is_dir) scan_(p, &out); else if (!polling_) native_.add_file(p); return; }
         if (it->second.is_dir != en.is_dir) { gone_(p, out); snap_[p] = en; out.push_back({p, watch_kind::created}); if (en.is_dir) scan_(p, &out); return; }
         if (!en.is_dir && (it->second.mtime != en.mtime || it->second.size != en.size)) { it->second = en; out.push_back({p, watch_kind::modified}); }
     }

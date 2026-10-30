@@ -72,6 +72,17 @@ public:
         return {{}, unsupported("file watching")};
 #endif
     }
+    // Watch one file's own contents where the backend needs per-file handles (kqueue: directory events do
+    // not fire for in-place writes). A no-op elsewhere, where the parent directory's watch already covers it.
+    status add_file(const std::string& path) {
+#if defined(FORGE_OS_KQUEUE)
+        if (fd_ < 0) return {{}, last_error("kqueue")};
+        for (auto& x : kw_) if (!x.is_dir && x.path == path && x.fd >= 0) return {};
+        return kq_add_(path, false, dirname(path), basename(path));
+#else
+        (void)path; return {};
+#endif
+    }
     // Wait up to timeout_ms (-1 forever, 0 poll) and return whatever arrived.
     std::vector<watch_event> poll(int timeout_ms) {
         std::vector<watch_event> out;

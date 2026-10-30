@@ -226,3 +226,14 @@ systemd/SCM, Windows sandbox exec denial on real Windows, macOS kperf (root).
 - Linux, g++ dev build: ctest 76/76 pass, including the two new `doc_example_*` tests. The Python golden, signing and ONNX tests need `numpy`, `safetensors`, `onnx` and `cryptography` in the configured Python.
 - Windows under wine, mingw build, `tests/wine_run.sh`: 32 pass, `test_vulkan` skipped, `test_os.exe` failed once inside the suite, at `cpu_time_ns() > 0` in `time_and_sleep`. Windows process times tick at about 15.6 ms, so the test's short loop could read 0. The test now busy-spins for 100 ms of wall time first, and passed 5 out of 5 reruns under wine.
 - Android x86_64 emulator, full suite (`tests/android_emulator.sh native build/android-x64`, with `test_mind`): 23 pass, 2 skipped (`test_gpu`, `test_vulkan`), 1 failed. The failure was `test_os_ext` on socket-file binds. Commit 21c58e0 had accidentally reverted the abstract-socket fix; commit 7b7602c restores it. Linux `test_os_ext` passes again. **The Android rerun of `test_os_ext` after the restore is still pending.**
+
+## QEMU / multi-OS test matrix (2026-10-31)
+Host has /dev/kvm but KVM guests hang, so all VMs run under QEMU TCG (QEMU 9.2.2 built user-locally).
+
+| Target | How | Result |
+|---|---|---|
+| FreeBSD 14.5 amd64 | official BASIC-CLOUDINIT image, cross-built with clang 18 + FreeBSD sysroot, ctest in VM | all real tests pass after fixes; host-path tests (zig/python goldens) n/a in VM |
+| Shells on FreeBSD | pkg: sh, bash, zsh, dash, ksh93, mksh, oksh, yash, oils osh/ysh, fish, tcsh/csh, nu, elvish | backend golden + emit golden pass; xonsh pkg broken (ModuleNotFoundError), es segfaults, rc binary corrupt in VM |
+| Shells on Linux host | + oils 0.34 (user-local), busybox hush | ysh, osh, hush pass |
+
+Bugs fixed: GPU images with clangs lacking NVPTX/AMDGPU; strtod fallback for libc++ without FP from_chars; `-pthread` on FreeBSD; dlopen("libc.so") linker script on FreeBSD; kqueue tree watcher missed in-place file writes; safetensors header-length overflow (fuzz crash, trapped by FreeBSD libc++); ysh quoting (`'\''` invalid, now J8 `b'...'`); ksh93 emitter used `local` (now `typeset` + `function f {}`).
