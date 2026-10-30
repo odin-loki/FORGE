@@ -17,3 +17,6 @@
 #include <forge/os/perf.hpp>
 #include <forge/os/background.hpp>
 #include <forge/os/service.hpp>
+#include <forge/os/process.hpp>
+#include <forge/os/pipe.hpp>
+#include <forge/os/signal.hpp>

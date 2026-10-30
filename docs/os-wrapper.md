@@ -66,7 +66,7 @@ can branch on features rather than on platform names.
 
 ## Phasing
 
-1. `process` + `pipe` + `signal` (needed by scripting `sh {}` blocks and `run`).
+1. **Done:** `process` + `pipe` + `signal` (needed by scripting `sh {}` blocks and `run`). `process.hpp`: `spawn_wait(spawn_spec)` (argv/env/cwd, stdin data, separate or merged stdout/stderr, output cap, timeout with process-group / Job Object kill, memory/CPU/open-file limits), RAII `child` (stream, wait, kill; POSIX), `find_executable`, `list_processes`/`process_info` (Linux). `pipe.hpp`: RAII `pipe_end`, `make_pipe` (POSIX). `signal.hpp`: `signal_id`, `send_signal` (process or group). Tests: `tests/test_os_process.cpp`, plus cross compile/link checks for FreeBSD, macOS, Windows and musl.
 2. `fs` extensions, `users`, `time`, `sysinfo`, `console`.
 3. `net` extensions, `file_watch` recursive, `service`, `registry`.
 4. `devices`, `clipboard`, remaining platform gaps.
