@@ -1,5 +1,14 @@
 # FORGE implementation status
 
+## Latest check (2026-10-31, qemu-user aarch64/riscv64, cross, emitters)
+- **aarch64** (zig 0.17 musl, qemu-user 10.0.13 `-cpu max,sve256=on`, `QEMU_LD_PREFIX` = Alpine musl loader): `ctest -E '^(xos_|mobile_)'` gives 50/54 with 6 GPU skips. All lane/SVE VL tests and fuzz targets pass.
+- **riscv64** (`-cpu rv64,v=true,vlen=256`): the same 50/54. All RVV VL 128-1024 tests pass. Fixed a real build break: riscv64 has no `__NR_renameat`, so `sandbox.hpp` now guards it (cff8244).
+- The 4 failures are the same on both architectures and come from the qemu-user environment, not from FORGE. zig musl links statically, so dlopen and plugins are unavailable. Self-exec of a guest binary gets ENOEXEC because there is no binfmt. `/proc/self` rss is 0. The child-spawn memory limit and the sandbox_* children also fail. They affect `test_os`, `test_os_ext`, `test_os_process` and `test_script` (plugin case).
+- **Cross (`ctest -L cross`)**: 39/39 pass after a fix. zig 0.17 `-fsyntax-only` fails with "failed to rename tmp/...o", so `xos_emit_*` now compiles each file with `-c` (`cmake/xos_compile_each.cmake`, ee0100c). macOS (aarch64/x86_64) is cross-compiled and linked only. iOS (`mobile_ios`) is skipped because there is no Xcode SDK.
+- **Emitters**: `emit_golden_all_shells` now also runs **ksh, osh, hush** and cmd (wine) on the box. They pass, along with the 14 shells below.
+- **Not yet available**: rc and es are registered backends without an emitter, and no rc/es binary is installed. ysh is not an emit target (osh covers Oils). mksh/oksh/posh are not installed.
+- **Android**: not re-run this round. A second TCG AVD needs about 2 GB RAM and 2 GB disk. The box had about 3.4 GB RAM and 3 GB disk free, with another agent's emulator (fuse34) running, so the earlier emulator pass below still stands.
+
 ## Latest check (2026-10-30, scripting milestones 6-7 + shell backends)
 Built with conda clang 18 (`/workspace/opt/llvm18`) and a user-local OpenSSL (`/workspace/opt/openssl`). `ctest -LE "slow|emu"`: **84/84 pass**; the hardware tests skip. The cuda_mock failures from earlier are gone. ASan and TSan runs of `test_script` and `test_rpc` are clean.
 - **Milestone 6, AI commands**: `forge::ask`, `forge::explain`, `forge::suggest_cmd`, `forge::ask_json`, `forge::ai_run`, `forge::ai_eval`. They call an OpenAI-compatible endpoint (`FORGE_AI_ENDPOINT`, for example forge-serve). Nothing runs without a confirm callback; the CLI prompts `[y/N]`.
