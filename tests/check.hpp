@@ -1,4 +1,5 @@
 #pragma once
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -28,7 +29,10 @@ struct reg { reg(const char* n, std::function<void()> f) { registry().push_back(
 #define CHECK_MSG(c, ...) do { if (!(c)) { std::fprintf(stderr, "  CHECK failed %s:%d: %s :: ", __FILE__, __LINE__, #c); std::fprintf(stderr, __VA_ARGS__); std::fputc('\n', stderr); ++forge_test::failures(); } } while (0)
 #define CHECK_THROWS(expr) do { bool t_ = false; try { (void)(expr); } catch (...) { t_ = true; } CHECK_MSG(t_, "expected exception"); } while (0)
 int main() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const char* only = std::getenv("FORGE_TEST_ONLY");   // substring filter for locating a hang
     for (auto& t : forge_test::registry()) {
+        if (only && *only && !std::strstr(t.name, only)) continue;
         int before = forge_test::failures();
         try { t.fn(); } catch (const std::exception& e) { std::fprintf(stderr, "  exception: %s\n", e.what()); ++forge_test::failures(); }
         std::printf("[%s] %s\n", forge_test::failures() == before ? " ok " : "FAIL", t.name);
