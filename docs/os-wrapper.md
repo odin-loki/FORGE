@@ -43,6 +43,14 @@ crash handling and GPU device enumeration.
 | `console.hpp` | is-a-tty, terminal size, ANSI/VT enabling on Windows, raw mode for the REPL line editor |
 | `clipboard.hpp` | text get/set on desktop platforms (optional, low priority) |
 
+### Mobile and device services
+
+`forge::os::mobile` (`forge_mobile`, see [mobile.md](mobile.md)): 16 sensor kinds, touch and gestures,
+GNSS/geofencing, camera/torch, audio, haptics, power, connectivity, BLE, NFC, clipboard, notifications,
+display controls, biometrics, lifecycle (low_memory → forge::mem pressure), device info, paths, share,
+open_url and permissions — on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, plus null and simulated
+backends. Missing platform features return `unsupported`.
+
 ### Platform notes
 
 - **Android / iOS:** no `fork`, restricted spawn (iOS: `unsupported`), no services, sandboxed paths.

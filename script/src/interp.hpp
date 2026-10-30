@@ -145,6 +145,7 @@ struct NodeIter;   // runtime iterator
 void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
 void install_automation(Shared& sh);
+void install_mobile(Shared& sh);
 void install_ai(Shared& sh);
 void install_remote(Shared& sh);
 std::vector<std::string> module_search_path(const Interp& in);

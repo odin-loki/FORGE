@@ -1,5 +1,11 @@
 # FORGE implementation status
 
+## forge::os::mobile (2026-10-31)
+- New `forge_mobile` library ([mobile.md](mobile.md)): sensors, touch/gestures, device services and lifecycle on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, null and simulated backends; script built-ins `forge::mobile::device`, `forge::sensors::*`, `forge::touch::open`.
+- **Tested here (x86_64 Linux):** `test_mobile` 13/13 (simulator, gestures, services, lifecycle, geofencing, Linux IIO/evdev against fake sysfs), `test_script` `mobile_sensors_touch`.
+- **Compile-checked only:** Windows, FreeBSD, macOS and musl backends via zig (`xos_mobile_*`); Android (`android.cpp`, `services.cpp`, `linux.cpp`, `mobile.cpp`) with NDK r27c aarch64.
+- **Not compiled here:** `apple.mm` (iOS/iPadOS/macOS Objective-C++) needs an Apple SDK. It needs a macOS CI job.
+
 ## Latest check (2026-10-31, qemu-user aarch64/riscv64, cross, emitters)
 - **aarch64** (zig 0.17 musl, qemu-user 10.0.13 `-cpu max,sve256=on`, `QEMU_LD_PREFIX` = Alpine musl loader): `ctest -E '^(xos_|mobile_)'` gives 50/54 with 6 GPU skips. All lane/SVE VL tests and fuzz targets pass.
 - **riscv64** (`-cpu rv64,v=true,vlen=256`): the same 50/54. All RVV VL 128-1024 tests pass. Fixed a real build break: riscv64 has no `__NR_renameat`, so `sandbox.hpp` now guards it (cff8244).

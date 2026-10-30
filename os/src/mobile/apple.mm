@@ -7,11 +7,12 @@
 //   cameras   AVCaptureDeviceDiscoverySession.  permissions: AVCaptureDevice / CLLocationManager / UNUserNotificationCenter.
 #include "internal.hpp"
 #include <TargetConditionals.h>
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE && !TARGET_OS_WATCH   // iOS, iPadOS, tvOS-less UIKit targets; watchOS uses the null backend + glue
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreLocation/CoreLocation.h>
 #import <CoreMotion/CoreMotion.h>
+#import <LocalAuthentication/LocalAuthentication.h>
 #import <UIKit/UIKit.h>
 #import <UserNotifications/UserNotifications.h>
 
@@ -192,10 +193,87 @@ struct apple_backend final : backend {
         [[UNUserNotificationCenter currentNotificationCenter] addNotificationRequest:r withCompletionHandler:nil];
         return {};
     }
+    static NSString* ns(std::string_view s) { return [[NSString alloc] initWithBytes:s.data() length:s.size() encoding:NSUTF8StringEncoding]; }
+    result<double> brightness() override { double v = 0; on_main([&] { v = UIScreen.mainScreen.brightness; }); return {v, {}}; }
+    status set_brightness(double l) override { on_main([l] { UIScreen.mainScreen.brightness = CGFloat(l); }); return {}; }
+    status keep_awake(bool on) override { on_main([on] { UIApplication.sharedApplication.idleTimerDisabled = on; }); return {}; }
+    status torch(bool on) override {
+        AVCaptureDevice* d = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
+        if (!d || !d.hasTorch) return {{}, unsupported("torch (no flash)")};
+        NSError* e = nil; if (![d lockForConfiguration:&e]) return {{}, {1, "torch: lockForConfiguration failed"}};
+        d.torchMode = on ? AVCaptureTorchModeOn : AVCaptureTorchModeOff; [d unlockForConfiguration]; return {};
+    }
+    status open_url(std::string_view u) override {
+        NSURL* url = [NSURL URLWithString:ns(u)]; if (!url) return {{}, {22, "open_url: bad URL"}};
+        on_main([url] { [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil]; }); return {};
+    }
+    result<biometric_info> biometrics() override {
+        LAContext* c = [LAContext new]; NSError* e = nil;
+        bool ok = [c canEvaluatePolicy:LAPolicyDeviceOwnerAuthenticationWithBiometrics error:&e];
+        biometric_info b; b.available = c.biometryType != LABiometryTypeNone; b.enrolled = ok;
+        b.kind = c.biometryType == LABiometryTypeFaceID ? "face" : c.biometryType == LABiometryTypeTouchID ? "fingerprint" : "";
+        return {b, {}};
+    }
+    result<device_info> info() override {
+        auto d = backend::info(); if (!d) return d;
+        UIDevice* u = UIDevice.currentDevice; d.value.manufacturer = "Apple"; d.value.model = u.model.UTF8String;
+        d.value.os_name = u.systemName.UTF8String; d.value.os_version = u.systemVersion.UTF8String;
+        d.value.form = u.userInterfaceIdiom == UIUserInterfaceIdiomPad ? form_factor::tablet : u.userInterfaceIdiom == UIUserInterfaceIdiomTV ? form_factor::tv
+                     : u.userInterfaceIdiom == UIUserInterfaceIdiomCarPlay ? form_factor::car : form_factor::phone;
+        return d;
+    }
+    void lifecycle_started() override {
+        backend::lifecycle_started();
+        static std::once_flag once; std::call_once(once, [] {
+            auto* nc = NSNotificationCenter.defaultCenter;
+            [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil usingBlock:^(NSNotification*) { dispatch_lifecycle(app_event::foreground); }];
+            [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil usingBlock:^(NSNotification*) { dispatch_lifecycle(app_event::background); }];
+            [nc addObserverForName:UIApplicationDidReceiveMemoryWarningNotification object:nil queue:nil usingBlock:^(NSNotification*) { dispatch_lifecycle(app_event::low_memory); }];
+            [nc addObserverForName:UIApplicationWillTerminateNotification object:nil queue:nil usingBlock:^(NSNotification*) { dispatch_lifecycle(app_event::terminate); }];
+        });
+    }
 };
 } // namespace
 std::shared_ptr<backend> make_apple() { return std::make_shared<apple_backend>(); }
 } // namespace forge::os::mobile::detail
+#elif defined(__APPLE__) && TARGET_OS_OSX
+// macOS: trackpad touches/gestures come from the app's NSView via feed_touch; location via CoreLocation in
+// the app (feed_sensor). Here: IOKit power assertions (keep-awake), NSWorkspace open_url, user notifications,
+// device info; everything else uses the portable defaults (power, clipboard, connectivity) or is not_supported.
+#import <AppKit/AppKit.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
+#import <UserNotifications/UserNotifications.h>
+namespace forge::os::mobile::detail {
+namespace {
+struct mac_backend final : backend {
+    IOPMAssertionID awake = 0;
+    ~mac_backend() override { if (awake) IOPMAssertionRelease(awake); }
+    std::string name() const override { return "macos"; }
+    result<touch_stream> open_touch() override { auto q = std::make_shared<queue>(); bridge::get().add_touch(q); return {make_touch(q, nullptr), {}}; }
+    result<sensor_stream> open_sensor(sensor_kind k, double) override {
+        if (k != sensor_kind::location) return {{}, unsupported(std::string("sensor ") + sensor_name(k) + " on macOS")};
+        auto q = std::make_shared<queue>(); bridge::get().add_sensor(k, q); return {make_sensor(k, q, nullptr), {}};
+    }
+    status keep_awake(bool on) override {
+        if (on && !awake) return IOPMAssertionCreateWithName(kIOPMAssertionTypeNoDisplaySleep, kIOPMAssertionLevelOn, CFSTR("forge keep_awake"), &awake) == kIOReturnSuccess ? status{} : status{{}, {1, "IOPMAssertionCreateWithName failed"}};
+        if (!on && awake) { IOPMAssertionRelease(awake); awake = 0; }
+        return {};
+    }
+    status open_url(std::string_view u) override {
+        NSURL* url = [NSURL URLWithString:[[NSString alloc] initWithBytes:u.data() length:u.size() encoding:NSUTF8StringEncoding]];
+        if (!url) return {{}, {22, "open_url: bad URL"}};
+        return [NSWorkspace.sharedWorkspace openURL:url] ? status{} : status{{}, {1, "NSWorkspace openURL failed"}};
+    }
+    result<device_info> info() override {
+        auto d = backend::info(); if (!d) return d; d.value.manufacturer = "Apple";
+        d.value.form = power_status().has_battery ? form_factor::laptop : form_factor::desktop; return d;
+    }
+    result<permission_state> permission_status(permission p) override { if (auto b = backend::permission_status(p)) return b; return {permission_state::not_required, {}}; }
+    status request_permission(permission) override { return {}; }
+};
+} // namespace
+std::shared_ptr<backend> make_apple() { return std::make_shared<mac_backend>(); }
+} // namespace forge::os::mobile::detail
 #elif defined(__APPLE__)
-namespace forge::os::mobile::detail { std::shared_ptr<backend> make_apple() { return make_null(); } }
+namespace forge::os::mobile::detail { std::shared_ptr<backend> make_apple() { return make_null(); } }   // watchOS: glue only
 #endif

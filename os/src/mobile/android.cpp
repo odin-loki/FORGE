@@ -14,6 +14,7 @@
 #include <camera/NdkCameraManager.h>
 #include <forge/os/power.hpp>
 #include <dlfcn.h>
+#include <sys/system_properties.h>
 
 namespace forge::os::mobile {
 bool android_feed_motion(const void* p) {
@@ -48,6 +49,14 @@ int ndk_type(sensor_kind k) {
     case sensor_kind::light: return ASENSOR_TYPE_LIGHT;
     case sensor_kind::proximity: return ASENSOR_TYPE_PROXIMITY;
     case sensor_kind::pressure: return ASENSOR_TYPE_PRESSURE;
+    case sensor_kind::gravity: return 9;               // ASENSOR_TYPE_GRAVITY
+    case sensor_kind::linear_acceleration: return 10;
+    case sensor_kind::rotation_vector: return 11;      // v = x,y,z of the unit quaternion
+    case sensor_kind::humidity: return 12;
+    case sensor_kind::temperature: return 13;          // ambient
+    case sensor_kind::step_detector: return 18;
+    case sensor_kind::step_counter: return 19;
+    case sensor_kind::heart_rate: return 21;           // needs BODY_SENSORS
     default: return -1;
     }
 }
@@ -62,6 +71,16 @@ ASensorManager* manager() {
 
 struct android_backend final : backend {
     std::string name() const override { return "android"; }
+    result<device_info> info() override {
+        auto d = backend::info(); if (!d) return d;
+        auto prop = [](const char* k) { char v[PROP_VALUE_MAX] = {}; __system_property_get(k, v); return std::string(v); };
+        d.value.os_name = "Android"; d.value.os_version = prop("ro.build.version.release");
+        d.value.manufacturer = prop("ro.product.manufacturer"); d.value.model = prop("ro.product.model");
+        auto ch = prop("ro.build.characteristics");
+        d.value.form = ch.find("watch") != std::string::npos ? form_factor::watch : ch.find("tv") != std::string::npos ? form_factor::tv
+                     : ch.find("automotive") != std::string::npos ? form_factor::car : ch.find("tablet") != std::string::npos ? form_factor::tablet : form_factor::phone;
+        return d;
+    }
     result<std::vector<sensor_info>> sensors() override {
         std::vector<sensor_info> v; auto* m = manager(); if (!m) return {{}, unsupported("ASensorManager")};
         for (int k = 0; k < sensor_kind_count; ++k) {
@@ -103,6 +122,9 @@ struct android_backend final : backend {
                         case sensor_kind::light: e.v[0] = buf[i].light; e.n = 1; break;
                         case sensor_kind::proximity: e.v[0] = buf[i].distance; e.n = 1; break;
                         case sensor_kind::pressure: e.v[0] = buf[i].pressure; e.n = 1; break;
+                        case sensor_kind::humidity: case sensor_kind::temperature: case sensor_kind::heart_rate: case sensor_kind::step_detector:
+                            e.v[0] = buf[i].data[0]; e.n = 1; break;
+                        case sensor_kind::step_counter: e.v[0] = double(buf[i].u64.step_counter); e.n = 1; break;
                         default: for (int a = 0; a < 3; ++a) e.v[a] = buf[i].data[a]; e.n = 3;
                         }
                         q->push({false, e, {}});

@@ -295,6 +295,27 @@ std::println("{}", got);
     EXPECT("auto t = std::async([] { throw std::invalid_argument(\"in task\"); });\ntry { t.get(); } catch (const std::invalid_argument& e) { std::println(\"task failed: {}\", e.what()); }", "task failed: in task\n");
 }
 
+TEST(mobile_sensors_touch) {
+    EXPECT(R"CPP(
+auto dev = forge::mobile::device({{"sim", "{\"display\":{\"width\":100,\"height\":200},\"sensors\":[\"accelerometer\"],\"services\":{\"clipboard\":\"c\"},\"events\":[{\"t_ms\":0,\"type\":\"sensor\",\"kind\":\"accelerometer\",\"v\":[1,2,3]},{\"t_ms\":1,\"type\":\"touch\",\"phase\":\"down\",\"id\":0,\"x\":10,\"y\":10},{\"t_ms\":2,\"type\":\"touch\",\"phase\":\"up\",\"id\":0,\"x\":11,\"y\":10}]}"}});
+std::println("{}", dev.backend());
+std::println("{}", forge::sensors::list(dev).size());
+auto acc = forge::sensors::open("accelerometer", 100, dev);
+forge::channel<int> ch(16);
+int n = 0;
+for (int i = 0; i < 50 && n == 0; ++i) n = acc.pump(ch, 8, 20);
+auto e = ch.recv();
+std::println("{} {}", e["kind"], e["v"]);
+auto t = forge::touch::open(dev);
+std::vector<int> kinds;
+auto gs = t.gestures(200);
+std::println("{}", gs.size() > 0 ? gs[0]["kind"] : "none");
+std::println("{} {}", dev.clipboard_get(), dev.display()["width"]);
+acc.close();
+try { acc.poll(); } catch (const std::exception& x) { std::println("disposed"); }
+)CPP", "sim\n1\naccelerometer [1, 2, 3]\ntap\nc 100\ndisposed\n");
+}
+
 #if !defined(_WIN32)
 TEST(shell_and_processes) {
     EXPECT("std::string name = \"it's\";\nauto r = forge::sh(\"printf '%s' {}\", name);\nstd::println(\"{} {} {}\", r.out, r.code, r.ok);", "it's 0 true\n");

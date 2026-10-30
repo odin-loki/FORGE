@@ -321,6 +321,28 @@ release, uptime, loadavg, memory, is_tty, term_size, devices, clipboard), `proc.
 - `mem.budget()`, `mem.usage()`, `mem.limit(size)` from `forge::mem`.
 - `serve.start(opts)` / `serve.stop()`.
 
+## Mobile and device built-ins (implemented)
+
+Gated by the `env` capability (device access). Handles own their device/stream; methods copy the owner per
+call, so disposing a handle while a task uses it is safe.
+
+```cpp
+auto dev = forge::mobile::device();              // or ({{"sim", trace_json}}), ({{"sim_file", p}}), ({{"null", true}})
+std::println("{} {}", dev.backend(), dev.info()["form"]);
+auto acc = forge::sensors::open("accelerometer", 100, dev);   // forge::sensors::list(dev) lists kinds
+forge::channel<int> ch(64);
+while (acc.pump(ch, 32, 50) == 0) {}            // pump on the interpreter thread; consumers recv from ch (tasks too)
+auto e = ch.recv();                              // {"type":"sensor","kind":..., "t_ns":..., "v":[...]}
+auto touch = forge::touch::open(dev);
+for (auto g : touch.gestures(16)) std::println("{}", g["kind"]);   // tap, double_tap, long_press, swipe, pinch, rotate
+```
+
+Sensor handle: `poll(timeout)`, `pump(ch, max, timeout)` (never blocks; stops at channel capacity), `kind()`,
+`dropped()`, `finished()`, `close()`. Touch handle: `poll`, `gestures`, `pump` (gestures), `finished`, `close`.
+Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`, `notify`, `clipboard_get/set`,
+`brightness`, `set_brightness`, `keep_awake`, `torch`, `open_url`, `permission`, `request_permission`,
+`sim_log`, `close`. Unsupported features raise `NotSupportedError`; other failures raise `IOError`.
+
 ## Higher-level features (approved, all in scope)
 
 1. **Parallel tasks** — `spawn fn`, `await`, `parallel(list, fn, n)`; thread pool from `forge::os`.
