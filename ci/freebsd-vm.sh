@@ -28,6 +28,8 @@ runcmd:
   # cmake is packaged as cmake-core since 2026Q4).
   - env ASSUME_ALWAYS_YES=yes pkg update -f
   - env ASSUME_ALWAYS_YES=yes pkg install -y cmake-core ninja python3 py312-numpy bash zsh mksh fish
+  # python deps of the golden/onnx tests (best effort: names vary between package sets)
+  - env ASSUME_ALWAYS_YES=yes pkg install -y py312-safetensors py312-onnx py312-protobuf || true
   - mkdir -p /workspace
   - chown ci /workspace
   - touch /var/ci-ready

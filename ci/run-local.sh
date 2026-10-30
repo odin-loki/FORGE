@@ -38,14 +38,21 @@ job_shells() {
     -DFORGE_BUILD_EXAMPLES=OFF &&
   cmake --build "$CI_ROOT/shells" -j"$J" --target test_script forge &&
   PATH="$SHELL_DIRS:$PATH" FORGE_TEST_ONLY=emit "$CI_ROOT/shells/test_script"; }
+winepath_w() { "$(dirname "$WINE")/winepath" -w "$1" 2>/dev/null || echo "Z:$(echo "$1" | tr / '\\\\')"; }
 job_windows_mingw() { # windows-mingw job: llvm-mingw cross build, ctest via wine; cmd/pwsh emit goldens.
   b="$CI_ROOT/win64"; export WINEPREFIX=${WINEPREFIX:-$CI_ROOT/wineprefix} WINEDEBUG=-all
   [ -d "$WINEPREFIX" ] || xvfb-run -a "$WINE" wineboot -i >/dev/null 2>&1
+  # wine's powershell.exe is a stub that prints nothing and real PowerShell 7 crashes under wine: hide the stub so
+  # pwsh/powershell report "not installed". busybox-w32 stands in for Git-for-Windows' sh on the hosted runner.
+  ps="$WINEPREFIX/drive_c/windows/system32/WindowsPowerShell/v1.0/powershell.exe"; [ -f "$ps" ] && mv "$ps" "$ps.stub"
+  wb=${WIN_SH_DIR:-$CI_ROOT/winbin}; [ -f "$wb/sh.exe" ] && export WINEPATH="$(winepath_w "$wb")"
   cmake -S . -B "$b" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$MINGW_TC" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF \
     -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE" &&
   cmake --build "$b" -j"$J" &&
-  xvfb-run -a ctest --test-dir "$b" -LE "slow|emu" -j2 --timeout 1200 &&
-  (cd "$b" && FORGE_TEST_ONLY=emit xvfb-run -a "$WINE" ./test_script.exe); }
+  # python-driven tests launch forge.exe directly from Linux python (no wine in between): run natively by linux-*.
+  xvfb-run -a ctest --test-dir "$b" -LE "slow|emu" -E "^(golden_|pack_signing|onnx_import|docs_up_to_date|sbom_spdx|doc_example_mind_generate)" \
+    -j2 --timeout 1200 &&
+  FORGE_TEST_ONLY=emit xvfb-run -a "$WINE" "$b/test_script.exe"; }   # from the source dir (tests/data/emit)
 job_freebsd() { # needs FBSD_VM_SH: a script that boots the VM, syncs $src, and runs the workflow's cmake/ctest steps inside.
   [ -n "${FBSD_VM_SH:-}" ] && [ -x "$FBSD_VM_SH" ] || { echo "SKIP: set FBSD_VM_SH (see ci/freebsd-vm.sh)"; return 77; }
   "$FBSD_VM_SH" "$src"; }
@@ -67,10 +74,10 @@ job_zig_cross() { # macos/ios: no Apple SDK here, so zig cross compile/link chec
     cmake -S . -B "$b" -G Ninja -DCMAKE_C_COMPILER="$GCC" -DCMAKE_CXX_COMPILER="$GXX" -DFORGE_BUILD_EXAMPLES=OFF "-DFORGE_ZIG=$ZIG" >/dev/null
   ctest --test-dir "$b" -L cross -R "$1" -j"$J" --timeout 1200; }
 job_macos() { job_zig_cross 'macos'; }
-job_ios() { # zig ships no iOS libc; compile-only check of the C API + os headers for aarch64-ios.
-  [ -x "$ZIG" ] || { echo "SKIP: no zig"; return 77; }
-  for f in tests/test_os.cpp tests/test_balance.cpp; do
-    "$ZIG" c++ -target aarch64-ios -std=c++20 -fsyntax-only -Ios/include -Ibalance/include -Itests "$f" || return 1; done; echo "ios syntax ok"; }
+job_ios() { # needs an iOS SDK (Xcode); zig ships no iOS libc headers, so there is nothing faithful to run here.
+  command -v xcodebuild >/dev/null || { echo "SKIP: no Xcode/iOS SDK (zig has no iOS libc)"; return 77; }
+  cmake -S . -B "$CI_ROOT/ios" -G Xcode -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_APPS=OFF \
+    -DFORGE_BUILD_EXAMPLES=OFF && cmake --build "$CI_ROOT/ios" --config Release --target forge_c -- -quiet CODE_SIGNING_ALLOWED=NO; }
 
 jobs=${*:-linux-gcc linux-clang linux-tsan linux-asan shells windows-mingw freebsd android macos ios}
 rc_all=0
