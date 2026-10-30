@@ -1,7 +1,11 @@
 // forge::os::mobile: simulated backend, gesture recognizer, Linux IIO/evdev against fake trees.
 #include <forge/os/mobile.hpp>
 #include "check.hpp"
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
+#include <mutex>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -91,6 +95,53 @@ TEST(null_device_unsupported) {
 }
 TEST(platform_open) { auto d = m::device::open(); CHECK(d); if (d) CHECK(!d->backend_name().empty()); }
 
+static const char* k_svc = R"({"permissions": {"camera": "denied"},
+ "services": {"power": {"battery_percent": 64, "charging": true}, "connectivity": {"online": true, "transport": "wifi", "ssid": "home", "signal_percent": 70},
+  "bluetooth_scan": [{"address": "AA:BB", "name": "band", "rssi": -60}], "clipboard": "hi", "brightness": 0.3,
+  "info": {"manufacturer": "Sim", "model": "S1", "form": "watch"}, "gnss": {"fix": true, "satellites_visible": 9, "satellites_used": 6}},
+ "events": [{"t_ms": 0, "type": "lifecycle", "value": "background"}, {"t_ms": 5, "type": "lifecycle", "value": "foreground"}]})";
+TEST(sim_services) {
+    auto d = m::device::simulated(k_svc); CHECK(d); if (!d) return;
+    auto p = d->power(); CHECK(p && p->battery_percent == 64);
+    auto c = d->connectivity(); CHECK(c && c->online && c->transport == "wifi" && c->ssid == "home");
+    auto b = d->bluetooth_scan(10); CHECK(b && b->size() == 1 && b->at(0).rssi == -60);
+    auto cl = d->clipboard_get(); CHECK(cl && *cl == "hi"); CHECK(d->clipboard_set("yo")); CHECK(d->clipboard_get().value == "yo");
+    CHECK(d->set_brightness(0.8)); auto br = d->brightness(); CHECK(br && *br > 0.79);
+    CHECK(!d->torch(true));                       // camera permission denied
+    auto g = d->gnss(); CHECK(g && g->fix && g->satellites_used == 6);
+    auto nfc = d->nfc_available(); CHECK(!nfc && is_unsupported(nfc.err));   // absent from trace
+    CHECK(d->keep_awake(true)); CHECK(d->open_url("https://example.com"));
+    CHECK(d->haptic_pattern({20, 10, 20}));
+}
+TEST(sim_lifecycle) {
+    auto d = m::device::simulated(k_svc); if (!d) { CHECK(false); return; }
+    std::mutex mu; std::vector<m::app_event> got;
+    auto sub = d->on_lifecycle([&](m::app_event e) { std::lock_guard g(mu); got.push_back(e); });
+    m::feed_lifecycle(m::app_event::low_memory);
+    for (int i = 0; i < 100; ++i) { { std::lock_guard g(mu); if (got.size() >= 3) break; } std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+    std::lock_guard g(mu); CHECK(got.size() >= 3);
+    CHECK(std::find(got.begin(), got.end(), m::app_event::low_memory) != got.end());
+    CHECK(std::find(got.begin(), got.end(), m::app_event::background) != got.end());
+}
+TEST(geofencing) {
+    CHECK(std::abs(m::geofence_monitor::distance_m(0, 0, 0, 1) - 111195) < 200);
+    m::geofence_monitor gm; gm.add({"home", -33.87, 151.21, 100});
+    m::sensor_event far; far.kind = m::sensor_kind::location; far.v = {-33.90, 151.21}; far.n = 2;
+    m::sensor_event near = far; near.v = {-33.8701, 151.2101};
+    CHECK(gm.feed(far).empty());
+    auto e = gm.feed(near); CHECK(e.size() == 1 && e[0].entered);
+    e = gm.feed(far); CHECK(e.size() == 1 && !e[0].entered);
+    CHECK(gm.remove("home")); CHECK(!gm.remove("home"));
+}
+TEST(gesture_rotate) {
+    m::gesture_recognizer r; std::vector<m::gesture> out;
+    auto f = [&](std::uint64_t t, m::touch_phase ph, int id, double x, double y) { for (auto& g : r.feed({t, ph, id, x, y, 1, 1})) out.push_back(g); };
+    f(0, m::touch_phase::down, 0, 100, 100); f(1, m::touch_phase::down, 1, 200, 100);
+    f(20000000, m::touch_phase::move, 1, 100 + 100 * std::cos(0.5), 100 + 100 * std::sin(0.5));
+    f(40000000, m::touch_phase::up, 1, 100 + 100 * std::cos(0.5), 100 + 100 * std::sin(0.5)); f(41000000, m::touch_phase::up, 0, 100, 100);
+    bool rot = false; for (auto& g : out) if (g.kind == m::gesture_kind::rotate && std::abs(g.rotation) > 0.3) rot = true;
+    CHECK(rot);
+}
 #if defined(__linux__) && !defined(__ANDROID__)
 static void put(const fs::path& p, const std::string& s) { fs::create_directories(p.parent_path()); std::ofstream(p) << s << "\n"; }
 TEST(linux_iio_fake_sysfs) {

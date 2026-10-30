@@ -11,13 +11,14 @@ namespace forge::os::mobile {
 using namespace detail;
 
 // ------------------------------------------------------------------ names
-static constexpr const char* k_sensor[] = {"accelerometer", "gyroscope", "magnetometer", "light", "proximity", "pressure", "location", "battery"};
+static constexpr const char* k_sensor[] = {"accelerometer", "gyroscope", "magnetometer", "light", "proximity", "pressure", "location", "battery",
+    "step_counter", "step_detector", "rotation_vector", "gravity", "linear_acceleration", "heart_rate", "temperature", "humidity"};
 const char* sensor_name(sensor_kind k) { return k_sensor[int(k)]; }
 std::optional<sensor_kind> parse_sensor(std::string_view s) { for (int i = 0; i < sensor_kind_count; ++i) if (s == k_sensor[i]) return sensor_kind(i); return std::nullopt; }
 static constexpr const char* k_phase[] = {"down", "move", "up", "cancel"};
 const char* touch_phase_name(touch_phase p) { return k_phase[int(p)]; }
 static std::optional<touch_phase> parse_phase(std::string_view s) { for (int i = 0; i < 4; ++i) if (s == k_phase[i]) return touch_phase(i); return std::nullopt; }
-static constexpr const char* k_gesture[] = {"tap", "double_tap", "long_press", "swipe", "pinch"};
+static constexpr const char* k_gesture[] = {"tap", "double_tap", "long_press", "swipe", "pinch", "rotate"};
 const char* gesture_name(gesture_kind g) { return k_gesture[int(g)]; }
 static constexpr const char* k_orient[] = {"unknown", "portrait", "portrait_upside_down", "landscape_left", "landscape_right"};
 const char* orientation_name(orientation o) { return k_orient[int(o)]; }
@@ -114,14 +115,19 @@ std::vector<gesture> gesture_recognizer::feed(const touch_event& e) {
     case touch_phase::down:
         if (auto it = find(e.id); it != live_.end()) live_.erase(it);
         live_.push_back({e.id, e.x, e.y, e.x, e.y, e.t_ns, false});
-        if (live_.size() == 2) { multi_ = true; pinch0_ = dist2(); pinch_last_ = 1; }
+        if (live_.size() == 2) { multi_ = true; pinch0_ = dist2(); pinch_last_ = 1; angle0_ = std::atan2(live_[1].y - live_[0].y, live_[1].x - live_[0].x); angle_last_ = 0; }
         break;
     case touch_phase::move: {
         auto it = find(e.id); if (it == live_.end()) break;
         it->x = e.x; it->y = e.y;
         if (live_.size() == 2 && pinch0_ > 0) {
             double s = dist2() / pinch0_;
-            if (std::fabs(s - pinch_last_) >= 0.05) { pinch_last_ = s; out.push_back({gesture_kind::pinch, e.t_ns, (live_[0].x + live_[1].x) / 2, (live_[0].y + live_[1].y) / 2, 0, 0, s}); }
+            double cx = (live_[0].x + live_[1].x) / 2, cy = (live_[0].y + live_[1].y) / 2;
+            if (std::fabs(s - pinch_last_) >= 0.05) { pinch_last_ = s; out.push_back({gesture_kind::pinch, e.t_ns, cx, cy, 0, 0, s}); }
+            constexpr double pi = 3.14159265358979323846;
+            double a = std::atan2(live_[1].y - live_[0].y, live_[1].x - live_[0].x) - angle0_;
+            while (a > pi) a -= 2 * pi; while (a < -pi) a += 2 * pi;
+            if (std::fabs(a - angle_last_) >= 0.1) { angle_last_ = a; out.push_back({gesture_kind::rotate, e.t_ns, cx, cy, 0, 0, s, a}); }
         } else if (!multi_ && !it->long_fired && std::hypot(it->x - it->x0, it->y - it->y0) <= c_.tap_slop_px && e.t_ns - it->t0 >= c_.long_press_ns) {
             it->long_fired = true; out.push_back({gesture_kind::long_press, e.t_ns, it->x, it->y});
         }
@@ -158,7 +164,8 @@ std::shared_ptr<backend> make_null() { return std::make_shared<null_backend>(); 
 
 // ------------------------------------------------------------------ simulated backend (JSON trace)
 struct sim_backend final : backend, std::enable_shared_from_this<sim_backend> {
-    struct ev { std::uint64_t t_ns; item it; std::optional<orientation> orient; };
+    struct ev { std::uint64_t t_ns; item it; std::optional<orientation> orient; std::optional<app_event> life; };
+    json::value services = json::object{}; double bright = 0.5; std::string clip; std::shared_ptr<worker> life_w; bool life_started = false;
     bool realtime = false;
     std::vector<sensor_info> sens; std::vector<camera_info> cams; std::optional<display_info> disp;
     std::array<permission_state, 5> perms{permission_state::granted, permission_state::granted, permission_state::granted, permission_state::granted, permission_state::granted};
@@ -174,7 +181,7 @@ struct sim_backend final : backend, std::enable_shared_from_this<sim_backend> {
             std::uint64_t start = now_ns(), base = self->events.empty() ? 0 : self->events.front().t_ns;
             for (auto& e : self->events) {
                 if (wp->stop) return;
-                if (!pred(e.it) || e.orient) continue;
+                if (!pred(e.it) || e.orient || e.life) continue;
                 if (self->realtime) { auto due = start + (e.t_ns - base), n = now_ns(); if (due > n && !wp->sleep_ns(due - n)) return; }
                 q->push(e.it);
             }
@@ -219,6 +226,46 @@ struct sim_backend final : backend, std::enable_shared_from_this<sim_backend> {
         log.push_back({"notify", std::string(t) + ": " + std::string(b)}); return {};
     }
     std::vector<sim_record> sim_log() const override { std::lock_guard g(m); return log; }
+    ~sim_backend() override { life_w.reset(); }
+    std::optional<std::string> svc(std::string_view op, std::string_view args) override {
+        std::lock_guard g(m);
+        auto deny = [&](permission p) { return perms[int(p)] == permission_state::denied; };
+        auto act = [&](std::optional<permission> p = std::nullopt) -> std::optional<std::string> {
+            if (p && deny(*p)) return std::string("{\"error\":\"") + std::string(op) + ": permission denied\",\"code\":13}";
+            log.push_back({std::string(op), std::string(args)}); return std::string("true");
+        };
+        if (op == "clipboard_get") return json::dump(json::value(clip));
+        if (op == "clipboard_set") { clip = json::parse(args)["text"].str(); return act(); }
+        if (op == "brightness") return std::to_string(bright);
+        if (op == "set_brightness") { bright = json::parse(args)["level"].num(); return act(); }
+        if (op == "torch" || op == "capture_photo") {
+            if (cams.empty()) return std::string("{\"unsupported\":\"camera (none in trace)\"}");
+            if (op == "torch") return act(permission::camera);
+            if (deny(permission::camera)) return act(permission::camera);
+            log.push_back({"capture_photo", std::string(args)});
+            if (auto* p = services.find("photo")) return json::dump(*p);
+            return std::string("{\"bytes\":[255,216,255,224,0,16,74,70,73,70,0,1,255,217]}");   // minimal JFIF SOI..EOI
+        }
+        if (op == "record_audio") { if (auto r = act(); *r != "true") return r; if (auto* a = services.find("audio")) return json::dump(*a); return std::string("{}"); }
+        if (op == "keep_awake" || op == "lock_orientation" || op == "show_keyboard" || op == "open_url" || op == "share" || op == "play_audio") return act();
+        if (op == "haptic_pattern") return act(permission::vibrate);
+        if (op == "bluetooth_scan" || op == "gnss") { if (deny(permission::location)) return act(permission::location); }
+        if (auto* v = services.find(op)) return json::dump(*v);
+        return std::string("{\"unsupported\":\"") + std::string(op) + " (not in trace)\"}";
+    }
+    void lifecycle_started() override {
+        std::lock_guard g(m); if (life_started) return; life_started = true;
+        life_w = std::make_shared<worker>();
+        life_w->start([this, wp = life_w.get()] {
+            std::uint64_t start = now_ns(), base = events.empty() ? 0 : events.front().t_ns;
+            for (auto& e : events) {
+                if (!e.life) continue;
+                if (realtime) { auto due = start + (e.t_ns - base), n = now_ns(); if (due > n && !wp->sleep_ns(due - n)) return; }
+                if (wp->stop) return;
+                dispatch_lifecycle(*e.life);
+            }
+        });
+    }
 };
 
 std::shared_ptr<backend> make_sim(std::string_view text, bool realtime, error& err) {
@@ -243,6 +290,8 @@ std::shared_ptr<backend> make_sim(std::string_view text, bool realtime, error& e
             if (!pk || !ps) { err = {22, "trace: bad permission entry '" + k + "'"}; return nullptr; }
             b->perms[int(*pk)] = *ps;
         }
+        if (auto* sv = j.find("services")) { if (!sv->is_obj()) { err = {22, "trace: services must be an object"}; return nullptr; } b->services = *sv;
+            if (auto* c = sv->find("clipboard")) b->clip = c->str(); if (auto* br = sv->find("brightness")) b->bright = br->num(); }
         if (auto* e = j.find("events")) for (auto& x : e->arr()) {
             sim_backend::ev ev{}; ev.t_ns = std::uint64_t(x.num_or("t_ms", 0) * 1e6);
             auto type = x.str_or("type", "");
@@ -257,6 +306,9 @@ std::shared_ptr<backend> make_sim(std::string_view text, bool realtime, error& e
             } else if (type == "orientation") {
                 auto o = parse_orientation(x.str_or("value", "")); if (!o) { err = {22, "trace: bad orientation"}; return nullptr; }
                 ev.orient = *o;
+            } else if (type == "lifecycle") {
+                auto l = parse_app_event(x.str_or("value", "")); if (!l) { err = {22, "trace: bad lifecycle value"}; return nullptr; }
+                ev.life = *l;
             } else { err = {22, "trace: unknown event type '" + type + "'"}; return nullptr; }
             b->events.push_back(ev);
         }
@@ -296,6 +348,10 @@ result<device> device::open() {
     d.b_ = make_android();
 #elif defined(__APPLE__)
     d.b_ = make_apple();
+#elif defined(_WIN32)
+    d.b_ = make_windows();
+#elif defined(__FreeBSD__)
+    d.b_ = make_freebsd();
 #elif defined(__linux__)
     const char* s = std::getenv("FORGE_MOBILE_SYSFS"); const char* i = std::getenv("FORGE_MOBILE_INPUT");
     d.b_ = make_linux(s && *s ? s : "/sys", i && *i ? i : "/dev/input");

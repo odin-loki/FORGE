@@ -93,7 +93,8 @@ if(Threads_FOUND)
 endif()
 
 # forge::os::mobile — sensors, touch, haptics, display, cameras, permissions (docs/mobile.md).
-set(FORGE_MOBILE_SRCS os/src/mobile/mobile.cpp os/src/mobile/linux.cpp os/src/mobile/android.cpp)
+set(FORGE_MOBILE_SRCS os/src/mobile/mobile.cpp os/src/mobile/linux.cpp os/src/mobile/android.cpp
+  os/src/mobile/services.cpp os/src/mobile/windows.cpp os/src/mobile/freebsd.cpp)
 if(APPLE)
   enable_language(OBJCXX)
   list(APPEND FORGE_MOBILE_SRCS os/src/mobile/apple.mm)
@@ -107,6 +108,8 @@ endif()
 set_target_properties(forge_mobile PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(ANDROID)
   target_link_libraries(forge_mobile PUBLIC android camera2ndk ${CMAKE_DL_LIBS})
+elseif(WIN32)
+  target_link_libraries(forge_mobile PUBLIC shell32 user32)
 elseif(APPLE)
   set_source_files_properties(os/src/mobile/apple.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
   if(CMAKE_SYSTEM_NAME STREQUAL "iOS")

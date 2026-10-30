@@ -45,6 +45,8 @@ struct bridge {
     std::optional<display_info> disp;
     std::array<std::optional<permission_state>, 5> perms{};
     action_hooks hooks;
+    service_hook svc;
+    std::vector<std::weak_ptr<std::function<void(app_event)>>> life;
     void add_touch(const std::shared_ptr<queue>& q) { std::lock_guard g(m); touch.push_back(q); }
     void add_sensor(sensor_kind k, const std::shared_ptr<queue>& q) { std::lock_guard g(m); sensor.emplace_back(k, q); }
 };
@@ -64,6 +66,32 @@ struct backend {
     virtual status notify(std::string_view title, std::string_view body);
     virtual std::vector<sim_record> sim_log() const { return {}; }
 
+    // Hook/sim answer for a service op (JSON), or nullopt to use the native implementation below.
+    virtual std::optional<std::string> svc(std::string_view op, std::string_view args);
+    // Native implementations. Defaults are the portable ones (services.cpp); platforms override.
+    virtual result<power_info> power();
+    virtual result<connectivity_info> connectivity();
+    virtual result<std::vector<ble_device>> bluetooth_scan(int) { return {{}, unsupported("bluetooth scan")}; }
+    virtual result<bool> nfc_available() { return {{}, unsupported("NFC")}; }
+    virtual result<std::string> clipboard_get();
+    virtual status clipboard_set(std::string_view t);
+    virtual result<double> brightness() { return {{}, unsupported("screen brightness")}; }
+    virtual status set_brightness(double) { return {{}, unsupported("screen brightness")}; }
+    virtual status keep_awake(bool) { return {{}, unsupported("keep awake")}; }
+    virtual status lock_orientation(orientation) { return {{}, unsupported("orientation lock")}; }
+    virtual status show_keyboard(bool) { return {{}, unsupported("soft keyboard")}; }
+    virtual result<biometric_info> biometrics() { return {{}, unsupported("biometrics")}; }
+    virtual result<device_info> info();
+    virtual result<storage_paths> paths();
+    virtual status open_url(std::string_view url);
+    virtual status share(std::string_view) { return {{}, unsupported("share sheet")}; }
+    virtual status torch(bool) { return {{}, unsupported("torch")}; }
+    virtual result<std::vector<std::uint8_t>> capture_photo(std::string_view) { return {{}, unsupported("camera capture")}; }
+    virtual result<audio_clip> record_audio(int, int) { return {{}, unsupported("audio recording")}; }
+    virtual status play_audio(const audio_clip&) { return {{}, unsupported("audio playback")}; }
+    virtual result<gnss_status> gnss() { return {{}, unsupported("GNSS status")}; }
+    virtual void lifecycle_started();   // on_lifecycle subscribed: default maps os::memory_pressure critical -> low_memory; sim replays its trace
+
     // Stream construction (backends are friends of the stream types through this base).
     static sensor_stream make_sensor(sensor_kind k, std::shared_ptr<queue> q, std::shared_ptr<void> keep) {
         sensor_stream s; s.kind_ = k; s.q_ = std::move(q); s.keep_ = std::move(keep); return s;
@@ -74,6 +102,16 @@ struct backend {
 };
 
 std::shared_ptr<backend> make_null();
+void dispatch_lifecycle(app_event e, bool drive_mem = true);
+// Run argv[0] from PATH and wait (unix: posix_spawnp; Windows: CreateProcess). Returns exit code or -1 if not found;
+// with `out`, stdout is captured.
+int run_tool(const std::vector<std::string>& argv, std::string* out = nullptr, int timeout_ms = 15000);
+#if defined(_WIN32)
+std::shared_ptr<backend> make_windows();
+#endif
+#if defined(__FreeBSD__)
+std::shared_ptr<backend> make_freebsd();
+#endif
 std::shared_ptr<backend> make_sim(std::string_view json, bool realtime, error& err);
 #if defined(__linux__) && !defined(__ANDROID__)
 std::shared_ptr<backend> make_linux(std::string sysfs, std::string input);

@@ -8,6 +8,7 @@
 //   cameras   <sysfs>/class/video4linux.  notify: notify-send.  permissions: not_required.
 #include "internal.hpp"
 #if defined(__linux__) && !defined(__ANDROID__)
+#include "evdev.hpp"
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -21,6 +22,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <map>
+#include <forge/os/process.hpp>
 
 extern char** environ;
 
@@ -64,7 +66,9 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         static const kind_def defs[] = {
             {sensor_kind::accelerometer, "in_accel", 3, 1.0}, {sensor_kind::gyroscope, "in_anglvel", 3, 1.0},
             {sensor_kind::magnetometer, "in_magn", 3, 100.0 /* gauss -> uT */}, {sensor_kind::light, "in_illuminance", 1, 1.0},
-            {sensor_kind::proximity, "in_proximity", 1, 1.0}, {sensor_kind::pressure, "in_pressure", 1, 10.0 /* kPa -> hPa */}};
+            {sensor_kind::proximity, "in_proximity", 1, 1.0}, {sensor_kind::pressure, "in_pressure", 1, 10.0 /* kPa -> hPa */},
+            {sensor_kind::temperature, "in_temp", 1, 0.001 /* milli degC */}, {sensor_kind::humidity, "in_humidityrelative", 1, 0.001 /* milli %RH */},
+            {sensor_kind::step_counter, "in_steps", 1, 1.0}, {sensor_kind::gravity, "in_gravity", 3, 1.0}};
         for (auto& d : ls(root)) {
             std::string dev = root + "/" + d; auto nm = slurp(dev + "/name");
             for (auto& k : defs) {
@@ -132,49 +136,6 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         w->start([fd, q, wp = w.get()] { evdev_loop(fd, *q, *wp); ::close(fd); });
         return {make_touch(q, w), {}};
     }
-    static void evdev_loop(int fd, queue& q, worker& w) {
-        struct slot { int id = -1; double x = 0, y = 0, p = 1; bool changed = false, down = false, up = false; };
-        std::vector<slot> slots(16); int cur = 0; bool st_touch = false, st_changed = false;
-        auto active = [&] { int n = 0; for (auto& s : slots) n += s.id >= 0; return n; };
-        input_event buf[64];
-        while (!w.stop) {
-            pollfd pf{fd, POLLIN, 0}; int r = ::poll(&pf, 1, 50);
-            if (r < 0 && errno != EINTR) break; if (r <= 0) continue;
-            ssize_t n = ::read(fd, buf, sizeof buf);
-            if (n == 0) break; if (n < 0) { if (errno == EAGAIN || errno == EINTR) continue; break; }
-            for (std::size_t i = 0; i < std::size_t(n) / sizeof(input_event); ++i) {
-                auto& ev = buf[i]; auto& s = slots[std::size_t(cur)];
-                if (ev.type == EV_ABS) {
-                    switch (ev.code) {
-                    case ABS_MT_SLOT: cur = std::clamp(ev.value, 0, 15); break;
-                    case ABS_MT_TRACKING_ID: if (ev.value >= 0) { s.id = ev.value; s.down = true; } else { s.up = true; } s.changed = true; break;
-                    case ABS_MT_POSITION_X: s.x = ev.value; s.changed = true; break;
-                    case ABS_MT_POSITION_Y: s.y = ev.value; s.changed = true; break;
-                    case ABS_MT_PRESSURE: s.p = ev.value; s.changed = true; break;
-                    case ABS_X: if (s.id < 0 || cur == 0) { slots[0].x = ev.value; st_changed = true; } break;
-                    case ABS_Y: if (s.id < 0 || cur == 0) { slots[0].y = ev.value; st_changed = true; } break;
-                    }
-                } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
-                    st_touch = true; if (ev.value) { if (slots[0].id < 0) { slots[0].id = 0; slots[0].down = true; } } else slots[0].up = true;
-                    slots[0].changed = true;
-                } else if (ev.type == EV_SYN && ev.code == SYN_REPORT) {
-                    std::uint64_t t = std::uint64_t(ev.input_event_sec) * 1000000000ull + std::uint64_t(ev.input_event_usec) * 1000ull;
-                    if (st_touch && st_changed) slots[0].changed = true;
-                    for (auto& sl : slots) {
-                        if (!sl.changed) continue;
-                        touch_phase ph = sl.up ? touch_phase::up : sl.down ? touch_phase::down : touch_phase::move;
-                        int id = sl.id; int ptrs = active();
-                        q.push({true, {}, {t, ph, id, sl.x, sl.y, sl.p, ptrs}});
-                        if (sl.up) sl.id = -1;
-                        sl.changed = sl.down = sl.up = false;
-                    }
-                    st_changed = false;
-                }
-            }
-        }
-        q.finish();
-    }
-
     // ---- haptics via evdev force feedback
     status vibrate(int ms, double amp) override {
         for (auto& n : ls(input)) {
@@ -224,6 +185,84 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         std::vector<camera_info> v; std::string r = sys + "/class/video4linux";
         for (auto& c : ls(r)) { auto nm = slurp(r + "/" + c + "/name"); auto lc = nm; for (auto& ch : lc) ch = char(std::tolower(ch)); v.push_back({c, nm, lc.find("front") != std::string::npos}); }
         return {v, {}};
+    }
+    // ---- services
+    std::string first_class(const char* cls, const char* contains = nullptr) const {
+        std::string r = sys + "/class/" + cls;
+        for (auto& e : ls(r)) { if (!contains) return r + "/" + e; auto lc = e; for (auto& c : lc) c = char(std::tolower(c)); if (lc.find(contains) != std::string::npos) return r + "/" + e; }
+        return {};
+    }
+    result<double> brightness() override {
+        auto d = first_class("backlight"); double b, m;
+        if (d.empty() || !num(d + "/brightness", b) || !num(d + "/max_brightness", m) || m <= 0) return {{}, unsupported("screen brightness (no backlight)")};
+        return {b / m, {}};
+    }
+    status set_brightness(double l) override {
+        auto d = first_class("backlight"); double m; if (d.empty() || !num(d + "/max_brightness", m)) return {{}, unsupported("screen brightness (no backlight)")};
+        std::ofstream f(d + "/brightness"); if (!f) return {{}, last_error("write " + d + "/brightness")};
+        f << long(std::lround(l * m)) << "\n"; return f ? status{} : status{{}, last_error("write brightness")};
+    }
+    status torch(bool on) override {
+        auto d = first_class("leds", "flash"); if (d.empty()) d = first_class("leds", "torch");
+        if (d.empty()) return {{}, unsupported("torch (no flash LED)")};
+        double m = 1; num(d + "/max_brightness", m);
+        std::ofstream f(d + "/brightness"); if (!f) return {{}, last_error("write " + d + "/brightness")};
+        f << (on ? long(m) : 0) << "\n"; return {};
+    }
+    result<bool> nfc_available() override { return {!ls(sys + "/class/nfc").empty(), {}}; }
+    result<connectivity_info> connectivity() override {
+        auto c = backend::connectivity(); if (!c) return c;
+        std::string out;   // NetworkManager over its CLI (D-Bus underneath); optional
+        if (run_tool({"nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"}, &out, 5000) == 0) {
+            std::size_t i = 0;
+            while (i < out.size()) { auto j = out.find('\n', i); auto line = out.substr(i, j - i); i = j == std::string::npos ? out.size() : j + 1;
+                if (line.rfind("yes:", 0) == 0) { auto k = line.rfind(':'); c.value.ssid = line.substr(4, k - 4); c.value.signal_percent = std::atoi(line.c_str() + k + 1); break; } }
+        }
+        if (c.value.transport == "cellular" || run_tool({"mmcli", "-L"}, &out, 5000) == 0 && out.find("/Modem/") != std::string::npos) {
+            if (c.value.transport == "unknown") c.value.transport = "cellular";
+        }
+        return c;
+    }
+    result<std::vector<ble_device>> bluetooth_scan(int ms) override {
+        std::string out;   // BlueZ through bluetoothctl (D-Bus underneath)
+        if (run_tool({"bluetoothctl", "--timeout", std::to_string(std::max(1, ms / 1000)), "scan", "on"}, &out, ms + 5000) < 0) return {{}, unsupported("bluetooth scan (no bluetoothctl/BlueZ)")};
+        if (run_tool({"bluetoothctl", "devices"}, &out, 5000) != 0) return {{}, {-1, "bluetoothctl devices failed"}};
+        std::vector<ble_device> v; std::size_t i = 0;
+        while (i < out.size()) { auto j = out.find('\n', i); auto line = out.substr(i, j - i); i = j == std::string::npos ? out.size() : j + 1;
+            if (line.rfind("Device ", 0) == 0 && line.size() >= 24) v.push_back({line.substr(7, 17), line.size() > 25 ? line.substr(25) : "", 0}); }
+        return {v, {}};
+    }
+    result<biometric_info> biometrics() override {
+        std::string out; int rc = run_tool({"fprintd-list", os::getenv("USER")}, &out, 5000);
+        if (rc < 0) return {biometric_info{false, false, ""}, {}};
+        return {biometric_info{true, out.find("finger") != std::string::npos && out.find("no fingers") == std::string::npos, "fingerprint"}, {}};
+    }
+    result<device_info> info() override {
+        auto d = backend::info(); if (!d) return d;
+        std::string model = slurp("/proc/device-tree/model");
+        if (!model.empty()) { while (!model.empty() && model.back() == '\0') model.pop_back(); d.value.model = model; d.value.form = form_factor::phone; }
+        auto dmi = sys + "/class/dmi/id";
+        if (auto v = slurp(dmi + "/sys_vendor"); !v.empty()) d.value.manufacturer = v;
+        if (auto v = slurp(dmi + "/product_name"); !v.empty() && model.empty()) d.value.model = v;
+        if (auto ct = slurp(dmi + "/chassis_type"); !ct.empty()) {
+            int t = std::atoi(ct.c_str());
+            d.value.form = (t == 8 || t == 9 || t == 10 || t == 14 || t == 31) ? form_factor::laptop : (t == 30 || t == 32) ? form_factor::tablet : form_factor::desktop;
+        }
+        return d;
+    }
+    result<audio_clip> record_audio(int ms, int rate) override {   // ALSA through arecord
+        std::string out;
+        int rc = run_tool({"arecord", "-q", "-t", "raw", "-f", "S16_LE", "-c", "1", "-r", std::to_string(rate), "-d", std::to_string(std::max(1, (ms + 999) / 1000))}, &out, ms + 10000);
+        if (rc < 0) return {{}, unsupported("audio recording (no arecord)")};
+        if (rc != 0) return {{}, {rc, "arecord failed"}};
+        audio_clip c; c.sample_rate = rate; c.samples.resize(std::min<std::size_t>(out.size() / 2, std::size_t(rate) * std::size_t(ms) / 1000));
+        std::memcpy(c.samples.data(), out.data(), c.samples.size() * 2); return {c, {}};
+    }
+    status play_audio(const audio_clip& c) override {
+        spawn_spec sp; sp.argv = {"aplay", "-q", "-t", "raw", "-f", "S16_LE", "-c", std::to_string(c.channels), "-r", std::to_string(c.sample_rate)};
+        sp.stdin_data = std::string(reinterpret_cast<const char*>(c.samples.data()), c.samples.size() * 2);
+        auto r = spawn_wait(sp); if (!r || r.value.exit_code == 127) return {{}, unsupported("audio playback (no aplay)")};
+        return r.value.exit_code == 0 ? status{} : status{{}, {r.value.exit_code, "aplay failed"}};
     }
     result<permission_state> permission_status(permission p) override { if (auto b = backend::permission_status(p)) return b; return {permission_state::not_required, {}}; }
     status request_permission(permission) override { return {}; }
