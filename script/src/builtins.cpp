@@ -882,4 +882,36 @@ void install_builtins(Shared& sh) {
     for (auto& [k, v] : B) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) (*r)->frozen = true;
 }
 
+Value host_native(Shared& sh, const std::string& name, int lo, int hi, std::function<std::string(const std::string&)> fn) {
+    Shared* shp = &sh;
+    return native(name, std::max(0, lo), hi < 0 ? -1 : hi, [shp, name, fn = std::move(fn)](Interp& in, Args& a) -> Value {
+        // Script callables anywhere in the arguments (also inside lists / maps) become {"$callback": id}.
+        std::function<json::value(const Value&, int)> conv = [&](const Value& x, int depth) -> json::value {
+            if (depth > 256) in.raise("ValueError", name + ": arguments nested too deep (cycle?)");
+            if (as<Function>(x) || as<Native>(x) || as<Bound>(x)) {
+                std::uint64_t id;
+                { std::lock_guard g(shp->cb_m); id = shp->cb_next++; shp->callbacks[id] = x; }
+                json::object o; o.emplace_back("$callback", double(id)); return json::value(std::move(o));
+            }
+            if (auto* l = as<List>(x)) { json::array r; for (auto& e : l->items) r.push_back(conv(e, depth + 1)); return json::value(std::move(r)); }
+            if (auto* m = as<Map>(x)) { json::object o; for (auto& [k, e] : m->entries) o.emplace_back(as<String>(k) ? as<String>(k)->s : in.str(k), conv(e, depth + 1)); return json::value(std::move(o)); }
+            return to_json(in, x);
+        };
+        json::array arr;
+        for (auto& x : a) arr.push_back(conv(x, 0));
+        std::string res;
+        try { res = fn(json::dump(json::value(std::move(arr)))); }
+        catch (const ScriptError&) { throw; }
+        catch (const std::exception& e) { in.raise("HostError", name + ": " + e.what()); }
+        if (res.empty()) return Nil{};
+        try { return from_json(json::parse(res)); }
+        catch (const forge_exception& e) { in.raise("HostError", name + ": bad JSON result: " + e.what()); }
+    });
+}
+Value host_args(const std::string& js) {
+    Value v = from_json(json::parse(js.empty() ? "[]" : js));
+    if (!as<List>(v)) { auto l = make<List>(); l->push(v); return obj(l); }
+    return v;
+}
+
 } // namespace forge::script

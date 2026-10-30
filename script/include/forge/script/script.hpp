@@ -55,6 +55,17 @@ public:
     int repl();                                                                // interactive loop on stdin/stdout
     std::string stats();
 
+    // ---- host bindings (embedding): native C++ functions callable from scripts, and script callbacks the host
+    // can invoke later. Values cross as JSON text, like the plugin ABI (plugin.h). A script function passed as an
+    // argument arrives as {"$callback": id}; keep the id and call it with call(id, args), release() it when done.
+    // `name` may be qualified ("ui::find"); scripts call it as ui::find(...) (or ui.find after `auto ui = ...`).
+    // A host function reports an error by throwing; the script sees HostError with what().
+    using host_fn = std::function<std::string(const std::string& args_json)>;
+    void define(const std::string& name, int min_args, int max_args, host_fn fn);
+    result call(std::uint64_t callback, const std::string& args_json = "[]");   // re-entrant (safe inside a host fn)
+    void release(std::uint64_t callback);
+    std::size_t callbacks() const;                                             // live callback ids
+
     struct impl;
 private:
     std::unique_ptr<impl> p_;

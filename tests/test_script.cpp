@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <stdexcept>
+#include <cstdint>
 
 using namespace forge;
 
@@ -772,4 +774,45 @@ TEST(emit_errors_and_host_shell) {
     CHECK(!script::host_shell().empty());
     auto got = run("auto r = forge::shell(\"echo hi\"); std::print(\"{} {} {}\", r.out, r.code, forge::host_shell());");
     CHECK_MSG(got == "hi\n 0 " + script::host_shell() || got == "hi\r\n 0 " + script::host_shell(), "got [%s]", got.c_str());   // cmd ends lines with CRLF
+}
+
+TEST(host_bindings) {
+    for (bool vm : {false, true}) {
+        script::options o;
+        o.use_vm = vm;
+        std::string text;
+        o.out = [&](std::string_view s) { text += s; };
+        script::engine e(o);
+        std::uint64_t kept = 0;
+        e.define("host::add", 2, 2, [](const std::string& a) {
+            // args arrive as a JSON array of two numbers
+            double x = 0, y = 0;
+            std::sscanf(a.c_str(), "[%lf,%lf]", &x, &y);
+            return std::to_string(x + y);
+        });
+        e.define("host::keep", 1, 1, [&](const std::string& a) {
+            const auto p = a.find("\"$callback\":");
+            CHECK_MSG(p != std::string::npos, "no callback in %s", a.c_str());
+            kept = std::stoull(a.substr(p + 12));
+            return std::string("null");
+        });
+        e.define("host::boom", 0, 0, [](const std::string&) -> std::string { throw std::runtime_error("boom"); });
+        auto r = e.run(R"(
+            std::print("{} ", host::add(2, 3));
+            host::keep([](auto v) { std::print("cb {} ", v); });
+            bool caught = false;
+            try { host::boom(); } catch (const std::exception& x) { caught = true; }
+            std::print("{}", caught);
+        )", "<host>");
+        CHECK_MSG(r.ok, "%s", r.error.c_str());
+        CHECK_MSG(text == "5 true", "got [%s]", text.c_str());
+        CHECK(kept != 0);
+        CHECK(e.callbacks() == 1);
+        auto c = e.call(kept, "[7]");
+        CHECK_MSG(c.ok, "%s", c.error.c_str());
+        CHECK_MSG(text == "5 truecb 7 ", "got [%s]", text.c_str());
+        e.release(kept);
+        CHECK(e.callbacks() == 0);
+        CHECK(!e.call(kept, "[]").ok);
+    }
 }

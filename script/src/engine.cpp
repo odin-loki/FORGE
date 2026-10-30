@@ -73,7 +73,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     sh.builtins["args"] = obj(l);
     p_->fresh();
 }
-engine::~engine() { p_->in.reset(); p_->sh->modules.clear(); Heap::instance().collect(); }
+engine::~engine() { { std::lock_guard g(p_->sh->cb_m); p_->sh->callbacks.clear(); } p_->in.reset(); p_->sh->modules.clear(); Heap::instance().collect(); }
 
 result engine::run_file(const std::string& path) {
     auto src = os::read_file(path);
@@ -158,5 +158,32 @@ int engine::repl() {
     g_interrupt = nullptr;
     return 0;
 }
+
+void engine::define(const std::string& name, int min_args, int max_args, host_fn fn) {
+    p_->sh->builtins[name] = host_native(*p_->sh, name, min_args, max_args, std::move(fn));
+}
+result engine::call(std::uint64_t id, const std::string& args_json) {
+    Value f;
+    { std::lock_guard g(p_->sh->cb_m); auto it = p_->sh->callbacks.find(id); if (it != p_->sh->callbacks.end()) f = it->second; }
+    result r;
+    if (is_nil(f)) { r.ok = false; r.error_type = "ValueError"; r.error = "ValueError: no callback " + std::to_string(id); return r; }
+    auto& in = *p_->in;
+    const int depth = in.depth; auto frames = in.frames; const int line = in.line;
+    const bool nested = depth > 0 || !frames.empty();
+    if (!nested) { p_->sh->interrupt = false; }
+    try {
+        Value args = host_args(args_json);
+        std::vector<Value> a = as<List>(args)->items;
+        Value v = in.call(f, a);
+        if (!is_nil(v)) r.value = in.repr(v);
+    } catch (...) {
+        r = p_->fail(std::current_exception());
+        in.depth = depth; in.frames = std::move(frames);
+    }
+    in.line = line;
+    return r;
+}
+void engine::release(std::uint64_t id) { std::lock_guard g(p_->sh->cb_m); p_->sh->callbacks.erase(id); }
+std::size_t engine::callbacks() const { std::lock_guard g(p_->sh->cb_m); return p_->sh->callbacks.size(); }
 
 } // namespace forge::script

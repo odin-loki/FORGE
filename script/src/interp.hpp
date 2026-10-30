@@ -47,6 +47,8 @@ struct Shared {
     std::vector<std::shared_ptr<const FnDecl>> keep;           // programs whose AST must outlive globals
     std::unordered_map<std::string, std::unordered_map<std::string, Value>> methods;   // built-in methods by receiver type
     std::unordered_map<std::string, Ref<Class>> classes;       // built-in classes (ProcResult, ...)
+    std::mutex cb_m; std::uint64_t cb_next = 1;                // engine::define / call: script callbacks held by the host
+    std::unordered_map<std::uint64_t, Value> callbacks;
 };
 
 struct Chunk;
@@ -143,6 +145,9 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
 struct NodeIter;   // runtime iterator
 
 void install_builtins(Shared& sh);
+// engine::define: a native that converts its arguments to JSON (script callables become {"$callback": id}).
+Value host_native(Shared& sh, const std::string& name, int lo, int hi, std::function<std::string(const std::string&)> fn);
+Value host_args(const std::string& json_array);              // JSON array -> argument list (List)
 void install_cpp_std(Shared& sh);
 void install_automation(Shared& sh);
 void install_mobile(Shared& sh);
