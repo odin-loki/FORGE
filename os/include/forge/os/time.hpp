@@ -102,7 +102,7 @@ public:
     bool cancel(id t) { std::lock_guard<std::mutex> g(m_); for (auto it = q_.begin(); it != q_.end(); ++it) if (it->second.id == t) { q_.erase(it); return true; } if (running_ == t) { running_cancelled_ = true; return true; } return false; }
     std::size_t pending() { std::lock_guard<std::mutex> g(m_); return q_.size(); }
 private:
-    struct item { id id; std::uint64_t period_ns; std::function<void()> fn; };
+    struct item { timer_queue::id id; std::uint64_t period_ns; std::function<void()> fn; };
     id add(std::uint64_t delay_ms, std::uint64_t period_ms, std::function<void()> fn) {
         std::lock_guard<std::mutex> g(m_); id t = ++next_;
         q_.emplace(monotonic_ns() + delay_ms * 1000000ull, item{t, period_ms * 1000000ull, std::move(fn)});
