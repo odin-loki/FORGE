@@ -13,6 +13,12 @@ option(FORGE_TSAN        "Build with ThreadSanitizer (scripting runtime threads,
 option(FORGE_REPRODUCIBLE "Strip build paths and timestamps from artefacts (bit-identical rebuilds)" ON)
 if(WIN32)
   link_libraries(ws2_32 bcrypt)
+  # Windows' default 1 MiB main-thread stack overflows the script interpreter's recursion tests; match Linux's 8 MiB.
+  if(MSVC)
+    add_link_options(/STACK:8388608)
+  else()
+    add_link_options(-Wl,--stack,8388608)
+  endif()
   add_compile_definitions(_USE_MATH_DEFINES NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 option(FORGE_JNI          "Build libforge_jni (Android / JVM Kotlin bindings, bindings/android)" OFF)
