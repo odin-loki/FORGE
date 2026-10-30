@@ -109,6 +109,7 @@ TEST(spill_roundtrip_and_cap) {
 TEST(scheduler_reports_kv_and_defers_under_budget) {
     auto path = (std::filesystem::temp_directory_path() / ("forge_test_mem_" + std::to_string(::getpid()) + ".fpk")).string();
     forge_test::make_tiny_model(path);
+    {   // scope: the model's mapping must be gone before the file is deleted (Windows)
     auto m = mind::model::open(path);
     mem::budget b("kvtest", 0);
     std::vector<std::vector<int>> outs(4), want(4);
@@ -129,5 +130,6 @@ TEST(scheduler_reports_kv_and_defers_under_budget) {
     s.run_until_idle();
     CHECK(s.stats().peak_active == 1); CHECK(s.stats().deferred > 0); CHECK(s.stats().completed == 4);
     for (int i = 0; i < 4; ++i) CHECK(outs[std::size_t(i)] == want[std::size_t(i)]);
+    }
     std::filesystem::remove(path);
 }

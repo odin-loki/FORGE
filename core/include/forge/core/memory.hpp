@@ -355,14 +355,14 @@ public:
         std::lock_guard g(m_);
         if (cap_ && bytes_ + n > cap_) return 0;
         auto k = ++next_; std::ofstream f(path_(k), std::ios::binary); f.write(static_cast<const char*>(data), std::streamsize(n));
-        if (!f) { std::error_code ec; std::filesystem::remove(path_(k), ec); return 0; }
+        if (!f) { f.close(); std::error_code ec; std::filesystem::remove(path_(k), ec); return 0; }   // close first: Windows can't delete open files
         sizes_[k] = n; bytes_ += n; return k;
     }
     // Reads back and deletes. Empty optional if the key is unknown.
     std::optional<std::vector<std::byte>> take(std::uint64_t k) {
         std::lock_guard g(m_); auto it = sizes_.find(k); if (it == sizes_.end()) return std::nullopt;
         std::vector<std::byte> v(it->second); std::ifstream f(path_(k), std::ios::binary); f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size()));
-        bool ok = bool(f); bytes_ -= it->second; sizes_.erase(it); std::error_code ec; std::filesystem::remove(path_(k), ec);
+        bool ok = bool(f); f.close(); bytes_ -= it->second; sizes_.erase(it); std::error_code ec; std::filesystem::remove(path_(k), ec);
         if (!ok) raise(errc::io_error, "spill file {} truncated", path_(k).string());
         return v;
     }

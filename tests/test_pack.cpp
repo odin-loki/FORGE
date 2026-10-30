@@ -67,9 +67,11 @@ TEST(fpk_write_read_verify_and_corruption) {
         auto off = r.sections().at("data").offset + r.entry("a").offset + 17;
         f.seekp(std::streamoff(off)); char c = 0x5a; f.write(&c, 1);
     }
-    pack::reader r(path.string());
-    auto bad = r.verify();
-    CHECK(bad.size() == 2);  // the data section and tensor "a"
+    {
+        pack::reader r(path.string());
+        auto bad = r.verify();
+        CHECK(bad.size() == 2);  // the data section and tensor "a"
+    }   // unmap before deleting: Windows refuses to delete a mapped file
     std::filesystem::remove(path);
 }
 
