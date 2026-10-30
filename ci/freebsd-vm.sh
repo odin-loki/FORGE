@@ -28,8 +28,6 @@ runcmd:
   # cmake is packaged as cmake-core since 2026Q4).
   - env ASSUME_ALWAYS_YES=yes pkg update -f
   - env ASSUME_ALWAYS_YES=yes pkg install -y cmake-core ninja python3 py312-numpy bash zsh mksh fish
-  # python deps of the golden/onnx tests (best effort: names vary between package sets)
-  - env ASSUME_ALWAYS_YES=yes pkg install -y py312-safetensors py312-onnx py312-protobuf || true
   - mkdir -p /workspace
   - chown ci /workspace
   - touch /var/ci-ready
@@ -49,4 +47,6 @@ ssh_ "pkg info -q cmake-core ninja bash zsh mksh fish python3 && mkdir -p '$src'
 hp=$(sed -n 's/^Python3_EXECUTABLE:[A-Z]*=//p' "$b/CMakeCache.txt")
 [ -z "$hp" ] || ssh_ "echo | su root -c 'mkdir -p $(dirname "$hp") && ln -sf /usr/local/bin/python3 $hp'"
 tar cf - -C "$b" --exclude='*.o' --exclude='*.a' . | ssh_ "tar xf - -C '$b'"
-ssh_ "cd '$b' && env CTEST_OUTPUT_ON_FAILURE=1 FORGE_THREADS=2 ctest -LE 'slow|emu|gpu' -j2 --timeout 1200 --output-on-failure"
+# FreeBSD packages no python safetensors/onnx (pip would build them from Rust/C++ source under TCG), so the
+# tests that need them (and doc_example_mind_generate, which uses golden_tiny_llama's model) run on linux-* only.
+ssh_ "cd '$b' && env CTEST_OUTPUT_ON_FAILURE=1 FORGE_THREADS=2 ctest -LE 'slow|emu|gpu' -E '^(golden_tiny_llama|golden_moe_mla|pack_signing|onnx_import|doc_example_mind_generate)\$' -j2 --timeout 1200 --output-on-failure"
