@@ -5,7 +5,12 @@
 // Wire format (little endian): request  = "FRPC" u32 op-name-len name u32 nattrs {key, tag, value} u32 nin {u32 rank, i64 dims, f32 data} u32 rank i64 out-dims
 //                              response = u32 status(0 ok) then f32 out data, or u32 len + error text.
 // Not optimised: weights travel with every op (no remote residency yet).
+// Security (rpc_secure.hpp, docs/rpc.md): optional TLS + token / Ed25519 key auth before the first frame.
+// Remote scripts:  request  = "FRPS" str source, str name, u32 argc {str}, u32 timeout_ms
+//                  response = u32 status(0 ok / 1 refused + str error) then u32 ok, str error_type, str error, str output
 #include <forge/flow/kernels.hpp>
+#include <forge/flow/rpc_secure.hpp>
+#include <functional>
 #include <cstring>
 #include <string>
 #include <thread>
@@ -15,10 +20,15 @@
 #include <forge/os/os.hpp>
 
 namespace forge::flow::rpc {
+#ifdef FORGE_HAVE_TLS
+inline namespace tls_v1 {
+#else
+inline namespace plain_v1 {
+#endif
 namespace detail {
 inline void wsa() { os::net_init(); }
-inline bool send_all(os::socket& s, const void* p, std::size_t n) { return s.send_all(p, n); }
-inline bool recv_all(os::socket& s, void* p, std::size_t n) { return s.recv_all(p, n); }
+inline bool send_all(channel& s, const void* p, std::size_t n) { return s.send_all(p, n); }
+inline bool recv_all(channel& s, void* p, std::size_t n) { return s.recv_all(p, n); }
 struct writer {
     std::vector<char> b;
     void raw(const void* p, std::size_t n) { auto* c = static_cast<const char*>(p); b.insert(b.end(), c, c + n); }
@@ -28,7 +38,7 @@ struct writer {
     void shape(const shape_t& s) { u32(std::uint32_t(s.size())); for (auto d : s) i64(d); }
 };
 struct reader {
-    os::socket& s; bool ok = true;
+    channel& s; bool ok = true;
     void raw(void* p, std::size_t n) { if (ok) ok = recv_all(s, p, n); }
     std::uint32_t u32() { std::uint32_t v = 0; raw(&v, 4); return v; }
     std::int64_t i64() { std::int64_t v = 0; raw(&v, 8); return v; }
@@ -65,13 +75,45 @@ inline int op_index(std::string_view name) {
 // Connection to one server; serialises calls (one op in flight).
 class client {
 public:
-    static std::shared_ptr<client> connect(const std::string& host, const std::string& port, std::string* why) {
+    static std::shared_ptr<client> connect(const std::string& host, const std::string& port, std::string* why, const client_security& sec = env_security()) {
         detail::wsa();
         int pn = std::atoi(port.c_str());
         auto r = os::socket::connect(host, pn, 10000);
         if (!r) { if (why) *why = "rpc: cannot connect to " + host + ":" + port + " (" + r.err.what + ")"; return nullptr; }
         r->set_nodelay();
-        auto c = std::shared_ptr<client>(new client); c->s_ = std::move(r.value); return c;
+        auto c = std::shared_ptr<client>(new client); c->s_ = channel(std::move(r.value));
+        if (sec.tls.enabled) {
+#ifdef FORGE_HAVE_TLS
+            if (!c->s_.connect_tls(sec.tls, host, why)) return nullptr;
+#else
+            if (why) *why = "rpc: TLS requested but this build has no TLS (rebuild with OpenSSL)"; return nullptr;
+#endif
+        }
+        if (!client_auth(c->s_, sec, why)) return nullptr;
+        return c;
+    }
+    // Credentials from the environment: FORGE_RPC_KEY (secret key file), FORGE_RPC_TOKEN, FORGE_RPC_TLS=1,
+    // FORGE_RPC_CA, FORGE_RPC_FINGERPRINT (sha256 of the server cert), FORGE_RPC_SERVER_NAME.
+    static client_security env_security() {
+        client_security s; auto env = [](const char* k) { const char* v = std::getenv(k); return std::string(v ? v : ""); };
+        if (auto k = env("FORGE_RPC_KEY"); !k.empty()) s.key = std::make_shared<identity>(identity_from_seed_hex(read_key_file(k)));
+        s.token = env("FORGE_RPC_TOKEN");
+        s.tls.ca_file = env("FORGE_RPC_CA"); s.tls.fingerprint_sha256 = env("FORGE_RPC_FINGERPRINT"); s.tls.server_name = env("FORGE_RPC_SERVER_NAME");
+        s.tls.enabled = env("FORGE_RPC_TLS") == "1" || !s.tls.ca_file.empty() || !s.tls.fingerprint_sha256.empty();
+        return s;
+    }
+    struct script_reply { bool ok = false; std::string error_type, error, output; };
+    // Run a FORGE script on the server (needs an authenticated connection to a server started with scripts allowed).
+    script_reply run_script(std::string_view source, std::string_view name = "<remote>", const std::vector<std::string>& argv = {}, std::uint32_t timeout_ms = 0) {
+        std::lock_guard g(m_);
+        detail::writer w; w.raw("FRPS", 4); w.str(source); w.str(name); w.u32(std::uint32_t(argv.size())); for (auto& a : argv) w.str(a); w.u32(timeout_ms);
+        if (!detail::send_all(s_, w.b.data(), w.b.size())) raise(errc::io_error, "rpc: send failed");
+        detail::reader r{s_};
+        auto st = r.u32(); if (!r.ok) raise(errc::io_error, "rpc: connection lost");
+        if (st != 0) raise(errc::unsupported, "rpc server: {}", r.str());
+        script_reply out; out.ok = r.u32() != 0; out.error_type = r.str(); out.error = r.str(); out.output = r.str(64u << 20);
+        if (!r.ok) raise(errc::io_error, "rpc: short reply");
+        return out;
     }
     std::uint64_t calls() const { return calls_; }
     void run(std::string_view op, std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
@@ -91,7 +133,7 @@ public:
     }
 private:
     client() = default;
-    os::socket s_; std::mutex m_; std::uint64_t calls_ = 0;
+    channel s_; std::mutex m_; std::uint64_t calls_ = 0;
 };
 
 // Registry whose every op runs remotely ("rpc.<op>", priority 20). Ops the server lacks a lowering for run there on its reference.
@@ -118,8 +160,19 @@ inline std::unique_ptr<registry> open(const std::string& addr, std::string* why)
 class server {
 public:
     // port 0 = ephemeral; see port(). bind = "127.0.0.1" by default (pass "0.0.0.0" to expose; there is no auth).
-    server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1") : reg_(reg ? reg : &registry::cpu()) {
+    struct script_result { bool ok = false; std::string error_type, error, output; };
+    // Runs a remote script; set by the host (apps/forge.cpp wires forge::script). Null = scripts unsupported.
+    std::function<script_result(const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t timeout_ms)> script_handler;
+    server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1", server_security sec = {}) : reg_(reg ? reg : &registry::cpu()), sec_(std::move(sec)) {
         detail::wsa();
+        if (!sec_.tls.cert_file.empty()) {
+#ifdef FORGE_HAVE_TLS
+            tls_ = make_server_tls(sec_.tls);
+#else
+            raise(errc::unsupported, "rpc: TLS requested but this build has no TLS (rebuild with OpenSSL)");
+#endif
+        }
+        if (sec_.allow_scripts && !sec_.auth_required()) raise(errc::invalid_argument, "rpc: remote scripts need authentication (tokens or authorized keys)");
         auto l = os::socket::listen(bind, port, 8);
         if (!l) raise(errc::io_error, "rpc: cannot listen on {}:{}: {}", bind, port, l.err.what);
         ls_ = std::move(l.value); port_ = ls_.local_port();
@@ -132,25 +185,39 @@ public:
         while (!stop_) {
             auto c = ls_.accept();
             if (!c) { if (stop_) break; continue; }
-            auto sp = std::make_shared<os::socket>(std::move(c.value));
+            auto ch = std::make_shared<channel>(std::move(c.value));
+            auto done = std::make_shared<std::atomic<bool>>(false);
             std::lock_guard g(m_);
-            workers_.emplace_back([this, sp] { serve_conn(*sp); sp->close(); });
+            for (std::size_t i = 0; i < conns_.size();)   // reap finished connections
+                if (conns_[i].done->load()) { if (conns_[i].th.joinable()) conns_[i].th.join(); conns_.erase(conns_.begin() + std::ptrdiff_t(i)); } else ++i;
+            conns_.push_back({ch, done, std::thread([this, ch, done] { serve_conn(*ch); ch->shutdown_both(); done->store(true); })});
         }
     }
     void start() { th_ = std::thread([this] { run(); }); }
     void stop() {
         if (stop_.exchange(true)) return;
-        ls_.shutdown_both(); ls_.close();
+        ls_.shutdown_both();                    // wakes accept(); close only after the accept thread is gone
         if (th_.joinable()) th_.join();
-        std::lock_guard g(m_);
-        for (auto& w : workers_) if (w.joinable()) w.detach();   // connections end when their clients close
+        ls_.close();
+        std::vector<conn> cs; { std::lock_guard g(m_); for (auto& c : conns_) c.ch->shutdown_both(); cs.swap(conns_); }
+        for (auto& c : cs) if (c.th.joinable()) c.th.join();     // workers never outlive the server
     }
 private:
-    void serve_conn(os::socket& s) {
+    void serve_conn(channel& s) {
+#ifdef FORGE_HAVE_TLS
+        if (tls_) { s.sock().set_timeout_ms(15000); if (!s.accept_tls(tls_, nullptr)) return; s.sock().set_timeout_ms(0); }
+#endif
+        bool authed = false, first = true;
         for (;;) {
             detail::reader r{s};
             char magic[4]; r.raw(magic, 4);
             if (!r.ok) return;
+            if (first) {
+                first = false;
+                if (!server_auth(s, sec_, magic, authed, nullptr)) return;
+                if (authed) continue;   // handshake consumed; next frame
+            }
+            if (std::memcmp(magic, "FRPS", 4) == 0) { if (!serve_script(s, r, authed)) return; continue; }
             if (std::memcmp(magic, "FRPC", 4) != 0) return;
             auto name = r.str(256); auto a = detail::get_attrs(r);
             auto n = r.u32(); if (n > 64) return;
@@ -177,8 +244,37 @@ private:
             if (!detail::send_all(s, w.b.data(), w.b.size())) return;
         }
     }
-    registry* reg_; os::socket ls_; int port_ = 0;
+    bool serve_script(channel& s, detail::reader& r, bool authed) {
+        auto src = r.str(16u << 20); auto name = r.str(4096); auto n = r.u32(); if (!r.ok || n > 4096) return false;
+        std::vector<std::string> argv; for (std::uint32_t i = 0; i < n && r.ok; ++i) argv.push_back(r.str(1 << 20));
+        auto tmo = r.u32(); if (!r.ok) return false;
+        detail::writer w;
+        if (!sec_.allow_scripts || !authed) { w.u32(1); w.str("remote scripts are disabled on this server"); }
+        else if (!script_handler) { w.u32(1); w.str("this server has no script runtime"); }
+        else {
+            script_result res;
+            try { res = script_handler(src, name, argv, tmo); } catch (const std::exception& e) { res.ok = false; res.error_type = "RuntimeError"; res.error = e.what(); }
+            w.u32(0); w.u32(res.ok ? 1 : 0); w.str(res.error_type); w.str(res.error); w.str(res.output); ++scripts_;
+        }
+        return detail::send_all(s, w.b.data(), w.b.size());
+    }
+public:
+    std::uint64_t scripts() const { return scripts_; }
+    bool tls() const {
+#ifdef FORGE_HAVE_TLS
+        return tls_ != nullptr;
+#else
+        return false;
+#endif
+    }
+private:
+    registry* reg_; server_security sec_; os::socket ls_; int port_ = 0; std::atomic<std::uint64_t> scripts_{0};
+#ifdef FORGE_HAVE_TLS
+    std::shared_ptr<SSL_CTX> tls_;
+#endif
     std::atomic<bool> stop_{false}; std::atomic<std::uint64_t> ops_{0};
-    std::thread th_; std::mutex m_, dev_m_; std::vector<std::thread> workers_;
+    std::thread th_; std::mutex m_, dev_m_; struct conn { std::shared_ptr<channel> ch; std::shared_ptr<std::atomic<bool>> done; std::thread th; };
+    std::vector<conn> conns_;
 };
+} // inline namespace
 } // namespace forge::flow::rpc

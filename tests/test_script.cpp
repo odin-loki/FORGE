@@ -520,3 +520,23 @@ try { forge::ask("x"); } catch (const AIError& e) { std::println("AIError"); }
 )CPP", none);
     CHECK_MSG(e == "AIError\n", "got:\n%s", e.c_str());
 }
+
+#include <forge/flow/rpc.hpp>
+TEST(remote_scripts) {
+    flow::rpc::server_security sec; sec.tokens = {"tok"}; sec.allow_scripts = true;
+    flow::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
+    srv.script_handler = [](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t) {
+        script::options o; std::string out; o.argv = argv; o.out = [&](std::string_view s) { out += s; };
+        script::engine e(o); auto r = e.run(src, name);
+        return flow::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
+    };
+    srv.start();
+    std::string addr = "127.0.0.1:" + std::to_string(srv.port());
+    auto got = run("auto r = forge::remote(\"" + addr + "\", \"std::println(\\\"hi {}\\\", args.size());\", {{\"token\", \"tok\"}, {\"args\", std::vector<std::string>{\"a\"}}});\n"
+                   "std::println(\"{} {}\", r[\"ok\"], r[\"output\"]);\n"
+                   "auto b = forge::remote(\"" + addr + "\", \"throw std::runtime_error(\\\"x\\\");\", {{\"token\", \"tok\"}});\n"
+                   "std::println(\"{}\", b[\"ok\"]);\n"
+                   "try { forge::remote(\"" + addr + "\", \"1;\", {{\"token\", \"nope\"}}); } catch (const PermissionError& e) { std::println(\"denied\"); }\n");
+    CHECK_MSG(got == "true hi 1\n\nfalse\ndenied\n", "got:\n%s", got.c_str());
+    srv.stop();
+}

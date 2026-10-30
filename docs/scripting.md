@@ -275,8 +275,8 @@ release, uptime, loadavg, memory, is_tty, term_size, devices, clipboard), `proc.
 5. **Scheduled tasks** — `every "10m" { }`, `at "02:00" { }`; optionally installed as an OS service.
 6. **AI-assisted commands** — `ai "find the 5 largest files here"` asks a local model to draft a
    script, shows it, and runs only on confirmation; `ai.explain(r.err)` for failed commands.
-7. **Remote execution** — `remote "host:7000" { ... }` ships the block to `forge rpc-serve`.
-   Requires adding auth/TLS first (rpc-serve has none today).
+7. **Remote execution** — `forge::remote("host:7000", source, opts)` runs on `forge rpc-serve
+   --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS. Implemented; see docs/rpc.md.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
 9. **Sandboxed runs** — run untrusted scripts with fs/net capabilities off, using `sandbox.hpp`.
 

@@ -77,3 +77,66 @@ TEST(pipeline_multi_gpu_if_present) {   // real multi-GPU: needs two CUDA/HIP de
         CHECK_MSG(maxdiff(ref, got) < 2e-3f, "%s pipe diff %g", b, maxdiff(ref, got));
     }
 }
+
+// ---- security: token / Ed25519 key auth, TLS, remote scripts
+static flow::rpc::client_security tok(const std::string& t) { flow::rpc::client_security s; s.token = t; return s; }
+static const char* kSeed = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";   // RFC 8032 test 1
+static bool relu_ok(flow::rpc::client& c) {
+    tensor x({4}), y({4}); for (auto& v : x.data) v = -1.f; tensor_view in{x.data.data(), x.shape};
+    c.run("relu", std::span<const tensor_view>(&in, 1), {y.data.data(), y.shape}, {}); return y.data[0] == 0.f;
+}
+TEST(rpc_token_auth) {
+    flow::rpc::server_security sec; sec.tokens = {"s3cret"};
+    flow::rpc::server srv(nullptr, 0, "127.0.0.1", sec); srv.start();
+    auto port = std::to_string(srv.port()); std::string why;
+    CHECK(!flow::rpc::client::connect("127.0.0.1", port, &why, {}) || true);   // unauthenticated: rejected on first frame
+    { auto c = flow::rpc::client::connect("127.0.0.1", port, &why, {}); bool threw = false; if (c) { try { relu_ok(*c); } catch (...) { threw = true; } } CHECK(!c || threw); }
+    why.clear(); CHECK(!flow::rpc::client::connect("127.0.0.1", port, &why, tok("wrong"))); CHECK(why.find("bad token") != std::string::npos);
+    auto c = flow::rpc::client::connect("127.0.0.1", port, &why, tok("s3cret")); CHECK(c != nullptr);
+    CHECK(relu_ok(*c));
+    srv.stop();
+}
+TEST(rpc_key_auth_and_scripts) {
+    auto id = std::make_shared<flow::rpc::identity>(flow::rpc::identity_from_seed_hex(kSeed));
+    CHECK(flow::rpc::sec::hex(id->pub.data(), 32) == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+    flow::rpc::server_security sec; sec.authorized_keys = {flow::rpc::sec::hex(id->pub.data(), 32)}; sec.allow_scripts = true;
+    flow::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
+    srv.script_handler = [](const std::string& src, const std::string&, const std::vector<std::string>& argv, std::uint32_t) {
+        return flow::rpc::server::script_result{true, "", "", "ran:" + src + ":" + std::to_string(argv.size())};
+    };
+    srv.start(); auto port = std::to_string(srv.port()); std::string why;
+    flow::rpc::client_security good; good.key = id;
+    auto c = flow::rpc::client::connect("127.0.0.1", port, &why, good); CHECK_MSG(c != nullptr, "%s", why.c_str());
+    auto r = c->run_script("x", "<t>", {"a", "b"}); CHECK(r.ok && r.output == "ran:x:2");
+    CHECK(relu_ok(*c));
+    std::uint8_t other[32] = {1}; flow::rpc::client_security bad; bad.key = std::make_shared<flow::rpc::identity>(flow::rpc::identity_from_seed_hex(flow::rpc::sec::hex(other, 32)));
+    why.clear(); CHECK(!flow::rpc::client::connect("127.0.0.1", port, &why, bad)); CHECK(why.find("not authorized") != std::string::npos);
+    CHECK(srv.scripts() == 1);
+    srv.stop();
+    // scripts need auth; and a no-auth server refuses them
+    bool threw = false; try { flow::rpc::server_security s2; s2.allow_scripts = true; flow::rpc::server x(nullptr, 0, "127.0.0.1", s2); } catch (...) { threw = true; } CHECK(threw);
+    flow::rpc::server open_srv(nullptr, 0); open_srv.start();
+    auto oc = flow::rpc::client::connect("127.0.0.1", std::to_string(open_srv.port()), &why, {});
+    threw = false; try { oc->run_script("x"); } catch (const std::exception& e) { threw = std::string(e.what()).find("disabled") != std::string::npos; } CHECK(threw);
+    open_srv.stop();
+}
+TEST(rpc_tls) {
+    if (!flow::rpc::tls_available()) { std::printf("skip: built without TLS\n"); return; }
+    auto crt = tmp("c.pem"), key = tmp("k.pem");
+    auto cmd = "openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout " + key + " -out " + crt + " >/dev/null 2>&1";
+    if (std::system(cmd.c_str()) != 0) { std::printf("skip: no openssl CLI\n"); return; }
+    flow::rpc::server_security sec; sec.tokens = {"t"}; sec.tls = {crt, key};
+    flow::rpc::server srv(nullptr, 0, "127.0.0.1", sec); srv.start(); CHECK(srv.tls());
+    auto port = std::to_string(srv.port()); std::string why;
+    auto s = tok("t"); s.tls.enabled = true; s.tls.ca_file = crt; s.tls.server_name = "localhost";
+    auto c = flow::rpc::client::connect("127.0.0.1", port, &why, s); CHECK_MSG(c != nullptr, "%s", why.c_str());
+    if (c) CHECK(relu_ok(*c));
+    auto nv = tok("t"); nv.tls.enabled = true; why.clear();                         // no CA / fingerprint: refuse
+    CHECK(!flow::rpc::client::connect("127.0.0.1", port, &why, nv)); CHECK(why.find("verify") != std::string::npos);
+    auto fp = tok("t"); fp.tls.enabled = true; fp.tls.fingerprint_sha256 = std::string(64, 'a'); why.clear();
+    CHECK(!flow::rpc::client::connect("127.0.0.1", port, &why, fp)); CHECK(why.find("fingerprint") != std::string::npos);
+    auto plain = tok("t"); why.clear(); auto pc = flow::rpc::client::connect("127.0.0.1", port, &why, plain);   // plaintext to a TLS server fails
+    CHECK(!pc);
+    srv.stop();
+    std::filesystem::remove(crt); std::filesystem::remove(key);
+}

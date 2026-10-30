@@ -55,8 +55,8 @@ Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or 
 ### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey)`
 Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file. Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
 
-### `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu]`
-Exposes a local device to other processes as a remote `rpc:host:port` device (see [flow.md](flow.md)). **No authentication: use only on a trusted network.** (This command exists but is not listed in the built-in usage text.)
+### `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu] [auth/TLS/script flags]`
+Exposes a local device to other processes as a remote `rpc:host:port` device (see [flow.md](flow.md)), and optionally runs remote scripts. Auth: `--token`, `--token-file`, `--authorized-keys`, `--pubkey`; TLS: `--tls-cert`, `--tls-key`; scripts: `--allow-scripts`, `--script-timeout`, `--script-no-proc|fs|net`. Without auth it is open to anyone who can reach it. See [rpc.md](rpc.md).
 
 ## Strict loading
 `FORGE_REQUIRE_SIGNED=1` refuses unsigned models; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` only accepts signatures from those public keys.

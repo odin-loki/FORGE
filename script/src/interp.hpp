@@ -146,6 +146,7 @@ void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
 void install_automation(Shared& sh);
 void install_ai(Shared& sh);
+void install_remote(Shared& sh);
 std::vector<std::string> module_search_path(const Interp& in);
 bool is_native_module(const std::string& p);
 std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Value>& args, std::size_t first);

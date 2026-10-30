@@ -9,6 +9,8 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <sstream>
+#include <mutex>
 #include <chrono>
 #include <forge/grid/prims.hpp>
 #include <forge/script/script.hpp>
@@ -305,13 +307,51 @@ int cmd_bench(const args& a) {
     return 0;
 }
 
-// forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]  (no auth: keep it on a trusted network)
+// forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]
+//   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]... [--tls-cert C --tls-key K]
+//   [--allow-scripts [--script-timeout MS] [--script-no-proc] [--script-no-fs] [--script-no-net]]
+// Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
     std::string why, dev = a.get("device", "cpu");
     auto reg = flow::device_registry(dev, &why, false);
     if (!reg && dev != "cpu") std::fprintf(stderr, "forge: %s; serving on cpu\n", why.c_str());
-    flow::rpc::server srv(reg.get(), int(a.num("port", 7000)), a.get("bind", "127.0.0.1"));
-    std::printf("forge rpc: listening on %s:%d (%s)\n", a.get("bind", "127.0.0.1").c_str(), srv.port(), reg ? dev.c_str() : "cpu");
+    flow::rpc::server_security sec;
+    auto trim = [](std::string s) { while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back(); std::size_t i = 0; while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i; return s.substr(i); };
+    for (auto& t : a.all("token")) sec.tokens.push_back(t);
+    if (a.has("token") && a.all("token").empty()) sec.tokens.push_back(a.get("token"));
+    auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
+    for (auto& f : files) sec.tokens.push_back(flow::rpc::read_key_file(f));
+    auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
+    for (auto& f : keyfiles) {
+        auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
+        std::istringstream in(r.value); std::string line;
+        while (std::getline(in, line)) { line = trim(line); if (!line.empty() && line[0] != '#') sec.authorized_keys.push_back(line.substr(0, 64)); }
+    }
+    auto pubs = a.all("pubkey"); if (pubs.empty() && a.has("pubkey")) pubs.push_back(a.get("pubkey"));
+    for (auto& p : pubs) sec.authorized_keys.push_back(p.size() == 64 && p.find('/') == std::string::npos && !std::filesystem::exists(p) ? p : pack::load_public_key(p));
+    sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key");
+    if (sec.tls.cert_file.empty() != sec.tls.key_file.empty()) throw std::runtime_error("--tls-cert and --tls-key go together");
+    sec.allow_scripts = a.has("allow-scripts");
+    std::string bind = a.get("bind", "127.0.0.1");
+    if (!sec.auth_required() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
+        std::fprintf(stderr, "forge rpc: WARNING: no authentication and bound to %s; anyone who can reach it can use it\n", bind.c_str());
+    flow::rpc::server srv(reg.get(), int(a.num("port", 7000)), bind, sec);
+    std::mutex script_m;
+    if (sec.allow_scripts) {
+        auto def_tmo = std::uint64_t(a.num("script-timeout", 60000));
+        bool no_proc = a.has("script-no-proc"), no_fs = a.has("script-no-fs"), no_net = a.has("script-no-net");
+        srv.script_handler = [&script_m, def_tmo, no_proc, no_fs, no_net](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
+            std::lock_guard g(script_m);   // one remote script at a time (engine globals, memory budget)
+            forge::script::options o; std::string out;
+            o.argv = argv; o.timeout_ms = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
+            o.allow_proc = !no_proc; o.allow_fs = !no_fs; o.allow_net = !no_net;
+            o.out = [&out](std::string_view s) { if (out.size() < (32u << 20)) out += s; };
+            forge::script::engine e(o); auto r = e.run(src, name.empty() ? "<remote>" : name);
+            return flow::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
+        };
+    }
+    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
+                srv.tls() ? " tls" : "", sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
     std::fflush(stdout);
     srv.run();
     return 0;
@@ -363,7 +403,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net"});
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
