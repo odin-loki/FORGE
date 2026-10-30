@@ -1,6 +1,6 @@
 // forge-serve — OpenAI-compatible HTTP server over the continuous-batching scheduler.
 //
-//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N]   (see docs/serve.md)
+//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N]   (see docs/serve.md)
 //
 //   GET  /health                 -> {"status":"ok"}
 //   GET  /v1/models              -> model list
@@ -67,8 +67,8 @@ bool read_request(forge_sock_t fd, http_request& r) {
 }
 
 std::string response(int code, const std::string& body, const char* type = "application/json") {
-    const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : code == 405 ? "Method Not Allowed" : "Internal Server Error";
-    return std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}", code, msg, type, body.size(), body);
+    const char* msg = code == 200 ? "OK" : code == 400 ? "Bad Request" : code == 404 ? "Not Found" : code == 405 ? "Method Not Allowed" : code == 503 ? "Service Unavailable" : code == 507 ? "Insufficient Storage" : "Internal Server Error";
+    return std::format("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}Access-Control-Allow-Origin: *\r\n\r\n{}", code, msg, type, body.size(), code == 503 ? "Retry-After: 1\r\n" : "", body);
 }
 std::string error_json(const std::string& m) { return json::dump(json::value(json::object{{"error", json::value(json::object{{"message", m}, {"type", "invalid_request_error"}})}})); }
 
@@ -113,8 +113,8 @@ struct channel {
 
 class server {
 public:
-    server(std::shared_ptr<mind::model> m, mind::batch_options bo, std::string name)
-        : m_(std::move(m)), sched_(m_, bo), name_(std::move(name)) { sched_.start(); }
+    server(std::shared_ptr<mind::model> m, mind::batch_options bo, std::string name, std::size_t max_queue = 0)
+        : m_(std::move(m)), sched_(m_, bo), name_(std::move(name)), max_queue_(max_queue) { sched_.start(); }
     ~server() { sched_.stop(); }
     void evict_kv(std::size_t keep) { sched_.request_kv_eviction(keep); }
 
@@ -123,6 +123,8 @@ public:
         http_request r;
         if (!read_request(fd, r)) { forge_sock_close(fd); return; }
         try { route(c, r); }
+        catch (const forge_exception& e) { c.send(response(e.code == errc::out_of_memory ? 503 : 400, error_json(e.what()))); }
+        catch (const std::bad_alloc&) { c.send(response(503, error_json("out of memory"))); }
         catch (const std::exception& e) { c.send(response(400, error_json(e.what()))); }
         forge_sock_close(fd);
     }
@@ -137,12 +139,16 @@ private:
         }
         if (path == "/metrics") {
             auto& s = sched_.stats();
-            c.send(response(200, std::format("forge_steps {}\nforge_completed {}\nforge_prefix_hits {}\nforge_prefix_tokens_reused {}\nforge_peak_active {}\nforge_peak_kv_bytes {}\n",
-                                             s.steps, s.completed, s.prefix_hits, s.prefix_tokens_reused, s.peak_active, s.peak_kv_bytes), "text/plain")); return;
+            c.send(response(200, std::format("forge_steps {}\nforge_completed {}\nforge_prefix_hits {}\nforge_prefix_tokens_reused {}\nforge_peak_active {}\nforge_peak_kv_bytes {}\n"
+                                             "forge_queue_waiting {}\nforge_queue_active {}\nforge_admission_deferred_total {}\nforge_rejected_total {}\nforge_kv_evictions_total {}\n",
+                                             s.steps, s.completed, s.prefix_hits, s.prefix_tokens_reused, s.peak_active, s.peak_kv_bytes,
+                                             sched_.waiting(), sched_.active_count(), s.deferred, rejected_.load(), sched_.evictions()) + mem::governor::instance().prometheus(), "text/plain")); return;
         }
         bool chat = path == "/v1/chat/completions";
         if (path != "/v1/completions" && !chat) { c.send(response(404, error_json("no route " + path))); return; }
         if (r.method != "POST") { c.send(response(405, error_json("use POST"))); return; }
+        // Backpressure: a full queue answers 503 + Retry-After instead of piling up work it cannot hold.
+        if (max_queue_ && sched_.waiting() >= max_queue_) { ++rejected_; c.send(response(503, error_json("server busy: request queue is full, retry later"))); return; }
         auto j = json::parse(r.body);
         auto* tok = m_->tokenizer();
         std::vector<int> prompt;
@@ -246,7 +252,8 @@ private:
     std::shared_ptr<mind::model> m_;
     mind::batch_scheduler sched_;
     std::string name_;
-    std::atomic<std::uint64_t> counter_{0};
+    std::atomic<std::uint64_t> counter_{0}, rejected_{0};
+    std::size_t max_queue_ = 0;
 };
 
 bool has_flag(int argc, char** argv, const std::string& k) {
@@ -303,7 +310,7 @@ int run_proxy(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)
@@ -324,11 +331,20 @@ int main(int argc, char** argv) {
             auto r = forge::os::bind_thread_to_node(unsigned(std::stoul(nn)));
             std::printf("forge-serve: numa node %s%s\n", nn.c_str(), r ? "" : (" (bind failed: " + r.err.what + ")").c_str());
         }
+        // Memory budget (docs/memory.md): --mem-limit overrides FORGE_MEM_LIMIT; 0/off disables.
+        auto& host = mem::host_budget();
+        if (auto ml = arg(argc, argv, "mem-limit", ""); !ml.empty()) {
+            if (ml == "0" || ml == "off") host.set_limit(0);
+            else if (auto v = mem::parse_size(ml, mem::detect_host_limits().effective())) host.set_limit(*v);
+            else raise(errc::invalid_argument, "bad --mem-limit '{}' (use e.g. 6G, 512M or 75%)", ml);
+        }
+        mem::governor::instance().watch_pressure();
         auto m = mind::model::open(path);
         m->blueprint().session == "generative_sequence" || (raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session), true);
         mind::batch_options bo;
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
+        if (host.limit()) bo.budget = &host;
         namespace fos = forge::os;
         // P-core pinning: on hybrid CPUs keep the main thread (and the scheduler/request threads it spawns, which
         // inherit the mask) on performance cores. --no-pin disables.
@@ -336,7 +352,7 @@ int main(int argc, char** argv) {
             auto r = fos::pin_thread_to_kind(fos::core_kind::performance);
             std::printf("forge-serve: hybrid CPU, pinned to %zu P-cores%s\n", t.of_kind(fos::core_kind::performance).size(), r ? "" : " (failed)");
         }
-        server srv(m, bo, fs::path(argv[1]).filename().string());
+        server srv(m, bo, fs::path(argv[1]).filename().string(), std::size_t(std::stoull(arg(argc, argv, "max-queue", "0"))));
         // Memory pressure -> drop cached prefix KV sessions (moderate: keep 1, critical: keep none).
         fos::memory_pressure::instance().subscribe([&srv](fos::pressure_level l) {
             if (l == fos::pressure_level::normal) return;
@@ -350,7 +366,8 @@ int main(int argc, char** argv) {
         if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) raise(errc::io_error, "bind failed: {}", std::strerror(errno));
         ::listen(s, 64);
         socklen_t al = sizeof a; getsockname(s, reinterpret_cast<sockaddr*>(&a), &al);
-        std::printf("forge-serve: %s on http://%s:%d (max_active %d)\n", path.c_str(), arg(argc, argv, "host", "127.0.0.1").c_str(), ntohs(a.sin_port), bo.max_active);
+        std::printf("forge-serve: %s on http://%s:%d (max_active %d, memory budget %s)\n", path.c_str(), arg(argc, argv, "host", "127.0.0.1").c_str(), ntohs(a.sin_port), bo.max_active,
+                    host.limit() ? mem::format_size(host.limit()).c_str() : "off");
         std::fflush(stdout);
         fos::service::ready("serving " + path);
         // Hot reload: --watch re-execs forge-serve when the model file changes (systemd sees RELOADING=1 then READY=1).

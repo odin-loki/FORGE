@@ -43,7 +43,7 @@ args parse(int argc, char** argv, int from, std::set<std::string> boolean) {
 int usage() {
     std::puts(
         "usage: forge <command> [options]\n"
-        "  info                                   CPU features, lane target, grid backends\n"
+        "  info                                   CPU features, lane target, grid backends, memory budget\n"
         "  import <hf_dir|model.gguf> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|fp8_e5m2|q8_0|q4_k|q4_g32|q8_g32|mxfp8|mxfp6|mxfp4|mxint8|nvfp4|tq2] [--template llama]\n"
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
@@ -96,6 +96,7 @@ int cmd_info() {
     auto& f = lane::detect();
     std::printf("cpu      %s\nfeatures %s\nlane     %s\n", f.brand.c_str(), f.summary().c_str(), lane::active().target);
     for (auto& b : grid::probe_backends()) std::printf("grid     %-10s %s  %s\n", grid::name(b.kind), b.available ? "yes" : "no ", b.detail.c_str());
+    std::fputs(mem::governor::instance().describe().c_str(), stdout);
     return 0;
 }
 

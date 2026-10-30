@@ -51,3 +51,22 @@ try:
     print("serve ok;", m.replace("\n", " "))
 finally:
     p.kill()
+
+# Memory budget: a tiny --mem-limit must serialise requests (admission control), not fail or change output.
+p = subprocess.Popen([serve, fpk, "--port", "0", "--max-active", "3", "--mem-limit", "4K", "--max-queue", "64"], stdout=subprocess.PIPE, text=True)
+try:
+    line = p.stdout.readline()
+    assert "memory budget 4.0 KiB" in line, line
+    port = int(line.split("http://127.0.0.1:")[1].split()[0])
+    base = f"http://127.0.0.1:{port}"
+    got = {}
+    ts = [threading.Thread(target=worker, args=(q,)) for q in prompts]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    for q in prompts:
+        assert got[q] == [t for t in want[q] if t != 291], q
+    m = urllib.request.urlopen(base + "/metrics").read().decode()
+    assert 'forge_mem_limit_bytes{pool="host"} 4096' in m, m
+    assert "forge_admission_deferred_total" in m and "forge_queue_waiting 0" in m, m
+    print("serve mem-limit ok")
+finally:
+    p.kill()
