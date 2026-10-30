@@ -196,9 +196,14 @@ public:
     void start() { th_ = std::thread([this] { run(); }); }
     void stop() {
         if (stop_.exchange(true)) return;
+#if defined(_WIN32)
+        ls_.close();                            // Winsock: shutdown() does not wake a blocked accept(); closesocket() does
+        if (th_.joinable()) th_.join();
+#else
         ls_.shutdown_both();                    // wakes accept(); close only after the accept thread is gone
         if (th_.joinable()) th_.join();
         ls_.close();
+#endif
         std::vector<conn> cs; { std::lock_guard g(m_); for (auto& c : conns_) c.ch->shutdown_both(); cs.swap(conns_); }
         for (auto& c : cs) if (c.th.joinable()) c.th.join();     // workers never outlive the server
     }
@@ -209,6 +214,11 @@ private:
 #endif
         bool authed = false, first = true;
         for (;;) {
+#if defined(_WIN32)
+            // Winsock: shutdown() from stop() does not reliably wake a blocked recv(), so idle between requests in slices.
+            while (!stop_ && !s.sock().wait_readable(200)) {}
+            if (stop_) return;
+#endif
             detail::reader r{s};
             char magic[4]; r.raw(magic, 4);
             if (!r.ok) return;
