@@ -921,7 +921,11 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
     }
     if (auto* g = dynamic_cast<const Globals*>(o)) {
         auto n = make<Globals>(); memo[o] = obj(n); n->consts = g->consts;
-        for (auto& [k, x] : g->vars) n->vars[k] = deep_copy(in, x, memo);
+        for (auto& [k, x] : g->vars) {
+            // Same rule as closure frames: thread-bound globals (handles, tasks) stay behind.
+            if (as<Task>(x) || as<Handle>(x)) { n->vars[k] = Value(Ref<Obj>(moved_sentinel())); continue; }
+            n->vars[k] = deep_copy(in, x, memo);
+        }
         return obj(n);
     }
     if (auto* f = dynamic_cast<const Function*>(o)) {

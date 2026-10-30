@@ -141,6 +141,7 @@ struct NodeIter;   // runtime iterator
 
 void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
+void install_automation(Shared& sh);
 std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Value>& args, std::size_t first);
 std::vector<std::string>& script_argv();   // forge::args()
 

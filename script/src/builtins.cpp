@@ -185,7 +185,7 @@ void install_builtins(Shared& sh) {
     for (auto n : {"IOError", "OSError", "TypeError", "IndexError", "KeyError", "OverflowError", "OutOfMemoryError", "TimeoutError",
                    "CancelledError", "ObjectDisposedError", "ShellError", "PermissionError", "LimitExceededError", "NameError",
                    "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError", "RuntimeError", "LogicError",
-                   "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError"})
+                   "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError", "PipelineError"})
         mkclass(n, err);
     sh.errors["ZeroDivisionError"] = sh.errors["ArithmeticError"];
 
@@ -815,7 +815,7 @@ void install_builtins(Shared& sh) {
         if (auto* f = as<Function>(a[0])) return strv(f->decl->name); if (auto* n = as<Native>(a[0])) return strv(n->name); return strv("<bound>");
     });
 
-    install_cpp_std(sh);
+    install_cpp_std(sh); install_automation(sh);
     for (auto& [k, v] : B) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) (*r)->frozen = true;
 }
 

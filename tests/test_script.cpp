@@ -352,6 +352,84 @@ fs.remove(d);
 std::println("{}", fs.exists(d));
 )CPP", "[\"a.cpp\", \"s/b.cpp\", \"t/b.cpp\"]\n5 true\ntrue\ntrue\n1970-01-01T00:00:00.000Z 1793318400\ntrue true\nfalse\n");
 }
+TEST(automation_pipeline) {
+    EXPECT(R"CPP(
+std::vector<std::string> log;
+auto p = forge::pipeline();
+p.job("build", {"gen"}, [&]() { log.push_back("build"); return 2; });
+p.job("gen", [&]() { log.push_back("gen"); return 1; });
+p.job("test", {"build"}, [&]() { log.push_back("test"); throw std::runtime_error("boom"); });
+p.job("docs", {"gen"}, [&]() { log.push_back("docs"); return 0; });
+p.job("ship", {"test"}, [&]() { log.push_back("ship"); return 0; });
+std::println("{}", p.order());
+auto r = p.run();
+std::println("{} {} {}", r["ok"], log, r["jobs"]["build"]["value"]);
+std::println("{} {} {}", r["jobs"]["test"]["status"], r["jobs"]["test"]["error"], r["jobs"]["ship"]["status"]);
+auto q = forge::pipeline();
+q.job("a", {"b"}, [&]() { return 0; });
+q.job("b", {"a"}, [&]() { return 0; });
+try { q.run(); } catch (const PipelineError& e) { std::println("{}", e.message); }
+int tries = 0;
+auto z = forge::pipeline();
+z.job("flaky", {}, [&]() { tries += 1; if (tries < 3) throw std::runtime_error("x"); return tries; }, {{"retries", 2}});
+std::println("{}", z.run()["jobs"]["flaky"]["value"]);
+auto par = forge::pipeline();
+par.job("x", [&]() { return 1; });
+par.job("y", [&]() { return 2; });
+par.job("sum", {"x", "y"}, [&]() { return 3; });
+auto pr = par.run({{"parallel", 4}});
+std::println("{} {} {}", pr["ok"], pr["jobs"]["y"]["value"], pr["jobs"]["sum"]["status"]);
+)CPP", "[\"gen\", \"build\", \"test\", \"docs\", \"ship\"]\nfalse [\"gen\", \"build\", \"docs\", \"test\"] 2\nfailed boom cancelled\ndependency cycle through 'a'\n3\ntrue 2 ok\n");
+}
+
+TEST(automation_incremental) {
+    EXPECT(R"CPP(
+auto d = fs.make_temp_dir("fpl-");
+auto src = path.join(d, "in.txt"); auto out = path.join(d, "out.txt");
+fs.write(src, "hello");
+int runs = 0;
+auto p = forge::pipeline({{"cache", path.join(d, ".cache")}});
+p.job("copy", {}, [&]() { runs += 1; fs.write(out, fs.read(src)); return 0; }, {{"inputs", std::vector<std::string>{src}}, {"outputs", std::vector<std::string>{out}}});
+p.run(); auto r2 = p.run();
+std::println("{} {}", runs, r2["jobs"]["copy"]["status"]);
+fs.set_mtime(src, time.now() + 5); p.run();
+std::println("{} {}", runs, p.run({{"dry_run", true}})["jobs"]["copy"]["status"]);
+p.run({{"force", true}});
+std::println("{}", runs);
+fs.remove(d);
+)CPP", "1 skipped\n2 skipped\n3\n");
+}
+
+TEST(automation_schedule) {
+    EXPECT(R"CPP(
+std::println("{} {} {}", forge::duration_ms("1h30m"), forge::duration_ms("250ms"), forge::duration_ms(7));
+std::println("{}", forge::every("20ms", [&](int i) { return true; }, {{"count", 3}}));
+int n = 0;
+std::println("{} {}", forge::every(10, [&]() { n += 1; return n < 2; }), n);
+auto s = forge::scheduler();
+s.every("15ms", [&]() { n += 10; }, {{"times", 2}});
+s.every("10ms", [&]() { n += 100; }, {{"times", 1}});
+std::println("{} {} {}", s.upcoming().size(), s.run(), n);
+auto t = forge::cron_next("30 4 * * *", 0);
+std::println("{}", t != nullptr);
+try { forge::cron("61 * * * *", [&]() {}); } catch (const ValueError& e) { std::println("bad cron"); }
+try { forge::every("5parsecs", [&]() {}); } catch (const ValueError& e) { std::println("bad dur"); }
+)CPP", "5400000 250 7\n3\n2 2\n2 3 122\ntrue\nbad cron\nbad dur\n");
+}
+
+TEST(automation_watch) {
+    EXPECT(R"CPP(
+auto d = fs.make_temp_dir("fwt-");
+std::vector<std::string> got;
+auto n = forge::watch(path.join(d, "*.txt"), [&](auto changes) {
+    for (auto& c : changes) got.push_back(c["kind"] + " " + path.base(c["path"]));
+    return got.size() < 1;
+}, {{"debounce_ms", 30}, {"for", "5s"}, {"ready", [&]() { fs.write(path.join(d, "a.log"), "x"); fs.write(path.join(d, "a.txt"), "x"); }}});
+std::println("{} {}", n, got);
+fs.remove(d);
+)CPP", "1 [\"created a.txt\"]\n");
+}
+
 TEST(os_phase3_surface) {
     EXPECT(R"CPP(
 auto d = fs.make_temp_dir("fst-");

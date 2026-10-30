@@ -2,7 +2,8 @@
 
 Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
 cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
-Still to come: pipelines/watch/schedules, AI commands, remote execution. See *Phasing* at the end.
+Automation (pipelines, file-watch triggers, schedules) implemented. Still to come: modules/plugins, AI
+commands, remote execution. See *Phasing* at the end.
 
 ## Purpose
 
@@ -279,6 +280,41 @@ release, uptime, loadavg, memory, is_tty, term_size, devices, clipboard), `proc.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
 9. **Sandboxed runs** — run untrusted scripts with fs/net capabilities off, using `sandbox.hpp`.
 
+## Automation (implemented)
+
+C++-shaped library calls rather than new keywords (`script/src/automation.cpp`):
+
+```cpp
+auto p = forge::pipeline({{"cache", ".forge-cache"}});          // optional input-fingerprint cache file
+p.job("gen", [&]() { return sh("./gen.sh").code; });
+p.job("build", {"gen"}, [&]() { ... }, {{"inputs", std::vector<std::string>{"src/*.cpp"}},
+                                         {"outputs", std::vector<std::string>{"out/app"}}, {"retries", 1}});
+auto r = p.run({{"parallel", 4}});   // also: targets, keep_going, dry_run, force, raise
+// r["ok"], r["order"], r["jobs"][name] = {status: ok|skipped|failed|cancelled|would_run, ms, value, error, error_type}
+
+forge::watch("src/**/*.cpp", [&](auto changes) { ...; return true; },   // false stops
+             {{"debounce_ms", 100}, {"count", 1}, {"for", "10m"}, {"ignore", ...}, {"polling", false}});
+
+forge::every("10m", fn, {{"count", 3}});  forge::at("02:00", fn);  forge::cron("*/5 * * * *", fn);
+auto s = forge::scheduler(); s.every("1h", f, {{"times", 2}}); s.cron("@daily", g); s.upcoming(); s.run({{"for", "1d"}});
+forge::cron_next(expr[, unix_s]);  forge::duration_ms("1h30m");
+```
+
+- Pipelines: DAG with unknown-dependency and cycle checks (`PipelineError`); a failed job cancels its
+  dependants, and without `keep_going` everything not yet started. A job is skipped when all outputs
+  exist and are newer than its inputs (make rule) or its input fingerprint (path, size, mtime) matches
+  the cache, unless a dependency re-ran or `force`. `parallel > 1` runs each ready wave as tasks (same
+  deep-copy rules as `std::async`; handles and tasks held in globals are not copied into them).
+  `TimeoutError`/`OutOfMemoryError` are never retried or swallowed.
+- Watch: `tree_watcher` (inotify/FSEvents/ReadDirectoryChangesW or polling) with debounce; events are
+  filtered by glob relative to the pattern's literal root.
+- Schedules: run on the calling thread, sleeping in slices so script timeouts apply. Callbacks returning
+  `false` stop their entry. Cron is 5-field POSIX (lists, ranges, steps, `@daily` etc.; day-of-month and
+  day-of-week OR together when both are set) in local time. To survive reboots, install the script
+  as an OS service with `service.install`.
+- Callbacks are stored in the handle's props, which the cycle collector traces (handles are tracked),
+  so a lambda capturing its own pipeline/scheduler does not leak.
+
 ## Safety
 
 - Scripts run with the user's privileges; nothing is sandboxed unless asked.
@@ -301,7 +337,7 @@ All phases are in scope.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).
    Features 1-2 (parallel tasks, resource-limited runs).
-4. **Automation**: features 3-5 and 8 (job pipelines, file-watch triggers, scheduled tasks, modules
+4. **Automation**: features 3-5 (done) and 8 (job pipelines, file-watch triggers, scheduled tasks, modules
    and plugins).
 5. **Advanced**: features 6, 7 and 9 (AI-assisted commands, remote execution once rpc-serve has
    auth/TLS, sandboxed runs).

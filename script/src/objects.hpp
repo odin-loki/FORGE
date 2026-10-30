@@ -172,11 +172,14 @@ struct Handle final : Obj {
     std::shared_ptr<void> payload;       // the C++ owner (type-erased, typed access via payload_as)
     std::unordered_map<std::string, Value> props;
     bool disposed = false;
-    explicit Handle(std::string k) : kind(std::move(k)) {}
-    ~Handle() override { dispose(); }
+    explicit Handle(std::string k) : kind(std::move(k)) { Heap::instance().track(*this); }
+    ~Handle() override { dispose(); Heap::instance().untrack(*this); }
     const char* type_name() const override { return "handle"; }
     void dispose() noexcept { if (!disposed) { disposed = true; if (closer) { try { closer(); } catch (...) {} } closer = nullptr; payload.reset(); } }
     template <class T> std::shared_ptr<T> payload_as() const { return std::static_pointer_cast<T>(payload); }
+    // Script values a handle keeps (callbacks of pipelines / schedulers) live in props, visible to the cycle collector.
+    void trace(const Visit& f) const override { for (auto& [k, v] : props) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) f(**r); }
+    void clear() override { props.clear(); }
 };
 
 // Result slot shared between a task thread and its awaiting owner. Values crossing threads are deep-copied.
