@@ -7,7 +7,7 @@ Options are `--name value`, `--name=value`, or a single-letter `-x value`. Unkno
 ## Commands
 
 ### `forge info`
-Prints the CPU name and feature flags, the lane kernel table in use, and for each grid backend (cpu, cuda, hip, level_zero, vulkan, metal) whether its runtime was found.
+Prints the CPU name and feature flags, the lane kernel table in use, and for each grid backend (cpu, cuda, hip, level_zero, vulkan, metal) whether its runtime was found. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
 ### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME]`
 Converts a model to `.fpk`.

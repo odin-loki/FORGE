@@ -53,7 +53,7 @@ To run a real model, import it first, or pass a Hugging Face directory, `.gguf` 
 Programs built by default:
 
 - `forge`: command-line tool (`info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`). See [docs/cli.md](docs/cli.md).
-- `forge-serve`: OpenAI-compatible HTTP server, and `forge-serve proxy` load balancer. See [docs/serve.md](docs/serve.md).
+- `forge-serve`: OpenAI-compatible HTTP server, and `forge-serve proxy` load balancer. See [docs/serve.md](docs/serve.md). Memory budgets and OOM avoidance: [docs/memory.md](docs/memory.md).
 - `libforge.so` (`forge_c` target): the stable C ABI, used by the Python, Kotlin and Swift bindings.
 
 ## Repository layout

@@ -14,11 +14,13 @@ Defaults are taken from `apps/forge_serve.cpp`:
 
 ```
 forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx 0] [--codec f32]
-            [--watch] [--no-pin] [--numa-node N]
+            [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0]
 forge-serve proxy ...                      # see balance.md
 ```
 
 `--ctx 0` means use the model's maximum context.
+
+`--mem-limit` sets the host memory budget (overrides `FORGE_MEM_LIMIT`; by default 85% of RAM or the cgroup limit). Under it the scheduler reports live KV bytes, evicts cached prefixes, and keeps new requests queued while the budget is over its soft watermark, so a tight limit runs requests one at a time instead of OOM-ing. `--max-queue N` (default 0, no cap) answers `503` with `Retry-After: 1` once N requests are waiting. An out-of-memory error while handling a request also returns 503. See [memory.md](memory.md).
 
 ### Endpoints
 
@@ -28,7 +30,7 @@ forge-serve proxy ...                      # see balance.md
 | `GET /v1/models` | Returns `{"object":"list","data":[{"id":<file name>,...}]}` |
 | `POST /v1/completions` | Takes `prompt` (a string or a list of token ids) and the sampling fields below. The response holds `choices[0].text`, `choices[0].tokens` and `usage` |
 | `POST /v1/chat/completions` | Takes `messages: [{role, content}]` and the same sampling fields. The response holds `choices[0].message` |
-| `GET /metrics` | Plain-text scheduler counters, `forge_steps`, `forge_completed`, `forge_prefix_hits`, `forge_prefix_tokens_reused`, `forge_peak_active`, `forge_peak_kv_bytes` |
+| `GET /metrics` | Plain-text scheduler counters, `forge_steps`, `forge_completed`, `forge_prefix_hits`, `forge_prefix_tokens_reused`, `forge_peak_active`, `forge_peak_kv_bytes`, queue gauges (`forge_queue_waiting`, `forge_queue_active`), `forge_admission_deferred_total`, `forge_rejected_total`, `forge_kv_evictions_total`, and the memory budget (`forge_mem_*{pool=...}`, see [memory.md](memory.md)) |
 
 The sampling fields are:
 - `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`

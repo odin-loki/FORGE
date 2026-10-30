@@ -16,6 +16,19 @@ FORGE has no config file. Programs take command-line flags ([cli.md](cli.md), [s
 | `FORGE_GPU_NO_RESIDENCY` | Vulkan lowerings | If set, tensors are not kept resident on the device between ops |
 | `FORGE_SVE_KEEP_VL=1` | lane (aarch64) | Do not change the SVE vector length at start-up |
 
+## Memory
+
+See [memory.md](memory.md) for how the budget is used.
+
+| Variable | Effect |
+|----------|--------|
+| `FORGE_MEM_LIMIT` | Host memory budget: `6G`, `512M`, `1.5GiB`, bytes, or `75%` of the detected limit; `0`/`off` disables. Default: `FORGE_MEM_FRACTION` of min(RAM, cgroup limit, `RLIMIT_AS`) |
+| `FORGE_MEM_FRACTION` | Share of the detected limit used when `FORGE_MEM_LIMIT` is unset (default `0.85`) |
+| `FORGE_MEM_SOFT` | Soft watermark as a share of the limit; above it caches are trimmed and new requests wait (default `0.9`) |
+| `FORGE_MEM_DEVICE_LIMIT` | Limit for device memory pools (default: accounting only) |
+| `FORGE_MEM_PRESSURE=0` | Ignore OS memory-pressure signals |
+| `FORGE_MEM_SPILL_DIR` / `FORGE_MEM_SPILL_MAX` | Spill-store directory (default `<tmp>/forge-spill-<pid>`) and size cap |
+
 ## Models and security
 
 | Variable | Effect |
