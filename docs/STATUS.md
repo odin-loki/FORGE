@@ -260,3 +260,10 @@ Bugs fixed: GPU images with clangs lacking NVPTX/AMDGPU; strtod fallback for lib
 Windows fixes (found under wine): close/unmap files before deleting; 8 MiB main-thread stack; `fs::glob` root backslashes; rpc `server::stop()` hung (Winsock `shutdown()` does not wake `accept()`/`recv()`); tree watcher pinned deleted subdirectories via per-directory handles (now one recursive handle); emitted shells did not map busybox-w32 `uname -s` = `Windows_NT`; the cmd emitter used multi-letter FOR variables, `^^!` escapes and `""` quote doubling (all wrong on real cmd too), `(a)+(b)` arithmetic and `/` paths.
 
 Where wine's cmd differs from Windows cmd (seen in this run): `set /a (a)+(b)` is a syntax error or crashes cmd (a group followed by an operator); `^` escapes are not processed during delayed expansion, so `^^!` prints `^`; `mkdir "a/b"` fails ("Path not found") where Windows accepts `/`; `sc query <missing>` exits 36 instead of 1060. The emitter now avoids all four, so its output is the same on both, but it has not been run on real Windows.
+
+## Text & locale (os layer)
+
+Clean-room Unicode/CLDR stack, no ICU: `test_text` 115/115, `test_locale` 223/223, UCD
+conformance 100% on 8 suites, cross-OS compile of `os/src/text` passes for freebsd,
+macos, windows-gnu and linux-musl. Script builtins in `script/src/text.cpp`. Gaps: see
+`docs/text-locale.md`.

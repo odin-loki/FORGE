@@ -138,3 +138,16 @@ Full ICU parity. Some things are left out: full CLDR (every locale and every fie
 tailorings beyond a simple rule list, IDNA/UTS 46, spoof checking, and the Chinese/Indian lunisolar
 calendars. Dictionary-based line and word breaking for Thai/Lao/Khmer/Burmese is also out; these
 fall back to the UAX 14 rule, which only breaks at spaces.
+
+## Script bindings
+
+`script/src/text.cpp` exposes ~80 builtins under `forge::text::` and `forge::locale::`
+(case mapping, normalization, segmentation, regex/catalog handles, number/currency/
+compact/unit/list/date/relative/message formatting). See `examples/scripts/text_locale.cpp`.
+
+## Known gaps
+
+No Thai dictionary breaking; no ja/zh/ko collation reordering; O(n) next_grapheme;
+approximate fuzzy gap scoring; possessive quantifiers treated as greedy; arab-digit
+regions hardcoded; non-Gregorian month names are English transliterations; no spellout;
+Apple `.mm` not compile-tested off macOS; Android has no bundled tzdata.

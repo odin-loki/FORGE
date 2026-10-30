@@ -878,7 +878,7 @@ void install_builtins(Shared& sh) {
         std::vector<std::string> v; { std::lock_guard g(in.sh->mod_m); for (auto& [k, m] : in.sh->modules) if (m) v.push_back(k); for (auto& [k, m] : in.sh->plugins) v.push_back(k); }
         std::sort(v.begin(), v.end()); auto l = make<List>(); for (auto& x : v) l->push(strv(x)); return obj(l);
     });
-    install_cpp_std(sh); install_automation(sh); install_ai(sh); install_remote(sh); install_mobile(sh); install_reflect(sh);
+    install_cpp_std(sh); install_automation(sh); install_ai(sh); install_remote(sh); install_mobile(sh); install_text(sh); install_reflect(sh);
     for (auto& [k, v] : B) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) (*r)->frozen = true;
 }
 
