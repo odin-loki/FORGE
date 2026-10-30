@@ -142,7 +142,7 @@ static void console() {
     wo.width = 12; wo.indent = "* "; wo.subsequent_indent = "  ";
     EQ(t::wrap("alpha beta gamma delta", wo), std::string("* alpha beta\n  gamma\n  delta"));
     auto sz = t::terminal_size(); CHECK(sz.cols > 0 && sz.rows > 0);
-    CHECK(t::enable_vt());
+    if (t::is_terminal(1)) CHECK(t::enable_vt());   // Windows: no console mode when stdout is a pipe (ctest)
 }
 int main() {
     utf_props_case(); collation(); encodings(); translit(); fuzzy(); regex(); console();

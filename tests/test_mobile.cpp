@@ -126,11 +126,11 @@ TEST(sim_lifecycle) {
 TEST(geofencing) {
     CHECK(std::abs(m::geofence_monitor::distance_m(0, 0, 0, 1) - 111195) < 200);
     m::geofence_monitor gm; gm.add({"home", -33.87, 151.21, 100});
-    m::sensor_event far; far.kind = m::sensor_kind::location; far.v = {-33.90, 151.21}; far.n = 2;
-    m::sensor_event near = far; near.v = {-33.8701, 151.2101};
-    CHECK(gm.feed(far).empty());
-    auto e = gm.feed(near); CHECK(e.size() == 1 && e[0].entered);
-    e = gm.feed(far); CHECK(e.size() == 1 && !e[0].entered);
+    m::sensor_event away; away.kind = m::sensor_kind::location; away.v = {-33.90, 151.21}; away.n = 2;
+    m::sensor_event inside = away; inside.v = {-33.8701, 151.2101};
+    CHECK(gm.feed(away).empty());
+    auto e = gm.feed(inside); CHECK(e.size() == 1 && e[0].entered);
+    e = gm.feed(away); CHECK(e.size() == 1 && !e[0].entered);
     CHECK(gm.remove("home")); CHECK(!gm.remove("home"));
 }
 TEST(gesture_rotate) {

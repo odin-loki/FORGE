@@ -403,7 +403,8 @@ auto e = ch.recv();
 std::println("{} {}", e["kind"], e["v"]);
 auto t = forge::touch::open(dev);
 std::vector<int> kinds;
-auto gs = t.gestures(200);
+auto gs = t.gestures(200);   // down and up can land in separate polls under load
+for (int i = 0; i < 20 && gs.size() == 0; ++i) gs = t.gestures(200);
 std::println("{}", gs.size() > 0 ? gs[0]["kind"] : "none");
 std::println("{} {}", dev.clipboard_get(), dev.display()["width"]);
 acc.close();
