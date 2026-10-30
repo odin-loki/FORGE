@@ -15,7 +15,7 @@ struct Limits {
     int max_depth = 800;              // script call depth (keeps the C++ stack safe)
     std::uint64_t max_output = 64ull << 20;   // per child-process stream
 };
-struct Caps { bool fs = true, net = true, proc = true, env = true; };
+struct Caps { bool fs = true, net = true, proc = true, env = true, reflect = true; };   // reflect: reflect::set/invoke/call/construct
 
 // A script-level exception travelling through C++ frames. `v` is the thrown value (usually an Error object).
 struct ScriptError : std::exception {
@@ -146,6 +146,7 @@ void install_builtins(Shared& sh);
 void install_cpp_std(Shared& sh);
 void install_automation(Shared& sh);
 void install_mobile(Shared& sh);
+void install_reflect(Shared& sh);
 void install_ai(Shared& sh);
 void install_remote(Shared& sh);
 std::vector<std::string> module_search_path(const Interp& in);

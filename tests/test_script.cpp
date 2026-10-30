@@ -187,6 +187,101 @@ std::println("{}", twice(1));
 )CPP", "7 2 9\n2\n");
 }
 
+TEST(reflection) {
+    EXPECT(R"CPP(
+// Runtime reflection in FORGE script: run with `forge run docs/examples/script/reflection.cpp`
+struct [[serializable]] Point {
+    [[key("x")]] double x = 0;
+    double y = 0;
+    const int id = 7;
+    Point(double a, double b) : x(a), y(b) {}
+    double norm2() const { return x * x + y * y; }
+    void scale(double k) { x *= k; y *= k; }
+};
+enum class Color { Red, Green, Blue };
+int add(int a, int b = 2) { return a + b; }
+
+int main() {
+    auto p = forge::reflect::construct("Point", 3.0, 4.0);
+    std::println("{} is a {}", forge::typeof(p), forge::reflect::kind(p));
+    for (const auto& f : forge::reflect::fields(Point)) std::println("field {} : {}", f["name"], f["type"]);
+    for (const auto& m : forge::reflect::methods(Point)) std::println("method {}", m["name"]);
+    std::println("attrs {}", forge::reflect::attributes(Point).size());
+    std::println("norm2 {}", forge::reflect::invoke(p, "norm2"));
+    forge::reflect::set(p, "x", 6.0);
+    std::println("x {}", forge::reflect::get(p, "x"));
+    try { forge::reflect::set(p, "id", 1); } catch (const std::exception& e) { std::println("const refused"); }
+    for (const auto& e : forge::reflect::enum_values(Color)) std::println("{} = {}", e["name"], e["value"]);
+    auto s = forge::reflect::signature(add);
+    std::println("{} returns {} arity {}", s["name"], s["returns"], s["arity"]);
+    std::println("call {}", forge::reflect::call("add", 40));
+    return 0;
+}
+)CPP", R"OUT(Point is a object
+field x : double
+field y : double
+field id : const int
+method norm2
+method scale
+attrs 1
+norm2 25
+x 6
+const refused
+Red = 0
+Green = 1
+Blue = 2
+add returns int arity 1
+call 42
+)OUT");
+    EXPECT(R"CPP(
+class Acct { int secret = 1; void hide() {} public: int bal = 5; int get() const { return bal; } void dep(int n) { bal += n; } };
+struct B1 { int a = 1; }; struct D1 : B1 { int b = 2; };
+auto o = Acct();
+try { forge::reflect::get(o, "secret"); } catch (const std::exception& e) { std::println("get private: {}", e.what()); }
+try { forge::reflect::invoke(o, "hide"); } catch (const std::exception& e) { std::println("invoke private: {}", e.what()); }
+try { forge::reflect::set(o, "bal", "str"); } catch (const std::exception& e) { std::println("bad type: {}", e.what()); }
+forge::reflect::invoke(o, "dep", 10); std::println("{}", forge::reflect::get(o, "bal"));
+forge::freeze(o);
+try { forge::reflect::set(o, "bal", 1); } catch (const std::exception& e) { std::println("frozen: {}", e.what()); }
+try { forge::reflect::invoke(o, "dep", 1); } catch (const std::exception& e) { std::println("frozen call: {}", e.what()); }
+std::println("{}", forge::reflect::invoke(o, "get"));
+std::println("{} {}", forge::reflect::bases(D1).size(), forge::reflect::is_base_of(B1, D1));
+std::println("{}", forge::reflect::has(D1, "b"));
+std::vector<int> v{1,2};
+auto h = D1();
+try { for (auto x : v) forge::reflect::set(v, "size", 1); } catch (const std::exception& e) { std::println("vec: {}", e.what()); }
+std::println("{}", forge::reflect::symbols().size() > 0);
+)CPP", R"OUT(get private: Acct::secret is private
+invoke private: Acct::hide() is private
+bad type: Acct::bal expects int, got string
+15
+frozen: object is frozen
+frozen call: Acct::dep() is not const and the object is frozen
+15
+1 true
+true
+vec: reflect::set expects an object, class or map, got list
+true
+)OUT");
+    EXPECT(R"CPP(
+std::map<std::string, int> m{{"a", 1}};
+try { for (const auto& [k, x] : m) forge::reflect::set(m, "a", 2); } catch (const std::exception& e) { std::println("borrow: {}", e.what()); }
+forge::reflect::set(m, "a", 3); std::println("{}", m["a"]);
+struct P { int x = 1; };
+try { forge::sandbox(std::map<std::string, bool>{{"reflect", false}}, [] { auto p = P(); forge::reflect::set(p, "x", 2); }); } catch (const std::exception& e) { std::println("sandbox: {}", e.what()); }
+forge::sandbox(std::map<std::string, bool>{{"reflect", false}}, [] { auto p = P(); std::println("read ok {}", forge::reflect::get(p, "x")); });
+)CPP", R"OUT(borrow: cannot insert into a map while it is being iterated
+3
+sandbox: reflection (set) is disabled in this sandbox
+read ok 1
+)OUT");
+    EXPECT("struct S { int x = 1; }; auto s = S(); forge::reflect::get(s, \"nope\");", "!AttributeError");
+    EXPECT("class A { int s = 1; }; auto a = A(); forge::reflect::get(a, \"s\");", "!AccessError");
+    EXPECT("struct P { int x = 1; }; forge::sandbox(std::map<std::string, bool>{{\"reflect\", false}}, [] { auto p = P(); forge::reflect::set(p, \"x\", 2); });", "!PermissionError");
+    EXPECT("std::map<std::string, int> m{{\"a\", 1}}; for (auto& [k, v] : m) forge::reflect::set(m, \"a\", 2);", "!BorrowError");
+    EXPECT("struct C { const int k = 1; }; auto c = C(); forge::reflect::set(c, \"k\", 2);", "!TypeError");
+}
+
 TEST(destructors_raii) {
     EXPECT(R"CPP(
 struct G { std::string n; G(std::string s) : n(s) { std::println("+{}", n); } ~G() { std::println("-{}", n); } };

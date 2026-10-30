@@ -320,7 +320,44 @@ private:
         expect_op(open); int depth = 1;
         while (depth) { if (at(T::End)) fail(std::string("unbalanced '") + open + "'"); if (is_op(open)) ++depth; else if (is_op(close)) --depth; take(); }
     }
-    void skip_attributes() { while (is_op("[") && ahead_op(1, "[")) { take(); skip_balanced("[", "]"); expect_op("]"); } }
+    // [[a, b(1)]] ... : each attribute's text is appended to pending_attrs_ (reflection: forge::reflect::attributes).
+    std::vector<std::string> pending_attrs_;
+    void skip_attributes() {
+        while (is_op("[") && ahead_op(1, "[")) {
+            take(); take(); int depth = 0; std::string cur_a;
+            auto flush = [&] { if (!cur_a.empty()) pending_attrs_.push_back(cur_a); cur_a.clear(); };
+            for (;;) {
+                if (at(T::End)) fail("unbalanced '[['");
+                if (depth == 0 && is_op("]") && ahead_op(1, "]")) { take(); take(); break; }
+                if (depth == 0 && is_op(",")) { take(); flush(); continue; }
+                if (is_op("(") || is_op("[")) ++depth; else if (is_op(")") || is_op("]")) --depth;
+                const Tok& k = take();
+                std::string txt = k.t == T::Str ? "\"" + k.s + "\"" : k.t == T::Int && k.s.empty() ? std::to_string(k.i) : k.s;
+                bool glue = cur_a.empty() || txt == "(" || txt == ")" || txt == "," || txt == "::" || cur_a.back() == '(' || (cur_a.size() > 1 && cur_a.ends_with("::"));
+                if (!glue) cur_a += ' ';
+                cur_a += txt; if (txt == ",") cur_a += ' ';
+            }
+            flush();
+        }
+    }
+    std::vector<std::string> take_attrs() { return std::exchange(pending_attrs_, {}); }
+    static std::string tname(const TI& t) {
+        std::string b;
+        switch (t.k) {
+        case TK::Auto: b = "auto"; break; case TK::Void: b = "void"; break; case TK::Int: b = "int"; break; case TK::Float: b = "double"; break;
+        case TK::Bool: b = "bool"; break; case TK::String: b = "std::string"; break; case TK::List: b = "std::vector"; break;
+        case TK::Map: b = t.sorted ? "std::map" : "std::unordered_map"; break; case TK::Set: b = t.sorted ? "std::set" : "std::unordered_set"; break;
+        case TK::Pair: b = "std::pair"; break; case TK::Fn: b = "std::function"; break; case TK::Any: b = "std::any"; break;
+        case TK::Class: case TK::Enum: b = t.name; break; case TK::Weak: b = "std::weak_ptr"; break; case TK::Task: b = "std::future"; break;
+        case TK::Channel: b = "forge::channel"; break; case TK::Shared: b = "forge::shared"; break;
+        }
+        if (!t.args.empty()) { b += "<"; for (std::size_t i = 0; i < t.args.size(); ++i) { if (i) b += ", "; b += tname(t.args[i]); } b += ">"; }
+        if (t.nullable && !t.smart) b = "std::optional<" + b + ">";
+        if (t.smart == 1) b = "std::shared_ptr<" + b + ">"; else if (t.smart == 2) b = "std::unique_ptr<" + b + ">";
+        if (t.cnst) b = "const " + b;
+        if (t.ref) b += "&";
+        return b;
+    }
 
     static std::shared_ptr<Node> mk(NK k, int line) { auto n = std::make_shared<Node>(); n->k = k; n->line = line; return n; }
     std::shared_ptr<Node> var_node(const std::string& name, int line) { auto n = mk(NK::Var, line); n->s = name; n->var = lookup(name); return n; }
@@ -352,6 +389,10 @@ private:
                 if (k > 0 && t_[k - 1].t == T::Op && (t_[k - 1].s == "<" || t_[k - 1].s == ",")) continue;   // template <class T>
                 std::size_t j = k + 1;
                 if (a.s == "enum" && j < t_.size() && t_[j].t == T::Kw && (t_[j].s == "class" || t_[j].s == "struct")) ++j;
+                if (a.s != "enum" && j + 1 < t_.size() && t_[j].t == T::Op && t_[j].s == "[" && t_[j + 1].t == T::Op && t_[j + 1].s == "[") {
+                    int d = 0;   // struct [[attr]] Name
+                    for (; j < t_.size(); ++j) { if (t_[j].t == T::Op && t_[j].s == "[") ++d; else if (t_[j].t == T::Op && t_[j].s == "]" && --d == 0) { ++j; break; } }
+                }
                 if (j < t_.size() && t_[j].t == T::Ident) { types_.insert(t_[j].s); if (a.s == "enum") enums_.insert(t_[j].s); }
             }
         }
@@ -703,6 +744,7 @@ private:
 
     NodeP statement() {
         int line = cur().line;
+        pending_attrs_.clear();
         skip_attributes();
         if (accept_op(";")) return nullptr;
         if (is_op("{")) return block_body(line);
@@ -732,6 +774,7 @@ private:
             }
             if (k == "try") return try_stmt();
             if (k == "class" || k == "struct") {
+                if (ahead_op(1, "[") && ahead_op(2, "[")) return class_stmt();
                 if (ahead(1).t == T::Ident && (ahead_op(2, "{") || ahead_op(2, ":") || ahead_op(2, ";") || (ahead(2).t == T::Kw && ahead(2).s == "final"))) return class_stmt();
             }
             if (k == "enum") return enum_stmt();
@@ -888,6 +931,7 @@ private:
             p.out = ti.ref && !ti.cnst;
             if (ti.k != TK::Auto && ti.k != TK::Any && ti.k != TK::Fn && ti.k != TK::Class && ti.k != TK::Enum && ti.k != TK::Float && ti.k != TK::Int) p.type = ti.ann();
             if (accept_op("=")) p.dflt = is_op("{") ? construct(ti, brace_list(), true, cur().line) : assign_expr();
+            p.tname = tname(ti); p.cnst = ti.cnst;
             if (types) types->push_back(ti);
             ps.push_back(std::move(p));
             if (!accept_op(",")) break;
@@ -912,14 +956,16 @@ private:
     std::shared_ptr<FnDecl> function_body(const std::string& name, int line, const std::string& cls, bool is_static, const TI& ret,
                                           std::vector<Param>* pre_params = nullptr, const std::vector<std::pair<std::string, NodeP>>* = nullptr) {
         auto fd = std::make_shared<FnDecl>(); fd->name = cls.empty() ? name : cls + "::" + name; fd->line = line; fd->file = file_;
+        fd->attrs = take_attrs(); fd->is_static = is_static;
         push_fn(cls, is_static);
         fns_.back().ret = std::make_shared<TI>(ret);
         if (!cls.empty() && !is_static) { fd->is_method = true; declare("self", false); }
         std::vector<Param> ps = pre_params ? std::move(*pre_params) : params();
         for (auto& p : ps) { if (p.name == "...") { p.name = "__va"; } p.slot = declare(p.name, false).slot; }
         fd->params = std::move(ps);
-        TI r = ret;
-        fn_qualifiers(&r);
+        TI r = ret; bool cq = false;
+        fn_qualifiers(&r, &cq);
+        fd->ret_name = tname(r); fd->is_const = cq;
         fns_.back().ret = std::make_shared<TI>(r);
         fd->body = block_body(line, false);
         fd->nslots = fns_.back().nslots;
@@ -1168,10 +1214,13 @@ private:
     NodeP class_stmt() {
         int line = cur().line;
         bool is_struct = take().s == "struct";
+        skip_attributes();   // struct [[deprecated]] S
+        auto class_attrs = take_attrs();
         std::string name = ident();
         std::string full = ns_name(name);
         types_.insert(name); types_.insert(full);
         auto cd = std::make_shared<ClassDecl>(); cd->name = full; cd->is_struct = true;
+        cd->meta->attrs = std::move(class_attrs); cd->meta->file = file_; cd->meta->line = line;
         accept_kw("final");
         if (accept_op(";")) return nullptr;   // forward declaration
         if (accept_op(":")) {
@@ -1190,16 +1239,17 @@ private:
         if (full != name) classes_[name] = ci;
         VarRef cv = declare(name, true);
         expect_op("{");
-        bool def_private = !is_struct; (void)def_private;
+        std::string access = is_struct ? "public" : "private";
         std::vector<NodeP> post;   // static member initialisers, run after the class is defined
         std::map<std::string, int> ctor_count;
         std::vector<std::shared_ptr<FnDecl>> ctors;
         while (!accept_op("}")) {
             if (at(T::End)) fail("expected '}' at end of class");
             int ml = cur().line;
+            pending_attrs_.clear();
             skip_attributes();
             if (accept_op(";")) continue;
-            if ((is_kw("public") || is_kw("private") || is_kw("protected")) && ahead_op(1, ":")) { take(); take(); continue; }
+            if ((is_kw("public") || is_kw("private") || is_kw("protected")) && ahead_op(1, ":")) { access = take().s; take(); continue; }
             if (is_kw("using") || is_kw("typedef")) { auto s = statement(); (void)s; continue; }
             if (accept_kw("friend")) {
                 if (is_kw("class") || is_kw("struct")) { while (!accept_op(";")) take(); continue; }
@@ -1236,14 +1286,15 @@ private:
             (void)explicit_ctor;
             if (at(T::Ident) && cur().s == name && ahead_op(1, "(")) {   // constructor
                 take();
+                auto ca = take_attrs();
                 auto fd = constructor(full, ml);
                 if (!fd) continue;
+                fd->attrs = std::move(ca); fd->access = access; fd->ret_name = "void";
                 ctors.push_back(fd);
                 continue;
             }
             bool is_virtual = is_kw("virtual");
             TI ti = parse_type();
-            (void)is_virtual;
             std::string mname = is_kw("operator") ? operator_name() : ident();
             if (is_op("(")) {   // method
                 bool pure = false;
@@ -1255,7 +1306,7 @@ private:
                 if (is_op("=")) { take(); take(); semi(); continue; }   // = default / = delete
                 i_ = save;
                 auto fd = function_body(mname, ml, full, ti.is_static, ti);
-                fd->name = mname;
+                fd->name = mname; fd->access = access; fd->is_virtual = is_virtual;
                 if (ti.is_static) {   // static member function: kept on the class as a plain function
                     auto lam = mk(NK::Lambda, ml); lam->fn = fd;
                     auto f = mk(NK::Field, ml); f->s = mname; f->kids.push_back(hidden_ref(cv, ml));
@@ -1265,7 +1316,10 @@ private:
                 continue;
             }
             // data members: T a = 1, b{2}, c;
+            auto mattrs = take_attrs();
             for (;;) {
+                { MemberMeta mm; mm.name = mname; TI bare = ti; bare.is_static = false; mm.type = tname(bare); mm.ann = bare.ann(); mm.is_const = ti.cnst;
+                  mm.is_static = ti.is_static; mm.access = access; mm.attrs = mattrs; mm.line = ml; cd->meta->fields.push_back(std::move(mm)); }
                 NodeP init;
                 if (accept_op("=")) init = initializer(ti, ml);
                 else if (is_op("{")) init = construct(ti, brace_list(), true, ml);
@@ -1408,7 +1462,7 @@ private:
         }
         expect_op("}"); semi();
         auto let = mk(NK::Let, line); let->s = name; let->flag = true;
-        let->kids.push_back(builtin_call("forge::freeze", {m}, line));
+        let->kids.push_back(builtin_call("forge::__enum", {str_node(name, line), m}, line));
         let->var = declare(name, true);
         if (!scoped) for (auto& [e, v] : vals) { auto d = mk(NK::Let, line); d->s = e; d->flag = true; d->kids.push_back(v); d->var = declare(e, true); extra_.push_back(d); }
         return let;

@@ -440,6 +440,48 @@ forge::module_path(); forge::modules();
 - Plugins run native code, so they are refused unless all capabilities (fs, net, proc, env) are on.
   Loaded libraries stay loaded for the life of the process.
 
+## Reflection (implemented)
+
+Runtime reflection in the spirit of C++26 reflection (P2996), exposed as ordinary builtins rather
+than a `^^` operator, and identical in the tree-walker and the bytecode VM (classes are defined by
+shared runtime code, and the builtins are natives called through `Interp::call`). Implementation:
+`script/src/reflect.cpp`. Example: `docs/examples/script/reflection.cpp`.
+
+**Metadata.** The parser records a `ClassMeta` for each `class`/`struct`. It holds the class
+`[[attributes]]`, and for each data member the name, the C++-style type name, the type annotation,
+`const`/`static`, access, attributes and line. Function declarations record parameter type names,
+the return type, `const`/`static`/`virtual`, access and attributes. `ClassMeta` is held by
+`shared_ptr` from the runtime `Class`, so it outlives the AST. An `enum` becomes a frozen map tagged
+with `Map::enum_name` (via `forge::__enum`). Metadata memory comes from the script heap (`forge::mem`,
+charged under "script"), like every other script object.
+
+**API** (`forge::reflect::`; `forge::typeof` and `forge::type_info` are also top-level):
+
+| builtin | result |
+|---|---|
+| `typeof(v)`, `kind(v)`, `type_info(v\|T)`, `find_type("Name")` | type name, kind, or an info map (name, kind, bases, fields, methods, attributes) |
+| `fields(T)`, `statics(T)`, `methods(T)`, `bases(T)`, `is_base_of(B, D)`, `has(T, "m")` | member lists as maps `{name, type, const, static, access, attributes, line}` |
+| `attributes(T[, "member"])`, `attributes(fn)` | attribute texts, e.g. `"key(\"x\")"` |
+| `get(obj, "f")`, `set(obj, "f", v)` | read or write a field by name |
+| `invoke(obj, "m", args...)`, `call("fn", args...)`, `construct("T"\|T, args...)` | call or construct by name |
+| `enum_values(E)`, `enum_name(E, v)` | `[{name, value}]` in declaration order; value back to name |
+| `symbols([module])` | names a module (or the globals) defines |
+| `signature(fn\|T\|"name")` | `{name, kind, returns, params[{name, type, default, ref, out, const}], arity, variadic, const, static, virtual, access, attributes, file, line}` |
+
+**Rules.** Reflection never bypasses the language:
+- Private and protected members are listed, but `get`/`set`/`invoke` on them raise `AccessError`.
+- `set` on a `const` member or a frozen object raises `TypeError`. `invoke` of a non-`const` method
+  on a frozen object is refused too.
+- `set` while the object or the field's value is borrowed (for example, during iteration) raises
+  `BorrowError`, exactly like a normal assignment.
+- `set` checks the value against the member's declared type. Enums are read-only.
+- Mutation and dynamic dispatch (`set`, `invoke`, `call`, `construct`) need the `reflect`
+  capability (on by default). `forge::sandbox(std::map<std::string, bool>{{"reflect", false}}, fn)` turns it off, and those
+  calls then raise `PermissionError`. Read-only queries always work.
+
+**Tests.** `TEST(reflection)` in `tests/test_script.cpp` runs every builtin and each error case
+in both execution modes.
+
 ## Safety
 
 - Scripts run with the user's privileges; nothing is sandboxed unless asked.

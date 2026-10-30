@@ -1,6 +1,7 @@
 # FORGE implementation status
 
 ## forge::os::mobile (2026-10-31)
+- **Runtime reflection** in the script language ([scripting.md](scripting.md#reflection-implemented)): `forge::reflect::*` covers type info, fields/methods/bases/attributes, get/set/invoke by name, enum values, module symbols, signatures and construct-by-name, in both VM and tree-walker, gated by the `reflect` capability. Tested: `test_script` `reflection`, plus `docs/examples/script/reflection.cpp`.
 - New `forge_mobile` library ([mobile.md](mobile.md)): sensors, touch/gestures, device services and lifecycle on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, null and simulated backends; script built-ins `forge::mobile::device`, `forge::sensors::*`, `forge::touch::open`.
 - **Tested here (x86_64 Linux):** `test_mobile` 13/13 (simulator, gestures, services, lifecycle, geofencing, Linux IIO/evdev against fake sysfs), `test_script` `mobile_sensors_touch`.
 - **Compile-checked only:** Windows, FreeBSD, macOS and musl backends via zig (`xos_mobile_*`); Android (`android.cpp`, `services.cpp`, `linux.cpp`, `mobile.cpp`) with NDK r27c aarch64.

@@ -71,7 +71,7 @@ struct Node {
     std::vector<int> locals;     // Block: slots declared here, released in reverse order at block exit (RAII)
 };
 
-struct Param { std::string name; int slot = 0; std::shared_ptr<TypeAnn> type; NodeP dflt; bool by_ref = false; bool out = false; char conv = 0; };   // out: non-const T& (written back to the caller's lvalue)   // conv: 'i' int, 'f' double (implicit arithmetic conversion)
+struct Param { std::string name; int slot = 0; std::shared_ptr<TypeAnn> type; NodeP dflt; bool by_ref = false; bool out = false; char conv = 0; std::string tname; bool cnst = false; };   // tname/cnst: declared type, for reflection   // out: non-const T& (written back to the caller's lvalue)   // conv: 'i' int, 'f' double (implicit arithmetic conversion)
 
 struct FnDecl {
     std::string name; int line = 0;
@@ -84,6 +84,27 @@ struct FnDecl {
     bool is_top = false;         // program / module / REPL entry
     bool has_main = false;       // program defines int main(): run it after the top-level statements
     std::string file;
+    // reflection (forge::reflect::signature / attributes)
+    std::string ret_name;                 // declared return type as written ("auto" when deduced)
+    bool is_const = false, is_static = false, is_virtual = false;
+    std::vector<std::string> attrs;       // [[...]] attribute texts
+    std::string access = "public";
+};
+
+// Reflection metadata for a class / struct, filled by the parser and shared with the runtime Class.
+struct MemberMeta {
+    std::string name, type;               // type as written
+    std::shared_ptr<TypeAnn> ann;         // checked on reflect::set
+    bool is_const = false, is_static = false;
+    std::string access = "public";
+    std::vector<std::string> attrs;
+    int line = 0;
+};
+struct ClassMeta {
+    std::vector<std::string> attrs;
+    std::vector<MemberMeta> fields;       // instance + static data members, declaration order
+    std::string file; int line = 0;
+    const MemberMeta* field(const std::string& n) const { for (auto& f : fields) if (f.name == n) return &f; return nullptr; }
 };
 
 struct ClassDecl {
@@ -95,6 +116,7 @@ struct ClassDecl {
     std::vector<std::string> required;                     // interface method names
     std::vector<std::string> statics;                      // static data members (kept on the class)
     VarRef var;
+    std::shared_ptr<ClassMeta> meta = std::make_shared<ClassMeta>();
 };
 
 struct Program { std::shared_ptr<const FnDecl> top; };

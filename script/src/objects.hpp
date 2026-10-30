@@ -12,6 +12,7 @@ namespace forge::script {
 struct Node;     // AST (ast.hpp)
 struct FnDecl;
 struct Chunk;    // bytecode (vm.hpp)
+struct ClassMeta;   // reflection metadata (ast.hpp)
 struct Interp;
 
 struct String final : Obj {
@@ -39,6 +40,7 @@ struct Map final : Obj {
     std::unordered_map<std::string, std::size_t> index;
     bool sorted = false;                 // std::map (ordered by key) vs std::unordered_map (insertion order)
     bool has_dflt = false; Value dflt;
+    std::string enum_name;               // non-empty: the frozen value table of `enum [class] enum_name`
     bool is_set = false;                 // std::set / unordered_set: iteration yields keys   // operator[] inserts a copy of dflt for a missing key (std::map semantics)
     Map() { Heap::instance().track(*this); }
     ~Map() override { Heap::instance().untrack(*this); }
@@ -113,6 +115,7 @@ struct Class final : Obj {
     std::vector<std::string> interfaces;
     bool is_struct = false, is_dynamic = false, is_interface = false;
     std::vector<std::string> required;                // interface: method names
+    std::shared_ptr<const ClassMeta> meta;            // fields' types, const, access, attributes (reflection)
     Class() { Heap::instance().track(*this); }
     ~Class() override { Heap::instance().untrack(*this); }
     const char* type_name() const override { return is_interface ? "interface" : "class"; }

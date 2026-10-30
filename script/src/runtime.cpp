@@ -748,7 +748,7 @@ Value Interp::run_main() {
 Value Interp::define_class(const ClassDecl& cd, const Ref<Env>& env) {
     auto c = make<Class>();
     c->name = cd.name; c->is_struct = cd.is_struct; c->is_dynamic = cd.is_dynamic; c->is_interface = cd.is_interface;
-    c->required = cd.required; c->interfaces = cd.interfaces;
+    c->required = cd.required; c->interfaces = cd.interfaces; c->meta = cd.meta;
     auto lookup_name = [&](const std::string& n) -> Value {
         if (auto it = globals->vars.find(n); it != globals->vars.end()) return it->second;
         if (auto it = sh->builtins.find(n); it != sh->builtins.end()) return it->second;
