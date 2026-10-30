@@ -487,6 +487,7 @@ void install_builtins(Shared& sh) {
         for (auto& e : w->poll(to)) { auto m = make<Map>(); m->set_str("path", strv(e.path)); m->set_str("kind", strv(os::watch_kind_name(e.kind))); l->push(obj(m)); }
         return obj(l);
     });
+    M["handle:treewatcher"]["close"] = native("treewatcher.close", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     M["handle:treewatcher"]["backend"] = native("treewatcher.backend", 1, 1, [](Interp& in, Args& a) -> Value { return strv(h_of(in, a[0], "treewatcher").payload_as<os::tree_watcher>()->backend()); });
     M["handle:lock"]["unlock"] = native("lock.unlock", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     M["handle"]["dispose"] = native("handle.dispose", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
