@@ -16,11 +16,15 @@ int main() {
         w.add_tensor("wq", {256}, a, "q8_0");          // quantised on write
         w.write(path);
     }
-    pack::reader r(path);
-    bool ok = r.verify().empty();                       // empty = every hash matches
-    auto t = r.load("w");                               // decoded to f32
-    std::printf("name=%s verify=%s w[255]=%g wq codec=%s\n", r.manifest()["name"].str().c_str(),
-                ok ? "ok" : "BAD", t.data[255], r.entry("wq").codec.c_str());
+    bool ok; std::vector<float> data;
+    {   // scoped: the reader maps the file, and Windows cannot delete a mapped file
+        pack::reader r(path);
+        ok = r.verify().empty();                        // empty = every hash matches
+        auto t = r.load("w");                           // decoded to f32
+        data = t.data;
+        std::printf("name=%s verify=%s w[255]=%g wq codec=%s\n", r.manifest()["name"].str().c_str(),
+                    ok ? "ok" : "BAD", t.data[255], r.entry("wq").codec.c_str());
+    }
     std::filesystem::remove(path);
-    return ok && t.data == a ? 0 : 1;
+    return ok && data == a ? 0 : 1;
 }
