@@ -1,3 +1,4 @@
+#include <iterator>
 // forge — command-line front end: info | import | inspect | run | bench
 #include <sys/stat.h>
 #include <forge/import/gguf.hpp>
@@ -362,12 +363,15 @@ int cmd_rpc_serve(const args& a) {
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
-    std::string file, code; bool have_code = false;
+    std::string file, code, emit_target, emit_out; bool have_code = false;
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
         auto val = [&](const char* what) -> std::string { if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + what); return argv[++i]; };
         if (s == "-e") { code = val("-e"); have_code = true; ++i; break; }
+        else if (s == "--emit") emit_target = val("--emit");
+        else if (s == "-o") emit_out = val("-o");
+        else if (s == "--emit-targets") { for (auto& t : forge::script::emit_targets()) std::printf("%s\n", t.c_str()); return 0; }
         else if (s == "--tree") o.use_vm = false;
         else if (s == "--debug") o.debug = true;
         else if (s == "--timeout") o.timeout_ms = std::stoull(val("--timeout"));
@@ -387,6 +391,16 @@ int cmd_script(int argc, char** argv) {
         char buf[16] = {}; if (!std::fgets(buf, sizeof buf, stdin)) return false;
         return buf[0] == 'y' || buf[0] == 'Y';
     };
+    if (!emit_target.empty()) for (std::size_t k = 0; k + 1 < o.argv.size(); ++k) if (o.argv[k] == "-o") { emit_out = o.argv[k + 1]; o.argv.erase(o.argv.begin() + k, o.argv.begin() + k + 2); break; }
+    if (!emit_target.empty()) {   // write once, emit anywhere: translate instead of running
+        if (!have_code) { if (file.empty()) throw std::runtime_error("--emit needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
+        try {
+            auto text = forge::script::emit(code, have_code ? "<-e>" : file, emit_target);
+            if (emit_out.empty()) std::fwrite(text.data(), 1, text.size(), stdout);
+            else { std::ofstream f(emit_out, std::ios::binary); f << text; f.close(); std::filesystem::permissions(emit_out, std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec | std::filesystem::perms::others_exec, std::filesystem::perm_options::add); }
+            return 0;
+        } catch (const forge::script::emit_error& ex) { std::fprintf(stderr, "%s:%d: emit %s: %s\n", file.empty() ? "<-e>" : file.c_str(), ex.line, emit_target.c_str(), ex.what()); return 2; }
+    }
     forge::script::engine e(o);
     if (!have_code && file.empty()) return e.repl();
     auto r = have_code ? e.run(code, "<-e>") : e.run_file(file);

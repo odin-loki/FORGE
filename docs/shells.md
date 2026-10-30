@@ -3,7 +3,9 @@
 Every shell is a backend: one file in `script/src/shells/` that defines `forge_shell_register_<file>(shell_registry&)`.
 CMake globs that directory and generates the registry, so **adding a shell takes one file**. For each backend and each alias,
 `forge::<name>(template, args...)` substitutes `{}` with the shell's own quoting and runs it, using the first executable it finds.
-`forge::shells()` lists the backends with `{name, family, available, exe, tested, aliases}`.
+`forge::shells()` lists the backends with `{name, family, available, exe, tested, emit, emit_tested, aliases}`.
+A backend can also provide an emitter (`b.emitter`), which `forge script --emit` uses. See [scripting.md](scripting.md#write-once-emit-anywhere) for the emit matrix.
+`forge::shell(tmpl, args...)` runs a command through `forge::host_shell()`.
 
 | Backend | Aliases | Invocation | Golden-tested |
 |---|---|---|---|
@@ -25,4 +27,4 @@ CMake globs that directory and generates the registry, so **adding a shell takes
 | rc, es | | `-c` | **untested** |
 
 Golden test: `shell_backends_golden` in `tests/test_script.cpp`. It round-trips a hostile literal through each available
-shell and skips any that are missing. Set `FORGE_TEST_SHELL_PATH=/workspace/opt/shells/bin` to pick up the user-local shells.
+shell and skips any that are missing. ctest sets `FORGE_TEST_SHELL_PATH` automatically from the CMake cache variable of the same name. It defaults to `../opt/shells/bin` when that directory exists.

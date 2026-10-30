@@ -4,11 +4,13 @@
 //     void forge_shell_register_<file-stem>(forge::script::shell_registry& r)
 // CMake globs the directory and generates the call list, so nothing else needs editing.
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace forge::script {
 
+struct emit_dialect;
 struct shell_backend {
     std::string name;                         // forge::<name>(...) and sh { } style kind
     std::vector<std::string> aliases;         // other kinds that map here (e.g. "ps" -> pwsh)
@@ -19,6 +21,10 @@ struct shell_backend {
     std::string family;                       // posix, csh, fish, nu, python, elvish, powershell, cmd, rc
     bool golden_tested = false;               // true = covered by tests/test_shells.cpp on CI boxes that have it
     std::string notes;
+    // Emitter for `forge script --emit <name>` (null = this shell has no emitter yet).
+    std::function<std::unique_ptr<emit_dialect>()> emitter;
+    std::string emit_ext = ".sh";             // file extension for emitted scripts
+    bool emit_tested = false;                 // emitted output golden-tested against the interpreter
 };
 
 class shell_registry {

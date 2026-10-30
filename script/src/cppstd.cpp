@@ -2,6 +2,7 @@
 // names, iterators, smart-pointer helpers, and the forge:: runtime helpers the parser lowers to.
 #include "interp.hpp"
 #include "shells/shell.hpp"
+#include <forge/script/script.hpp>
 #include <forge/os/process.hpp>
 #include <algorithm>
 #include <charconv>
@@ -571,12 +572,16 @@ void install_cpp_std(Shared& sh) {
         std::vector<std::string> ns{b.name}; ns.insert(ns.end(), b.aliases.begin(), b.aliases.end());
         for (auto& k : ns) def("forge::" + k, 1, -1, [k](Interp& in, Args& a) -> Value { return shell_call(in, k, a); });
     }
+    // forge::shell: the host's default shell (FORGE_SHELL, else pwsh/powershell/cmd on Windows, mksh on Android, sh elsewhere)
+    def("forge::shell", 1, -1, [](Interp& in, Args& a) -> Value { return shell_call(in, host_shell(), a); });
+    def("forge::host_shell", 0, 0, [](Interp&, Args&) -> Value { return sv(host_shell()); });
+    def("std::getenv", 1, 1, [](Interp& in, Args& a) -> Value { auto k = in.str(a[0]); if (!os::has_env(k)) return Nil{}; return sv(os::getenv(k)); });
     def("forge::shells", 0, 0, [](Interp&, Args&) -> Value {
         auto l = make<List>();
         for (auto& b : shells().all()) {
             auto m = make<Map>(); std::string exe; for (auto& e : b.exes) if (!os::find_executable(e).empty()) { exe = e; break; }
             m->set_str("name", sv(b.name)); m->set_str("family", sv(b.family)); m->set_str("available", !exe.empty()); m->set_str("exe", sv(exe));
-            m->set_str("tested", b.golden_tested); auto al = make<List>(); for (auto& x : b.aliases) al->push(sv(x)); m->set_str("aliases", obj(al));
+            m->set_str("tested", b.golden_tested); m->set_str("emit", bool(b.emitter)); m->set_str("emit_tested", b.emit_tested); auto al = make<List>(); for (auto& x : b.aliases) al->push(sv(x)); m->set_str("aliases", obj(al));
             l->push(obj(m));
         }
         return obj(l);

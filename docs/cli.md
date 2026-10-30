@@ -82,6 +82,8 @@ FORGE_MODEL_KEY_FILE=k.mkey $B/forge inspect sealed.fpk
 ```
 forge script <file.cpp> [args...]     # run a script; int main()'s return value is the exit status
 forge script -e '<code>' [args...]    # run a snippet
+forge script --emit <shell|auto|android|ast> <file.cpp> [-o out]   # translate to a standalone shell script (chmod +x)
+forge script --emit-targets           # list backends that have an emitter
 forge script                          # interactive REPL (:help, :type, :dis, :mem, :gc, :vm on|off)
   --tree          tree-walker only (default: compile to verified bytecode)
   --debug         race detector + lock-order / stall deadlock detection
@@ -91,3 +93,5 @@ forge script                          # interactive REPL (:help, :type, :dis, :m
 
 Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md).
 Arguments after the file are available as `forge::args()`.
+`--emit` prints the script to stdout, or writes it to `-o`. A construct the target can't express exits with status 2 and prints `file:line: emit <target>: <reason>`.
+See [scripting.md, "Write once, emit anywhere"](scripting.md#write-once-emit-anywhere).

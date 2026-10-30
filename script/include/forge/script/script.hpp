@@ -1,4 +1,5 @@
 #pragma once
+#include <stdexcept>
 // forge::script — the FORGE managed scripting runtime (see docs/scripting.md).
 // ARC + backup cycle collector, RAII handles, hybrid tree-walker / verified bytecode VM, written in safe
 // ISO C++23 (no raw owning pointers, no unsafe escape hatch in the language).
@@ -58,5 +59,13 @@ public:
 private:
     std::unique_ptr<impl> p_;
 };
+
+// Write once, emit anywhere (docs/scripting.md): translate a script in the portable subset into a
+// standalone native script for `target` (a shell backend name/alias, "auto" = host default, or "ast").
+// Throws emit_error with the offending line when the script uses something the target can't express.
+struct emit_error : std::runtime_error { int line; emit_error(int l, const std::string& m) : std::runtime_error(m), line(l) {} };
+std::string emit(std::string_view src, const std::string& file, const std::string& target);
+std::vector<std::string> emit_targets();      // backends that have an emitter
+std::string host_shell();                     // default shell for this OS ("pwsh"/"cmd" on Windows, "sh" elsewhere)
 
 } // namespace forge::script

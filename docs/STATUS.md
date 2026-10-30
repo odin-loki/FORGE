@@ -6,13 +6,15 @@ Built with conda clang 18 (`/workspace/opt/llvm18`) and a user-local OpenSSL (`/
 - **Milestone 7, RPC security**: token auth and Ed25519 key auth (reusing forge_trust), optional TLS (`FORGE_TLS`), and remote script execution (`forge::remote`, `rpc-serve --allow-scripts`, which requires auth). See docs/rpc.md.
 - **Shell emit targets**: a pluggable backend registry, one file per shell (docs/shells.md). 14 backends are golden-tested on the box: sh, bash, zsh, dash, ash/busybox, yash, fish, tcsh, csh (via tcsh), nu, xonsh, elvish, pwsh, and powershell (via pwsh). **Untested**: ksh, mksh, oksh, posh, osh/ysh, hush, cmd, rc, es, and real Windows PowerShell 5.1.
 
+- **Translator (`forge script --emit`)**: one C++-subset script becomes a standalone script for 21 backends. The `emit_golden_all_shells` test matches the interpreter's output and exit code on sh, bash, zsh, dash, ash, yash, fish, tcsh, pwsh, xonsh, elvish and nu, and on csh and powershell through tcsh and pwsh. **Untested emitters**: ksh, mksh/android, oksh, posh, hush, osh, cmd and PowerShell 5.1. iOS is interpreter-only. Added `forge::shell` and `forge::host_shell`. ctest now sets `FORGE_TEST_SHELL_PATH` automatically. The emitter has zig cross syntax checks (`ctest -L cross`), but they were not run because zig is absent.
+
 ### Deferred
+- Emitters for ysh, rc and es; cmd emit golden runs (wine segfaults on this box)
 - TLS channel binding and client certificates (mTLS)
 - Per-key permissions in authorized_keys
 - Shipping lambdas to remote nodes
 - In-process inference for `forge::ask` (it currently goes through HTTP)
 - Golden tests for the untested shells (needs ksh/mksh/oils builds, Windows or wine)
-- Wiring `FORGE_TEST_SHELL_PATH` into ctest automatically
 
 ## Latest check (2026-10-30, documentation rewrite)
 x86_64 Linux box, no GPU, built with zig 0.17 (`zig cc`/`zig c++`) as the compiler: `ctest -LE "slow|emu"` gave 71/73 after installing `numpy safetensors cryptography onnx` in the Python environment. The 2 failures were `test_gpu_cuda_mock` and `test_gpu_features_cuda_mock`, which need `clang` to embed the PTX image; without it they exit 77 but are not marked as skip tests. All `doc_example_*` tests passed. Vulkan was compiled out (no glslang on that machine). Cross builds and qemu runs below were not repeated; treat them as historical.

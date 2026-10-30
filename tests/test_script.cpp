@@ -566,3 +566,80 @@ TEST(shell_backends_golden) {
     }
     std::printf("shells tested:%s\nshells skipped (not installed):%s\n", ran.c_str(), skipped.c_str());
 }
+
+// "Write once, emit anywhere": every golden script is emitted for every backend that has an emitter and is
+// installed, run by that shell without FORGE, and must match the interpreter's output and exit code.
+#include <array>
+#include <sys/wait.h>
+#include <unistd.h>
+namespace {
+std::string slurp_file(const std::string& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), {}}; }
+std::pair<std::string, int> sh_capture(const std::string& cmd) {
+    std::string out; std::array<char, 4096> buf{};
+    FILE* p = ::popen(cmd.c_str(), "r");
+    if (!p) return {"", -1};
+    size_t n; while ((n = std::fread(buf.data(), 1, buf.size(), p)) > 0) out.append(buf.data(), n);
+    int st = ::pclose(p);
+    return {out, WIFEXITED(st) ? WEXITSTATUS(st) : -1};
+}
+const char* runner(const std::string& s) {
+    if (s == "ash" || s == "busybox") return "busybox sh"; if (s == "nu") return "nu --no-config-file"; if (s == "xonsh") return "xonsh --no-rc";
+    if (s == "elvish") return "elvish -norc"; if (s == "pwsh") return "pwsh -NoProfile -NonInteractive -File";
+    if (s == "powershell") return "powershell -NoProfile -File"; if (s == "tcsh" || s == "csh") return "tcsh -f";
+    return nullptr;
+}
+}
+TEST(emit_golden_all_shells) {
+    if (const char* extra = std::getenv("FORGE_TEST_SHELL_PATH")) { std::string p = std::string(extra) + ":" + (std::getenv("PATH") ? std::getenv("PATH") : ""); ::setenv("PATH", p.c_str(), 1); }
+    namespace stdfs = std::filesystem;
+    auto dir = stdfs::temp_directory_path() / ("forge_emit_" + std::to_string(::getpid()));
+    stdfs::create_directories(dir);
+    auto avail = run("for (auto& s : forge::shells()) if (s[\"available\"] && s[\"emit\"]) std::print(\" {}={} \", s[\"name\"], s[\"exe\"]);");
+    std::string tested, refused;
+    for (const char* g : {"functions", "flat"}) {
+        std::string src = slurp_file("tests/data/emit/" + std::string(g) + ".cpp");
+        CHECK_MSG(!src.empty(), "missing golden %s", g);
+        auto old = stdfs::current_path(); stdfs::current_path(dir);
+        script::options o; std::string want; o.out = [&](std::string_view s) { want += s; };
+        script::engine e(o); auto r = e.run_file(stdfs::absolute(old / "tests/data/emit" / (std::string(g) + ".cpp")).string());
+        stdfs::current_path(old);
+        CHECK_MSG(r.ok, "%s interp: %s", g, r.error.c_str());
+        for (auto& name : script::emit_targets()) {
+            auto at = avail.find(" " + name + "=");
+            if (at == std::string::npos) continue;
+            auto exe = avail.substr(at + name.size() + 2, avail.find(' ', at + 1) - at - name.size() - 2);
+            exe = stdfs::path(exe).filename().string();
+            std::string code;
+            try { code = script::emit(src, g, name); }
+            catch (const script::emit_error&) { refused += " " + std::string(g) + "/" + name; continue; }
+            auto path = (dir / (std::string(g) + "." + name)).string();
+            { std::ofstream(path, std::ios::binary) << code; }
+            const char* rn = runner(exe);
+            auto [got, rc] = sh_capture("cd '" + dir.string() + "' && " + (rn ? std::string(rn) : exe) + " '" + path + "' 2>&1");
+            CHECK_MSG(got == want, "%s/%s output:\n%s\nwant:\n%s", g, name.c_str(), got.c_str(), want.c_str());
+            CHECK_MSG(rc == r.exit_code, "%s/%s exit %d want %d", g, name.c_str(), rc, r.exit_code);
+            tested += " " + std::string(g) + "/" + name + (exe != name ? "(via " + exe + ")" : "");
+        }
+    }
+    stdfs::remove_all(dir);
+    std::printf("emit tested:%s\nemit refused (outside the target's subset):%s\n", tested.c_str(), refused.c_str());
+}
+
+TEST(emit_errors_and_host_shell) {
+    auto refuse = [](const std::string& src, const std::string& t, const char* what) {
+        bool threw = false;
+        try { script::emit(src, "x.cpp", t); } catch (const script::emit_error& e) { threw = true; CHECK_MSG(std::string(e.what()).find(what) != std::string::npos, "%s: %s", t.c_str(), e.what()); }
+        CHECK_MSG(threw, "%s accepted unsupported script", t.c_str());
+    };
+    refuse("class A { int x; };\nint main() { return 0; }", "bash", "class");
+    refuse("int f() { return 1; }\nint main() { return f(); }", "tcsh", "functions");
+    refuse("int main() { auto s = fs.read(\"x\"); return 0; }", "tcsh", "fs.read");
+    refuse("int main() { return 0; }", "rc", "no emitter");
+    refuse("int main() { return 0; }", "nope", "");
+    auto bash = script::emit("int main() { std::println(\"hi\"); return 0; }", "x.cpp", "bash");
+    CHECK(bash.starts_with("#!"));
+    CHECK(script::emit("int main() { return 0; }", "x.cpp", "android").starts_with("#!/system/bin/sh"));
+    CHECK(!script::host_shell().empty());
+    auto got = run("auto r = forge::shell(\"echo hi\"); std::print(\"{} {} {}\", r.out, r.code, forge::host_shell());");
+    CHECK_MSG(got == "hi\n 0 " + script::host_shell(), "got [%s]", got.c_str());
+}

@@ -249,6 +249,63 @@ let procs = pwsh { Get-Process | ConvertTo-Json }.json   # parsed into lists/map
 - Shells are located via the OS wrapper; a missing shell raises a catchable error.
 - `run(["git", "status"])` runs without any shell (no quoting issues).
 
+## Write once, emit anywhere
+
+`forge script --emit <shell> file.cpp [-o out]` translates a script into a standalone native script for that shell.
+The output runs without FORGE. `--emit auto` (or `forge::host_shell()` at runtime) picks the host's shell:
+`$FORGE_SHELL` if set, otherwise pwsh, then powershell, then cmd on Windows; mksh on Android; and sh everywhere else.
+`--emit android` (alias `toybox`) emits for Android's mksh with a `/system/bin/sh` shebang. `--emit ast` dumps the parse tree.
+`forge script --emit-targets` lists every backend that has an emitter.
+
+```
+$ forge script --emit bash -o hello.bash examples/scripts/hello_emit.cpp && ./hello.bash
+$ forge script --emit pwsh -o hello.ps1  examples/scripts/hello_emit.cpp && pwsh -File hello.ps1
+```
+
+**Portable subset** (the same for every target):
+
+- `int`, `bool`, `std::string`, `auto` locals, and a few `int`/`std::string` parameters on free functions, which may recurse.
+- `+ - * / %` (C truncation), comparisons, `&& || !` (short-circuit), `?:`, `+=`, `++`, string `+`, and `.size()`.
+- `if`/`else`, `while`, `for(;;)`, range-for over a `{...}` literal list, `break`, `continue`, `return`, and `std::exit`.
+- `std::println`/`std::print` with `{}`, `std::cout << ... << std::endl`, and `std::cerr`.
+- `os.env(name, default)`, `os.setenv`, `os.cwd()`, and `os.platform` (linux/windows/macos/freebsd/android/ios/other).
+- `fs.exists/is_dir/is_file/mkdir/remove/write/append/read`.
+- `forge::sh(tmpl, args...)` and `forge::shell(...)` results (`.out`, `.code`, `.ok`), with `{}` quoted for the target.
+
+Anything else is a clear compile-time error naming the file and line. Examples: `x.cpp:1: emit bash: classes and structs can't
+be expressed in bash`. Unsupported constructs include classes, lambdas, containers, exceptions, templates, and tasks.
+
+| Target | Extension | Not expressible (emit error) |
+|---|---|---|
+| sh, bash, zsh, dash, ash, yash, ksh, mksh/android, oksh, posh, hush, osh | none | none |
+| fish | `.fish` | none |
+| pwsh / powershell (output avoids 7-only syntax) | `.ps1` | on Windows, `forge::sh` needs an `sh` on PATH |
+| xonsh (plain Python) | `.xsh` | none |
+| elvish | `.elv` | none |
+| nu | `.nu` | functions that read or write script-level variables (nu `def` can't capture) |
+| tcsh, csh | `.csh` | functions (only `int main()` is inlined), `fs.read`, `forge::sh` results (csh drops newlines) |
+| cmd (**untested**) | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |
+| ysh, rc, es | | no emitter yet |
+
+**Tests.** `emit_golden_all_shells` in `tests/test_script.cpp` emits `tests/data/emit/functions.cpp` and `flat.cpp` for every
+installed backend. It runs each output with the real shell and requires exactly the interpreter's stdout and exit code. Shells that
+are missing are skipped. ctest sets `FORGE_TEST_SHELL_PATH` from the `FORGE_TEST_SHELL_PATH` cache variable, which defaults to
+`../opt/shells/bin` when that directory exists. **Golden-tested on Linux**: sh, bash, zsh, dash, ash (busybox), yash, fish, tcsh,
+pwsh, xonsh, elvish and nu, plus csh and powershell through tcsh and pwsh. **Untested**: ksh, mksh/android, oksh, posh, hush, osh,
+real csh, Windows PowerShell 5.1, and cmd. Wine segfaults on this box.
+
+**OS targets.**
+
+- **Linux**: tested.
+- **macOS and FreeBSD**: the POSIX, fish, zsh, nu, elvish, xonsh and pwsh output is the same code. `_platform` maps `uname -s`.
+  This output has not been run on either OS.
+- **Windows**: pwsh/powershell and cmd output. `os.platform` is `windows`.
+- **Android**: `--emit android` gives mksh/toybox output. Untested.
+- **iOS**: *interpreter only*. iOS has no user shell to run emitted scripts, so use the embedded interpreter (`bindings/apple`).
+- **Cross-compile checks**: `ctest -L cross` syntax-checks the emitter and backends with
+  `zig c++ -target x86_64-freebsd|aarch64-macos|x86_64-windows-gnu|aarch64-linux-musl`. These tests are registered only when zig
+  is found. zig is not installed on the current box, so they have not been run here.
+
 ## Built-ins (from the OS wrapper)
 
 `fs.*` (read, write, append, open, copy, move, glob, walk, match, symlink, chmod, touch, write_atomic,
