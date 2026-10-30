@@ -1,5 +1,10 @@
 # FORGE implementation status
 
+## Latest check (2026-10-30, documentation rewrite)
+x86_64 Linux box, no GPU, built with zig 0.17 (`zig cc`/`zig c++`) as the compiler: `ctest -LE "slow|emu"` gave 71/73 after installing `numpy safetensors cryptography onnx` in the Python environment. The 2 failures were `test_gpu_cuda_mock` and `test_gpu_features_cuda_mock`, which need `clang` to embed the PTX image; without it they exit 77 but are not marked as skip tests. All `doc_example_*` tests passed. Vulkan was compiled out (no glslang on that machine). Cross builds and qemu runs below were not repeated; treat them as historical.
+
+## Historical results
+
 Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backend runs on Mesa lavapipe (a software Vulkan device). aarch64 and riscv64 are cross-built with zig and tested under qemu-user.
 
 ## Test matrix (ctest)

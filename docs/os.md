@@ -1,64 +1,54 @@
-# os: the portable OS layer
+# os: the portability layer
 
 ## Concepts
-`forge::os` is header-only (`forge_os` is an INTERFACE target). Include `<forge/os/os.hpp>` for the core, or `<forge/os/all.hpp>` for everything.
-- **Targets:** Linux, Android, Windows, macOS, iOS and FreeBSD.
-- **No extra link flags:** Apple frameworks (CoreFoundation, IOKit, Security, objc, kperf, libdispatch) and Windows DLLs (dbghelp, crypt32, powrprof, dxgi) are loaded late with `dlopen` or `LoadLibrary`.
-- **Errors:** every call returns `result<T>` or `status`. If the OS lacks a feature, the error satisfies `os::is_unsupported(err)` (`unsupported_code = 0x0F0E5`) instead of crashing.
+`forge::os` (`os/include/forge/os/`) is a header-only OS abstraction (`forge_os` INTERFACE target) for **Linux, Android, Windows, macOS, iOS and FreeBSD**. The rest of FORGE (mapped files, sockets, RPC, async I/O, dynamic loading, entropy) goes through it.
 
-## API reference
+- Include `<forge/os/os.hpp>` for the core API, or `<forge/os/all.hpp>` for the core plus all 16 extension modules.
+- **No extra link flags.** Apple frameworks (CoreFoundation, IOKit, Security, objc, …) and Windows DLLs (dbghelp, crypt32, powrprof, dxgi, …) are bound at run time with `dlopen`/`LoadLibrary`. On Linux the target links only `libdl`; on Windows `ws2_32` and `bcrypt`.
+- **Errors are values.** Calls return `result<T>` or `status`. When a platform lacks a feature the error satisfies `os::is_unsupported(err)` (code `os::unsupported_code`, `0x0F0E5`), so callers can degrade gracefully.
 
-### Core (`os.hpp`)
-- Files and filesystem, and `mapping` (mmap or Windows file mapping).
-- Processes: `run` and `exe_path`. `run` is unsupported on iOS.
-- Threads and sync, time (`monotonic_ns`, `wall_ns`, `cpu_time_ns`, `sleep_ns`).
-- Networking: TCP `socket`, `poller` (epoll, kqueue or WSAPoll) and `completion_port` (IOCP, emulated on other platforms).
-- Dynamic libraries (`library`), env, signals (`on_signal`), memory, sysinfo, paths and entropy.
+## Core API (`os.hpp`)
+Files and filesystem; `mapping` (mmap / file mapping); processes (`run`, `exe_path`; `run` is unsupported on iOS); threads and synchronisation; time (`monotonic_ns`, `wall_ns`, `cpu_time_ns`, `sleep_ns`); TCP `socket`, `poller` (epoll / kqueue / WSAPoll) and `completion_port` (IOCP on Windows, emulated elsewhere); dynamic libraries (`library`); environment; signals (`on_signal`); memory; system info; standard paths; entropy; `os::rename` (atomic replace, also on Windows).
 
-### Extension modules (one header each, all included by `all.hpp`)
-Each column shows the backend used on that platform.
+## Extension modules
+One header each. The table lists the mechanism used per platform, as documented in each header.
 
-| # | Header | API | Linux | Android | Windows | macOS | iOS | FreeBSD |
-|---|---|---|---|---|---|---|---|---|
-| 1 | `numa.hpp` | `numa_nodes`, `bind_thread_to_node`, `numa_alloc/free`, `numa_node_of_address` | sysfs + mbind + move_pages | same | `VirtualAllocExNuma`, group affinity | single node | single node | `cpuset_setdomain` |
-| 2 | `hugepages.hpp` | `huge_page_sizes`, `huge_alloc(n, kind, fallback)`, `advise_huge`, `thp_enabled` | MAP_HUGETLB 2M/1G, THP | THP | large pages (needs SeLockMemoryPrivilege) | superpages (VM_FLAGS) | normal | `MAP_ALIGNED_SUPER` |
-| 3 | `async_file.hpp` | `async_file_io` read/write/wait | io_uring (fallback threads) | io_uring/threads | IOCP | POSIX AIO | POSIX AIO | kqueue AIO |
-| 4 | `cpu_topology.hpp` | `cpu_topology_query`, P/E `core_kind`, caches, `pin_thread_to(_kind)` | sysfs cpu_core/cpu_atom, capacity | capacity (big.LITTLE) | `EfficiencyClass` | perflevels + QoS | perflevels + QoS | sysctl + CPUID |
-| 5 | `power.hpp` | `power_status`, `power_hooks::report` | sysfs power_supply/thermal | sysfs + hooks | `GetSystemPowerStatus`, powrprof | IOKit / NSProcessInfo | hooks | sysctl acpi |
-| 6 | `memory_pressure.hpp` | `memory_pressure::instance().subscribe`, `on_trim_memory` | PSI triggers | PSI / `onTrimMemory` glue | memory resource notification | dispatch source | dispatch source | poll fallback |
-| 7 | `shared_memory.hpp` | `shared_memory::create/open/unlink` | shm_open | file in TMPDIR | `CreateFileMapping Local\forge-*` | shm_open | shm_open | shm_open |
-| 8 | `gpu_devices.hpp` | `gpu_devices()` | PCI sysfs + DRM | kgsl/mali/DRM | DXGI | IOKit IOAccelerator | integrated GPU from `hw.machine` | /dev/pci `PCIOCGETCONF` |
-| 9 | `local_ipc.hpp` | `local_listener`, `local_stream` | AF_UNIX + abstract `@name` | AF_UNIX | overlapped named pipes | AF_UNIX | AF_UNIX | AF_UNIX |
-| 10 | `crash.hpp` | `stack_trace`, `crash_handler::install`, `write_dump_now` | signal handler, `.crash` report | same | SEH + minidump `.dmp` | signal handler | signal handler | signal handler |
-| 11 | `sandbox.hpp` | `apply_sandbox`, `run_sandboxed`, `sandbox_status` | seccomp BPF | seccomp | job object (exec) / restricted token for children; in-process net/fs → unsupported | `sandbox_init` profiles | already sandboxed (no-op) | Capsicum `cap_enter` |
-| 12 | `keystore.hpp` | `keystore::put/get/remove` | libsecret, else file | JNI-installed backend (`set_backend`), else file | DPAPI | Keychain | Keychain | file |
-| 13 | `file_watch.hpp` | `file_watcher::add/poll` | inotify | inotify | `ReadDirectoryChangesW` | kqueue | kqueue | kqueue |
-| 14 | `perf.hpp` | `cycle_counter`, `precise_sleep_ns`, `perf_counters` | perf_event_open, falls back to TSC | same | `QueryThreadCycleTime` / TSC | kperf (root) | CNTVCT | TSC |
-| 15 | `background.hpp` | `background::begin/end`, `background_scope` | not required | JNI hooks (`set_hooks`), else unsupported | `SetThreadExecutionState` | IOPMAssertion | `beginBackgroundTask` | not required |
-| 16 | `service.hpp` | `service::ready/reloading/stopping/watchdog`, `log`, `run_as_service` | sd_notify + journald (else syslog) | liblog | SCM + Event Log | launchd detection + syslog (→ os_log) | syslog (→ os_log) | rc.d detection + syslog |
+| Header | Main API | Linux | Android | Windows | macOS / iOS | FreeBSD |
+|---|---|---|---|---|---|---|
+| `numa.hpp` | `numa_nodes`, `bind_thread_to_node`, `numa_alloc/free`, `numa_node_of_address` | sysfs + mbind | same | `VirtualAllocExNuma`, group affinity | single node (UMA) | `cpuset_setdomain` |
+| `hugepages.hpp` | `huge_page_sizes`, `huge_alloc`, `advise_huge`, `thp_enabled` | MAP_HUGETLB 2M/1G, else THP | THP | large pages (needs "Lock pages in memory") | superpages on x86_64 macOS | super pages |
+| `async_file.hpp` | `async_file_io` read/write/wait | io_uring (raw syscalls), else threads | same | IOCP | POSIX AIO | POSIX AIO + kqueue |
+| `cpu_topology.hpp` | `cpu_topology_query`, `core_kind` P/E, caches, `pin_thread_to(_kind)` | sysfs `cpu_core`/`cpu_atom`, capacity | capacity (big.LITTLE) | `EfficiencyClass` | `hw.perflevelN` + QoS | sysctl |
+| `power.hpp` | `power_status`, `power_hooks::report` | sysfs power_supply / thermal | sysfs + app hooks | `GetSystemPowerStatus` | IOKit / process info; iOS via hooks | sysctl |
+| `memory_pressure.hpp` | `memory_pressure::instance().subscribe`, `on_trim_memory` | PSI triggers | PSI + `onTrimMemory` hook | memory resource notification | dispatch source | polling |
+| `shared_memory.hpp` | `shared_memory::create/open/unlink` | shm_open | file under `$TMPDIR` | `CreateFileMappingW Local\forge-*` | shm_open | shm_open |
+| `gpu_devices.hpp` | `gpu_devices()` (no runtime initialised) | PCI sysfs + DRM | kgsl / mali / EGL | DXGI | IOKit (macOS), model lookup (iOS) | `/dev/pci` |
+| `local_ipc.hpp` | `local_listener`, `local_stream`, `local_endpoint` | AF_UNIX, abstract `@name` | same | named pipes | AF_UNIX | AF_UNIX |
+| `crash.hpp` | `stack_trace`, `crash_handler::install`, `write_dump_now` | signal handler → `.crash` text report | same | SEH + minidump `.dmp` | signal handler | signal handler |
+| `sandbox.hpp` | `apply_sandbox`, `run_sandboxed`, `sandbox_status` | no_new_privs + seccomp-BPF | same | job object / restricted token for children; in-process net/fs denial unsupported | `sandbox_init` (macOS); iOS already sandboxed | Capsicum |
+| `keystore.hpp` | `keystore::put/get/remove` | libsecret, else file | backend set from JNI, else file | DPAPI | Keychain | file |
+| `file_watch.hpp` | `file_watcher::add/poll` | inotify | inotify | `ReadDirectoryChangesW` | kqueue | kqueue |
+| `perf.hpp` | `cycle_counter`, `precise_sleep_ns`, `perf_counters` | perf_event_open, else TSC | same | thread cycle time / TSC | kperf (root) / CNTVCT | TSC |
+| `background.hpp` | `background::begin/end`, `background_scope` | not required | JNI hooks, else unsupported | `SetThreadExecutionState` | IOPMAssertion / `beginBackgroundTask` | not required |
+| `service.hpp` | `service::ready/reloading/stopping/watchdog`, `log`, `run_as_service` | sd_notify + journald, else syslog | liblog | SCM + Event Log | launchd detection + syslog | rc.d detection + syslog |
 
-### Environment variables
-- `FORGE_AIO=threads` forces the thread backend for `async_file_io`.
-- `FORGE_KEYSTORE=file` forces the file keystore.
-- `FORGE_KEYSTORE_DIR` sets the file keystore's directory.
+Environment: `FORGE_AIO=threads`, `FORGE_KEYSTORE=file`, `FORGE_KEYSTORE_DIR` (see [configuration.md](configuration.md)).
 
 ## Example
-`docs/examples/os_features.cpp` runs as the ctest `doc_example_os_features`:
+`docs/examples/os_features.cpp` (ctest `doc_example_os_features`):
 
 ```cpp
 auto t = os::cpu_topology_query();
-auto shm = os::shared_memory::create(name, 4096);   // result<shared_memory>
-if (!shm) std::puts(shm.err.what.c_str());
+auto nodes = os::numa_nodes();                               // always at least one node
+auto shm = os::shared_memory::create(name, 4096);            // result<shared_memory>
+if (!shm) { std::printf("shm failed: %s\n", shm.err.what.c_str()); return 1; }
 auto pin = os::pin_thread_to_kind(os::core_kind::performance);
-if (!pin && os::is_unsupported(pin.err)) { /* fine: the platform lacks it */ }
+if (!pin && os::is_unsupported(pin.err)) { /* platform lacks it: carry on */ }
 ```
 
 ## Platform notes and limits
-- **Local IPC names:** on Linux and Android, `local_endpoint(name)` produces an abstract socket name (`@forge-<name>`), because SELinux on Android refuses socket files in `/data/local/tmp`. Other POSIX systems use a `.sock` file in the temp directory unless the name is absolute.
-- **File keystore:** stores files with mode 0600, obfuscated with a per-store pad. It is a fallback, not real secret storage.
-- **Mobile hooks:** `power_hooks`, `memory_pressure::on_trim_memory` and `background::set_hooks` are plain C++ entry points for the app's JNI or Swift code to call.
-- **Tests:**
-  - `tests/test_os.cpp` covers the core.
-  - `tests/test_os_ext.cpp` has one TEST per extension module. Its child-process modes are selected with `FORGE_OS_EXT_CHILD`; never export that variable in a shell.
-  - The `xos_*` ctests (label `cross`) cross-compile and link the tests for other platforms.
-- **Where it has actually run:** Linux, wine and the Android emulator. FreeBSD and macOS are link-only, and iOS has not been built. See [STATUS.md](STATUS.md).
+- **Local IPC names:** on Linux and Android `local_endpoint(name)` gives an abstract socket `@forge-<name>`, because Android's SELinux policy refuses socket files in `/data/local/tmp`. Other POSIX systems use a `.sock` file in the temp directory unless the name is absolute.
+- **File keystore** writes mode-0600 files obfuscated with a per-store pad. It is a fallback, not real secret storage.
+- **Mobile hooks** (`power_hooks`, `memory_pressure::on_trim_memory`, `background::set_hooks`, `keystore::set_backend`) are plain C++ entry points that the app's JNI or Swift code must call.
+- **Tests:** `tests/test_os.cpp` (core) and `tests/test_os_ext.cpp` (one test per module; never export `FORGE_OS_EXT_CHILD`). `xos_*` ctests cross-link them for other OSes.
+- **Where it has run:** Linux, Windows under wine, the Android x86_64 emulator. FreeBSD and macOS are link-checked only; iOS has not been built. See [STATUS.md](STATUS.md).

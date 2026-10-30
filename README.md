@@ -1,84 +1,91 @@
 # FORGE
 
-FORGE is a single C++20 library that covers three jobs usually split across separate projects:
+FORGE is a C++23 library and toolset for running AI models on CPUs and GPUs. One codebase covers:
 
-- **SIMD kernels** with runtime CPU dispatch (`lane`)
-- **GPU compute** through one API: CPU, Vulkan, CUDA, HIP, Level Zero and Metal (`grid`)
-- **AI inference** from a self-describing model file, `.fpk` (`flow`, `pack`, `mind`)
+- **SIMD kernels** picked at run time for the CPU you are on (`lane`)
+- **GPU compute** behind one API, with backends loaded at run time: CPU, Vulkan, CUDA, HIP, Level Zero, OpenCL and Metal (`grid`)
+- **Inference** from a self-describing model file, `.fpk`, which carries its own computation graph (`flow`, `pack`, `mind`)
+- **Serving**: an OpenAI-compatible HTTP server with a built-in load-balancing proxy (`forge-serve`, `balance`)
+- **A portable OS layer** for Linux, Android, Windows, macOS, iOS and FreeBSD (`os`)
 
-The model file carries its own computation graph, so supporting a new architecture means importing a file, not writing engine code. FORGE is a clean-room design: it is not a fork or wrapper of another project.
+Because the model file describes its own graph, adding an architecture means importing a file, not writing engine code. FORGE is a clean-room design, not a fork or wrapper of another project.
 
-> **Status:** in development. Every layer has code and tests. Tests have run on Linux, on Windows under wine, on the Android emulator and on qemu cross targets. FreeBSD and macOS builds have been cross-linked but never run. iOS has not been built. GPU vendor backends have only run against mock drivers. See [docs/STATUS.md](docs/STATUS.md) for results per platform.
-
-## Features
-
-| Layer | Headers | What it provides |
-|-------|---------|------------------|
-| core | `core/include/forge/core` | Tensors, memory-mapped files (`FORGE_HUGEPAGES=1` enables huge pages for mappings of 2 MiB or more) |
-| os | `os/include/forge/os` | Portability layer: threads, sockets, IPC, CPU topology, NUMA, perf counters, sandbox, service integration and more |
-| lane | `lane/include/forge/lane` | CPU feature detection and a kernel table resolved once (scalar, AVX2, AVX-512, NEON, plus AMX/SME tile units) |
-| grid | `grid/include/forge/grid` | Device backends loaded at runtime; scan, compaction, radix sort and similar primitives |
-| flow | `flow/include/forge/flow` | Graph IR, optimisation passes, memory planning, quantisation codecs, autodiff, RPC devices |
-| pack | `pack/include/forge/pack` | The `.fpk` format: BLAKE3 hashes, Ed25519 signing, optional encryption, BPE tokenizer |
-| mind | `mind/include/forge/mind` | Sessions, samplers, batching, speculative decoding, GBNF grammars, LoRA, plus the C ABI `forge.h` |
-| balance | `balance/include/forge/balance` | Load-balancing strategies (p2c, round robin, least connections, EWMA, hash ring, KV-prefix affinity) |
-
-There are two apps:
-- `forge`, the command-line tool. Its commands are `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt` and `rpc-serve`.
-- `forge-serve`, an OpenAI-compatible HTTP server.
+> **Status: in development (version 0.1.0).** Every layer has code and tests. Tests run on Linux x86_64, on Windows under wine, on the Android x86_64 emulator and on aarch64/riscv64 under qemu. FreeBSD and macOS have only been cross-compiled and linked; iOS has never been built. CUDA, HIP, OpenCL, Level Zero and Metal have only run against mock drivers, never real GPUs. Vulkan has run on software devices (Mesa lavapipe, SwiftShader). Details: [docs/STATUS.md](docs/STATUS.md).
 
 ## Quick start (Linux)
 
+You need CMake 3.25 or newer, Ninja, Python 3 and a C++23 compiler (recent g++ or clang).
+
 ```sh
-cmake --preset dev              # configures into build/dev (RelWithDebInfo)
-ninja -C build/dev -j4
-./build/dev/forge info          # CPU features, lane target, grid backends
-(cd build/dev && ctest -j4)     # golden, signing and ONNX tests need numpy, safetensors, onnx, cryptography
-./build/dev/forge run model.fpk --prompt "Hello" -n 32
+cmake --preset dev                      # configure into build/dev (RelWithDebInfo)
+cmake --build build/dev -j4             # or: ninja -C build/dev -j4
+./build/dev/forge info                  # CPU features, chosen lane target, GPU backends found
+(cd build/dev && ctest -j4)             # full test suite; also generates build/dev/golden/tiny_f32.fpk
+./build/dev/forge run build/dev/golden/tiny_f32.fpk --prompt "Hello" -n 8
 ```
 
-You can also pass a Hugging Face directory or a `.gguf` file to `forge run`. It is imported once into `~/.cache/forge`.
+The golden test model has random weights, so the text it prints is meaningless; it shows the pipeline runs end to end. Some script tests need `numpy`, `safetensors`, `onnx` and `cryptography` installed in the Python that CMake finds.
 
-## Building on other platforms
+To run a real model, import it first, or pass a Hugging Face directory, `.gguf` or `.onnx` file straight to `forge run` (it is imported once into `~/.cache/forge`):
 
-Each preset in `CMakePresets.json` has its own build directory:
+```sh
+./build/dev/forge import /path/to/hf_model -o model.fpk --codec q8_0
+./build/dev/forge run model.fpk --prompt "Hello" -n 32
+./build/dev/forge-serve model.fpk --port 8080
+```
 
-| Preset | Directory | Toolchain | Tested? |
-|--------|-----------|-----------|---------|
-| `dev`, `release`, `asan` | `build/dev`, `build/release`, `build/asan` | host | yes (Linux) |
-| `windows-mingw` | `build/win64` | `cmake/toolchains/mingw-w64.cmake` | runs under wine |
-| `android-arm64` | `build/android-arm64` | `cmake/toolchains/android-arm64.cmake` (needs `ANDROID_NDK_HOME`) | x86_64 emulator |
-| `macos-osxcross` | `build/macos` | `cmake/toolchains/macos-osxcross.cmake` | not run (the zig `xos_*` cross-link tests cover macOS) |
-| `ios` | `build/ios` | `cmake/toolchains/ios.cmake` | not built |
+## What is in the box
 
-The `aarch64-sve-qemu` and `riscv64-rvv-qemu` toolchains run their tests under qemu. Wine, emulator and qemu steps are in [docs/building.md](docs/building.md).
+| Layer | Headers | Provides |
+|-------|---------|----------|
+| core | `core/include/forge/core` | Tensors, dtypes (incl. FP4/FP6/FP8, bf16, complex), errors, logging, memory-mapped files |
+| os | `os/include/forge/os` | Files, processes, threads, sockets, polling, IPC, NUMA, huge pages, CPU topology, sandboxing, keystore, service integration, … |
+| spec | `spec/` | One declaration per tensor op (`.fspec`) plus a scalar reference; code generators |
+| lane | `lane/include/forge/lane` | CPU feature detection and kernel tables: scalar, AVX2, AVX-512, NEON, SVE, RVV; AMX/SME tile kernels |
+| grid | `grid/include/forge/grid` | Devices, recorded graphs, parallel primitives, GPU backends loaded with `dlopen` |
+| flow | `flow/include/forge/flow` | Graph IR, optimisation passes, memory planning, weight and KV codecs, autodiff, remote (RPC) devices |
+| pack | `pack/include/forge/pack`, `forge/import` | The `.fpk` container (BLAKE3, Ed25519 signing, XChaCha20-Poly1305 encryption), BPE tokenizer, importers for Hugging Face safetensors, GGUF and ONNX |
+| mind | `mind/include/forge/mind`, `forge.h` | Sessions, samplers, continuous batching, speculative decoding, GBNF grammars, JSON Schema, LoRA, diffusion and streaming sessions, the C ABI |
+| balance | `balance/include/forge/balance` | Load-balancing pool (7 strategies, circuit breakers, retries, backpressure) and L4/L7 proxy |
+| support | `support/include/forge/*` | BLAKE3, JSON, async I/O, thread pool, allocators, linear algebra, FFT/audio, vision, profiler, RNGs |
+| verify | `verify/` | The oracle that checks every lowering against the spec, and golden-model scripts |
+
+Programs built by default:
+
+- `forge`: command-line tool (`info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`). See [docs/cli.md](docs/cli.md).
+- `forge-serve`: OpenAI-compatible HTTP server, and `forge-serve proxy` load balancer. See [docs/serve.md](docs/serve.md).
+- `libforge.so` (`forge_c` target): the stable C ABI, used by the Python, Kotlin and Swift bindings.
 
 ## Repository layout
 
 ```
-core os lane grid flow pack mind balance   library layers (header-mostly)
-spec/       operation specs and generators      verify/   oracle + golden models
-support/    blake3, aio, json, linalg, arenas   import/   import templates
-apps/       forge, forge-serve                  bindings/ android (Kotlin/JNI), apple (Swift)
-python/     Python package                      examples/integrations/  sample apps
-tests/      test_*.cpp + script tests           fuzz/, perf/, tools/, ci/
-docs/       guides (start at docs/index.md)
+core/ os/ spec/ lane/ grid/ flow/ pack/ mind/ balance/ support/ verify/   library layers
+apps/                  forge and forge-serve
+import/templates/      blueprint templates used by the importers (llama, mixtral, deepseek_v2)
+python/ bindings/      Python (ctypes), Android (Kotlin + JNI) and Apple (Swift) bindings
+examples/integrations/ embedding examples built as example_* executables
+tests/ fuzz/           unit, differential, script and fuzz tests
+docs/                  guides; start at docs/index.md (docs/examples/*.cpp are compiled and run by ctest)
+cmake/ ci/ tools/ perf/ third_party/   toolchains, CI and release tooling, perf baselines, vendored Monocypher and ze_api.h
+FORGE_PLAN.md          original design and roadmap
 ```
 
 ## Documentation
 
-Start at **[docs/index.md](docs/index.md)**. The design and roadmap are in [FORGE_PLAN.md](FORGE_PLAN.md), and security reporting is covered in [SECURITY.md](SECURITY.md).
+Start at **[docs/index.md](docs/index.md)**. Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Security: [SECURITY.md](SECURITY.md).
 
 ## Licence
 
 FORGE is dual licensed.
 
-- **AGPL-3.0 or later** — see [`LICENSE`](LICENSE). Free for individuals, charities and not-for-profits, education and research, and organisations with annual income under AUD 50,000.
-- **Commercial licence** — required for organisations at or above that threshold, or anyone who needs to keep modifications private. See [`COMMERCIAL-LICENCE.md`](COMMERCIAL-LICENCE.md).
+- **AGPL-3.0 or later** ([`LICENSE`](LICENSE)). Free for individuals, charities and not-for-profits, education and research, and organisations with annual income under AUD 50,000.
+- **Commercial licence** for organisations at or above that threshold, or anyone who needs to keep modifications private. See [`COMMERCIAL-LICENCE.md`](COMMERCIAL-LICENCE.md).
 
 Attribution line for AGPL users:
 
 > Powered by FORGE, developed by Odin Loch. Licensed under AGPL-3.0+.
+
+Third-party code: Monocypher (see [`NOTICE`](NOTICE)) and the MIT-licensed Level Zero API header in `third_party/level-zero`.
 
 ---
 

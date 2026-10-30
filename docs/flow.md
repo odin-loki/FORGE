@@ -1,44 +1,46 @@
 # flow: graph IR, compilation and execution
 
 ## Concepts
-A tensor graph is treated as a program: it is compiled once and replayed. The pipeline is:
+flow treats a tensor graph as a program that is compiled once and replayed:
 
-1. Build the graph with `flow::graph`.
-2. Run the passes: verify, canonicalise (CSE, constant folding, DCE, algebraic simplification), then fuse (for example `silu(x) * y` becomes `silu_mul`).
-3. Partition the graph across devices.
-4. Plan memory. Liveness analysis gives static arena offsets, so peak memory is known exactly before the graph runs.
-5. Lower each op to a device implementation.
-6. Produce a flat plan for replay. Plans are cached per shape bucket.
+1. **Build** a `flow::graph` (or let `mind` build one from a model's blueprint).
+2. **Optimise**: verify, constant folding, algebraic simplification, CSE, dead-code elimination, then fusion (for example `silu(x) * y` → `silu_mul`).
+3. **Plan memory**: liveness analysis gives static arena offsets, view aliasing and in-place reuse, so peak memory is known before running.
+4. **Lower** each op to an implementation from a lowering registry (CPU by default; Vulkan, CUDA/HIP, OpenCL, Level Zero, Metal, RPC or a multi-device pipeline when a device is selected).
+5. **Replay** the flat plan. `mind` caches plans per shape bucket.
 
-A lowering only becomes eligible if it passes the oracle, which compares it against the scalar reference in `spec`.
+A lowering is only used if it agrees with the scalar reference in `spec/` within the op's tolerance (the oracle, `verify/`). Ops a device does not support fall back to the CPU.
 
 ## API (`flow/include/forge/flow/*.hpp`)
-- `graph` (`ir.hpp`):
-  - Inputs and outputs: `input(name, shape)`, `scalar(v)` and `output(name, value)`.
-  - Ops: `add` and `mul` are named helpers; any other spec op goes through `apply(spec::op::X, {inputs}, attrs)`. `matmul` builds a matrix product.
-- `verify_graph(g)` throws with the offending node, for example `node %2 (matmul)`. `optimise(g, pass_options)` runs the passes.
-- `pass_options` has `{cse, fold, simplify, fuse}`, all `true` by default, plus `lowerings` (null means CPU).
-- `compile(graph, state_store* = nullptr, pass_options = {})` returns a `std::unique_ptr<plan>`.
-- `executor(plan&, state_store* = nullptr)` methods: `set_input(name, data)`, `run()`, `output(name)` (returns a tensor) and `output_view(name)`.
-- `grad(g, loss, wrt)` (`autodiff.hpp`) appends the backward graph and returns a map from each input to its gradient value. Supported ops are listed in the header.
-- `codecs.hpp` holds the weight codecs (for example Q8_0, Q4_K, FP8, group-32, MX). `kv_codec.hpp` holds the KV codecs `f32`, `int8` and `fp8` (see `kv_codec_from_name`).
-- `rpc.hpp` provides the remote device `"rpc:host:port"`. `client`/`server`, or `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device ...]`, start the remote side. **There is no authentication, so only use it on a trusted network.**
-- `vulkan.hpp` registers `vk.<op>` lowerings for every op with a generated GPU kernel. Any other op falls back to the CPU.
+- `graph` (`ir.hpp`): `input(name, shape)`, `scalar(v)`, `output(name, value)`; helpers `add`, `mul`, `matmul`; any spec op via `apply(spec::op::X, {inputs}, attrs)`.
+- `verify_graph(g)` throws with the offending node (e.g. `node %2 (matmul)`); `optimise(g, pass_options)` runs the passes. `pass_options{cse, fold, simplify, fuse}` all default to `true`; `lowerings` (registry, `nullptr` = CPU).
+- `compile(graph, state_store* = nullptr, pass_options = {})` → `std::unique_ptr<plan>` (`plan.hpp`).
+- `executor(plan&, state_store* = nullptr)`: `set_input(name, data)`, `run()`, `output(name)` (tensor copy), `output_view(name)`.
+- `grad(g, loss, wrt)` (`autodiff.hpp`): reverse-mode autodiff; appends the backward graph and returns a map from each `wrt` value to its gradient. Supported ops are listed in the header.
+- `codecs.hpp`: weight codecs `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`.
+- `kv_codec.hpp`: KV cache codecs via `kv_codec_from_name`: `f32` (also `""`, `none`), `int8` (`i8`, `q8`), `fp8` (`fp8_e4m3`, `e4m3`). int8/fp8 store a per-(row, head) f32 scale and are decoded on the fly by the attention kernels.
+- `device_registry(name)` (`vulkan.hpp`): lowering registry for a device string: `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]`/`level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or `pipe:<dev>[*w],<dev>...` to split layers across devices by weight.
+- `rpc.hpp`: remote device over TCP. Start the server with `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu]`. Every op is still oracle-checked on the client. Weights are sent with every op (no remote residency). **No authentication or encryption: trusted networks only.**
 
 ## Example
-`docs/examples/flow_graph.cpp` runs as the ctest `doc_example_flow_graph`. It checks the result of `silu(1) * exp(1)` and checks the gradient at x = 0, which is 0.5.
+`docs/examples/flow_graph.cpp` (ctest `doc_example_flow_graph`) checks `silu(1)·exp(1)` and that the gradient at x = 0 is 0.5:
 
 ```cpp
 graph g;
 auto x = g.input("x", {2, 4});
-g.output("y", g.mul(g.apply(spec::op::silu, {x}), g.apply(spec::op::exp, {x})));
+auto y = g.mul(g.apply(spec::op::silu, {x}), g.apply(spec::op::exp, {x}));
+g.output("y", y);
+auto flat = g.apply(spec::op::reshape, {y}, {{"shape", std::vector<i64>{8}}});
+auto loss = g.apply(spec::op::reduce_sum, {flat}, {{"axis", 0.0}});
+auto grads = grad(g, loss, {x});
+g.output("dx", grads[x]);
 auto plan = compile(g);
 executor ex(*plan);
 ex.set_input("x", in);
 ex.run();
-tensor y = ex.output("y");
+tensor out = ex.output("y");
 ```
 
 ## Platform notes and limits
-- Link with `forge_flow`, `forge_verify` and `forge_lane_mv`.
-- GPU lowerings other than Vulkan have only run against mock drivers. See [grid.md](grid.md).
+- Link `forge_flow`, `forge_verify` and `forge_lane_mv`.
+- GPU lowerings other than Vulkan have only run against mock drivers; see [grid.md](grid.md).

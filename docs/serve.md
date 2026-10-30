@@ -28,13 +28,16 @@ forge-serve proxy ...                      # see balance.md
 | `GET /v1/models` | Returns `{"object":"list","data":[{"id":<file name>,...}]}` |
 | `POST /v1/completions` | Takes `prompt` (a string or a list of token ids) and the sampling fields below. The response holds `choices[0].text`, `choices[0].tokens` and `usage` |
 | `POST /v1/chat/completions` | Takes `messages: [{role, content}]` and the same sampling fields. The response holds `choices[0].message` |
-| `GET /metrics` | Plain-text scheduler counters, for example `forge_steps`, `forge_completed`, `forge_prefix_hits` and `forge_peak_active` |
+| `GET /metrics` | Plain-text scheduler counters, `forge_steps`, `forge_completed`, `forge_prefix_hits`, `forge_prefix_tokens_reused`, `forge_peak_active`, `forge_peak_kv_bytes` |
 
 The sampling fields are:
 - `max_tokens`, `temperature`, `top_p`, `top_k`, `min_p`, `typical_p`
 - `repetition_penalty`, `presence_penalty`, `frequency_penalty`
 - `mirostat_tau`, `mirostat_eta`, `seed`
-- `stop` (a list of strings), `grammar` (GBNF), `response_format` (JSON schema) and `stream`
+- `stop` (a string or list of strings), `grammar` (GBNF), `response_format` (`{"type":"json_schema",...}`, converted to a grammar) and `stream` (Server-Sent Events, `Content-Type: text/event-stream`)
+- `add_bos` (completions; by default BOS is prepended when the tokenizer has one)
+
+`finish_reason` is `stop` (EOS, stop string or grammar complete) or `length`.
 
 ### Flags and environment variables
 
@@ -68,6 +71,7 @@ The `serve_http` ctest (`tests/serve_test.py`) exercises the same endpoints.
     Environment=FORGE_HUGEPAGES=1
 
 ## Platform notes and limits
+- **No authentication or TLS.** It binds to 127.0.0.1 by default; put a reverse proxy in front before exposing it.
 - **`--watch`:** re-executes the server on POSIX only. On Windows it logs that the service needs a restart instead.
 - **`--watch` and `--numa-node 0`:** checked live on Linux.
 - **Service mode:** `Type=notify` readiness was tested with an abstract `NOTIFY_SOCKET` inside `test_os_ext`, not under a real systemd.
