@@ -62,7 +62,7 @@ struct csh_dialect : block_dialect {
     std::string platform() override {
         auto t = cx->tmp(); L("set " + t + " = `uname -s`");
         L("switch ( $" + t + " )"); in();
-        for (auto [k, v] : {std::pair{"Linux", "linux"}, std::pair{"Darwin", "macos"}, std::pair{"FreeBSD", "freebsd"}, std::pair{"MINGW*", "windows"}, std::pair{"MSYS*", "windows"}, std::pair{"CYGWIN*", "windows"}}) { L(std::string("case ") + k + ":"); L(std::string("    set ") + t + " = " + v); L("    breaksw"); }
+        for (auto [k, v] : {std::pair{"Linux", "linux"}, std::pair{"Darwin", "macos"}, std::pair{"FreeBSD", "freebsd"}, std::pair{"MINGW*", "windows"}, std::pair{"MSYS*", "windows"}, std::pair{"CYGWIN*", "windows"}, std::pair{"Windows_NT", "windows"}}) { L(std::string("case ") + k + ":"); L(std::string("    set ") + t + " = " + v); L("    breaksw"); }
         L("default:"); L("    set " + t + " = other"); out(); L("endsw");
         if_("( $" + t + " == linux && $?ANDROID_ROOT )"); L("set " + t + " = android"); end_if();
         return "$" + t + ":q";
