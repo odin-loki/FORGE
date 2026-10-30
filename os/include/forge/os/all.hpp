@@ -25,3 +25,7 @@
 #include <forge/os/time.hpp>
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/console.hpp>
+#include <forge/os/file_watch_tree.hpp>
+#include <forge/os/net.hpp>
+#include <forge/os/service_control.hpp>
+#include <forge/os/registry.hpp>

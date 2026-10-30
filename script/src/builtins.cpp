@@ -9,7 +9,10 @@
 #include <forge/json/json.hpp>
 #include <forge/os/console.hpp>
 #include <forge/os/file_watch.hpp>
+#include <forge/os/file_watch_tree.hpp>
 #include <forge/os/fs.hpp>
+#include <forge/os/net.hpp>
+#include <forge/os/service_control.hpp>
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/time.hpp>
 #include <forge/os/users.hpp>
@@ -55,7 +58,13 @@ double f_of(Interp& in, const Value& v, const char* what) {
 List& l_of(Interp& in, const Value& v, const char* what) { auto* l = as<List>(v); if (!l) in.raise("TypeError", std::string(what) + " expects a list, got " + Interp::type_of(v)); return *l; }
 Map& m_of(Interp& in, const Value& v, const char* what) { auto* m = as<Map>(v); if (!m) in.raise("TypeError", std::string(what) + " expects a map, got " + Interp::type_of(v)); return *m; }
 const Value* opt(const Args& a, std::size_t i) { return i < a.size() && !is_nil(a[i]) ? &a[i] : nullptr; }
-const Value* opt_key(const Args& a, std::size_t i, const std::string& k) { if (auto* m = i < a.size() ? as<Map>(a[i]) : nullptr) if (auto* v = m->find_str(k)) return is_nil(*v) ? nullptr : v; return nullptr; }
+// Option bags: a map, or a braced list of {"key", value} pairs (what `{{"k", v}, ...}` evaluates to).
+const Value* kv_find(const Value& bag, const std::string& k) {
+    if (auto* m = as<Map>(bag)) return m->find_str(k);
+    if (auto* l = as<List>(bag)) for (auto& e : l->items) if (auto* p = as<List>(e); p && p->items.size() == 2) if (auto* s = as<String>(p->items[0]); s && s->s == k) return &p->items[1];
+    return nullptr;
+}
+const Value* opt_key(const Args& a, std::size_t i, const std::string& k) { if (i < a.size()) if (auto* v = kv_find(a[i], k)) return is_nil(*v) ? nullptr : v; return nullptr; }
 void mut(Interp& in, const Obj& o) { if (o.frozen) in.raise("TypeError", std::string(o.type_name()) + " is frozen"); }
 Value list_of(std::vector<Value> v) { return obj(make<List>(std::move(v))); }
 Value strv(std::string s) { return obj(make<String>(std::move(s))); }
@@ -433,6 +442,17 @@ void install_builtins(Shared& sh) {
             auto l = std::make_shared<os::fs::file_lock>(std::move(r.value));
             return make_handle("lock", l, [l]() { l->unlock(); });
         })
+        .def("watch_tree", 1, 2, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.fs, "file access");
+            os::tree_watch_opts o;
+            if (auto* v = opt_key(a, 1, "debounce_ms")) o.debounce_ms = int(i_of(in, *v, "debounce_ms"));
+            if (auto* v = opt_key(a, 1, "polling")) o.force_polling = Interp::truthy(*v);
+            if (auto* v = opt_key(a, 1, "hidden")) o.include_hidden = Interp::truthy(*v);
+            if (auto* v = opt_key(a, 1, "ignore")) if (auto* l = as<List>(*v)) for (auto& x : l->items) o.ignore.push_back(in.str(x));
+            auto w = ok(in, os::tree_watcher::open(s_of(in, a[0], "fs.watch_tree"), o));
+            std::shared_ptr<os::tree_watcher> sp(std::move(w));
+            return make_handle("treewatcher", sp, {});
+        })
         .def("watch", 1, 1, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access");
             auto w = std::make_shared<os::file_watcher>();
@@ -457,6 +477,14 @@ void install_builtins(Shared& sh) {
         for (auto& e : w->poll(to)) { auto m = make<Map>(); m->set_str("path", strv(e.path)); m->set_str("kind", strv(os::watch_kind_name(e.kind))); l->push(obj(m)); }
         return obj(l);
     });
+    M["handle:treewatcher"]["poll"] = native("treewatcher.poll", 1, 2, [](Interp& in, Args& a) -> Value {
+        auto w = h_of(in, a[0], "treewatcher").payload_as<os::tree_watcher>();
+        int to = a.size() > 1 ? int(i_of(in, a[1], "poll timeout")) : 0;
+        auto l = make<List>();
+        for (auto& e : w->poll(to)) { auto m = make<Map>(); m->set_str("path", strv(e.path)); m->set_str("kind", strv(os::watch_kind_name(e.kind))); l->push(obj(m)); }
+        return obj(l);
+    });
+    M["handle:treewatcher"]["backend"] = native("treewatcher.backend", 1, 1, [](Interp& in, Args& a) -> Value { return strv(h_of(in, a[0], "treewatcher").payload_as<os::tree_watcher>()->backend()); });
     M["handle:lock"]["unlock"] = native("lock.unlock", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     M["handle"]["dispose"] = native("handle.dispose", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
     M["handle"]["get_disposed"] = native("handle.disposed", 1, 1, [](Interp&, Args& a) -> Value { return as<Handle>(a[0])->disposed; });
@@ -539,6 +567,59 @@ void install_builtins(Shared& sh) {
         .def("utc_offset", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::utc_offset_seconds()); })
         .def("zone", 0, 0, [](Interp&, Args&) -> Value { return strv(os::timezone_name()); })
         .def("ns", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::monotonic_ns()); }).done();
+
+    // ------------------------------------------------ net (forge::os::net) and service (forge::os::service)
+    B["net"] = Lib("net")
+        .def("resolve", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.net, "network access"); auto r = ok(in, os::net::resolve(s_of(in, a[0], "net.resolve")), "NetError"); auto l = make<List>(); for (auto& x : r) l->push(strv(x.ip)); return obj(l); })
+        .def("interfaces", 0, 0, [](Interp& in, Args&) -> Value {
+            need(in, in.caps.net, "network access"); auto r = ok(in, os::net::interfaces(), "NetError"); auto l = make<List>();
+            for (auto& i : r) { auto m = make<Map>(); m->set_str("name", strv(i.name)); m->set_str("up", i.up); m->set_str("loopback", i.loopback); auto ad = make<List>(); for (auto& x : i.addresses) ad->push(strv(x.ip)); m->set_str("addresses", obj(ad)); l->push(obj(m)); }
+            return obj(l);
+        })
+        .def("port_open", 2, 3, [](Interp& in, Args& a) -> Value { need(in, in.caps.net, "network access"); return os::net::port_open(s_of(in, a[0], "net.port_open"), int(i_of(in, a[1], "port")), a.size() > 2 ? int(i_of(in, a[2], "timeout")) : 1000); })
+        .def("http", 1, 2, [](Interp& in, Args& a) -> Value {
+            need(in, in.caps.net, "network access");
+            os::net::http_request rq; rq.url = s_of(in, a[0], "net.http");
+            if (auto* v = opt_key(a, 1, "method")) rq.method = in.str(*v);
+            if (auto* v = opt_key(a, 1, "body")) rq.body = in.str(*v);
+            if (auto* v = opt_key(a, 1, "timeout")) rq.timeout_ms = int(i_of(in, *v, "timeout"));
+            if (auto* v = opt_key(a, 1, "headers")) if (auto* hm = as<Map>(*v)) for (auto& [k, x] : hm->entries) rq.headers[in.str(k)] = in.str(x);
+            auto r = ok(in, os::net::http(rq), "NetError");
+            auto m = make<Map>(); m->set_str("status", std::int64_t(r.status)); m->set_str("reason", strv(r.reason)); m->set_str("body", strv(r.body));
+            auto h = make<Map>(); for (auto& [k, v] : r.headers) h->set_str(k, strv(v)); m->set_str("headers", obj(h));
+            return obj(m);
+        })
+        .def("parse_url", 1, 1, [](Interp& in, Args& a) -> Value {
+            auto u = ok(in, os::net::parse_url(s_of(in, a[0], "net.parse_url")), "ValueError"); auto m = make<Map>();
+            m->set_str("scheme", strv(u.scheme)); m->set_str("host", strv(u.host)); m->set_str("port", std::int64_t(u.port)); m->set_str("path", strv(u.path)); m->set_str("query", strv(u.query));
+            return obj(m);
+        }).done();
+    auto svc_spec = [](Interp& in, const Value& v) {
+        os::service::service_spec s; if (!as<Map>(v) && !as<List>(v)) in.raise("TypeError", "service: expected a spec {name, argv, ...}");
+        if (auto* x = kv_find(v, "name")) s.name = in.str(*x);
+        if (auto* x = kv_find(v, "description")) s.description = in.str(*x);
+        if (auto* x = kv_find(v, "argv")) if (auto* l = as<List>(*x)) for (auto& i : l->items) s.argv.push_back(in.str(i));
+        if (auto* x = kv_find(v, "cwd")) s.working_dir = in.str(*x);
+        if (auto* x = kv_find(v, "dir")) s.dir = in.str(*x);
+        if (auto* x = kv_find(v, "restart")) s.restart_on_failure = Interp::truthy(*x);
+        if (auto* x = kv_find(v, "at_login")) s.start_at_login = Interp::truthy(*x);
+        if (auto* x = kv_find(v, "env")) if (auto* e = as<Map>(*x)) for (auto& [k, val] : e->entries) s.env[in.str(k)] = in.str(val);
+        return s;
+    };
+    B["service"] = Lib("service")
+        .def("unit", 1, 1, [svc_spec](Interp& in, Args& a) -> Value {
+            auto s = svc_spec(in, a[0]);
+#if defined(__APPLE__)
+            return strv(os::service::render_launchd_plist(s));
+#else
+            return strv(os::service::render_systemd_unit(s));
+#endif
+        })
+        .def("install", 1, 1, [svc_spec](Interp& in, Args& a) -> Value { need(in, in.caps.proc, "service control"); ok(in, os::service::install(svc_spec(in, a[0])), "OSError"); return Nil{}; })
+        .def("uninstall", 1, 1, [svc_spec](Interp& in, Args& a) -> Value { need(in, in.caps.proc, "service control"); ok(in, os::service::uninstall(svc_spec(in, a[0])), "OSError"); return Nil{}; })
+        .def("start", 1, 1, [svc_spec](Interp& in, Args& a) -> Value { need(in, in.caps.proc, "service control"); ok(in, os::service::start(svc_spec(in, a[0])), "OSError"); return Nil{}; })
+        .def("stop", 1, 1, [svc_spec](Interp& in, Args& a) -> Value { need(in, in.caps.proc, "service control"); ok(in, os::service::stop(svc_spec(in, a[0])), "OSError"); return Nil{}; })
+        .def("status", 1, 1, [svc_spec](Interp& in, Args& a) -> Value { return strv(os::service::state_name(os::service::query(svc_spec(in, a[0])))); }).done();
 
     // ------------------------------------------------ processes (forge::os::process)
     B["run"] = native("run", 1, 2, run_process);

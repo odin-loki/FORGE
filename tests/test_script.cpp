@@ -352,3 +352,21 @@ fs.remove(d);
 std::println("{}", fs.exists(d));
 )CPP", "[\"a.cpp\", \"s/b.cpp\", \"t/b.cpp\"]\n5 true\ntrue\ntrue\n1970-01-01T00:00:00.000Z 1793318400\ntrue true\nfalse\n");
 }
+TEST(os_phase3_surface) {
+    EXPECT(R"CPP(
+auto d = fs.make_temp_dir("fst-");
+auto w = fs.watch_tree(d, {{"debounce_ms", 40}, {"ignore", std::vector<std::string>{"*.tmp"}}});
+fs.mkdir(path.join(d, "x"));
+fs.write(path.join(d, "x/f.txt"), "1");
+fs.write(path.join(d, "skip.tmp"), "1");
+std::vector<std::string> seen;
+for (int i = 0; i < 10 && seen.size() < 2; ++i)
+    for (auto& e : w.poll(500)) seen.push_back(e["kind"] + " " + path.base(e["path"]));
+std::println("{}", seen);
+auto u = net.parse_url("http://h:81/p?q=1");
+std::println("{} {} {}", u["host"], u["port"], u["query"]);
+std::println("{}", service.unit({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo", "a b"}}}).find("\"a b\"") != std::string::npos);
+std::println("{}", service.status({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo"}}, {"dir", d}}));
+fs.remove(d);
+)CPP", "[\"created x\", \"created f.txt\"]\nh 81 q=1\ntrue\nnot_installed\n");
+}
