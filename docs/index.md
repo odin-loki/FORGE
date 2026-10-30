@@ -8,6 +8,7 @@ Every guide follows the same shape: **concepts**, **API or command reference**, 
 3. [testing.md](testing.md): test kinds, labels, how to run them
 4. [cli.md](cli.md): every `forge` command and flag
 5. [configuration.md](configuration.md): all environment variables in one table, and [memory.md](memory.md): memory budgets, eviction, admission control and OOM avoidance
+6. Design (not yet built): [os-wrapper.md](os-wrapper.md): full portable OS wrapper, and [scripting.md](scripting.md): `forge script` language, shell blocks and higher-level features
 
 ## Library layers, bottom up
 6. [os.md](os.md): `forge::os`, the portability layer and its 16 extension modules
