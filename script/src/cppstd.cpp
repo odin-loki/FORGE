@@ -1,6 +1,8 @@
 // C++ standard-library surface for FORGE script: std::cout/println/format, containers' C++ method
 // names, iterators, smart-pointer helpers, and the forge:: runtime helpers the parser lowers to.
 #include "interp.hpp"
+#include "shells/shell.hpp"
+#include <forge/os/process.hpp>
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -565,7 +567,20 @@ void install_cpp_std(Shared& sh) {
     def("forge::await", 1, 1, [](Interp& in, Args& a) -> Value { return in.await(a[0]); });
     def("forge::shared", 1, 1, [](Interp& in, Args& a) -> Value { return obj(make<SharedBox>(in.copy_value(a[0]))); });
     def("forge::args", 0, 0, [](Interp&, Args&) -> Value { auto l = make<List>(); for (auto& s : script_argv()) l->push(sv(s)); return obj(l); });
-    for (const char* k : {"sh", "bash", "pwsh", "cmd"}) def(std::string("forge::") + k, 1, -1, [k = std::string(k)](Interp& in, Args& a) -> Value { return shell_call(in, k, a); });
+    for (auto& b : shells().all()) {   // pluggable backends (script/src/shells/*.cpp): forge::<name> and aliases
+        std::vector<std::string> ns{b.name}; ns.insert(ns.end(), b.aliases.begin(), b.aliases.end());
+        for (auto& k : ns) def("forge::" + k, 1, -1, [k](Interp& in, Args& a) -> Value { return shell_call(in, k, a); });
+    }
+    def("forge::shells", 0, 0, [](Interp&, Args&) -> Value {
+        auto l = make<List>();
+        for (auto& b : shells().all()) {
+            auto m = make<Map>(); std::string exe; for (auto& e : b.exes) if (!os::find_executable(e).empty()) { exe = e; break; }
+            m->set_str("name", sv(b.name)); m->set_str("family", sv(b.family)); m->set_str("available", !exe.empty()); m->set_str("exe", sv(exe));
+            m->set_str("tested", b.golden_tested); auto al = make<List>(); for (auto& x : b.aliases) al->push(sv(x)); m->set_str("aliases", obj(al));
+            l->push(obj(m));
+        }
+        return obj(l);
+    });
     def("std::chrono::milliseconds", 1, 1, [](Interp& in, Args& a) -> Value { return iv(in, a[0], "milliseconds"); });
     def("std::chrono::seconds", 1, 1, [](Interp& in, Args& a) -> Value { return iv(in, a[0], "seconds") * 1000; });
     def("std::this_thread::sleep_for", 1, 1, [&sh](Interp& in, Args& a) -> Value { Args x{a[0]}; return in.call(sh.builtins["sleep"], x); });

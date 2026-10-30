@@ -540,3 +540,29 @@ TEST(remote_scripts) {
     CHECK_MSG(got == "true hi 1\n\nfalse\ndenied\n", "got:\n%s", got.c_str());
     srv.stop();
 }
+
+// Golden test for every shell backend found on PATH (plus $FORGE_TEST_SHELL_PATH): a hostile literal
+// must round-trip unchanged through {} quoting. Backends not installed are reported and skipped.
+#include <cstdlib>
+TEST(shell_backends_golden) {
+    if (const char* extra = std::getenv("FORGE_TEST_SHELL_PATH")) { std::string p = std::string(extra) + ":" + (std::getenv("PATH") ? std::getenv("PATH") : ""); ::setenv("PATH", p.c_str(), 1); }
+    const char* printer[][2] = {
+        {"sh", "printf '%s\\n' {}"}, {"bash", "printf '%s\\n' {}"}, {"zsh", "printf '%s\\n' {}"}, {"dash", "printf '%s\\n' {}"},
+        {"ash", "printf '%s\\n' {}"}, {"ksh", "printf '%s\\n' {}"}, {"mksh", "printf '%s\\n' {}"}, {"oksh", "printf '%s\\n' {}"},
+        {"yash", "printf '%s\\n' {}"}, {"posh", "printf '%s\\n' {}"}, {"osh", "printf '%s\\n' {}"}, {"ysh", "write -- {}"}, {"hush", "printf '%s\\n' {}"},
+        {"fish", "printf '%s\\n' {}"}, {"tcsh", "printf '%s\\n' {}"}, {"csh", "printf '%s\\n' {}"},
+        {"nu", "print {}"}, {"xonsh", "print({})"}, {"elvish", "echo {}"}, {"pwsh", "Write-Output {}"}, {"powershell", "Write-Output {}"},
+        {"cmd", "echo {}"}, {"rc", "echo {}"}, {"es", "echo {}"},
+    };
+    const std::string hostile = "a 'b' \"c\" $HOME `x` \\n; | & * ? ~ # ! %PATH% {}";
+    std::string ran, skipped;
+    for (auto& [name, tmpl] : printer) {
+        auto got = run(std::string("auto av = false; for (auto& s : forge::shells()) if (s[\"name\"] == \"") + name + "\") av = s[\"available\"];\n"
+                       "if (!av) { std::print(\"SKIP\"); } else { auto r = forge::" + name + "(R\"T(" + tmpl + ")T\", R\"H(" + hostile + ")H\"); std::print(\"{}\", r.out); }\n");
+        if (got == "SKIP") { skipped += std::string(" ") + name; continue; }
+        if (std::string(name) == "cmd") continue;   // cmd echo keeps the quotes; covered by the Windows/wine job
+        CHECK_MSG(got == hostile + "\n" || got == hostile + "\r\n", "%s: got [%s]", name, got.c_str());
+        ran += std::string(" ") + name;
+    }
+    std::printf("shells tested:%s\nshells skipped (not installed):%s\n", ran.c_str(), skipped.c_str());
+}

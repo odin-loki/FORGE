@@ -1,5 +1,19 @@
 # FORGE implementation status
 
+## Latest check (2026-10-30, scripting milestones 6-7 + shell backends)
+Built with conda clang 18 (`/workspace/opt/llvm18`) and a user-local OpenSSL (`/workspace/opt/openssl`). `ctest -LE "slow|emu"`: **84/84 pass**; the hardware tests skip. The cuda_mock failures from earlier are gone. ASan and TSan runs of `test_script` and `test_rpc` are clean.
+- **Milestone 6, AI commands**: `forge::ask`, `forge::explain`, `forge::suggest_cmd`, `forge::ask_json`, `forge::ai_run`, `forge::ai_eval`. They call an OpenAI-compatible endpoint (`FORGE_AI_ENDPOINT`, for example forge-serve). Nothing runs without a confirm callback; the CLI prompts `[y/N]`.
+- **Milestone 7, RPC security**: token auth and Ed25519 key auth (reusing forge_trust), optional TLS (`FORGE_TLS`), and remote script execution (`forge::remote`, `rpc-serve --allow-scripts`, which requires auth). See docs/rpc.md.
+- **Shell emit targets**: a pluggable backend registry, one file per shell (docs/shells.md). 14 backends are golden-tested on the box: sh, bash, zsh, dash, ash/busybox, yash, fish, tcsh, csh (via tcsh), nu, xonsh, elvish, pwsh, and powershell (via pwsh). **Untested**: ksh, mksh, oksh, posh, osh/ysh, hush, cmd, rc, es, and real Windows PowerShell 5.1.
+
+### Deferred
+- TLS channel binding and client certificates (mTLS)
+- Per-key permissions in authorized_keys
+- Shipping lambdas to remote nodes
+- In-process inference for `forge::ask` (it currently goes through HTTP)
+- Golden tests for the untested shells (needs ksh/mksh/oils builds, Windows or wine)
+- Wiring `FORGE_TEST_SHELL_PATH` into ctest automatically
+
 ## Latest check (2026-10-30, documentation rewrite)
 x86_64 Linux box, no GPU, built with zig 0.17 (`zig cc`/`zig c++`) as the compiler: `ctest -LE "slow|emu"` gave 71/73 after installing `numpy safetensors cryptography onnx` in the Python environment. The 2 failures were `test_gpu_cuda_mock` and `test_gpu_features_cuda_mock`, which need `clang` to embed the PTX image; without it they exit 77 but are not marked as skip tests. All `doc_example_*` tests passed. Vulkan was compiled out (no glslang on that machine). Cross builds and qemu runs below were not repeated; treat them as historical.
 

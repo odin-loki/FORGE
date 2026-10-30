@@ -1,5 +1,6 @@
 // forge::script runtime operations shared by the tree-walker and the VM.
 #include "interp.hpp"
+#include "shells/shell.hpp"
 #include "parser.hpp"
 #include "vm.hpp"
 #include <forge/core/error.hpp>
@@ -865,30 +866,22 @@ Value Interp::proc_result(const std::string& cmd, int code, std::string out, std
     r->fields["timed_out"] = timed_out;
     return obj(r);
 }
-static std::string quote_for(const std::string& kind, const std::string& s) {
-    if (kind == "cmd") {
-        std::string o = "\""; for (char c : s) { if (c == '"') o += "\"\""; else if (c == '%') o += "%%"; else o += c; } return o + "\"";
-    }
-    if (kind == "pwsh" || kind == "ps") { std::string o = "'"; for (char c : s) { if (c == '\'') o += "''"; else o += c; } return o + "'"; }
-    std::string o = "'"; for (char c : s) { if (c == '\'') o += "'\\''"; else o += c; } return o + "'";
-}
+static std::string quote_for(const shell_backend& b, const std::string& s) { return b.quote(s); }
 Value Interp::shell(const Node& n, const std::vector<Value>& parts) {
     if (!caps.proc) raise("PermissionError", "running processes is disabled in this sandbox");
     const std::string& kind = n.s;
+    const shell_backend* be = shells().find(kind);
+    if (!be) raise("ValueError", "unknown shell " + kind + " (see forge::shells())");
     // kids[0] is a Str (no interpolation) or an Interp node whose Str parts are literal
     std::string script;
     const Node& body = *n.kids[0];
     if (body.k == NK::Str) script = body.s;
     else for (std::size_t i = 0; i < body.kids.size() && i < parts.size(); ++i)
-        script += body.kids[i]->k == NK::Str ? str(parts[i]) : quote_for(kind, str(parts[i]));
-    std::vector<std::string> argv;
-    if (kind == "sh" || kind == "bash" || kind == "zsh") argv = {kind, "-c", script};
-    else if (kind == "pwsh" || kind == "ps") {
-        std::string exe = !os::find_executable("pwsh").empty() ? "pwsh" : "powershell";
-        argv = {exe, "-NoProfile", "-NonInteractive", "-Command", script};
-    } else if (kind == "cmd") argv = {"cmd.exe", "/d", "/s", "/c", script};
-    else raise("ValueError", "unknown shell " + kind);
-    if (os::find_executable(argv[0]).empty()) raise("ShellError", kind + " is not installed (looked for '" + argv[0] + "' on PATH)");
+        script += body.kids[i]->k == NK::Str ? str(parts[i]) : quote_for(*be, str(parts[i]));
+    std::string exe;
+    for (auto& e : be->exes) if (!os::find_executable(e).empty()) { exe = e; break; }
+    if (exe.empty()) raise("ShellError", kind + " is not installed (looked for " + [&] { std::string l; for (auto& e : be->exes) l += (l.empty() ? "'" : ", '") + e + "'"; return l; }() + " on PATH)");
+    std::vector<std::string> argv = be->argv(exe, script);
     os::spawn_spec sp; sp.argv = argv; sp.max_output = sh->limits.max_output;
     sp.limits.memory_bytes = child_mem; sp.limits.cpu_seconds = child_cpu_s;
     sp.timeout_ms = child_timeout_ms;

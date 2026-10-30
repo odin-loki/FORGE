@@ -9,6 +9,7 @@
 // `forge-serve`; FORGE_AI_MODEL optional). Confirmation: opts {"confirm", fn} if given, else options::confirm;
 // with neither, drafted code never runs ({ran:false}). Endpoint calls need the net capability; running needs proc.
 #include "interp.hpp"
+#include "shells/shell.hpp"
 #include <forge/json/json.hpp>
 #include <forge/os/net.hpp>
 #include <cstdlib>
@@ -106,7 +107,7 @@ void install(Shared& sh) {
     });
     B["forge::ai_run"] = nat("forge::ai_run", 1, 2, [](Interp& in, Args& a) -> Value {
         std::string shell = "sh"; if (auto* v = kv(a, 1, "shell")) shell = in.str(*v);
-        if (shell != "sh" && shell != "bash" && shell != "pwsh" && shell != "cmd") in.raise("ValueError", "forge::ai_run: shell must be sh, bash, pwsh or cmd");
+        if (!shells().find(shell)) in.raise("ValueError", "forge::ai_run: unknown shell '" + shell + "' (see forge::shells())");
         auto cmd = clean_code(complete(in, std::string(kShellSys) + " Target shell: " + shell + ".", with_ctx(in, a, in.str(a[0]))));
         auto m = make<Map>(); m->set_str("command", strv(cmd)); m->set_str("ran", false);
         if (cmd.empty() || !confirmed(in, a, cmd)) return obj(m);
