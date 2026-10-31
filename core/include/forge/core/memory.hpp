@@ -17,6 +17,7 @@
 #include <forge/core/error.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/memory_pressure.hpp>
+#include <forge/os/process.hpp>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -373,4 +374,30 @@ private:
     std::filesystem::path path_(std::uint64_t k) const { return dir_ / std::format("{}.bin", k); }
     std::filesystem::path dir_; mutable std::mutex m_; std::map<std::uint64_t, std::size_t> sizes_; std::uint64_t next_ = 0, bytes_ = 0, cap_ = 0;
 };
+
+// A child process whose address-space cap is a lease on a budget. The cap and the charge are the same
+// number, so concurrent children can never promise more than the budget holds; the lease is returned the
+// moment the child is reaped (wait/try_wait/wait_any through proc) or the leased_child is destroyed.
+struct leased_child {
+    os::child proc;
+    lease mem;
+    int wait(std::uint64_t timeout_ms = 0) { int c = proc.wait(timeout_ms); if (proc.exited()) mem.release(); return c; }
+    int try_wait() { int c = proc.try_wait(); if (proc.exited()) mem.release(); return c; }
+    void reap_if_done() { if (proc.exited()) mem.release(); }   // call after os::wait_any picked this child
+    std::uint64_t cap() const { return mem.bytes(); }
+};
+
+// Reserve `bytes` from `b` (waiting up to `wait` for room; 0 = fail at once) and start the child with that
+// many bytes as its memory cap. Throws errc::out_of_memory if the reservation cannot be made; returns the
+// spawn error otherwise (the reservation is released on failure).
+inline os::result<leased_child> spawn_leased(budget& b, os::spawn_spec sp, std::uint64_t bytes, std::string tag = "child",
+                                             std::chrono::milliseconds wait = std::chrono::milliseconds(0)) {
+    lease l = wait.count() > 0 ? b.reserve(bytes, tag, wait) : b.try_reserve(bytes, tag);
+    if (!l) raise(errc::out_of_memory, "{}: cannot reserve {} for child {} ({} of {} used)", b.name(), format_size(bytes),
+                  sp.argv.empty() ? std::string("?") : sp.argv[0], format_size(b.used()), format_size(b.limit()));
+    sp.limits.memory_bytes = bytes;
+    auto c = os::child::start(sp);
+    if (!c) return {{}, c.err};
+    return {leased_child{std::move(c.value), std::move(l)}, {}};
+}
 } // namespace forge::mem
