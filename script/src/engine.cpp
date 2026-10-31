@@ -5,6 +5,7 @@
 #include "vm.hpp"
 #include <forge/os/os.hpp>
 #include <forge/os/sandbox.hpp>
+#include <forge/os/oserror.hpp>
 #include <csignal>
 #include <filesystem>
 #include <format>
@@ -67,7 +68,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     if (o.os_sandbox != options::os_sandbox_mode::off && (!o.allow_fs || !o.allow_net || !o.allow_proc)) {
         os::sandbox_policy pol; pol.deny_network = !o.allow_net; pol.deny_exec = !o.allow_proc; pol.deny_fs_write = !o.allow_fs;
         auto st = os::apply_sandbox(pol);
-        if (st) p_->sandbox = os::sandbox_status().mechanism.empty() ? std::string("applied") : os::sandbox_status().mechanism;
+        if (st) os::note_sandboxed(), p_->sandbox = os::sandbox_status().mechanism.empty() ? std::string("applied") : os::sandbox_status().mechanism;
         else {
             p_->sandbox = "failed: " + st.err.what;
             if (o.os_sandbox == options::os_sandbox_mode::require) throw std::runtime_error("forge script: OS sandbox could not be applied: " + st.err.what);

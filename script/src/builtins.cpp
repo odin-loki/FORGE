@@ -2,6 +2,7 @@
 // forge::json (json.*), forge::os (fs.*, os.*, path.*, time.*), forge::os::process (proc.*, shell blocks),
 // forge::os::file_watcher (fs.watch), forge::hash::blake3 (hash.*), forge::task::pool (parallel),
 // forge::mem::host_budget (mem.*, heap accounting).
+#include <forge/os/oserror.hpp>
 #include "interp.hpp"
 #include "vm.hpp"
 #include "parser.hpp"
@@ -72,8 +73,14 @@ void mut(Interp& in, const Obj& o) { if (o.frozen) in.raise("TypeError", std::st
 Value list_of(std::vector<Value> v) { return obj(make<List>(std::move(v))); }
 Value strv(std::string s) { return obj(make<String>(std::move(s))); }
 void need(Interp& in, bool cap, const char* what) { if (!cap) in.raise("PermissionError", std::string(what) + " is disabled in this sandbox"); }
-template <class T> T ok(Interp& in, os::result<T> r, const char* type = "IOError") { if (!r) in.raise(type, r.err.what); return std::move(r.value); }
-void ok(Interp& in, const os::status& s, const char* type = "IOError") { if (!s) in.raise(type, s.err.what); }
+// OS failures raise a typed ForgeScript exception (FileNotFoundError, SandboxViolationError, ...; see
+// forge/os/oserror.hpp); `type` is the fallback for errors that don't classify more precisely.
+[[noreturn]] void raise_os(Interp& in, const os::error& e, const char* type) {
+    auto k = os::classify(e);
+    in.raise(k == os::os_errc::other || k == os::os_errc::io ? type : os::script_error_type(k), e.what);
+}
+template <class T> T ok(Interp& in, os::result<T> r, const char* type = "IOError") { if (!r) raise_os(in, r.err, type); return std::move(r.value); }
+void ok(Interp& in, const os::status& s, const char* type = "IOError") { if (!s) raise_os(in, s.err, type); }
 
 // ---- json <-> values (forge::json)
 json::value to_json(Interp& in, const Value& v, int depth = 0) {
@@ -188,6 +195,10 @@ void install_builtins(Shared& sh) {
                    "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError", "RuntimeError", "LogicError",
                    "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError", "PipelineError", "PluginError", "AIError", "AccessError"})
         mkclass(n, err);
+    // typed OS errors (forge/os/oserror.hpp): catch OSError to get all of them
+    for (auto n : {"FileNotFoundError", "FileExistsError", "NotSupportedError", "InterruptedError", "ConnectionError", "SignalError"})
+        if (!sh.errors.count(n)) mkclass(n, sh.errors["OSError"]);
+    mkclass("SandboxViolationError", sh.errors["PermissionError"]);   // denied by the OS sandbox, not the interpreter
     sh.errors["ZeroDivisionError"] = sh.errors["ArithmeticError"];
 
     // ------------------------------------------------ ProcResult
