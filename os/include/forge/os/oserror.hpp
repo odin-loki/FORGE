@@ -419,7 +419,7 @@ template <class T> T throw_if(result<T> r) { throw_if(r.err); return std::move(r
 namespace detail {
 // volatile: the handler writes sig and reads t_fault asynchronously. Without it an optimiser that sees a fault-free
 // (or provably faulting) f() inline drops the t_fault store as dead and constant-folds sig to 0.
-struct fault_frame { std::jmp_buf* jb = nullptr; volatile int sig = 0; };
+struct fault_frame { std::jmp_buf* volatile jb = nullptr; volatile int sig = 0; };   // jb volatile too: only the handler reads it, so a plain store is dead to the optimiser (clang 23 -O3 dropped it -> siglongjmp(nullptr))
 inline thread_local fault_frame* volatile t_fault = nullptr;
 }
 
