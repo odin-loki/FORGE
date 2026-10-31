@@ -1,0 +1,145 @@
+Test project /workspace/FORGE-audit/build
+      Start 81: golden_tiny_llama
+      Start  1: test_aio
+ 1/66 Test  #1: test_aio .........................   Passed    0.03 sec
+      Start  2: test_balance
+ 2/66 Test #81: golden_tiny_llama ................   Passed    0.24 sec
+      Start  3: test_cache
+ 3/66 Test  #3: test_cache .......................   Passed    0.19 sec
+      Start  4: test_dtypes
+ 4/66 Test  #4: test_dtypes ......................   Passed    0.06 sec
+      Start  5: test_flow
+ 5/66 Test  #5: test_flow ........................   Passed    0.01 sec
+      Start  7: test_grid
+ 6/66 Test  #7: test_grid ........................   Passed    0.01 sec
+      Start  8: test_interop
+ 7/66 Test  #8: test_interop .....................   Passed    0.00 sec
+      Start  9: test_kvquant
+ 8/66 Test  #9: test_kvquant .....................   Passed    0.01 sec
+      Start 10: test_lane
+ 9/66 Test #10: test_lane ........................   Passed    0.96 sec
+      Start 11: test_lane_raw
+10/66 Test #11: test_lane_raw ....................   Passed    0.01 sec
+      Start 12: test_locale
+11/66 Test #12: test_locale ......................   Passed    0.02 sec
+      Start 13: test_log
+12/66 Test #13: test_log .........................   Passed    0.00 sec
+      Start 14: test_log_strip
+13/66 Test #14: test_log_strip ...................   Passed    0.00 sec
+      Start 15: test_memory
+14/66 Test #15: test_memory ......................   Passed    0.48 sec
+      Start 16: test_mind
+15/66 Test #16: test_mind ........................   Passed    0.87 sec
+      Start 17: test_mobile
+16/66 Test #17: test_mobile ......................   Passed    0.02 sec
+      Start 18: test_os
+17/66 Test  #2: test_balance .....................   Passed    2.90 sec
+      Start 19: test_os_dev
+18/66 Test #19: test_os_dev ......................   Passed    0.00 sec
+      Start 20: test_os_ext
+19/66 Test #18: test_os ..........................   Passed    0.21 sec
+      Start 21: test_os_net
+20/66 Test #20: test_os_ext ......................   Passed    0.29 sec
+      Start 22: test_os_process
+21/66 Test #22: test_os_process ..................   Passed    1.03 sec
+      Start 23: test_os_sys
+22/66 Test #21: test_os_net ......................   Passed    1.20 sec
+      Start 24: test_pack
+23/66 Test #24: test_pack ........................   Passed    0.03 sec
+      Start 25: test_pool
+24/66 Test #23: test_os_sys ......................   Passed    0.13 sec
+      Start 26: test_rpc
+25/66 Test #25: test_pool ........................   Passed    0.11 sec
+      Start 27: test_script
+26/66 Test #26: test_rpc .........................   Passed    0.06 sec
+      Start 28: test_sessions
+27/66 Test #28: test_sessions ....................   Passed    0.00 sec
+      Start 29: test_support
+28/66 Test #29: test_support .....................   Passed    0.01 sec
+      Start 30: test_support2
+29/66 Test #30: test_support2 ....................   Passed    0.04 sec
+      Start 31: test_text
+30/66 Test #31: test_text ........................   Passed    0.01 sec
+      Start 32: test_text_conformance
+31/66 Test #32: test_text_conformance ............***Skipped   0.00 sec
+      Start 33: test_tile
+32/66 Test #33: test_tile ........................   Passed    0.00 sec
+      Start 34: test_util
+33/66 Test #34: test_util ........................   Passed    0.09 sec
+      Start 35: test_video
+34/66 Test #35: test_video .......................   Passed    0.01 sec
+      Start 68: doc_example_capi_generate
+35/66 Test #68: doc_example_capi_generate ........   Passed    0.01 sec
+      Start 69: doc_example_lane_dispatch
+36/66 Test #69: doc_example_lane_dispatch ........   Passed    0.00 sec
+      Start 70: doc_example_grid_graph
+37/66 Test #70: doc_example_grid_graph ...........   Passed    0.00 sec
+      Start 71: doc_example_pack_roundtrip
+38/66 Test #71: doc_example_pack_roundtrip .......   Passed    0.01 sec
+      Start 72: doc_example_flow_graph
+39/66 Test #72: doc_example_flow_graph ...........   Passed    0.00 sec
+      Start 73: doc_example_os_features
+40/66 Test #73: doc_example_os_features ..........   Passed    0.01 sec
+      Start 74: doc_example_balance_pool
+41/66 Test #74: doc_example_balance_pool .........   Passed    0.01 sec
+      Start 75: doc_example_mind_generate
+42/66 Test #75: doc_example_mind_generate ........   Passed    0.01 sec
+      Start 76: pack_signing
+43/66 Test #76: pack_signing .....................   Passed    0.19 sec
+      Start 77: onnx_import
+44/66 Test #77: onnx_import ......................   Passed    0.33 sec
+      Start 78: golden_moe_mla
+45/66 Test #78: golden_moe_mla ...................   Passed    0.29 sec
+      Start 79: golden_quant_inplace
+46/66 Test #79: golden_quant_inplace .............   Passed    0.57 sec
+      Start 80: golden_tiny_qwen3
+47/66 Test #80: golden_tiny_qwen3 ................   Passed    0.39 sec
+      Start 82: capi_smoke
+48/66 Test #82: capi_smoke .......................   Passed    0.00 sec
+      Start 83: python_bindings
+49/66 Test #83: python_bindings ..................   Passed    0.18 sec
+      Start 84: serve_http
+50/66 Test #84: serve_http .......................   Passed    0.24 sec
+      Start 85: docs_up_to_date
+51/66 Test #85: docs_up_to_date ..................   Passed    0.02 sec
+      Start 86: sbom_spdx
+52/66 Test #86: sbom_spdx ........................   Passed    0.16 sec
+      Start 87: fuzz_json
+53/66 Test #87: fuzz_json ........................   Passed    0.02 sec
+      Start 88: fuzz_blueprint
+54/66 Test #88: fuzz_blueprint ...................   Passed    0.05 sec
+      Start 89: fuzz_fpk
+55/66 Test #89: fuzz_fpk .........................   Passed    0.40 sec
+      Start 90: fuzz_safetensors
+56/66 Test #90: fuzz_safetensors .................   Passed    0.44 sec
+      Start 91: fuzz_gguf
+57/66 Test #91: fuzz_gguf ........................   Passed    0.34 sec
+      Start 92: fuzz_tokenizer
+58/66 Test #92: fuzz_tokenizer ...................   Passed    0.08 sec
+      Start 93: fuzz_grammar
+59/66 Test #93: fuzz_grammar .....................   Passed    0.11 sec
+      Start 94: fuzz_onnx
+60/66 Test #94: fuzz_onnx ........................   Passed    0.02 sec
+      Start 95: example_camera_detector
+61/66 Test #95: example_camera_detector ..........   Passed    0.00 sec
+      Start 96: example_cypha_classifier
+62/66 Test #96: example_cypha_classifier .........   Passed    0.00 sec
+      Start 97: example_fuse_runtime
+63/66 Test #97: example_fuse_runtime .............   Passed    0.00 sec
+      Start 98: example_neuralvfx_stream
+64/66 Test #98: example_neuralvfx_stream .........   Passed    0.01 sec
+      Start 99: example_seatbelt_one_shot
+65/66 Test #99: example_seatbelt_one_shot ........   Passed    0.00 sec
+66/66 Test #27: test_script ......................   Passed   10.66 sec
+
+100% tests passed out of 66
+
+Label Time Summary:
+fuzz           =   1.47 sec*proc (8 tests)
+integration    =   0.02 sec*proc (5 tests)
+
+Total Test time (real) =  15.09 sec
+
+The following tests did not run:
+	 32 - test_text_conformance (Skipped)
+CTEST 0
