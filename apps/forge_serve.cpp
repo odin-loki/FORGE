@@ -340,7 +340,7 @@ int main(int argc, char** argv) {
         }
         mem::governor::instance().watch_pressure();
         auto m = mind::model::open(path);
-        m->blueprint().session == "generative_sequence" || (raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session), true);
+        if (m->blueprint().session != "generative_sequence") raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session);
         mind::batch_options bo;
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
