@@ -10,7 +10,9 @@ Every guide follows the same shape: **concepts**, **API or command reference**, 
 5. [configuration.md](configuration.md): all environment variables in one table
 6. [memory.md](memory.md): memory budgets, eviction, admission control and OOM avoidance
 7. [os-wrapper.md](os-wrapper.md): full portable OS wrapper (design, not yet built)
-8. [scripting.md](scripting.md): `forge script` managed language, REPL, shell blocks and higher-level features (design, not yet built)
+8. [scripting.md](scripting.md): `forge script` managed language, REPL, shell blocks and higher-level features (implemented; planned parts are marked in the doc)
+- [security.md](security.md): script capabilities, OS sandbox, plugins, AI confirmation, RPC auth, signing, known gaps
+- [support.md](support.md): logger, process wait/leases, thread pool, cache, deadlines, settings registry
 
 ## Library layers, bottom up
 9. [os.md](os.md): `forge::os`, the portability layer and its 16 extension modules

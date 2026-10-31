@@ -38,7 +38,7 @@ crash handling and GPU device enumeration.
 | `sysinfo.hpp` (extends) | OS name/version/kernel, arch, uptime, load average, per-CPU usage, memory (incl. cgroup limit, shared with `forge::mem`), disks, battery/thermal (via `power.hpp`), GPU list (via `gpu_devices.hpp`) |
 | `devices.hpp` | block devices, USB/PCI enumeration where the OS exposes it (sysfs, SetupAPI, IOKit); read-only |
 | `service.hpp` (extend) | install/start/stop/status for systemd user units, launchd agents, Windows SCM; `unsupported` on mobile |
-| `dynlib.hpp` | existing `library` plus symbol enumeration where available and search-path helpers |
+| `os.hpp` (`library`) | dynamic libraries via `os::library`; a separate `dynlib.hpp` with symbol enumeration is planned, not implemented |
 | `registry.hpp` | Windows registry read/write/enumerate; `unsupported` elsewhere |
 | `console.hpp` | is-a-tty, terminal size, ANSI/VT enabling on Windows, raw mode for the REPL line editor |
 | `clipboard.hpp` | text get/set on desktop platforms (optional, low priority) |
