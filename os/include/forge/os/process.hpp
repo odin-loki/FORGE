@@ -428,7 +428,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     const bool new_session = sp.new_session;
     const char* cwd = sp.cwd.empty() ? nullptr : sp.cwd.c_str();
     const proc_limits lim = sp.limits;
-    pid_t p = ::fork();
+    pid_t p = forge::os::serialized_fork();
     if (p < 0) { auto e = last_error("fork"); for (int* f : {&pin[0], &pin[1], &pout[0], &pout[1], &perr[0], &perr[1], &pexec[0], &pexec[1]}) cl(*f); return {{}, e}; }
     if (p == 0) {
         if (new_session) ::setsid(); else ::setpgid(0, 0);
@@ -567,7 +567,7 @@ public:
         int po[2]; if (::pipe(po)) return {{}, last_error("pipe")};
         detail_proc::cloexec(po[0]);
         const char* wd = cwd.empty() ? nullptr : cwd.c_str();
-        pid_t p = ::fork();
+        pid_t p = forge::os::serialized_fork();
         if (p < 0) { ::close(po[0]); ::close(po[1]); return {{}, last_error("fork")}; }
         if (p == 0) { ::setpgid(0, 0); ::dup2(po[1], 1); if (merge_stderr) ::dup2(po[1], 2); ::close(po[1]);
                       if (wd && ::chdir(wd) != 0) ::_exit(127); ::execve(exe.c_str(), av.data(), environ); ::_exit(127); }
@@ -611,7 +611,7 @@ public:
             auto e = last_error("open"); for (int fd : {po[0], po[1], px[0], px[1], devnull, ferr}) if (fd >= 0) ::close(fd); return {{}, e}; }
         const char* wd = sp.cwd.empty() ? nullptr : sp.cwd.c_str();
         const proc_limits lim = sp.limits; const bool merge = sp.merge_stderr; const bool new_session = sp.new_session;
-        pid_t p = ::fork();
+        pid_t p = forge::os::serialized_fork();
         if (p < 0) { auto e = last_error("fork"); for (int fd : {po[0], po[1], px[0], px[1], devnull}) if (fd >= 0) ::close(fd); return {{}, e}; }
         if (p == 0) {
             if (new_session) ::setsid(); else ::setpgid(0, 0);
