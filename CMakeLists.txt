@@ -14,6 +14,21 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION
   endif()
   unset(CMAKE_REQUIRED_FLAGS)
 endif()
+# libc++ < 20 (FreeBSD 14 base clang, older Xcode) keeps std::jthread / std::stop_token behind -fexperimental-library.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_FLAGS -std=c++23)
+  check_cxx_source_compiles("#include <stop_token>\n#include <thread>\nint main() { std::stop_source s; std::jthread t([](std::stop_token) {}); return s.stop_requested(); }" FORGE_STD_STOP_TOKEN_OK)
+  if(NOT FORGE_STD_STOP_TOKEN_OK)
+    set(CMAKE_REQUIRED_FLAGS "-std=c++23 -fexperimental-library")
+    check_cxx_source_compiles("#include <stop_token>\n#include <thread>\nint main() { std::stop_source s; std::jthread t([](std::stop_token) {}); return s.stop_requested(); }" FORGE_STD_STOP_TOKEN_EXPERIMENTAL)
+    if(FORGE_STD_STOP_TOKEN_EXPERIMENTAL)
+      add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>")
+      add_link_options("$<$<LINK_LANGUAGE:CXX>:-fexperimental-library>")
+    endif()
+  endif()
+  unset(CMAKE_REQUIRED_FLAGS)
+endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -869,7 +884,7 @@ if(FORGE_BUILD_TESTS)
         endforeach()
       endif()
     endfunction()
-    forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_moe_mla golden_quant_inplace
+    forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_mind_generate doc_example_capi_generate
       capi_smoke python_bindings serve_http pack_signing)

@@ -12,9 +12,9 @@ int main() {
     std::println("big={} len={}", big, name.size());
     std::string home = os.env("FORGE_EMIT_NOPE", "none");
     std::println("env={} plat={}", home, os.platform);
-    fs.write("/tmp/forge_emit_t.txt", "line1\nline2\n");
-    if (fs.exists("/tmp/forge_emit_t.txt") && !fs.is_dir("/tmp/forge_emit_t.txt")) std::print("{}", fs.read("/tmp/forge_emit_t.txt"));
-    fs.remove("/tmp/forge_emit_t.txt");
+    fs.write("forge_emit_t.txt", "line1\nline2\n");
+    if (fs.exists("forge_emit_t.txt") && !fs.is_dir("forge_emit_t.txt")) std::print("{}", fs.read("forge_emit_t.txt"));
+    fs.remove("forge_emit_t.txt");
     auto r = forge::sh("printf '%s|' {}; exit 3", name);
     std::println("out=[{}] code={} ok={}", r.out, r.code, r.ok);
     int n = 0;

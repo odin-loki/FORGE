@@ -93,7 +93,10 @@ inline std::int64_t file_clock_offset_ns() {
         auto f = stdfs::file_time_type::clock::now(); auto s = std::chrono::system_clock::now();
         auto ns = [](auto d) { return std::int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()); };
         std::int64_t v = ns(s.time_since_epoch()) - ns(f.time_since_epoch());
-        return (v + 500000) / 1000000 * 1000000;   // round to ms: both clocks tick together
+        // Every implementation's offset is a whole number of seconds (0, the 1601 FILETIME epoch, libstdc++'s
+        // 2174 epoch), and some file clocks tick coarsely (mingw: ~15 ms), so round to the second.
+        constexpr std::int64_t S = 1000000000;
+        return (v >= 0 ? v + S / 2 : v - S / 2) / S * S;
     }();
     return off;
 }

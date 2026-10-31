@@ -143,7 +143,7 @@ jobs:
           export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
           sh tests/mobile_build.sh android arm64-v8a
           cmake -S . -B build/android-x86_64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/android-arm64.cmake -DANDROID_ABI=x86_64 -DCMAKE_BUILD_TYPE=Release -DFORGE_BUILD_EXAMPLES=OFF
-          cmake --build build/android-x86_64 -j4 --target forge test_script
+          cmake --build build/android-x86_64 -j4 --target forge test_script forge_script_example_plugin
       - name: host forge for --emit android
         run: |
           cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_EXAMPLES=OFF
