@@ -206,6 +206,10 @@ public:
         st_.reset();
         for (auto& [k, s] : o.st_.slots) {
             auto& d = st_.slots[k];
+            if (s.fixed) {   // recurrent state: only a full-length copy is meaningful
+                if (n != s.len) raise(errc::unsupported, "copy_prefix: recurrent slot '{}' holds {} tokens, cannot share {}", k, s.len, n);
+                d = s; continue;
+            }
             if (!d.capacity) d.codec = s.codec;
             shape_t row = s.buf.shape;
             st_.ensure(d, row, std::max<i64>(n, 1));

@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <optional>
 #include <memory>
 // Lowerings: implementations of spec ops for a device. Only lowerings that pass the oracle are eligible.
 #include <forge/core/log.hpp>
@@ -69,6 +70,9 @@ public:
     // equal cost (weights in stage_weight) and selects each node's lowering from its stage's registry
     // (null entry = CPU). Stage registries must be non-resident; activations cross stages through host memory.
     std::vector<std::unique_ptr<registry>> stages;
+    // Resident device backends: matmul_t over an encoded weight (tensor_view::qdata) on the device, for these codecs.
+    std::optional<lowering> device_qgemm;
+    std::vector<std::string> device_qgemm_codecs;
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);
