@@ -125,7 +125,10 @@ jobs:
           release: "14.3"
           usesh: true
           mem: 8192
-          prepare: pkg install -y cmake ninja python3 py311-numpy py311-cryptography bash zsh mksh fish
+          prepare: |
+            pkg install -y cmake ninja python3 bash zsh mksh fish
+            py=$(python3 -c 'import sys; print("py%d%d" % sys.version_info[:2])')
+            pkg install -y $py-numpy $py-cryptography || true
           run: |
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF
             cmake --build build -j4

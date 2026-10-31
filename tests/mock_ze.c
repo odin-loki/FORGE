@@ -18,7 +18,11 @@
 #define FORGE_CL_HOST_SHIM
 #define FORGE_K static
 #define G
+#ifdef _MSC_VER
+static __declspec(thread) size_t mock_gid;
+#else
 static __thread size_t mock_gid;
+#endif
 static size_t get_global_id(int d) { (void)d; return mock_gid; }
 static unsigned as_uint(float f) { unsigned u; memcpy(&u, &f, 4); return u; }
 #include "kernels.cl"

@@ -2,7 +2,7 @@
 #   cmake -S . -B build/ios -G Xcode -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake
 # or use tools/build_xcframework.sh to produce FORGE.xcframework for the Swift package (bindings/apple).
 set(CMAKE_SYSTEM_NAME iOS)
-set(CMAKE_OSX_DEPLOYMENT_TARGET 15.0 CACHE STRING "")
+set(CMAKE_OSX_DEPLOYMENT_TARGET 16.3 CACHE STRING "")   # std::to_chars(float) (std::format) needs iOS 16.3
 if(FORGE_IOS_SIMULATOR)
   set(CMAKE_OSX_SYSROOT iphonesimulator)
   set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "")

@@ -5,7 +5,7 @@ import PackageDescription
 
 let package = Package(
     name: "Forge",
-    platforms: [.iOS(.v15), .macOS(.v13)],
+    platforms: [.iOS("16.3"), .macOS("13.3")],   // std::to_chars(float) availability
     products: [.library(name: "Forge", targets: ["Forge"])],
     targets: [
         .binaryTarget(name: "FORGEBinary", path: "FORGE.xcframework"),
