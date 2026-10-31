@@ -49,6 +49,9 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     if (tname.empty()) {
         if (arch == "LlamaForCausalLM" || arch == "MistralForCausalLM" || arch == "Qwen2ForCausalLM" || cfg.str_or("model_type", "") == "llama")
             tname = "llama";
+        else if (arch == "Qwen3ForCausalLM" || cfg.str_or("model_type", "") == "qwen3") tname = "qwen3";
+        else if (arch == "Qwen3_5ForConditionalGeneration" || arch == "Qwen3_5ForCausalLM" || cfg.str_or("model_type", "") == "qwen3_5")
+            raise(errc::unsupported, "qwen3_5 (Gated DeltaNet hybrid attention) has no blueprint template yet");
         else if (arch == "MixtralForCausalLM" || cfg.str_or("model_type", "") == "mixtral") tname = "mixtral";
         else if (arch == "DeepseekV2ForCausalLM" || arch == "DeepseekV3ForCausalLM" || cfg.str_or("model_type", "") == "deepseek_v2") tname = "deepseek_v2";
         else raise(errc::unsupported, "no blueprint template for architecture {} (pass --template)", arch);
@@ -147,6 +150,10 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         put(Q + "wq", find(P + "self_attn.q_proj.weight"), true);
         put(Q + "wk", find(P + "self_attn.k_proj.weight"), true);
         put(Q + "wv", find(P + "self_attn.v_proj.weight"), true);
+        if (tname == "qwen3") {
+            put(Q + "q_norm", find(P + "self_attn.q_norm.weight"), false);
+            put(Q + "k_norm", find(P + "self_attn.k_norm.weight"), false);
+        }
         if (tname == "mixtral") {
             put(Q + "router", find(P + "block_sparse_moe.gate.weight"), false);
             for (i64 e = 0; e < i64(bp.param("n_experts")); ++e)

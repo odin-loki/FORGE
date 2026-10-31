@@ -235,6 +235,113 @@ inline void dec_tq2(const u8* in, std::size_t n, float* x) {
         for (std::size_t i = 0; i < 64 && b + i < n; ++i) x[b + i] = g * float(int((in[2 + i / 4] >> (2 * (i & 3))) & 3) - 1);
     }
 }
+
+// Q6_K (GGUF-compatible layout): super-block of 256 = 16 sub-blocks of 16.
+// struct { u8 ql[128]; u8 qh[64]; i8 scales[16]; f16 d; }  x = d * scales[s] * (q - 32), q in [0, 63]
+inline void dec_q6_k(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 210) {
+        const u8* ql = in; const u8* qh = in + 128; const i8* sc = reinterpret_cast<const i8*>(in + 192);
+        float d = get16(in + 208), out[256];
+        for (int h = 0; h < 2; ++h, ql += 64, qh += 32, sc += 8) {
+            float* y = out + 128 * h;
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int q1 = int((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = int((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = int((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = int((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l] = d * sc[is] * q1; y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3; y[l + 96] = d * sc[is + 6] * q4;
+            }
+        }
+        std::copy_n(out, std::min<std::size_t>(256, n - b), x + b);
+    }
+}
+inline void enc_q6_k(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 210) {
+        float blk[256] = {};
+        std::copy_n(x + b, std::min<std::size_t>(256, n - b), blk);
+        float ss[16], amax = 0;
+        for (int s = 0; s < 16; ++s) {
+            float m = 0; for (int i = 0; i < 16; ++i) m = std::max(m, std::fabs(blk[s * 16 + i]));
+            ss[s] = m / 31.f; amax = std::max(amax, ss[s]);
+        }
+        float d = amax / 127.f; put16(o + 208, d); d = get16(o + 208);
+        i8 sc[16]; int q[256];
+        for (int s = 0; s < 16; ++s) {
+            int v = d ? int(std::lround(ss[s] / d)) : 0;
+            if (d && v < 127 && v * d * 31.f < ss[s] * 31.f - 1e-6f) ++v;   // cover the range after rounding
+            sc[s] = i8(std::clamp(v, 0, 127));
+            float ds = d * sc[s];
+            for (int i = 0; i < 16; ++i) q[s * 16 + i] = std::clamp(ds ? int(std::lround(blk[s * 16 + i] / ds)) : 0, -32, 31) + 32;
+        }
+        std::memcpy(o + 192, sc, 16);
+        u8* ql = o; u8* qh = o + 128; std::memset(o, 0, 192);
+        for (int h = 0; h < 2; ++h) {
+            const int* qq = q + 128 * h; u8* L = ql + 64 * h; u8* H = qh + 32 * h;
+            for (int l = 0; l < 32; ++l) {
+                L[l] = u8((qq[l] & 0xF) | ((qq[l + 64] & 0xF) << 4));
+                L[l + 32] = u8((qq[l + 32] & 0xF) | ((qq[l + 96] & 0xF) << 4));
+                H[l] = u8((qq[l] >> 4) | ((qq[l + 32] >> 4) << 2) | ((qq[l + 64] >> 4) << 4) | ((qq[l + 96] >> 4) << 6));
+            }
+        }
+    }
+}
+
+// Q5_K (GGUF-compatible layout): super-block of 256 = 8 sub-blocks of 32.
+// struct { f16 d; f16 dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]; }  x = d*sc*q - dmin*m, q in [0, 31]
+inline void dec_q5_k(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 176) {
+        float d = get16(in), dmin = get16(in + 2);
+        const u8* scales = in + 4; const u8* qh = in + 16; const u8* ql = in + 48;
+        float out[256]; int is = 0; u8 u1 = 1, u2 = 2;
+        for (int j = 0; j < 256; j += 64, ql += 32, is += 2, u1 <<= 2, u2 <<= 2) {
+            u8 sc, m; get_scale_min_k4(is, scales, sc, m);
+            float d1 = d * sc, m1 = dmin * m;
+            get_scale_min_k4(is + 1, scales, sc, m);
+            float d2 = d * sc, m2 = dmin * m;
+            for (int l = 0; l < 32; ++l) out[j + l] = d1 * float((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+            for (int l = 0; l < 32; ++l) out[j + 32 + l] = d2 * float((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+        }
+        std::copy_n(out, std::min<std::size_t>(256, n - b), x + b);
+    }
+}
+inline void enc_q5_k(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 176) {
+        float blk[256] = {};
+        std::copy_n(x + b, std::min<std::size_t>(256, n - b), blk);
+        float sc[8], mn[8];
+        for (int s = 0; s < 8; ++s) {
+            float lo = 0, hi = 0;
+            for (int i = 0; i < 32; ++i) { lo = std::min(lo, blk[s * 32 + i]); hi = std::max(hi, blk[s * 32 + i]); }
+            sc[s] = (hi - lo) / 31.f; mn[s] = -lo;
+        }
+        float d = *std::max_element(sc, sc + 8) / 63.f, dmin = *std::max_element(mn, mn + 8) / 63.f;
+        put16(o, d); put16(o + 2, dmin); d = get16(o); dmin = get16(o + 2);
+        u8 ls[8], lm[8];
+        for (int s = 0; s < 8; ++s) {
+            ls[s] = u8(std::clamp(d ? int(std::lround(sc[s] / d)) : 0, 0, 63));
+            lm[s] = u8(std::clamp(dmin ? int(std::lround(mn[s] / dmin)) : 0, 0, 63));
+            if (d && ls[s] < 63 && ls[s] * d * 31.f < (sc[s] * 31.f) - 1e-6f) ++ls[s];
+        }
+        u8* scales = o + 4; std::memset(scales, 0, 12);
+        for (int j = 0; j < 4; ++j) { scales[j] = u8(ls[j] | ((ls[j + 4] >> 4) << 6)); scales[j + 4] = u8(lm[j] | ((lm[j + 4] >> 4) << 6)); }
+        for (int j = 4; j < 8; ++j) scales[j + 4] = u8((ls[j] & 0xF) | ((lm[j] & 0xF) << 4));
+        u8* qh = o + 16; u8* qs = o + 48; std::memset(qh, 0, 32);
+        u8 u1 = 1, u2 = 2;
+        for (int j = 0, is = 0; j < 256; j += 64, is += 2, u1 <<= 2, u2 <<= 2) {
+            u8 s1, m1, s2, m2; get_scale_min_k4(is, scales, s1, m1); get_scale_min_k4(is + 1, scales, s2, m2);
+            float d1 = d * s1, mm1 = dmin * m1, d2 = d * s2, mm2 = dmin * m2;
+            for (int l = 0; l < 32; ++l) {
+                int q1 = std::clamp(d1 ? int(std::lround((blk[j + l] + mm1) / d1)) : 0, 0, 31);
+                int q2 = std::clamp(d2 ? int(std::lround((blk[j + 32 + l] + mm2) / d2)) : 0, 0, 31);
+                qs[j / 2 + l] = u8((q1 & 0xF) | ((q2 & 0xF) << 4));
+                if (q1 & 16) qh[l] |= u1;
+                if (q2 & 16) qh[l] |= u2;
+            }
+        }
+    }
+}
 } // namespace detail
 
 inline const std::vector<codec>& all() {
@@ -254,6 +361,8 @@ inline const std::vector<codec>& all() {
         {"mxint8", dtype::mxint8, 32, 33, detail::enc_mx<i8, 0, 8>, detail::dec_mx<i8, 0, 8>},
         {"nvfp4", dtype::nvfp4, 16, 9, detail::enc_nvfp4, detail::dec_nvfp4},
         {"tq2", dtype::tq2, 64, 18, detail::enc_tq2, detail::dec_tq2},
+        {"q6_k", dtype::q6_k, 256, 210, detail::enc_q6_k, detail::dec_q6_k},
+        {"q5_k", dtype::q5_k, 256, 176, detail::enc_q5_k, detail::dec_q5_k},
     };
     return c;
 }

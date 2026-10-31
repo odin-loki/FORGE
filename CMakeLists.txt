@@ -807,6 +807,9 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_moe_mla
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_moe.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_moe)
+    add_test(NAME golden_tiny_qwen3
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_qwen3.py
+              --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_qwen3)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden)
@@ -820,7 +823,7 @@ if(FORGE_BUILD_TESTS)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
-      set_tests_properties(golden_tiny_llama golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
       add_test(NAME capi_smoke COMMAND capi_smoke ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
