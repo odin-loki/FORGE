@@ -134,6 +134,20 @@ inline void gemm_nt(std::span<const tensor_view> in, tensor_view out, const spec
         }
     });
 }
+// gather (embedding lookup) straight from encoded rows: a q8_0/q4_k tok_emb never gets an f32 copy.
+inline void gather_rows(std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
+    const auto& w = in[0]; const auto* c = codec_of(w);
+    std::size_t d = std::size_t(w.shape[1]), rowsn = std::size_t(w.shape[0]), rb = c->bytes(d);
+    for (std::size_t i = 0; i < in[1].size(); ++i) {
+        auto r = std::size_t(in[1].data[i]);
+        if (r >= rowsn) raise(errc::invalid_argument, "gather index {} out of range", r);
+        c->decode(w.qdata + r * rb, d, out.data + i * d);
+    }
+}
+inline const lowering& gather_lowering() {
+    static const lowering l{"cpu.qgather", spec::op::gather, 100, [](auto, auto&, auto&) { return true; }, gather_rows, 1};
+    return l;
+}
 inline const lowering& gemm_nt_lowering() {
     static const lowering l{"cpu.qgemm_nt", spec::op::matmul_t, 100, [](auto, auto&, auto&) { return true; }, gemm_nt, 1};
     return l;
@@ -214,9 +228,10 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             std::size_t s = 0; for (; s < k; ++s) if ((reg.stages[s] ? reg.stages[s].get() : &registry::cpu()) == stage_of[i]) break;
             p->stage_of_node[i] = int(s); }
     }
-    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t taking it as the weight operand
+    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t (weight operand) or gather (table)
     for (auto& n : G.nodes()) for (std::size_t j = 0; j < n.inputs.size(); ++j)
-        if (!(n.kind == node_kind::op && n.op == spec::op::matmul_t && j == 1)) q_ok[n.inputs[j]] = false;
+        if (!(n.kind == node_kind::op && ((n.op == spec::op::matmul_t && j == 1) || (n.op == spec::op::gather && j == 0))))
+            q_ok[n.inputs[j]] = false;
     for (auto& [nm, v] : G.outputs()) q_ok[v] = false;
     bool q_direct = !p->hooks && reg.stages.empty();
     for (std::size_t i = 0; i < G.size(); ++i) {
@@ -285,6 +300,8 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             }
             if (n.op == spec::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
                 p->steps.push_back({&qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
+            else if (n.op == spec::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
+                p->steps.push_back({&qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }

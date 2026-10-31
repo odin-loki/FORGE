@@ -38,7 +38,10 @@ inline std::string instantiate(std::string tpl, const json::value& cfg) {
     return tpl;
 }
 
-struct import_options { std::string codec = "f32"; std::string template_name; };
+struct import_options {
+    std::string codec = "f32"; std::string template_name;
+    std::string emb_codec;   // tok_emb codec; empty = q8_0 when codec is quantised, else f32
+};
 
 struct import_report { std::string arch, template_name; std::size_t tensors = 0, bytes = 0; };
 
@@ -126,33 +129,31 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     for (auto& f : std::filesystem::directory_iterator(dir))
         if (f.path().extension() == ".safetensors") shards.push_back(std::make_unique<safetensors>(f.path().string()));
     if (shards.empty()) raise(errc::not_found, "{}: no .safetensors files", dir.string());
+    // Vision tower and multi-token-prediction heads are not part of the text model: never loaded.
+    auto skipped = [](const std::string& n) {
+        for (const char* p : {"visual.", "model.visual.", "mtp.", "model.mtp."}) if (n.starts_with(p)) return true;
+        return false;
+    };
     auto find = [&](const std::string& n) -> tensor {
+        if (skipped(n)) raise(errc::not_found, "tensor {} belongs to a skipped (vision/mtp) tower", n);
         for (auto& s : shards) if (s->has(n)) return s->load(n);
         raise(errc::not_found, "missing tensor {}", n);
     };
-    auto has = [&](const std::string& n) { for (auto& s : shards) if (s->has(n)) return true; return false; };
+    auto has = [&](const std::string& n) { if (skipped(n)) return false; for (auto& s : shards) if (s->has(n)) return true; return false; };
     // Qwen3.5 multimodal checkpoints keep the text model under model.language_model.
     std::string mp = has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
 
-    pack::writer w;
-    {   // estimate the encoded size (2-D weights in the target codec, the rest f32) plus slack, and reserve it once
-        auto* qc = flow::codecs::find(opt.codec);
-        std::size_t est = 0;
-        auto enc = [&](std::size_t k) { return qc && qc->block > 0 && k % std::size_t(qc->block) == 0 ? qc->bytes(k) : 4 * k; };
-        for (auto& s : shards) for (auto& [n, e] : s->entries()) {
-            std::size_t k = 1; for (auto d : e.shape) k *= std::size_t(d);
-            bool emb = n == mp + "embed_tokens.weight";
-            est += (e.shape.size() == 2 && !emb ? enc(k) : 4 * k) + pack::alignment;
-            if (emb && !has("lm_head.weight")) est += enc(k);  // tied lm_head is re-encoded from the embedding
-        }
-        w.reserve(est + est / 8);
-    }
+    pack::stream_writer w(out);   // each tensor is encoded, written and freed before the next is loaded
     import_report rep{arch, tname, 0, 0};
     auto put = [&](const std::string& n, const tensor& t, bool quantisable) {
         w.add_tensor(n, t.shape, t.data, quantisable ? opt.codec : std::string("f32")); ++rep.tensors;
     };
     i64 L = i64(bp.param("n_layers"));
-    put("tok_emb", find(mp + "embed_tokens.weight"), false);  // not kept alive: 2.5 GB f32 for 150k-vocab 4k-wide models
+    {   // quantised embeddings: the runtime gathers rows straight from q8_0/q4_k blocks
+        std::string ec = opt.emb_codec.empty() ? (opt.codec == "f32" || opt.codec == "f16" || opt.codec == "bf16" ? opt.codec : std::string("q8_0")) : opt.emb_codec;
+        auto t = find(mp + "embed_tokens.weight");
+        w.add_tensor("tok_emb", t.shape, t.data, ec); ++rep.tensors;
+    }
     auto mlp = [&](const std::string& P, const std::string& Q, const char* g, const char* u, const char* d) {
         put(Q + "w_gate", find(P + g + ".weight"), true);
         put(Q + "w_up", find(P + u + ".weight"), true);
@@ -234,7 +235,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     if (std::filesystem::exists(dir / "tokenizer.json")) w.set_section("tokenizer", read_file(dir / "tokenizer.json"));
-    w.write(out);
+    w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;
 }
