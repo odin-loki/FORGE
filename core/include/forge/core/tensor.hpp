@@ -23,6 +23,9 @@ inline std::string shape_str(const shape_t& s) {
 struct tensor_view {
     float* data = nullptr;
     shape_t shape;
+    // Quantised weight payload (data == nullptr): encoded rows read in place by quantised kernels.
+    const std::uint8_t* qdata = nullptr;
+    const void* qcodec = nullptr;   // const flow::codec*
     std::size_t size() const { return std::size_t(numel(shape)); }
     std::span<float> span() const { return {data, size()}; }
 };

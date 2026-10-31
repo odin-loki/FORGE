@@ -22,6 +22,8 @@ struct node {
     shape_t shape;                    // filled by verify
     std::string name;                 // inputs/weights/state slots
     const float* weight = nullptr;    // kind == weight: external (e.g. mmap'd / decoded) data
+    const std::uint8_t* qweight = nullptr;  // kind == weight: encoded data instead (see plan.hpp: matmul_t reads it in place)
+    std::string qcodec;                     // codec name for qweight
     std::shared_ptr<tensor> constant; // kind == constant
     int device = 0;                   // filled by partition
 };
@@ -31,6 +33,10 @@ public:
     value_id input(std::string name, shape_t s) { node n; n.kind = node_kind::input; n.shape = std::move(s); n.name = std::move(name); return push(std::move(n)); }
     value_id weight(std::string name, shape_t s, const float* data) {
         node n; n.kind = node_kind::weight; n.shape = std::move(s); n.name = std::move(name); n.weight = data; return push(std::move(n));
+    }
+    value_id qweight(std::string name, shape_t s, const std::uint8_t* data, std::string codec) {
+        node n; n.kind = node_kind::weight; n.shape = std::move(s); n.name = std::move(name); n.qweight = data; n.qcodec = std::move(codec);
+        return push(std::move(n));
     }
     value_id constant(tensor t) {
         node n; n.kind = node_kind::constant; n.shape = t.shape;

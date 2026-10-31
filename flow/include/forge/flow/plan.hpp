@@ -1,5 +1,6 @@
 #pragma once
 // partition -> memory-plan -> lower -> flat plan -> replay. Plans are cached per shape bucket.
+#include <forge/flow/codecs.hpp>
 #include <forge/flow/kernels.hpp>
 #include <forge/flow/kv_codec.hpp>
 #include <forge/flow/memplan.hpp>
@@ -88,6 +89,41 @@ inline partition_report partition(graph& g, const std::vector<grid::device>& dev
     return r;
 }
 
+// Quantised weights: matmul_t reads encoded rows in place (decode one row into a per-thread buffer, then
+// SIMD dot products against every input row), so a q4_k model costs its file size in memory, not 4 bytes/param.
+namespace qweights {
+using codecs::codec;
+inline const codec* codec_of(const tensor_view& v) { return static_cast<const codec*>(v.qcodec); }
+inline void gemm_nt(std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
+    const auto& x = in[0]; const auto& w = in[1];
+    std::size_t k = std::size_t(x.shape.back()), m = x.size() / k, n = std::size_t(w.shape[0]);
+    const auto* c = codec_of(w); std::size_t rb = c->bytes(k);
+    task::parallel_for(n, 8, [&](std::size_t b, std::size_t e) {
+        thread_local std::vector<float> row;
+        if (row.size() < k) row.resize(k);
+        const auto& ker = lane::active();
+        for (std::size_t j = b; j < e; ++j) {
+            c->decode(w.qdata + j * rb, k, row.data());
+            for (std::size_t i = 0; i < m; ++i) out.data[i * n + j] = ker.dot(x.data + i * k, row.data(), k);
+        }
+    });
+}
+inline const lowering& gemm_nt_lowering() {
+    static const lowering l{"cpu.qgemm_nt", spec::op::matmul_t, 100, [](auto, auto&, auto&) { return true; }, gemm_nt, 1};
+    return l;
+}
+// f32 copies for quantised weights that something other than matmul_t consumes, shared across plans.
+inline std::shared_ptr<tensor> decoded(const std::uint8_t* p, const codec* c, const shape_t& s) {
+    static std::mutex mu; static std::map<const std::uint8_t*, std::weak_ptr<tensor>> cache;
+    std::lock_guard lk(mu);
+    if (auto sp = cache[p].lock()) return sp;
+    auto t = std::make_shared<tensor>(s);
+    c->decode(p, t->size(), t->data.data());
+    cache[p] = t;
+    return t;
+}
+} // namespace qweights
+
 struct step {
     const lowering* low;
     std::vector<value_id> in;
@@ -101,7 +137,8 @@ public:
     graph g;
     memory_plan mem;
     std::vector<step> steps;
-    std::deque<spec::attrs> attr_store;   // per-step attribute overrides (stable addresses)
+    std::deque<spec::attrs> attr_store;
+    std::vector<std::shared_ptr<tensor>> decoded_weights;   // f32 fallbacks for quantised weights   // per-step attribute overrides (stable addresses)
     std::vector<tensor_view> views;   // per value
     std::vector<std::pair<value_id, value_id>> state_aliases;  // (view, state node) pairs rebound at run time
     std::vector<float> arena;
@@ -151,11 +188,22 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             std::size_t s = 0; for (; s < k; ++s) if ((reg.stages[s] ? reg.stages[s].get() : &registry::cpu()) == stage_of[i]) break;
             p->stage_of_node[i] = int(s); }
     }
+    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t taking it as the weight operand
+    for (auto& n : G.nodes()) for (std::size_t j = 0; j < n.inputs.size(); ++j)
+        if (!(n.kind == node_kind::op && n.op == spec::op::matmul_t && j == 1)) q_ok[n.inputs[j]] = false;
+    for (auto& [nm, v] : G.outputs()) q_ok[v] = false;
+    bool q_direct = !p->hooks && reg.stages.empty();
     for (std::size_t i = 0; i < G.size(); ++i) {
         auto& n = G.nodes()[i];
         auto& s = p->mem.slots[i];
         tensor_view v; v.shape = n.shape;
-        if (n.kind == node_kind::weight) v.data = const_cast<float*>(n.weight);
+        if (n.kind == node_kind::weight && n.qweight) {
+            auto* c = codecs::find(n.qcodec);
+            if (!c) raise(errc::unsupported, "weight {}: unknown codec {}", n.name, n.qcodec);
+            if (q_direct && q_ok[i] && n.shape.size() == 2 && std::size_t(n.shape[1]) % c->block == 0) { v.qdata = n.qweight; v.qcodec = c; }
+            else { auto t = qweights::decoded(n.qweight, c, n.shape); v.data = t->data.data(); p->decoded_weights.push_back(std::move(t)); }
+        }
+        else if (n.kind == node_kind::weight) v.data = const_cast<float*>(n.weight);
         else if (n.kind == node_kind::constant) v.data = n.constant->data.data();
         else if (n.kind == node_kind::state_append) {
             if (!st) raise(errc::invalid_argument, "graph uses state slot '{}' but no state store given", n.name);
@@ -202,7 +250,9 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
                     at = &a2;
                 }
             }
-            p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
+            if (n.op == spec::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
+                p->steps.push_back({&qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
+            else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
     return p;
