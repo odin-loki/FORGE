@@ -13,11 +13,11 @@ int main() {
     std::size_t n = 32 * 32;
     latent target(n); for (std::size_t i = 0; i < n; ++i) target[i] = std::sin(float(i) * 0.1f);
     // Macro stage: predicts the clean sample directly (coarse layout).
-    session macro(sch, [&](const latent&, double, int) { return target; });
+    forge::mind::diffusion::session macro(sch, [&](const latent&, double, int) { return target; });
     options om; om.steps = 8; om.pred = prediction::sample; om.kind = sampler_kind::ddim;
     latent coarse = macro.run(macro.initial_noise(n, 7), om);
     // Micro stage: refines from the coarse latent with a few low-noise steps.
-    session micro(sch, [&](const latent& x, double, int) { latent d(x.size()); for (std::size_t i = 0; i < x.size(); ++i) d[i] = target[i]; return d; });
+    forge::mind::diffusion::session micro(sch, [&](const latent& x, double, int) { latent d(x.size()); for (std::size_t i = 0; i < x.size(); ++i) d[i] = target[i]; return d; });
     options mi = om; mi.steps = 8; mi.start_step = 5;
     latent fine = micro.run(coarse, mi);
     double err = 0; for (std::size_t i = 0; i < n; ++i) err = std::max(err, double(std::abs(fine[i] - target[i])));
