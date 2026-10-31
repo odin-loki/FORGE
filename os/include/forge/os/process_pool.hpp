@@ -126,7 +126,7 @@ inline std::optional<msg> read_msg(fd_t f) {
 
 // The worker side: serve tasks until quit/EOF.
 inline int serve(fd_t in, fd_t out, const sandbox_policy* sb) {
-    if (sb) { if (auto st = apply_sandbox(*sb); st.err && !is_unsupported(st.err)) return 70; note_sandboxed(true); }
+    if (sb) { if (auto st = apply_sandbox(*sb); st.err && !is_unsupported(st.err)) return 70; note_sandbox_policy(sb->deny_network, sb->deny_exec, sb->deny_fs_write); }
     for (;;) {
         auto m = read_msg(in);
         if (!m || m->type == msg_quit) return 0;

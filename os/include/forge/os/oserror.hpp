@@ -96,18 +96,52 @@ inline const char* script_error_type(os_errc k) {
     }
 }
 
-namespace detail { inline bool& assume_sandboxed() { static bool b = false; return b; } }
-// Set by whoever applies the sandbox (ForgeScript's engine) so EPERM is reported as a sandbox violation
-// without re-reading /proc on every error.
-inline void note_sandboxed(bool on = true) { detail::assume_sandboxed() = on; }
+// What kind of operation a failing call was, so EPERM/EACCES is only called a sandbox violation when the
+// active sandbox policy actually denies that kind of operation (a plain chmod-000 file stays PermissionError).
+enum class os_op : std::uint8_t { any, fs_read, fs_write, net, exec };
+namespace detail {
+struct sbx_state { std::atomic<bool> on{false}, all{false}, net{false}, exec{false}, fs_write{false}; };
+inline sbx_state& sbx() { static sbx_state s; return s; }
+inline thread_local os_op t_op = os_op::any;
+// True when the sandbox is active and denies the current (or given) operation kind. With note_sandboxed(true)
+// (policy unknown) every operation matches; with a recorded policy, os_op::any and fs_read never match.
+inline bool assume_sandboxed(os_op op) {
+    auto& s = sbx(); if (!s.on.load()) return false;
+    if (s.all.load()) return true;
+    switch (op) {
+    case os_op::net: return s.net.load();
+    case os_op::exec: return s.exec.load();
+    case os_op::fs_write: return s.fs_write.load();
+    default: return false;
+    }
+}
+inline bool assume_sandboxed() { return assume_sandboxed(t_op); }
+}
+// Set by whoever applies the sandbox. note_sandboxed(true): sandboxed with an unknown policy (any EPERM counts);
+// note_sandbox_policy(): the exact denied classes (what engine / process_pool / sandbox{isolate} apply).
+inline void note_sandboxed(bool on = true) { auto& s = detail::sbx(); s.on = on; s.all = on; s.net = s.exec = s.fs_write = false; }
+inline void note_sandbox_policy(bool deny_net, bool deny_exec, bool deny_fs_write) {
+    auto& s = detail::sbx(); s.all = false; s.net = deny_net; s.exec = deny_exec; s.fs_write = deny_fs_write;
+    s.on = deny_net || deny_exec || deny_fs_write;
+}
+// RAII: mark the operations in this scope (on this thread) as `op` for classification.
+struct os_op_scope {
+    os_op prev;
+    explicit os_op_scope(os_op o) : prev(detail::t_op) { detail::t_op = o; }
+    ~os_op_scope() { detail::t_op = prev; }
+    os_op_scope(const os_op_scope&) = delete; os_op_scope& operator=(const os_op_scope&) = delete;
+};
 
-inline os_errc classify_errno(int e) {
-    bool sbx = detail::assume_sandboxed();
+inline os_errc classify_errno(int e, os_op op) {
+    bool sbx = detail::assume_sandboxed(op);
     switch (e) {
     case 0: return os_errc::ok;
     case ENOENT: return os_errc::not_found;
     case EEXIST: return os_errc::already_exists;
-    case EPERM: case EACCES: return sbx ? os_errc::sandbox_violation : os_errc::permission_denied;
+    // seccomp ERRNO, macOS sandbox and pledge report denials as EPERM; EACCES is ordinary file-mode/ACL denial,
+    // so with a recorded policy only EPERM counts (EACCES only when the policy is unknown).
+    case EPERM: return sbx ? os_errc::sandbox_violation : os_errc::permission_denied;
+    case EACCES: return sbx && detail::sbx().all.load() ? os_errc::sandbox_violation : os_errc::permission_denied;
 #if defined(ECAPMODE)       // FreeBSD Capsicum
     case ECAPMODE: return os_errc::sandbox_violation;
 #endif
@@ -222,6 +256,7 @@ inline os_errc classify_errno(int e) {
     default: return os_errc::other;
     }
 }
+inline os_errc classify_errno(int e) { return classify_errno(e, detail::t_op); }
 
 #if defined(_WIN32)
 inline os_errc classify_win32(unsigned long e) {
@@ -493,11 +528,17 @@ inline BOOL WINAPI forge_console_ctrl(DWORD ev) {
 }
 #endif
 }
+// Installing saves the handlers that were there; install_cancel_signals(nullptr) puts them back.
 inline void install_cancel_signals(std::atomic<bool>* flag) {
-    detail::cancel_flag().store(flag);
+    auto* was = detail::cancel_flag().exchange(flag);
 #if !defined(_WIN32)
-    struct sigaction sa{}; sa.sa_handler = flag ? detail::forge_cancel_handler : SIG_DFL; sigemptyset(&sa.sa_mask);
-    ::sigaction(SIGINT, &sa, nullptr); ::sigaction(SIGTERM, &sa, nullptr);
+    static struct sigaction old_int{}, old_term{};
+    static bool saved = false;
+    if (flag) {
+        struct sigaction sa{}; sa.sa_handler = detail::forge_cancel_handler; sigemptyset(&sa.sa_mask);
+        if (!was || !saved) { ::sigaction(SIGINT, &sa, &old_int); ::sigaction(SIGTERM, &sa, &old_term); saved = true; }
+        else { ::sigaction(SIGINT, &sa, nullptr); ::sigaction(SIGTERM, &sa, nullptr); }
+    } else if (saved) { ::sigaction(SIGINT, &old_int, nullptr); ::sigaction(SIGTERM, &old_term, nullptr); saved = false; }
 #else
     SetConsoleCtrlHandler(detail::forge_console_ctrl, flag ? TRUE : FALSE);
 #endif

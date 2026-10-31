@@ -41,6 +41,10 @@ struct options {
     std::vector<std::string> fsc_trusted_keys;
     bool fsc_require_signed = false;
     std::string fsc_sign_seed;
+    // SIGINT / SIGTERM (Windows: Ctrl-C, Ctrl-Break, console close) raise CancelledError in the running script
+    // during top-level run()/run_file()/eval(); the previous handlers are restored afterwards. Embedders that
+    // own those signals set this to false (engine::interrupt() still works).
+    bool cancel_signals = true;
     std::vector<std::string> argv;      // visible to scripts as `args`
     std::function<void(std::string_view)> out;   // print(); default stdout
     // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = use FORGE_AI_ENDPOINT
@@ -102,4 +106,7 @@ std::string emit(std::string_view src, const std::string& file, const std::strin
 std::vector<std::string> emit_targets();      // backends that have an emitter
 std::string host_shell();                     // default shell for this OS ("pwsh"/"cmd" on Windows, "sh" elsewhere)
 
+// Programs that use ForgeScript's ProcessPool in spawn mode (Windows, or spawn on POSIX) call this first in
+// main(): returns true if this process was started as a pool worker and has finished serving.
+bool run_process_worker_if_requested(int argc, char** argv);
 } // namespace forge::script

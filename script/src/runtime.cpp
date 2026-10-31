@@ -233,12 +233,13 @@ ScriptError Interp::from_cpp(std::exception_ptr ep) {
     catch (const heap_exhausted& e) { return mk("OutOfMemoryError", e.what()); }
     catch (const std::bad_alloc&) { return mk("OutOfMemoryError", "out of memory"); }
     catch (const syntax_error& e) { return mk("SyntaxError", e.what()); }
+    catch (const os::os_exception& e) { return mk(e.script_type(), e.what()); }   // typed OS errors, faults, crashed workers
     catch (const forge_exception& e) {
         switch (e.code) {
         case errc::out_of_memory: return mk("OutOfMemoryError", e.what());
         case errc::io_error: case errc::not_found: return mk("IOError", e.what());
         case errc::invalid_argument: case errc::parse_error: case errc::format_error: return mk("ValueError", e.what());
-        case errc::unsupported: return mk("OSError", e.what());
+        case errc::unsupported: return mk("NotSupportedError", e.what());
         default: return mk("Error", e.what());
         }
     }

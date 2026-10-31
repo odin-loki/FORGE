@@ -29,6 +29,7 @@ struct engine::impl {
     std::shared_ptr<Shared> sh = std::make_shared<Shared>();
     std::unique_ptr<Interp> in;
     std::string sandbox = "off";
+    bool cancel_signals = true;
     std::string fsc_dir, cache = "off";
     fsc::trust fsc_trust;
     std::optional<std::array<std::uint8_t, 32>> fsc_seed;
@@ -82,6 +83,11 @@ struct engine::impl {
         sh->start_ns = os::monotonic_ns();
         in->deadline_ns = sh->limits.timeout_ms ? sh->start_ns + sh->limits.timeout_ms * 1000000 : 0;
         sh->interrupt = false;
+        // Gap 4: cancellation signals for the top-level run (not for nested runs from host callbacks).
+        struct cancel_scope {
+            bool on; explicit cancel_scope(bool b, std::atomic<bool>* f) : on(b) { if (on) os::install_cancel_signals(f); }
+            ~cancel_scope() { if (on) os::install_cancel_signals(nullptr); }
+        } cs(cancel_signals && in->depth == 0 && in->frames.empty() && name != "<repl>", &sh->interrupt);
         std::string saved = in->file; in->file = name;
         try {
             Value v = in->run_top(top, vm);
@@ -106,7 +112,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     auto& sh = *p_->sh;
     sh.limits.max_steps = o.max_steps; sh.limits.timeout_ms = o.timeout_ms; sh.limits.heap_bytes = o.heap_bytes; sh.limits.max_depth = o.max_depth;
     sh.caps = Caps{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
-    p_->sandbox = "off";
+    p_->sandbox = "off"; p_->cancel_signals = o.cancel_signals;
     {
         auto hex32 = [](const std::string& h, const char* what) {
             std::array<std::uint8_t, 32> k{};
@@ -131,7 +137,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     if (o.os_sandbox != options::os_sandbox_mode::off && (!o.allow_fs || !o.allow_net || !o.allow_proc)) {
         os::sandbox_policy pol; pol.deny_network = !o.allow_net; pol.deny_exec = !o.allow_proc; pol.deny_fs_write = !o.allow_fs;
         auto st = os::apply_sandbox(pol);
-        if (st) os::note_sandboxed(), p_->sandbox = os::sandbox_status().mechanism.empty() ? std::string("applied") : os::sandbox_status().mechanism;
+        if (st) os::note_sandbox_policy(pol.deny_network, pol.deny_exec, pol.deny_fs_write), p_->sandbox = os::sandbox_status().mechanism.empty() ? std::string("applied") : os::sandbox_status().mechanism;
         else {
             p_->sandbox = "failed: " + st.err.what;
             if (o.os_sandbox == options::os_sandbox_mode::require) throw std::runtime_error("forge script: OS sandbox could not be applied: " + st.err.what);

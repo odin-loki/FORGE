@@ -193,8 +193,18 @@ int main() {
 - `try { } catch e: IOError { } catch e { } finally { }`, `throw Error("msg")`; user classes derive
   from `Error`. Exceptions carry message, type, script stack trace and optional `cause`.
 - Built-in hierarchy: `Error` > `IOError`, `OSError` (with `errno`/`win32` code), `TypeError`,
-  `IndexError`, `KeyError`, `OverflowError`, `OutOfMemoryError`, `TimeoutError`, `CancelledError`,
-  `ObjectDisposedError`, `ShellError`, `PermissionError`, `LimitExceededError`.
+  `IndexError`, `KeyError`, `OverflowError`, `ObjectDisposedError`, `ShellError`, `LimitExceededError`.
+- OS errors (as in Python, all under `OSError`, so `catch (OSError e)` gets every one): `PermissionError`
+  (and its subclass `SandboxViolationError`), `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError`,
+  `FileNotFoundError`, `FileExistsError`, `NotADirectoryError`, `IsADirectoryError`, `NotSupportedError`,
+  `InterruptedError`, `BlockingIOError`, `ProcessLookupError`, `NoSpaceError`, `TooManyFilesError`, `BusyError`,
+  `ReadOnlyFileSystemError`, `SignalError` (a fault caught by `fault_guard`, or a crashed process-pool worker), and
+  `ConnectionError` with `ConnectionRefusedError`, `ConnectionResetError`, `BrokenPipeError`. The mapping from
+  errno / GetLastError / WSA / NTSTATUS / Mach codes is in `forge/os/oserror.hpp`. `EPERM` is reported as
+  `SandboxViolationError` only when the active OS sandbox policy denies that kind of operation (network, exec,
+  file write); `EACCES` stays `PermissionError`. SIGINT/SIGTERM (Ctrl-C/Ctrl-Break/console close on Windows)
+  raise `CancelledError` during a top-level run (`options::cancel_signals`, default on; the previous handlers
+  are restored afterwards).
 - C++ exceptions are mapped to script exceptions by `Interp::from_cpp` (`script/src/runtime.cpp`):
   `heap_exhausted`/`std::bad_alloc` -> `OutOfMemoryError`, `syntax_error` -> `SyntaxError`, `forge_exception`
   by `errc` (`IOError`, `ValueError`, `OSError`, `OutOfMemoryError`, else `Error`), `std::out_of_range` ->
@@ -417,6 +427,27 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
      files unreadable unless their ACL grants ALL APPLICATION PACKAGES) inside a kill-on-close job with UI
      limits; an exec-only policy uses a restricted token in the job. rpc-serve children on Windows use
      `best-effort`. Not yet run on Windows (cross-compiled with llvm-mingw only). See docs/security.md.
+
+## Process pools (implemented)
+
+`ProcessPool(workers, {fs, net, proc, env, timeout})` runs tasks in worker *processes* (`forge::os::process_pool`:
+fork on Linux/macOS/FreeBSD/Android, spawn of the same executable on Windows; not available on iOS, where it raises
+`NotSupportedError`). A task is ForgeScript source that defines `task(arg)`; each call runs it in a fresh engine in the
+worker with a JSON-representable argument and result:
+
+```
+auto pp = ProcessPool(4);                                   // capabilities default to off
+auto f = pp.submit("auto task(auto x) { return x * x; }", 7);
+f.get();                                                     // 49; f.get(timeout_ms), f.done()
+pp.map("auto task(auto x) { return x + 1; }", [1, 2, 3]);    // [2, 3, 4]
+pp.shutdown();                                               // also pp.size(), pp.resize(n)
+```
+
+Workers never get a capability the calling script lacks, and the pool applies the matching OS sandbox to each
+worker process (no network / no exec / no file writes unless enabled). Errors keep their type (`ValueError` raised
+in the task is `ValueError` in the caller); a worker that crashes raises `SignalError` and is replaced. A task's
+`print` output is replayed in the caller when the result is collected. Programs embedding the engine that use spawn
+mode must call `forge::script::run_process_worker_if_requested(argc, argv)` first in `main()` (the `forge` CLI does).
 
 ## AI-assisted commands (implemented)
 

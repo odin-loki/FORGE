@@ -456,6 +456,7 @@ int cmd_script(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
     if (argc < 2) return usage();
     std::string c = argv[1];
     if (c == "script") {

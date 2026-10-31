@@ -93,3 +93,40 @@ TEST(script_os_hierarchy_extended) {
         auto r = e.eval(q); CHECK_MSG(r.ok && r.value == "true", "%s -> %s %s", q, r.value.c_str(), r.error.c_str());
     }
 }
+
+TEST(sandbox_label_matches_policy) {
+#if !defined(_WIN32)
+    os::note_sandbox_policy(/*net*/true, /*exec*/false, /*fs_write*/false);
+    { os::os_op_scope s(os::os_op::net); CHECK(os::classify_errno(EPERM) == os::os_errc::sandbox_violation); }
+    { os::os_op_scope s(os::os_op::exec); CHECK(os::classify_errno(EPERM) == os::os_errc::permission_denied); }
+    { os::os_op_scope s(os::os_op::net); CHECK(os::classify_errno(EACCES) == os::os_errc::permission_denied); }
+    CHECK(os::classify_errno(EPERM) == os::os_errc::permission_denied);   // os_op::any never matches a known policy
+    os::note_sandboxed(false);
+#endif
+}
+
+TEST(script_python_style_hierarchy) {
+    script::engine e;
+    for (const char* q : {"PermissionError(\"x\") is OSError", "TimeoutError(\"x\") is OSError", "OutOfMemoryError(\"x\") is OSError",
+                          "CancelledError(\"x\") is OSError", "DeadlockError(\"x\") is OSError", "SandboxViolationError(\"x\") is OSError"}) {
+        auto r = e.eval(q); CHECK_MSG(r.ok && r.value == "true", "%s -> %s %s", q, r.value.c_str(), r.error.c_str());
+    }
+}
+
+TEST(engine_cancel_signals_option) {
+    script::options o; o.cancel_signals = false; script::engine e(o);
+    auto r = e.run("1 + 1;"); CHECK(r.ok);
+}
+
+#if !defined(_WIN32) && !defined(FORGE_OS_IOS)
+TEST(script_process_pool) {
+    script::engine e;
+    auto r = e.eval("auto pp = ProcessPool(2); auto f = pp.submit(\"auto task(auto x) { return x * x; }\", 7); auto v = f.get(); pp.shutdown(); v");
+    CHECK_MSG(r.ok && r.value == "49", "%s %s", r.value.c_str(), r.error.c_str());
+    auto r2 = e.eval("auto p2 = ProcessPool(1); auto m = p2.map(\"auto task(auto x) { return x + 1; }\", [1, 2, 3]); p2.shutdown(); m");
+    CHECK_MSG(r2.ok, "%s", r2.error.c_str());
+    // error type crosses the process boundary; worker has no fs by default
+    auto r3 = e.eval("auto p3 = ProcessPool(1); auto t = \"\"; try { p3.submit(\"auto task(auto x) { return fs.read(\\\"/etc/hostname\\\"); }\", 0).get(); } catch (PermissionError err) { t = \"perm\"; } p3.shutdown(); t");
+    CHECK_MSG(r3.ok && r3.value.find("perm") != std::string::npos, "%s %s", r3.value.c_str(), r3.error.c_str());
+}
+#endif

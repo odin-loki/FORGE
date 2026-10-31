@@ -24,6 +24,8 @@
 #include <forge/os/process.hpp>
 #include <forge/os/signal.hpp>
 #include <forge/os/sandbox.hpp>
+#include <forge/os/process_pool.hpp>
+#include <forge/script/script.hpp>
 #if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
@@ -77,15 +79,23 @@ const Value* opt_key(const Args& a, std::size_t i, const std::string& k) { if (i
 void mut(Interp& in, const Obj& o) { if (o.frozen) in.raise("TypeError", std::string(o.type_name()) + " is frozen"); }
 Value list_of(std::vector<Value> v) { return obj(make<List>(std::move(v))); }
 Value strv(std::string s) { return obj(make<String>(std::move(s))); }
-void need(Interp& in, bool cap, const char* what) { if (!cap) in.raise("PermissionError", std::string(what) + " is disabled in this sandbox"); }
+// Also records which kind of OS operation follows (for EPERM -> SandboxViolationError only when the active
+// OS sandbox policy denies that kind; see os::os_op). Reset by ok()/raise_os().
+void need(Interp& in, const bool& cap, const char* what) {
+    os::detail::t_op = &cap == &in.caps.net ? os::os_op::net : &cap == &in.caps.proc ? os::os_op::exec
+                     : &cap == &in.caps.fs ? os::os_op::fs_write : os::os_op::any;
+    if (!cap) in.raise("PermissionError", std::string(what) + " is disabled in this sandbox");
+}
 // OS failures raise a typed ForgeScript exception (FileNotFoundError, SandboxViolationError, ...; see
 // forge/os/oserror.hpp); `type` is the fallback for errors that don't classify more precisely.
 [[noreturn]] void raise_os(Interp& in, const os::error& e, const char* type) {
-    auto k = os::classify(e);
+    auto k = os::classify(e); os::detail::t_op = os::os_op::any;
     in.raise(k == os::os_errc::other || k == os::os_errc::io ? type : os::script_error_type(k), e.what);
 }
-template <class T> T ok(Interp& in, os::result<T> r, const char* type = "IOError") { if (!r) raise_os(in, r.err, type); return std::move(r.value); }
-void ok(Interp& in, const os::status& s, const char* type = "IOError") { if (!s) raise_os(in, s.err, type); }
+template <class T> T ok(Interp& in, os::result<T> r, const char* type = "IOError") { if (!r) raise_os(in, r.err, type); os::detail::t_op = os::os_op::any; return std::move(r.value); }
+void ok(Interp& in, const os::status& s, const char* type = "IOError") { if (!s) raise_os(in, s.err, type); os::detail::t_op = os::os_op::any; }
+// errno / GetLastError() right now -> typed exception
+[[noreturn]] void raise_last_os(Interp& in, const std::string& what) { int c = os::last_errno(); raise_os(in, os::error{c ? c : -1, what + ": " + os::error_text(c)}, "OSError"); }
 
 // ---- json <-> values (forge::json)
 json::value to_json(Interp& in, const Value& v, int depth = 0) {
@@ -155,7 +165,7 @@ Value run_process(Interp& in, Args& a) {
     if (auto* v = opt_key(a, 1, "env")) for (auto& [k, x] : m_of(in, *v, "env").entries) sp.env_set[in.str(k)] = in.str(x);
     if (in.deadline_ns) { auto now = os::monotonic_ns(); std::uint64_t left = in.deadline_ns > now ? (in.deadline_ns - now) / 1000000 + 1 : 1; sp.timeout_ms = sp.timeout_ms ? std::min(sp.timeout_ms, left) : left; }
     auto r = os::spawn_wait(sp);
-    if (!r) in.raise("OSError", r.err.what);
+    if (!r) raise_os(in, r.err, "OSError");
     std::string cmd; for (auto& s : sp.argv) { if (!cmd.empty()) cmd += ' '; cmd += s; }
     Value res = in.proc_result(cmd, r->exit_code, std::move(r->out), std::move(r->err), r->wall_ms, r->timed_out);
     if (auto* v = opt_key(a, 1, "check"); v && Interp::truthy(*v)) {
@@ -173,6 +183,44 @@ struct Scope {
 };
 
 } // namespace
+
+// ---- ProcessPool (forge::os::process_pool): script tasks in worker processes.
+// Payload (JSON): {"src": source defining task(arg), "arg": <json>, "fs","net","proc","env": bools, "timeout_ms": n}.
+// The worker runs src in a fresh engine with those capabilities (the pool already applied the matching OS
+// sandbox to the worker process), calls task(arg) and answers {"ok":true,"value":<json>} or
+// {"ok":false,"type":"<ErrorType>","msg":"..."}; script errors keep their exact type across the process boundary.
+std::string script_process_task(std::string payload) {
+    json::value p = json::parse(payload);
+    auto get = [&](const char* k) -> const json::value* { for (auto& [n, v] : p.obj()) if (n == k) return &v; return nullptr; };
+    auto flag = [&](const char* k) { auto* v = get(k); return v && v->v.index() == 1 && v->b(); };
+    options o;
+    o.allow_fs = flag("fs"); o.allow_net = flag("net"); o.allow_proc = flag("proc"); o.allow_env = flag("env");
+    o.os_sandbox = options::os_sandbox_mode::off;   // the pool sandboxes the worker process itself
+    o.cancel_signals = false;
+    if (auto* t = get("timeout_ms"); t && t->v.index() == 2) o.timeout_ms = std::uint64_t(t->num());
+    std::string out_text; o.out = [&out_text](std::string_view t) { if (out_text.size() < (1u << 20)) out_text += t; };
+    std::string src = get("src") && get("src")->v.index() == 3 ? get("src")->str() : std::string();
+    std::string arg = get("arg") ? json::dump(*get("arg")) : std::string("null");
+    std::string result = "null"; bool got = false;
+    engine e(o);
+    e.define("__pp_arg", 0, 0, [&](const std::string&) { return arg; });
+    e.define("__pp_result", 1, 1, [&](const std::string& a) {
+        auto v = json::parse(a); result = v.arr().empty() ? std::string("null") : json::dump(v.arr()[0]); got = true; return std::string("null"); });
+    auto r = e.run(src + "\n__pp_result(task(__pp_arg()));\n", "<process-task>");
+    json::object res;
+    if (r.ok && got) { res.emplace_back("ok", true); res.emplace_back("value", json::parse(result)); }
+    else {
+        res.emplace_back("ok", false);
+        res.emplace_back("type", r.error_type.empty() ? std::string("RuntimeError") : r.error_type);
+        std::string m = r.error; if (auto c = m.find(": "); c != std::string::npos && m.compare(0, c, r.error_type) == 0) m = m.substr(c + 2);
+        res.emplace_back("msg", r.ok ? std::string("task(arg) was not called; define task(arg) in the source") : m);
+    }
+    res.emplace_back("out", out_text);
+    return json::dump(json::value(std::move(res)));
+}
+void register_script_process_task() { static bool once = os::register_process_task("forge.script", script_process_task); (void)once; }
+struct PoolBox { std::unique_ptr<os::process_pool> pool; bool fs = false, net = false, proc = false, env = false; std::uint64_t timeout_ms = 0; };
+struct FutureBox { std::future<std::string> f; std::optional<std::string> got; std::exception_ptr err; };
 
 void install_builtins(Shared& sh) {
     auto& B = sh.builtins;
@@ -195,14 +243,14 @@ void install_builtins(Shared& sh) {
         return c;
     };
     auto err = mkclass("Error", {});
-    for (auto n : {"IOError", "OSError", "TypeError", "IndexError", "KeyError", "OverflowError", "OutOfMemoryError", "TimeoutError",
-                   "CancelledError", "ObjectDisposedError", "ShellError", "PermissionError", "LimitExceededError", "NameError",
+    for (auto n : {"IOError", "OSError", "TypeError", "IndexError", "KeyError", "OverflowError",
+                   "ObjectDisposedError", "ShellError", "LimitExceededError", "NameError",
                    "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError", "RuntimeError", "LogicError",
-                   "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError", "PipelineError", "PluginError", "AIError", "AccessError"})
+                   "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "PipelineError", "PluginError", "AIError", "AccessError"})
         mkclass(n, err);
+    // As in Python, OS-level conditions are OSError subclasses: catch (OSError e) gets all of them.
+    for (auto n : {"PermissionError", "TimeoutError", "OutOfMemoryError", "CancelledError", "DeadlockError"}) mkclass(n, sh.errors["OSError"]);
     // typed OS errors (forge/os/oserror.hpp): catch OSError to get all of them
-    // PermissionError / TimeoutError / OutOfMemoryError / CancelledError / DeadlockError pre-date OSError and
-    // keep their Error parent so existing `catch (PermissionError e)` code is unchanged.
     for (auto n : {"FileNotFoundError", "FileExistsError", "NotSupportedError", "InterruptedError", "ConnectionError", "SignalError",
                    "BlockingIOError", "NotADirectoryError", "IsADirectoryError", "ProcessLookupError", "NoSpaceError",
                    "TooManyFilesError", "BusyError", "ReadOnlyFileSystemError"})
@@ -389,10 +437,10 @@ void install_builtins(Shared& sh) {
         in.raise("PermissionError", "sandbox({isolate: true}) needs fork(), which this platform does not have; the block was not run");
         return Value{};
 #else
-        int fd[2]; if (::pipe(fd) != 0) in.raise("OSError", "sandbox isolate: pipe failed");
+        int fd[2]; if (::pipe(fd) != 0) raise_last_os(in, "sandbox isolate: pipe");
         std::fflush(stdout); std::fflush(stderr);
         pid_t pid = ::fork();
-        if (pid < 0) { ::close(fd[0]); ::close(fd[1]); in.raise("OSError", "sandbox isolate: fork failed"); }
+        if (pid < 0) { int e = errno; ::close(fd[0]); ::close(fd[1]); errno = e; raise_last_os(in, "sandbox isolate: fork"); }
         if (pid == 0) {
             ::close(fd[0]);
             json::object res; std::string out;
@@ -588,7 +636,7 @@ void install_builtins(Shared& sh) {
         .def("processes", 0, 0, [](Interp& in, Args&) -> Value {
             need(in, in.caps.proc, "process listing");
             auto ps = os::list_processes(); auto l = make<List>();
-            if (!ps) in.raise("OSError", ps.err.what);
+            if (!ps) raise_os(in, ps.err, "OSError");
             for (auto& p : ps.value) { auto m = make<Map>(); m->set_str("pid", std::int64_t(p.pid)); m->set_str("ppid", std::int64_t(p.ppid)); m->set_str("name", strv(p.name)); m->set_str("rss", std::int64_t(p.rss_bytes)); l->push(obj(m)); }
             return obj(l);
         })
@@ -725,6 +773,82 @@ void install_builtins(Shared& sh) {
     M["handle:process"]["wait"] = native("process.wait", 1, 2, [](Interp& in, Args& a) -> Value { auto c = h_of(in, a[0], "process").payload_as<os::child>(); return std::int64_t(c->wait(a.size() > 1 ? std::uint64_t(i_of(in, a[1], "timeout")) : 0)); });
     M["handle:process"]["kill"] = native("process.kill", 1, 1, [](Interp& in, Args& a) -> Value { return h_of(in, a[0], "process").payload_as<os::child>()->kill(); });
     M["handle:process"]["get_running"] = native("process.running", 1, 1, [](Interp& in, Args& a) -> Value { return h_of(in, a[0], "process").payload_as<os::child>()->running(); });
+
+    // ------------------------------------------------ ProcessPool
+    //   auto pp = ProcessPool(4, {net: false, fs: false, timeout: 5000});   // workers default to no fs/net/proc/env
+    //   auto f = pp.submit("auto task(auto x) { return x * x; }", 7);     f.get() == 49
+    //   pp.map(src, [1, 2, 3]); pp.size(); pp.shutdown();
+    B["ProcessPool"] = native("ProcessPool", 0, 2, [](Interp& in, Args& a) -> Value {
+        register_script_process_task();
+        auto box = std::make_shared<PoolBox>();
+        // a worker never gets a capability its parent script lacks
+        auto cap = [&](const char* k, bool parent) { auto* v = opt_key(a, 1, k); return parent && v && Interp::truthy(*v); };
+        box->fs = cap("fs", in.caps.fs); box->net = cap("net", in.caps.net); box->proc = cap("proc", in.caps.proc); box->env = cap("env", in.caps.env);
+        if (auto* v = opt_key(a, 1, "timeout")) box->timeout_ms = std::uint64_t(i_of(in, *v, "timeout"));
+        os::process_pool::options po;
+        po.workers = a.empty() || is_nil(a[0]) ? 0u : unsigned(std::max<std::int64_t>(1, i_of(in, a[0], "workers")));
+        os::sandbox_policy sp; sp.deny_network = !box->net; sp.deny_exec = !box->proc; sp.deny_fs_write = !box->fs;
+        po.sandbox = sp;
+        try { box->pool = std::make_unique<os::process_pool>(std::move(po)); }
+        catch (const os::os_exception& e) { in.raise(e.script_type(), e.what()); }
+        Value h = make_handle("processpool", box, [box]() { if (box->pool) box->pool->shutdown(); });
+        as<Handle>(h)->props["workers"] = std::int64_t(box->pool->size());
+        return h;
+    });
+    auto pp_submit = [](Interp& in, PoolBox& box, const Value& src, const Value& arg) -> Value {
+        if (!box.pool) in.raise("ObjectDisposedError", "ProcessPool is shut down");
+        json::object p;
+        p.emplace_back("src", in.str(src)); p.emplace_back("arg", to_json(in, arg));
+        p.emplace_back("fs", box.fs); p.emplace_back("net", box.net); p.emplace_back("proc", box.proc); p.emplace_back("env", box.env);
+        if (box.timeout_ms) p.emplace_back("timeout_ms", double(box.timeout_ms));
+        auto fb = std::make_shared<FutureBox>();
+        fb->f = box.pool->submit("forge.script", json::dump(json::value(std::move(p))));
+        return make_handle("processfuture", fb, [] {});
+    };
+    auto pp_get = [](Interp& in, FutureBox& fb, std::uint64_t timeout_ms) -> Value {
+        if (!fb.got && !fb.err) {
+            auto end = timeout_ms ? os::monotonic_ns() + timeout_ms * 1000000 : 0;
+            while (fb.f.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
+                in.step();   // CancelledError / limits while waiting
+                if (end && os::monotonic_ns() > end) in.raise("TimeoutError", "ProcessPool future: timed out waiting for the worker");
+            }
+            try { fb.got = fb.f.get(); } catch (...) { fb.err = std::current_exception(); }
+        }
+        if (fb.err) {
+            try { std::rethrow_exception(fb.err); }
+            catch (const os::os_exception& e) { in.raise(e.script_type(), std::string("process worker: ") + e.what()); }
+            catch (const std::exception& e) { in.raise("RuntimeError", std::string("process worker: ") + e.what()); }
+        }
+        json::value r;
+        try { r = json::parse(*fb.got); } catch (const std::exception& e) { in.raise("ValueError", std::string("process worker: bad reply: ") + e.what()); }
+        bool okv = false; const json::value* val = nullptr; std::string type = "RuntimeError", msg, out;
+        for (auto& [k, v] : r.obj()) {
+            if (k == "ok") okv = v.v.index() == 1 && v.b(); else if (k == "value") val = &v;
+            else if (k == "type") type = v.str(); else if (k == "msg") msg = v.str(); else if (k == "out") out = v.str();
+        }
+        if (!out.empty() && in.sh->out) in.sh->out(out);
+        if (!okv) in.raise(in.sh->errors.count(type) ? type : std::string("RuntimeError"), msg);
+        return val ? from_json(*val) : Value(Nil{});
+    };
+    M["handle:processpool"]["submit"] = native("ProcessPool.submit", 2, 3, [pp_submit](Interp& in, Args& a) -> Value {
+        return pp_submit(in, *h_of(in, a[0], "processpool").payload_as<PoolBox>(), a[1], a.size() > 2 ? a[2] : Value(Nil{}));
+    });
+    M["handle:processpool"]["map"] = native("ProcessPool.map", 3, 3, [pp_submit, pp_get](Interp& in, Args& a) -> Value {
+        auto& box = *h_of(in, a[0], "processpool").payload_as<PoolBox>();
+        std::vector<Value> fs; for (auto& x : l_of(in, a[2], "ProcessPool.map").items) fs.push_back(pp_submit(in, box, a[1], x));
+        auto l = make<List>(); for (auto& f : fs) l->push(pp_get(in, *h_of(in, f, "processfuture").payload_as<FutureBox>(), 0)); return obj(l);
+    });
+    M["handle:processpool"]["size"] = native("ProcessPool.size", 1, 1, [](Interp& in, Args& a) -> Value {
+        auto& b = *h_of(in, a[0], "processpool").payload_as<PoolBox>(); return std::int64_t(b.pool ? b.pool->size() : 0); });
+    M["handle:processpool"]["resize"] = native("ProcessPool.resize", 2, 2, [](Interp& in, Args& a) -> Value {
+        auto& b = *h_of(in, a[0], "processpool").payload_as<PoolBox>(); if (b.pool) b.pool->set_workers(unsigned(std::max<std::int64_t>(1, i_of(in, a[1], "workers")))); return Nil{}; });
+    M["handle:processpool"]["shutdown"] = native("ProcessPool.shutdown", 1, 1, [](Interp& in, Args& a) -> Value {
+        auto& b = *h_of(in, a[0], "processpool").payload_as<PoolBox>(); if (b.pool) { b.pool->shutdown(); b.pool.reset(); } return Nil{}; });
+    M["handle:processfuture"]["get"] = native("ProcessFuture.get", 1, 2, [pp_get](Interp& in, Args& a) -> Value {
+        return pp_get(in, *h_of(in, a[0], "processfuture").payload_as<FutureBox>(), a.size() > 1 ? std::uint64_t(i_of(in, a[1], "timeout")) : 0); });
+    M["handle:processfuture"]["done"] = native("ProcessFuture.done", 1, 1, [](Interp& in, Args& a) -> Value {
+        auto& fb = *h_of(in, a[0], "processfuture").payload_as<FutureBox>();
+        return fb.got || fb.err || fb.f.wait_for(std::chrono::seconds(0)) == std::future_status::ready; });
 
     // ------------------------------------------------ json (forge::json) / hash (forge::hash::blake3) / re
     B["json"] = Lib("json")
@@ -978,4 +1102,8 @@ Value host_args(const std::string& js) {
     return v;
 }
 
+bool run_process_worker_if_requested(int argc, char** argv) {
+    register_script_process_task();
+    return os::process_pool::run_worker_if_requested(argc, argv);
+}
 } // namespace forge::script
