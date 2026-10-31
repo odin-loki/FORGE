@@ -1058,6 +1058,8 @@ void install_builtins(Shared& sh) {
     B["forge::plugin"] = native("forge::plugin", 1, 1, [](Interp& in, Args& a) -> Value {
         auto p = s_of(in, a[0], "forge::plugin");
         if (!is_native_module(p)) in.raise("ValueError", "forge::plugin: '" + p + "' is not a .so/.dylib/.dll");
+        // Refuse before resolving the path, so a sandboxed run gets PermissionError whether or not the file exists.
+        if (!(in.caps.fs && in.caps.net && in.caps.proc && in.caps.env)) in.raise("PermissionError", "native plugins are refused in sandboxed runs");
         return in.import_module(p);
     });
     B["forge::import"] = native("forge::import", 1, 1, [](Interp& in, Args& a) -> Value { return in.import_module(s_of(in, a[0], "forge::import")); });

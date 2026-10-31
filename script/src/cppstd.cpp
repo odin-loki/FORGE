@@ -591,7 +591,7 @@ void install_cpp_std(Shared& sh) {
     def("forge::shells", 0, 0, [](Interp&, Args&) -> Value {
         auto l = make<List>();
         for (auto& b : shells().all()) {
-            auto m = make<Map>(); std::string exe; for (auto& e : b.exes) if (!os::find_executable(e).empty()) { exe = e; break; }
+            auto m = make<Map>(); std::string exe = shell_exe(b);
             m->set_str("name", sv(b.name)); m->set_str("family", sv(b.family)); m->set_str("available", !exe.empty()); m->set_str("exe", sv(exe));
             m->set_str("tested", b.golden_tested); m->set_str("emit", bool(b.emitter)); m->set_str("emit_tested", b.emit_tested); auto al = make<List>(); for (auto& x : b.aliases) al->push(sv(x)); m->set_str("aliases", obj(al));
             l->push(obj(m));

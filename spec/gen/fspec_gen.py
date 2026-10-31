@@ -7,7 +7,7 @@ CLASSES = {"elementwise", "reduction", "contraction", "data_movement", "stateful
 
 def parse(path):
     ops = []
-    for ln, line in enumerate(open(path), 1):
+    for ln, line in enumerate(open(path, encoding="utf-8"), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -71,13 +71,13 @@ def main():
           "inline std::optional<op> op_from_name(std::string_view n) {",
           "    for (std::size_t i = 0; i < op_count; ++i) if (op_table[i].name == n) return op(i);",
           "    return std::nullopt;", "}", "", "} // namespace forge::spec", ""]
-    open(os.path.join(a.out, "forge", "spec", "ops.gen.hpp"), "w").write("\n".join(h))
+    open(os.path.join(a.out, "forge", "spec", "ops.gen.hpp"), "w", encoding="utf-8", newline="\n").write("\n".join(h))
     d = ["# FORGE op reference (generated)", "", f"{len(ops)} ops.", "",
          "| op | class | inputs | shape rule | tolerance | fusion | cost | attrs | semantics |",
          "|---|---|---|---|---|---|---|---|---|"]
     for o in ops:
         d.append(f"| `{o['name']}` | {o['class']} | {o['inputs']} | {o['shape']} | {o['tol']} | {o['fuse']} | {o['cost']} | {o['attrs']} | {o['doc']} |")
-    open(os.path.join(a.out, "ops.md"), "w").write("\n".join(d) + "\n")
+    open(os.path.join(a.out, "ops.md"), "w", encoding="utf-8", newline="\n").write("\n".join(d) + "\n")
 
 if __name__ == "__main__":
     main()

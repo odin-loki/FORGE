@@ -8,6 +8,7 @@ a random tiny Qwen3.5 text model built with transformers, imported with `forge i
 Needs torch + transformers >= 5 (qwen3_5); skips otherwise.
 """
 import argparse, json, os, sys
+import shutil
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny_llama as tl
@@ -50,14 +51,16 @@ def wrap_multimodal(src, dst):
     W = {}
     for f in os.listdir(src):
         if f.endswith(".safetensors"): W.update(load_file(os.path.join(src, f)))
-    W = {(k.replace("model.", "model.language_model.", 1) if k.startswith("model.") else k): v for k, v in W.items()}
+    # Newer transformers already save the text model under model.language_model.; prefix only the old layout.
+    W = {(k.replace("model.", "model.language_model.", 1) if k.startswith("model.") and not k.startswith("model.language_model.") else k): v
+         for k, v in W.items()}
     W["model.visual.dummy.weight"] = np.zeros((2, 2), np.float32)   # ignored by the importer
     save_file(W, os.path.join(dst, "model.safetensors"))
     tc = json.load(open(os.path.join(src, "config.json"))); tc.pop("architectures", None); tc["model_type"] = "qwen3_5_text"
     json.dump(dict(architectures=["Qwen3_5ForConditionalGeneration"], model_type="qwen3_5", text_config=tc,
                    tie_word_embeddings=False), open(os.path.join(dst, "config.json"), "w"), indent=1)
     for f in ("tokenizer.json",):
-        open(os.path.join(dst, f), "w").write(open(os.path.join(src, f)).read())
+        shutil.copyfile(os.path.join(src, f), os.path.join(dst, f))   # bytes: no locale re-encoding on Windows
 
 def write_gguf(m, hf, path):
     """Write the model the way llama.cpp's Qwen3_5TextModel converter does (arch qwen35): (1 + w) norms,
@@ -78,7 +81,7 @@ def write_gguf(m, hf, path):
     w.add_uint32("qwen35.full_attention_interval", c["full_attention_interval"])
     w.add_ssm_conv_kernel(c["linear_conv_kernel_dim"]); w.add_ssm_state_size(dk); w.add_ssm_group_count(nk)
     w.add_ssm_time_step_rank(nv); w.add_ssm_inner_size(nv * dv); w.add_bool("qwen35.ssm.v_head_reordered", True)
-    tj = json.load(open(os.path.join(hf, "tokenizer.json")))
+    tj = json.load(open(os.path.join(hf, "tokenizer.json"), encoding="utf-8"))
     vocab = sorted(tj["model"]["vocab"].items(), key=lambda kv: kv[1]); toks = [k for k, _ in vocab]
     toks += [f"<pad{i}>" for i in range(len(toks), c["vocab_size"])]
     w.add_tokenizer_model("gpt2"); w.add_token_list(toks[:c["vocab_size"]]); w.add_eos_token_id(c["eos_token_id"])

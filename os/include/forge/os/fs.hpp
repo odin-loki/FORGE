@@ -4,6 +4,7 @@
 // temp files/dirs and atomic writes. std::filesystem underneath where it is portable; native calls for the
 // rest. Nothing throws: every call returns os::result / os::status. Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
+#include <chrono>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -86,14 +87,18 @@ inline status chown(const std::string& p, long uid, long gid) {
     (void)p; (void)uid; (void)gid; return {{}, unsupported("chown")};
 #endif
 }
-// Unix-epoch ns minus file_clock-epoch ns (file_clock's epoch is implementation-defined; clock_cast is not
-// available everywhere). Sampled once; good to well under a millisecond.
-inline std::int64_t file_clock_offset_ns() {
-    static const std::int64_t off = [] {
+// Unix epoch minus file_clock epoch, in file_clock ticks (the epoch is implementation-defined; clock_cast is not
+// available everywhere). Kept in the clock's own tick type: MSVC's 1601 FILETIME epoch is ~1.3e19 ns ago, which
+// overflows int64 nanoseconds. Sampled once; good to well under a millisecond.
+inline stdfs::file_time_type::duration file_clock_offset() {
+    using fdur = stdfs::file_time_type::duration;
+    static const fdur off = [] {
         auto f = stdfs::file_time_type::clock::now(); auto s = std::chrono::system_clock::now();
-        auto ns = [](auto d) { return std::int64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()); };
-        std::int64_t v = ns(s.time_since_epoch()) - ns(f.time_since_epoch());
-        return (v + 500000) / 1000000 * 1000000;   // round to ms: both clocks tick together
+        fdur v = std::chrono::duration_cast<fdur>(s.time_since_epoch()) - f.time_since_epoch();
+        // Every implementation's offset is a whole number of seconds (0, the 1601 FILETIME epoch, libstdc++'s
+        // 2174 epoch), and some file clocks tick coarsely (mingw: ~15 ms), so round to the second.
+        auto r = std::chrono::round<std::chrono::seconds>(v);
+        return std::chrono::duration_cast<fdur>(r);
     }();
     return off;
 }
@@ -101,11 +106,11 @@ inline std::int64_t file_clock_offset_ns() {
 inline result<std::int64_t> mtime_ns(const std::string& p) {
     std::error_code ec; auto t = stdfs::last_write_time(u8path(p), ec);
     if (ec) return {0, from_ec(ec, "mtime " + p)};
-    return {std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count() + file_clock_offset_ns(), {}};
+    return {std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch() + file_clock_offset()).count(), {}};
 }
 inline status set_mtime_ns(const std::string& p, std::int64_t ns) {
     std::error_code ec;
-    auto d = std::chrono::duration_cast<stdfs::file_time_type::duration>(std::chrono::nanoseconds(ns - file_clock_offset_ns()));
+    auto d = std::chrono::duration_cast<stdfs::file_time_type::duration>(std::chrono::nanoseconds(ns)) - file_clock_offset();
     stdfs::last_write_time(u8path(p), stdfs::file_time_type(d), ec);
     if (ec) return {{}, from_ec(ec, "set mtime " + p)};
     return {};

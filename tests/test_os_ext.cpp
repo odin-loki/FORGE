@@ -176,7 +176,12 @@ TEST(local_ipc) {
 #endif
 }
 // ---------------------------------------------------------------- 10 crash handling
-static __attribute__((noinline)) std::vector<os::stack_frame> deep_trace(int n) { if (n) { auto v = deep_trace(n - 1); asm volatile(""); return v; } return os::stack_trace(); }
+#if defined(_MSC_VER) && !defined(__clang__)
+#define FORGE_TEST_NOINLINE __declspec(noinline)
+#else
+#define FORGE_TEST_NOINLINE __attribute__((noinline))
+#endif
+static FORGE_TEST_NOINLINE std::vector<os::stack_frame> deep_trace(int n) { if (n) { auto v = deep_trace(n - 1); std::atomic_signal_fence(std::memory_order_seq_cst); return v; } return os::stack_trace(); }
 TEST(crash_handling) {
     auto st = deep_trace(3); CHECK(st.size() >= 3);
     std::printf("%s", os::format_stack_trace(std::vector<os::stack_frame>(st.begin(), st.begin() + std::ptrdiff_t(std::min<std::size_t>(st.size(), 5)))).c_str());

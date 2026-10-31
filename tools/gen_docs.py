@@ -12,11 +12,11 @@ def gpu_names():
     return set(gpu_gen.UNARY) | set(gpu_gen.BINARY) | set(gpu_gen.OTHER)
 
 def capi():
-    src = open(os.path.join(root, "mind", "include", "forge.h")).read()
+    src = open(os.path.join(root, "mind", "include", "forge.h"), encoding="utf-8").read()
     abi = re.search(r"#define FORGE_ABI_VERSION (\d+)", src).group(1)
     fns = []
     for m in re.finditer(r"^([A-Za-z_][\w\s\*]*?\b(forge_\w+)\s*\([^;]*\);)[ \t]*(/\*(.*?)\*/)?", src, re.M | re.S):
-        sig = " ".join(m.group(1).split())
+        sig = " ".join(m.group(1).replace("FORGE_API ", "").split())   # export macro is not part of the signature
         fns.append((m.group(2), sig, (m.group(4) or "").strip()))
     return abi, fns
 
@@ -41,11 +41,11 @@ def render():
 def main():
     path = os.path.join(root, "docs", "reference.md"); text = render()
     if "--check" in sys.argv:
-        cur = open(path).read() if os.path.exists(path) else ""
+        cur = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
         if cur != text:
             print("docs/reference.md is stale: run tools/gen_docs.py"); return 1
         print("docs/reference.md up to date"); return 0
-    open(path, "w").write(text); print("wrote", path); return 0
+    open(path, "w", encoding="utf-8", newline="\n").write(text); print("wrote", path); return 0
 
 if __name__ == "__main__":
     sys.exit(main())

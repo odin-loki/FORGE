@@ -1,5 +1,6 @@
 // forge::script AST tree-walker: the REPL / eval path, and delegated statements from the VM.
 #include "interp.hpp"
+#include <exception>
 
 namespace forge::script {
 
@@ -20,17 +21,19 @@ Flow Interp::exec_block(const Node& n, const Ref<Env>& env) {
                 if (std::size_t(*it) < env->slots.size()) { Value dead = std::move(env->slots[std::size_t(*it)]); env->slots[std::size_t(*it)] = Nil{}; }
         }
     } scope{*this, n, env};
+    // Defers run from a destructor while an error unwinds, not from catch (...) { ...; throw; }: MSVC keeps every
+    // frame alive until a catch block exits, so one rethrow per nested block overflowed the stack on deep recursion.
+    struct Unwind {
+        std::vector<const Node*>& defers; decltype(run_defers)& run; int pending = std::uncaught_exceptions(); bool done = false;
+        ~Unwind() { if (!done && !defers.empty() && std::uncaught_exceptions() > pending) { try { run(); } catch (...) {} } }
+    } unwind{defers, run_defers};
     Flow f = Flow::Normal;
-    try {
-        for (auto& s : n.kids) {
-            if (s->k == NK::Defer) { defers.push_back(s.get()); continue; }
-            f = exec(*s, env);
-            if (f != Flow::Normal) break;
-        }
-    } catch (...) {
-        if (!defers.empty()) { try { run_defers(); } catch (...) {} }
-        throw;
+    for (auto& s : n.kids) {
+        if (s->k == NK::Defer) { defers.push_back(s.get()); continue; }
+        f = exec(*s, env);
+        if (f != Flow::Normal) break;
     }
+    unwind.done = true;
     run_defers();
     return f;
 }

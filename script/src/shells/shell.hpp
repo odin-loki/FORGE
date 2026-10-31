@@ -39,6 +39,9 @@ private:
     std::vector<shell_backend> v_;
 };
 const shell_registry& shells();     // all registered backends (built once)
+// The executable to run for a backend ("" if none is installed). On Windows this is a full path and skips
+// the WSL bash relays (System32 and WindowsApps bash.exe), which run Linux bash and cannot take Windows paths or quoting.
+std::string shell_exe(const shell_backend& b);
 
 namespace shellq {
 inline std::string posix(const std::string& s) { std::string o = "'"; for (char c : s) { if (c == '\'') o += "'\\''"; else o += c; } return o + "'"; }

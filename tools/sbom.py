@@ -16,7 +16,8 @@ def files(root):
     try:
         out = subprocess.run(["git", "-C", root, "ls-files"], check=True, capture_output=True, text=True).stdout.split("\n")
     except Exception:
-        out = [os.path.relpath(os.path.join(d, f), root) for d, _, fs in os.walk(root) if "/build" not in d and "/.git" not in d for f in fs]
+        out = [os.path.relpath(os.path.join(d, f), root).replace(os.sep, "/") for d, _, fs in os.walk(root)
+               if "/build" not in d.replace(os.sep, "/") and "/.git" not in d.replace(os.sep, "/") for f in fs]
     return sorted(f for f in out if f and f.endswith(SRC_EXT) and os.path.isfile(os.path.join(root, f)))
 
 def sha(path, algo):

@@ -32,7 +32,7 @@ TEST(golden_scripts) {
         auto want_p = fs::path(f).replace_extension(".out");
         if (update) { std::ofstream(want_p, std::ios::binary) << vm; continue; }
         CHECK_MSG(fs::exists(want_p), "%s: missing %s", name.c_str(), want_p.string().c_str());
-        auto want = slurp(want_p);
+        auto want = slurp(want_p); std::erase(want, '\r');   // CRLF checkout (core.autocrlf on Windows)
         CHECK_MSG(vm == want, "%s: output differs\n--- got\n%s--- want\n%s", name.c_str(), vm.c_str(), want.c_str());
     }
 }

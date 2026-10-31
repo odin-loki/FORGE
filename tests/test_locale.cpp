@@ -198,16 +198,21 @@ static void dates() {
     EQ(L::format_duration(std::chrono::seconds(3725), "en"), "1 hour, 2 minutes");
     EQ(L::format_duration(std::chrono::seconds(3725), "en", L::unit_width::narrow, 3), "1h 2m 5s");
 }
+// MSVC's std::chrono::tzdb takes abbreviations from Windows ICU, which gives "GMT-5" where the IANA data says "EST"
+// (whether a zone gets a letter abbreviation depends on the user's display locale).
+static bool abbrev_is(const std::string& got, const char* iana, const char* gmt_form) {
+    return got == iana || (L::tz_backend() == "chrono-tzdb" && got == gmt_form);
+}
 static void zones() {
     std::printf("  tz backend: %s, local zone: %s\n", L::tz_backend().c_str(), L::local_zone().c_str());
     auto u = L::zone_at("UTC", L::sys_seconds{}); CHECK(u && u.value.offset.count() == 0);
     if (L::tz_backend() == "utc-only") return;
     auto t = L::sys_seconds(std::chrono::seconds(1793000000));   // 2026-10-26 07:33 UTC (AEDT in Sydney)
-    auto z = L::zone_at("Australia/Sydney", t); CHECK(z && z.value.offset.count() == 39600 && z.value.dst && z.value.abbrev == "AEDT");
+    auto z = L::zone_at("Australia/Sydney", t); CHECK(z && z.value.offset.count() == 39600 && z.value.dst && abbrev_is(z.value.abbrev, "AEDT", "GMT+11"));
     z = L::zone_at("Australia/Sydney", L::sys_seconds(std::chrono::seconds(1780000000)));   // May 2026: AEST
     CHECK(z && z.value.offset.count() == 36000 && !z.value.dst);
     z = L::zone_at("America/New_York", L::sys_seconds(std::chrono::seconds(4102444800)));  // 2100-01-01: POSIX footer
-    CHECK(z && z.value.offset.count() == -18000 && z.value.abbrev == "EST");
+    CHECK(z && z.value.offset.count() == -18000 && abbrev_is(z.value.abbrev, "EST", "GMT-5"));
     z = L::zone_at("America/New_York", L::sys_seconds(std::chrono::seconds(4118083200)));  // 2100-07-01
     CHECK(z && z.value.offset.count() == -14400);
     CHECK(!L::zone_at("Nowhere/Atlantis", t));
@@ -219,7 +224,7 @@ static void zones() {
     auto a = L::from_local("Australia/Sydney", ls(2026, 4, 5, 2, 30), true), b = L::from_local("Australia/Sydney", ls(2026, 4, 5, 2, 30), false);
     CHECK(a && b && b.value - a.value == std::chrono::seconds(3600));
     auto r = L::from_time(std::chrono::system_clock::time_point(std::chrono::seconds(1793000000)), "Australia/Sydney");
-    CHECK(r && r.value.hour == 18 && r.value.minute == 33 && r.value.zone_abbrev == "AEDT");
+    CHECK(r && r.value.hour == 18 && r.value.minute == 33 && abbrev_is(r.value.zone_abbrev, "AEDT", "GMT+11"));
     if (r) { EQ(L::format_pattern(r.value, "HH:mm zzz xxx", "en"), "18:33 AEDT +11:00"); EQ(L::format_pattern(r.value, "VV O", "en"), "Australia/Sydney GMT+11"); }
     auto names = L::zone_names(); CHECK(names.size() > 300);
 }

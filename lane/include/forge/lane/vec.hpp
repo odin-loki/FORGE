@@ -63,8 +63,8 @@ template <Target Tg> constexpr int kind() {   // 5 = rvv (fixed VLEN), 4 = sve (
 #if defined(__AVX512F__)
     if constexpr (Has<Tg, avx512f>) return 2;
 #endif
-#if defined(__AVX2__) && defined(__FMA__)
-    if constexpr (Has<Tg, avx2> && Has<Tg, fma>) return 1;
+#if defined(__AVX2__) && (defined(__FMA__) || defined(_MSC_VER))   // MSVC /arch:AVX2 implies FMA3 but never defines __FMA__
+    if constexpr (Has<Tg, avx2> && Has<Tg, fma3>) return 1;
 #endif
     return 0;
 }
