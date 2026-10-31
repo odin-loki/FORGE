@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <stop_token>
 #if defined(FORGE_OS_POSIX)
 #include <sys/time.h>
 #endif
@@ -16,7 +17,34 @@ struct proc_limits {
     std::uint64_t memory_bytes = 0;   // address-space cap (RLIMIT_AS / Job Object process memory); 0 = none
     std::uint64_t cpu_seconds = 0;    // RLIMIT_CPU / Job Object user time; 0 = none
     std::uint64_t open_files = 0;     // RLIMIT_NOFILE; 0 = inherit
+    std::uint64_t file_size_bytes = 0;// RLIMIT_FSIZE (largest file the process may write); 0 = none. POSIX only
+    bool no_core = false;             // RLIMIT_CORE = 0: no core dumps. POSIX only (Windows has no per-process core rlimit)
 };
+
+#if defined(FORGE_OS_POSIX)
+// Apply `lim` to the calling process (POSIX; async-signal-safe, so it may run in a forked child before exec).
+// A request above an existing hard limit is lowered to it (an unprivileged process cannot raise its hard limit,
+// and setrlimit would otherwise fail and leave no limit at all); soft never exceeds hard. CPU: soft = cpu_seconds,
+// hard = cpu_seconds + 1 (SIGXCPU first, then SIGKILL). Returns false if any setrlimit failed.
+inline bool apply_limits(const proc_limits& lim) noexcept {
+    bool ok = true;
+    auto set = [&](int which, rlim_t soft, rlim_t hard) {
+        struct rlimit cur{};
+        if (::getrlimit(which, &cur) == 0 && cur.rlim_max != RLIM_INFINITY) {
+            if (hard == RLIM_INFINITY || hard > cur.rlim_max) hard = cur.rlim_max;
+        }
+        if (soft > hard) soft = hard;
+        struct rlimit r{soft, hard};
+        if (::setrlimit(which, &r) != 0) ok = false;
+    };
+    if (lim.memory_bytes) set(RLIMIT_AS, rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes));
+    if (lim.cpu_seconds) set(RLIMIT_CPU, rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1));
+    if (lim.open_files) set(RLIMIT_NOFILE, rlim_t(lim.open_files), rlim_t(lim.open_files));
+    if (lim.file_size_bytes) set(RLIMIT_FSIZE, rlim_t(lim.file_size_bytes), rlim_t(lim.file_size_bytes));
+    if (lim.no_core) set(RLIMIT_CORE, 0, 0);
+    return ok;
+}
+#endif
 
 struct spawn_spec {
     std::vector<std::string> argv;
@@ -30,9 +58,53 @@ struct spawn_spec {
     std::uint64_t timeout_ms = 0;                      // 0 = wait forever; on expiry the process tree is killed
     std::uint64_t max_output = 64ull << 20;            // per stream; extra output is discarded, truncated = true
     proc_limits limits;
+    // Redirect a stream to a file (empty = not used). stdin_file wins over stdin_data; stdout_file/stderr_file
+    // win over capture_* (and merge_stderr sends stderr to stdout_file). Files are created/truncated, or
+    // appended to with append_output.
+    std::string stdin_file, stdout_file, stderr_file;
+    bool append_output = false;
+    // Cancel: when stop is requested the whole process tree is killed, cancelled = true, exit_code = 125.
+    std::stop_token stop{};
+    // POSIX: setsid() (new session, no controlling terminal) instead of setpgid(0,0); the session leader's
+    // group is still killed as a whole. Windows: CREATE_NEW_PROCESS_GROUP (the Job Object kills the tree).
+    bool new_session = false;
+    // Memory watchdog: kill the tree once its memory passes this many bytes (0 = off); memory_killed = true,
+    // exit_code = 137. Windows: Job Object committed memory of every process in the job; Linux/Android: RSS of
+    // the process group (/proc); other POSIX: the child's RSS is not readable, use limits.memory_bytes.
+    std::uint64_t watch_memory_bytes = 0;
 };
 
+#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+// Signal every process in group `pgid` (spawned children lead their own group). True on success.
+inline bool kill_group(std::uint64_t pgid, int sig = SIGKILL) { return pgid > 1 && ::kill(-pid_t(pgid), sig) == 0; }
+#endif
+namespace detail_proc {
+#if defined(__linux__)
+// Sum of RSS (bytes) over processes whose process group is pgid.
+inline std::uint64_t group_rss(pid_t pgid) {
+    std::uint64_t total = 0; long pg = ::sysconf(_SC_PAGESIZE);
+    DIR* d = ::opendir("/proc"); if (!d) return 0;
+    while (dirent* e = ::readdir(d)) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char path[64]; std::snprintf(path, sizeof path, "/proc/%s/stat", e->d_name);
+        FILE* f = std::fopen(path, "r"); if (!f) continue;
+        char buf[1024]; std::size_t n = std::fread(buf, 1, sizeof buf - 1, f); std::fclose(f); buf[n] = 0;
+        const char* q = std::strrchr(buf, ')'); if (!q) continue;
+        // fields after ')': state ppid pgrp ... rss is field 24 overall (22nd after the comm)
+        long long v[22] = {}; char st = 0;
+        if (std::sscanf(q + 2, "%c %lld %lld", &st, &v[0], &v[1]) != 3 || v[1] != pgid) continue;
+        const char* r = q + 2; int field = 0;
+        while (*r && field < 21) { if (*r == ' ') ++field; ++r; }
+        total += std::uint64_t(std::strtoull(r, nullptr, 10)) * std::uint64_t(pg);
+    }
+    ::closedir(d); return total;
+}
+#endif
+}
+
+
 struct proc_result {
+    bool cancelled = false, memory_killed = false;
     int exit_code = -1;      // 128+signal when killed by a signal (POSIX convention)
     int term_signal = 0;
     bool timed_out = false, truncated = false;
@@ -125,14 +197,25 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE in_r = nullptr, in_w = nullptr, out_r = nullptr, out_w = nullptr, err_r = nullptr, err_w = nullptr;
     auto closeh = [](HANDLE& h) { if (h) { CloseHandle(h); h = nullptr; } };
+    auto open_file = [&](const std::string& f, bool write) -> HANDLE {
+        if (f.empty()) return nullptr;
+        HANDLE h = CreateFileW(widen(f).c_str(), write ? (sp.append_output ? FILE_APPEND_DATA : GENERIC_WRITE) : GENERIC_READ,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, write ? (sp.append_output ? OPEN_ALWAYS : CREATE_ALWAYS) : OPEN_EXISTING,
+                               FILE_ATTRIBUTE_NORMAL, nullptr);
+        return h == INVALID_HANDLE_VALUE ? INVALID_HANDLE_VALUE : h;
+    };
+    HANDLE fin = open_file(sp.stdin_file, false), fout = open_file(sp.stdout_file, true), ferr = sp.merge_stderr ? nullptr : open_file(sp.stderr_file, true);
+    for (auto [h, f] : {std::pair{fin, &sp.stdin_file}, {fout, &sp.stdout_file}, {ferr, &sp.stderr_file}})
+        if (h == INVALID_HANDLE_VALUE) { auto e = last_error("open " + *f); for (HANDLE x : {fin, fout, ferr}) if (x && x != INVALID_HANDLE_VALUE) CloseHandle(x); return {{}, e}; }
     if (!CreatePipe(&in_r, &in_w, &sa, 0)) return {{}, last_error("CreatePipe")};
     SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
-    if (sp.capture_stdout || sp.merge_stderr) { CreatePipe(&out_r, &out_w, &sa, 0); SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0); }
-    if (sp.capture_stderr && !sp.merge_stderr) { CreatePipe(&err_r, &err_w, &sa, 0); SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0); }
+    if (!fout && (sp.capture_stdout || sp.merge_stderr)) { CreatePipe(&out_r, &out_w, &sa, 0); SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0); }
+    if (!ferr && sp.capture_stderr && !sp.merge_stderr) { CreatePipe(&err_r, &err_w, &sa, 0); SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0); }
     STARTUPINFOW si{}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = in_r;
-    si.hStdOutput = out_w ? out_w : GetStdHandle(STD_OUTPUT_HANDLE);
-    si.hStdError = sp.merge_stderr ? out_w : (err_w ? err_w : GetStdHandle(STD_ERROR_HANDLE));
+    si.hStdInput = fin ? fin : in_r;
+    HANDLE o1 = fout ? fout : out_w;
+    si.hStdOutput = o1 ? o1 : GetStdHandle(STD_OUTPUT_HANDLE);
+    si.hStdError = sp.merge_stderr ? si.hStdOutput : (ferr ? ferr : (err_w ? err_w : GetStdHandle(STD_ERROR_HANDLE)));
     HANDLE job = CreateJobObjectW(nullptr, nullptr);
     if (job) {
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
@@ -143,13 +226,13 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     }
     PROCESS_INFORMATION pi{};
     std::wstring wcwd = widen(sp.cwd);
-    BOOL ok = CreateProcessW(widen(exe).c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
+    BOOL ok = CreateProcessW(widen(exe).c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
                              envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), &si, &pi);
-    closeh(in_r); closeh(out_w); closeh(err_w);
+    closeh(in_r); closeh(out_w); closeh(err_w); closeh(fin); closeh(fout); closeh(ferr);
     if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); closeh(in_w); closeh(out_r); closeh(err_r); if (job) CloseHandle(job); return {{}, e}; }
     if (job) AssignProcessToJobObject(job, pi.hProcess);
     ResumeThread(pi.hThread);
-    std::string in = sp.stdin_data.value_or("");
+    std::string in = sp.stdin_file.empty() ? sp.stdin_data.value_or("") : std::string{};
     struct rd { HANDLE h; std::string* s; std::uint64_t cap; bool trunc = false; };
     rd ro{out_r, &res.out, sp.max_output}, re{err_r, &res.err, sp.max_output};
     auto reader = [](void* p) -> unsigned { auto* r = static_cast<rd*>(p); char buf[4096]; DWORD n;
@@ -159,10 +242,27 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     if (err_r) th[1] = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, reader, &re, 0, nullptr));
     if (!in.empty()) { DWORD w = 0; std::size_t off = 0; while (off < in.size() && WriteFile(in_w, in.data() + off, DWORD(std::min<std::size_t>(in.size() - off, 1 << 20)), &w, nullptr)) off += w; }
     closeh(in_w);
-    DWORD wr = WaitForSingleObject(pi.hProcess, sp.timeout_ms ? DWORD(sp.timeout_ms) : INFINITE);
-    if (wr == WAIT_TIMEOUT) { res.timed_out = true; if (job) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, INFINITE); }
+    // Wait in 50 ms slices: timeout, stop token and the memory watchdog (Job Object committed memory of the tree).
+    const std::uint64_t deadline = sp.timeout_ms ? t0 + sp.timeout_ms * 1000000ull : 0;
+    for (;;) {
+        DWORD slice = INFINITE;
+        if (deadline || sp.stop.stop_possible() || sp.watch_memory_bytes) {
+            std::uint64_t now = monotonic_ns();
+            if (deadline && now >= deadline) { res.timed_out = true; break; }
+            slice = 50; if (deadline) slice = DWORD(std::min<std::uint64_t>(50, (deadline - now) / 1000000 + 1));
+        }
+        if (WaitForSingleObject(pi.hProcess, slice) == WAIT_OBJECT_0) break;
+        if (sp.stop.stop_requested()) { res.cancelled = true; break; }
+        if (sp.watch_memory_bytes && job) {
+            std::uint64_t used = 0;
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION xi{};
+            if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &xi, sizeof xi, nullptr)) used = std::uint64_t(xi.PeakJobMemoryUsed);
+            if (used > sp.watch_memory_bytes) { res.memory_killed = true; break; }
+        }
+    }
+    if (res.timed_out || res.cancelled || res.memory_killed) { if (job) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, INFINITE); }
     for (auto t : th) if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
-    DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code); res.exit_code = res.timed_out ? 124 : int(code);
+    DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code); res.exit_code = res.timed_out ? 124 : res.cancelled ? 125 : res.memory_killed ? 137 : int(code);
     res.truncated = ro.trunc || re.trunc;
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread); closeh(out_r); closeh(err_r); if (job) CloseHandle(job);
     res.wall_ms = (monotonic_ns() - t0) / 1000000;
@@ -185,37 +285,55 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     int pin[2] = {-1, -1}, pout[2] = {-1, -1}, perr[2] = {-1, -1}, pexec[2] = {-1, -1};
     auto cl = [](int& fd) { if (fd >= 0) { ::close(fd); fd = -1; } };
     if (::pipe(pin) || ::pipe(pexec)) return {{}, last_error("pipe")};
-    if ((sp.capture_stdout || sp.merge_stderr) && ::pipe(pout)) return {{}, last_error("pipe")};
-    if (sp.capture_stderr && !sp.merge_stderr && ::pipe(perr)) return {{}, last_error("pipe")};
+    const int oflags = O_WRONLY | O_CREAT | O_CLOEXEC | (sp.append_output ? O_APPEND : O_TRUNC);
+    int fin = -1, fout = -1, ferr = -1;
+    auto open_fail = [&](const std::string& f) { auto e = last_error("open " + f); for (int* x : {&fin, &fout, &ferr, &pin[0], &pin[1], &pexec[0], &pexec[1]}) cl(*x); return e; };
+    if (!sp.stdin_file.empty() && (fin = ::open(sp.stdin_file.c_str(), O_RDONLY | O_CLOEXEC)) < 0) return {{}, open_fail(sp.stdin_file)};
+    if (!sp.stdout_file.empty() && (fout = ::open(sp.stdout_file.c_str(), oflags, 0644)) < 0) return {{}, open_fail(sp.stdout_file)};
+    if (!sp.stderr_file.empty() && !sp.merge_stderr && (ferr = ::open(sp.stderr_file.c_str(), oflags, 0644)) < 0) return {{}, open_fail(sp.stderr_file)};
+    if (fout < 0 && (sp.capture_stdout || sp.merge_stderr) && ::pipe(pout)) return {{}, last_error("pipe")};
+    if (ferr < 0 && sp.capture_stderr && !sp.merge_stderr && ::pipe(perr)) return {{}, last_error("pipe")};
     for (int fd : {pin[1], pout[0], perr[0], pexec[0], pexec[1]}) if (fd >= 0) detail_proc::cloexec(fd);
-    int devnull = sp.stdin_data ? -1 : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const bool use_stdin = sp.stdin_data.has_value() && fin < 0;
+    int devnull = (use_stdin || fin >= 0) ? -1 : ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    const bool new_session = sp.new_session;
     const char* cwd = sp.cwd.empty() ? nullptr : sp.cwd.c_str();
     const proc_limits lim = sp.limits;
     pid_t p = ::fork();
     if (p < 0) { auto e = last_error("fork"); for (int* f : {&pin[0], &pin[1], &pout[0], &pout[1], &perr[0], &perr[1], &pexec[0], &pexec[1]}) cl(*f); return {{}, e}; }
     if (p == 0) {
-        ::setpgid(0, 0);
+        if (new_session) ::setsid(); else ::setpgid(0, 0);
         ::signal(SIGPIPE, SIG_DFL);
-        if (sp.stdin_data) ::dup2(pin[0], 0); else if (devnull >= 0) ::dup2(devnull, 0);
-        if (pout[1] >= 0) ::dup2(pout[1], 1);
-        if (sp.merge_stderr && pout[1] >= 0) ::dup2(pout[1], 2); else if (perr[1] >= 0) ::dup2(perr[1], 2);
-        if (lim.memory_bytes) { struct rlimit r{rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes)}; ::setrlimit(RLIMIT_AS, &r); }
-        if (lim.cpu_seconds) { struct rlimit r{rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1)}; ::setrlimit(RLIMIT_CPU, &r); }
-        if (lim.open_files) { struct rlimit r{rlim_t(lim.open_files), rlim_t(lim.open_files)}; ::setrlimit(RLIMIT_NOFILE, &r); }
+        if (fin >= 0) ::dup2(fin, 0); else if (use_stdin) ::dup2(pin[0], 0); else if (devnull >= 0) ::dup2(devnull, 0);
+        const int o1 = fout >= 0 ? fout : pout[1];
+        if (o1 >= 0) ::dup2(o1, 1);
+        if (sp.merge_stderr && o1 >= 0) ::dup2(o1, 2); else if (ferr >= 0) ::dup2(ferr, 2); else if (perr[1] >= 0) ::dup2(perr[1], 2);
+        (void)apply_limits(lim);
         if (cwd && ::chdir(cwd) != 0) { int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127); }
         ::execve(exe.c_str(), av.data(), ev.data());
         int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127);
     }
-    ::setpgid(p, p);   // also in the parent, to close the race
-    cl(pin[0]); cl(pout[1]); cl(perr[1]); cl(pexec[1]); if (devnull >= 0) ::close(devnull);
+    if (!new_session) ::setpgid(p, p);   // also in the parent, to close the race (setsid makes p the group id too)
+    cl(pin[0]); cl(pout[1]); cl(perr[1]); cl(pexec[1]); cl(fin); cl(fout); cl(ferr); if (devnull >= 0) ::close(devnull);
     int child_errno = 0;
     { auto n = ::read(pexec[0], &child_errno, sizeof child_errno); if (n != sizeof child_errno) child_errno = 0; cl(pexec[0]); }
     if (child_errno) {
         cl(pin[1]); cl(pout[0]); cl(perr[0]); int st; ::waitpid(p, &st, 0);
         return {{}, {child_errno, "spawn " + sp.argv[0] + ": " + error_text(child_errno)}};
     }
-    std::string in = sp.stdin_data.value_or("");
+    std::string in = use_stdin ? *sp.stdin_data : std::string{};
     std::size_t in_off = 0;
+    // stop / memory watchdog: checked at least every 50 ms
+    const bool watching = sp.stop.stop_possible() || sp.watch_memory_bytes;
+    std::uint64_t next_mem_check = 0;
+    auto check_watch = [&]() -> bool {
+        if (sp.stop.stop_requested()) { res.cancelled = true; return true; }
+#if defined(__linux__)
+        const std::uint64_t now = monotonic_ns();
+        if (sp.watch_memory_bytes && now >= next_mem_check && (next_mem_check = now + 50000000ull, true) && detail_proc::group_rss(p) > sp.watch_memory_bytes && detail_proc::group_rss(p) > sp.watch_memory_bytes) { res.memory_killed = true; return true; }
+#endif
+        return false;
+    };
     if (in.empty()) cl(pin[1]); else detail_proc::set_nonblock(pin[1]);
     if (pout[0] >= 0) detail_proc::set_nonblock(pout[0]);
     if (perr[0] >= 0) detail_proc::set_nonblock(perr[0]);
@@ -234,6 +352,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         if (pin[1] >= 0) { ii = nf; fds[nf++] = {pin[1], POLLOUT, 0}; }
         int to = -1;
         if (deadline) { auto now = monotonic_ns(); if (now >= deadline) { res.timed_out = true; break; } to = int(std::min<std::uint64_t>((deadline - now) / 1000000 + 1, 1000)); }
+        if (watching) { if (check_watch()) break; to = to < 0 ? 50 : std::min(to, 50); }
         int r = ::poll(fds, nfds_t(nf), to);
         if (r < 0) { if (errno == EINTR) continue; break; }
         if (io >= 0 && fds[io].revents) drain(pout[0], res.out);
@@ -245,18 +364,24 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
                    if (in_off >= in.size()) cl(pin[1]); }
         }
     }
-    if (res.timed_out) ::kill(-p, SIGKILL);
+    auto killed = [&] { return res.timed_out || res.cancelled || res.memory_killed; };
+    if (killed()) ::kill(-p, SIGKILL);
     cl(pin[1]); cl(pout[0]); cl(perr[0]);
     int st = 0;
     for (;;) {
-        pid_t w = ::waitpid(p, &st, deadline && !res.timed_out ? WNOHANG : 0);
+        pid_t w = ::waitpid(p, &st, (deadline || watching) && !killed() ? WNOHANG : 0);
         if (w == p) break;
         if (w < 0 && errno != EINTR) break;
-        if (w == 0) { if (monotonic_ns() >= deadline) { res.timed_out = true; ::kill(-p, SIGKILL); } else sleep_ns(1000000); }
+        if (w == 0) {
+            if (deadline && monotonic_ns() >= deadline) res.timed_out = true; else if (watching) (void)check_watch();
+            if (killed()) ::kill(-p, SIGKILL); else sleep_ns(1000000);
+        }
     }
     if (WIFEXITED(st)) res.exit_code = WEXITSTATUS(st);
     else if (WIFSIGNALED(st)) { res.term_signal = WTERMSIG(st); res.exit_code = 128 + res.term_signal; }
     if (res.timed_out) res.exit_code = 124;
+    else if (res.cancelled) res.exit_code = 125;
+    else if (res.memory_killed) res.exit_code = 137;
     res.wall_ms = (monotonic_ns() - t0) / 1000000;
     return {std::move(res), {}};
 #endif
@@ -319,23 +444,28 @@ public:
         if (::pipe(po)) return {{}, last_error("pipe")};
         if (::pipe(px)) { ::close(po[0]); ::close(po[1]); return {{}, last_error("pipe")}; }
         detail_proc::cloexec(po[0]); detail_proc::cloexec(px[0]); detail_proc::cloexec(px[1]);
-        int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        int devnull = sp.stdin_file.empty() ? ::open("/dev/null", O_RDONLY | O_CLOEXEC) : ::open(sp.stdin_file.c_str(), O_RDONLY | O_CLOEXEC);
+        int ferr = -1;
+        if (!sp.stderr_file.empty() && !sp.merge_stderr)
+            ferr = ::open(sp.stderr_file.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC | (sp.append_output ? O_APPEND : O_TRUNC), 0644);
+        if ((!sp.stdin_file.empty() && devnull < 0) || (!sp.stderr_file.empty() && !sp.merge_stderr && ferr < 0)) {
+            auto e = last_error("open"); for (int fd : {po[0], po[1], px[0], px[1], devnull, ferr}) if (fd >= 0) ::close(fd); return {{}, e}; }
         const char* wd = sp.cwd.empty() ? nullptr : sp.cwd.c_str();
-        const proc_limits lim = sp.limits; const bool merge = sp.merge_stderr;
+        const proc_limits lim = sp.limits; const bool merge = sp.merge_stderr; const bool new_session = sp.new_session;
         pid_t p = ::fork();
         if (p < 0) { auto e = last_error("fork"); for (int fd : {po[0], po[1], px[0], px[1], devnull}) if (fd >= 0) ::close(fd); return {{}, e}; }
         if (p == 0) {
-            ::setpgid(0, 0); ::signal(SIGPIPE, SIG_DFL);
+            if (new_session) ::setsid(); else ::setpgid(0, 0);
+            ::signal(SIGPIPE, SIG_DFL);
             if (devnull >= 0) ::dup2(devnull, 0);
-            ::dup2(po[1], 1); if (merge) ::dup2(po[1], 2); ::close(po[1]);
-            if (lim.memory_bytes) { struct rlimit r{rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes)}; ::setrlimit(RLIMIT_AS, &r); }
-            if (lim.cpu_seconds) { struct rlimit r{rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1)}; ::setrlimit(RLIMIT_CPU, &r); }
-            if (lim.open_files) { struct rlimit r{rlim_t(lim.open_files), rlim_t(lim.open_files)}; ::setrlimit(RLIMIT_NOFILE, &r); }
+            ::dup2(po[1], 1); if (merge) ::dup2(po[1], 2); else if (ferr >= 0) ::dup2(ferr, 2); ::close(po[1]);
+            (void)apply_limits(lim);
             if (wd && ::chdir(wd) != 0) { int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127); }
             ::execve(exe.c_str(), av.data(), ev.data());
             int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127);
         }
-        ::setpgid(p, p); ::close(po[1]); ::close(px[1]); if (devnull >= 0) ::close(devnull);
+        if (!new_session) ::setpgid(p, p);
+        ::close(po[1]); ::close(px[1]); if (devnull >= 0) ::close(devnull); if (ferr >= 0) ::close(ferr);
         int child_errno = 0;
         { auto n = ::read(px[0], &child_errno, sizeof child_errno); if (n != sizeof child_errno) child_errno = 0; ::close(px[0]); }
         if (child_errno) { int st; while (::waitpid(p, &st, 0) < 0 && errno == EINTR) {} ::close(po[0]); errno = child_errno; return {{}, last_error("exec " + sp.argv[0])}; }

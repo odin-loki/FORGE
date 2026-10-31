@@ -97,3 +97,15 @@ can branch on features rather than on platform names.
    - Tests: `tests/test_os_dev.cpp` (cross-compiled too).
 
 Remaining platform gaps (tracked, not blocking): Windows/macOS device enumeration (SetupAPI / IOKit), Windows `interfaces()` (GetAdaptersAddresses), per-CPU times off Linux, `mounts()` on macOS/FreeBSD, user lookup by SID on Windows, and HTTPS in `net::http`.
+
+### Process control additions (spawn_spec)
+- `limits.file_size_bytes` (RLIMIT_FSIZE) and `limits.no_core` (RLIMIT_CORE=0), POSIX only; `apply_limits(lim)` applies a
+  `proc_limits` to the calling process (async-signal-safe), lowering each request to an existing hard limit.
+- `current_rss()` (sysinfo.hpp): this process's resident set in bytes on Linux/Android, macOS/iOS, FreeBSD and Windows.
+- `stdin_file` / `stdout_file` / `stderr_file` (+ `append_output`): redirect streams to files.
+- `stop` (std::stop_token): cancels the run, kills the tree; `cancelled`, exit code 125.
+- `new_session`: setsid() on POSIX, CREATE_NEW_PROCESS_GROUP on Windows (the Job Object kills the tree);
+  `kill_group(pgid, sig)` signals a whole group (POSIX).
+- `watch_memory_bytes`: memory watchdog; Windows uses the Job Object's peak committed memory, Linux/Android the
+  process group's RSS; other POSIX: use `limits.memory_bytes`. `memory_killed`, exit code 137.
+- iOS: spawning is unavailable, all of the above return the existing unsupported error.
