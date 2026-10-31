@@ -34,7 +34,9 @@ TEST(throw_if_typed) {
 
 TEST(fault_guard_recovers_segv) {
     bool caught = false;
-    try { os::fault_guard([] { volatile int* p = nullptr; *p = 1; }); }
+    // `int* volatile`: the pointer value is opaque to the optimiser. With a visibly-null pointer GCC proves the
+    // lambda always faults, isolates the path (store + ud2) and drops fault_guard's t_fault store as dead.
+    try { os::fault_guard([] { int* volatile p = nullptr; *p = 1; }); }
     catch (const os::os_exception& e) { caught = true; CHECK(e.kind == os::os_errc::signal); }
     CHECK(caught);
     CHECK(os::fault_guard([] { return 7; }) == 7);   // still usable afterwards

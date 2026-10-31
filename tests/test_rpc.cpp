@@ -14,7 +14,7 @@ static const std::string& model_a() { static std::string p = forge_test::make_ti
 static std::vector<float> logits(const std::string& dev) {
     auto m = model::open(model_a());
     CHECK(m->set_device(dev) == dev);
-    session s(m);
+    mind::session s(m);
     std::vector<int> p = {1, 5, 9, 33, 70, 101};
     auto a = s.forward(p); int t = 7; auto b = s.forward(std::span<const int>(&t, 1));
     a.insert(a.end(), b.begin(), b.end()); return a;

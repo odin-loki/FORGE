@@ -490,6 +490,9 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
             sleep_ns(1000000);
         }
     }
+    // A new session owns everything it started: after a normal exit, sweep leftovers (background
+    // children, members that moved to their own group) too. The pgid/sid p cannot be reused while any member lives.
+    if (reaped && new_session && !killed()) detail_proc::kill_tree(p, true);
     if (!reaped) {
         res.unreaped = true;
         std::thread([p] { int s2 = 0; while (::waitpid(p, &s2, 0) < 0 && errno == EINTR) {} }).detach();
