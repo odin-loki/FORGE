@@ -11,4 +11,5 @@ TEST(compile_time_strip) {
     L::remove_sink(id);
     CHECK(got.size() == 2);
     CHECK(!L::enabled(L::level::info));
+    int evals = 0; FORGE_LOG_INFO("m", "{}", ++evals); CHECK(evals == 0);   // stripped: not evaluated
 }

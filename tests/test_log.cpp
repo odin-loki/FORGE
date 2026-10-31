@@ -75,3 +75,28 @@ TEST(env_spec_parsing) {
     CHECK(L::enabled(L::level::trace, "mind"));
     L::configure("warn");
 }
+
+TEST(fatal_level_and_macros_skip_arguments) {
+    L::configure("warn"); capture c; int evals = 0;
+    auto bump = [&] { return ++evals; };
+    FORGE_LOG_DEBUG("m", "x {}", bump());   // disabled at run time: argument not evaluated
+    CHECK(evals == 0);
+    FORGE_LOG_WARN("m", "y {}", bump()); CHECK(evals == 1);
+    L::fatal("down"); CHECK(c.lines.size() == 2); CHECK(c.lines[1] == "[forge F] down");
+    CHECK(L::parse_level("fatal") == L::level::fatal);
+}
+
+TEST(file_sink_rotation) {
+    L::configure("info");
+    auto p = (std::filesystem::temp_directory_path() / ("forge_rot_" + std::to_string(forge::os::pid()) + ".log")).string();
+    for (auto s : {"", ".1", ".2", ".3"}) std::filesystem::remove(p + s);
+    int id = L::add_file_sink(p, 200, 2);
+    for (int i = 0; i < 30; ++i) L::info("line {:02} {}", i, std::string(20, 'x'));   // 36 bytes each
+    L::remove_sink(id);
+    CHECK(std::filesystem::exists(p)); CHECK(std::filesystem::exists(p + ".1")); CHECK(std::filesystem::exists(p + ".2"));
+    CHECK(!std::filesystem::exists(p + ".3"));
+    for (auto s : {"", ".1", ".2"}) CHECK(std::filesystem::file_size(p + s) <= 200);
+    std::ifstream in(p); std::string last, s; while (std::getline(in, s)) last = s;
+    CHECK(last.find("line 29") != std::string::npos);
+    for (auto s : {"", ".1", ".2"}) std::filesystem::remove(p + s);
+}

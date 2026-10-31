@@ -1,6 +1,6 @@
 # FORGE TODO
 
-## Add a logging module (logger) to FORGE
+## [x] Add a logging module (logger) to FORGE (done: PR forge-logger)
 Grow today's minimal `core/include/forge/core/log.hpp` (stderr only, `FORGE_LOG` threshold) into a proper
 logger module, so PRISM can use it instead of its own logger.
 - **Levels:** trace, debug, info, warn, error, fatal; global threshold plus per-component/category overrides
@@ -11,5 +11,8 @@ logger module, so PRISM can use it instead of its own logger.
 - **Compile-time strip:** a `FORGE_LOG_MIN_LEVEL` macro/CMake option that removes calls below the level at
   compile time (format arguments not evaluated), so trace/debug cost nothing in release builds.
 - Keep the `std::format` call style; document it in docs/ and add tests (levels, filtering, sinks, strip).
-- **Status:** scheduled in the current workstream after the quantised dot kernels and Qwen 3.5. It must be
-  thread-safe, use the FORGE OS wrapper for files/syslog/clock/thread ids, and ship with tests.
+- **Status: done** in `core/log.hpp` + `tests/test_log*.cpp`: levels incl. fatal, per-module overrides
+  (`FORGE_LOG`, `configure`, `set_module_level`), stderr/file (size rotation)/syslog/callback sinks, JSON lines,
+  one locked write per line, `FORGE_LOG_MIN`/`FORGE_LOG_MIN_LEVEL` strip and `FORGE_LOG_*` macros that skip
+  argument evaluation. Clock and thread ids come from the OS wrapper.
+- [ ] Still open: async/buffered sink, Windows event log sink, a CMake option for the strip level.

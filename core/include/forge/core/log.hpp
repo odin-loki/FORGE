@@ -6,13 +6,16 @@
 //
 // Threshold: FORGE_LOG="warn" or "info,mind=debug,flow=trace" (first letter of each level counts:
 // t[race] d[ebug] i[nfo] w[arn] e[rror] o[ff]; default warn). set_level()/set_module_level() override it.
-// Compile-time strip: define FORGE_LOG_MIN to 0..5 (trace..off) and calls below it compile to nothing.
+// Compile-time strip: define FORGE_LOG_MIN (or FORGE_LOG_MIN_LEVEL) to 0..6 (trace..fatal, off) and calls
+// below it compile to nothing. The FORGE_LOG_TRACE(...)..FORGE_LOG_FATAL(...) macros also skip evaluating
+// their arguments when the level is stripped or disabled at run time; the functions always evaluate them.
 // Sinks: stderr (default), append-to-file, or any callback. Each record is formatted first and written
 // as one line under a lock, so concurrent lines never interleave. Format: text (default) or JSON lines
 // (FORGE_LOG_FORMAT=json or set_format()).
 // A sink must not log itself (the sink lock is held while it runs).
 #include <forge/os/os.hpp>
 #include <forge/os/time.hpp>
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -25,13 +28,19 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+#if defined(__unix__) || defined(__APPLE__)
+#include <syslog.h>
+#endif
 
+#if !defined(FORGE_LOG_MIN) && defined(FORGE_LOG_MIN_LEVEL)
+#define FORGE_LOG_MIN FORGE_LOG_MIN_LEVEL
+#endif
 #ifndef FORGE_LOG_MIN
 #define FORGE_LOG_MIN 0
 #endif
 
 namespace forge::log {
-enum class level : int { trace, debug, info, warn, error, off };
+enum class level : int { trace, debug, info, warn, error, fatal, off };
 enum class format { text, json };
 
 struct record {
@@ -44,14 +53,14 @@ struct record {
 using sink = std::function<void(const record&, std::string_view line)>;   // line = formatted, no newline
 
 inline const char* level_name(level l) {
-    static const char* n[] = {"trace", "debug", "info", "warn", "error", "off"};
-    return n[int(l) < 0 || int(l) > 5 ? 5 : int(l)];
+    static const char* n[] = {"trace", "debug", "info", "warn", "error", "fatal", "off"};
+    return n[int(l) < 0 || int(l) > 6 ? 6 : int(l)];
 }
 inline level parse_level(std::string_view s, level dflt = level::warn) {
     if (s.empty()) return dflt;
     switch (s[0] | 0x20) {
         case 't': return level::trace; case 'd': return level::debug; case 'i': return level::info;
-        case 'w': return level::warn; case 'e': return level::error; case 'o': return level::off;
+        case 'w': return level::warn; case 'e': return level::error; case 'f': return level::fatal; case 'o': return level::off;
         default: return dflt;
     }
 }
@@ -103,7 +112,7 @@ inline void json_escape(std::string& o, std::string_view s) {
     }
 }
 inline std::string format_line(const record& r, format f) {
-    static const char tag[] = {'T', 'D', 'I', 'W', 'E', 'O'};
+    static const char tag[] = {'T', 'D', 'I', 'W', 'E', 'F', 'O'};
     std::string o;
     if (f == format::json) {
         o = std::format("{{\"ts\":\"{}\",\"level\":\"{}\",\"module\":\"", os::format_iso8601(r.unix_ns), level_name(r.lvl));
@@ -140,15 +149,41 @@ inline bool enabled(level l, std::string_view mod = "forge") {
 inline int add_sink(sink k) { auto& s = detail::st(); std::lock_guard g(s.m); int id = s.next_id++; s.sinks.emplace_back(id, std::move(k)); return id; }
 inline void remove_sink(int id) { auto& s = detail::st(); std::lock_guard g(s.m); std::erase_if(s.sinks, [&](auto& p) { return p.first == id; }); }
 inline void set_stderr(bool on) { auto& s = detail::st(); std::lock_guard g(s.m); s.use_stderr = on; }
-// Appends each line to `path` (created if missing) and flushes it. Returns the sink id, or 0 if the file
-// could not be opened.
-inline int add_file_sink(const std::string& path) {
-    std::shared_ptr<std::FILE> f(std::fopen(path.c_str(), "ab"), [](std::FILE* p) { if (p) std::fclose(p); });
-    if (!f) return 0;
-    return add_sink([f](const record&, std::string_view line) {
-        std::fwrite(line.data(), 1, line.size(), f.get()); std::fputc('\n', f.get()); std::fflush(f.get());
+// Appends each line to `path` (created if missing) and flushes it. With max_bytes > 0 the file is rotated
+// when it would grow past that size: path -> path.1 -> ... -> path.<keep> (the oldest is dropped).
+// Returns the sink id, or 0 if the file could not be opened.
+inline int add_file_sink(const std::string& path, std::uint64_t max_bytes = 0, unsigned keep = 3) {
+    struct file_state { std::FILE* f = nullptr; std::uint64_t size = 0; ~file_state() { if (f) std::fclose(f); } };
+    auto st = std::make_shared<file_state>();
+    st->f = std::fopen(path.c_str(), "ab");
+    if (!st->f) return 0;
+    std::fseek(st->f, 0, SEEK_END); st->size = std::uint64_t(std::max(0L, std::ftell(st->f)));
+    return add_sink([st, path, max_bytes, keep](const record&, std::string_view line) {
+        if (max_bytes && st->size && st->size + line.size() + 1 > max_bytes) {
+            std::fclose(st->f); st->f = nullptr;
+            if (keep == 0) std::remove(path.c_str());
+            for (unsigned i = keep; i >= 1; --i) {
+                std::string from = i == 1 ? path : path + "." + std::to_string(i - 1), to = path + "." + std::to_string(i);
+                (void)os::rename(from, to);
+            }
+            st->f = std::fopen(path.c_str(), "ab"); st->size = 0;
+            if (!st->f) return;
+        }
+        if (!st->f) return;
+        std::fwrite(line.data(), 1, line.size(), st->f); std::fputc('\n', st->f); std::fflush(st->f);
+        st->size += line.size() + 1;
     });
 }
+#if defined(__unix__) || defined(__APPLE__)
+// Sends each record to syslog(3) (journald picks it up on systemd hosts) with the matching priority.
+inline int add_syslog_sink(const char* ident = "forge") {
+    ::openlog(ident, LOG_PID, LOG_USER);
+    return add_sink([](const record& r, std::string_view line) {
+        static const int pri[] = {LOG_DEBUG, LOG_DEBUG, LOG_INFO, LOG_WARNING, LOG_ERR, LOG_CRIT, LOG_DEBUG};
+        ::syslog(pri[int(r.lvl)], "%.*s", int(line.size()), line.data());
+    });
+}
+#endif
 
 // ---- emitting -------------------------------------------------------------------------------------
 inline void emit(level l, std::string_view mod, std::string_view msg) {
@@ -174,6 +209,7 @@ FORGE_LOG_FN_(debug, level::debug)
 FORGE_LOG_FN_(info, level::info)
 FORGE_LOG_FN_(warn, level::warn)
 FORGE_LOG_FN_(error, level::error)
+FORGE_LOG_FN_(fatal, level::fatal)
 #undef FORGE_LOG_FN_
 
 // A module-tagged logger: logger L{"mind"}; L.info("..."). Cheap to copy; holds only the tag.
@@ -188,7 +224,19 @@ struct logger {
     FORGE_LOG_M_(info, level::info)
     FORGE_LOG_M_(warn, level::warn)
     FORGE_LOG_M_(error, level::error)
+    FORGE_LOG_M_(fatal, level::fatal)
 #undef FORGE_LOG_M_
     bool enabled(level l) const { return log::enabled(l, module); }
 };
 } // namespace forge::log
+
+// Macros that skip argument evaluation when the level is stripped or disabled:
+//   FORGE_LOG_DEBUG("mind", "kv {}", expensive());
+#define FORGE_LOG_AT_(L, mod, ...)                                                                        \
+    do { if constexpr (int(L) >= FORGE_LOG_MIN) { if (::forge::log::enabled(L, mod)) ::forge::log::write_module(L, mod, __VA_ARGS__); } } while (0)
+#define FORGE_LOG_TRACE(mod, ...) FORGE_LOG_AT_(::forge::log::level::trace, mod, __VA_ARGS__)
+#define FORGE_LOG_DEBUG(mod, ...) FORGE_LOG_AT_(::forge::log::level::debug, mod, __VA_ARGS__)
+#define FORGE_LOG_INFO(mod, ...) FORGE_LOG_AT_(::forge::log::level::info, mod, __VA_ARGS__)
+#define FORGE_LOG_WARN(mod, ...) FORGE_LOG_AT_(::forge::log::level::warn, mod, __VA_ARGS__)
+#define FORGE_LOG_ERROR(mod, ...) FORGE_LOG_AT_(::forge::log::level::error, mod, __VA_ARGS__)
+#define FORGE_LOG_FATAL(mod, ...) FORGE_LOG_AT_(::forge::log::level::fatal, mod, __VA_ARGS__)
