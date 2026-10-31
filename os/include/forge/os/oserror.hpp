@@ -417,8 +417,10 @@ template <class T> T throw_if(result<T> r) { throw_if(r.err); return std::move(r
 
 // ---------------------------------------------------------------- fault signals -> exceptions
 namespace detail {
-struct fault_frame { std::jmp_buf* jb = nullptr; int sig = 0; };
-inline thread_local fault_frame* t_fault = nullptr;
+// volatile: the handler writes sig and reads t_fault asynchronously. Without it an optimiser that sees a fault-free
+// (or provably faulting) f() inline drops the t_fault store as dead and constant-folds sig to 0.
+struct fault_frame { std::jmp_buf* jb = nullptr; volatile int sig = 0; };
+inline thread_local fault_frame* volatile t_fault = nullptr;
 }
 
 inline const char* signal_name(int s) {
