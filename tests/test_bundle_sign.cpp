@@ -3,7 +3,7 @@
 #include "check.hpp"
 #include <filesystem>
 #include <fstream>
-#include <unistd.h>
+#include <forge/os/os.hpp>
 using namespace forge;
 namespace sfs = std::filesystem;
 
@@ -12,7 +12,7 @@ pack::keypair key(std::uint8_t b) { std::array<std::uint8_t, 32> s{}; s.fill(b);
 std::string hexpub(const pack::keypair& k) { return pack::detail::to_hex(k.pub); }
 void put(const sfs::path& p, const std::string& s) { sfs::create_directories(p.parent_path()); std::ofstream(p, std::ios::binary) << s; }
 sfs::path fresh(const char* tag) {
-    auto d = sfs::temp_directory_path() / ("forge_bundle_" + std::string(tag) + "_" + std::to_string(::getpid()));
+    auto d = sfs::temp_directory_path() / ("forge_bundle_" + std::string(tag) + "_" + std::to_string(forge::os::pid()));
     sfs::remove_all(d); sfs::create_directories(d);
     put(d / "result.json", "{\"verdict\":\"true\"}"); put(d / "proofs/a.cert", "cert-a"); put(d / "proofs/b.cert", std::string(200000, 'x'));
     return d;
