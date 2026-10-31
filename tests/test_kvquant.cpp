@@ -16,7 +16,7 @@ static float maxabs(const std::vector<float>& a) { float m = 0; for (float x : a
 static float maxdiff(const std::vector<float>& a, const std::vector<float>& b) { float m = 0; for (std::size_t i = 0; i < a.size(); ++i) m = std::max(m, std::abs(a[i] - b[i])); return m; }
 
 // logits for a prompt then `steps` single-token decode steps (fixed tokens, so paths are comparable)
-static std::vector<std::vector<float>> trace(session& s, int steps) {
+static std::vector<std::vector<float>> trace(mind::session& s, int steps) {
     std::vector<int> p = {1, 5, 9, 33, 70, 101, 7, 12, 3};
     std::vector<std::vector<float>> out; s.reset();
     out.push_back(s.forward(p));
@@ -51,7 +51,7 @@ TEST(codec_roundtrip_bounds) {
 static void accuracy_vs_f32(const std::string& dev) {
     auto mf = model::open(model_a()), m8 = model::open(model_a()), mq = model::open(model_a());
     if (!dev.empty()) { mf->set_device(dev); m8->set_device(dev); mq->set_device(dev); }
-    session sf(mf), s8(m8, {.kv_codec = "int8"}), sq(mq, {.kv_codec = "fp8"});
+    mind::session sf(mf), s8(m8, {.kv_codec = "int8"}), sq(mq, {.kv_codec = "fp8"});
     auto rf = trace(sf, 24), r8 = trace(s8, 24), rq = trace(sq, 24);
     float w8 = 0, wq = 0;
     for (std::size_t i = 0; i < rf.size(); ++i) {
@@ -83,7 +83,7 @@ TEST(kv_quant_cpu_accuracy) { accuracy_vs_f32(""); }
 
 TEST(kv_quant_prefix_copy_and_rewind) {
     auto m = model::open(model_a());
-    session a(m, {.kv_codec = "int8"}), b(m, {.kv_codec = "int8"}), c(m);
+    mind::session a(m, {.kv_codec = "int8"}), b(m, {.kv_codec = "int8"}), c(m);
     std::vector<int> p = {4, 8, 15, 16, 23, 42};
     a.reset(); a.forward(p);
     b.copy_prefix(a, 4);
@@ -102,7 +102,7 @@ TEST(kv_quant_vulkan) {
     accuracy_vs_f32("vulkan");
     // Vulkan int8 KV matches CPU int8 KV (same decode, f32 accumulation differences only)
     auto mc = model::open(model_a()), mv = model::open(model_a()); mv->set_device("vulkan");
-    session sc(mc, {.kv_codec = "int8"}), sv(mv, {.kv_codec = "int8"});
+    mind::session sc(mc, {.kv_codec = "int8"}), sv(mv, {.kv_codec = "int8"});
     auto rc = trace(sc, 8), rv = trace(sv, 8);
     float w = 0; for (std::size_t i = 0; i < rc.size(); ++i) w = std::max(w, maxdiff(rc[i], rv[i]) / maxabs(rc[i]));
     std::printf("  vulkan int8 vs cpu int8: %.2e\n", w);
@@ -110,9 +110,9 @@ TEST(kv_quant_vulkan) {
     // host offload: identical results, lower peak device memory
     auto mo = model::open(model_a()); mo->set_device("vulkan");
     auto rt = flow::last_vulkan_runtime();
-    session so(mo, {.kv_offload = 1});
+    mind::session so(mo, {.kv_offload = 1});
     auto mn = model::open(model_a()); mn->set_device("vulkan"); auto rt2 = flow::last_vulkan_runtime();
-    session sn(mn, {.kv_offload = 0});
+    mind::session sn(mn, {.kv_offload = 0});
     std::vector<int> p = {1, 5, 9, 33, 70, 101, 7, 12, 3, 44, 55, 66, 77, 88, 99, 10};
     so.reset(); auto lo = so.forward(p); sn.reset(); auto ln = sn.forward(p);
     CHECK(maxdiff(lo, ln) == 0.f);
