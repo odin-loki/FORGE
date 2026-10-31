@@ -9,6 +9,7 @@ if(FORGE_IOS_SIMULATOR)
 else()
   set(CMAKE_OSX_SYSROOT iphoneos)
   set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "")
+  set(CMAKE_SYSTEM_PROCESSOR arm64)   # pick the NEON kernels, not the host's x86 ones
 endif()
 set(CMAKE_XCODE_ATTRIBUTE_ONLY_ACTIVE_ARCH NO)
 set(FORGE_BUILD_TESTS OFF CACHE BOOL "")   # no executables on device; tests run via XCTest in bindings/apple

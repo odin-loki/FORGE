@@ -6,6 +6,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <malloc.h>
+#define MOCK_ALIGNED_ALLOC(a, n) _aligned_malloc((n), (a))   /* no C11 aligned_alloc in the MS CRT */
+#define MOCK_ALIGNED_FREE(p) _aligned_free(p)
+#else
+#define MOCK_ALIGNED_ALLOC(a, n) aligned_alloc((a), (n))
+#define MOCK_ALIGNED_FREE(p) free(p)
+#endif
 
 #define FORGE_CL_HOST_SHIM
 #define FORGE_K static
@@ -45,9 +53,9 @@ ze_result_t zeCommandListAppendMemoryCopy(ze_command_list_handle_t l, void* d, c
 ze_result_t zeCommandListAppendBarrier(ze_command_list_handle_t l, ze_event_handle_t e, uint32_t ne, ze_event_handle_t* w) { (void)l; (void)e; (void)ne; (void)w; return ZE_RESULT_SUCCESS; }
 ze_result_t zeMemAllocDevice(ze_context_handle_t c, const ze_device_mem_alloc_desc_t* d, size_t n, size_t al, ze_device_handle_t dev, void** p) {
     (void)c; (void)dev; if (d->stype != ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    size_t* b = aligned_alloc(al < 16 ? 16 : al, ((n + 16 + al - 1) / al) * al + al); if (!b) return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+    size_t a2 = al < 16 ? 16 : al; size_t* b = MOCK_ALIGNED_ALLOC(a2, ((n + 16 + a2 - 1) / a2) * a2 + a2); if (!b) return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
     g_live += n; *p = b; return ZE_RESULT_SUCCESS; }
-ze_result_t zeMemFree(ze_context_handle_t c, void* p) { (void)c; free(p); return ZE_RESULT_SUCCESS; }
+ze_result_t zeMemFree(ze_context_handle_t c, void* p) { (void)c; MOCK_ALIGNED_FREE(p); return ZE_RESULT_SUCCESS; }
 ze_result_t zeModuleCreate(ze_context_handle_t c, ze_device_handle_t d, const ze_module_desc_t* m, ze_module_handle_t* mod, ze_module_build_log_handle_t* log) {
     (void)c; (void)d; if (log) *log = NULL;
     if (m->stype != ZE_STRUCTURE_TYPE_MODULE_DESC || m->format != ZE_MODULE_FORMAT_IL_SPIRV) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
