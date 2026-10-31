@@ -33,7 +33,7 @@ Every section and every tensor has a BLAKE3 hash. Files can be **signed** (Ed255
 | Source | Header | Notes |
 |--------|--------|-------|
 | Hugging Face directory (`config.json` + safetensors) | `hf.hpp`, `safetensors.hpp` | Templates: `llama` (Llama, Mistral, Qwen2), `mixtral` (MoE), `deepseek_v2` (MLA; DeepSeek-V2/V3 architectures) |
-| GGUF v2/v3 | `gguf.hpp` | `llama`, `qwen2`, `mistral` architectures. Q8_0 / Q4_K blocks are copied verbatim |
+| GGUF v2/v3 | `gguf.hpp` | `llama`, `qwen2`, `qwen3`, `mistral`, `qwen35` (Qwen3.5 dense, onto the `qwen3_5` template; tiled V heads are put back in grouped order, and the Gated DeltaNet out projection is re-encoded as q8_0 when quantised) architectures. Q8_0 / Q4_K blocks are copied verbatim |
 | ONNX | `onnx.hpp` | Static-shape inference graphs (MLPs, classifiers, encoder blocks) from MatMul, Gemm, elementwise ops, Relu/Sigmoid/Tanh/Gelu/Erf/Softplus, Softmax, LayerNormalization, Transpose, Reshape, Flatten, ReduceMean/Sum and a few more (list in the header). One symbolic dimension maps to `seq`; unsupported ops are rejected by name |
 
 CLI: `forge import <src> -o out.fpk [--codec C] [--template NAME]`. Codecs: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`.

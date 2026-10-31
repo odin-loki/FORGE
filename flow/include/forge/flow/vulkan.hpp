@@ -3,6 +3,7 @@
 // (priority above the CPU ones). Like every lowering it must pass the oracle before it is selected, and any
 // op/shape without a GPU kernel runs on the CPU, so a whole model runs with the GPU doing what it can.
 #include <forge/flow/kernels.hpp>
+#include <forge/flow/codecs.hpp>
 #include <forge/grid/vulkan.hpp>
 #include <forge/grid/cuda.hpp>
 #include <forge/grid/opencl.hpp>
@@ -78,6 +79,22 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                 [rt, name](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
                     if (!rt->run_op(name, std::vector<tensor_view>(in.begin(), in.end()), a, out))
                         raise(errc::unsupported, "{}: {} rejected its inputs", rt->backend(), name); }, -1, resident});
+    }
+    // Quantised matmul_t with the weight kept encoded on the device (CUDA/HIP forge_qmatmul_t); FORGE_GPU_QMATMUL=0
+    // falls back to the f32 path (decoded weights within FORGE_GPU_WEIGHT_BUDGET, the rest on the CPU).
+    if constexpr (requires(RT& t, const tensor_view& v, tensor_view o) { t.run_qmatmul(v, nullptr, std::size_t(0), 0u, 0u, o); t.has_function(""); }) {
+        auto* qe = std::getenv("FORGE_GPU_QMATMUL");
+        if (!(qe && std::string(qe) == "0") && rt->has_function("forge_qmatmul_t")) {
+            r->device_qgemm = lowering{pre + ".qmatmul_t", spec::op::matmul_t, 30, [](auto, auto&, auto&) { return true; },
+                [rt](std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
+                    const auto* c = static_cast<const codecs::codec*>(in[1].qcodec);
+                    std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : c->name == "q5_k" ? 4 : 0;
+                    std::size_t k = std::size_t(in[0].shape.back());
+                    if (!rt->run_qmatmul(in[0], in[1].qdata, c->bytes(k), std::uint32_t(in[1].shape[0]), fmt, out))
+                        raise(errc::unsupported, "{}: qmatmul_t rejected a {} weight", rt->backend(), c->name); },
+                1, resident};
+            r->device_qgemm_codecs = {"q8_0", "q4_k", "q5_k", "q6_k"};
+        }
     }
     return r;
 }

@@ -255,7 +255,7 @@ if(FORGE_GPU_CLANG_IMAGES AND FORGE_LLVM_SPIRV)
 endif()
 if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_NVPTX)
   add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.ptx
-    COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib --cuda-gpu-arch=sm_70 -O3 -Werror
+    COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version --cuda-gpu-arch=sm_70 -O3 -Werror
             -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu
     DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "PTX (sm_70)")
   list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.ptx)
@@ -723,7 +723,7 @@ if(FORGE_BUILD_TESTS)
   endif()
   # CUDA / HIP: compile the generated kernels to PTX / AMDGCN with clang (no SDK needed); hardware runs need a GPU.
   if(FORGE_GPU_CLANG)
-    add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib
+    add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version
              --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_sm80.ptx ${FORGE_GPU_DIR}/kernels.cu)
     add_test(NAME gpu_compile_hip COMMAND ${FORGE_GPU_CLANG} -x hip --cuda-device-only -nogpuinc -nogpulib
              --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_gfx90a.s ${FORGE_GPU_DIR}/kernels.cu)

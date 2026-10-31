@@ -85,7 +85,34 @@ static float kvat(const float* base, unsigned codec, unsigned e) {
     if (!codec) return base[e];
     uint32_t w; memcpy(&w, &base[1 + (e >> 2)], 4); unsigned b = (w >> (8u * (e & 3u))) & 255u;
     return (codec == 1 ? (float)(signed char)b : fp8dec(b)) * base[0]; }
+/* forge_qmatmul_t (grid/cuda.hpp run_qmatmul): same decode as the kernel / flow/codecs.hpp */
+static float m_h2f(unsigned h) {
+    unsigned s = (h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u, b; float f;
+    if (e == 0u) { if (m == 0u) b = s; else { e = 113u; while (!(m & 1024u)) { m <<= 1; --e; } m &= 1023u; b = s | (e << 23) | (m << 13); } }
+    else if (e == 31u) b = s | 0x7f800000u | (m << 13);
+    else b = s | ((e + 112u) << 23) | (m << 13);
+    memcpy(&f, &b, 4); return f; }
+static unsigned m_ld16(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+static void m_scmin(unsigned j, const unsigned char* q, unsigned* d, unsigned* m) {
+    if (j < 4u) { *d = q[j] & 63u; *m = q[j + 4u] & 63u; }
+    else { *d = (q[j + 4u] & 15u) | ((q[j - 4u] >> 6) << 4); *m = (q[j + 4u] >> 4) | ((q[j] >> 6) << 4); } }
+static void m_qgroup(unsigned fmt, const unsigned char* row, unsigned g, float* v) {
+    unsigned l, s = g & 7u;
+    if (fmt == 1u) { const unsigned char* b = row + g * 34u; float d = m_h2f(m_ld16(b)); for (l = 0; l < 32u; ++l) v[l] = d * (float)(signed char)b[2u + l]; return; }
+    if (fmt == 3u) { const unsigned char* b = row + (g >> 3) * 210u; unsigned h = s >> 2, t = s & 3u;
+        const unsigned char* ql = b + 64u * h; const unsigned char* qh = b + 128u + 32u * h; const signed char* sc = (const signed char*)(b + 192u + 8u * h);
+        float d = m_h2f(m_ld16(b + 208u));
+        for (l = 0; l < 32u; ++l) { unsigned lo = (t & 1u) ? ql[l + 32u] : ql[l]; int q; lo = (t & 2u) ? (lo >> 4) : (lo & 15u);
+            q = (int)(lo | (((qh[l] >> (2u * t)) & 3u) << 4)) - 32; v[l] = d * (float)sc[(l >> 4) + 2u * t] * (float)q; }
+        return; }
+    { const unsigned char* b = row + (g >> 3) * (fmt == 2u ? 144u : 176u);
+      float d = m_h2f(m_ld16(b)), dm = m_h2f(m_ld16(b + 2u)), d1, m1; unsigned sc, mn, hi = s & 1u; m_scmin(s, b + 4u, &sc, &mn);
+      d1 = d * (float)sc; m1 = dm * (float)mn;
+      if (fmt == 2u) { const unsigned char* q = b + 16u + (s >> 1) * 32u; for (l = 0; l < 32u; ++l) v[l] = d1 * (float)(hi ? (q[l] >> 4) : (q[l] & 15u)) - m1; }
+      else { const unsigned char* qh = b + 16u; const unsigned char* q = b + 48u + (s >> 1) * 32u; unsigned u = 1u << s;
+          for (l = 0; l < 32u; ++l) v[l] = d1 * (float)((hi ? (q[l] >> 4) : (q[l] & 15u)) + ((qh[l] & u) ? 16u : 0u)) - m1; } } }
 static int nargs_of(const char* op) {
+    if (!strcmp(op, "qmatmul_t")) return 8;
     if (!strcmp(op, "attention")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
@@ -136,6 +163,13 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
                 float dot = 0; for (e = 0; e < d; ++e) dot = fmaf(qp[e], kvat(k + (j * hk + kh) * kw, kc, e), dot);
                 float w = expf(dot * sc - m); sum += w; for (e = 0; e < dv; ++e) yp[e] = fmaf(w, kvat(v + (j * hk + kh) * vw, vc, e), yp[e]); }
             for (e = 0; e < dv; ++e) yp[e] *= sum > 0 ? 1 / sum : 0; }
+        return 0; }
+    if (!strcmp(op, "qmatmul_t")) { float *a = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
+        unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned), r, c, g, l; float v[32];
+        if (gx < cols * ((rows + 3) / 4) || bx != 128) return 1;   /* run_qmatmul's launch shape */
+        for (r = 0; r < rows; ++r) for (c = 0; c < cols; ++c) { float s = 0;
+            for (g = 0; g < k / 32u; ++g) { m_qgroup(fmt, w + (size_t)c * rb, g, v); for (l = 0; l < 32u; ++l) s = fmaf(a[(size_t)r * k + g * 32u + l], v[l], s); }
+            y[(size_t)r * cols + c] = s; }
         return 0; }
     if (!strcmp(op, "scale")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned); float a = ARG(3, float);
         for (i = 0; i < threads && i < n; ++i) y[i] = a * x[i]; return 0; }

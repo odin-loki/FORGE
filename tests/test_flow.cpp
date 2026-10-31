@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstring>
 #include <map>
 #include "check.hpp"
@@ -310,4 +311,49 @@ TEST(autodiff_matches_finite_differences) {
     CHECK_THROWS(grad(g2, am, {a}));
     graph g3; auto u = g3.input("u", {2}), v = g3.input("v", {2}); auto l3 = g3.apply(op::reduce_sum, {g3.apply(op::exp, {u})}, {{"axis", 0.0}});
     auto z3 = grad(g3, l3, {u, v}); CHECK(g3.at(z3[v]).kind == node_kind::constant);
+}
+
+// Resident device backends have no quantised kernels: compile() decodes their quantised weights to f32 only up to
+// FORGE_GPU_WEIGHT_BUDGET and keeps the rest encoded for the CPU kernels (a no-op residency stands in for a GPU).
+TEST(resident_backend_quantised_weight_budget) {
+    auto setb = [](const char* v) {
+#ifdef _WIN32
+        _putenv_s("FORGE_GPU_WEIGHT_BUDGET", v);
+#else
+        setenv("FORGE_GPU_WEIGHT_BUDGET", v, 1);
+#endif
+    };
+    const auto* c = codecs::find("q8_0");
+    CHECK(c); if (!c) return;
+    const i64 n = 8, k = 64;
+    std::vector<float> w(std::size_t(n * k));
+    for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(float(i) * 0.37f);
+    std::vector<std::uint8_t> enc(std::size_t(n) * c->bytes(std::size_t(k)));
+    c->encode(w.data(), w.size(), enc.data());
+    graph g;
+    auto x = g.input("x", {2, k});
+    g.output("y", g.apply(spec::op::matmul_t, {x, g.qweight("w", {n, k}, enc.data(), "q8_0")}));
+    auto reg = registry::make();
+    auto h = std::make_shared<device_hooks>();
+    h->begin_run = [] {}; h->end_run = [] {};
+    h->pin = h->to_host = h->host_wrote = h->release = [](const float*, std::size_t) {};
+    reg->hooks = h;
+    pass_options po; po.lowerings = reg.get();
+    std::vector<float> xs(std::size_t(2 * k));
+    for (std::size_t i = 0; i < xs.size(); ++i) xs[i] = std::cos(float(i) * 0.11f);
+    auto run = [&](const char* budget, bool& encoded) {
+        setb(budget);
+        auto p = compile(g, nullptr, po);
+        encoded = false;
+        for (auto& v : p->views) if (v.qdata) encoded = true;
+        executor e(*p); e.set_input("x", xs); e.run();
+        return e.output("y");
+    };
+    bool q0 = false, q1 = false;
+    auto y0 = run("0", q0), y1 = run("1G", q1);
+    setb("");
+    CHECK(q0);    // budget 0: the weight stays encoded (CPU quantised matmul)
+    CHECK(!q1);   // ample budget: decoded to f32 for the device
+    auto cmp = verify::compare(y0, y1, {spec::tol_kind::rel, 1e-4});
+    CHECK_MSG(cmp.ok, "%s", cmp.message.c_str());
 }
