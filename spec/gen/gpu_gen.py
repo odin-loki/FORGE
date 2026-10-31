@@ -126,7 +126,7 @@ void main() {
 }
 """
     if name == "attention":  # q[s,hq,d] k[t,hk,d] v[t,hk,dv]; one invocation per (query, head).
-        # push: rows=s, cols=hq, k=d, a=t, b=hk, c=dv, d=causal | kcodec<<1 | vcodec<<3 | window<<5, alpha=scale
+        # push: rows=s, cols=hq, k=d, a=t, b=hk, c=dv, d=causal | kcodec<<1 | vcodec<<4 | window<<7, alpha=scale
         # A quantised K/V (codec 1 int8, 2 fp8 e4m3) holds per (row, head) one f32 scale word + ceil(d/4)
         # words of packed bytes (flow/kv_codec.hpp); it is decoded here on the fly.
         return GLSL_HEAD + """layout(std430, binding = 0) readonly buffer Qb { float q_[]; };
@@ -142,29 +142,59 @@ float qdec(uint codec, uint word, uint e) {
   uint b = (word >> (8u * (e & 3u))) & 255u;
   return codec == 1u ? float(int(b << 24) >> 24) : fp8dec(b);
 }
+const float TBQ4[16] = float[16](-2.7326, -2.0690, -1.6181, -1.2562, -0.9424, -0.6568, -0.3881, -0.1284,
+                                  0.1284, 0.3881, 0.6568, 0.9424, 1.2562, 1.6181, 2.0690, 2.7326);
+const float TBQ3[8] = float[8](-2.1520, -1.3439, -0.7560, -0.2451, 0.2451, 0.7560, 1.3439, 2.1520);
+// TurboQuant level * gain (rotated domain); see flow/kv_codec.hpp
+float tbqdec(uint codec, float gain, uint word, uint e) {
+  uint per = codec == 3u ? 8u : 10u, bits = codec == 3u ? 4u : 3u, c = (word >> (bits * (e % per))) & ((1u << bits) - 1u);
+  return (codec == 3u ? TBQ4[c] : TBQ3[c]) * gain;
+}
+uint tbqdim(uint d) { uint q = 1u; while (q < d) q <<= 1; return q; }
+uint kvwords(uint codec, uint d) {
+  if (codec == 0u) return d; if (codec < 3u) return 1u + (d + 3u) / 4u;
+  return codec == 3u ? 1u + (tbqdim(d) + 7u) / 8u : 1u + (tbqdim(d) + 9u) / 10u;
+}
+float tbqsign(uint i) { uint h = i * 0x9E3779B1u; h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; return (h & 1u) != 0u ? -1.0 : 1.0; }
+float fwhtnorm(uint n) { float r = 1.0; uint lg = 0u; while ((1u << lg) < n) ++lg; for (uint i = 0u; i < lg / 2u; ++i) r *= 0.5; return (lg & 1u) != 0u ? r * 0.70710678118654752 : r; }
 float kat(uint kc, uint base, uint e) {
   if (kc == 0u) return k_[base + e];
+  if (kc >= 3u) return tbqdec(kc, k_[base], floatBitsToUint(k_[base + 1u + e / (kc == 3u ? 8u : 10u)]), e);
   return qdec(kc, floatBitsToUint(k_[base + 1u + (e >> 2)]), e) * k_[base];
 }
 float vat(uint vc, uint base, uint e) {
   if (vc == 0u) return v_[base + e];
+  if (vc >= 3u) return tbqdec(vc, v_[base], floatBitsToUint(v_[base + 1u + e / (vc == 3u ? 8u : 10u)]), e);
   return qdec(vc, floatBitsToUint(v_[base + 1u + (e >> 2)]), e) * v_[base];
 }
+float qr[256]; float yr[256];
 // 4 partial sums (like the CPU lane dot) keep the score error well inside the oracle's 1e-5.
 float qk(uint kc, uint qo, uint ko) {
+  if (kc >= 3u) { uint n = tbqdim(p.k); float s = 0.0; for (uint e = 0u; e < n; ++e) s = fma(qr[e], kat(kc, ko, e), s); return s; }
   vec4 acc = vec4(0.0); uint e = 0;
   for (; e + 4u <= p.k; e += 4u) acc = fma(vec4(q_[qo+e], q_[qo+e+1u], q_[qo+e+2u], q_[qo+e+3u]), vec4(kat(kc,ko,e), kat(kc,ko,e+1u), kat(kc,ko,e+2u), kat(kc,ko,e+3u)), acc);
   float s = (acc.x + acc.y) + (acc.z + acc.w);
   for (; e < p.k; ++e) s = fma(q_[qo + e], kat(kc, ko, e), s);
   return s;
 }
+void fwht_q(uint n) {
+  for (uint len = 1u; len < n; len <<= 1) for (uint i = 0u; i < n; i += len << 1) for (uint j = i; j < i + len; ++j) { float u = qr[j], w = qr[j + len]; qr[j] = u + w; qr[j + len] = u - w; }
+  float r = fwhtnorm(n); for (uint i = 0u; i < n; ++i) qr[i] *= r;
+}
+void fwht_y(uint n) {
+  for (uint len = 1u; len < n; len <<= 1) for (uint i = 0u; i < n; i += len << 1) for (uint j = i; j < i + len; ++j) { float u = yr[j], w = yr[j + len]; yr[j] = u + w; yr[j + len] = u - w; }
+  float r = fwhtnorm(n); for (uint i = 0u; i < n; ++i) yr[i] *= r;
+}
 void main() {
   uint id = gl_GlobalInvocationID.x; if (id >= p.rows * p.cols) return;
   uint i = id / p.cols, h = id % p.cols, kh = h / (p.cols / p.b);
-  bool causal = (p.d & 1u) != 0u; uint kc = (p.d >> 1) & 3u, vc = (p.d >> 3) & 3u, window = p.d >> 5;
-  uint kw = kc == 0u ? p.k : 1u + (p.k + 3u) / 4u, vw = vc == 0u ? p.c : 1u + (p.c + 3u) / 4u;
+  bool causal = (p.d & 1u) != 0u; uint kc = (p.d >> 1) & 7u, vc = (p.d >> 4) & 7u, window = p.d >> 7;
+  uint kw = kvwords(kc, p.k), vw = kvwords(vc, p.c);
   int pos = int(p.a) - int(p.rows) + int(i);
   uint qo = id * p.k, yo = id * p.c;
+  if (kc >= 3u) { uint n = tbqdim(p.k); for (uint e = 0u; e < n; ++e) qr[e] = e < p.k ? q_[qo + e] * tbqsign(e) : 0.0; fwht_q(n); }
+  uint nv = vc >= 3u ? tbqdim(p.c) : 0u;
+  for (uint e = 0u; e < nv; ++e) yr[e] = 0.0;
   float m = -1.0 / 0.0;
   for (uint j = 0; j < p.a; ++j) {
     if (causal && int(j) > pos) continue; if (window > 0u && pos - int(j) >= int(window)) continue;
@@ -177,8 +207,10 @@ void main() {
     if (causal && int(j) > pos) continue; if (window > 0u && pos - int(j) >= int(window)) continue;
     float dot = qk(kc, qo, (j * p.b + kh) * kw);
     float w = fexp(dot * p.alpha - m); sum += w;
-    for (uint e = 0; e < p.c; ++e) y_[yo + e] += w * vat(vc, (j * p.b + kh) * vw, e);
+    if (vc >= 3u) { for (uint e = 0u; e < nv; ++e) yr[e] = fma(w, vat(vc, (j * p.b + kh) * vw, e), yr[e]); }
+    else for (uint e = 0; e < p.c; ++e) y_[yo + e] += w * vat(vc, (j * p.b + kh) * vw, e);
   }
+  if (vc >= 3u) { fwht_y(nv); for (uint e = 0u; e < p.c; ++e) y_[yo + e] = yr[e] * tbqsign(e); }
   float inv = sum > 0.0 ? 1.0 / sum : 0.0;
   for (uint e = 0; e < p.c; ++e) y_[yo + e] *= inv;
 }
@@ -329,32 +361,62 @@ def cuda(names):
     out.append("""FORGE_DEV float fp8dec(unsigned b) {
   unsigned e = (b >> 3) & 15u, m = b & 7u; float v = e == 0u ? (float)m * (1.0f / 512.0f) : (float)(8u + m) * fexp2((float)((int)e - 10));
   return (b & 0x80u) ? -v : v; }
+FORGE_DEV float tbq4lv(unsigned c) {
+  const float l[16] = {-2.7326f, -2.0690f, -1.6181f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
+                        0.1284f, 0.3881f, 0.6568f, 0.9424f, 1.2562f, 1.6181f, 2.0690f, 2.7326f}; return l[c]; }
+FORGE_DEV float tbq3lv(unsigned c) { const float l[8] = {-2.1520f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1520f}; return l[c]; }
 FORGE_DEV float kvat(const float* base, unsigned codec, unsigned e) {
   if (codec == 0u) return base[e];
+  if (codec >= 3u) {   // TurboQuant: Lloyd-Max level * head gain, in the rotated domain (flow/kv_codec.hpp)
+    unsigned per = codec == 3u ? 8u : 10u, bits = codec == 3u ? 4u : 3u;
+    unsigned w = __builtin_bit_cast(unsigned, base[1u + e / per]), c = (w >> (bits * (e % per))) & ((1u << bits) - 1u);
+    float lv = codec == 3u ? tbq4lv(c) : tbq3lv(c);
+    return lv * base[0]; }
   unsigned w = __builtin_bit_cast(unsigned, base[1u + (e >> 2)]), b = (w >> (8u * (e & 3u))) & 255u;
   return (codec == 1u ? (float)(signed char)b : fp8dec(b)) * base[0]; }
-// q[s,hq,d] k[t,hk,d] v[t,hk,dv]; flags = causal | kcodec<<1 | vcodec<<3 | window<<5 (see flow/kv_codec.hpp)
+FORGE_DEV unsigned tbqdim(unsigned d) { unsigned p = 1u; while (p < d) p <<= 1; return p; }
+FORGE_DEV unsigned kvwords(unsigned codec, unsigned d) {
+  if (codec == 0u) return d; if (codec < 3u) return 1u + (d + 3u) / 4u;
+  return codec == 3u ? 1u + (tbqdim(d) + 7u) / 8u : 1u + (tbqdim(d) + 9u) / 10u; }
+FORGE_DEV float tbqsign(unsigned i) { unsigned h = i * 0x9E3779B1u; h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; return (h & 1u) ? -1.0f : 1.0f; }
+FORGE_DEV float fwhtnorm(unsigned n) { float r = 1.0f; unsigned lg = 0u; while ((1u << lg) < n) ++lg;
+  for (unsigned i = 0u; i < lg / 2u; ++i) r *= 0.5f; return (lg & 1u) ? r * 0.70710678118654752f : r; }
+// in-place orthonormal Walsh-Hadamard transform of a private array (a macro: no pointers to private memory)
+#define FORGE_FWHT(a, n) { for (unsigned len_ = 1u; len_ < (n); len_ <<= 1) for (unsigned i_ = 0u; i_ < (n); i_ += len_ << 1) \
+  for (unsigned j_ = i_; j_ < i_ + len_; ++j_) { float u_ = a[j_], w_ = a[j_ + len_]; a[j_] = u_ + w_; a[j_ + len_] = u_ - w_; } \
+  float r_ = fwhtnorm(n); for (unsigned i_ = 0u; i_ < (n); ++i_) a[i_] *= r_; }
+// q[s,hq,d] k[t,hk,d] v[t,hk,dv]; flags = causal | kcodec<<1 | vcodec<<4 | window<<7 (see flow/kv_codec.hpp).
+// TurboQuant K: q is rotated once (q.k = Rq.Rk); TurboQuant V: rows are accumulated rotated, R^T applied once.
+// Padded head dims up to 256 (the host refuses larger ones).
 FORGE_GLOBAL void forge_attention(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq, unsigned d,
                                   unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
   unsigned id = gid(); if (id >= s * hq) return;
   unsigned i = id / hq, h = id % hq, kh = h / (hq / hk);
-  unsigned causal = flags & 1u, kc = (flags >> 1) & 3u, vc = (flags >> 3) & 3u, window = flags >> 5;
-  unsigned kw = kc ? 1u + (d + 3u) / 4u : d, vw = vc ? 1u + (dv + 3u) / 4u : dv;
+  unsigned causal = flags & 1u, kc = (flags >> 1) & 7u, vc = (flags >> 4) & 7u, window = flags >> 7;
+  unsigned kw = kvwords(kc, d), vw = kvwords(vc, dv);
   int pos = (int)t - (int)s + (int)i; const float* qp = q + id * d; float* yp = y + id * dv;
+  float qr[256]; float yr[256];
+  unsigned dk = kc >= 3u ? tbqdim(d) : d, dvp = vc >= 3u ? tbqdim(dv) : dv;
+  if (kc >= 3u) { for (unsigned e = 0; e < dk; ++e) qr[e] = e < d ? qp[e] * tbqsign(e) : 0.0f; FORGE_FWHT(qr, dk) }
   float m = -__builtin_inff();
   for (unsigned j = 0; j < t; ++j) {
     if (causal && (int)j > pos) continue; if (window && pos - (int)j >= (int)window) continue;
     const float* kp = k + (j * hk + kh) * kw; float dot = 0.0f;
-    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kvat(kp, kc, e), dot);
+    if (kc >= 3u) { for (unsigned e = 0; e < dk; ++e) dot = fma_(qr[e], kvat(kp, kc, e), dot); }
+    else { for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kvat(kp, kc, e), dot); }
     m = dot * scale > m ? dot * scale : m; }
   for (unsigned e = 0; e < dv; ++e) yp[e] = 0.0f;
+  if (vc >= 3u) for (unsigned e = 0; e < dvp; ++e) yr[e] = 0.0f;
   float sum = 0.0f;
   for (unsigned j = 0; j < t; ++j) {
     if (causal && (int)j > pos) continue; if (window && pos - (int)j >= (int)window) continue;
     const float* kp = k + (j * hk + kh) * kw; const float* vp = v + (j * hk + kh) * vw; float dot = 0.0f;
-    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kvat(kp, kc, e), dot);
+    if (kc >= 3u) { for (unsigned e = 0; e < dk; ++e) dot = fma_(qr[e], kvat(kp, kc, e), dot); }
+    else { for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kvat(kp, kc, e), dot); }
     float w = fexp(dot * scale - m); sum += w;
-    for (unsigned e = 0; e < dv; ++e) yp[e] = fma_(w, kvat(vp, vc, e), yp[e]); }
+    if (vc >= 3u) { for (unsigned e = 0; e < dvp; ++e) yr[e] = fma_(w, kvat(vp, vc, e), yr[e]); }
+    else { for (unsigned e = 0; e < dv; ++e) yp[e] = fma_(w, kvat(vp, vc, e), yp[e]); } }
+  if (vc >= 3u) { FORGE_FWHT(yr, dvp) for (unsigned e = 0; e < dv; ++e) yp[e] = yr[e] * tbqsign(e); }
   float inv = sum > 0.0f ? 1.0f / sum : 0.0f; for (unsigned e = 0; e < dv; ++e) yp[e] *= inv; }""")
     return "\n".join(out) + "\n"
 
