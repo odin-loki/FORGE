@@ -12,12 +12,12 @@ static const std::string& model_a() { static std::string p = forge_test::make_ti
 static const std::string& model_b() { static std::string p = forge_test::make_tiny_model(tmp("b.fpk"), {.seed = 99}); return p; }
 static const std::string& model_q() { static std::string p = forge_test::make_tiny_model(tmp("q.fpk"), {.codec = "q8_0"}); return p; }
 
-static std::vector<int> greedy(session& s, std::vector<int> prompt, int n) { sampler g; s.reset(); return s.generate(prompt, n, g); }
+static std::vector<int> greedy(mind::session& s, std::vector<int> prompt, int n) { sampler g; s.reset(); return s.generate(prompt, n, g); }
 static float maxdiff(const std::vector<float>& a, const std::vector<float>& b) { float m = 0; for (std::size_t i = 0; i < a.size(); ++i) m = std::max(m, std::abs(a[i] - b[i])); return m; }
 
 TEST(paged_kv_matches_preallocated) {
     auto m = model::open(model_a());
-    session flat(m, {.page_rows = 0}), paged(m, {.page_rows = 4});
+    mind::session flat(m, {.page_rows = 0}), paged(m, {.page_rows = 4});
     std::vector<int> p = {1, 5, 9, 33, 70, 101, 7};
     auto gf = greedy(flat, p, 20), gp = greedy(paged, p, 20);
     CHECK(gf == gp);
@@ -31,7 +31,7 @@ TEST(paged_kv_matches_preallocated) {
 
 TEST(forward_all_rows_match_incremental) {
     auto m = model::open(model_a());
-    session a(m), b(m);
+    mind::session a(m), b(m);
     std::vector<int> p = {3, 1, 4, 1, 5, 9, 2, 6};
     auto all = a.forward_all(p);
     std::size_t V = std::size_t(a.vocab());
@@ -44,7 +44,7 @@ TEST(forward_all_rows_match_incremental) {
 
 TEST(rewind_and_copy_prefix) {
     auto m = model::open(model_a());
-    session a(m), b(m);
+    mind::session a(m), b(m);
     std::vector<int> p = {10, 20, 30, 40, 50};
     a.forward(p);
     auto l1 = a.forward(std::vector<int>{60});
@@ -60,10 +60,10 @@ TEST(rewind_and_copy_prefix) {
 TEST(speculative_greedy_equals_target_greedy) {
     auto tm = model::open(model_a());
     std::vector<int> p = {256, 72, 101, 108, 108, 111};
-    session ref(tm); auto want = greedy(ref, p, 40);
+    mind::session ref(tm); auto want = greedy(ref, p, 40);
     for (auto* dpath : {&model_a(), &model_q(), &model_b()}) {
         for (int k : {1, 3, 6}) {
-            session t(tm), d(model::open(*dpath));
+            mind::session t(tm), d(model::open(*dpath));
             sampler g; speculative_stats st;
             auto got = speculative_generate(t, d, p, 40, g, k, {}, &st);
             CHECK_MSG(got == want, "draft %s k=%d", dpath->c_str(), k);
@@ -77,7 +77,7 @@ TEST(speculative_sampling_preserves_distribution) {
     // first sampled token after a fixed prompt: empirical distribution with a mismatched draft must match the target
     auto tm = model::open(model_a()), dm = model::open(model_b());
     std::vector<int> p = {256, 65, 66};
-    session t(tm), d(dm), ref(tm);
+    mind::session t(tm), d(dm), ref(tm);
     sampler_config sc{.temperature = 1.0f, .seed = 5};
     sampler probe(sc);
     auto want = probe.probs(ref.forward(p), p);
@@ -93,9 +93,9 @@ TEST(speculative_sampling_preserves_distribution) {
 TEST(lookup_speculation_exact) {
     auto tm = model::open(model_a());
     std::vector<int> p = {256, 72, 101, 108, 108, 111, 32, 72, 101, 108, 108, 111, 32, 72, 101};
-    session ref(tm); auto want = greedy(ref, p, 40);
+    mind::session ref(tm); auto want = greedy(ref, p, 40);
     for (int k : {1, 4, 8}) {
-        session t(tm); sampler g; speculative_stats st;
+        mind::session t(tm); sampler g; speculative_stats st;
         auto got = lookup_generate(t, p, 40, g, k, 3, {}, &st);
         CHECK_MSG(got == want, "lookup k=%d", k);
         CHECK(st.drafted > 0);
@@ -106,8 +106,8 @@ TEST(lookup_speculation_exact) {
     // Sampling: the first token's distribution must equal the target's even though a draft is always proposed.
     std::vector<int> q = {256, 65, 66, 256, 65, 66};
     sampler_config sc{.temperature = 1.0f, .seed = 8};
-    session r2(tm); sampler probe(sc); auto pw = probe.probs(r2.forward(q), q);
-    std::vector<double> cnt(pw.size(), 0); const int N = 3000; sampler s(sc); session t(tm);
+    mind::session r2(tm); sampler probe(sc); auto pw = probe.probs(r2.forward(q), q);
+    std::vector<double> cnt(pw.size(), 0); const int N = 3000; sampler s(sc); mind::session t(tm);
     for (int i = 0; i < N; ++i) { auto o = lookup_generate(t, q, 1, s, 3, 3); cnt[std::size_t(o[0])] += 1; }
     double tv = 0; for (std::size_t i = 0; i < pw.size(); ++i) tv += std::abs(cnt[i] / N - pw[i]);
     CHECK_MSG(tv / 2 < 0.08, "lookup tv %.3f", tv / 2);
@@ -146,7 +146,7 @@ TEST(grammar_constrained_generation) {
     auto m = model::open(model_a());
     auto g = std::make_shared<grammar>(R"(root ::= "{\"name\": \"" [a-z] [a-z]? [a-z]? [a-z]? [a-z]? "\", \"age\": " [1-9] [0-9]? "}")");
     for (std::uint64_t seed : {1ull, 2ull, 3ull}) {
-        session s(m);
+        mind::session s(m);
         sampler smp({.temperature = 1.2f, .seed = seed});
         grammar_constraint gc(g, *m->tokenizer(), int(m->vocab()), m->tokenizer()->eos());
         smp.filter = [&](std::span<float> l) { gc.apply(l); };
@@ -164,7 +164,7 @@ TEST(batch_scheduler_matches_sequential) {
     std::vector<std::vector<int>> prompts = {{256, 1, 2, 3}, {256, 9, 8}, {256, 1, 2, 3, 4, 5, 6}, {256, 40}, {256, 1, 2, 3, 99}, {256, 7, 7, 7, 7, 7, 7, 7, 7, 7}};
     std::vector<int> lens = {12, 5, 20, 1, 9, 15};
     std::vector<std::vector<int>> want;
-    for (std::size_t i = 0; i < prompts.size(); ++i) { session s(m); want.push_back(greedy(s, prompts[i], lens[i])); }
+    for (std::size_t i = 0; i < prompts.size(); ++i) { mind::session s(m); want.push_back(greedy(s, prompts[i], lens[i])); }
     batch_scheduler b(m, {.max_active = 3, .prefill_chunk = 3, .prefix_cache = 4, .session = {.page_rows = 8}});
     std::vector<std::vector<int>> got(prompts.size());
     std::vector<std::string> why(prompts.size());
@@ -250,7 +250,7 @@ TEST(json_schema_grammar) {
 
 TEST(lora_hot_swap) {
     auto m = model::open(model_a());
-    session base(m); auto L0 = base.forward(std::vector<int>{1, 2, 3});
+    mind::session base(m); auto L0 = base.forward(std::vector<int>{1, 2, 3});
     std::size_t w0 = m->loaded_weights();
     auto vocab = m->vocab(); i64 d = 0; { pack::reader r(model_a()); d = r.load("lm_head").shape[1]; }
     std::mt19937 g(4); std::normal_distribution<float> N(0, 0.05f); const i64 r = 4;
@@ -261,7 +261,7 @@ TEST(lora_hot_swap) {
       z.b.shape = {wq.shape[0], r}; z.b.data.assign(std::size_t(wq.shape[0] * r), 1.f); m->add_adapter("zero", {{"layer.0.wq", z}}, 8); }
     CHECK_THROWS(m->add_adapter("one", {{"lm_head", l}}, 1.f));
     model::lora bad = l; bad.b.shape = {vocab + 1, r}; CHECK_THROWS(m->add_adapter("bad", {{"lm_head", bad}}, 1.f));
-    session s(m); std::vector<int> ids{1, 2, 3};
+    mind::session s(m); std::vector<int> ids{1, 2, 3};
     s.set_adapter("one"); auto L1 = s.forward(ids);
     s.set_adapter("two"); auto L2 = s.forward(ids);
     s.set_adapter("zero"); auto Lz = s.forward(ids);
@@ -274,7 +274,7 @@ TEST(lora_hot_swap) {
     CHECK(z == 0); CHECK(b == 0);
     CHECK(m->loaded_weights() == w0);                         // base weights were not reloaded or copied
     // Two sessions with different adapters on one model.
-    session s1(m), s2(m); s1.set_adapter("one"); s2.set_adapter("two");
+    mind::session s1(m), s2(m); s1.set_adapter("one"); s2.set_adapter("two");
     auto a = s1.forward(ids), c = s2.forward(ids); CHECK(a == L1 && c == L2);
 }
 TEST(lora_adapter_file) {
@@ -289,6 +289,6 @@ TEST(lora_adapter_file) {
     m->add_adapter_file("file", path); m->add_adapter("mem", {{"lm_head", l}}, 3.f);
     std::filesystem::remove(path);
     std::vector<int> ids{4, 5, 6};
-    session a(m), b(m); a.set_adapter("file"); b.set_adapter("mem");
+    mind::session a(m), b(m); a.set_adapter("file"); b.set_adapter("mem");
     CHECK(a.forward(ids) == b.forward(ids));
 }

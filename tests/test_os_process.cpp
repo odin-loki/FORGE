@@ -104,6 +104,22 @@ TEST(spawn_timeout_sweeps_session) {
         const char* q = std::strrchr(b, ')'); return q && q[2] == 'Z'; }()); if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
     CHECK(gone);
 }
+TEST(spawn_normal_exit_sweeps_session) {
+    // the leader exits 0 but leaves a background grandchild in its own group: new_session still reaps it
+    auto pidfile = std::string("/tmp/forge_sessx_") + std::to_string(::getpid());
+    os::spawn_spec s; s.argv = {"sh", "-c", "(set -m; sleep 60 >/dev/null 2>&1 & echo $! > " + pidfile + ") ; sleep 60 >/dev/null 2>&1 & sleep 0.2; exit 0"};
+    s.new_session = true; s.timeout_ms = 20000;
+    auto r = os::spawn_wait(s); CHECK(r); CHECK(!r->timed_out); CHECK(r->exit_code == 0);
+    std::FILE* f = std::fopen(pidfile.c_str(), "r"); CHECK(f != nullptr);
+    long gp = 0; if (f) { CHECK(std::fscanf(f, "%ld", &gp) == 1); std::fclose(f); }
+    std::remove(pidfile.c_str());
+    bool gone = false;
+    for (int i = 0; i < 200 && !gone; ++i) { gone = gp > 0 && (::kill(pid_t(gp), 0) != 0 || [&] {
+        std::FILE* st = std::fopen(("/proc/" + std::to_string(gp) + "/stat").c_str(), "r"); if (!st) return true;
+        char b[512]{}; std::size_t n = std::fread(b, 1, sizeof b - 1, st); std::fclose(st); (void)n;
+        const char* q = std::strrchr(b, ')'); return q && q[2] == 'Z'; }()); if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    CHECK(gone);
+}
 TEST(spawn_output_cap) {
     os::spawn_spec s; s.argv = {"sh", "-c", "head -c 100000 /dev/zero"}; s.max_output = 1000;
     auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out.size() <= 1000); CHECK(r->truncated);
