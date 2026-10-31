@@ -107,6 +107,7 @@ inline launch_args kernel_args(const std::string& op, const std::vector<tensor_v
     case sig::attention: {
         auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
         if (std::uint32_t dd = std::uint32_t(x.shape[2]), dvv = std::uint32_t(a.num("kv_dv", 0)); (kc >= 3u && dd > 256u) || (vc >= 3u && dvv > 256u)) raise(errc::unsupported, "TurboQuant KV on the GPU supports head dims up to 256");
+        if (kc >= 5u || vc >= 5u) raise(errc::unsupported, "TurboQuant QJL KV types (tbq4p, tbq3p) run on the CPU only");
         std::uint32_t s = std::uint32_t(x.shape[0]), hq = std::uint32_t(x.shape[1]), d = std::uint32_t(x.shape[2]);
         U(s); U(hq); U(d); U(std::uint32_t(in[1].shape[0])); U(std::uint32_t(in[1].shape[1]));
         U(vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]));
@@ -300,6 +301,7 @@ public:
         case sig::attention: {
             auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
         if (std::uint32_t dd = std::uint32_t(x.shape[2]), dvv = std::uint32_t(a.num("kv_dv", 0)); (kc >= 3u && dd > 256u) || (vc >= 3u && dvv > 256u)) raise(errc::unsupported, "TurboQuant KV on the GPU supports head dims up to 256");
+        if (kc >= 5u || vc >= 5u) raise(errc::unsupported, "TurboQuant QJL KV types (tbq4p, tbq3p) run on the CPU only");
             rows = std::uint32_t(x.shape[0]); cols = std::uint32_t(x.shape[1]); k = std::uint32_t(x.shape[2]);
             u4 = std::uint32_t(in[1].shape[0]); u5 = std::uint32_t(in[1].shape[1]);
             u6 = vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]);

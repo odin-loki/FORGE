@@ -302,7 +302,7 @@ int cmd_bench(const args& a) {
     std::vector<int> prompt(std::size_t(p), 1);
     mind::sampler smp;
     mind::generate_stats st;
-    s.generate(prompt, n, smp, {}, &st);
+    s.generate(prompt, n, smp, {}, &st, /*stop_at_eos=*/false);   // bench: always decode n tokens
     std::printf("prefill %d tokens: %.1f tok/s\ndecode  %zu tokens: %.1f tok/s\n", p, p / st.prefill_s, st.new_tokens,
                 st.new_tokens > 1 ? double(st.new_tokens - 1) / st.decode_s : 0.0);
     return 0;

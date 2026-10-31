@@ -25,8 +25,10 @@
 
 namespace forge::flow {
 
-enum class kv_codec : int { f32 = 0, int8 = 1, fp8 = 2, tbq4 = 3, tbq3 = 4 };
-inline bool kv_is_tbq(kv_codec c) { return c == kv_codec::tbq4 || c == kv_codec::tbq3; }
+// tbq4p / tbq3p: TurboQuant_prod - a (b-1)-bit MSE stage plus a 1-bit QJL sketch of the residual (CPU only).
+enum class kv_codec : int { f32 = 0, int8 = 1, fp8 = 2, tbq4 = 3, tbq3 = 4, tbq4p = 5, tbq3p = 6 };
+inline bool kv_is_qjl(kv_codec c) { return c == kv_codec::tbq4p || c == kv_codec::tbq3p; }
+inline bool kv_is_tbq(kv_codec c) { return c == kv_codec::tbq4 || c == kv_codec::tbq3 || kv_is_qjl(c); }
 
 // (key codec, value codec) for a codec name; "k8v4" is int8 keys + tbq4 values, anything else is uniform.
 struct kv_codec_pair { kv_codec k = kv_codec::f32, v = kv_codec::f32; };
@@ -36,8 +38,10 @@ inline kv_codec_pair kv_codec_pair_from_name(const std::string& s) {
     if (s == "fp8" || s == "fp8_e4m3" || s == "e4m3") return {kv_codec::fp8, kv_codec::fp8};
     if (s == "tbq4" || s == "tbq4_0" || s == "turbo4") return {kv_codec::tbq4, kv_codec::tbq4};
     if (s == "tbq3" || s == "tbq3_0" || s == "turbo3") return {kv_codec::tbq3, kv_codec::tbq3};
+    if (s == "tbq4p" || s == "tbq4_qjl" || s == "turbo4p") return {kv_codec::tbq4p, kv_codec::tbq4p};
+    if (s == "tbq3p" || s == "tbq3_qjl" || s == "turbo3p") return {kv_codec::tbq3p, kv_codec::tbq3p};
     if (s == "k8v4") return {kv_codec::int8, kv_codec::tbq4};
-    raise(errc::invalid_argument, "unknown KV codec '{}' (f32, int8, fp8, tbq4, tbq3, k8v4)", s);
+    raise(errc::invalid_argument, "unknown KV codec '{}' (f32, int8, fp8, tbq4, tbq3, tbq4p, tbq3p, k8v4)", s);
 }
 inline kv_codec kv_codec_from_name(const std::string& s) {
     auto p = kv_codec_pair_from_name(s);
@@ -46,7 +50,8 @@ inline kv_codec kv_codec_from_name(const std::string& s) {
 }
 inline const char* kv_codec_name(kv_codec c) {
     switch (c) { case kv_codec::int8: return "int8"; case kv_codec::fp8: return "fp8"; case kv_codec::tbq4: return "tbq4";
-                 case kv_codec::tbq3: return "tbq3"; default: return "f32"; }
+                 case kv_codec::tbq3: return "tbq3"; case kv_codec::tbq4p: return "tbq4p"; case kv_codec::tbq3p: return "tbq3p";
+                 default: return "f32"; }
 }
 inline std::string kv_codec_pair_name(kv_codec_pair p) {
     if (p.k == kv_codec::int8 && p.v == kv_codec::tbq4) return "k8v4";
@@ -59,16 +64,21 @@ inline i64 kv_head_words(i64 d, kv_codec c) {
     if (c == kv_codec::f32) return d;
     if (c == kv_codec::tbq4) return 1 + (kv_tbq_dim(d) + 7) / 8;
     if (c == kv_codec::tbq3) return 1 + (kv_tbq_dim(d) + 9) / 10;
+    if (c == kv_codec::tbq4p) return 2 + (kv_tbq_dim(d) + 9) / 10 + (kv_tbq_dim(d) + 31) / 32;
+    if (c == kv_codec::tbq3p) return 2 + (kv_tbq_dim(d) + 15) / 16 + (kv_tbq_dim(d) + 31) / 32;
     return kv_head_words(d);
 }
-inline int kv_tbq_bits(kv_codec c) { return c == kv_codec::tbq4 ? 4 : 3; }
-inline int kv_tbq_per_word(kv_codec c) { return c == kv_codec::tbq4 ? 8 : 10; }
+// bits of the MSE (Lloyd-Max) stage
+inline int kv_tbq_bits(kv_codec c) { return c == kv_codec::tbq4 ? 4 : c == kv_codec::tbq3 || c == kv_codec::tbq4p ? 3 : 2; }
+inline int kv_tbq_per_word(kv_codec c) { int b = kv_tbq_bits(c); return b == 4 ? 8 : b == 3 ? 10 : 16; }
 // Lloyd-Max reconstruction levels for N(0,1), ascending (code i -> level i). GPU kernels carry the same tables.
 inline const float* kv_tbq_levels(kv_codec c) {
     static const float l4[16] = {-2.7326f, -2.0690f, -1.6181f, -1.2562f, -0.9424f, -0.6568f, -0.3881f, -0.1284f,
                                   0.1284f,  0.3881f,  0.6568f,  0.9424f,  1.2562f,  1.6181f,  2.0690f,  2.7326f};
     static const float l3[8] = {-2.1520f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1520f};
-    return c == kv_codec::tbq4 ? l4 : l3;
+    static const float l2[4] = {-1.5104f, -0.4528f, 0.4528f, 1.5104f};
+    int b = kv_tbq_bits(c);
+    return b == 4 ? l4 : b == 3 ? l3 : l2;
 }
 // fixed pseudo-random sign of coordinate i (integer hash; identical in every kernel language)
 inline float kv_tbq_sign(std::uint32_t i) {
@@ -92,9 +102,11 @@ inline void kv_tbq_encode(const float* x, i64 d, kv_codec c, float* dst) {
     kv_fwht(y, dp);
     double r2 = 0; for (i64 e = 0; e < dp; ++e) r2 += double(y[e]) * y[e];
     float s0 = float(std::sqrt(r2 / double(dp)));
-    i64 nw = kv_head_words(d, c) - 1;
-    auto* w = reinterpret_cast<std::uint32_t*>(dst + 1);
+    const i64 h = kv_is_qjl(c) ? 2 : 1;
+    i64 nw = kv_head_words(d, c) - h;
+    auto* w = reinterpret_cast<std::uint32_t*>(dst + h);
     std::memset(w, 0, std::size_t(nw) * 4);
+    std::vector<int> codes(kv_is_qjl(c) ? std::size_t(dp) : 0);
     double num = 0, den = 0;
     float inv = s0 > 0 ? 1.f / s0 : 0.f;
     for (i64 e = 0; e < dp; ++e) {
@@ -103,18 +115,38 @@ inline void kv_tbq_encode(const float* x, i64 d, kv_codec c, float* dst) {
         while (lo < hi) { int mid = (lo + hi) / 2; if (u > 0.5f * (lv[mid] + lv[mid + 1])) lo = mid + 1; else hi = mid; }
         num += double(y[e]) * lv[lo]; den += double(lv[lo]) * lv[lo];
         w[e / per] |= std::uint32_t(lo) << (bits * (e % per));
+        if (!codes.empty()) codes[std::size_t(e)] = lo;
     }
     float g = den > 0 ? float(num / den) : 0.f;
     std::memcpy(dst, &g, 4);
+    if (kv_is_qjl(c)) {   // QJL (Zandieh et al.): sign bits of S r, S = H D2 (a second random-sign Hadamard), plus |r|
+        std::vector<float> r(static_cast<std::size_t>(dp));
+        double rn = 0;
+        for (i64 e = 0; e < dp; ++e) { r[e] = (y[e] - g * lv[codes[e]]) * kv_tbq_sign(std::uint32_t(e) + 0x10000u); rn += double(r[e]) * r[e]; }
+        kv_fwht(r.data(), dp);
+        float rnf = float(std::sqrt(rn)); std::memcpy(dst + 1, &rnf, 4);
+        auto* sb = w + (dp + per - 1) / per;
+        for (i64 e = 0; e < dp; ++e) if (r[e] >= 0.f) sb[e / 32] |= 1u << (e % 32);
+    }
 }
 inline void kv_tbq_decode(const float* src, i64 d, kv_codec c, float* out) {
     i64 dp = kv_tbq_dim(d); int bits = kv_tbq_bits(c), per = kv_tbq_per_word(c); std::uint32_t mask = (1u << bits) - 1u;
     const float* lv = kv_tbq_levels(c);
     float g; std::memcpy(&g, src, 4);
-    auto* w = reinterpret_cast<const std::uint32_t*>(src + 1);
+    const i64 h = kv_is_qjl(c) ? 2 : 1;
+    auto* w = reinterpret_cast<const std::uint32_t*>(src + h);
     float zb[512]; std::vector<float> zh; float* z = zb;
     if (dp > 512) { zh.resize(std::size_t(dp)); z = zh.data(); }
     for (i64 e = 0; e < dp; ++e) z[e] = lv[(w[e / per] >> (bits * (e % per))) & mask] * g;
+    if (kv_is_qjl(c)) {   // unbiased residual estimate: sqrt(pi/2) |r| / sqrt(n) * S^T sign(S r)
+        float rn; std::memcpy(&rn, src + 1, 4);
+        auto* sb = w + (dp + per - 1) / per;
+        std::vector<float> t(static_cast<std::size_t>(dp));
+        for (i64 e = 0; e < dp; ++e) t[e] = (sb[e / 32] >> (e % 32)) & 1u ? 1.f : -1.f;
+        kv_fwht(t.data(), dp);
+        float k = 1.2533141373155003f * rn / std::sqrt(float(dp));
+        for (i64 e = 0; e < dp; ++e) z[e] += k * t[e] * kv_tbq_sign(std::uint32_t(e) + 0x10000u);
+    }
     kv_fwht(z, dp);
     for (i64 e = 0; e < d; ++e) out[e] = z[e] * kv_tbq_sign(std::uint32_t(e));
 }

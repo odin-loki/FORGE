@@ -550,6 +550,7 @@ inline bool run_op(runtime& rt, const std::string& op, const std::vector<tensor_
         pc.rows = std::uint32_t(x.shape[0]); pc.cols = std::uint32_t(x.shape[1]); pc.k = std::uint32_t(x.shape[2]);
         auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
         if (std::uint32_t dd = std::uint32_t(x.shape[2]), dvv = std::uint32_t(a.num("kv_dv", 0)); (kc >= 3u && dd > 256u) || (vc >= 3u && dvv > 256u)) raise(errc::unsupported, "TurboQuant KV on the GPU supports head dims up to 256");
+        if (kc >= 5u || vc >= 5u) raise(errc::unsupported, "TurboQuant QJL KV types (tbq4p, tbq3p) run on the CPU only");
         pc.a = std::uint32_t(in[1].shape[0]); pc.b = std::uint32_t(in[1].shape[1]);
         pc.c = vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]);   // quantised V: physical last dim is packed
         pc.d = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7);
