@@ -6,7 +6,12 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#ifdef _WIN32
+#include <process.h>
+#define getpid _getpid
+#else
 #include <unistd.h>
+#endif
 
 using namespace forge;
 using namespace forge::mind;
@@ -178,7 +183,8 @@ TEST(tbq_qjl_inner_product) {
             std::printf("  %s d %lld: <q,k> bias %+.4f (%.2e of rms), rmse %.4f, vector rel MSE %.4f, words %lld\n", std::string(flow::kv_codec_name(c)).c_str(), (long long)d,
                         bias, bias / rms, rmse / rms, rel / xx, (long long)flow::kv_head_words(d, c));
             if (flow::kv_is_qjl(c)) {
-                CHECK_MSG(std::fabs(bias / rms) < 3e-3, "bias %g", bias / rms);
+                CHECK_MSG(std::fabs(bias / rms) < 6e-3,   // MSE-only: 8e-3 (tbq4), 3e-2 (tbq3); sampling noise ~1e-3 (stdlib RNGs differ)
+                          "bias %g", bias / rms);
                 CHECK_MSG(rel / xx < (c == kv_codec::tbq4p ? 0.06 : 0.2), "rel %g", rel / xx);
                 CHECK(flow::kv_head_words(d, c) <= flow::kv_head_words(d, c == kv_codec::tbq4p ? kv_codec::tbq4 : kv_codec::tbq3) + 2);
             }
