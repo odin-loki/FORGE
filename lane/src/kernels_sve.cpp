@@ -1,6 +1,7 @@
 // SVE kernel table at one fixed vector length. CMake compiles this file once per length
 // (-msve-vector-bits=128/256/512/1024); each copy exports forge::lane::mv_sve<B>::table.
 #include <forge/lane/algo.hpp>
+#include <forge/lane/qdot.hpp>
 #include <forge/lane/dispatch.hpp>
 #if defined(__aarch64__)
 #if !defined(FORGE_HAVE_SVE_FIXED)

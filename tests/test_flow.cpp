@@ -1,3 +1,4 @@
+#include <cstring>
 #include <map>
 #include "check.hpp"
 #include <forge/flow/flow.hpp>
@@ -165,6 +166,33 @@ TEST(codecs_roundtrip) {
         double bound = bounds.count(c.name) ? bounds.at(c.name) : 0;
         std::printf("  %-9s %5zu bytes  max err %.5f\n", std::string(c.name).c_str(), buf.size(), maxe);
         CHECK_MSG(maxe <= bound, "%s", std::string(c.name).c_str());
+    }
+}
+
+
+// Native quantised kernels (lane/qdot.hpp) must be bit-identical to the scalar codec decode + lane dot, on every
+// lane target this machine can run, including a partial final tile (k not a multiple of 256 for q8_0).
+TEST(qdot_matches_decode_exactly) {
+    std::mt19937 r(11);
+    for (const char* tgt : {"scalar", "avx2", "avx512"}) {
+        const auto* ker = lane::by_name(tgt);
+        if (!ker) { std::printf("  qdot: target %s not available\n", tgt); continue; }
+        for (const char* cn : {"q8_0", "q4_k", "q6_k", "q5_k", "f16", "q8_g32"}) {
+            const auto* c = codecs::find(cn);
+            for (std::size_t k : {std::size_t(256), std::size_t(1024), std::size_t(768 + (c->block == 32 ? 96 : 0))}) {
+                auto w = verify::random_tensor({i64(k)}, r, -2, 2); auto x = verify::random_tensor({i64(k)}, r, -1, 1);
+                std::vector<u8> enc(c->bytes(k)); c->encode(w.data.data(), k, enc.data());
+                std::vector<float> ref(k), got(k);
+                c->decode(enc.data(), k, ref.data());
+                int fmt = qweights::fmt_of(c);
+                ker->qdecode(fmt, enc.data(), k, got.data(), c->decode);
+                CHECK_MSG(std::memcmp(ref.data(), got.data(), k * 4) == 0, "%s/%s k=%zu: qdecode differs", tgt, cn, k);
+                float a = ker->dot(x.data.data(), ref.data(), k);
+                float b = ker->qdot(fmt, enc.data(), x.data.data(), k, c->decode, c->block, c->block_bytes);
+                CHECK_MSG(std::memcmp(&a, &b, 4) == 0, "%s/%s k=%zu: qdot %.9g vs dot %.9g", tgt, cn, k, double(b), double(a));
+            }
+        }
+        std::printf("  qdot: %s exact for q8_0 q4_k q6_k q5_k f16 q8_g32\n", tgt);
     }
 }
 
