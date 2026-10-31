@@ -128,10 +128,9 @@ int main() {
 
 - Scripts and modules are compiled to a **compact, verified stack bytecode** (NETMF uses a compact IL
   interpreter for the same reasons: small footprint, fast startup, no JIT, predictable on small
-  devices). Bytecode is cached as `.fsc` next to the source (keyed by content hash and VM version).
+  devices). A `.fsc` bytecode cache next to the source is **planned, not implemented**: scripts are compiled on every run.
 - The **REPL and `eval`** use a direct **AST tree-walker** path: no compile step, best error locations,
-  instant feedback. Functions defined at the REPL are compiled to bytecode lazily once called N times
-  (default 2), so hot REPL code also runs on the VM.
+  instant feedback. Lazy compilation of hot REPL functions to bytecode is **planned**; REPL code currently stays on the tree-walker.
 - Both paths share one value model, one object heap and one built-in table, so behaviour is identical;
   golden tests run every test script through both paths.
 - The verifier checks stack depth, jump targets, constant/local indices and opcode operands before a
@@ -175,8 +174,14 @@ int main() {
 - Built-in hierarchy: `Error` > `IOError`, `OSError` (with `errno`/`win32` code), `TypeError`,
   `IndexError`, `KeyError`, `OverflowError`, `OutOfMemoryError`, `TimeoutError`, `CancelledError`,
   `ObjectDisposedError`, `ShellError`, `PermissionError`, `LimitExceededError`.
-- C++ exceptions and `std::expected` errors from `forge::os`, `forge::mem` and other modules are mapped
-  to script exceptions at the built-in boundary; no C++ exception ever escapes into or past the VM.
+- C++ exceptions are mapped to script exceptions by `Interp::from_cpp` (`script/src/runtime.cpp`):
+  `heap_exhausted`/`std::bad_alloc` -> `OutOfMemoryError`, `syntax_error` -> `SyntaxError`, `forge_exception`
+  by `errc` (`IOError`, `ValueError`, `OSError`, `OutOfMemoryError`, else `Error`), `std::out_of_range` ->
+  `IndexError`, `std::invalid_argument` -> `ValueError`, anything else -> `Error`. Built-ins turn failed
+  `forge::os` results into script exceptions via their `ok(...)` helpers. Script `try`/`catch` sees these
+  mapped errors, and `engine` (`script/src/engine.cpp`) catches everything at the embedding API, so no
+  C++ exception leaves `engine::run`/`eval`. The VM itself has no separate catch layer; this is enforced at
+  the interpreter and engine boundaries, not proven for every native call.
   `std::bad_alloc` maps to `OutOfMemoryError`.
 
 ### Threads and async
@@ -197,7 +202,7 @@ int main() {
 - Built-ins are thin C++ bindings over `forge::os` (fs, proc, net, time, env, registry) and return
   handles or plain values; native resources never appear as raw addresses.
 - The managed heap uses a `forge::mem` allocator: every object allocation is charged to the script's
-  memory budget (`FORGE_MEM_LIMIT`, `--mem-limit`, or a `limit {mem: ...}` block). When an allocation
+  memory budget (`FORGE_MEM_LIMIT`, `forge script --heap BYTES`, or `forge::limit({mem: BYTES}, fn)`). When an allocation
   would exceed the budget the runtime first evicts caches and runs the cycle collector, then throws a
   catchable `OutOfMemoryError` instead of being OOM-killed. A small reserve is kept so handlers and
   `finally` blocks can still run.
@@ -205,10 +210,13 @@ int main() {
 
 ### Resource limits
 
-Per script, per task, or per `limit {}` block: heap bytes, total allocations, instruction count /
-CPU time, wall-clock timeout, recursion depth (default 10 000 frames, checked, never a C++ stack
-overflow), open handles, child processes, and output size. Child processes get OS limits (cgroups v2,
-Job Objects, setrlimit). Exceeding any limit throws `LimitExceededError` (or `OutOfMemoryError`).
+Implemented (`Limits` in `script/src/interp.hpp`, CLI `--timeout MS`, `--max-steps N`, `--heap BYTES`):
+step count, wall-clock timeout, managed-heap cap, call depth (default 800, checked so the C++ stack is
+safe) and per-child output size (64 MiB). `forge::limit(opts, fn)` narrows these for one call:
+`timeout` (ms), `mem` (bytes, integer), `proc_mem` and `proc_cpu` (child memory bytes / CPU seconds,
+applied at spawn through `forge::os` process limits). Exceeding a limit raises `LimitExceededError`,
+`TimeoutError` or `OutOfMemoryError`. **Planned, not implemented:** `limit {}` block syntax, string sizes
+such as `"2G"`, allocation-count, open-handle and child-count limits. `forge::limit` has no dedicated test yet.
 
 ### Interpreter implementation rules (safe ISO C++23)
 
@@ -221,9 +229,9 @@ Job Objects, setrlimit). Exceeding any limit throws `LimitExceededError` (or `Ou
   `std::variant`/tagged unions with checked access; `std::bit_cast` only for float/int bits.
 - Bounds-checked access everywhere (`.at()`, `std::span` with checked helpers, hardened libstdc++/libc++
   assertions enabled in all builds); bytecode reads go through a checked reader.
-- Errors via exceptions/`std::expected` internally; all mapped to script exceptions at the boundary.
+- Errors via exceptions/`std::expected` internally; mapped to script exceptions as described under Errors.
 - Enforced by clang-tidy (cppcoreguidelines, bugprone), `-Wall -Wextra -Werror`, ASan/UBSan/TSan CI
-  jobs and fuzzing of the lexer, parser, compiler and verifier.
+  jobs; fuzzing of the lexer, parser, compiler and verifier is planned (no fuzz target yet).
 
 ## REPL
 
@@ -346,7 +354,7 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 ## Higher-level features (approved, all in scope)
 
 1. **Parallel tasks** — `spawn fn`, `await`, `parallel(list, fn, n)`; thread pool from `forge::os`.
-2. **Resource-limited runs** — `limit {mem: "2G", cpu_s: 60, timeout: "5m"} { ... }` applies to
+2. **Resource-limited runs** — `forge::limit(opts, fn)` with an options map of integers (`mem` bytes, `timeout` ms, `proc_mem`, `proc_cpu`) (block syntax `limit {...} {}` is planned) applies to
    child processes (cgroups / Job Objects) and to script work via the `forge::mem` budget, so
    jobs fail cleanly instead of OOM-killing the box.
 3. **Job pipelines** — declare steps with dependencies (`job build after fetch { }`), run as a DAG,
@@ -358,7 +366,8 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 7. **Remote execution** — `forge::remote("host:7000", source, opts)` runs on `forge rpc-serve
    --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS. Implemented; see docs/rpc.md.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
-9. **Sandboxed runs** — run untrusted scripts with fs/net capabilities off, using `sandbox.hpp`.
+9. **Sandboxed runs** — `forge::sandbox(opts, fn)` and `--no-fs/--no-net/--no-proc` turn interpreter
+   capabilities off. This is an in-interpreter check only; it does **not** use `os/sandbox.hpp` (planned). See docs/security.md.
 
 ## AI-assisted commands (implemented)
 
@@ -484,14 +493,17 @@ in both execution modes.
 
 ## Safety
 
-- Scripts run with the user's privileges; nothing is sandboxed unless asked.
+- Scripts run with the user's privileges. Capability flags (`forge::sandbox`, `--no-*`) are checked by
+  the interpreter only; there is no OS-level sandbox for scripts yet. See [security.md](security.md).
 - AI-generated code is never run without confirmation.
-- Remote execution stays disabled until rpc-serve has authentication.
+- Remote execution is refused unless rpc-serve has authentication (`flow/include/forge/flow/rpc.hpp`).
 
 ## Testing
 
-Golden-output tests for the language (`tests/script/*.fs` + expected output), unit tests per
-built-in, shell-block tests that skip if the shell is missing, and a parser fuzz target.
+Implemented: `tests/test_script.cpp` runs every snippet through both the VM and the tree-walker and fails on
+any divergence, plus per-built-in cases, emit goldens (`tests/data/emit/`) and shell tests that skip when the
+shell is missing. **Planned, not implemented:** a `tests/script/*.fs` golden corpus and a parser/compiler fuzz
+target (the 8 targets in `fuzz/` cover model formats, JSON, grammar and the tokenizer, not the script parser).
 
 ## Phasing
 
@@ -499,7 +511,7 @@ All phases are in scope.
 
 1. **Core runtime**: value model, ARC heap on `forge::mem`, weak refs, exceptions, lexer/parser,
    tree-walker, REPL, `run` + `sh/bash/zsh/ps/cmd` blocks, fs/os/json built-ins, `using`/`defer`.
-2. **Bytecode VM**: compiler, verifier, `.fsc` cache, lazy REPL compilation, dual-path golden tests;
+2. **Bytecode VM**: compiler, verifier and dual-path tests are done; `.fsc` cache and lazy REPL compilation are planned;
    classes, structs, interfaces, optional annotations and generics-lite.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).

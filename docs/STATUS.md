@@ -1,5 +1,12 @@
 # FORGE implementation status
 
+## Known gaps / not yet implemented (verified 2026-10-31, see docs/security.md)
+- Script sandboxing is interpreter capability checks only; `script/` does not call `os/sandbox.hpp`.
+- No `.fsc` bytecode cache, no lazy REPL compilation, no `limit {}` block syntax (only `forge::limit(opts, fn)`).
+- No `tests/script/*.fs` golden corpus and no script parser fuzz target.
+- No `os/dynlib.hpp` (dynamic libraries are `os::library` in `os.hpp`).
+- Logger: no async sink, Windows event log sink or CMake strip option.
+
 ## forge::os::mobile (2026-10-31)
 - **Runtime reflection** in the script language ([scripting.md](scripting.md#reflection-implemented)): `forge::reflect::*` covers type info, fields/methods/bases/attributes, get/set/invoke by name, enum values, module symbols, signatures and construct-by-name, in both VM and tree-walker, gated by the `reflect` capability. Tested: `test_script` `reflection`, plus `docs/examples/script/reflection.cpp`.
 - New `forge_mobile` library ([mobile.md](mobile.md)): sensors, touch/gestures, device services and lifecycle on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, null and simulated backends; script built-ins `forge::mobile::device`, `forge::sensors::*`, `forge::touch::open`.
