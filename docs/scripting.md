@@ -665,8 +665,18 @@ leftmost recorded token column among the node and its sub-expressions on that li
 methods warns at `obj.m()` calls (the receiver's class is unknown statically, so the message says when only some
 classes defining `m` mark it).
 
-Known gaps: builtins put into containers by constructor syntax (`std::vector<auto> t = {fs.read}`) or by
-`push_back` are not tracked; capability taint does not flow through return values, lambdas' captures or methods'
-parameters; native `.so/.dylib/.dll` imports and module-path (non-relative) lookups are not followed; statements
-with no sub-expressions (e.g. `import`) report the column of their last token. Test scripts that deliberately trigger the runtime errors carry
+Capability taint is a small value analysis: a builtin (`fs.read`, ...) taints the local it is stored in, a container
+built from it (literal, `std::vector<auto> t = {fs.read}` and other standard constructors, `push_back`/`insert`/
+`emplace*`/`append`), an element read from such a container, the return value of a script function or method that
+returns it, and the parameters of script functions and methods it is passed to. Lambdas see the taint of captured
+locals. Calls through any tainted value are warnings (the value may differ at run time); only a `const` local
+initialised directly from the builtin is an error. `import` resolves modules like the runtime (`module_search_path`:
+script dir, `FORGE_SCRIPT_PATH`, `~/.forge/modules`, cwd; `name.fs`, `name.cpp`, `name/mod.fs`, `name/mod.cpp`), and
+with `fs` denied an import is itself an error (the runtime refuses it). A native `.so/.dylib/.dll` import is an error
+unless every capability is granted, matching `load_plugin`. Statement nodes carry the column of their first token.
+
+Known gaps: the host's `base_dir` search entry is not known to the CLI checker; taint is tracked per variable, not
+per element or per key; taint through fields of objects, through `forge::plugin("...")`/`forge::import("...")` calls and
+through values returned from lambdas is not tracked; `ret_caps` is learnt in program order, so a call that appears
+before the function's definition is not tainted. Test scripts that deliberately trigger the runtime errors carry
 `// forge-check: ignore-file`.

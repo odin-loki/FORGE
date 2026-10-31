@@ -8,6 +8,7 @@
 #include <memory>
 #include <tuple>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 
@@ -219,8 +220,11 @@ struct Checker {
             if (auto* cp = cap_of(lib, c->s); cp && !caps.get(cp))
                 D(L::error, "capability", n, lib + "." + c->s + " needs the '" + cp + "' capability, which this run denies (raises PermissionError)", c->s);
         }
-        if (c && c->k == NK::Index && !c->kids.empty() && c->kids[0]->k == NK::Var) if (auto* b = bind_of(c->kids[0]->var); b && b->cap && b->container_cap && !caps.get(b->cap))
-            D(L::warning, "capability", n, "'" + c->kids[0]->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies; calling an element may raise PermissionError", c->kids[0]->s);
+        if (c && (c->k == NK::Index || c->k == NK::Call)) if (auto t = taint(*c); t.first && !t.second && !caps.get(t.first))
+            D(L::warning, "capability", n, std::string("this call may invoke a builtin that needs the '") + t.first + "' capability, which this run denies");
+        // push_back & co. of a builtin taints the container
+        if (c && c->k == NK::Field && !c->kids.empty() && c->kids[0]->k == NK::Var && (c->s == "push_back" || c->s == "emplace_back" || c->s == "push_front" || c->s == "insert" || c->s == "append" || c->s == "emplace"))
+            if (auto* b = bind_of(c->kids[0]->var); b && !b->chan) for (std::size_t i = 1; i < n.kids.size(); ++i) if (auto t = taint(*n.kids[i]); t.first) { b->cap = t.first; b->container_cap = true; }
         if (c && c->k == NK::Var) if (auto* b = bind_of(c->var); b && b->cap && !b->container_cap && !caps.get(b->cap))
             D(b->cnst && !b->param ? L::error : L::warning, "capability", n, "'" + c->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies", c->s);
         if (c && (is_builtin_var(*c, "eval") || is_builtin_var(*c, "forge::eval")) && argc == 1 && n.kids[1]->k == NK::Str) sub_check(n, n.kids[1]->s, "eval");
@@ -279,14 +283,55 @@ struct Checker {
         }
         if (at_top() && !(c && c->k == NK::Field && c->kids.size() && c->kids[0]->k == NK::Var && c->kids[0]->var.global() && !gbind.count(c->kids[0]->s))) after_call(st);
     }
+    std::map<std::string, const char*> ret_caps;   // script fn -> builtin capability its return value may carry
+    static bool ctor_name(const std::string& n) {
+        static const std::set<std::string> c = {"std::vector", "std::deque", "std::list", "std::forward_list", "std::map", "std::unordered_map", "std::multimap",
+            "std::set", "std::unordered_set", "std::multiset", "std::array", "std::pair", "std::tuple", "std::make_pair", "std::make_tuple", "std::optional"};
+        return c.count(n) > 0;
+    }
+    // Does this value carry a capability-needing builtin? {cap, held inside a container}
+    std::pair<const char*, bool> taint(const Node& e, int d = 0) {
+        if (d > 8) return {nullptr, false};
+        switch (e.k) {
+        case NK::Copy: case NK::Move: return e.kids.empty() ? std::pair<const char*, bool>{nullptr, false} : taint(*e.kids[0], d + 1);
+        case NK::Field: if (!e.kids.empty() && e.kids[0]->k == NK::Var && e.kids[0]->var.global() && !gbind.count(e.kids[0]->s)) return {cap_of(e.kids[0]->s, e.s), false}; return {nullptr, false};
+        case NK::Var: if (auto* b = bind_of(e.var); b && b->cap) return {b->cap, b->container_cap}; return {nullptr, false};
+        case NK::Index: if (!e.kids.empty()) { auto t = taint(*e.kids[0], d + 1); if (t.first && t.second) return {t.first, false}; } return {nullptr, false};
+        case NK::Ternary: for (std::size_t i = 1; i < e.kids.size(); ++i) { auto t = taint(*e.kids[i], d + 1); if (t.first) return t; } return {nullptr, false};
+        case NK::List: case NK::Map: for (auto& k : e.kids) if (k) { auto t = taint(*k, d + 1); if (t.first) return {t.first, true}; } return {nullptr, false};
+        case NK::Call: {
+            auto* c = callee(e); if (!c || c->k != NK::Var || !c->var.global()) return {nullptr, false};
+            if (auto it = ret_caps.find(c->s); it != ret_caps.end()) return {it->second, false};
+            if (ctor_name(c->s)) for (std::size_t i = 1; i < e.kids.size(); ++i) { auto t = taint(*e.kids[i], d + 1); if (t.first) return {t.first, true}; }
+            return {nullptr, false};
+        }
+        default: return {nullptr, false};
+        }
+    }
     std::set<std::string> imported;
     void import_check(const Node& n) {
-        if (n.s.ends_with(".so") || n.s.ends_with(".dylib") || n.s.ends_with(".dll")) return;
-        std::string dir = file; auto sl = dir.find_last_of('/'); dir = sl == std::string::npos ? std::string(".") : dir.substr(0, sl);
-        for (auto cand : {n.s, n.s + ".fs", n.s + ".fsx"}) {
-            std::string path = cand.size() && cand[0] == '/' ? cand : dir + "/" + cand;
+        bool native = n.s.ends_with(".so") || n.s.ends_with(".dylib") || n.s.ends_with(".dll");
+        if (native) {   // load_plugin: native code is refused unless every capability is granted
+            if (!(caps.fs && caps.net && caps.proc && caps.env)) D(L::error, "capability", n, "native module '" + n.s + "' needs every capability (fs, net, proc, env); this run denies some (raises PermissionError)", "import");
+            return;
+        }
+        if (!caps.fs) { D(L::error, "capability", n, "import needs the 'fs' capability, which this run denies (raises PermissionError)", "import"); return; }
+        // module_search_path (runtime.cpp): script dir, FORGE_SCRIPT_PATH, ~/.forge/modules, cwd
+        std::vector<std::string> dirs;
+        { auto sl = file.find_last_of('/'); dirs.push_back(sl == std::string::npos ? std::string(".") : file.substr(0, sl)); }
+        if (const char* mp = std::getenv("FORGE_SCRIPT_PATH")) { std::string m = mp; std::size_t i = 0;
+            while (i <= m.size()) { auto j = m.find_first_of(":;", i); if (j == std::string::npos) j = m.size(); if (j > i) dirs.push_back(m.substr(i, j - i)); i = j + 1; } }
+        if (const char* h = std::getenv("HOME")) dirs.push_back(std::string(h) + "/.forge/modules");
+        dirs.push_back(".");
+        std::vector<std::string> forms;
+        auto slash = n.s.find_last_of('/'); auto base = slash == std::string::npos ? n.s : n.s.substr(slash + 1);
+        if (base.find('.') == std::string::npos) forms = {n.s + ".fs", n.s + ".cpp", n.s + "/mod.fs", n.s + "/mod.cpp"}; else forms = {n.s};
+        std::vector<std::string> cand;
+        if (!n.s.empty() && n.s[0] == '/') cand = forms; else for (auto& d : dirs) for (auto& f : forms) cand.push_back(d + "/" + f);
+        for (auto& path : cand) {
             std::FILE* f = std::fopen(path.c_str(), "rb"); if (!f) continue;
             std::string code; char buf[4096]; std::size_t r; while ((r = std::fread(buf, 1, sizeof buf, f)) > 0) code.append(buf, r); std::fclose(f);
+            if (code.empty()) continue;   // directory or empty module: nothing to check
             if (!imported.insert(path).second) return;
             sub_check(n, code, "import");
             return;
@@ -446,9 +491,9 @@ struct Checker {
             if (n.type) { static const std::set<std::string> cont = {"list", "map", "set", "dict", "vector", "deque", "std::vector", "std::deque", "std::list",
                 "std::forward_list", "std::map", "std::unordered_map", "std::multimap", "std::set", "std::unordered_set", "std::multiset", "std::array"};
                 if (cont.count(n.type->name)) list = true; }
-            const char* cap = nullptr; bool chan = false, ctr = false; char lit = 0;
+            const char* cap = nullptr; bool chan = false, ctr = false, direct_ok = true; char lit = 0;
             if (!n.kids.empty() && n.kids[0]) { auto& i = n.kids[0]->k == NK::Copy && !n.kids[0]->kids.empty() ? *n.kids[0]->kids[0] : *n.kids[0];
-                if (i.k == NK::Field && !i.kids.empty() && i.kids[0]->k == NK::Var && i.kids[0]->var.global()) cap = cap_of(i.kids[0]->s, i.s);
+                { auto t = taint(i); cap = t.first; ctr = t.second; if (cap && !(i.k == NK::Field)) direct_ok = false; }
                 if (auto* c = callee(i); c && (is_builtin_var(*c, "forge::channel") || is_builtin_var(*c, "channel"))) chan = true;
                 if (auto* c = callee(i); c && c->k == NK::Var && c->var.global() && (c->s == "std::vector" || c->s == "std::deque" || c->s == "std::list" || c->s == "std::map" || c->s == "std::unordered_map" || c->s == "std::set" || c->s == "std::unordered_set")) list = true;
                 lit = i.k == NK::Int ? 'i' : i.k == NK::Float ? 'f' : i.k == NK::Str ? 's' : 0;
@@ -456,7 +501,7 @@ struct Checker {
             std::string alias = n.ref && !n.kids.empty() && n.kids[0] && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field) ? lkey(*n.kids[0]) : std::string();
             if (n.var.global() && !at_top()) return true;
             declare(n.var, n.s, n.line, report, n.flag);
-            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; b->alias = alias; b->container_cap = ctr; }
+            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; b->alias = alias; b->container_cap = ctr; if (!direct_ok) b->param = true; }
             { auto k = n.var.global() ? "g" + n.s : "l" + std::to_string(n.var.slot); kill(st, k); }
             return true;
         }
@@ -497,7 +542,12 @@ struct Checker {
             return true;
         }
         case NK::FnStmt: if (n.fn) { fn(*n.fn); } return true;
-        case NK::Return: for (auto& k : n.kids) if (k) expr(*k, st); return false;
+        case NK::Return:
+            for (auto& k : n.kids) if (k) { expr(*k, st); if (auto t = taint(*k); t.first && !t.second && cur().decl && !cur().decl->is_top && !cur().decl->name.empty()) ret_caps[(cur().decl->is_method ? "." : "") + cur().decl->name] = t.first; }
+            return false;
+        case NK::ClassStmt:
+            if (n.cls) for (auto& m : n.cls->methods) if (m) fn(*m);
+            return true;
         case NK::Throw: for (auto& k : n.kids) if (k) expr(*k, st); return false;
         case NK::Break: case NK::Continue: return false;
         case NK::Try: {
@@ -561,7 +611,7 @@ struct Checker {
     void fn(const FnDecl& f) {
         fns.emplace_back(); cur().decl = &f; cur().scopes.emplace_back();
         for (std::size_t pi = 0; pi < f.params.size(); ++pi) { auto& p = f.params[pi]; declare(VarRef{p.name, 0, p.slot}, p.name, f.line, false, p.cnst);
-            if (auto it = param_caps.find({f.name, pi}); it != param_caps.end() && !f.is_top) if (auto* b = cur().slot[p.slot]) { b->cap = it->second; b->param = true; } }
+            if (auto it = param_caps.find({(f.is_method ? "." : "") + f.name, pi}); it != param_caps.end() && !f.is_top) if (auto* b = cur().slot[p.slot]) { b->cap = it->second; b->param = true; } }
         State st;
         if (f.body) stmt(*f.body, st);
         static const std::set<std::string> no_value = {"", "void", "auto", "any"};
@@ -575,6 +625,9 @@ struct Checker {
         if (n.k == NK::Call && n.kids.size() > 1 && n.kids[0]->k == NK::Var && n.kids[0]->var.global())
             for (std::size_t i = 1; i < n.kids.size(); ++i) { auto& e = *n.kids[i];
                 if (e.k == NK::Field && !e.kids.empty() && e.kids[0]->k == NK::Var && e.kids[0]->var.global()) if (auto* cp = cap_of(e.kids[0]->s, e.s)) param_caps[{n.kids[0]->s, i - 1}] = cp; }
+        if (n.k == NK::Call && n.kids.size() > 1 && n.kids[0]->k == NK::Field)
+            for (std::size_t i = 1; i < n.kids.size(); ++i) { const Node* e = n.kids[i].get(); if (e->k == NK::Copy && !e->kids.empty()) e = e->kids[0].get();
+                if (e->k == NK::Field && !e->kids.empty() && e->kids[0]->k == NK::Var && e->kids[0]->var.global()) if (auto* cp = cap_of(e->kids[0]->s, e->s)) param_caps[{"." + n.kids[0]->s, i - 1}] = cp; }
         if (n.k == NK::ClassStmt && n.cls) for (auto& m : n.cls->methods) if (m) {
             auto& d = method_dep[m->name]; ++d.second;
             for (auto& a : m->attrs) if (a.rfind("deprecated", 0) == 0) { ++d.first; break; }

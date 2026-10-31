@@ -760,7 +760,14 @@ private:
         i_ = pos;
     }
 
+    // statement start column: the first token of the statement (Node::col for statement nodes)
     NodeP statement() {
+        int l0 = cur().line, c0 = cur().col;
+        NodeP n = statement_body();
+        if (n && n->line == l0 && n->k != NK::Block) const_cast<Node&>(*n).col = c0;
+        return n;
+    }
+    NodeP statement_body() {
         int line = cur().line;
         pending_attrs_.clear();
         skip_attributes();
