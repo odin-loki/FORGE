@@ -160,7 +160,7 @@ TEST(codecs_roundtrip) {
         static const std::map<std::string_view, double> bounds = {
             {"f32", 0}, {"f16", 2e-3}, {"bf16", 2e-2}, {"fp8_e4m3", 0.13}, {"fp8_e5m2", 0.26}, {"q8_0", 0.013}, {"q4_k", 0.25},
             {"q4_g32", 0.21}, {"q8_g32", 0.013}, {"mxfp8", 0.126}, {"mxfp6", 0.126}, {"mxfp4", 0.51}, {"mxint8", 0.016},
-            {"nvfp4", 0.51}, {"tq2", 3.0}};
+            {"nvfp4", 0.51}, {"tq2", 3.0}, {"q6_k", 0.07}, {"q5_k", 0.13}};
         CHECK_MSG(bounds.count(c.name), "no bound for %s", std::string(c.name).c_str());
         double bound = bounds.count(c.name) ? bounds.at(c.name) : 0;
         std::printf("  %-9s %5zu bytes  max err %.5f\n", std::string(c.name).c_str(), buf.size(), maxe);

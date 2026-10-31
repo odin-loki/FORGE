@@ -80,35 +80,49 @@ public:
                                        {"bytes", double(t.bytes)}, {"blake3", t.blake3}});
         }
         sections_["tensors"] = json::dump(idx);
-        std::FILE* f = std::fopen(path.c_str(), "wb");
-        if (!f) raise(errc::io_error, "cannot write {}", path);
-        std::vector<std::uint8_t> out(64, 0);
-        struct ent { std::string name; std::uint64_t off, size; hash::blake3::digest h; };
+        // Lay out sections first, then stream them to disk: the tensor data is never copied into a second buffer,
+        // so peak memory stays at roughly one copy of the encoded weights (matters for 8B+ models).
+        struct ent { std::string name; const std::uint8_t* p; std::uint64_t off, size; hash::blake3::digest h; };
         std::vector<ent> table;
-        auto put = [&](const std::string& nm, const std::uint8_t* p, std::size_t n) {
-            while (out.size() % alignment) out.push_back(0);
-            table.push_back({nm, out.size(), n, hash::blake3::of({p, n})});
-            out.insert(out.end(), p, p + n);
+        std::uint64_t pos = 64;
+        auto place = [&](const std::string& nm, const std::uint8_t* p, std::size_t n) {
+            pos = (pos + alignment - 1) / alignment * alignment;
+            table.push_back({nm, p, pos, n, hash::blake3::of({p, n})});
+            pos += n;
         };
-        for (auto& [nm, s] : sections_) put(nm, reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
-        put("data", data_.data(), data_.size());
-        while (out.size() % alignment) out.push_back(0);
-        std::uint64_t toff = out.size();
+        for (auto& [nm, s] : sections_) place(nm, reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+        place("data", data_.data(), data_.size());
+        std::uint64_t toff = (pos + alignment - 1) / alignment * alignment;
+        std::vector<std::uint8_t> tail;
         for (auto& e : table) {
             std::uint8_t rec[96] = {};
             if (e.name.size() >= 32) raise(errc::invalid_argument, "section name too long: {}", e.name);
             std::memcpy(rec, e.name.data(), e.name.size());
             std::memcpy(rec + 32, &e.off, 8); std::memcpy(rec + 40, &e.size, 8); std::memcpy(rec + 48, e.h.data(), 32);
-            out.insert(out.end(), rec, rec + 96);
+            tail.insert(tail.end(), rec, rec + 96);
         }
         std::uint32_t n = std::uint32_t(table.size());
-        std::uint64_t fsz = out.size();
-        std::memcpy(out.data(), magic, 8); std::memcpy(out.data() + 8, &format_version, 4); std::memcpy(out.data() + 12, &n, 4);
-        std::memcpy(out.data() + 16, &toff, 8); std::memcpy(out.data() + 24, &fsz, 8);
-        if (std::fwrite(out.data(), 1, out.size(), f) != out.size()) { std::fclose(f); raise(errc::io_error, "short write {}", path); }
+        std::uint64_t fsz = toff + tail.size();
+        std::uint8_t head[64] = {};
+        std::memcpy(head, magic, 8); std::memcpy(head + 8, &format_version, 4); std::memcpy(head + 12, &n, 4);
+        std::memcpy(head + 16, &toff, 8); std::memcpy(head + 24, &fsz, 8);
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (!f) raise(errc::io_error, "cannot write {}", path);
+        std::uint64_t at = 0;
+        static const std::uint8_t zeros[alignment] = {};
+        auto emit = [&](const std::uint8_t* p, std::size_t k) {
+            if (k && std::fwrite(p, 1, k, f) != k) { std::fclose(f); raise(errc::io_error, "short write {}", path); }
+            at += k;
+        };
+        emit(head, 64);
+        for (auto& e : table) { emit(zeros, std::size_t(e.off - at)); emit(e.p, e.size); }
+        emit(zeros, std::size_t(toff - at));
+        emit(tail.data(), tail.size());
         std::fclose(f);
     }
     std::size_t tensor_bytes() const { return data_.size(); }
+    // Pre-size the data buffer so growth never holds two copies of the weights at once.
+    void reserve(std::size_t bytes) { data_.reserve(bytes); }
 private:
     std::map<std::string, std::string> sections_;
     std::vector<tensor_entry> tensors_;

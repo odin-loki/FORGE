@@ -38,11 +38,11 @@ public:
     const std::vector<tinfo>& tensors() const { return tensors_; }
     const tinfo* find(const std::string& n) const { for (auto& t : tensors_) if (t.name == n) return &t; return nullptr; }
     static const char* codec_of(std::uint32_t t) {
-        switch (t) { case 0: return "f32"; case 1: return "f16"; case 8: return "q8_0"; case 12: return "q4_k"; case 30: return "bf16"; default: return nullptr; }
+        switch (t) { case 0: return "f32"; case 1: return "f16"; case 8: return "q8_0"; case 12: return "q4_k"; case 13: return "q5_k"; case 14: return "q6_k"; case 30: return "bf16"; default: return nullptr; }
     }
     std::span<const std::uint8_t> bytes(const tinfo& t) const {
         auto* c = codec_of(t.type);
-        if (!c) raise(errc::unsupported, "tensor {}: ggml type {} not supported (supported: F32 F16 BF16 Q8_0 Q4_K)", t.name, t.type);
+        if (!c) raise(errc::unsupported, "tensor {}: ggml type {} not supported (supported: F32 F16 BF16 Q8_0 Q4_K Q5_K Q6_K)", t.name, t.type);
         for (auto d : t.shape) if (d < 0 || d > (i64(1) << 40)) raise(errc::format_error, "tensor {}: bad shape", t.name);
         std::size_t n = flow::codecs::find(c)->bytes(std::size_t(numel(t.shape)));
         if (t.offset > size_ || n > size_ || data_ + t.offset + n > size_) raise(errc::format_error, "tensor {} out of bounds", t.name);
@@ -74,7 +74,7 @@ private:
 inline import_report import_gguf(const std::string& path, const std::string& out, const import_options& opt = {}) {
     gguf_file g(path);
     auto arch = g.need("general.architecture").str();
-    if (arch != "llama" && arch != "qwen2" && arch != "mistral")
+    if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral")
         raise(errc::unsupported, "GGUF architecture '{}' has no template", arch);
     auto K = [&](const std::string& k) { return g.need(arch + "." + k).num(); };
     auto Kor = [&](const std::string& k, double d) { auto* v = g.get(arch + "." + k); return v ? v->num() : d; };
@@ -86,7 +86,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
                      {"rms_norm_eps", Kor("attention.layer_norm_rms_epsilon", 1e-6)}, {"rope_theta", Kor("rope.freq_base", 10000.0)},
                      // llama.cpp's converter permutes Q/K for llama so it can use interleaved (GPT-J) RoPE
                      {"rope_neox", arch == "llama" || arch == "mistral" ? 0.0 : 1.0}};
-    std::string tname = opt.template_name.empty() ? "llama" : opt.template_name;
+    std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : "llama";
     auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), json::value(cfg));
     auto bp = pack::parse_blueprint(bp_text);
 
@@ -105,6 +105,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         auto P = std::format("blk.{}.", l), Q = std::format("layer.{}.", l);
         put(Q + "attn_norm", P + "attn_norm.weight"); put(Q + "ffn_norm", P + "ffn_norm.weight");
         put(Q + "wq", P + "attn_q.weight"); put(Q + "wk", P + "attn_k.weight"); put(Q + "wv", P + "attn_v.weight");
+        if (tname == "qwen3") { put(Q + "q_norm", P + "attn_q_norm.weight"); put(Q + "k_norm", P + "attn_k_norm.weight"); }
         put(Q + "wo", P + "attn_output.weight"); put(Q + "w_gate", P + "ffn_gate.weight");
         put(Q + "w_up", P + "ffn_up.weight"); put(Q + "w_down", P + "ffn_down.weight");
     }

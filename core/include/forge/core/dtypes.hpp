@@ -215,7 +215,7 @@ using c64 = std::complex<double>;
 
 // Runtime dtype tag used by flow/pack. New tags are appended before `invalid` so stored values stay stable.
 enum class dtype : u8 { f32, f16, bf16, f64, i8, u8, i16, i32, i64, fp8_e4m3, fp8_e5m2, q8_0, q4_k,
-                        q4_g32, q8_g32, mxfp8, mxfp6, mxfp4, mxint8, nvfp4, tq2, invalid };
+                        q4_g32, q8_g32, mxfp8, mxfp6, mxfp4, mxint8, nvfp4, tq2, q6_k, q5_k, invalid };
 
 constexpr std::string_view name(dtype d) {
     switch (d) {
@@ -227,6 +227,7 @@ constexpr std::string_view name(dtype d) {
         case dtype::q4_g32: return "q4_g32"; case dtype::q8_g32: return "q8_g32"; case dtype::mxfp8: return "mxfp8";
         case dtype::mxfp6: return "mxfp6"; case dtype::mxfp4: return "mxfp4"; case dtype::mxint8: return "mxint8";
         case dtype::nvfp4: return "nvfp4"; case dtype::tq2: return "tq2";
+        case dtype::q6_k: return "q6_k"; case dtype::q5_k: return "q5_k";
         default: return "invalid";
     }
 }

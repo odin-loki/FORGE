@@ -49,6 +49,9 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     if (tname.empty()) {
         if (arch == "LlamaForCausalLM" || arch == "MistralForCausalLM" || arch == "Qwen2ForCausalLM" || cfg.str_or("model_type", "") == "llama")
             tname = "llama";
+        else if (arch == "Qwen3ForCausalLM" || cfg.str_or("model_type", "") == "qwen3") tname = "qwen3";
+        else if (arch == "Qwen3_5ForConditionalGeneration" || arch == "Qwen3_5ForCausalLM" || cfg.str_or("model_type", "") == "qwen3_5")
+            raise(errc::unsupported, "qwen3_5 (Gated DeltaNet hybrid attention) has no blueprint template yet");
         else if (arch == "MixtralForCausalLM" || cfg.str_or("model_type", "") == "mixtral") tname = "mixtral";
         else if (arch == "DeepseekV2ForCausalLM" || arch == "DeepseekV3ForCausalLM" || cfg.str_or("model_type", "") == "deepseek_v2") tname = "deepseek_v2";
         else raise(errc::unsupported, "no blueprint template for architecture {} (pass --template)", arch);
@@ -98,13 +101,24 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     auto has = [&](const std::string& n) { for (auto& s : shards) if (s->has(n)) return true; return false; };
 
     pack::writer w;
+    {   // estimate the encoded size (2-D weights in the target codec, the rest f32) plus slack, and reserve it once
+        auto* qc = flow::codecs::find(opt.codec);
+        std::size_t est = 0;
+        auto enc = [&](std::size_t k) { return qc && qc->block > 0 && k % std::size_t(qc->block) == 0 ? qc->bytes(k) : 4 * k; };
+        for (auto& s : shards) for (auto& [n, e] : s->entries()) {
+            std::size_t k = 1; for (auto d : e.shape) k *= std::size_t(d);
+            bool emb = n == "model.embed_tokens.weight";
+            est += (e.shape.size() == 2 && !emb ? enc(k) : 4 * k) + pack::alignment;
+            if (emb && !has("lm_head.weight")) est += enc(k);  // tied lm_head is re-encoded from the embedding
+        }
+        w.reserve(est + est / 8);
+    }
     import_report rep{arch, tname, 0, 0};
     auto put = [&](const std::string& n, const tensor& t, bool quantisable) {
         w.add_tensor(n, t.shape, t.data, quantisable ? opt.codec : std::string("f32")); ++rep.tensors;
     };
     i64 L = i64(bp.param("n_layers"));
-    auto emb = find("model.embed_tokens.weight");
-    put("tok_emb", emb, false);
+    put("tok_emb", find("model.embed_tokens.weight"), false);  // not kept alive: 2.5 GB f32 for 150k-vocab 4k-wide models
     auto mlp = [&](const std::string& P, const std::string& Q, const char* g, const char* u, const char* d) {
         put(Q + "w_gate", find(P + g + ".weight"), true);
         put(Q + "w_up", find(P + u + ".weight"), true);
@@ -147,6 +161,10 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         put(Q + "wq", find(P + "self_attn.q_proj.weight"), true);
         put(Q + "wk", find(P + "self_attn.k_proj.weight"), true);
         put(Q + "wv", find(P + "self_attn.v_proj.weight"), true);
+        if (tname == "qwen3") {
+            put(Q + "q_norm", find(P + "self_attn.q_norm.weight"), false);
+            put(Q + "k_norm", find(P + "self_attn.k_norm.weight"), false);
+        }
         if (tname == "mixtral") {
             put(Q + "router", find(P + "block_sparse_moe.gate.weight"), false);
             for (i64 e = 0; e < i64(bp.param("n_experts")); ++e)
@@ -154,7 +172,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         } else mlp(P + "mlp.", Q, "gate_proj", "up_proj", "down_proj");
     }
     put("out_norm", find("model.norm.weight"), false);
-    put("lm_head", has("lm_head.weight") ? find("lm_head.weight") : emb, true);
+    put("lm_head", has("lm_head.weight") ? find("lm_head.weight") : find("model.embed_tokens.weight"), true);
 
     json::object man{{"format", "fpk"}, {"forge_format_version", double(pack::format_version)}, {"architecture", arch},
                      {"template", tname}, {"codec", opt.codec}, {"session", bp.session},
