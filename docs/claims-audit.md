@@ -80,3 +80,12 @@ Unverified: ASan/UBSan/TSan "CI jobs" (no workflow in repo; CI branch pending Od
 - PR #10 reintroduced "recursion depth default 10 000" and "--mem-limit" for scripts in the resolved section; both re-checked FALSE (interp.hpp:15 = 800; apps/forge.cpp script options) and kept corrected.
 - `.fsc` described as dropped (PR #10 wording) in scripting.md and STATUS.md.
 - Removed stray build2.log / ctest.log committed to main by PR #10.
+
+## Pass 3 addendum 3 (pending-features section, security.md)
+| Sentence | Source | Result |
+|---|---|---|
+| fs/net/proc flags apply OS sandbox | origin/forge-script-os-sandbox engine.cpp diff | first draft said `--no-fs` locks all files; actually deny_fs_write only -> CORRECTED |
+| typed errors, SandboxViolationError under PermissionError | builtins.cpp diff | VERIFIED |
+| sign_bytes/verify_bytes, FORGE-SIGNATURE.json | origin/forge-bundle-sign bundle.hpp:22,50 | VERIFIED; "not built" -> CORRECTED to compile-checked (bsign-check.log EXIT 0) |
+| qwen35 files | git diff --stat main...qwen35 | VERIFIED |
+| subproject fix not on remote | git branch -r | VERIFIED |

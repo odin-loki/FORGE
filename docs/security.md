@@ -57,3 +57,17 @@ catches all of them, so an embedder never sees a C++ exception from `run`/`eval`
 - `limit {}` block syntax (only `forge::limit(opts, fn)` exists), no allocation/handle/child-count limits.
 - No escape tests for the capability checks (the parser is fuzzed by `fuzz/fuzz_script.cpp`).
 - RPC: no mTLS or per-key permissions (docs/STATUS.md, Deferred).
+
+## Pending features (not on `main` yet)
+
+Everything above describes `main`. The following work is on feature branches and is **not merged**; do not rely on it from `main`.
+
+| Feature | Branch | What it adds | State |
+|---|---|---|---|
+| ForgeScript OS sandbox on by default | `forge-script-os-sandbox` | When any of fs/net/proc is disallowed, the engine also applies `os::apply_sandbox` (deny network, deny starting processes, deny file writes); mode `off`/default/`require`, where `require` fails the run if the sandbox cannot be applied; exceptions `OSError` subclasses and `SandboxViolationError` (a `PermissionError`); test `tests/test_script_os_sandbox.cpp` | Compiles on Linux; non-Linux paths untested |
+| Typed OS exceptions | `forge-script-os-sandbox` | `os/include/forge/os/oserror.hpp`: errno / Win32 / Capsicum errors, sandbox violations and fault signals become typed, catchable ForgeScript exceptions; test `tests/test_script_oserror.cpp` | Compiles on Linux; non-Linux paths untested |
+| Generic Ed25519 bundle signing | `forge-bundle-sign` | `pack/include/forge/pack/bundle.hpp`: detached `sign_bytes`/`verify_bytes` and signed bundles (`FORGE-SIGNATURE.json`); test `tests/test_bundle_sign.cpp` | Compile-checked only, tests not run |
+| Qwen 3.5 models | `qwen35` (PR #13) | Gated DeltaNet + gated full attention (`flow/state_ops.hpp`, `import/templates/qwen3_5.fbp`) | Open PR |
+| Building FORGE as a subproject | local fix, not pushed | Lets FORGE build inside another project's CMake build | Not on remote |
+
+Known gaps still open on those branches: scripts run by the RPC server are not OS-sandboxed (planned: sandboxed child process); nested `sandbox{}` blocks are interpreter-checked only; on Windows only process creation is blocked.
