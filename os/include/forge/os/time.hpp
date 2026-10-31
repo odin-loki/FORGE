@@ -3,6 +3,7 @@
 // civil time, and a timer_queue that runs callbacks after a delay or periodically on one background thread.
 // (Monotonic time and sleep live in os.hpp.) Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
+#include <algorithm>
 #include <condition_variable>
 #include <ctime>
 #include <map>
@@ -125,4 +126,41 @@ private:
     id next_ = 0, running_ = 0; bool running_cancelled_ = false, stop_ = false;
     std::thread th_;
 };
+// ---------------------------------------------------------------- stopwatch / deadline (monotonic)
+// stopwatch: elapsed time since start or the last restart(); lap() returns the time since the previous lap.
+class stopwatch {
+public:
+    stopwatch() : t0_(monotonic_ns()), lap_(t0_) {}
+    void restart() { t0_ = lap_ = monotonic_ns(); }
+    std::uint64_t elapsed_ns() const { return monotonic_ns() - t0_; }
+    std::uint64_t elapsed_ms() const { return elapsed_ns() / 1000000ull; }
+    double elapsed_s() const { return double(elapsed_ns()) * 1e-9; }
+    std::uint64_t lap_ns() { auto n = monotonic_ns(), d = n - lap_; lap_ = n; return d; }
+private:
+    std::uint64_t t0_, lap_;
+};
+// deadline: an absolute monotonic point in time. A default or never() deadline never expires. Sub-budgets
+// for nested work come from child(ms), which never extends past the parent.
+class deadline {
+public:
+    static constexpr std::uint64_t never_ns = ~0ull;
+    deadline() = default;
+    static deadline never() { return {}; }
+    static deadline after_ms(std::uint64_t ms) { return after_ns(ms * 1000000ull); }
+    static deadline after_ns(std::uint64_t ns) { deadline d; auto n = monotonic_ns(); d.at_ = ns >= never_ns - n ? never_ns : n + ns; return d; }
+    static deadline at_ns(std::uint64_t t) { deadline d; d.at_ = t; return d; }
+    bool is_never() const { return at_ == never_ns; }
+    bool expired() const { return !is_never() && monotonic_ns() >= at_; }
+    std::uint64_t remaining_ns() const { if (is_never()) return never_ns; auto n = monotonic_ns(); return n >= at_ ? 0 : at_ - n; }
+    // Milliseconds left, rounded up so a positive remainder never reads as 0 (0 = expired). never() -> UINT64_MAX.
+    std::uint64_t remaining_ms() const { auto r = remaining_ns(); return r == never_ns ? never_ns : (r + 999999ull) / 1000000ull; }
+    std::uint64_t at() const { return at_; }
+    deadline child(std::uint64_t ms) const { auto c = after_ms(ms); return c.at_ < at_ ? c : *this; }
+    deadline earlier(const deadline& o) const { return o.at_ < at_ ? o : *this; }
+    // Sleep until expiry or for at most max_ns, whichever comes first. Returns true if now expired.
+    bool sleep(std::uint64_t max_ns = never_ns) const { auto r = std::min(remaining_ns(), max_ns); if (r && r != never_ns) sleep_ns(r); return expired(); }
+private:
+    std::uint64_t at_ = never_ns;
+};
+
 } // namespace forge::os

@@ -327,6 +327,11 @@ inline status write_file_atomic(const std::string& path, std::string_view data, 
     if (::fsync(fd)) { auto e = last_error("fsync " + tmp); ::close(fd); ::unlink(tmp.c_str()); return {{}, e}; }
     ::close(fd);
     if (::rename(tmp.c_str(), path.c_str())) { auto e = last_error("rename " + path); ::unlink(tmp.c_str()); return {{}, e}; }
+    // Make the rename itself durable: fsync the containing directory (best effort; some filesystems refuse).
+    auto slash = path.find_last_of('/');
+    std::string dir = slash == std::string::npos ? std::string(".") : slash == 0 ? std::string("/") : path.substr(0, slash);
+    int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
     return {};
 #else
     (void)mode;

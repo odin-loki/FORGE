@@ -5,6 +5,7 @@
 #include <forge/os/os.hpp>
 #include <map>
 #include <optional>
+#include <span>
 #if defined(FORGE_OS_POSIX)
 #include <sys/time.h>
 #endif
@@ -294,6 +295,73 @@ public:
         return {{}, {unsupported_code, "child::start: not available on this platform yet (use spawn_wait)"}};
 #endif
     }
+    // Start from a full spawn_spec: argv, cwd, env_set/env_unset/clear_env, limits (memory/cpu/files) and
+    // merge_stderr. stdout (plus stderr when merged) is readable through read(); stdin is /dev/null and an
+    // unmerged stderr is inherited. An exec failure (e.g. command not found) is reported here, not at wait().
+    static result<child> start(const spawn_spec& sp) {
+        child c;
+#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+        if (sp.argv.empty()) return {{}, {EINVAL, "spawn: empty argv"}};
+        std::string exe = find_executable(sp.argv[0]);
+        if (exe.empty()) return {{}, {ENOENT, "spawn " + sp.argv[0] + ": command not found"}};
+        std::vector<std::string> envs;
+        if (!sp.clear_env) for (char** e = environ; e && *e; ++e) {
+            std::string s(*e); auto eq = s.find('='); std::string k = s.substr(0, eq);
+            bool drop = sp.env_set.count(k) > 0;
+            for (auto& u : sp.env_unset) if (u == k) drop = true;
+            if (!drop) envs.push_back(std::move(s));
+        }
+        for (auto& [k, v] : sp.env_set) envs.push_back(k + "=" + v);
+        std::vector<char*> av, ev;
+        for (auto& a : sp.argv) av.push_back(const_cast<char*>(a.c_str())); av.push_back(nullptr);
+        for (auto& e : envs) ev.push_back(const_cast<char*>(e.c_str())); ev.push_back(nullptr);
+        int po[2], px[2];
+        if (::pipe(po)) return {{}, last_error("pipe")};
+        if (::pipe(px)) { ::close(po[0]); ::close(po[1]); return {{}, last_error("pipe")}; }
+        detail_proc::cloexec(po[0]); detail_proc::cloexec(px[0]); detail_proc::cloexec(px[1]);
+        int devnull = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+        const char* wd = sp.cwd.empty() ? nullptr : sp.cwd.c_str();
+        const proc_limits lim = sp.limits; const bool merge = sp.merge_stderr;
+        pid_t p = ::fork();
+        if (p < 0) { auto e = last_error("fork"); for (int fd : {po[0], po[1], px[0], px[1], devnull}) if (fd >= 0) ::close(fd); return {{}, e}; }
+        if (p == 0) {
+            ::setpgid(0, 0); ::signal(SIGPIPE, SIG_DFL);
+            if (devnull >= 0) ::dup2(devnull, 0);
+            ::dup2(po[1], 1); if (merge) ::dup2(po[1], 2); ::close(po[1]);
+            if (lim.memory_bytes) { struct rlimit r{rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes)}; ::setrlimit(RLIMIT_AS, &r); }
+            if (lim.cpu_seconds) { struct rlimit r{rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1)}; ::setrlimit(RLIMIT_CPU, &r); }
+            if (lim.open_files) { struct rlimit r{rlim_t(lim.open_files), rlim_t(lim.open_files)}; ::setrlimit(RLIMIT_NOFILE, &r); }
+            if (wd && ::chdir(wd) != 0) { int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127); }
+            ::execve(exe.c_str(), av.data(), ev.data());
+            int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127);
+        }
+        ::setpgid(p, p); ::close(po[1]); ::close(px[1]); if (devnull >= 0) ::close(devnull);
+        int child_errno = 0;
+        { auto n = ::read(px[0], &child_errno, sizeof child_errno); if (n != sizeof child_errno) child_errno = 0; ::close(px[0]); }
+        if (child_errno) { int st; while (::waitpid(p, &st, 0) < 0 && errno == EINTR) {} ::close(po[0]); errno = child_errno; return {{}, last_error("exec " + sp.argv[0])}; }
+        c.pid_ = p; c.out_ = po[0];
+        return {std::move(c), {}};
+#else
+        (void)sp;
+        return {{}, {unsupported_code, "child::start: not available on this platform yet (use spawn_wait)"}};
+#endif
+    }
+    // Non-blocking: the exit code (128+signal) if the child has exited, else -1.
+    int try_wait() {
+#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+        if (done_) return code_;
+        if (pid_ <= 0) return -1;
+        int st = 0; pid_t w;
+        do { w = ::waitpid(pid_, &st, WNOHANG); } while (w < 0 && errno == EINTR);
+        if (w != pid_) return -1;
+        done_ = true; code_ = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
+        return code_;
+#else
+        return -1;
+#endif
+    }
+    bool exited() const { return done_; }
+    int exit_code() const { return done_ ? code_ : -1; }
     // Read up to `max` bytes of output; empty string at end of stream. Waits at most timeout_ms (0 = block).
     std::string read(std::size_t max = 65536, std::uint64_t timeout_ms = 0) {
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
@@ -350,6 +418,37 @@ private:
 #endif
     int out_ = -1; bool done_ = false; int code_ = -1;
 };
+
+// Wait for whichever of several children exits first. Returns its index into `cs` (that child is reaped,
+// so exit_code() is valid), or nullopt when timeout_ms (0 = forever) passes with all still running, or when
+// every child has already been reaped. Null entries and finished children are skipped. Polls with a short
+// back-off (1 ms rising to 10 ms) so it is portable and never steals another waiter's child.
+inline std::optional<std::size_t> wait_any(std::span<child* const> cs, std::uint64_t timeout_ms = 0) {
+    std::uint64_t end = timeout_ms ? monotonic_ns() + timeout_ms * 1000000ull : 0;
+    std::uint64_t nap = 1000000ull;
+    for (;;) {
+        bool any_live = false;
+        for (std::size_t i = 0; i < cs.size(); ++i) {
+            child* c = cs[i];
+            if (!c || c->exited() || !c->running()) continue;
+            any_live = true;
+            if (c->try_wait() != -1) return i;
+        }
+        if (!any_live) return std::nullopt;
+        if (end && monotonic_ns() >= end) return std::nullopt;
+        sleep_ns(nap); nap = std::min<std::uint64_t>(nap * 2, 10000000ull);
+    }
+}
+// Wait until every child has exited; false on timeout (the ones that finished are reaped either way).
+inline bool wait_all(std::span<child* const> cs, std::uint64_t timeout_ms = 0) {
+    std::uint64_t end = timeout_ms ? monotonic_ns() + timeout_ms * 1000000ull : 0;
+    for (;;) {
+        auto i = wait_any(cs, end ? std::max<std::uint64_t>(1, (end - std::min(end, monotonic_ns())) / 1000000ull) : 0);
+        if (!i) break;
+    }
+    for (auto* c : cs) if (c && c->running()) return false;
+    return true;
+}
 
 // One running process as seen by list_processes()/process_info().
 struct process_entry { std::uint64_t pid = 0, ppid = 0, rss_bytes = 0; std::string name, cmdline; };

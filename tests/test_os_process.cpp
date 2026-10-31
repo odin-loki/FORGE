@@ -64,3 +64,35 @@ TEST(process_list) {
 #endif
 #endif
 TEST(find_exe) { CHECK(os::find_executable("no-such-command-forge-xyz").empty()); CHECK(!os::process_caps().empty() || true); }
+
+#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+TEST(child_start_spec_env_cwd_and_exec_error) {
+    os::spawn_spec s; s.argv = {"sh", "-c", "echo $FORGE_X; pwd"}; s.env_set["FORGE_X"] = "hi"; s.cwd = "/";
+    auto c = os::child::start(s); CHECK(c);
+    std::string out, part; while (!(part = c->read()).empty()) out += part;
+    CHECK(c->wait() == 0); CHECK(out == "hi\n/\n");
+    os::spawn_spec bad; bad.argv = {"/nonexistent/forge-no-such-binary"};
+    CHECK(!os::child::start(bad));
+}
+TEST(child_start_memory_limit) {
+    os::spawn_spec s; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=1 of=/dev/null 2>/dev/null"};
+    s.limits.memory_bytes = 32ull << 20;
+    auto c = os::child::start(s); CHECK(c); CHECK(c->wait() != 0);   // 64 MiB buffer cannot fit in 32 MiB
+    s.limits.memory_bytes = 512ull << 20;
+    auto d = os::child::start(s); CHECK(d); CHECK(d->wait() == 0);
+}
+TEST(wait_any_picks_first_and_wait_all) {
+    auto mk = [](const char* t, int code) { os::spawn_spec s; s.argv = {"sh", "-c", std::string("sleep ") + t + "; exit " + std::to_string(code)}; return std::move(os::child::start(s).value); };
+    os::child a = mk("0.6", 1), b = mk("0.05", 2), c = mk("0.3", 3);
+    os::child* all[] = {&a, &b, &c, nullptr};
+    auto i = os::wait_any(all); CHECK(i && *i == 1); CHECK(b.exit_code() == 2);
+    i = os::wait_any(all); CHECK(i && *i == 2); CHECK(c.exit_code() == 3);
+    CHECK(!os::wait_any(all, 20));                         // a still sleeping: timeout
+    CHECK(a.try_wait() == -1);
+    CHECK(os::wait_all(all, 5000)); CHECK(a.exit_code() == 1);
+    CHECK(!os::wait_any(all));                             // nothing left to wait for
+    os::child d = mk("5", 0); os::child* one[] = {&d};
+    auto t0 = os::monotonic_ns(); CHECK(!os::wait_all(one, 50)); CHECK(os::monotonic_ns() - t0 < 2000000000ull);
+    d.kill(); CHECK(d.wait() == 128 + 9);
+}
+#endif
