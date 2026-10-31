@@ -248,7 +248,7 @@ void install_builtins(Shared& sh) {
                    "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError", "RuntimeError", "LogicError",
                    "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "PipelineError", "PluginError", "AIError", "AccessError"})
         mkclass(n, err);
-    // As in Python, OS-level conditions are OSError subclasses: catch (OSError e) gets all of them.
+    // As in Python, OS-level conditions are OSError subclasses: catch (const OSError& e) gets all of them.
     for (auto n : {"PermissionError", "TimeoutError", "OutOfMemoryError", "CancelledError", "DeadlockError"}) mkclass(n, sh.errors["OSError"]);
     // typed OS errors (forge/os/oserror.hpp): catch OSError to get all of them
     for (auto n : {"FileNotFoundError", "FileExistsError", "NotSupportedError", "InterruptedError", "ConnectionError", "SignalError",
@@ -777,7 +777,7 @@ void install_builtins(Shared& sh) {
     // ------------------------------------------------ ProcessPool
     //   auto pp = ProcessPool(4, {net: false, fs: false, timeout: 5000});   // workers default to no fs/net/proc/env
     //   auto f = pp.submit("auto task(auto x) { return x * x; }", 7);     f.get() == 49
-    //   pp.map(src, [1, 2, 3]); pp.size(); pp.shutdown();
+    //   std::vector<int> xs = {1, 2, 3}; pp.map(src, xs); pp.size(); pp.shutdown();
     B["ProcessPool"] = native("ProcessPool", 0, 2, [](Interp& in, Args& a) -> Value {
         register_script_process_task();
         auto box = std::make_shared<PoolBox>();
