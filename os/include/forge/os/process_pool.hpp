@@ -306,7 +306,7 @@ private:
         if (::pipe(b)) { err = last_error("pipe").what; ::close(a[0]); ::close(a[1]); return std::nullopt; }
         for (int f : {a[0], a[1], b[0], b[1]}) ::fcntl(f, F_SETFD, FD_CLOEXEC);
         std::string exe = opt_.exe, spec = std::string(detail::pp::worker_flag) + std::to_string(a[0]) + "," + std::to_string(b[1]) + sb_spec();
-        pid_t pid = ::fork();
+        pid_t pid = serialized_fork();   // one fork at a time (atfork handlers, e.g. Z3, livelock otherwise)
         if (pid < 0) { err = last_error("fork").what; for (int f : {a[0], a[1], b[0], b[1]}) ::close(f); return std::nullopt; }
         if (pid == 0) {
             ::close(a[1]); ::close(b[0]);
