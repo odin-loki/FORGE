@@ -3,7 +3,9 @@
 #include <forge/flow/flow.hpp>
 #include <forge/grid/cuda.hpp>
 #include <forge/flow/vulkan.hpp>
+#include <algorithm>
 #include <cstdio>
+#include <vector>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -13,7 +15,7 @@ namespace gpu = forge::grid::gpu;
 
 static const char* kernel_ops[] = {"neg", "abs", "sqrt", "rsqrt", "recip", "square", "exp", "exp2", "log", "log2", "tanh", "sigmoid",
     "silu", "relu", "softplus", "gelu_tanh", "add", "sub", "mul", "div", "maximum", "minimum", "silu_mul", "scale", "softmax",
-    "rms_norm", "matmul_t", "rope", "gather", "slice", "attention"};
+    "rms_norm", "matmul_t", "rope", "gather", "slice", "attention", "qmatmul_t"};
 
 static bool has(std::string_view hay, const std::string& needle) { return hay.find(needle) != std::string_view::npos; }
 
@@ -44,6 +46,34 @@ static int images() {
     return fails ? 1 : 0;
 }
 
+// Quantised matmul_t kept encoded on the device vs the CPU quantised kernel (flow::qweights::gemm_nt).
+template<class RT> static int qmatmul_check(flow::registry& reg, const std::string& api) {
+    if (!reg.device_qgemm) { std::printf("note %s: no device quantised matmul\n", api.c_str()); return 0; }
+    int fails = 0, n = 0;
+    for (std::string cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) for (std::size_t rows : {1, 3, 6}) {
+        const auto* c = flow::codecs::find(cn);
+        const std::size_t k = 512, cols = 37, rb = c->bytes(k);
+        std::vector<float> wf(cols * k), x(rows * k);
+        for (std::size_t i = 0; i < wf.size(); ++i) wf[i] = std::sin(float(i) * 0.731f + float(cn.size())) * (1.f + float(i % 97) / 50.f);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+        std::vector<std::uint8_t> enc(cols * rb);
+        for (std::size_t j = 0; j < cols; ++j) c->encode(wf.data() + j * k, k, enc.data() + j * rb);
+        tensor_view xv; xv.data = x.data(); xv.shape = {i64(rows), i64(k)};
+        tensor_view wv; wv.shape = {i64(cols), i64(k)}; wv.qdata = enc.data(); wv.qcodec = c;
+        std::vector<float> yg(rows * cols, -1.f), yc(rows * cols);
+        tensor_view og; og.data = yg.data(); og.shape = {i64(rows), i64(cols)};
+        tensor_view oc; oc.data = yc.data(); oc.shape = og.shape;
+        std::vector<tensor_view> ins{xv, wv};
+        reg.device_qgemm->fn(ins, og, {});
+        flow::qweights::gemm_nt(ins, oc, {});
+        double worst = 0;
+        for (std::size_t i = 0; i < yc.size(); ++i) worst = std::max(worst, std::fabs(double(yg[i]) - yc[i]) / (1.0 + std::fabs(double(yc[i]))));
+        ++n; if (worst > 1e-4) { std::printf("FAIL %s.qmatmul_t %s rows %zu: worst rel error %.3g\n", api.c_str(), cn.c_str(), rows, worst); ++fails; }
+    }
+    std::printf("%s %d/%d %s quantised matmul_t cases match the CPU kernel\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
@@ -58,6 +88,7 @@ template<class RT, class Open> static int device_t(Open open) {
         if (!flow::registry::oracle_check(l, &msg)) { std::printf("FAIL %s: %s\n", l.name.c_str(), msg.c_str()); ++fails; }
     }
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    fails += qmatmul_check<RT>(*reg, api);
     return fails ? 1 : 0;
 }
 
