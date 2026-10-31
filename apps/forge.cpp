@@ -346,6 +346,9 @@ int cmd_rpc_serve(const args& a) {
             forge::script::options o; std::string out;
             o.argv = argv; o.timeout_ms = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
             o.allow_proc = !no_proc; o.allow_fs = !no_fs; o.allow_net = !no_net;
+            // In-process scripts share the server's process: an OS sandbox here would also cut the server's own
+            // sockets, so rpc-serve keeps interpreter-level checks only. TODO: run remote scripts in a sandboxed child.
+            o.os_sandbox = forge::script::options::os_sandbox_mode::off;
             o.out = [&out](std::string_view s) { if (out.size() < (32u << 20)) out += s; };
             forge::script::engine e(o); auto r = e.run(src, name.empty() ? "<remote>" : name);
             return flow::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
@@ -363,7 +366,7 @@ int cmd_rpc_serve(const args& a) {
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
-    std::string file, code, emit_target, emit_out; bool have_code = false;
+    std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false;
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
@@ -380,11 +383,13 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--no-proc") o.allow_proc = false;
         else if (s == "--no-fs") o.allow_fs = false;
         else if (s == "--no-net") o.allow_net = false;
+        else if (s == "--os-sandbox") { os_sandbox_set = true; auto m = val("--os-sandbox"); o.os_sandbox = m == "off" ? forge::script::options::os_sandbox_mode::off : m == "require" ? forge::script::options::os_sandbox_mode::require : m == "best-effort" ? forge::script::options::os_sandbox_mode::best_effort : throw std::runtime_error("--os-sandbox takes off|best-effort|require"); }
         else if (s == "--") { ++i; if (i < argc) file = argv[i++]; break; }
         else if (s.starts_with("--")) throw std::runtime_error("unknown script option " + s);
         else { file = s; ++i; break; }
     }
     for (; i < argc; ++i) o.argv.push_back(argv[i]);
+    (void)os_sandbox_set;   // ForgeScript enforces cap flags at the OS level by default (options::os_sandbox)
     // AI-drafted code (forge::ai_run / ai_eval) runs only after an explicit "y" on the terminal.
     o.confirm = [](const std::string& code) {
         std::fprintf(stderr, "\nAI drafted:\n%s\nRun it? [y/N] ", code.c_str()); std::fflush(stderr);

@@ -22,6 +22,15 @@ struct options {
     std::uint64_t deadlock_ms = 1000;   // debug: how long every thread may be blocked before DeadlockError
     int jit_threshold = 2;              // calls before a function is compiled
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
+    // OS-level enforcement of the capability flags (forge/os/sandbox.hpp: seccomp / Capsicum / pledge /
+    // macOS sandbox_init / Windows job object). Applied once, process-wide and irreversibly, by the
+    // engine constructor when any of fs/net/proc is off: !allow_net -> deny_network, !allow_proc ->
+    // deny_exec, !allow_fs -> deny_fs_write (the OS layer blocks writes; reads stay blocked by the
+    // interpreter only). off = interpreter checks only (embedders, rpc-serve, which must keep its own
+    // sockets); best_effort (default) = apply, record any failure in sandbox_status(); require = throw if it fails.
+    // ForgeScript treats this as a core guarantee: it is on by default whenever a capability is turned off.
+    enum class os_sandbox_mode { off, best_effort, require };
+    os_sandbox_mode os_sandbox = os_sandbox_mode::best_effort;
     std::vector<std::string> argv;      // visible to scripts as `args`
     std::function<void(std::string_view)> out;   // print(); default stdout
     // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = use FORGE_AI_ENDPOINT
@@ -54,6 +63,8 @@ public:
     void reset();                                                              // drop all globals
     int repl();                                                                // interactive loop on stdin/stdout
     std::string stats();
+    // What os_sandbox did: e.g. "seccomp", "pledge", "off", or "failed: <reason>".
+    const std::string& sandbox_status() const;
 
     // ---- host bindings (embedding): native C++ functions callable from scripts, and script callbacks the host
     // can invoke later. Values cross as JSON text, like the plugin ABI (plugin.h). A script function passed as an

@@ -4,6 +4,7 @@
 #include "parser.hpp"
 #include "vm.hpp"
 #include <forge/os/os.hpp>
+#include <forge/os/sandbox.hpp>
 #include <csignal>
 #include <filesystem>
 #include <format>
@@ -14,6 +15,7 @@ namespace forge::script {
 struct engine::impl {
     std::shared_ptr<Shared> sh = std::make_shared<Shared>();
     std::unique_ptr<Interp> in;
+    std::string sandbox = "off";
     void fresh() { in = std::make_unique<Interp>(sh); in->file = "<repl>"; }
     result fail(std::exception_ptr ep) {
         result r; r.ok = false;
@@ -61,6 +63,16 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     auto& sh = *p_->sh;
     sh.limits.max_steps = o.max_steps; sh.limits.timeout_ms = o.timeout_ms; sh.limits.heap_bytes = o.heap_bytes; sh.limits.max_depth = o.max_depth;
     sh.caps = Caps{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
+    p_->sandbox = "off";
+    if (o.os_sandbox != options::os_sandbox_mode::off && (!o.allow_fs || !o.allow_net || !o.allow_proc)) {
+        os::sandbox_policy pol; pol.deny_network = !o.allow_net; pol.deny_exec = !o.allow_proc; pol.deny_fs_write = !o.allow_fs;
+        auto st = os::apply_sandbox(pol);
+        if (st) p_->sandbox = os::sandbox_status().mechanism.empty() ? std::string("applied") : os::sandbox_status().mechanism;
+        else {
+            p_->sandbox = "failed: " + st.err.what;
+            if (o.os_sandbox == options::os_sandbox_mode::require) throw std::runtime_error("forge script: OS sandbox could not be applied: " + st.err.what);
+        }
+    }
     sh.use_vm = o.use_vm; sh.jit_threshold = std::max(1, o.jit_threshold);
     Heap::instance().debug = o.debug; debug::stall_ms = o.deadlock_ms;
     sh.argv = o.argv;
@@ -87,6 +99,7 @@ result engine::run_file(const std::string& path) {
 }
 result engine::run(std::string_view src, const std::string& name) { return p_->exec(src, name, p_->sh->use_vm, false); }
 result engine::eval(std::string_view src) { return p_->exec(src, "<repl>", false, true); }
+const std::string& engine::sandbox_status() const { return p_->sandbox; }
 void engine::interrupt() { p_->sh->interrupt = true; }
 void engine::reset() { p_->fresh(); Heap::instance().collect(); }
 

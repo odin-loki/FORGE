@@ -469,7 +469,7 @@ try { h.add(1); } catch (const TypeError& e) { std::println("arity"); }
     CHECK_MSG(text == want, "%s", text.c_str());
     // Sandboxed runs refuse native code.
 #ifdef FORGE_TEST_PLUGIN
-    script::options so; so.allow_proc = false; std::string t2; so.out = [&](std::string_view s) { t2 += s; };
+    script::options so; so.allow_proc = false; so.os_sandbox = script::options::os_sandbox_mode::off;   // keep the test process unsandboxed std::string t2; so.out = [&](std::string_view s) { t2 += s; };
     script::engine se(so);
     auto r2 = se.eval(std::string("forge::plugin(\"") + FORGE_TEST_PLUGIN + "\");");
     CHECK(!r2.ok); CHECK_MSG(r2.error_type == "PermissionError", "%s", r2.error_type.c_str());

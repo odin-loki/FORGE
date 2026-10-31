@@ -366,7 +366,16 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 7. **Remote execution** — `forge::remote("host:7000", source, opts)` runs on `forge rpc-serve
    --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS. Implemented; see docs/rpc.md.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
-9. **Sandboxed runs** — run untrusted scripts with fs/net capabilities off, using `sandbox.hpp`.
+9. **Sandboxed runs** — run untrusted scripts with fs/net/proc capabilities off. ForgeScript enforces
+   the flags twice: the interpreter raises `PermissionError`, and the engine applies the OS sandbox from
+   `forge/os/sandbox.hpp` to the whole process (Linux/Android seccomp-BPF, FreeBSD Capsicum, OpenBSD
+   pledge, macOS `sandbox_init`, Windows job object). Mapping: `--no-net` → deny sockets other than
+   AF_UNIX; `--no-proc` → deny exec; `--no-fs` → deny file writes (reads are blocked by the interpreter
+   only). It is on by default (`options::os_sandbox = best_effort`; `forge script --os-sandbox
+   off|best-effort|require`), is one-way, and `engine::sandbox_status()` reports the mechanism or the
+   failure. Limits: Windows can only block child processes in-process; inner `sandbox({...}) { }` blocks
+   are interpreter-only (the OS sandbox cannot be narrowed per block); `forge rpc-serve
+   --script-no-*` keeps interpreter checks only, because the server shares the process.
 
 ## AI-assisted commands (implemented)
 
