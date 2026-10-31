@@ -1,12 +1,17 @@
 #pragma once
 // High-resolution timing and hardware performance counters.
-//   cycle_counter(): rdtsc (x86) / cntvct_el0 (arm64) / monotonic_ns elsewhere; counter_hz() its frequency
-//   (cntfrq_el0, or TSC calibrated against the monotonic clock).
+//   cycle_counter(): rdtsc (x86) / mach_absolute_time (Apple) / cntvct_el0 (other arm64) / monotonic_ns elsewhere;
+//   counter_hz() its frequency (mach timebase, cntfrq_el0, or TSC calibrated against the monotonic clock).
+//   Apple: mach_absolute_time, not a raw cntvct_el0 read - in Virtualization.framework guests (GitHub's macOS
+//   runners) the raw register did not advance across a short loop.
 //   precise_sleep_ns(): Windows high-resolution waitable timer; POSIX absolute clock_nanosleep + short spin.
 //   perf_counters: Linux/Android perf_event_open (cycles, instructions, cache refs/misses, branch misses; obeys
 //   perf_event_paranoid); macOS kperf (kpc_* fixed counters: cycles, instructions; needs root); Windows
 //   QueryThreadCycleTime (cycles only); FreeBSD/iOS: TSC/CNTVCT "cycles" only, the rest unsupported.
 #include <forge/os/detail.hpp>
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+#endif
 #if defined(__linux__)
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
@@ -17,7 +22,9 @@
 
 namespace forge::os {
 inline std::uint64_t cycle_counter() {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__APPLE__) && defined(__aarch64__)
+    return mach_absolute_time();
+#elif defined(__x86_64__) || defined(__i386__)
     return __rdtsc();
 #elif defined(__aarch64__)
     std::uint64_t v; asm volatile("isb; mrs %0, cntvct_el0" : "=r"(v)); return v;
@@ -26,7 +33,11 @@ inline std::uint64_t cycle_counter() {
 #endif
 }
 inline std::uint64_t counter_hz() {
-#if defined(__aarch64__)
+#if defined(__APPLE__) && defined(__aarch64__)
+    static const std::uint64_t hz = [] { mach_timebase_info_data_t tb{}; mach_timebase_info(&tb);
+                                          return tb.numer ? 1000000000ull * tb.denom / tb.numer : 24000000ull; }();
+    return hz;
+#elif defined(__aarch64__)
     std::uint64_t f; asm volatile("mrs %0, cntfrq_el0" : "=r"(f)); return f;
 #elif defined(__x86_64__) || defined(__i386__)
     static const std::uint64_t hz = [] {

@@ -607,7 +607,8 @@ for (int i = 0; i < 10 && seen.size() < 2; ++i)
 std::println("{}", seen);
 auto u = net.parse_url("http://h:81/p?q=1");
 std::println("{} {} {}", u["host"], u["port"], u["query"]);
-std::println("{}", service.unit({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo", "a b"}}}).find("\"a b\"") != std::string::npos);
+auto un = service.unit({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo", "a b"}}});
+std::println("{}", un.find("\"a b\"") != std::string::npos || un.find("<string>a b</string>") != std::string::npos);   // systemd/sc quote, launchd plist
 auto st = service.status({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo"}}, {"dir", d}});
 std::println("{}", st == "unknown" ? "not_installed" : st);   // wine's sc.exe can't report 1060
 w.close();   // Windows: the watch holds the directory open

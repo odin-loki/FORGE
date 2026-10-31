@@ -102,6 +102,37 @@ inline stdfs::file_time_type::duration file_clock_offset() {
     }();
     return off;
 }
+#if defined(FORGE_OS_WINDOWS)
+// Windows: FILETIME directly (100 ns ticks since 1601). mingw's libstdc++ last_write_time goes through
+// _wstat64/_wutime64 and keeps whole seconds only; MSVC's is fine but this keeps both identical.
+namespace detail {
+inline constexpr std::int64_t filetime_unix_epoch = 116444736000000000LL;   // 1970-01-01 in FILETIME ticks
+inline HANDLE open_for_times(const std::string& p, DWORD access) {
+    return CreateFileW(widen(p).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                       OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);   // BACKUP_SEMANTICS: directories too
+}
+}
+inline result<std::int64_t> mtime_ns(const std::string& p) {
+    HANDLE h = detail::open_for_times(p, FILE_READ_ATTRIBUTES);
+    if (h == INVALID_HANDLE_VALUE) return {0, last_error("mtime " + p)};
+    FILETIME w{}; BOOL ok = GetFileTime(h, nullptr, nullptr, &w);
+    auto err = ok ? error{} : last_error("mtime " + p); CloseHandle(h);
+    if (!ok) return {0, err};
+    std::int64_t ticks = std::int64_t((std::uint64_t(w.dwHighDateTime) << 32) | w.dwLowDateTime);
+    return {(ticks - detail::filetime_unix_epoch) * 100, {}};
+}
+inline status set_mtime_ns(const std::string& p, std::int64_t ns) {
+    std::int64_t ticks = (ns >= 0 ? ns / 100 : -((-ns + 99) / 100)) + detail::filetime_unix_epoch;
+    if (ticks < 0) return {{}, error{int(ERROR_INVALID_PARAMETER), "set mtime " + p + ": before 1601"}};
+    HANDLE h = detail::open_for_times(p, FILE_WRITE_ATTRIBUTES);
+    if (h == INVALID_HANDLE_VALUE) return {{}, last_error("set mtime " + p)};
+    FILETIME w{DWORD(std::uint64_t(ticks) & 0xffffffffu), DWORD(std::uint64_t(ticks) >> 32)};
+    BOOL ok = SetFileTime(h, nullptr, nullptr, &w);
+    auto err = ok ? error{} : last_error("set mtime " + p); CloseHandle(h);
+    if (!ok) return {{}, err};
+    return {};
+}
+#else
 // Modification time in ns since the Unix epoch.
 inline result<std::int64_t> mtime_ns(const std::string& p) {
     std::error_code ec; auto t = stdfs::last_write_time(u8path(p), ec);
@@ -115,6 +146,7 @@ inline status set_mtime_ns(const std::string& p, std::int64_t ns) {
     if (ec) return {{}, from_ec(ec, "set mtime " + p)};
     return {};
 }
+#endif
 inline status touch(const std::string& p) {
     if (!exists(p)) { std::ofstream f(u8path(p), std::ios::app); if (!f) return {{}, last_error("touch " + p)}; return {}; }
     return set_mtime_ns(p, std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count());

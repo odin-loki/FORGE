@@ -771,10 +771,33 @@ if(FORGE_BUILD_TESTS)
   endif()
   # CUDA / HIP: compile the generated kernels to PTX / AMDGCN with clang (no SDK needed); hardware runs need a GPU.
   if(FORGE_GPU_CLANG)
-    add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version
-             --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_sm80.ptx ${FORGE_GPU_DIR}/kernels.cu)
-    add_test(NAME gpu_compile_hip COMMAND ${FORGE_GPU_CLANG} -x hip --cuda-device-only -nogpuinc -nogpulib
-             --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_gfx90a.s ${FORGE_GPU_DIR}/kernels.cu)
+    # Apple clang has no NVPTX backend and some Windows clang builds no AMDGPU one: a missing backend is a
+    # skip (77) with the reason printed, not a failure. The skip script asks the clang that would run the test.
+    execute_process(COMMAND ${FORGE_GPU_CLANG} -print-targets OUTPUT_VARIABLE _forge_gpu_targets ERROR_QUIET)
+    foreach(_t cuda:nvptx64 hip:amdgcn)
+      string(REPLACE ":" ";" _tp ${_t})
+      list(GET _tp 0 _lang)
+      list(GET _tp 1 _be)
+      string(FIND "${_forge_gpu_targets}" " ${_be} " _has)
+      set(FORGE_GPU_HAS_${_lang} ON)
+      if(_has LESS 0)
+        set(FORGE_GPU_HAS_${_lang} OFF)
+      endif()
+    endforeach()
+    if(FORGE_GPU_HAS_cuda)
+      add_test(NAME gpu_compile_cuda COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version
+               --cuda-gpu-arch=sm_80 -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_sm80.ptx ${FORGE_GPU_DIR}/kernels.cu)
+    else()
+      add_test(NAME gpu_compile_cuda COMMAND ${CMAKE_COMMAND} -E echo "skip: ${FORGE_GPU_CLANG} has no nvptx64 backend")
+      set_tests_properties(gpu_compile_cuda PROPERTIES SKIP_REGULAR_EXPRESSION "^skip: ")
+    endif()
+    if(FORGE_GPU_HAS_hip)
+      add_test(NAME gpu_compile_hip COMMAND ${FORGE_GPU_CLANG} -x hip --cuda-device-only -nogpuinc -nogpulib
+               --offload-arch=gfx90a -Werror -S -o ${FORGE_GPU_DIR}/kernels.check_gfx90a.s ${FORGE_GPU_DIR}/kernels.cu)
+    else()
+      add_test(NAME gpu_compile_hip COMMAND ${CMAKE_COMMAND} -E echo "skip: ${FORGE_GPU_CLANG} has no amdgcn backend")
+      set_tests_properties(gpu_compile_hip PROPERTIES SKIP_REGULAR_EXPRESSION "^skip: ")
+    endif()
     add_test(NAME gpu_compile_opencl COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
     add_test(NAME gpu_compile_opencl_nofp64 COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL3.0 --target=spir64 -Xclang -cl-ext=-cl_khr_fp64,-__opencl_c_fp64
              -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
@@ -794,8 +817,13 @@ if(FORGE_BUILD_TESTS)
       foreach(d ${_jni_md})
         list(APPEND _jni_inc -I${d})
       endforeach()
-      add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -c -o ${PROJECT_BINARY_DIR}/jni_syntax.o -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
-        -I${PROJECT_SOURCE_DIR}/mind/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+      if(MSVC)   # cl / clang-cl spelling of the same check
+        add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} /nologo /c /Fo${PROJECT_BINARY_DIR}/jni_syntax.obj /WX /W3 ${_jni_inc}
+          -I${PROJECT_SOURCE_DIR}/mind/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+      else()
+        add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -c -o ${PROJECT_BINARY_DIR}/jni_syntax.o -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
+          -I${PROJECT_SOURCE_DIR}/mind/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+      endif()
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
              -include ${PROJECT_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)

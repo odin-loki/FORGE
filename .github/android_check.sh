@@ -6,7 +6,9 @@ adb push emit $d/ >/dev/null
 for g in functions flat batch; do
   got=$(adb shell "cd $d/emit && /system/bin/sh ./$g.sh; echo RC=\$?" | tr -d '\r')
   rc=$(echo "$got" | sed -n 's/^RC=//p'); got=$(echo "$got" | sed '/^RC=/d')
-  if [ "$got" = "$(cat emit/$g.want)" ] && [ "$rc" = "$(cat emit/$g.rc)" ]; then echo "PASS emit android $g"; else echo "FAIL emit android $g (rc $rc)"; echo "$got"; fail=1; fi
+  # emit/$g.want comes from the Linux host interpreter, so its platform() line says linux.
+  want=$(sed 's/plat=linux/plat=android/' emit/$g.want)
+  if [ "$got" = "$want" ] && [ "$rc" = "$(cat emit/$g.rc)" ]; then echo "PASS emit android $g"; else echo "FAIL emit android $g (rc $rc)"; echo "$got"; fail=1; fi
 done
 libcxx=$(find -L "$ANDROID_NDK_LATEST_HOME/" -path "*x86_64-linux-android/libc++_shared.so" | head -1)
 adb push "$libcxx" build/android-x86_64/test_script build/android-x86_64/libhello_plugin.so $d/ >/dev/null
