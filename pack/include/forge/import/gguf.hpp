@@ -74,10 +74,19 @@ private:
 inline import_report import_gguf(const std::string& path, const std::string& out, const import_options& opt = {}) {
     gguf_file g(path);
     auto arch = g.need("general.architecture").str();
-    if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral")
+    if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral" && arch != "qwen35")
         raise(errc::unsupported, "GGUF architecture '{}' has no template", arch);
+    bool q35 = arch == "qwen35";
     auto K = [&](const std::string& k) { return g.need(arch + "." + k).num(); };
-    auto Kor = [&](const std::string& k, double d) { auto* v = g.get(arch + "." + k); return v ? v->num() : d; };
+    // per-layer keys (qwen35 head_count_kv: 0 on linear-attention layers) collapse to their largest entry
+    auto Kor = [&](const std::string& k, double d) {
+        auto* v = g.get(arch + "." + k);
+        if (!v) return d;
+        if (!v->is_arr()) return v->num();
+        double m = d; bool any = false;
+        for (auto& e : v->arr()) if (!any || e.num() > m) { m = e.num(); any = true; }
+        return m;
+    };
     double heads = K("attention.head_count"), hidden = K("embedding_length");
     const auto& toks = g.need("tokenizer.ggml.tokens").arr();
     json::object cfg{{"hidden_size", hidden}, {"num_hidden_layers", K("block_count")}, {"num_attention_heads", heads},
@@ -86,7 +95,29 @@ inline import_report import_gguf(const std::string& path, const std::string& out
                      {"rms_norm_eps", Kor("attention.layer_norm_rms_epsilon", 1e-6)}, {"rope_theta", Kor("rope.freq_base", 10000.0)},
                      // llama.cpp's converter permutes Q/K for llama so it can use interleaved (GPT-J) RoPE
                      {"rope_neox", arch == "llama" || arch == "mistral" ? 0.0 : 1.0}};
-    std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : "llama";
+    // Qwen3.5 (llama.cpp / Ollama arch "qwen35"): the hybrid Gated DeltaNet + gated attention decoder of the HF
+    // qwen3_5 template. The GGUF converter already applies the (1 + w) RMSNorm offset, A = -exp(A_log) and the conv
+    // squeeze; it may also reorder the V heads from grouped-by-K-head to tiled order (ssm.v_head_reordered), which
+    // the import undoes below.
+    i64 lk_heads = 0, lk_dim = 0, lv_heads = 0, lv_dim = 0;
+    bool v_tiled = false;
+    if (q35) {
+        double L0 = K("block_count"), iv = Kor("full_attention_interval", 4);
+        if (iv < 1 || std::fmod(L0, iv) != 0) raise(errc::unsupported, "qwen35: {} layers is not a multiple of full_attention_interval {}", L0, iv);
+        if (g.get("qwen35.expert_count") && Kor("expert_count", 0) > 0) raise(errc::unsupported, "qwen35: MoE variants are not supported yet");
+        lk_heads = i64(K("ssm.group_count")); lk_dim = i64(K("ssm.state_size")); lv_heads = i64(K("ssm.time_step_rank"));
+        if (lk_heads <= 0 || lv_heads <= 0 || lv_heads % lk_heads) raise(errc::format_error, "qwen35: bad ssm head counts {} / {}", lk_heads, lv_heads);
+        lv_dim = i64(K("ssm.inner_size")) / lv_heads;
+        double hd = Kor("attention.key_length", hidden / heads), rot = Kor("rope.dimension_count", hd);
+        if (rot >= hd) raise(errc::unsupported, "qwen35: full-width RoPE is not supported by the template");
+        auto* vr = g.get("qwen35.ssm.v_head_reordered");
+        v_tiled = vr && (vr->is_bool() ? vr->b() : vr->num() != 0) && lv_heads != lk_heads;
+        cfg.emplace_back("rotary_dim", rot); cfg.emplace_back("full_attention_interval", iv); cfg.emplace_back("n_blocks", L0 / iv);
+        cfg.emplace_back("linear_num_key_heads", double(lk_heads)); cfg.emplace_back("linear_key_head_dim", double(lk_dim));
+        cfg.emplace_back("linear_num_value_heads", double(lv_heads)); cfg.emplace_back("linear_value_head_dim", double(lv_dim));
+        cfg.emplace_back("linear_conv_kernel_dim", Kor("ssm.conv_kernel", 4));
+    }
+    std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : q35 ? "qwen3_5" : "llama";
     auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), json::value(cfg));
     auto bp = pack::parse_blueprint(bp_text);
 
@@ -100,9 +131,72 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         w.add_raw(dst, t->shape, gguf_file::codec_of(t->type) ? gguf_file::codec_of(t->type) : "?", g.bytes(*t));
         ++rep.tensors;
     };
+    auto need = [&](const std::string& src) -> const gguf_file::tinfo& {
+        auto* t = g.find(src);
+        if (!t) raise(errc::not_found, "{}: missing tensor {}", path, src);
+        used.insert(src);
+        return *t;
+    };
+    // tiled -> grouped V-head order: grouped head k*per + v sits at tiled head v*lk_heads + k
+    auto vhead = [&](i64 h) { i64 per = lv_heads / lk_heads; return (h % per) * lk_heads + h / per; };
+    // copy src with the rows [row0, row0 + lv_heads*rows_per_head) put back in grouped V-head order (raw blocks)
+    auto put_vrows = [&](const std::string& dst, const std::string& src, i64 row0, i64 rows_per_head) {
+        auto& t = need(src);
+        auto* codec = gguf_file::codec_of(t.type);
+        auto b = g.bytes(t);
+        if (!v_tiled) { w.add_raw(dst, t.shape, codec, b); ++rep.tensors; return; }
+        i64 rows = t.shape.empty() ? 1 : t.shape[0], cols = t.shape.size() > 1 ? numel(t.shape) / rows : 1;
+        if (t.shape.size() == 1) { rows = t.shape[0]; cols = 1; }
+        auto* c = flow::codecs::find(codec);
+        if (c->block > 1 && cols % i64(c->block)) raise(errc::unsupported, "tensor {}: rows are not whole {} blocks", src, codec);
+        std::size_t rb = c->bytes(std::size_t(cols));
+        if (rows < row0 + lv_heads * rows_per_head) raise(errc::shape_mismatch, "tensor {} has shape {}", src, shape_str(t.shape));
+        std::vector<std::uint8_t> o(b.begin(), b.end());
+        for (i64 h = 0; h < lv_heads; ++h)
+            std::memcpy(o.data() + std::size_t(row0 + h * rows_per_head) * rb, b.data() + std::size_t(row0 + vhead(h) * rows_per_head) * rb,
+                        rb * std::size_t(rows_per_head));
+        w.add_raw(dst, t.shape, codec, o); ++rep.tensors;
+    };
+    // the out projection consumes V heads along its input (column) dimension: blocks straddle heads, so decode,
+    // permute and re-encode (q8_0 for quantised sources, which keeps the extra rounding negligible)
+    auto put_vcols = [&](const std::string& dst, const std::string& src) {
+        auto& t = need(src);
+        auto* codec = gguf_file::codec_of(t.type);
+        if (!v_tiled) { w.add_raw(dst, t.shape, codec, g.bytes(t)); ++rep.tensors; return; }
+        auto* c = flow::codecs::find(codec);
+        if (t.shape.size() != 2 || t.shape[1] != lv_heads * lv_dim) raise(errc::shape_mismatch, "tensor {} has shape {}", src, shape_str(t.shape));
+        std::size_t n = std::size_t(numel(t.shape));
+        std::vector<float> x(n), y(n);
+        c->decode(g.bytes(t).data(), n, x.data());
+        for (i64 r = 0; r < t.shape[0]; ++r)
+            for (i64 h = 0; h < lv_heads; ++h)
+                std::memcpy(&y[std::size_t(r * t.shape[1] + h * lv_dim)], &x[std::size_t(r * t.shape[1] + vhead(h) * lv_dim)], std::size_t(lv_dim) * 4);
+        std::string out_codec = c->block > 1 ? "q8_0" : std::string(codec);
+        w.add_tensor(dst, t.shape, y, out_codec); ++rep.tensors;
+    };
     put("tok_emb", "token_embd.weight");
     for (i64 l = 0, L = i64(bp.param("n_layers")); l < L; ++l) {
         auto P = std::format("blk.{}.", l), Q = std::format("layer.{}.", l);
+        if (q35) {
+            put(Q + "attn_norm", P + "attn_norm.weight"); put(Q + "ffn_norm", P + "post_attention_norm.weight");
+            put(Q + "w_gate", P + "ffn_gate.weight"); put(Q + "w_up", P + "ffn_up.weight"); put(Q + "w_down", P + "ffn_down.weight");
+            if (g.find(P + "attn_qkv.weight")) {   // Gated DeltaNet layer
+                put_vrows(Q + "w_qkv", P + "attn_qkv.weight", 2 * lk_heads * lk_dim, lv_dim);
+                put_vrows(Q + "w_z", P + "attn_gate.weight", 0, lv_dim);
+                put_vrows(Q + "w_a", P + "ssm_alpha.weight", 0, 1);
+                put_vrows(Q + "w_b", P + "ssm_beta.weight", 0, 1);
+                put_vrows(Q + "conv_w", P + "ssm_conv1d.weight", 2 * lk_heads * lk_dim, lv_dim);
+                put_vrows(Q + "dt_bias", g.find(P + "ssm_dt.bias") ? P + "ssm_dt.bias" : P + "ssm_dt", 0, 1);
+                put_vrows(Q + "a_neg", P + "ssm_a", 0, 1);
+                put(Q + "ssm_norm", P + "ssm_norm.weight");
+                put_vcols(Q + "wo", P + "ssm_out.weight");
+            } else {                                // gated full-attention layer
+                put(Q + "wq", P + "attn_q.weight"); put(Q + "q_norm", P + "attn_q_norm.weight");
+                put(Q + "wk", P + "attn_k.weight"); put(Q + "k_norm", P + "attn_k_norm.weight");
+                put(Q + "wv", P + "attn_v.weight"); put(Q + "wo", P + "attn_output.weight");
+            }
+            continue;
+        }
         put(Q + "attn_norm", P + "attn_norm.weight"); put(Q + "ffn_norm", P + "ffn_norm.weight");
         put(Q + "wq", P + "attn_q.weight"); put(Q + "wk", P + "attn_k.weight"); put(Q + "wv", P + "attn_v.weight");
         if (tname == "qwen3") { put(Q + "q_norm", P + "attn_q_norm.weight"); put(Q + "k_norm", P + "attn_k_norm.weight"); }
@@ -112,8 +206,10 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     put("out_norm", "output_norm.weight");
     put("lm_head", g.find("output.weight") ? "output.weight" : "token_embd.weight");
 
+    // vision tower and multi-token-prediction heads are not part of the text model: never copied
+    auto skipped = [&](const std::string& n) { return q35 && (n.starts_with("v.") || n.starts_with("mm.") || n.starts_with("mtp.")); };
     for (auto& t : g.tensors())  // keep everything else (rope freqs, extra heads, ...) addressable
-        if (!used.count(t.name) && gguf_file::codec_of(t.type)) { w.add_raw("extra." + t.name, t.shape, gguf_file::codec_of(t.type), g.bytes(t)); ++rep.tensors; }
+        if (!used.count(t.name) && !skipped(t.name) && gguf_file::codec_of(t.type)) { w.add_raw("extra." + t.name, t.shape, gguf_file::codec_of(t.type), g.bytes(t)); ++rep.tensors; }
 
     // tokenizer.json synthesised from the GGUF vocabulary (gpt2-style byte-level BPE)
     auto model = g.get("tokenizer.ggml.model") ? g.need("tokenizer.ggml.model").str() : std::string("gpt2");

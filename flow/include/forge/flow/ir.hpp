@@ -12,7 +12,7 @@ namespace forge::flow {
 using value_id = std::uint32_t;
 inline constexpr value_id no_value = ~0u;
 
-enum class node_kind : u8 { input, weight, constant, op, state_append, output };
+enum class node_kind : u8 { input, weight, constant, op, state_append, output, state_op };
 
 struct node {
     node_kind kind = node_kind::op;
@@ -56,6 +56,12 @@ public:
     value_id state_append(std::string slot, value_id x) {
         node n; n.kind = node_kind::state_append; n.inputs = {x}; n.name = std::move(slot); return push(std::move(n));
     }
+    // Stateful op over a fixed-size mutable slot `slot` (recurrent state, conv window): reads and updates the
+    // slot in place each run and returns a fresh value. `fn` names the kernel (see state_ops.hpp).
+    value_id state_op(std::string slot, std::string fn, std::vector<value_id> in, spec::attrs a = {}) {
+        node n; n.kind = node_kind::state_op; n.inputs = std::move(in); n.name = std::move(slot);
+        n.attrs = std::move(a); n.attrs.set("fn", std::move(fn)); return push(std::move(n));
+    }
     void output(std::string name, value_id v) { outputs_.push_back({std::move(name), v}); }
 
     // fluent helpers
@@ -89,6 +95,7 @@ inline std::string to_string(const graph& g) {
             case node_kind::constant: s += "const"; break;
             case node_kind::state_append: s += "state_append " + n.name; break;
             case node_kind::output: s += "output"; break;
+            case node_kind::state_op: s += "state_op " + n.attrs.str("fn") + " " + n.name; break;
             case node_kind::op: s += std::string(spec::info(n.op).name); break;
         }
         for (auto in : n.inputs) s += " %" + std::to_string(in);

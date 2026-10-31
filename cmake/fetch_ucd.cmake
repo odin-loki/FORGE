@@ -1,5 +1,5 @@
 # Downloads the Unicode 16.0.0 conformance files into tests/data/ucd (gitignored) for test_text_conformance.
-set(_ucd "${CMAKE_SOURCE_DIR}/tests/data/ucd")
+set(_ucd "${CMAKE_CURRENT_LIST_DIR}/../tests/data/ucd")
 set(_base "https://www.unicode.org/Public/16.0.0/ucd")
 foreach(f NormalizationTest.txt auxiliary/GraphemeBreakTest.txt auxiliary/WordBreakTest.txt auxiliary/SentenceBreakTest.txt
           auxiliary/LineBreakTest.txt BidiCharacterTest.txt)
