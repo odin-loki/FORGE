@@ -203,8 +203,8 @@ std::string engine::stats() {
 }
 
 int engine::repl() {
-    g_interrupt = &p_->sh->interrupt;
-    std::signal(SIGINT, on_sigint);
+    g_interrupt = &p_->sh->interrupt; (void)on_sigint;
+    os::install_cancel_signals(&p_->sh->interrupt);   // SIGINT/SIGTERM (Ctrl-C/Break/close on Windows) -> CancelledError
     std::cout << "forge script — :help for commands, :quit to leave\n";
     std::string buf, line;
     for (;;) {
@@ -233,7 +233,7 @@ int engine::repl() {
         if (!r.ok) std::cout << r.error << "\n";
         else if (!r.value.empty()) std::cout << r.value << "\n";
     }
-    std::signal(SIGINT, SIG_DFL);
+    os::install_cancel_signals(nullptr);
     g_interrupt = nullptr;
     return 0;
 }

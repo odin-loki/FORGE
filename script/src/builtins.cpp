@@ -201,8 +201,13 @@ void install_builtins(Shared& sh) {
                    "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "DeadlockError", "PipelineError", "PluginError", "AIError", "AccessError"})
         mkclass(n, err);
     // typed OS errors (forge/os/oserror.hpp): catch OSError to get all of them
-    for (auto n : {"FileNotFoundError", "FileExistsError", "NotSupportedError", "InterruptedError", "ConnectionError", "SignalError"})
+    // PermissionError / TimeoutError / OutOfMemoryError / CancelledError / DeadlockError pre-date OSError and
+    // keep their Error parent so existing `catch (PermissionError e)` code is unchanged.
+    for (auto n : {"FileNotFoundError", "FileExistsError", "NotSupportedError", "InterruptedError", "ConnectionError", "SignalError",
+                   "BlockingIOError", "NotADirectoryError", "IsADirectoryError", "ProcessLookupError", "NoSpaceError",
+                   "TooManyFilesError", "BusyError", "ReadOnlyFileSystemError"})
         if (!sh.errors.count(n)) mkclass(n, sh.errors["OSError"]);
+    for (auto n : {"ConnectionRefusedError", "ConnectionResetError", "BrokenPipeError"}) mkclass(n, sh.errors["ConnectionError"]);
     mkclass("SandboxViolationError", sh.errors["PermissionError"]);   // denied by the OS sandbox, not the interpreter
     sh.errors["ZeroDivisionError"] = sh.errors["ArithmeticError"];
 

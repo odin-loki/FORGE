@@ -1,3 +1,4 @@
+#include <forge/os/oserror.hpp>
 // forge::script runtime operations shared by the tree-walker and the VM.
 #include "interp.hpp"
 #include "shells/shell.hpp"
@@ -253,7 +254,11 @@ void Interp::step() {
     auto n = sh->steps.fetch_add(1, std::memory_order_relaxed);
     if (sh->limits.max_steps && n >= sh->limits.max_steps) raise("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
     if ((n & 255) == 0) {
-        if (sh->interrupt.load()) { sh->interrupt = false; raise("CancelledError", "interrupted"); }
+        if (sh->interrupt.load()) {
+            sh->interrupt = false;
+            int sig = os::take_cancel_signal();
+            raise("CancelledError", sig ? os::cancellation_exception(sig).what() : std::string("interrupted"));
+        }
         if (task && task->cancel.load()) raise("CancelledError", "task cancelled");
         if (deadline_ns && os::monotonic_ns() > deadline_ns) { deadline_ns = 0; raise("TimeoutError", "time limit reached"); }
         if (cpu_deadline_ns && os::thread_cpu_time_ns() > cpu_deadline_ns) { cpu_deadline_ns = 0; raise("LimitExceededError", "CPU time limit reached"); }
