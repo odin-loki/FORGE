@@ -133,3 +133,28 @@ TEST(scheduler_reports_kv_and_defers_under_budget) {
     }
     std::filesystem::remove(path);
 }
+
+#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+TEST(spawn_leased_charges_and_returns_cap) {
+    forge::mem::budget b("children", 1ull << 30);
+    forge::os::spawn_spec s; s.argv = {"sh", "-c", "sleep 0.1; exit 4"};
+    auto c1 = forge::mem::spawn_leased(b, s, 600ull << 20, "z3");
+    CHECK(c1); CHECK(b.used() == 600ull << 20); CHECK(c1->cap() == 600ull << 20);
+    CHECK_THROWS(forge::mem::spawn_leased(b, s, 600ull << 20, "z3"));   // would over-promise the budget
+    CHECK(b.used() == 600ull << 20);
+    CHECK(c1->wait() == 4); CHECK(b.used() == 0);
+    auto c2 = forge::mem::spawn_leased(b, s, 600ull << 20, "z3"); CHECK(c2);
+    forge::os::child* w[] = {&c2->proc};
+    CHECK(forge::os::wait_any(w)); c2->reap_if_done(); CHECK(b.used() == 0);
+    forge::os::spawn_spec bad; bad.argv = {"/nonexistent/forge-nope"};
+    CHECK(!forge::mem::spawn_leased(b, bad, 1 << 20)); CHECK(b.used() == 0);
+    {   // waiting reservation: a second child gets room once the first exits
+        auto a = forge::mem::spawn_leased(b, s, 900ull << 20);
+        auto t0 = forge::os::monotonic_ns();
+        std::thread t([&] { a->wait(); });
+        auto d = forge::mem::spawn_leased(b, s, 900ull << 20, "child", std::chrono::milliseconds(5000));
+        t.join(); CHECK(d); CHECK(forge::os::monotonic_ns() - t0 >= 50000000ull); d->wait();
+    }
+    CHECK(b.used() == 0);
+}
+#endif
