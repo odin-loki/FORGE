@@ -28,18 +28,18 @@ struct node {
 
 class graph {
 public:
-    value_id input(std::string name, shape_t s) { return push({.kind = node_kind::input, .shape = std::move(s), .name = std::move(name)}); }
+    value_id input(std::string name, shape_t s) { node n; n.kind = node_kind::input; n.shape = std::move(s); n.name = std::move(name); return push(std::move(n)); }
     value_id weight(std::string name, shape_t s, const float* data) {
-        return push({.kind = node_kind::weight, .shape = std::move(s), .name = std::move(name), .weight = data});
+        node n; n.kind = node_kind::weight; n.shape = std::move(s); n.name = std::move(name); n.weight = data; return push(std::move(n));
     }
     value_id constant(tensor t) {
-        node n{.kind = node_kind::constant, .shape = t.shape};
+        node n; n.kind = node_kind::constant; n.shape = t.shape;
         n.constant = std::make_shared<tensor>(std::move(t));
         return push(std::move(n));
     }
     value_id scalar(float v) { return constant(tensor({1}, v)); }
     value_id apply(spec::op o, std::vector<value_id> in, spec::attrs a = {}) {
-        return push({.kind = node_kind::op, .op = o, .inputs = std::move(in), .attrs = std::move(a)});
+        node n; n.kind = node_kind::op; n.op = o; n.inputs = std::move(in); n.attrs = std::move(a); return push(std::move(n));
     }
     value_id apply(std::string_view opname, std::vector<value_id> in, spec::attrs a = {}) {
         auto o = spec::op_from_name(opname);
@@ -48,7 +48,7 @@ public:
     }
     // Stateful append along axis 0 to slot `slot`; returns the full history (state ++ x).
     value_id state_append(std::string slot, value_id x) {
-        return push({.kind = node_kind::state_append, .inputs = {x}, .name = std::move(slot)});
+        node n; n.kind = node_kind::state_append; n.inputs = {x}; n.name = std::move(slot); return push(std::move(n));
     }
     void output(std::string name, value_id v) { outputs_.push_back({std::move(name), v}); }
 
