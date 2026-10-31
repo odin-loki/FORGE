@@ -1,5 +1,6 @@
 #pragma once
 // Portable BLAKE3 (hash mode, 32-byte output). Used for .fpk section/tensor integrity.
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
