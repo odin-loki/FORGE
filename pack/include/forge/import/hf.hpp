@@ -101,13 +101,24 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     auto has = [&](const std::string& n) { for (auto& s : shards) if (s->has(n)) return true; return false; };
 
     pack::writer w;
+    {   // estimate the encoded size (2-D weights in the target codec, the rest f32) plus slack, and reserve it once
+        auto* qc = flow::codecs::find(opt.codec);
+        std::size_t est = 0;
+        auto enc = [&](std::size_t k) { return qc && qc->block > 0 && k % std::size_t(qc->block) == 0 ? qc->bytes(k) : 4 * k; };
+        for (auto& s : shards) for (auto& [n, e] : s->entries()) {
+            std::size_t k = 1; for (auto d : e.shape) k *= std::size_t(d);
+            bool emb = n == "model.embed_tokens.weight";
+            est += (e.shape.size() == 2 && !emb ? enc(k) : 4 * k) + pack::alignment;
+            if (emb && !has("lm_head.weight")) est += enc(k);  // tied lm_head is re-encoded from the embedding
+        }
+        w.reserve(est + est / 8);
+    }
     import_report rep{arch, tname, 0, 0};
     auto put = [&](const std::string& n, const tensor& t, bool quantisable) {
         w.add_tensor(n, t.shape, t.data, quantisable ? opt.codec : std::string("f32")); ++rep.tensors;
     };
     i64 L = i64(bp.param("n_layers"));
-    auto emb = find("model.embed_tokens.weight");
-    put("tok_emb", emb, false);
+    put("tok_emb", find("model.embed_tokens.weight"), false);  // not kept alive: 2.5 GB f32 for 150k-vocab 4k-wide models
     auto mlp = [&](const std::string& P, const std::string& Q, const char* g, const char* u, const char* d) {
         put(Q + "w_gate", find(P + g + ".weight"), true);
         put(Q + "w_up", find(P + u + ".weight"), true);
@@ -161,7 +172,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         } else mlp(P + "mlp.", Q, "gate_proj", "up_proj", "down_proj");
     }
     put("out_norm", find("model.norm.weight"), false);
-    put("lm_head", has("lm_head.weight") ? find("lm_head.weight") : emb, true);
+    put("lm_head", has("lm_head.weight") ? find("lm_head.weight") : find("model.embed_tokens.weight"), true);
 
     json::object man{{"format", "fpk"}, {"forge_format_version", double(pack::format_version)}, {"architecture", arch},
                      {"template", tname}, {"codec", opt.codec}, {"session", bp.session},
