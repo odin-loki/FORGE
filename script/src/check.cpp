@@ -69,7 +69,7 @@ State merge(const State& a, const State& b) {
     return r;
 }
 
-struct Binding { std::string name; int line = 0; bool used = false; bool report = false; bool unique = false; bool list = false; bool cnst = false; };
+struct Binding { const char* cap = nullptr; bool chan = false; char lit = 0; std::string name; int line = 0; bool used = false; bool report = false; bool unique = false; bool list = false; bool cnst = false; };
 
 struct Fn {
     const FnDecl* decl = nullptr;
@@ -105,9 +105,35 @@ struct Checker {
         out.push_back({sev, id, std::move(msg), file, line, col_of(line, needle)});
     }
 
+    void D(L sev, const char* id, const Node& n, std::string msg, const std::string& needle = {}) {
+        const Node* at = &n; if (n.k == NK::Call && !n.kids.empty() && n.kids[0]->col) at = n.kids[0].get();
+        if (sev == L::warning && !opt.warnings) return;
+        if (!seen.emplace(n.line, std::string(id) + msg).second) return;
+        out.push_back({sev, id, std::move(msg), file, n.line, at->col && at->line == n.line ? at->col : col_of(n.line, needle)});
+    }
     Fn& cur() { return fns.back(); }
+    std::map<std::string, Binding*> gbind;             // globals declared by this script's top level
+    std::set<std::string> gread, fn_assigned;          // globals read anywhere / assigned inside some function
+    std::map<std::string, int> ids; std::map<std::string, std::vector<int>> field_ids;
+    int gid(const std::string& k) { auto it = ids.find(k); if (it != ids.end()) return it->second; int id = -int(ids.size()) - 1; ids[k] = id; auto dot = k.find('.'); if (dot != std::string::npos) field_ids[k.substr(0, dot)].push_back(id); return id; }
+    bool at_top() const { return !fns.empty() && fns.back().decl && fns.back().decl->is_top; }
+    // flow key of an lvalue: own local "l<slot>", script global "g<name>" (top level only), plus ".field" chains
+    std::string lkey(const Node& n) {
+        if (n.k == NK::Var) {
+            if (!n.var.global()) return n.var.depth == 0 ? "l" + std::to_string(n.var.slot) : std::string();
+            return at_top() && gbind.count(n.s) ? "g" + n.s : std::string();
+        }
+        if (n.k == NK::Field && !n.kids.empty()) { auto b = lkey(*n.kids[0]); return b.empty() ? b : b + "." + n.s; }
+        return {};
+    }
+    int skey(const std::string& k) { return k.size() > 1 && k[0] == 'l' && k.find('.') == std::string::npos ? std::stoi(k.substr(1)) : gid(k); }
+    void kill(State& st, const std::string& k) { st.erase(skey(k)); for (auto id : field_ids[k]) st.erase(id); auto it = field_ids.find(k); (void)it; for (auto& [fk, v] : ids) if (fk.size() > k.size() && fk.compare(0, k.size(), k) == 0 && fk[k.size()] == '.') st.erase(v); }
+    void after_call(State& st) {   // a script function may reassign a global it writes
+        for (auto& g : fn_assigned) { auto it = ids.find("g" + g); if (it != ids.end()) if (auto s2 = st.find(it->second); s2 != st.end() && s2->second == DEF) s2->second = MAYBE; }
+    }
     Binding* bind_of(const VarRef& v) {
-        if (v.global() || v.depth >= int(fns.size())) return nullptr;
+        if (v.global()) { auto it = gbind.find(v.name); return it == gbind.end() ? nullptr : it->second; }
+        if (v.depth >= int(fns.size())) return nullptr;
         auto& f = fns[fns.size() - 1 - v.depth]; auto it = f.slot.find(v.slot); return it == f.slot.end() ? nullptr : it->second;
     }
     static bool internal_name(const std::string& n) { return n.empty() || n[0] == '_' || n.find_first_of("$#.: <>") != std::string::npos || !(std::isalpha((unsigned char)n[0])); }
@@ -118,7 +144,8 @@ struct Checker {
             f.scopes.back().insert(name);
         }
         auto b = std::make_unique<Binding>(); b->name = name; b->line = line; b->report = report && !internal_name(name); b->cnst = cnst;
-        f.slot[v.slot] = b.get(); f.all.push_back(std::move(b));
+        if (v.global()) { if (gread.count(name)) b->report = false; gbind[name] = b.get(); } else f.slot[v.slot] = b.get();
+        f.all.push_back(std::move(b));
     }
     void end_fn() {
         for (auto& b : cur().all) if (b->report && !b->used) diag(L::warning, "unused-variable", b->line, "variable '" + b->name + "' is never read", b->name);
@@ -128,10 +155,13 @@ struct Checker {
     // ---------------------------------------------------------------- expressions
     void read_var(const Node& n, State& st) {
         if (auto* b = bind_of(n.var)) b->used = true;
-        if (n.var.global() || n.var.depth != 0) return;
-        auto it = st.find(n.var.slot); if (it == st.end() || !it->second) return;
-        if (it->second == DEF && !quiet) diag(L::error, "use-after-move", n.line, "'" + n.s + "' is used after std::move (raises BorrowError)", n.s);
-        else diag(L::warning, "use-after-move", n.line, "'" + n.s + "' may be used after std::move on some path", n.s);
+        check_key(n, lkey(n), st);
+    }
+    void check_key(const Node& n, const std::string& k, State& st) {
+        if (k.empty()) return;
+        auto it = st.find(skey(k)); if (it == st.end() || !it->second) return;
+        if (it->second == DEF && !quiet) D(L::error, "use-after-move", n, "'" + n.s + "' is used after std::move (raises BorrowError)", n.s);
+        else D(L::warning, "use-after-move", n, "'" + n.s + "' may be used after std::move on some path", n.s);
     }
     std::string key(const Node& n) { return n.k == NK::Var ? (n.var.global() ? "g:" + n.s : n.s + "@" + std::to_string(fns.size() - 1 - std::max(0, n.var.depth)) + ":" + std::to_string(n.var.slot)) : std::string(); }
 
@@ -148,7 +178,7 @@ struct Checker {
         if (n.k == NK::Var && !n.var.global() && n.var.depth >= depth) {
             int up = n.var.depth - depth;   // hops above the thread lambda's definer
             if (up < int(fns.size())) { auto& f = fns[fns.size() - 1 - up]; auto it = f.slot.find(n.var.slot);
-                if (it != f.slot.end() && !it->second->cnst) diag(L::warning, "thread-capture", n.line, "thread body captures mutable local '" + n.s + "'; move, freeze or wrap it in forge::shared", n.s); }
+                if (it != f.slot.end() && !it->second->cnst) D(L::warning, "thread-capture", n, "thread body captures mutable local '" + n.s + "'; move, freeze or wrap it in forge::shared", n.s); }
         }
         for (auto& k : n.kids) if (k) thread_captures(*k, depth);
         if (n.extra) thread_captures(*n.extra, depth);
@@ -177,9 +207,13 @@ struct Checker {
         if (c && c->k == NK::Field && !c->kids.empty() && c->kids[0]->k == NK::Var && c->kids[0]->var.global()) {
             const std::string& lib = c->kids[0]->s;
             if (auto* cp = cap_of(lib, c->s); cp && !caps.get(cp))
-                diag(L::error, "capability", n.line, lib + "." + c->s + " needs the '" + cp + "' capability, which this run denies (raises PermissionError)", c->s);
+                D(L::error, "capability", n, lib + "." + c->s + " needs the '" + cp + "' capability, which this run denies (raises PermissionError)", c->s);
         }
-        if (c && is_builtin_var(*c, "run") && !caps.proc) diag(L::error, "capability", n.line, "run() needs the 'proc' capability, which this run denies (raises PermissionError)", "run");
+        if (c && c->k == NK::Var) if (auto* b = bind_of(c->var); b && b->cap && !caps.get(b->cap))
+            D(b->cnst ? L::error : L::warning, "capability", n, "'" + c->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies", c->s);
+        if (c && (is_builtin_var(*c, "eval") || is_builtin_var(*c, "forge::eval")) && argc == 1 && n.kids[1]->k == NK::Str) sub_check(n, n.kids[1]->s, "eval");
+        if (c) deprecated(n, *c);
+        if (c && is_builtin_var(*c, "run") && !caps.proc) D(L::error, "capability", n, "run() needs the 'proc' capability, which this run denies (raises PermissionError)", "run");
         // ---- format strings
         if (c && c->k == NK::Var && c->var.global() && (c->s == "std::format" || c->s == "std::println" || c->s == "std::print") && argc >= 1 && n.kids[1]->k == NK::Str)
             format_check(n.kids[1]->s, argc - 1, n.line);
@@ -187,22 +221,23 @@ struct Checker {
         if (c && c->k == NK::Var && c->var.global() && globals_fn.count(c->s) && !global_assigns.count(c->s)) {
             auto* f = globals_fn[c->s]; std::size_t req = 0; for (auto& p : f->params) if (!p.dflt) ++req;
             if (argc < req || argc > f->params.size())
-                diag(L::warning, "arg-count", n.line, c->s + "() takes " + (req == f->params.size() ? std::to_string(req) : std::to_string(req) + ".." + std::to_string(f->params.size())) + " argument(s), called with " + std::to_string(argc), c->s);
+                D(L::warning, "arg-count", n, c->s + "() takes " + (req == f->params.size() ? std::to_string(req) : std::to_string(req) + ".." + std::to_string(f->params.size())) + " argument(s), called with " + std::to_string(argc), c->s);
         }
         // ---- thread send
         bool thread = c && c->k == NK::Var && c->var.global() && (c->s == "forge::spawn" || c->s == "std::async" || c->s == "forge::async");
         if (thread) for (std::size_t i = 1; i < n.kids.size(); ++i) {
             auto& a = *n.kids[i];
             if (a.k == NK::Lambda) continue;
-            if (!sendable_arg(a, st)) diag(L::warning, "thread-send", a.line, "value passed to a thread is not moved, frozen, const or forge::shared; it is deep-copied or raises RaceError on shared access", a.k == NK::Var ? a.s : std::string());
+            if (!sendable_arg(a, st)) D(L::warning, "thread-send", a, "value passed to a thread is not moved, frozen, const or forge::shared; it is deep-copied or raises RaceError on shared access", a.k == NK::Var ? a.s : std::string());
         }
         bool chan_send = c && c->k == NK::Field && (c->s == "send" || c->s == "push") && !c->kids.empty() && c->kids[0]->k == NK::Var && argc == 1;
-        if (chan_send) { auto* b = bind_of(c->kids[0]->var); (void)b; }
+        if (chan_send) if (auto* b = bind_of(c->kids[0]->var); b && b->chan && n.kids[1]->k != NK::Lambda && !sendable_arg(*n.kids[1], st))
+            D(L::warning, "channel-send", *n.kids[1], "value sent on a channel is not moved, frozen, const or forge::shared; the receiver gets a deep copy or RaceError on shared access", n.kids[1]->k == NK::Var ? n.kids[1]->s : std::string());
         // ---- range-for structural mutation
         if (c && c->k == NK::Field && !c->kids.empty() && c->kids[0]->k == NK::Var) {
             static const std::set<std::string> mut = {"push_back", "emplace_back", "pop_back", "push_front", "pop_front", "insert", "emplace", "erase", "clear", "resize", "append", "extend", "remove", "pop", "push", "assign", "swap"};
             if (mut.count(c->s)) { auto k = key(*c->kids[0]); for (std::size_t i = 0; i < iter_stack.size(); ++i) if (!k.empty() && iter_stack[i] == k)
-                diag(iter_list[i].second ? L::error : L::warning, "iter-mutation", n.line, "'" + c->kids[0]->s + "." + c->s + "' changes the size of the container a range-for is iterating" + (iter_list[i].second ? std::string(" (raises BorrowError)") : std::string()), c->s); }
+                D(iter_list[i].second ? L::error : L::warning, "iter-mutation", n, "'" + c->kids[0]->s + "." + c->s + "' changes the size of the container a range-for is iterating" + (iter_list[i].second ? std::string(" (raises BorrowError)") : std::string()), c->s); }
         }
         // ---- lock order: x.with(fn)
         bool with = c && c->k == NK::Field && c->s == "with" && !c->kids.empty() && c->kids[0]->k == NK::Var && argc == 1;
@@ -230,12 +265,53 @@ struct Checker {
             }
             expr(a, st);
         }
+        if (at_top() && !(c && c->k == NK::Field && c->kids.size() && c->kids[0]->k == NK::Var && c->kids[0]->var.global() && !gbind.count(c->kids[0]->s))) after_call(st);
+    }
+    void sub_check(const Node& at, const std::string& code, const char* what) {
+        std::shared_ptr<const FnDecl> t;
+        try { t = parse_program(code, std::string("<") + what + ">"); } catch (const std::exception& e) { D(L::warning, "syntax", at, std::string(what) + " source does not parse: " + e.what()); return; }
+        Checker sub; sub.src = code; sub.file = file; sub.opt = opt; sub.opt.warnings = false; sub.caps = caps;
+        if (t->body) sub.collect(*t->body, false);
+        sub.fn(*t);
+        for (auto& d : sub.out) if (d.severity == L::error) D(L::error, d.id.c_str(), at, std::string("in ") + what + " source: " + d.message);
+    }
+    // Deprecated APIs: built-in table plus script functions marked [[deprecated]] / [[deprecated("why")]].
+    void deprecated(const Node& n, const Node& c) {
+        static const std::map<std::string, std::string> table = {
+            {"std::random_shuffle", "removed in C++17; use std::shuffle"}, {"std::auto_ptr", "removed in C++17; use std::unique_ptr"},
+            {"std::bind1st", "removed in C++17; use a lambda"}, {"std::bind2nd", "removed in C++17; use a lambda"},
+            {"std::ptr_fun", "removed in C++17; use a lambda"}, {"std::gets", "removed in C++14; use std::getline"},
+            {"std::aligned_storage", "deprecated in C++23; use alignas storage"}, {"std::aligned_union", "deprecated in C++23"},
+        };
+        std::string name = c.k == NK::Var ? c.s : std::string();
+        if (name.empty()) return;
+        if (auto it = table.find(name); it != table.end()) { D(L::warning, "deprecated", n, name + " is deprecated: " + it->second, name); return; }
+        if (c.var.global()) if (auto f = globals_fn.find(name); f != globals_fn.end())
+            for (auto& a : f->second->attrs) if (a.rfind("deprecated", 0) == 0) { D(L::warning, "deprecated", n, name + "() is marked [[" + a + "]]", name); return; }
+    }
+    // Warning-level type inference: literal operands, and const locals initialised from a literal.
+    char lit_of(const Node& e) {
+        if (e.k == NK::Int) return 'i'; if (e.k == NK::Float) return 'f'; if (e.k == NK::Str) return 's';
+        if (e.k == NK::Var) if (auto* b = bind_of(e.var)) return b->lit;
+        return 0;
+    }
+    void type_check(const Node& n) {
+        if (n.kids.size() != 2) return;
+        char a = lit_of(*n.kids[0]), b = lit_of(*n.kids[1]); if (!a || !b) return;
+        Op o = Op(n.i);
+        bool num_a = a != 's', num_b = b != 's';
+        bool bad = false;
+        if (o == Op::Sub || o == Op::Div || o == Op::Mod || o == Op::BitAnd || o == Op::BitOr || o == Op::BitXor || o == Op::Shl || o == Op::Shr) bad = !num_a || !num_b;
+        if (o == Op::Add) bad = num_a != num_b;
+        if (o == Op::Mul) bad = !num_a && !num_b;
+        if ((o == Op::Lt || o == Op::Le || o == Op::Gt || o == Op::Ge) && num_a != num_b) bad = true;
+        if (bad) D(L::warning, "type", n, std::string("operator ") + op_name(o) + " on " + (num_a ? "number" : "string") + " and " + (num_b ? "number" : "string") + " likely raises TypeError");
     }
     void pool_task(const Node& n) {
         auto& s = *n.kids[1];
         if (s.k == NK::Str) {
             std::shared_ptr<const FnDecl> t;
-            try { t = parse_program(s.s, "<task>"); } catch (const std::exception& e) { diag(L::error, "pool-task", n.line, std::string("ProcessPool task source does not parse: ") + e.what()); return; }
+            try { t = parse_program(s.s, "<task>"); } catch (const std::exception& e) { D(L::error, "pool-task", n, std::string("ProcessPool task source does not parse: ") + e.what()); return; }
             const FnDecl* task = nullptr; bool reassigned = false;
             std::function<void(const Node&)> walk = [&](const Node& x) {
                 if (x.k == NK::FnStmt && x.fn && x.fn->name == "task") task = x.fn.get();
@@ -243,16 +319,16 @@ struct Checker {
                 if (x.k == NK::Block) for (auto& k : x.kids) if (k) walk(*k);
             };
             if (t && t->body) walk(*t->body);
-            if (!task && !reassigned) diag(L::error, "pool-task", n.line, "ProcessPool task source does not define task(arg)");
+            if (!task && !reassigned) D(L::error, "pool-task", n, "ProcessPool task source does not define task(arg)");
             else if (task) { std::size_t req = 0; for (auto& p : task->params) if (!p.dflt) ++req;
-                if (req > 1 || task->params.empty()) diag(L::error, "pool-task", n.line, "ProcessPool task(arg) must take exactly one argument (it takes " + std::to_string(task->params.size()) + ")"); }
+                if (req > 1 || task->params.empty()) D(L::error, "pool-task", n, "ProcessPool task(arg) must take exactly one argument (it takes " + std::to_string(task->params.size()) + ")"); }
         }
         if (n.kids.size() > 2) {
             auto& a = *n.kids[2];
-            if (non_json_literal(a)) diag(L::error, "pool-json", a.line, "ProcessPool arguments must be JSON-representable; a function or shell value is not");
+            if (non_json_literal(a)) D(L::error, "pool-json", a, "ProcessPool arguments must be JSON-representable; a function or shell value is not");
             else if ((a.k == NK::List || a.k == NK::Map) && !json_literal(a)) {
                 bool bad = false; for (auto& k : a.kids) if (non_json_literal(*k)) bad = true;
-                if (bad) diag(L::error, "pool-json", a.line, "ProcessPool arguments must be JSON-representable; this literal contains a function");
+                if (bad) D(L::error, "pool-json", a, "ProcessPool arguments must be JSON-representable; this literal contains a function");
             }
         }
     }
@@ -275,16 +351,18 @@ struct Checker {
     void expr(const Node& n, State& st) {
         switch (n.k) {
         case NK::Var: read_var(n, st); return;
+        case NK::Field: if (!n.kids.empty() && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field)) { expr(*n.kids[0], st); check_key(n, lkey(n), st); return; } break;
+        case NK::Binary: type_check(n); break;
         case NK::Move:
-            if (!n.kids.empty() && n.kids[0]->k == NK::Var) { auto& v = *n.kids[0]; read_var(v, st); if (!v.var.global() && v.var.depth == 0) st[v.var.slot] = DEF; return; }
+            if (!n.kids.empty() && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field)) { auto& v = *n.kids[0]; expr(v, st); auto k = lkey(v); if (!k.empty()) st[skey(k)] = DEF; return; }
             break;
         case NK::Copy:
             if (!n.kids.empty() && n.kids[0]->k == NK::Var) if (auto* b = bind_of(n.kids[0]->var); b && b->unique)
-                diag(L::error, "unique-copy", n.line, "'" + n.kids[0]->s + "' is a unique_ptr and cannot be copied (raises BorrowError); use std::move", n.kids[0]->s);
+                D(L::error, "unique-copy", n, "'" + n.kids[0]->s + "' is a unique_ptr and cannot be copied (raises BorrowError); use std::move", n.kids[0]->s);
             break;
         case NK::Lambda: lambda(n, false); return;
         case NK::Call: call(n, st); return;
-        case NK::Shell: if (!caps.proc) diag(L::error, "capability", n.line, "shell blocks need the 'proc' capability, which this run denies (raises PermissionError)"); break;
+        case NK::Shell: if (!caps.proc) D(L::error, "capability", n, "shell blocks need the 'proc' capability, which this run denies (raises PermissionError)"); break;
         case NK::And: case NK::Or: case NK::Coalesce:
             if (n.kids.size() == 2) { expr(*n.kids[0], st); State b = st; expr(*n.kids[1], b); st = merge(st, b); return; }
             break;
@@ -332,16 +410,27 @@ struct Checker {
                 list = i.k == NK::List || i.k == NK::Map;
                 report = i.k == NK::Nil || i.k == NK::Int || i.k == NK::Float || i.k == NK::Str || i.k == NK::True || i.k == NK::False || i.k == NK::List || i.k == NK::Map;
             }
-            if (n.type && (n.type->name == "list" || n.type->name == "map" || n.type->name == "vector")) list = true;
-            if (!n.var.global()) { declare(n.var, n.s, n.line, report, n.flag); if (auto* b = bind_of(VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; } st.erase(n.var.slot); }
-            else if (!n.kids.empty()) { /* global */ }
+            if (n.type) { static const std::set<std::string> cont = {"list", "map", "set", "dict", "vector", "deque", "std::vector", "std::deque", "std::list",
+                "std::forward_list", "std::map", "std::unordered_map", "std::multimap", "std::set", "std::unordered_set", "std::multiset", "std::array"};
+                if (cont.count(n.type->name)) list = true; }
+            const char* cap = nullptr; bool chan = false; char lit = 0;
+            if (!n.kids.empty() && n.kids[0]) { auto& i = n.kids[0]->k == NK::Copy && !n.kids[0]->kids.empty() ? *n.kids[0]->kids[0] : *n.kids[0];
+                if (i.k == NK::Field && !i.kids.empty() && i.kids[0]->k == NK::Var && i.kids[0]->var.global()) cap = cap_of(i.kids[0]->s, i.s);
+                if (auto* c = callee(i); c && (is_builtin_var(*c, "forge::channel") || is_builtin_var(*c, "channel"))) chan = true;
+                if (auto* c = callee(i); c && c->k == NK::Var && c->var.global() && (c->s == "std::vector" || c->s == "std::deque" || c->s == "std::list" || c->s == "std::map" || c->s == "std::unordered_map" || c->s == "std::set" || c->s == "std::unordered_set")) list = true;
+                lit = i.k == NK::Int ? 'i' : i.k == NK::Float ? 'f' : i.k == NK::Str ? 's' : 0; }
+            if (n.var.global() && !at_top()) return true;
+            declare(n.var, n.s, n.line, report, n.flag);
+            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; }
+            { auto k = n.var.global() ? "g" + n.s : "l" + std::to_string(n.var.slot); kill(st, k); }
             return true;
         }
         case NK::Assign:
             if (n.kids.size() == 2) {
                 expr(*n.kids[1], st);
                 auto& t = *n.kids[0];
-                if (t.k == NK::Var) { if (n.s != "=") read_var(t, st); if (!t.var.global() && t.var.depth == 0) st.erase(t.var.slot); }
+                if (t.k == NK::Var) { if (n.s != "=") read_var(t, st); auto k = lkey(t); if (!k.empty()) kill(st, k); if (auto* b = bind_of(t.var)) { b->cap = nullptr; b->chan = false; b->lit = 0; b->unique = false; } }
+                else if (t.k == NK::Field && !t.kids.empty()) { expr(*t.kids[0], st); auto k = lkey(t); if (!k.empty()) kill(st, k); }
                 else expr(t, st);
             }
             return true;
@@ -357,7 +446,7 @@ struct Checker {
         case NK::While: {
             bool infinite = !n.kids.empty() && n.kids[0] && n.kids[0]->k == NK::True;
             if (infinite && !(n.kids.size() > 1 && n.kids[1] && has_exit(*n.kids[1], 0)) && !(n.extra && has_exit(*n.extra, 0)))
-                diag(L::warning, "infinite-loop", n.line, "loop has no break, return or throw; it only ends on a timeout, step limit or cancellation");
+                D(L::warning, "infinite-loop", n, "loop has no break, return or throw; it only ends on a timeout, step limit or cancellation");
             loop(n, st, n.kids[0].get(), n.kids.size() > 1 ? n.kids[1].get() : nullptr, nullptr);
             return !infinite || has_exit(n, 0);
         }
@@ -383,7 +472,7 @@ struct Checker {
             for (std::size_t i = 1; i < n.kids.size(); ++i) {
                 auto& c = *n.kids[i]; std::string t = c.s;
                 for (auto& p : prior) if (p.empty() || p == "..." || (err_is_a(t, p) && err_parent().count(t)))
-                    { diag(L::warning, "catch-order", c.line, "catch (" + (t.empty() ? std::string("...") : t) + ") is unreachable: an earlier catch (" + (p.empty() ? std::string("...") : p) + ") already handles it", t); break; }
+                    { D(L::warning, "catch-order", c, "catch (" + (t.empty() ? std::string("...") : t) + ") is unreachable: an earlier catch (" + (p.empty() ? std::string("...") : p) + ") already handles it", t); break; }
                 prior.push_back(t);
                 State cs = merge(entry, st);
                 if (!c.var.name.empty() && !c.var.global()) declare(c.var, c.var.name, c.line, false, false);
@@ -443,22 +532,36 @@ struct Checker {
             diag(L::warning, "missing-return", f.line, "function '" + f.name + "' is declared to return " + f.ret_name + " but can reach its end without returning (returns nil)", f.name);
         end_fn();
     }
-    void collect(const Node& n) {
+    void collect(const Node& n, bool in_fn) {
+        if (n.k == NK::Var && n.var.global()) gread.insert(n.s);
+        if (in_fn && n.k == NK::Assign && !n.kids.empty() && n.kids[0]->k == NK::Var && n.kids[0]->var.global()) fn_assigned.insert(n.kids[0]->s);
+        if (in_fn && n.k == NK::Move && !n.kids.empty() && n.kids[0]->k == NK::Var && n.kids[0]->var.global()) fn_assigned.insert(n.kids[0]->s);
         if (n.k == NK::FnStmt && n.fn && n.var.global() && !n.fn->is_method) { if (globals_fn.count(n.fn->name)) global_assigns[n.fn->name]++; globals_fn[n.fn->name] = n.fn.get(); }
         if (n.k == NK::Assign && !n.kids.empty() && n.kids[0]->k == NK::Var && n.kids[0]->var.global()) global_assigns[n.kids[0]->s]++;
         if (n.k == NK::Let && n.var.global()) global_assigns[n.s]++;
-        for (auto& k : n.kids) if (k) collect(*k);
-        if (n.extra) collect(*n.extra);
-        if (n.fn && n.fn->body && n.k == NK::Lambda) collect(*n.fn->body);
-        if (n.k == NK::FnStmt && n.fn && n.fn->body) collect(*n.fn->body);
+        for (auto& k : n.kids) if (k) collect(*k, in_fn);
+        if (n.extra) collect(*n.extra, in_fn);
+        if (n.fn && n.fn->body && n.k == NK::Lambda) collect(*n.fn->body, true);
+        if (n.k == NK::FnStmt && n.fn && n.fn->body) collect(*n.fn->body, true);
     }
     void lock_cycles() {
-        std::set<std::string> done;
-        for (auto& [a, outs] : lock_edges) for (auto& b : outs) if (lock_edges.count(b) && lock_edges[b].count(a) && a < b && !done.count(a + "|" + b)) {
-            done.insert(a + "|" + b);
-            int l1 = edge_line[{a, b}], l2 = edge_line[{b, a}];
-            diag(L::warning, "lock-order", std::max(l1, l2), "forge::shared values '" + a + "' and '" + b + "' are locked in both orders (lines " + std::to_string(l1) + " and " + std::to_string(l2) + "); this can deadlock (DeadlockError under --debug)");
-        }
+        std::map<std::string, int> idx, low; std::vector<std::string> stk; std::set<std::string> on; int counter = 0;
+        std::function<void(const std::string&)> sc = [&](const std::string& v) {
+            idx[v] = low[v] = counter++; stk.push_back(v); on.insert(v);
+            for (auto& w : lock_edges[v]) { if (!idx.count(w)) { sc(w); low[v] = std::min(low[v], low[w]); } else if (on.count(w)) low[v] = std::min(low[v], idx[w]); }
+            if (low[v] == idx[v]) {
+                std::vector<std::string> comp; std::string w;
+                do { w = stk.back(); stk.pop_back(); on.erase(w); comp.push_back(w); } while (w != v);
+                if (comp.size() < 2) return;
+                std::sort(comp.begin(), comp.end());
+                std::string names, lines; int last = 0;
+                for (auto& x : comp) names += (names.empty() ? "'" : ", '") + x + "'";
+                for (auto& [e, l] : edge_line) if (std::find(comp.begin(), comp.end(), e.first) != comp.end() && std::find(comp.begin(), comp.end(), e.second) != comp.end()) { lines += (lines.empty() ? "" : ", ") + std::to_string(l); last = std::max(last, l); }
+                diag(L::warning, "lock-order", last, "forge::shared values " + names + " are locked in a cyclic order (nested with() at lines " + lines + "); this can deadlock (DeadlockError under --debug)");
+            }
+        };
+        std::vector<std::string> keys; for (auto& [k, v] : lock_edges) keys.push_back(k);
+        for (auto& k : keys) if (!idx.count(k)) sc(k);
     }
     void suppress() {
         // `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the flagged line or the line above;
@@ -497,7 +600,7 @@ std::string jesc(const std::string& s) {
 
 std::vector<diagnostic> check_parsed(const FnDecl& top, std::string_view src, const std::string& file, const check_options& o) {
     Checker c; c.src = src; c.file = file; c.opt = o; c.caps = {o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
-    if (top.body) c.collect(*top.body);
+    if (top.body) c.collect(*top.body, false);
     c.fn(top);
     c.lock_cycles();
     c.suppress();

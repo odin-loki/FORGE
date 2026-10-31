@@ -636,15 +636,28 @@ Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the
 | `format` | warning | `std::format/print/println` literal with a placeholder count that does not match the arguments |
 | `syntax` | error | parse failure |
 
-Considered and not built (yet): **undefined variables** (the resolver already rejects unknown locals; unknown globals
-may be host-injected, so only a warning would be sound); **type inference** (dynamic values and implicit conversions
-make anything beyond literals unsound; planned as warnings over literal-typed locals); **await outside async**
-(`await` on a task value is legal anywhere in ForgeScript, so there is nothing to flag); **deprecated APIs** (no API
-is marked deprecated yet; the check needs an attribute table first); **channel send of non-sendable values** and
-**lock cycles longer than two** (planned).
+| `channel-send` | warning | a non-moved, non-frozen, non-const, non-shared value sent with `.send/.push` on a local made by `channel()` |
+| `deprecated` | warning | built-in table (`std::random_shuffle`, `std::auto_ptr`, `std::bind1st/2nd`, `std::ptr_fun`, `std::gets`, `std::aligned_storage/union`) and calls of script functions marked `[[deprecated]]` |
+| `type` | warning | arithmetic/comparison between a string and a number where both sides are literals or `const` locals initialised from literals |
 
-Known gaps: top-level `let`s are globals, so move/unique/unused checks see function locals only; columns are
-found by searching the source line for the flagged name (the AST stores lines only); aliasing (`auto& r = v`) and
-`forge::shared` values reached through fields are not tracked; capability checks cover only direct `lib.fn(...)`
-calls on the built-in library globals and literal `sandbox({...}, lambda)` blocks. Scripts in the test suite that
-deliberately trigger BorrowError now need `--no-check` or a suppression comment.
+Scope of the flow checks: function locals, and **script globals at top level**: a global declared by the script's
+own top-level `let` is tracked through the top-level statements; globals the host injects are never tracked. A move
+of a global is downgraded to "maybe" after any call to script code when some function assigns or moves that global.
+Field paths (`std::move(o.f)` then `o.f`) are tracked; assigning `o` or `o.f` clears them. `capability` also covers a
+builtin stored in a local (`auto r = fs.read; r(p)`: error when the local is `const`, warning otherwise) and
+`eval("literal")`, whose source is checked with the same capabilities. `iter-mutation` recognises `std::vector`,
+`deque`, `list`, `forward_list`, `map`, `unordered_map`, `multimap`, `set`, `unordered_set`, `multiset` and `array`.
+`lock-order` finds cycles of any length in the nested-`with` graph (strongly connected components). Columns come from
+the token positions recorded on AST nodes (`Node::col`).
+
+Considered and not built (yet): **undefined variables** (the resolver already rejects unknown locals; unknown globals
+may be host-injected, so only a warning would be sound); **await outside async** (`await` on a task value is legal
+anywhere in ForgeScript, so there is nothing to flag); **type inference beyond literals** (values are dynamic and
+conversions implicit).
+
+Known gaps: references (`auto& r = v`) are not tracked as aliases, because the AST does not record that a `let` is a
+reference; capability checks do not follow `import`ed modules or builtins passed through function parameters or
+containers; `Node::col` is the column of the last token consumed when the node was built, so for some compound nodes
+it points at the end of the construct (the checker prefers the callee or variable column); `[[deprecated]]` is only
+honoured on top-level script functions. Test scripts that deliberately trigger the runtime errors carry
+`// forge-check: ignore-file`.

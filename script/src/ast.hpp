@@ -55,7 +55,7 @@ using NodeP = std::shared_ptr<const Node>;
 struct VarRef { std::string name; int depth = -1, slot = -1; bool global() const { return depth < 0; } };
 
 struct Node {
-    NK k; int line = 0;
+    NK k; int line = 0; int col = 0;   // col: 1-based column of the last token consumed when the node was built (0 unknown)
     std::string s;               // op / name / string literal / shell kind
     std::int64_t i = 0; double d = 0;
     bool flag = false;           // let: const; using: declares var; field: optional

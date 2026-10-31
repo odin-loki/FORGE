@@ -23,7 +23,7 @@ namespace forge::script {
 namespace {
 
 enum class T { Ident, Int, Float, Str, Op, Kw, End };
-struct Tok { T t; std::string s; int line = 0; std::int64_t i = 0; double d = 0; };
+struct Tok { T t; std::string s; int line = 0; int col = 0; std::int64_t i = 0; double d = 0; };
 
 const std::unordered_set<std::string> kKeywords = {
     "auto", "const", "constexpr", "consteval", "constinit", "static", "inline", "virtual", "override", "final",
@@ -57,7 +57,7 @@ public:
             }
             if (p_ >= s_.size()) { out.push_back({T::End, "", line_}); return out; }
             bol = false;
-            out.push_back(next());
+            { auto nl = p_ ? s_.rfind('\n', p_ - 1) : std::string_view::npos; int col = int(p_ - (nl == std::string_view::npos ? 0 : nl + 1)) + 1; out.push_back(next()); out.back().col = col; }
         }
     }
 private:
@@ -306,7 +306,7 @@ private:
     bool is_op(const char* o) const { return cur().t == T::Op && cur().s == o; }
     bool is_kw(const char* k) const { return cur().t == T::Kw && cur().s == k; }
     bool ahead_op(std::size_t k, const char* o) const { return ahead(k).t == T::Op && ahead(k).s == o; }
-    Tok take() { Tok t = cur(); if (i_ < t_.size() - 1) ++i_; return t; }
+    Tok take() { Tok t = cur(); t_line_ = t.line; t_col_ = t.col; if (i_ < t_.size() - 1) ++i_; return t; }
     [[noreturn]] void fail(const std::string& m) const { throw syntax_error(cur().line, file_ + ":" + std::to_string(cur().line) + ": " + m, at(T::End)); }
     std::int64_t get_index(const std::string& n, int line) const {
         std::int64_t v = 0; auto r = std::from_chars(n.data(), n.data() + n.size(), v);
@@ -370,7 +370,8 @@ private:
         return b;
     }
 
-    static std::shared_ptr<Node> mk(NK k, int line) { auto n = std::make_shared<Node>(); n->k = k; n->line = line; return n; }
+    static inline thread_local int t_line_ = 0, t_col_ = 0;   // last consumed token: gives nodes a column
+    static std::shared_ptr<Node> mk(NK k, int line) { auto n = std::make_shared<Node>(); n->k = k; n->line = line; n->col = line == t_line_ ? t_col_ : 0; return n; }
     std::shared_ptr<Node> var_node(const std::string& name, int line) { auto n = mk(NK::Var, line); n->s = name; n->var = lookup(name); return n; }
     std::shared_ptr<Node> str_node(const std::string& s, int line) { auto n = mk(NK::Str, line); n->s = s; return n; }
     std::shared_ptr<Node> int_node(std::int64_t v, int line) { auto n = mk(NK::Int, line); n->i = v; return n; }
