@@ -214,8 +214,11 @@ const kernels* by_name(const char* t) {
     if (n == "rvv") return f.rvv ? rvv_table(f.rvv_bytes) : nullptr;
     return nullptr;
 #else
-    if (n == "avx2") return f.avx2 && f.fma ? &mv_avx2::table : nullptr;
-    if (n == "avx512") return f.avx512f && f.avx512bw && f.avx512dq && f.avx512vl ? &mv_avx512::table : nullptr;
+    // The whole x86-64-v3 / -v4 feature set the TUs are built for: nested VMs (e.g. the FreeBSD CI guest on AMD)
+    // can report AVX2 while masking F16C/BMI2, and a kernel using them then dies with SIGILL.
+    const bool v3 = f.sse2 && f.sse4_2 && f.popcnt && f.avx && f.avx2 && f.fma && f.f16c && f.bmi2;
+    if (n == "avx2") return v3 ? &mv_avx2::table : nullptr;
+    if (n == "avx512") return v3 && f.avx512f && f.avx512bw && f.avx512dq && f.avx512vl && f.avx512cd ? &mv_avx512::table : nullptr;
     return nullptr;
 #endif
 }

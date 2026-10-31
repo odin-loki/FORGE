@@ -1,4 +1,7 @@
 // forge::script runtime operations shared by the tree-walker and the VM.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>   // _AddressOfReturnAddress
+#endif
 #include "interp.hpp"
 #include "shells/shell.hpp"
 #include "parser.hpp"
@@ -637,7 +640,11 @@ struct DepthGuard {
     Interp& in;
     bool outer = false;
     DepthGuard(Interp& i, const std::string& name, int line) : in(i) {
+#if defined(_MSC_VER) && !defined(__clang__)
+        auto here = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
+#else
         auto here = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+#endif
         if (!t_stack_base) { t_stack_base = here; outer = true; }
         else if (t_stack_base > here && t_stack_base - here > kStackBudget) in.raise("LimitExceededError", "native stack limit reached (infinite recursion?)");
         if (++in.depth > in.sh->limits.max_depth) { --in.depth; if (outer) t_stack_base = 0; in.raise("LimitExceededError", "call depth limit of " + std::to_string(in.sh->limits.max_depth) + " reached (infinite recursion?)"); }
@@ -879,8 +886,7 @@ Value Interp::shell(const Node& n, const std::vector<Value>& parts) {
     if (body.k == NK::Str) script = body.s;
     else for (std::size_t i = 0; i < body.kids.size() && i < parts.size(); ++i)
         script += body.kids[i]->k == NK::Str ? str(parts[i]) : quote_for(*be, str(parts[i]));
-    std::string exe;
-    for (auto& e : be->exes) if (!os::find_executable(e).empty()) { exe = e; break; }
+    std::string exe = shell_exe(*be);
     if (exe.empty()) raise("ShellError", kind + " is not installed (looked for " + [&] { std::string l; for (auto& e : be->exes) l += (l.empty() ? "'" : ", '") + e + "'"; return l; }() + " on PATH)");
     std::vector<std::string> argv = be->argv(exe, script);
     os::spawn_spec sp; sp.argv = argv; sp.max_output = sh->limits.max_output;

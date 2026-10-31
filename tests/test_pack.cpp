@@ -2,7 +2,9 @@
 #include <forge/mind/mind.hpp>
 #include <cstdio>
 #include <filesystem>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 #include <fstream>
 #include "tiny_model.hpp"
 #include <cstring>

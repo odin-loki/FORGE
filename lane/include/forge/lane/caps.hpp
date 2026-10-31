@@ -5,8 +5,9 @@
 namespace forge::lane {
 
 // ---- feature tags ----
+// (FMA3 is tagged fma3, not fma: MSVC rejects a class and the lane::fma function template sharing a name.)
 #define FORGE_FEATURES(X) \
-    X(sse2) X(sse4_2) X(popcnt) X(avx) X(avx2) X(fma) X(f16c) X(bmi2) \
+    X(sse2) X(sse4_2) X(popcnt) X(avx) X(avx2) X(fma3) X(f16c) X(bmi2) \
     X(avx512f) X(avx512bw) X(avx512dq) X(avx512vl) X(avx512cd) X(avx512vnni) X(avx512bf16) \
     X(avx512fp16) X(avx512ifma) X(avx512vbmi) X(avx512vbmi2) X(avx512bitalg) X(avx512vpopcntdq) \
     X(avxvnni) X(avx10_1) X(amx_tile) X(amx_int8) X(amx_bf16) X(amx_fp16) \
@@ -34,8 +35,8 @@ template <class T, class F> concept Has = Target<T> && T::template has<F>;
 struct scalar_t : caps<> { using caps_type = caps<>; static constexpr const char* name = "scalar"; };
 struct x86_64_v2 : caps<sse2, sse4_2, popcnt> {
     using caps_type = caps<sse2, sse4_2, popcnt>; static constexpr const char* name = "x86-64-v2"; };
-struct x86_64_v3 : caps<sse2, sse4_2, popcnt, avx, avx2, fma, f16c, bmi2> {
-    using caps_type = caps<sse2, sse4_2, popcnt, avx, avx2, fma, f16c, bmi2>; static constexpr const char* name = "x86-64-v3"; };
+struct x86_64_v3 : caps<sse2, sse4_2, popcnt, avx, avx2, fma3, f16c, bmi2> {
+    using caps_type = caps<sse2, sse4_2, popcnt, avx, avx2, fma3, f16c, bmi2>; static constexpr const char* name = "x86-64-v3"; };
 struct x86_64_v4 : caps_extend<x86_64_v3, avx512f, avx512bw, avx512dq, avx512vl, avx512cd> {
     using caps_type = caps_extend_t<x86_64_v3::caps_type, avx512f, avx512bw, avx512dq, avx512vl, avx512cd>::type;
     static constexpr const char* name = "x86-64-v4"; };

@@ -450,7 +450,9 @@ std::println("{}", forge::modules().size());
 try { forge::import("nope_missing"); } catch (const ImportError& e) { std::println("missing"); }
 )CPP";
 #ifdef FORGE_TEST_PLUGIN
-    code += std::string("auto h = forge::plugin(\"") + FORGE_TEST_PLUGIN + "\");\n" + R"CPP(
+    // FORGE_TEST_PLUGIN_PATH: where the plugin lives when the test binary runs away from its build tree (emulator)
+    const char* plug = std::getenv("FORGE_TEST_PLUGIN_PATH"); if (!plug || !*plug) plug = FORGE_TEST_PLUGIN;
+    code += std::string("auto h = forge::plugin(\"") + plug + "\");\n" + R"CPP(
 std::println("{} {} {}", h.add(2, 3.5), h.greet("forge"), h.VERSION);
 try { h.fail(1, 2); } catch (const PluginError& e) { std::println("{}", e.message); }
 try { h.add(1); } catch (const TypeError& e) { std::println("arity"); }
@@ -605,7 +607,8 @@ for (int i = 0; i < 10 && seen.size() < 2; ++i)
 std::println("{}", seen);
 auto u = net.parse_url("http://h:81/p?q=1");
 std::println("{} {} {}", u["host"], u["port"], u["query"]);
-std::println("{}", service.unit({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo", "a b"}}}).find("\"a b\"") != std::string::npos);
+auto un = service.unit({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo", "a b"}}});
+std::println("{}", un.find("\"a b\"") != std::string::npos || un.find("<string>a b</string>") != std::string::npos);   // systemd/sc quote, launchd plist
 auto st = service.status({{"name", "forge-t"}, {"argv", std::vector<std::string>{"/bin/echo"}}, {"dir", d}});
 std::println("{}", st == "unknown" ? "not_installed" : st);   // wine's sc.exe can't report 1060
 w.close();   // Windows: the watch holds the directory open
@@ -721,7 +724,7 @@ TEST(emit_golden_all_shells) {
     namespace stdfs = std::filesystem;
     auto dir = stdfs::temp_directory_path() / ("forge_emit_" + std::to_string(::getpid()));
     stdfs::create_directories(dir);
-    auto avail = run("for (auto& s : forge::shells()) if (s[\"available\"] && s[\"emit\"]) std::print(\" {}={} \", s[\"name\"], s[\"exe\"]);");
+    auto avail = run("for (auto& s : forge::shells()) if (s[\"available\"] && s[\"emit\"]) std::print(\"\\t{}={}\\t\", s[\"name\"], s[\"exe\"]);");   // tabs: Windows paths have spaces
     std::string tested, refused;
     for (const char* g : {"functions", "flat", "batch"}) {
         std::string src = slurp_file("tests/data/emit/" + std::string(g) + ".cpp");
@@ -730,22 +733,31 @@ TEST(emit_golden_all_shells) {
         script::options o; std::string want; o.out = [&](std::string_view s) { want += s; };
         script::engine e(o); auto r = e.run_file(stdfs::absolute(old / "tests/data/emit" / (std::string(g) + ".cpp")).string());
         stdfs::current_path(old);
+        if (!r.ok && r.error.find("is not installed") != std::string::npos) {   // e.g. no sh on a bare Windows box
+            refused += " " + std::string(g) + "/*(" + r.error.substr(0, r.error.find('\n')) + ")"; continue;
+        }
         CHECK_MSG(r.ok, "%s interp: %s", g, r.error.c_str());
         for (auto& name : script::emit_targets()) {
-            auto at = avail.find(" " + name + "=");
+            auto at = avail.find("\t" + name + "=");
             if (at == std::string::npos) continue;
-            auto exe = avail.substr(at + name.size() + 2, avail.find(' ', at + 1) - at - name.size() - 2);
-            exe = stdfs::path(exe).filename().string();
+            auto exe = avail.substr(at + name.size() + 2, avail.find('\t', at + 1) - at - name.size() - 2);
+            auto full = exe;   // resolved path: the test's own shell (cmd.exe on Windows) may not share forge's PATH lookup
+            exe = stdfs::path(exe).stem().string();
             std::string code;
             try { code = script::emit(src, g, name); }
             catch (const script::emit_error&) { refused += " " + std::string(g) + "/" + name; continue; }
-            auto path = (dir / (std::string(g) + "." + name)).string();
+            // PowerShell refuses -File without .ps1
+            std::string ext = (name == "pwsh" || name == "powershell") ? "ps1" : name;
+            auto path = (dir / (std::string(g) + "." + ext)).string();
             { std::ofstream(path, std::ios::binary) << code; }
             const char* rn = runner(exe);
+            std::string cmdline = rn ? std::string(rn) : "\"" + full + "\"";   // the resolved path: cmd.exe would pick System32\\bash.exe (WSL) first
+            if (exe == "busybox") cmdline = "\"" + full + "\" sh";        // ash via busybox: run the binary forge found
+            else if (exe == "ash") cmdline = "\"" + full + "\"";
 #if defined(_WIN32)
-            auto [got, rc] = sh_capture("cd /d \"" + dir.string() + "\" && " + (rn ? std::string(rn) : exe) + " \"" + path + "\" 2>&1");
+            auto [got, rc] = sh_capture("cd /d \"" + dir.string() + "\" && " + cmdline + " \"" + path + "\" 2>&1");
 #else
-            auto [got, rc] = sh_capture("cd '" + dir.string() + "' && " + (rn ? std::string(rn) : exe) + " '" + path + "' 2>&1");
+            auto [got, rc] = sh_capture("cd '" + dir.string() + "' && " + cmdline + " '" + path + "' 2>&1");
 #endif
             if (name == "cmd") std::erase(got, '\r');   // batch output is CRLF
             CHECK_MSG(got == want, "%s/%s output:\n%s\nwant:\n%s", g, name.c_str(), got.c_str(), want.c_str());

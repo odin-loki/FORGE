@@ -96,7 +96,7 @@ TEST(file_sink_rotation) {
     CHECK(std::filesystem::exists(p)); CHECK(std::filesystem::exists(p + ".1")); CHECK(std::filesystem::exists(p + ".2"));
     CHECK(!std::filesystem::exists(p + ".3"));
     for (auto s : {"", ".1", ".2"}) CHECK(std::filesystem::file_size(p + s) <= 200);
-    std::ifstream in(p); std::string last, s; while (std::getline(in, s)) last = s;
-    CHECK(last.find("line 29") != std::string::npos);
+    { std::ifstream in(p); std::string last, s; while (std::getline(in, s)) last = s;   // closed before remove (Windows)
+      CHECK(last.find("line 29") != std::string::npos); }
     for (auto s : {"", ".1", ".2"}) std::filesystem::remove(p + s);
 }

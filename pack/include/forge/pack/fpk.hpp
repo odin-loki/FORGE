@@ -26,10 +26,7 @@
 #include <cstring>
 #include <fstream>
 #include <optional>
-#include <fcntl.h>
 #include <map>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace forge::pack {
 

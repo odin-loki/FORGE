@@ -267,7 +267,7 @@ let procs = pwsh { Get-Process | ConvertTo-Json }.json   # parsed into lists/map
 
 `forge script --emit <shell> file.cpp [-o out]` translates a script into a standalone native script for that shell.
 The output runs without FORGE. `--emit auto` (or `forge::host_shell()` at runtime) picks the host's shell:
-`$FORGE_SHELL` if set, otherwise pwsh, then powershell, then cmd on Windows; mksh on Android; and sh everywhere else.
+`$FORGE_SHELL` if set, otherwise pwsh, then powershell, then cmd on Windows; on Android mksh if a binary of that name exists, otherwise sh (Android's /system/bin/sh is mksh); and sh everywhere else. On Windows the WSL `bash.exe` relays (System32, WindowsApps) and the Windows Kits `rc.exe` are not treated as bash or rc.
 `--emit android` (alias `toybox`) emits for Android's mksh with a `/system/bin/sh` shebang. `--emit ast` dumps the parse tree.
 `forge script --emit-targets` lists every backend that has an emitter.
 

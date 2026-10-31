@@ -29,7 +29,8 @@
 namespace forge::os {
 
 struct proc_limits {
-    std::uint64_t memory_bytes = 0;   // address-space cap (RLIMIT_AS / Job Object process memory); 0 = none
+    std::uint64_t memory_bytes = 0;   // address-space cap (RLIMIT_AS / Job Object process memory; macOS: resident-size
+                                      // watchdog that SIGKILLs the group, see detail_proc::memory_watchdog); 0 = none
     std::uint64_t cpu_seconds = 0;    // RLIMIT_CPU / Job Object user time; 0 = none
     std::uint64_t open_files = 0;     // RLIMIT_NOFILE; 0 = inherit
     std::uint64_t file_size_bytes = 0;// RLIMIT_FSIZE (largest file the process may write); 0 = none. POSIX only
@@ -52,7 +53,9 @@ inline bool apply_limits(const proc_limits& lim) noexcept {
         struct rlimit r{soft, hard};
         if (::setrlimit(which, &r) != 0) ok = false;
     };
+#if !defined(FORGE_OS_MACOS)   // macOS: RLIMIT_AS aliases RLIMIT_RSS, which the kernel ignores; see memory_watchdog
     if (lim.memory_bytes) set(RLIMIT_AS, rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes));
+#endif
     if (lim.cpu_seconds) set(RLIMIT_CPU, rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1));
     if (lim.open_files) set(RLIMIT_NOFILE, rlim_t(lim.open_files), rlim_t(lim.open_files));
     if (lim.file_size_bytes) set(RLIMIT_FSIZE, rlim_t(lim.file_size_bytes), rlim_t(lim.file_size_bytes));
@@ -146,6 +149,37 @@ inline std::vector<pid_t> session_pids(pid_t sid) {
     for (pid_t pid : list_pids(PROC_ALL_PIDS, 0)) if (::getsid(pid) == sid) v.push_back(pid);
     return v;
 }
+// macOS enforces no address-space or resident-size rlimit, so proc_limits::memory_bytes is kept by a watchdog:
+// a double-forked grandchild (reparented to launchd, nothing to reap) polls the resident size of process group
+// `pgid` every 2 ms and SIGKILLs the group once it passes `cap`; it exits as soon as the group is empty. It
+// closes every inherited descriptor first, so it never holds a child's stdin/stdout pipe open. Only
+// async-signal-safe calls after fork (the caller may be multithreaded).
+inline void memory_watchdog(pid_t pgid, std::uint64_t cap) {
+    pid_t m = ::fork();
+    if (m < 0) return;
+    if (m == 0) {
+        if (::fork() != 0) ::_exit(0);
+        const int top = ::getdtablesize();
+        for (int fd = 0; fd < top; ++fd) ::close(fd);
+        int nul = ::open("/dev/null", O_RDWR); if (nul >= 0) { ::dup2(nul, 1); ::dup2(nul, 2); }
+        pid_t pids[512];
+        for (;;) {
+            int n = ::proc_listpids(PROC_PGRP_ONLY, std::uint32_t(pgid), pids, int(sizeof pids));
+            if (n <= 0) ::_exit(0);
+            std::uint64_t total = 0; int live = 0;
+            for (int i = 0; i < n / int(sizeof(pid_t)); ++i) {
+                if (pids[i] <= 0) continue;
+                rusage_info_v2 ri{};
+                if (::proc_pid_rusage(pids[i], RUSAGE_INFO_V2, reinterpret_cast<rusage_info_t*>(&ri)) == 0) { total += ri.ri_resident_size; ++live; }
+            }
+            if (!live) ::_exit(0);
+            if (total > cap) { ::kill(-pgid, SIGKILL); ::_exit(0); }
+            struct timespec ts{0, 2000000}; ::nanosleep(&ts, nullptr);
+        }
+    }
+    int st; while (::waitpid(m, &st, 0) < 0 && errno == EINTR) {}
+}
+#define FORGE_PROC_MEMORY_WATCHDOG 1
 #define FORGE_PROC_GROUP_RSS 1
 #elif defined(FORGE_OS_FREEBSD)
 inline std::vector<kinfo_proc> procs(int op, int arg) {
@@ -409,6 +443,9 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127);
     }
     if (!new_session) ::setpgid(p, p);   // also in the parent, to close the race (setsid makes p the group id too)
+#if defined(FORGE_PROC_MEMORY_WATCHDOG)
+    if (lim.memory_bytes) detail_proc::memory_watchdog(p, lim.memory_bytes);
+#endif
     cl(pin[0]); cl(pout[1]); cl(perr[1]); cl(pexec[1]); cl(fin); cl(fout); cl(ferr); if (devnull >= 0) ::close(devnull);
     int child_errno = 0;
     { auto n = ::read(pexec[0], &child_errno, sizeof child_errno); if (n != sizeof child_errno) child_errno = 0; cl(pexec[0]); }
@@ -587,6 +624,9 @@ public:
             int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127);
         }
         if (!new_session) ::setpgid(p, p);
+#if defined(FORGE_PROC_MEMORY_WATCHDOG)
+        if (lim.memory_bytes) detail_proc::memory_watchdog(p, lim.memory_bytes);
+#endif
         ::close(po[1]); ::close(px[1]); if (devnull >= 0) ::close(devnull); if (ferr >= 0) ::close(ferr);
         int child_errno = 0;
         { auto n = ::read(px[0], &child_errno, sizeof child_errno); if (n != sizeof child_errno) child_errno = 0; ::close(px[0]); }

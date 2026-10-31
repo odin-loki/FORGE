@@ -545,7 +545,7 @@ def main():
     if a.embed_images: embed_images(a.images, a.embed_images); return
     os.makedirs(a.out, exist_ok=True)
     def put(path, text):
-        if not os.path.exists(path) or open(path).read() != text: open(path, "w").write(text)
+        if not os.path.exists(path) or open(path, encoding="utf-8").read() != text: open(path, "w", encoding="utf-8", newline="\n").write(text)
     for n in names: put(os.path.join(a.out, n + ".comp"), glsl(n))
     put(os.path.join(a.out, "kernels.cu"), cuda(names) + "\n" + CU_QUANT)   # CUDA/HIP only (not OpenCL/Metal)
     put(os.path.join(a.out, "kernels.cl"), opencl(names))
@@ -568,7 +568,7 @@ def embed(spv_dir, names, out):
     lines += ["struct blob { const char* name; const std::uint32_t* words; std::size_t count; };",
               f"inline constexpr blob table[] = {{{', '.join(table)}}};", "} // namespace forge::grid::spv", ""]
     text = "\n".join(lines)
-    if not os.path.exists(out) or open(out).read() != text: open(out, "w").write(text)
+    if not os.path.exists(out) or open(out, encoding="utf-8").read() != text: open(out, "w", encoding="utf-8", newline="\n").write(text)
 
 def embed_images(files, out):
     """Write a header with the CUDA PTX and HIP code objects (used by grid/cuda.hpp); missing ones are empty."""
@@ -598,7 +598,7 @@ def embed_images(files, out):
     lines += [f"inline constexpr code_object hsaco[] = {{{entries}}};", f"inline constexpr std::size_t hsaco_count = {len(hsaco)};",
               "} // namespace forge::grid::gpu::images", ""]
     text = "\n".join(lines)
-    if not os.path.exists(out) or open(out).read() != text: open(out, "w").write(text)
+    if not os.path.exists(out) or open(out, encoding="utf-8").read() != text: open(out, "w", encoding="utf-8", newline="\n").write(text)
 
 if __name__ == "__main__":
     main()

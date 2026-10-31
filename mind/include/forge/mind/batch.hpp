@@ -99,7 +99,7 @@ public:
             else ++it;
         }
         stats_.peak_kv_bytes = std::max(stats_.peak_kv_bytes, kv);
-        if (o_.budget) { o_.budget->set_usage("kv", live); if (ran) kv_per_req_ = std::max(kv_per_req_, kv / ran); }
+        if (o_.budget) { o_.budget->set_usage("kv", live); if (ran) kv_per_req_ = std::max<std::uint64_t>(kv_per_req_, kv / ran); }
         ++stats_.steps;
         return true;
     }

@@ -2,6 +2,7 @@
 // run under Intel SDE (`sde64 -spr -- test_tile`) or qemu-aarch64 -cpu max (SME) to exercise them without hardware.
 #include "check.hpp"
 #include <forge/lane/tile.hpp>
+#include <array>
 #include <cmath>
 #include <random>
 #include <vector>

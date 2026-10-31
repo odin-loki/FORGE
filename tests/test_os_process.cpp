@@ -34,12 +34,25 @@ TEST(spawn_missing_command) {
     auto r = os::spawn_wait(s); CHECK(!r);
 }
 TEST(spawn_memory_limit) {
+#if defined(__APPLE__)
+    // macOS has no enforced memory rlimit: the cap is a resident-size watchdog, so check that it kills a child
+    // that holds 256 MiB (dd keeps its 64 MiB buffer for every block; 8 blocks take far longer than 2 ms polls).
+    os::spawn_spec s; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=64 of=/dev/null 2>/dev/null"};
+    s.limits.memory_bytes = 32ull << 20;
+    auto r = os::spawn_wait(s); CHECK(r); CHECK(r->exit_code != 0);
+    s.limits.memory_bytes = 512ull << 20; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=2 of=/dev/null 2>/dev/null"};
+    auto ok = os::spawn_wait(s); CHECK(ok); CHECK(ok->exit_code == 0);
+#else
     os::spawn_spec s; s.argv = {"sh", "-c", "ulimit -v"}; s.limits.memory_bytes = 512ull << 20;
     auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out == "524288\n");
+    if (r && r->out != "524288\n") std::printf("  ulimit -v printed [%s]\n", r->out.c_str());
+#endif
 }
 TEST(spawn_fsize_core_limits) {
     os::spawn_spec s; s.argv = {"sh", "-c", "ulimit -f; ulimit -c"}; s.limits.file_size_bytes = 1ull << 20; s.limits.no_core = true;
-    auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out == "2048\n0\n");   // ulimit -f counts 512-byte blocks
+    // POSIX shells count -f in 512-byte blocks; bash before 5.1 (macOS /bin/sh is bash 3.2) uses 1024-byte blocks.
+    auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out == "2048\n0\n" || r->out == "1024\n0\n");
+    if (r && r->out != "2048\n0\n" && r->out != "1024\n0\n") std::printf("  ulimit -f/-c printed [%s]\n", r->out.c_str());
 }
 TEST(apply_limits_clamps_to_hard) {
     // a child whose hard NOFILE is 64 asks for 256: lowered to 64 instead of failing and leaving none
@@ -161,7 +174,9 @@ TEST(child_start_spec_env_cwd_and_exec_error) {
     CHECK(!os::child::start(bad));
 }
 TEST(child_start_memory_limit) {
-    os::spawn_spec s; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=1 of=/dev/null 2>/dev/null"};
+    // count=16: the 64 MiB buffer stays resident across blocks, long enough for the macOS watchdog (2 ms polls);
+    // elsewhere the allocation itself fails under RLIMIT_AS / the Job Object.
+    os::spawn_spec s; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=16 of=/dev/null 2>/dev/null"};
     s.limits.memory_bytes = 32ull << 20;
     auto c = os::child::start(s); CHECK(c); CHECK(c->wait() != 0);   // 64 MiB buffer cannot fit in 32 MiB
     s.limits.memory_bytes = 512ull << 20;

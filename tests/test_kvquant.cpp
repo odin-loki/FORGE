@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 using namespace forge;
 using namespace forge::mind;

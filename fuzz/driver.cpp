@@ -70,9 +70,9 @@ int main(int argc, char** argv) {
             case 0: if (!x.empty()) x[r() % x.size()] ^= std::uint8_t(1u << (r() % 8)); break;
             case 1: if (!x.empty()) x[r() % x.size()] = std::uint8_t(r()); break;
             case 2: x.insert(x.begin() + std::ptrdiff_t(x.empty() ? 0 : r() % x.size()), std::uint8_t(r())); break;
-            case 3: if (!x.empty()) { auto p = r() % x.size(); x.erase(x.begin() + std::ptrdiff_t(p), x.begin() + std::ptrdiff_t(std::min(x.size(), p + 1 + r() % 16))); } break;
+            case 3: if (!x.empty()) { auto p = r() % x.size(); x.erase(x.begin() + std::ptrdiff_t(p), x.begin() + std::ptrdiff_t(std::min<std::size_t>(x.size(), std::size_t(p + 1 + r() % 16)))); } break;
             case 4: if (x.size() >= 8) { auto v = interesting[r() % 13]; auto p = r() % (x.size() - 7); std::memcpy(x.data() + p, &v, 1 + r() % 8); } break;
-            case 5: { auto& o = corpus[r() % corpus.size()]; if (!o.empty() && !x.empty()) { auto p = r() % o.size(), n = std::min<std::size_t>(o.size() - p, 1 + r() % 64); auto q = r() % x.size(); x.insert(x.begin() + std::ptrdiff_t(q), o.begin() + std::ptrdiff_t(p), o.begin() + std::ptrdiff_t(p + n)); } } break;
+            case 5: { auto& o = corpus[r() % corpus.size()]; if (!o.empty() && !x.empty()) { std::size_t p = std::size_t(r() % o.size()), n = std::min<std::size_t>(o.size() - p, 1 + r() % 64); auto q = r() % x.size(); x.insert(x.begin() + std::ptrdiff_t(q), o.begin() + std::ptrdiff_t(p), o.begin() + std::ptrdiff_t(p + n)); } } break;
             case 6: if (!x.empty()) x.resize(r() % x.size()); break;
             }
         }

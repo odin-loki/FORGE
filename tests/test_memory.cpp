@@ -5,7 +5,9 @@
 #include <cstring>
 #include <filesystem>
 #include <thread>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 
 using namespace forge;
 static std::vector<int> greedy(mind::session& s, std::vector<int> p, int n) { mind::sampler g; s.reset(); return s.generate(p, n, g); }
