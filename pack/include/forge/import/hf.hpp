@@ -44,6 +44,16 @@ struct import_report { std::string arch, template_name; std::size_t tensors = 0,
 
 inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt = {}) {
     auto cfg = json::parse(read_file(dir / "config.json"));
+    std::string arch0 = cfg.find("architectures") ? cfg["architectures"][0].str() : "";
+    if (cfg.find("text_config") && cfg["text_config"].is_obj()) {   // multimodal wrapper (Qwen3.5): import the text model
+        json::object t = cfg["text_config"].obj();
+        bool has_arch = false; for (auto& [k, v] : t) has_arch |= k == "architectures";
+        if (!has_arch && !arch0.empty()) t.emplace_back("architectures", json::value(json::array{json::value(arch0)}));
+        for (auto& [k, v] : cfg.obj()) if (k == "tie_word_embeddings" || k == "bos_token_id" || k == "eos_token_id") {
+            bool dup = false; for (auto& [kk, vv] : t) dup |= kk == k; if (!dup) t.emplace_back(k, v);
+        }
+        cfg = json::value(t);
+    }
     std::string arch = cfg.find("architectures") ? cfg["architectures"][0].str() : cfg.str_or("model_type", "unknown");
     std::string tname = opt.template_name;
     if (tname.empty()) {
@@ -51,7 +61,8 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
             tname = "llama";
         else if (arch == "Qwen3ForCausalLM" || cfg.str_or("model_type", "") == "qwen3") tname = "qwen3";
         else if (arch == "Qwen3_5ForConditionalGeneration" || arch == "Qwen3_5ForCausalLM" || cfg.str_or("model_type", "") == "qwen3_5")
-            raise(errc::unsupported, "qwen3_5 (Gated DeltaNet hybrid attention) has no blueprint template yet");
+            tname = "qwen3_5";
+        else if (cfg.str_or("model_type", "") == "qwen3_5_text") tname = "qwen3_5";
         else if (arch == "MixtralForCausalLM" || cfg.str_or("model_type", "") == "mixtral") tname = "mixtral";
         else if (arch == "DeepseekV2ForCausalLM" || arch == "DeepseekV3ForCausalLM" || cfg.str_or("model_type", "") == "deepseek_v2") tname = "deepseek_v2";
         else raise(errc::unsupported, "no blueprint template for architecture {} (pass --template)", arch);
@@ -85,6 +96,27 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         set("routed_scaling_factor", num("routed_scaling_factor", 1.0));
         if (num("n_group", 1) > 1 && cfg.str_or("topk_method", "greedy") != "greedy") raise(errc::unsupported, "deepseek_v2: group-limited routing");
     }
+    if (tname == "qwen3_5") {
+        const json::value* rp = cfg.find("rope_parameters");
+        auto rnum = [&](const char* k, double d) { return rp && rp->is_obj() && rp->find(k) ? (*rp)[k].num() : cfg.num_or(k, d); };
+        set("rope_theta", rnum("rope_theta", 10000.0));
+        double hd = num("head_dim", hidden / heads);
+        set("rotary_dim", std::floor(hd * rnum("partial_rotary_factor", 1.0) + 1e-9));
+        if (rnum("partial_rotary_factor", 1.0) >= 1.0) raise(errc::unsupported, "qwen3_5: full-width RoPE is not supported by the template");
+        double iv = num("full_attention_interval", 4), L0 = num("num_hidden_layers", 0);
+        if (iv < 1 || std::fmod(L0, iv) != 0) raise(errc::unsupported, "qwen3_5: {} layers is not a multiple of full_attention_interval {}", L0, iv);
+        if (const auto* lt = cfg.find("layer_types"); lt && lt->is_arr()) {
+            const auto& a = lt->arr();
+            for (std::size_t i = 0; i < a.size(); ++i)
+                if (a[i].str() != ((i + 1) % std::size_t(iv) == 0 ? "full_attention" : "linear_attention"))
+                    raise(errc::unsupported, "qwen3_5: layer_types[{}] = {} breaks the every-{}th-layer-full pattern", i, a[i].str(), iv);
+        }
+        if (cfg.find("num_experts") && cfg.num_or("num_experts", 0) > 0) raise(errc::unsupported, "qwen3_5: MoE variants are not supported yet");
+        if (cfg.str_or("hidden_act", "silu") != "silu") raise(errc::unsupported, "qwen3_5: hidden_act must be silu");
+        set("full_attention_interval", iv);
+        set("n_blocks", L0 / iv);
+        set("linear_conv_kernel_dim", num("linear_conv_kernel_dim", 4));
+    }
     json::value cv(c);
     auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), cv);
     auto bp = pack::parse_blueprint(bp_text);  // validate before writing anything
@@ -99,6 +131,8 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         raise(errc::not_found, "missing tensor {}", n);
     };
     auto has = [&](const std::string& n) { for (auto& s : shards) if (s->has(n)) return true; return false; };
+    // Qwen3.5 multimodal checkpoints keep the text model under model.language_model.
+    std::string mp = has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
 
     pack::writer w;
     {   // estimate the encoded size (2-D weights in the target codec, the rest f32) plus slack, and reserve it once
@@ -107,7 +141,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         auto enc = [&](std::size_t k) { return qc && qc->block > 0 && k % std::size_t(qc->block) == 0 ? qc->bytes(k) : 4 * k; };
         for (auto& s : shards) for (auto& [n, e] : s->entries()) {
             std::size_t k = 1; for (auto d : e.shape) k *= std::size_t(d);
-            bool emb = n == "model.embed_tokens.weight";
+            bool emb = n == mp + "embed_tokens.weight";
             est += (e.shape.size() == 2 && !emb ? enc(k) : 4 * k) + pack::alignment;
             if (emb && !has("lm_head.weight")) est += enc(k);  // tied lm_head is re-encoded from the embedding
         }
@@ -118,16 +152,35 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         w.add_tensor(n, t.shape, t.data, quantisable ? opt.codec : std::string("f32")); ++rep.tensors;
     };
     i64 L = i64(bp.param("n_layers"));
-    put("tok_emb", find("model.embed_tokens.weight"), false);  // not kept alive: 2.5 GB f32 for 150k-vocab 4k-wide models
+    put("tok_emb", find(mp + "embed_tokens.weight"), false);  // not kept alive: 2.5 GB f32 for 150k-vocab 4k-wide models
     auto mlp = [&](const std::string& P, const std::string& Q, const char* g, const char* u, const char* d) {
         put(Q + "w_gate", find(P + g + ".weight"), true);
         put(Q + "w_up", find(P + u + ".weight"), true);
         put(Q + "w_down", find(P + d + ".weight"), true);
     };
+    bool q35 = tname == "qwen3_5";
+    auto plus1 = [&](tensor t) { if (q35) for (auto& x : t.data) x += 1.f; return t; };   // Qwen3.5 RMSNorm: x * (1 + w)
     for (i64 l = 0; l < L; ++l) {
-        auto P = std::format("model.layers.{}.", l); auto Q = std::format("layer.{}.", l);
-        put(Q + "attn_norm", find(P + "input_layernorm.weight"), false);
-        put(Q + "ffn_norm", find(P + "post_attention_layernorm.weight"), false);
+        auto P = std::format("{}layers.{}.", mp, l); auto Q = std::format("layer.{}.", l);
+        put(Q + "attn_norm", plus1(find(P + "input_layernorm.weight")), false);
+        put(Q + "ffn_norm", plus1(find(P + "post_attention_layernorm.weight")), false);
+        if (q35 && has(P + "linear_attn.in_proj_qkv.weight")) {
+            auto A = P + "linear_attn.";
+            put(Q + "w_qkv", find(A + "in_proj_qkv.weight"), true);
+            put(Q + "w_z", find(A + "in_proj_z.weight"), true);
+            put(Q + "w_a", find(A + "in_proj_a.weight"), false);
+            put(Q + "w_b", find(A + "in_proj_b.weight"), false);
+            auto cw = find(A + "conv1d.weight");          // [C, 1, K] -> [C, K]
+            if (cw.shape.size() == 3) cw.shape = {cw.shape[0], cw.shape[2]};
+            put(Q + "conv_w", cw, false);
+            put(Q + "dt_bias", find(A + "dt_bias"), false);
+            auto an = find(A + "A_log"); for (auto& x : an.data) x = -std::exp(x);   // g = -exp(A_log) * softplus(..)
+            put(Q + "a_neg", an, false);
+            put(Q + "ssm_norm", find(A + "norm.weight"), false);   // gated norm: plain weight
+            put(Q + "wo", find(A + "out_proj.weight"), true);
+            mlp(P + "mlp.", Q, "gate_proj", "up_proj", "down_proj");
+            continue;
+        }
         put(Q + "wo", find(P + "self_attn.o_proj.weight"), true);
         if (tname == "deepseek_v2") {
             if (has(P + "self_attn.q_a_proj.weight")) {
@@ -161,9 +214,9 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         put(Q + "wq", find(P + "self_attn.q_proj.weight"), true);
         put(Q + "wk", find(P + "self_attn.k_proj.weight"), true);
         put(Q + "wv", find(P + "self_attn.v_proj.weight"), true);
-        if (tname == "qwen3") {
-            put(Q + "q_norm", find(P + "self_attn.q_norm.weight"), false);
-            put(Q + "k_norm", find(P + "self_attn.k_norm.weight"), false);
+        if (tname == "qwen3" || q35) {
+            put(Q + "q_norm", plus1(find(P + "self_attn.q_norm.weight")), false);
+            put(Q + "k_norm", plus1(find(P + "self_attn.k_norm.weight")), false);
         }
         if (tname == "mixtral") {
             put(Q + "router", find(P + "block_sparse_moe.gate.weight"), false);
@@ -171,8 +224,8 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
                 mlp(std::format("{}block_sparse_moe.experts.{}.", P, e), std::format("{}expert.{}.", Q, e), "w1", "w3", "w2");
         } else mlp(P + "mlp.", Q, "gate_proj", "up_proj", "down_proj");
     }
-    put("out_norm", find("model.norm.weight"), false);
-    put("lm_head", has("lm_head.weight") ? find("lm_head.weight") : find("model.embed_tokens.weight"), true);
+    put("out_norm", plus1(find(mp + "norm.weight")), false);
+    put("lm_head", has("lm_head.weight") ? find("lm_head.weight") : find(mp + "embed_tokens.weight"), true);
 
     json::object man{{"format", "fpk"}, {"forge_format_version", double(pack::format_version)}, {"architecture", arch},
                      {"template", tname}, {"codec", opt.codec}, {"session", bp.session},
