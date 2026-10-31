@@ -16,7 +16,34 @@ struct proc_limits {
     std::uint64_t memory_bytes = 0;   // address-space cap (RLIMIT_AS / Job Object process memory); 0 = none
     std::uint64_t cpu_seconds = 0;    // RLIMIT_CPU / Job Object user time; 0 = none
     std::uint64_t open_files = 0;     // RLIMIT_NOFILE; 0 = inherit
+    std::uint64_t file_size_bytes = 0;// RLIMIT_FSIZE (largest file the process may write); 0 = none. POSIX only
+    bool no_core = false;             // RLIMIT_CORE = 0: no core dumps. POSIX only (Windows has no per-process core rlimit)
 };
+
+#if defined(FORGE_OS_POSIX)
+// Apply `lim` to the calling process (POSIX; async-signal-safe, so it may run in a forked child before exec).
+// A request above an existing hard limit is lowered to it (an unprivileged process cannot raise its hard limit,
+// and setrlimit would otherwise fail and leave no limit at all); soft never exceeds hard. CPU: soft = cpu_seconds,
+// hard = cpu_seconds + 1 (SIGXCPU first, then SIGKILL). Returns false if any setrlimit failed.
+inline bool apply_limits(const proc_limits& lim) noexcept {
+    bool ok = true;
+    auto set = [&](int which, rlim_t soft, rlim_t hard) {
+        struct rlimit cur{};
+        if (::getrlimit(which, &cur) == 0 && cur.rlim_max != RLIM_INFINITY) {
+            if (hard == RLIM_INFINITY || hard > cur.rlim_max) hard = cur.rlim_max;
+        }
+        if (soft > hard) soft = hard;
+        struct rlimit r{soft, hard};
+        if (::setrlimit(which, &r) != 0) ok = false;
+    };
+    if (lim.memory_bytes) set(RLIMIT_AS, rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes));
+    if (lim.cpu_seconds) set(RLIMIT_CPU, rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1));
+    if (lim.open_files) set(RLIMIT_NOFILE, rlim_t(lim.open_files), rlim_t(lim.open_files));
+    if (lim.file_size_bytes) set(RLIMIT_FSIZE, rlim_t(lim.file_size_bytes), rlim_t(lim.file_size_bytes));
+    if (lim.no_core) set(RLIMIT_CORE, 0, 0);
+    return ok;
+}
+#endif
 
 struct spawn_spec {
     std::vector<std::string> argv;
@@ -199,9 +226,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         if (sp.stdin_data) ::dup2(pin[0], 0); else if (devnull >= 0) ::dup2(devnull, 0);
         if (pout[1] >= 0) ::dup2(pout[1], 1);
         if (sp.merge_stderr && pout[1] >= 0) ::dup2(pout[1], 2); else if (perr[1] >= 0) ::dup2(perr[1], 2);
-        if (lim.memory_bytes) { struct rlimit r{rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes)}; ::setrlimit(RLIMIT_AS, &r); }
-        if (lim.cpu_seconds) { struct rlimit r{rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1)}; ::setrlimit(RLIMIT_CPU, &r); }
-        if (lim.open_files) { struct rlimit r{rlim_t(lim.open_files), rlim_t(lim.open_files)}; ::setrlimit(RLIMIT_NOFILE, &r); }
+        (void)apply_limits(lim);
         if (cwd && ::chdir(cwd) != 0) { int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127); }
         ::execve(exe.c_str(), av.data(), ev.data());
         int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127);
@@ -328,9 +353,7 @@ public:
             ::setpgid(0, 0); ::signal(SIGPIPE, SIG_DFL);
             if (devnull >= 0) ::dup2(devnull, 0);
             ::dup2(po[1], 1); if (merge) ::dup2(po[1], 2); ::close(po[1]);
-            if (lim.memory_bytes) { struct rlimit r{rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes)}; ::setrlimit(RLIMIT_AS, &r); }
-            if (lim.cpu_seconds) { struct rlimit r{rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1)}; ::setrlimit(RLIMIT_CPU, &r); }
-            if (lim.open_files) { struct rlimit r{rlim_t(lim.open_files), rlim_t(lim.open_files)}; ::setrlimit(RLIMIT_NOFILE, &r); }
+            (void)apply_limits(lim);
             if (wd && ::chdir(wd) != 0) { int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127); }
             ::execve(exe.c_str(), av.data(), ev.data());
             int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127);

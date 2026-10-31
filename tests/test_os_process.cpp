@@ -34,6 +34,21 @@ TEST(spawn_memory_limit) {
     os::spawn_spec s; s.argv = {"sh", "-c", "ulimit -v"}; s.limits.memory_bytes = 512ull << 20;
     auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out == "524288\n");
 }
+TEST(spawn_fsize_core_limits) {
+    os::spawn_spec s; s.argv = {"sh", "-c", "ulimit -f; ulimit -c"}; s.limits.file_size_bytes = 1ull << 20; s.limits.no_core = true;
+    auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out == "2048\n0\n");   // ulimit -f counts 512-byte blocks
+}
+TEST(apply_limits_clamps_to_hard) {
+    // a child whose hard NOFILE is 64 asks for 256: lowered to 64 instead of failing and leaving none
+    pid_t p = ::fork();
+    if (p == 0) {
+        struct rlimit h{64, 64}; ::setrlimit(RLIMIT_NOFILE, &h);
+        os::proc_limits l; l.open_files = 256; l.cpu_seconds = 100;
+        bool ok = os::apply_limits(l); struct rlimit got{}; ::getrlimit(RLIMIT_NOFILE, &got);
+        ::_exit(ok && got.rlim_cur == 64 && got.rlim_max == 64 ? 0 : 1);
+    }
+    int st = 0; ::waitpid(p, &st, 0); CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
 TEST(spawn_output_cap) {
     os::spawn_spec s; s.argv = {"sh", "-c", "head -c 100000 /dev/zero"}; s.max_output = 1000;
     auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out.size() <= 1000); CHECK(r->truncated);
