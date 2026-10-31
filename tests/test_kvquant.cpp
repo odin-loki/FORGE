@@ -6,9 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
-#if !defined(_WIN32)
 #include <unistd.h>
-#endif
 
 using namespace forge;
 using namespace forge::mind;
@@ -158,6 +156,38 @@ TEST(tbq_roundtrip_mse) {
     CHECK_THROWS(flow::kv_codec_pair_from_name("tbq9"));
 }
 
+// TurboQuant_prod: (b-1)-bit MSE codes + 1-bit QJL residual sketch. Inner products should be unbiased.
+TEST(tbq_qjl_inner_product) {
+    std::mt19937 g(5); std::normal_distribution<float> nd(0, 1);
+    for (i64 d : {64, 128}) {
+        std::vector<float> q(static_cast<std::size_t>(d)); for (auto& v : q) v = nd(g);
+        for (auto c : {kv_codec::tbq4, kv_codec::tbq4p, kv_codec::tbq3, kv_codec::tbq3p}) {
+            std::vector<float> k(static_cast<std::size_t>(d)), y(static_cast<std::size_t>(d)), buf(static_cast<std::size_t>(flow::kv_head_words(d, c)));
+            double bias = 0, se = 0, ref2 = 0, rel = 0, xx = 0; const int n = 4000;
+            for (int r = 0; r < n; ++r) {
+                for (auto& v : k) v = nd(g);
+                // keys aligned with q: shrinkage bias of a pure MSE quantizer shows up here
+                for (i64 e = 0; e < d; ++e) k[e] += 0.5f * q[e];
+                flow::kv_encode_head(k.data(), d, c, buf.data());
+                flow::kv_decode_head(buf.data(), d, c, y.data());
+                double a = 0, b = 0;
+                for (i64 e = 0; e < d; ++e) { a += double(q[e]) * k[e]; b += double(q[e]) * y[e]; rel += double(k[e] - y[e]) * (k[e] - y[e]); xx += double(k[e]) * k[e]; }
+                bias += b - a; se += (b - a) * (b - a); ref2 += a * a;
+            }
+            bias /= n; double rmse = std::sqrt(se / n), rms = std::sqrt(ref2 / n);
+            std::printf("  %s d %lld: <q,k> bias %+.4f (%.2e of rms), rmse %.4f, vector rel MSE %.4f, words %lld\n", std::string(flow::kv_codec_name(c)).c_str(), (long long)d,
+                        bias, bias / rms, rmse / rms, rel / xx, (long long)flow::kv_head_words(d, c));
+            if (flow::kv_is_qjl(c)) {
+                CHECK_MSG(std::fabs(bias / rms) < 3e-3, "bias %g", bias / rms);
+                CHECK_MSG(rel / xx < (c == kv_codec::tbq4p ? 0.06 : 0.2), "rel %g", rel / xx);
+                CHECK(flow::kv_head_words(d, c) <= flow::kv_head_words(d, c == kv_codec::tbq4p ? kv_codec::tbq4 : kv_codec::tbq3) + 2);
+            }
+        }
+    }
+    CHECK(flow::kv_codec_pair_from_name("tbq4p").k == kv_codec::tbq4p);
+    CHECK(flow::kv_codec_pair_from_name("tbq3_qjl").v == kv_codec::tbq3p);
+}
+
 static double kld(const std::vector<float>& p, const std::vector<float>& q) {
     auto sm = [](const std::vector<float>& l) { float m = *std::max_element(l.begin(), l.end()); std::vector<double> o(l.size()); double s = 0;
         for (std::size_t i = 0; i < l.size(); ++i) s += o[i] = std::exp(double(l[i] - m)); for (auto& v : o) v /= s; return o; };
@@ -168,7 +198,8 @@ static double kld(const std::vector<float>& p, const std::vector<float>& q) {
 static std::size_t argmax(const std::vector<float>& v) { return std::size_t(std::max_element(v.begin(), v.end()) - v.begin()); }
 
 static void tbq_vs_f32(const std::string& dev) {
-    for (const char* name : {"tbq4", "tbq3", "k8v4"}) {
+    for (const char* name : {"tbq4", "tbq3", "k8v4", "tbq4p", "tbq3p"}) {
+        if (!dev.empty() && name[4] == 'p') continue;   // QJL types are CPU only
         auto mf = model::open(model_a()), mq = model::open(model_a());
         if (!dev.empty()) { mf->set_device(dev); mq->set_device(dev); }
         mind::session sf(mf), sq(mq, {.kv_codec = name});
@@ -180,8 +211,9 @@ static void tbq_vs_f32(const std::string& dev) {
                     rf.size(), w, std::size_t(sq.state().bytes()), std::size_t(sf.state().bytes()));
         CHECK(w > 0);
         // (random tiny model: near-tied logits make KLD large in absolute terms; tbq4 ~1.5e-2, tbq3 ~4e-2 here)
-        CHECK_MSG(kl < (std::string(name) == "tbq3" ? 8e-2 : 3e-2), "kld %g", kl);
-        CHECK(agree * 10 >= rf.size() * (std::string(name) == "tbq3" ? 7 : 8));
+        const bool loose = std::string(name) == "tbq3" || std::string(name) == "tbq3p";
+        CHECK_MSG(kl < (loose ? 1.2e-1 : std::string(name) == "tbq4p" ? 6e-2 : 3e-2), "kld %g", kl);
+        CHECK(agree * 10 >= rf.size() * (loose ? 6 : std::string(name) == "tbq4p" ? 7 : 8));
         CHECK(sq.state().bytes() < sf.state().bytes());
         bool any_v = false, any_k = false;
         for (auto& [k, sl] : sq.state().slots) {

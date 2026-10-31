@@ -230,7 +230,7 @@ public:
 
     // generative_sequence: prefill + decode loop with a sampler chain. `on_token` returning false stops.
     std::vector<int> generate(std::span<const int> prompt, int max_new, sampler& s,
-                              const std::function<bool(int)>& on_token = {}, generate_stats* stats = nullptr) {
+                              const std::function<bool(int)>& on_token = {}, generate_stats* stats = nullptr, bool stop_at_eos = true) {
         check_generative();
         std::vector<int> hist(prompt.begin(), prompt.end()), out;
         using clk = std::chrono::steady_clock;
@@ -242,7 +242,7 @@ public:
             int t = s.sample(logits, hist);
             out.push_back(t); hist.push_back(t);
             if (on_token && !on_token(t)) break;
-            if (t == eos) break;
+            if (stop_at_eos && t == eos) break;
             if (i + 1 == max_new || pos_ >= st_.capacity) break;
             logits = forward(std::span<const int>(&t, 1));
         }
