@@ -20,6 +20,7 @@ struct diagnostic {
 struct check_options {
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;   // the run's declared capabilities
     bool warnings = true;  // false: return errors only
+    std::vector<std::string> module_dirs;   // extra import search dirs, searched after the script dir (the engine passes its base_dir)
 };
 
 // Parse, resolve and check. A syntax error is returned as a single "syntax" error diagnostic.

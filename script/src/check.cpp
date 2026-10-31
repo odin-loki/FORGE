@@ -70,7 +70,7 @@ State merge(const State& a, const State& b) {
     return r;
 }
 
-struct Binding { bool param = false; bool container_cap = false; std::string alias; const char* cap = nullptr; bool chan = false; char lit = 0; std::string name; int line = 0; bool used = false; bool report = false; bool unique = false; bool list = false; bool cnst = false; };
+struct Binding { const FnDecl* lam = nullptr; bool param = false; bool container_cap = false; std::string alias; const char* cap = nullptr; bool chan = false; char lit = 0; std::string name; int line = 0; bool used = false; bool report = false; bool unique = false; bool list = false; bool cnst = false; };
 
 struct Fn {
     const FnDecl* decl = nullptr;
@@ -220,7 +220,7 @@ struct Checker {
             if (auto* cp = cap_of(lib, c->s); cp && !caps.get(cp))
                 D(L::error, "capability", n, lib + "." + c->s + " needs the '" + cp + "' capability, which this run denies (raises PermissionError)", c->s);
         }
-        if (c && (c->k == NK::Index || c->k == NK::Call)) if (auto t = taint(*c); t.first && !t.second && !caps.get(t.first))
+        if (c && (c->k == NK::Index || c->k == NK::Call || (c->k == NK::Field && !(c->kids.size() && c->kids[0]->k == NK::Var && c->kids[0]->var.global() && !gbind.count(c->kids[0]->s))))) if (auto t = taint(*c); t.first && !t.second && !caps.get(t.first))
             D(L::warning, "capability", n, std::string("this call may invoke a builtin that needs the '") + t.first + "' capability, which this run denies");
         // push_back & co. of a builtin taints the container
         if (c && c->k == NK::Field && !c->kids.empty() && c->kids[0]->k == NK::Var && (c->s == "push_back" || c->s == "emplace_back" || c->s == "push_front" || c->s == "insert" || c->s == "append" || c->s == "emplace"))
@@ -229,6 +229,9 @@ struct Checker {
             D(b->cnst && !b->param ? L::error : L::warning, "capability", n, "'" + c->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies", c->s);
         if (c && (is_builtin_var(*c, "eval") || is_builtin_var(*c, "forge::eval")) && argc == 1 && n.kids[1]->k == NK::Str) sub_check(n, n.kids[1]->s, "eval");
         if (c) deprecated(n, *c);
+        if (c && (is_builtin_var(*c, "forge::plugin") || is_builtin_var(*c, "forge::import")) && argc == 1 && n.kids[1]->k == NK::Str) {
+            Node fake; fake.k = NK::Import; fake.s = n.kids[1]->s; fake.line = n.line; fake.col = start_col(*c, n.line); import_check(fake);
+        }
         if (c && is_builtin_var(*c, "run") && !caps.proc) D(L::error, "capability", n, "run() needs the 'proc' capability, which this run denies (raises PermissionError)", "run");
         // ---- format strings
         if (c && c->k == NK::Var && c->var.global() && (c->s == "std::format" || c->s == "std::println" || c->s == "std::print") && argc >= 1 && n.kids[1]->k == NK::Str)
@@ -284,6 +287,9 @@ struct Checker {
         if (at_top() && !(c && c->k == NK::Field && c->kids.size() && c->kids[0]->k == NK::Var && c->kids[0]->var.global() && !gbind.count(c->kids[0]->s))) after_call(st);
     }
     std::map<std::string, const char*> ret_caps;   // script fn -> builtin capability its return value may carry
+    std::map<const FnDecl*, const char*> lambda_ret; // any function body (lambdas included) -> returned capability
+    std::map<std::string, const char*> field_caps; // object field name -> builtin stored there (any object; coarse)
+    std::map<const FnDecl*, int> dummy_;   // script fn -> builtin capability its return value may carry
     static bool ctor_name(const std::string& n) {
         static const std::set<std::string> c = {"std::vector", "std::deque", "std::list", "std::forward_list", "std::map", "std::unordered_map", "std::multimap",
             "std::set", "std::unordered_set", "std::multiset", "std::array", "std::pair", "std::tuple", "std::make_pair", "std::make_tuple", "std::optional"};
@@ -294,13 +300,21 @@ struct Checker {
         if (d > 8) return {nullptr, false};
         switch (e.k) {
         case NK::Copy: case NK::Move: return e.kids.empty() ? std::pair<const char*, bool>{nullptr, false} : taint(*e.kids[0], d + 1);
-        case NK::Field: if (!e.kids.empty() && e.kids[0]->k == NK::Var && e.kids[0]->var.global() && !gbind.count(e.kids[0]->s)) return {cap_of(e.kids[0]->s, e.s), false}; return {nullptr, false};
+        case NK::Field: {
+            if (!e.kids.empty() && e.kids[0]->k == NK::Var && e.kids[0]->var.global() && !gbind.count(e.kids[0]->s)) { if (auto* c = cap_of(e.kids[0]->s, e.s)) return {c, false}; }
+            if (auto it = field_caps.find(e.s); it != field_caps.end() && !(e.kids.size() && e.kids[0]->k == NK::Var && e.kids[0]->var.global() && !gbind.count(e.kids[0]->s))) return {it->second, false};
+            return {nullptr, false};
+        }
         case NK::Var: if (auto* b = bind_of(e.var); b && b->cap) return {b->cap, b->container_cap}; return {nullptr, false};
         case NK::Index: if (!e.kids.empty()) { auto t = taint(*e.kids[0], d + 1); if (t.first && t.second) return {t.first, false}; } return {nullptr, false};
         case NK::Ternary: for (std::size_t i = 1; i < e.kids.size(); ++i) { auto t = taint(*e.kids[i], d + 1); if (t.first) return t; } return {nullptr, false};
         case NK::List: case NK::Map: for (auto& k : e.kids) if (k) { auto t = taint(*k, d + 1); if (t.first) return {t.first, true}; } return {nullptr, false};
         case NK::Call: {
-            auto* c = callee(e); if (!c || c->k != NK::Var || !c->var.global()) return {nullptr, false};
+            auto* c = callee(e); if (!c) return {nullptr, false};
+            if (c->k == NK::Lambda && c->fn) { if (auto it = lambda_ret.find(c->fn.get()); it != lambda_ret.end()) return {it->second, false}; return {nullptr, false}; }
+            if (c->k == NK::Field) { if (auto it = ret_caps.find("." + c->s); it != ret_caps.end()) return {it->second, false}; return {nullptr, false}; }
+            if (c->k == NK::Var && !c->var.global()) { if (auto* b = bind_of(c->var); b && b->lam) if (auto it = lambda_ret.find(b->lam); it != lambda_ret.end()) return {it->second, false}; return {nullptr, false}; }
+            if (c->k != NK::Var) return {nullptr, false};
             if (auto it = ret_caps.find(c->s); it != ret_caps.end()) return {it->second, false};
             if (ctor_name(c->s)) for (std::size_t i = 1; i < e.kids.size(); ++i) { auto t = taint(*e.kids[i], d + 1); if (t.first) return {t.first, true}; }
             return {nullptr, false};
@@ -319,6 +333,7 @@ struct Checker {
         // module_search_path (runtime.cpp): script dir, FORGE_SCRIPT_PATH, ~/.forge/modules, cwd
         std::vector<std::string> dirs;
         { auto sl = file.find_last_of('/'); dirs.push_back(sl == std::string::npos ? std::string(".") : file.substr(0, sl)); }
+        for (auto& d : opt.module_dirs) dirs.push_back(d);
         if (const char* mp = std::getenv("FORGE_SCRIPT_PATH")) { std::string m = mp; std::size_t i = 0;
             while (i <= m.size()) { auto j = m.find_first_of(":;", i); if (j == std::string::npos) j = m.size(); if (j > i) dirs.push_back(m.substr(i, j - i)); i = j + 1; } }
         if (const char* h = std::getenv("HOME")) dirs.push_back(std::string(h) + "/.forge/modules");
@@ -501,7 +516,7 @@ struct Checker {
             std::string alias = n.ref && !n.kids.empty() && n.kids[0] && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field) ? lkey(*n.kids[0]) : std::string();
             if (n.var.global() && !at_top()) return true;
             declare(n.var, n.s, n.line, report, n.flag);
-            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; b->alias = alias; b->container_cap = ctr; if (!direct_ok) b->param = true; }
+            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; b->alias = alias; b->container_cap = ctr; if (!n.kids.empty() && n.kids[0] && n.kids[0]->k == NK::Lambda) b->lam = n.kids[0]->fn.get(); if (!direct_ok) b->param = true; }
             { auto k = n.var.global() ? "g" + n.s : "l" + std::to_string(n.var.slot); kill(st, k); }
             return true;
         }
@@ -510,7 +525,7 @@ struct Checker {
                 expr(*n.kids[1], st);
                 auto& t = *n.kids[0];
                 if (t.k == NK::Var) { if (n.s != "=") read_var(t, st); auto k = lkey(t); if (!k.empty()) kill(st, k); if (auto* b = bind_of(t.var)) { b->cap = nullptr; b->chan = false; b->lit = 0; b->unique = false; } }
-                else if (t.k == NK::Field && !t.kids.empty()) { expr(*t.kids[0], st); auto k = lkey(t); if (!k.empty()) kill(st, k); }
+                else if (t.k == NK::Field && !t.kids.empty()) { expr(*t.kids[0], st); auto k = lkey(t); if (!k.empty()) kill(st, k); if (auto tt = taint(*n.kids[1]); tt.first && !tt.second) field_caps[t.s] = tt.first; }
                 else expr(t, st);
             }
             return true;
@@ -543,7 +558,9 @@ struct Checker {
         }
         case NK::FnStmt: if (n.fn) { fn(*n.fn); } return true;
         case NK::Return:
-            for (auto& k : n.kids) if (k) { expr(*k, st); if (auto t = taint(*k); t.first && !t.second && cur().decl && !cur().decl->is_top && !cur().decl->name.empty()) ret_caps[(cur().decl->is_method ? "." : "") + cur().decl->name] = t.first; }
+            for (auto& k : n.kids) if (k) { expr(*k, st); if (auto t = taint(*k); t.first && !t.second && cur().decl && !cur().decl->is_top) {
+                if (!cur().decl->name.empty() && cur().decl->name != "<lambda>") ret_caps[(cur().decl->is_method ? "." : "") + cur().decl->name] = t.first;
+                lambda_ret[cur().decl] = t.first; } }
             return false;
         case NK::ClassStmt:
             if (n.cls) for (auto& m : n.cls->methods) if (m) fn(*m);
@@ -698,8 +715,14 @@ std::string jesc(const std::string& s) {
 } // namespace
 
 std::vector<diagnostic> check_parsed(const FnDecl& top, std::string_view src, const std::string& file, const check_options& o) {
-    Checker c; c.src = src; c.file = file; c.opt = o; c.caps = {o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
+    // Pass 1 summarises functions (returned builtins, lambda returns, field stores) so call order does not matter;
+    // pass 2 reports with those summaries.
+    Checker s1; s1.src = src; s1.file = file; s1.opt = o; s1.caps = {o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
+    if (top.body) s1.collect(*top.body, false);
+    for (int round = 0; round < 2; ++round) s1.fn(top);   // twice: summaries that depend on other summaries
+    Checker c; c.src = src; c.file = file; c.opt = o; c.caps = s1.caps;
     if (top.body) c.collect(*top.body, false);
+    c.ret_caps = s1.ret_caps; c.lambda_ret = s1.lambda_ret; c.field_caps = s1.field_caps;
     c.fn(top);
     c.lock_cycles();
     c.suppress();

@@ -83,6 +83,7 @@ struct engine::impl {
         catch (const syntax_error& e) { r.ok = false; r.exit_code = 2; r.error_type = "SyntaxError"; r.line = e.line; r.error = std::string("SyntaxError: ") + e.what(); return r; }
         if (static_check && name != "<repl>") {
             chk.warnings = strict_check;
+            chk.module_dirs.clear(); if (!sh->base_dir.empty()) chk.module_dirs.push_back(sh->base_dir);
             auto ds = check_parsed(*top, src, name, chk);
             bool refuse = strict_check ? !ds.empty() : has_errors(ds);
             if (refuse) { r.ok = false; r.exit_code = 2; r.error_type = "StaticCheckError"; r.line = ds.front().line;

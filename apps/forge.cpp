@@ -392,7 +392,7 @@ int cmd_rpc_serve(const args& a) {
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
-    std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false;
+    std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
     std::string rpc_child;
     int i = 2;
     for (; i < argc; ++i) {
@@ -406,6 +406,7 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--emit-targets") { for (auto& t : forge::script::emit_targets()) std::printf("%s\n", t.c_str()); return 0; }
         else if (s == "--check") check_only = true;           // static checks only (docs/scripting.md "Static checks")
         else if (s == "--json") check_json = true;
+        else if (s == "--module-dir") module_dirs.push_back(val("--module-dir"));   // extra import dir for --check
         else if (s == "--no-check") o.static_check = false;
         else if (s == "--strict-check") o.strict_check = true;
         else if (s == "--tree") o.use_vm = false;
@@ -436,7 +437,7 @@ int cmd_script(int argc, char** argv) {
     if (!emit_target.empty()) for (std::size_t k = 0; k + 1 < o.argv.size(); ++k) if (o.argv[k] == "-o") { emit_out = o.argv[k + 1]; o.argv.erase(o.argv.begin() + k, o.argv.begin() + k + 2); break; }
     if (check_only) {
         if (!have_code) { if (file.empty()) throw std::runtime_error("--check needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
-        forge::script::check_options co{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env, true};
+        forge::script::check_options co{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env, true, module_dirs};
         auto ds = forge::script::check(code, have_code ? "<-e>" : file, co);
         auto txt = check_json ? forge::script::to_json(ds) + "\n" : forge::script::to_text(ds);
         std::fwrite(txt.data(), 1, txt.size(), check_json ? stdout : stderr);

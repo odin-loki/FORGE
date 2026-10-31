@@ -675,8 +675,15 @@ script dir, `FORGE_SCRIPT_PATH`, `~/.forge/modules`, cwd; `name.fs`, `name.cpp`,
 with `fs` denied an import is itself an error (the runtime refuses it). A native `.so/.dylib/.dll` import is an error
 unless every capability is granted, matching `load_plugin`. Statement nodes carry the column of their first token.
 
-Known gaps: the host's `base_dir` search entry is not known to the CLI checker; taint is tracked per variable, not
-per element or per key; taint through fields of objects, through `forge::plugin("...")`/`forge::import("...")` calls and
-through values returned from lambdas is not tracked; `ret_caps` is learnt in program order, so a call that appears
-before the function's definition is not tainted. Test scripts that deliberately trigger the runtime errors carry
+The checker runs in two passes: the first summarises every function and lambda (returned builtins, builtins
+stored into object fields) and the second reports with those summaries, so a call may come before the definition.
+Builtins assigned to an object field taint that field name on every object (coarse, warning only); calling such a
+field warns. Calling a lambda, a local holding a lambda, or a method whose body returns a builtin taints the result.
+`forge::import("lit")` and `forge::plugin("lit")` are checked like `import` statements. Extra import directories:
+`forge script --check --module-dir DIR` (repeatable) or `check_options::module_dirs`; the engine passes its
+`base_dir` automatically, so embedded runs resolve modules like the runtime.
+
+Known gaps: field taint is by field name, not per object or class (warnings only); summaries iterate twice, so
+taint passed through more than two levels of function-returns-function may be missed; non-literal paths to
+`forge::import`/`plugin` are not followed; taint is per variable, not per element or key. Test scripts that deliberately trigger the runtime errors carry
 `// forge-check: ignore-file`.
