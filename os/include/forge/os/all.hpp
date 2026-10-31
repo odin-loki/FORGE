@@ -23,6 +23,7 @@
 #include <forge/os/fs.hpp>
 #include <forge/os/users.hpp>
 #include <forge/os/time.hpp>
+#include <forge/os/settings.hpp>
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/console.hpp>
 #include <forge/os/file_watch_tree.hpp>

@@ -40,7 +40,7 @@ option(FORGE_LIBFUZZER   "Link fuzz targets with libFuzzer (clang -fsanitize=fuz
 set(FORGE_FUZZ_ITERS 4000 CACHE STRING "Mutated inputs per fuzz target in ctest")
 
 if(FORGE_REPRODUCIBLE)
-  add_compile_options(-ffile-prefix-map=${CMAKE_SOURCE_DIR}=. -ffile-prefix-map=${CMAKE_BINARY_DIR}=build)
+  add_compile_options(-ffile-prefix-map=${PROJECT_SOURCE_DIR}=. -ffile-prefix-map=${PROJECT_BINARY_DIR}=build)
   add_link_options(-Wl,--build-id=none)
 endif()
 if(FORGE_SANITIZE)
@@ -58,23 +58,23 @@ endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # ---- spec codegen: .fspec -> op table header + docs + oracle test list ----
-file(GLOB FORGE_FSPECS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/spec/ops/*.fspec)
-set(FORGE_GEN_DIR ${CMAKE_BINARY_DIR}/generated)
+file(GLOB FORGE_FSPECS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/spec/ops/*.fspec)
+set(FORGE_GEN_DIR ${PROJECT_BINARY_DIR}/generated)
 add_custom_command(
   OUTPUT ${FORGE_GEN_DIR}/forge/spec/ops.gen.hpp ${FORGE_GEN_DIR}/ops.md
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/fspec_gen.py
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/fspec_gen.py
           --out ${FORGE_GEN_DIR} ${FORGE_FSPECS}
-  DEPENDS ${FORGE_FSPECS} ${CMAKE_SOURCE_DIR}/spec/gen/fspec_gen.py
+  DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/spec/gen/fspec_gen.py
   COMMENT "Generating op registry from spec/ops/*.fspec")
 add_custom_target(forge_spec_gen DEPENDS ${FORGE_GEN_DIR}/forge/spec/ops.gen.hpp)
 
 # ---- Tier R: raw intrinsic wrappers generated from spec/intrinsics ----
 add_custom_command(
   OUTPUT ${FORGE_GEN_DIR}/forge/lane/raw/x86.gen.hpp
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/intrin_gen.py
-          --db ${CMAKE_SOURCE_DIR}/spec/intrinsics/x86.json
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/intrin_gen.py
+          --db ${PROJECT_SOURCE_DIR}/spec/intrinsics/x86.json
           --out ${FORGE_GEN_DIR}/forge/lane/raw/x86.gen.hpp
-  DEPENDS ${CMAKE_SOURCE_DIR}/spec/intrinsics/x86.json ${CMAKE_SOURCE_DIR}/spec/gen/intrin_gen.py
+  DEPENDS ${PROJECT_SOURCE_DIR}/spec/intrinsics/x86.json ${PROJECT_SOURCE_DIR}/spec/gen/intrin_gen.py
   COMMENT "Generating lane Tier R (x86)")
 add_custom_target(forge_raw_gen DEPENDS ${FORGE_GEN_DIR}/forge/lane/raw/x86.gen.hpp)
 
@@ -167,9 +167,9 @@ target_link_libraries(forge_verify INTERFACE forge_spec)
 
 # ---- GPU kernels generated from spec/ops (FORGE_PLAN B.4): GLSL -> SPIR-V (embedded), CUDA/HIP compile checks ----
 set(FORGE_GPU_DIR ${FORGE_GEN_DIR}/gpu)
-execute_process(COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR} --list
+execute_process(COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR} --list
                 OUTPUT_VARIABLE FORGE_GPU_KERNELS OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _gpu_rc)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py)
 find_program(FORGE_GLSLANG glslangValidator)
 find_program(FORGE_SPIRV_VAL spirv-val)
 find_path(FORGE_VULKAN_INCLUDE vulkan/vulkan.h)
@@ -178,8 +178,8 @@ foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
 add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels.metal
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
-  DEPENDS ${FORGE_FSPECS} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+  DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
   set(FORGE_SPV)
   foreach(k ${FORGE_GPU_KERNELS})
@@ -193,9 +193,9 @@ if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
     list(APPEND FORGE_SPV ${FORGE_GPU_DIR}/${k}.spv)
   endforeach()
   add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
             --embed ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp
-    DEPENDS ${FORGE_SPV} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding SPIR-V kernels")
+    DEPENDS ${FORGE_SPV} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding SPIR-V kernels")
   add_custom_target(forge_gpu_gen ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp)
   # Copy only the Vulkan headers so the system include dir is not put ahead of the C++ standard library.
   file(COPY ${FORGE_VULKAN_INCLUDE}/vulkan DESTINATION ${FORGE_GEN_DIR}/vkinc)
@@ -268,10 +268,10 @@ if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_AMDGPU)
     set(_ldpath ${_lldir})
   elseif(FORGE_ZIG)
     # clang only accepts an --ld-path for AMDGPU whose file is named like lld
-    file(COPY ${CMAKE_SOURCE_DIR}/cmake/tools/zig/lld DESTINATION ${CMAKE_BINARY_DIR}/tools
+    file(COPY ${PROJECT_SOURCE_DIR}/cmake/tools/zig/lld DESTINATION ${PROJECT_BINARY_DIR}/tools
          FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
-    set(_ld --ld-path=${CMAKE_BINARY_DIR}/tools/lld)
-    set(_ldpath ${CMAKE_BINARY_DIR}/tools)   # clang runs "lld" from PATH for the LTO link at -O3
+    set(_ld --ld-path=${PROJECT_BINARY_DIR}/tools/lld)
+    set(_ldpath ${PROJECT_BINARY_DIR}/tools)   # clang runs "lld" from PATH for the LTO link at -O3
   endif()
   if(_ld)
     foreach(arch ${FORGE_HIP_ARCHS})
@@ -284,9 +284,9 @@ if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_AMDGPU)
   endif()
 endif()
 add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp
-  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
           --embed-images ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp ${FORGE_GPU_IMAGES}
-  DEPENDS ${FORGE_GPU_IMAGES} ${CMAKE_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding CUDA/HIP kernel images")
+  DEPENDS ${FORGE_GPU_IMAGES} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding CUDA/HIP kernel images")
 add_custom_target(forge_gpu_images ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp)
 add_dependencies(forge_gpu_images forge_gpu_gen)
 message(STATUS "FORGE: CUDA/HIP images: ${FORGE_GPU_IMAGES}")
@@ -344,7 +344,7 @@ target_link_libraries(forge_mind INTERFACE forge_pack)
 target_include_directories(forge_mind INTERFACE mind/include)
 # forge::script managed scripting runtime (docs/scripting.md). Safe C++23; libc++ hardening when available.
 # Shell backends: one file each in script/src/shells/ defining forge_shell_register_<stem>(); the registry TU is generated.
-file(GLOB FORGE_SHELL_SRCS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/script/src/shells/*.cpp)
+file(GLOB FORGE_SHELL_SRCS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/script/src/shells/*.cpp)
 set(_shell_decl "") 
 set(_shell_call "")
 foreach(f ${FORGE_SHELL_SRCS})
@@ -352,9 +352,9 @@ foreach(f ${FORGE_SHELL_SRCS})
   string(APPEND _shell_decl "void forge_shell_register_${_stem}(forge::script::shell_registry&);\n")
   string(APPEND _shell_call "        forge_shell_register_${_stem}(r);\n")
 endforeach()
-file(CONFIGURE OUTPUT ${CMAKE_BINARY_DIR}/generated/shells_registry.cpp CONTENT
+file(CONFIGURE OUTPUT ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp CONTENT
 "// generated by CMake from script/src/shells/*.cpp\n#include \"shells/shell.hpp\"\n${_shell_decl}namespace forge::script {\nconst shell_registry& shells() {\n    static const shell_registry reg = [] {\n        shell_registry r;\n${_shell_call}        return r;\n    }();\n    return reg;\n}\n}\n")
-add_library(forge_script STATIC ${FORGE_SHELL_SRCS} ${CMAKE_BINARY_DIR}/generated/shells_registry.cpp script/src/heap.cpp script/src/parser.cpp script/src/runtime.cpp script/src/tree.cpp
+add_library(forge_script STATIC ${FORGE_SHELL_SRCS} ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp script/src/heap.cpp script/src/parser.cpp script/src/runtime.cpp script/src/tree.cpp
   script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/ai.cpp script/src/remote.cpp script/src/mobile.cpp script/src/text.cpp script/src/reflect.cpp script/src/emit.cpp script/src/debug.cpp script/src/engine.cpp)
 target_include_directories(forge_script PUBLIC script/include PRIVATE script/src)
 target_link_libraries(forge_script PUBLIC forge_pack forge_mobile forge_text PRIVATE forge_verify)
@@ -386,7 +386,7 @@ if(FORGE_JNI)
     target_link_libraries(forge_jni PRIVATE log)
   endif()
 endif()
-target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 # Multiversioned lane kernels: one TU per target, own flags, own namespace.
 include(CheckCXXSourceCompiles)
@@ -517,8 +517,8 @@ if(FORGE_BUILD_TESTS)
   file(GLOB FORGE_TESTS CONFIGURE_DEPENDS tests/test_*.cpp)
   # Extra directories searched for shells by the shell/emit golden tests (user-local installs, never apt).
   set(_shells_default "")
-  if(EXISTS "${CMAKE_SOURCE_DIR}/../opt/shells/bin")
-    get_filename_component(_shells_default "${CMAKE_SOURCE_DIR}/../opt/shells/bin" ABSOLUTE)
+  if(EXISTS "${PROJECT_SOURCE_DIR}/../opt/shells/bin")
+    get_filename_component(_shells_default "${PROJECT_SOURCE_DIR}/../opt/shells/bin" ABSOLUTE)
   endif()
   set(FORGE_TEST_SHELL_PATH "${_shells_default}" CACHE STRING "Extra PATH entries for shell backend tests")
   foreach(t ${FORGE_TESTS})
@@ -529,14 +529,14 @@ if(FORGE_BUILD_TESTS)
     if(n MATCHES "^test_(text|locale)")   # only needs forge_text
       add_executable(${n} ${t})
       target_link_libraries(${n} PRIVATE forge_text)
-      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(${n} PROPERTIES SKIP_RETURN_CODE 77)
       continue()
     endif()
     if(n STREQUAL "test_mobile")   # only needs the device layer
       add_executable(${n} ${t})
       target_link_libraries(${n} PRIVATE forge_mobile)
-      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       continue()
     endif()
     add_executable(${n} ${t})
@@ -558,7 +558,7 @@ if(FORGE_BUILD_TESTS)
     if(n STREQUAL "test_lane_raw")
       target_compile_options(${n} PRIVATE -mavx2 -mfma -mf16c)
     endif()
-    add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     if(n MATCHES "^test_script" AND FORGE_TEST_SHELL_PATH)
       set_tests_properties(${n} PROPERTIES ENVIRONMENT "FORGE_TEST_SHELL_PATH=${FORGE_TEST_SHELL_PATH}")
     endif()
@@ -584,12 +584,12 @@ if(FORGE_BUILD_TESTS)
       string(REPLACE "|" ";" v "${v}")
       list(GET v 0 b)
       list(GET v 1 cpu)
-      add_test(NAME lane_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_lane> WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+      add_test(NAME lane_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_lane> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(lane_${_lane}_vl${b} PROPERTIES PASS_REGULAR_EXPRESSION "active: ${_lane}" FAIL_REGULAR_EXPRESSION "FAIL")
     endforeach()
     if(_emu MATCHES "qemu-aarch64" AND FORGE_CAN_SME)   # SME outer-product tiles at several streaming VLs
       foreach(b 128 256 512 2048)
-        add_test(NAME tile_sme_svl${b} COMMAND ${_emu} -cpu max,sme=on,sme${b}=on $<TARGET_FILE:test_tile> WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        add_test(NAME tile_sme_svl${b} COMMAND ${_emu} -cpu max,sme=on,sme${b}=on $<TARGET_FILE:test_tile> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
         set_tests_properties(tile_sme_svl${b} PROPERTIES PASS_REGULAR_EXPRESSION "SME SVL" FAIL_REGULAR_EXPRESSION "FAIL|failed")
       endforeach()
     endif()
@@ -603,50 +603,50 @@ if(FORGE_BUILD_TESTS)
         if(tg MATCHES windows)
           set(_lib -lws2_32 -lbcrypt)
         endif()
-        add_test(NAME xos_${src}_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++20 -O1 -I${CMAKE_SOURCE_DIR}/os/include
-                 -I${CMAKE_SOURCE_DIR}/balance/include -I${CMAKE_SOURCE_DIR}/tests ${CMAKE_SOURCE_DIR}/tests/${src}.cpp ${_lib}
-                 -o ${CMAKE_BINARY_DIR}/xos/${src}.${tg})
+        add_test(NAME xos_${src}_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++20 -O1 -I${PROJECT_SOURCE_DIR}/os/include
+                 -I${PROJECT_SOURCE_DIR}/balance/include -I${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tests/${src}.cpp ${_lib}
+                 -o ${PROJECT_BINARY_DIR}/xos/${src}.${tg})
         set_tests_properties(xos_${src}_${tg} PROPERTIES LABELS "cross;slow")
       endforeach()
     endforeach()
     # The script emitter + shell backends (host_shell() has per-OS branches): syntax-checked for every target.
-    file(GLOB _emit_srcs ${CMAKE_SOURCE_DIR}/script/src/emit.cpp ${CMAKE_SOURCE_DIR}/script/src/shells/*.cpp)
+    file(GLOB _emit_srcs ${PROJECT_SOURCE_DIR}/script/src/emit.cpp ${PROJECT_SOURCE_DIR}/script/src/shells/*.cpp)
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
       string(REPLACE ";" "|" _emit_list "${_emit_srcs}")
-      add_test(NAME xos_emit_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${CMAKE_BINARY_DIR}/xos/emit_${tg}
-               "-DINCS=-I${CMAKE_SOURCE_DIR}/script/include|-I${CMAKE_SOURCE_DIR}/script/src|-I${CMAKE_SOURCE_DIR}/os/include|-I${CMAKE_BINARY_DIR}"
-               "-DSRCS=${_emit_list}" -P ${CMAKE_SOURCE_DIR}/cmake/xos_compile_each.cmake)
+      add_test(NAME xos_emit_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/emit_${tg}
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/script/include|-I${PROJECT_SOURCE_DIR}/script/src|-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_BINARY_DIR}"
+               "-DSRCS=${_emit_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_emit_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
     # forge::os::mobile backends (every non-Apple-ObjC source; apple.mm needs an Apple SDK -> CI on macOS).
-    set(_mob_list "${CMAKE_SOURCE_DIR}/os/src/mobile/mobile.cpp|${CMAKE_SOURCE_DIR}/os/src/mobile/services.cpp|${CMAKE_SOURCE_DIR}/os/src/mobile/linux.cpp|${CMAKE_SOURCE_DIR}/os/src/mobile/windows.cpp|${CMAKE_SOURCE_DIR}/os/src/mobile/freebsd.cpp|${CMAKE_SOURCE_DIR}/os/src/mobile/android.cpp")
+    set(_mob_list "${PROJECT_SOURCE_DIR}/os/src/mobile/mobile.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/services.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/linux.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/windows.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/freebsd.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/android.cpp")
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
-      add_test(NAME xos_mobile_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${CMAKE_BINARY_DIR}/xos/mobile_${tg}
-               "-DINCS=-I${CMAKE_SOURCE_DIR}/os/include|-I${CMAKE_SOURCE_DIR}/core/include|-I${CMAKE_SOURCE_DIR}/support/include"
-               "-DSRCS=${_mob_list}" -P ${CMAKE_SOURCE_DIR}/cmake/xos_compile_each.cmake)
+      add_test(NAME xos_mobile_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/mobile_${tg}
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include"
+               "-DSRCS=${_mob_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_mobile_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
     # forge::os::text / forge::os::locale (every C++ source; locale_apple.mm needs an Apple SDK -> CI on macOS).
-    file(GLOB _text_srcs ${CMAKE_SOURCE_DIR}/os/src/text/*.cpp)
+    file(GLOB _text_srcs ${PROJECT_SOURCE_DIR}/os/src/text/*.cpp)
     string(REPLACE ";" "|" _text_list "${_text_srcs}")
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
-      add_test(NAME xos_text_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${CMAKE_BINARY_DIR}/xos/text_${tg}
-               "-DINCS=-I${CMAKE_SOURCE_DIR}/os/include|-I${CMAKE_SOURCE_DIR}/core/include|-I${CMAKE_SOURCE_DIR}/support/include"
-               "-DSRCS=${_text_list}" -P ${CMAKE_SOURCE_DIR}/cmake/xos_compile_each.cmake)
+      add_test(NAME xos_text_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/text_${tg}
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include"
+               "-DSRCS=${_text_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_text_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
-    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/xos)
+    file(MAKE_DIRECTORY ${PROJECT_BINARY_DIR}/xos)
   endif()
   # Intel SDE: AMX tiles on an emulated Sapphire Rapids / Granite Rapids, and the skip path on Ice Lake.
   find_program(FORGE_SDE NAMES sde64 HINTS $ENV{SDE_PATH})
   if(FORGE_SDE AND FORGE_CAN_AMX)
     foreach(c spr gnr icl)
-      add_test(NAME tile_amx_sde_${c} COMMAND ${FORGE_SDE} -${c} -- $<TARGET_FILE:test_tile> WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+      add_test(NAME tile_amx_sde_${c} COMMAND ${FORGE_SDE} -${c} -- $<TARGET_FILE:test_tile> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(tile_amx_sde_${c} PROPERTIES LABELS emu FAIL_REGULAR_EXPRESSION "FAIL")
     endforeach()
   endif()
   set_tests_properties(test_vulkan PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
-  add_test(NAME test_vulkan_align256 COMMAND test_vulkan WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+  add_test(NAME test_vulkan_align256 COMMAND test_vulkan WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(test_vulkan_align256 PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu ENVIRONMENT FORGE_VK_SSBO_ALIGN=256)
   set_tests_properties(test_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   add_test(NAME test_gpu_cuda COMMAND test_gpu cuda)
@@ -665,14 +665,14 @@ if(FORGE_BUILD_TESTS)
   if(NOT CMAKE_CROSSCOMPILING)
     # The CUDA host runtime against a CPU mock of libcuda.so.1 (argument packing, memcpy, launch sizing).
     add_library(mock_cuda SHARED tests/mock_cuda.c)
-    set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/mockcuda)
+    set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockcuda)
     target_link_libraries(mock_cuda PRIVATE m)
     add_test(NAME test_gpu_cuda_mock COMMAND test_gpu cuda)
-    set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockcuda" LABELS gpu SKIP_RETURN_CODE 77)
+    set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda" LABELS gpu SKIP_RETURN_CODE 77)
     add_dependencies(test_gpu mock_cuda)
     add_library(mock_hip SHARED tests/mock_cuda.c)
     target_compile_definitions(mock_hip PRIVATE MOCK_HIP)
-    set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/mockhip)
+    set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockhip)
     target_link_libraries(mock_hip PRIVATE m)
     add_dependencies(test_gpu mock_hip)
     foreach(m opencl ze)
@@ -683,39 +683,39 @@ if(FORGE_BUILD_TESTS)
         add_library(mock_${m} SHARED tests/mock_ze.c)
         set_target_properties(mock_${m} PROPERTIES OUTPUT_NAME ze_loader SOVERSION 1)
       endif()
-      set_target_properties(mock_${m} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/mock${m})
-      target_include_directories(mock_${m} PRIVATE ${FORGE_GPU_DIR} ${CMAKE_SOURCE_DIR}/third_party)
+      set_target_properties(mock_${m} PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mock${m})
+      target_include_directories(mock_${m} PRIVATE ${FORGE_GPU_DIR} ${PROJECT_SOURCE_DIR}/third_party)
       target_link_libraries(mock_${m} PRIVATE m)
       add_dependencies(mock_${m} forge_gpu_gen)
       add_dependencies(test_gpu mock_${m})
       add_test(NAME test_gpu_${m}_mock COMMAND test_gpu ${m})
       add_test(NAME test_gpu_features_${m}_mock COMMAND test_gpu features ${m})
       set_tests_properties(test_gpu_${m}_mock test_gpu_features_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mock${m};MOCK_DEVICES=2;FORGE_ZE_TEST_IMAGE=opencl-c")
+        ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};MOCK_DEVICES=2;FORGE_ZE_TEST_IMAGE=opencl-c")
     endforeach()
     add_test(NAME test_gpu_hip_mock COMMAND test_gpu hip)
-    set_tests_properties(test_gpu_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockhip" LABELS gpu SKIP_RETURN_CODE 77)
+    set_tests_properties(test_gpu_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip" LABELS gpu SKIP_RETURN_CODE 77)
     add_test(NAME test_gpu_features_cuda_mock COMMAND test_gpu features cuda)
-    set_tests_properties(test_gpu_features_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockcuda;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
+    set_tests_properties(test_gpu_features_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
     add_test(NAME test_gpu_features_hip_mock COMMAND test_gpu features hip)
-    set_tests_properties(test_gpu_features_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockhip;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
+    set_tests_properties(test_gpu_features_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
     if(FORGE_BUILD_APPS)
-      add_test(NAME golden_tiny_llama_cuda_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
-               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_cumock)
+      add_test(NAME golden_tiny_llama_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_cumock)
       set_tests_properties(golden_tiny_llama_cuda_mock PROPERTIES LABELS gpu
-        ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockcuda")
-      add_test(NAME golden_tiny_llama_opencl_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
-               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_clmock)
+        ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
+      add_test(NAME golden_tiny_llama_opencl_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_clmock)
       set_tests_properties(golden_tiny_llama_opencl_mock PROPERTIES LABELS gpu
-        ENVIRONMENT "FORGE_DEVICE=opencl;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockopencl")
-      add_test(NAME golden_tiny_llama_ze_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
-               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_zemock)
+        ENVIRONMENT "FORGE_DEVICE=opencl;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockopencl")
+      add_test(NAME golden_tiny_llama_ze_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_zemock)
       set_tests_properties(golden_tiny_llama_ze_mock PROPERTIES LABELS gpu
-        ENVIRONMENT "FORGE_DEVICE=level_zero;FORGE_ZE_TEST_IMAGE=opencl-c;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockze")
-      add_test(NAME golden_tiny_llama_hip_mock COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
-               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_hipmock)
+        ENVIRONMENT "FORGE_DEVICE=level_zero;FORGE_ZE_TEST_IMAGE=opencl-c;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockze")
+      add_test(NAME golden_tiny_llama_hip_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
-        ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mockhip")
+        ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip")
     endif()
   endif()
   if(FORGE_HAVE_VULKAN)
@@ -732,12 +732,12 @@ if(FORGE_BUILD_TESTS)
              -Werror -fsyntax-only ${FORGE_GPU_DIR}/kernels.cl)
     # Mobile: NDK cross-builds (skip without ANDROID_NDK_HOME), device + iOS runs (skip without adb/Xcode).
     foreach(abi arm64-v8a x86_64)
-      add_test(NAME mobile_android_${abi} COMMAND sh ${CMAKE_SOURCE_DIR}/tests/mobile_build.sh android ${abi})
+      add_test(NAME mobile_android_${abi} COMMAND sh ${PROJECT_SOURCE_DIR}/tests/mobile_build.sh android ${abi})
       set_tests_properties(mobile_android_${abi} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800 LABELS "mobile;slow"
-        ENVIRONMENT "FORGE_MOBILE_BUILD_DIR=${CMAKE_BINARY_DIR}/mobile")
+        ENVIRONMENT "FORGE_MOBILE_BUILD_DIR=${PROJECT_BINARY_DIR}/mobile")
     endforeach()
-    add_test(NAME mobile_android_device COMMAND sh ${CMAKE_SOURCE_DIR}/tests/mobile_build.sh android-device)
-    add_test(NAME mobile_ios COMMAND sh ${CMAKE_SOURCE_DIR}/tests/mobile_build.sh ios)
+    add_test(NAME mobile_android_device COMMAND sh ${PROJECT_SOURCE_DIR}/tests/mobile_build.sh android-device)
+    add_test(NAME mobile_ios COMMAND sh ${PROJECT_SOURCE_DIR}/tests/mobile_build.sh ios)
     set_tests_properties(mobile_android_device mobile_ios PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS "mobile;slow")
     find_path(FORGE_JNI_H jni.h HINTS $ENV{JAVA_HOME}/include NO_CMAKE_SYSTEM_PATH)  # JDK only; the NDK path is covered by mobile_android_*
     if(FORGE_JNI_H)  # host syntax check of the JNI bridge
@@ -746,14 +746,14 @@ if(FORGE_BUILD_TESTS)
       foreach(d ${_jni_md})
         list(APPEND _jni_inc -I${d})
       endforeach()
-      add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -c -o ${CMAKE_BINARY_DIR}/jni_syntax.o -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
-        -I${CMAKE_SOURCE_DIR}/mind/include ${CMAKE_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+      add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -c -o ${PROJECT_BINARY_DIR}/jni_syntax.o -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
+        -I${PROJECT_SOURCE_DIR}/mind/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
-             -include ${CMAKE_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
+             -include ${PROJECT_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
     find_program(FORGE_XCRUN xcrun)
     if(FORGE_XCRUN)   # real Metal compiler (macOS with Xcode)
-      add_test(NAME gpu_compile_metal COMMAND ${FORGE_XCRUN} -sdk macosx metal -c ${FORGE_GPU_DIR}/kernels.metal -o ${CMAKE_BINARY_DIR}/kernels.air)
+      add_test(NAME gpu_compile_metal COMMAND ${FORGE_XCRUN} -sdk macosx metal -c ${FORGE_GPU_DIR}/kernels.metal -o ${PROJECT_BINARY_DIR}/kernels.air)
       set_tests_properties(gpu_compile_metal PROPERTIES LABELS gpu)
     endif()
     set_tests_properties(gpu_compile_metal_syntax gpu_compile_cuda gpu_compile_hip gpu_compile_opencl gpu_compile_opencl_nofp64 PROPERTIES LABELS gpu)
@@ -770,7 +770,7 @@ if(FORGE_BUILD_TESTS)
     # sysroot (conda clang) can resolve it.
     set_target_properties(capi_smoke doc_example_capi_generate PROPERTIES LINKER_LANGUAGE CXX)
     if(FORGE_BUILD_APPS)
-      add_test(NAME doc_example_capi_generate COMMAND doc_example_capi_generate ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+      add_test(NAME doc_example_capi_generate COMMAND doc_example_capi_generate ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(doc_example_capi_generate PROPERTIES DEPENDS golden_tiny_llama)
     endif()
   endif()
@@ -796,38 +796,38 @@ if(FORGE_BUILD_TESTS)
   add_executable(doc_example_mind_generate docs/examples/mind_generate.cpp)
   target_link_libraries(doc_example_mind_generate PRIVATE forge_mind forge_verify forge_lane_mv)
   if(FORGE_BUILD_APPS)
-    add_test(NAME doc_example_mind_generate COMMAND doc_example_mind_generate ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk "Hi")
+    add_test(NAME doc_example_mind_generate COMMAND doc_example_mind_generate ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk "Hi")
     set_tests_properties(doc_example_mind_generate PROPERTIES DEPENDS golden_tiny_llama)
   endif()
   if(FORGE_BUILD_APPS)
-    add_test(NAME pack_signing COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/sign_test.py
-             $<TARGET_FILE:forge> ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+    add_test(NAME pack_signing COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/sign_test.py
+             $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
     set_tests_properties(pack_signing PROPERTIES DEPENDS golden_tiny_llama)
-    add_test(NAME onnx_import COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/onnx_test.py $<TARGET_FILE:forge>)
+    add_test(NAME onnx_import COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/onnx_test.py $<TARGET_FILE:forge>)
     add_test(NAME golden_moe_mla
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_moe.py
-              --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_moe)
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_moe)
     add_test(NAME golden_quant_inplace
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/quant_inplace.py
-              --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_quant_inplace)
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/quant_inplace.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_quant_inplace)
     # Qwen3.5 (Gated DeltaNet) against transformers; skips without torch + transformers >= 5. Set
     # FORGE_GOLDEN_PYTHON to an interpreter that has them (e.g. a venv) to run it.
     set(FORGE_GOLDEN_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python with torch/transformers for golden_tiny_qwen3_5")
     add_test(NAME golden_tiny_qwen3_5
-      COMMAND ${FORGE_GOLDEN_PYTHON} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_qwen3_5.py
-              --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_tiny_qwen3_5)
+      COMMAND ${FORGE_GOLDEN_PYTHON} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_qwen3_5.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_tiny_qwen3_5)
     add_test(NAME golden_tiny_qwen3
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_qwen3.py
-              --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_qwen3)
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_qwen3.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_qwen3)
     add_test(NAME golden_tiny_llama
-      COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
-              --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden)
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden)
     if(FORGE_HAVE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
       # Same goldens with the Vulkan lowerings (ops without a GPU kernel run on the CPU).
-      add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_llama.py
-               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_vk)
-      add_test(NAME golden_moe_mla_vulkan COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/verify/golden/tiny_moe.py
-               --forge $<TARGET_FILE:forge> --work ${CMAKE_BINARY_DIR}/golden_moe_vk)
+      add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_vk)
+      add_test(NAME golden_moe_mla_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_moe_vk)
       set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
@@ -835,18 +835,18 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
-      add_test(NAME capi_smoke COMMAND capi_smoke ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
-      add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/python_bindings.py
-               ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${CMAKE_BINARY_DIR}/golden/tiny_q8_0.fpk)
+      add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python_bindings.py
+               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk)
       set_tests_properties(python_bindings PROPERTIES DEPENDS golden_tiny_llama ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
-      add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/serve_test.py
-               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${CMAKE_BINARY_DIR}/golden/tiny_f32.fpk)
+      add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
     endif()
     if(Python3_EXECUTABLE)
-      add_test(NAME docs_up_to_date COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/gen_docs.py --check)
-      add_test(NAME sbom_spdx COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/sbom_test.py ${CMAKE_SOURCE_DIR})
+      add_test(NAME docs_up_to_date COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/gen_docs.py --check)
+      add_test(NAME sbom_spdx COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/sbom_test.py ${PROJECT_SOURCE_DIR})
     endif()
   endif()
 endif()
@@ -863,11 +863,25 @@ if(FORGE_BUILD_TESTS)
     endif()
     target_link_libraries(fuzz_${ft} PRIVATE forge_mind forge_verify forge_lane_mv)
     if(NOT FORGE_LIBFUZZER)
-      add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${FORGE_FUZZ_ITERS} ${CMAKE_SOURCE_DIR}/fuzz/corpus/${ft}
-               WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+      add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${FORGE_FUZZ_ITERS} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
+               WORKING_DIRECTORY ${PROJECT_BINARY_DIR})
       set_tests_properties(fuzz_${ft} PROPERTIES TIMEOUT 600 LABELS fuzz)
     endif()
   endforeach()
+endif()
+if(FORGE_BUILD_TESTS AND TARGET forge_script)   # script front end (parser + compiler + verifier)
+  if(FORGE_LIBFUZZER)
+    add_executable(fuzz_script fuzz/fuzz_script.cpp)
+    target_compile_options(fuzz_script PRIVATE -fsanitize=fuzzer)
+    target_link_options(fuzz_script PRIVATE -fsanitize=fuzzer)
+  else()
+    add_executable(fuzz_script fuzz/fuzz_script.cpp fuzz/driver.cpp)
+    add_test(NAME fuzz_script COMMAND fuzz_script --iters ${FORGE_FUZZ_ITERS} ${PROJECT_SOURCE_DIR}/fuzz/corpus/script
+             WORKING_DIRECTORY ${PROJECT_BINARY_DIR})
+    set_tests_properties(fuzz_script PROPERTIES TIMEOUT 600 LABELS fuzz)
+  endif()
+  target_link_libraries(fuzz_script PRIVATE forge_script)
+  target_include_directories(fuzz_script PRIVATE script/src)
 endif()
 
 # App integrations (Part F.2): runnable embedding examples for FUSE, Cypha, CameraDetector, seatbelt, NeuralVFX.
@@ -903,7 +917,7 @@ set(CPACK_PACKAGE_NAME forge)
 set(CPACK_PACKAGE_VENDOR "Odin Loch")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "FORGE: one C++23 stack for SIMD, GPU and model inference")
-set(CPACK_RESOURCE_FILE_LICENSE ${CMAKE_SOURCE_DIR}/LICENSE)
+set(CPACK_RESOURCE_FILE_LICENSE ${PROJECT_SOURCE_DIR}/LICENSE)
 set(CPACK_PACKAGE_FILE_NAME "forge-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_SOURCE_PACKAGE_FILE_NAME "forge-${PROJECT_VERSION}-src")
 set(CPACK_SOURCE_IGNORE_FILES "/build/" "/\\\\.git/" "/\\\\.venv/" "__pycache__")
