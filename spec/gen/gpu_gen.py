@@ -219,6 +219,68 @@ FORGE_DEV float flog(float x) { return flog2(x) * 0.6931471805599453f; }
 FORGE_DEV float ftanh(float x) { float e = fexp(-2.0f * fabs_(x)); float t = (1.0f - e) / (1.0f + e); return x < 0.0f ? -t : t; }
 """
 
+CU_QUANT = r"""// Quantised matmul_t: y[rows, cols] = a[rows, k] . W[cols, k]^T with W's rows still in their GGUF-compatible blocks
+// (fmt 1 q8_0, 2 q4_k, 3 q6_k, 4 q5_k; rb bytes per row), so a q4_k model costs its file size on the device.
+// One 128-thread block per (output column, tile of 4 rows): each thread decodes whole 32-value groups and dots them
+// against up to 4 activation rows; the block reduces in shared memory. Bodies mirror flow/codecs.hpp's decoders.
+#if defined(__NVPTX__)
+FORGE_DEV unsigned bid_() { return __nvvm_read_ptx_sreg_ctaid_x(); }
+FORGE_DEV unsigned tid_() { return __nvvm_read_ptx_sreg_tid_x(); }
+FORGE_DEV void bar_() { __syncthreads(); }
+#else
+FORGE_DEV unsigned bid_() { return __builtin_amdgcn_workgroup_id_x(); }
+FORGE_DEV unsigned tid_() { return __builtin_amdgcn_workitem_id_x(); }
+FORGE_DEV void bar_() { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup"); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"); }
+#endif
+FORGE_DEV float h2f(unsigned h) {
+  unsigned s = (h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u, b;
+  if (e == 0u) { if (m == 0u) b = s; else { e = 113u; while (!(m & 1024u)) { m <<= 1; --e; } m &= 1023u; b = s | (e << 23) | (m << 13); } }
+  else if (e == 31u) b = s | 0x7f800000u | (m << 13);
+  else b = s | ((e + 112u) << 23) | (m << 13);
+  return __builtin_bit_cast(float, b); }
+FORGE_DEV unsigned ld16(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+FORGE_DEV void scmin(unsigned j, const unsigned char* q, unsigned* d, unsigned* m) {
+  if (j < 4u) { *d = q[j] & 63u; *m = q[j + 4u] & 63u; }
+  else { *d = (q[j + 4u] & 15u) | ((q[j - 4u] >> 6) << 4); *m = (q[j + 4u] >> 4) | ((q[j] >> 6) << 4); } }
+FORGE_DEV void qgroup(unsigned fmt, const unsigned char* row, unsigned g, float* v) {
+  if (fmt == 1u) { const unsigned char* b = row + g * 34u; float d = h2f(ld16(b));
+    for (unsigned l = 0; l < 32u; ++l) v[l] = d * (float)(signed char)b[2u + l];
+    return; }
+  unsigned s = g & 7u;
+  if (fmt == 3u) {
+    const unsigned char* b = row + (g >> 3) * 210u; unsigned h = s >> 2, t = s & 3u;
+    const unsigned char* ql = b + 64u * h; const unsigned char* qh = b + 128u + 32u * h; const signed char* sc = (const signed char*)(b + 192u + 8u * h);
+    float d = h2f(ld16(b + 208u));
+    for (unsigned l = 0; l < 32u; ++l) {
+      unsigned lo = (t & 1u) ? ql[l + 32u] : ql[l]; lo = (t & 2u) ? (lo >> 4) : (lo & 15u);
+      int q = (int)(lo | (((qh[l] >> (2u * t)) & 3u) << 4)) - 32;
+      v[l] = d * (float)sc[(l >> 4) + 2u * t] * (float)q; }
+    return; }
+  const unsigned char* b = row + (g >> 3) * (fmt == 2u ? 144u : 176u);
+  float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned sc, mn; scmin(s, b + 4u, &sc, &mn);
+  float d1 = d * (float)sc, m1 = dm * (float)mn; unsigned hi = s & 1u;
+  if (fmt == 2u) { const unsigned char* q = b + 16u + (s >> 1) * 32u;
+    for (unsigned l = 0; l < 32u; ++l) { unsigned n = hi ? (q[l] >> 4) : (q[l] & 15u); v[l] = d1 * (float)n - m1; } }
+  else { const unsigned char* qh = b + 16u; const unsigned char* q = b + 48u + (s >> 1) * 32u; unsigned u = 1u << s;
+    for (unsigned l = 0; l < 32u; ++l) { unsigned n = (hi ? (q[l] >> 4) : (q[l] & 15u)) + ((qh[l] & u) ? 16u : 0u); v[l] = d1 * (float)n - m1; } } }
+FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
+  __attribute__((shared)) float red[4u * 128u];
+  unsigned t = tid_(), bi = bid_(), c = bi % cols, r0 = (bi / cols) * 4u;
+  const unsigned char* row = w + (unsigned long long)c * rb;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float v[32];
+  unsigned nr = rows - r0 < 4u ? rows - r0 : 4u;
+  for (unsigned g = t; g < k / 32u; g += 128u) {
+    qgroup(fmt, row, g, v);
+    for (unsigned rr = 0; rr < nr; ++rr) {
+      const float* ap = a + (unsigned long long)(r0 + rr) * k + g * 32u; float s = 0.0f;
+      for (unsigned l = 0; l < 32u; ++l) s = fma_(ap[l], v[l], s);
+      acc[rr] += s; } }
+  for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] = acc[rr];
+  bar_();
+  for (unsigned st = 64u; st > 0u; st >>= 1) { if (t < st) for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] += red[rr * 128u + t + st]; bar_(); }
+  if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[t * 128u]; }
+"""
+
 CU_MATH = r"""// sin/cos in double after reduction by pi/2 (no libdevice/ocml needed); |x| up to ~1e9 is exact enough.
 FORGE_DEV void fsincos(double x, float* s, float* c) {
   double k = __builtin_rint(x * 0.63661977236758134); double r = x - k * 1.5707963267341256; r -= k * 6.077100506506192e-11;
@@ -423,7 +485,7 @@ def main():
     def put(path, text):
         if not os.path.exists(path) or open(path).read() != text: open(path, "w").write(text)
     for n in names: put(os.path.join(a.out, n + ".comp"), glsl(n))
-    put(os.path.join(a.out, "kernels.cu"), cuda(names))
+    put(os.path.join(a.out, "kernels.cu"), cuda(names) + "\n" + CU_QUANT)   # CUDA/HIP only (not OpenCL/Metal)
     put(os.path.join(a.out, "kernels.cl"), opencl(names))
     put(os.path.join(a.out, "kernels.metal"), msl(names))
     put(os.path.join(a.out, "kernels_cl_mock.inc"), cl_mock_dispatch(names))

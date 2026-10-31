@@ -1,3 +1,4 @@
+#include <cmath>
 #include <cstring>
 #include <map>
 #include "check.hpp"
@@ -130,6 +131,77 @@ TEST(state_append_symbolic_length) {
     for (float v : y.data) CHECK(std::fabs(v - 0.5f) < 1e-6f);
 }
 
+// Fixed-size state ops: prefill in one run == token-by-token runs (state carried in the slot), against a
+// float64 reference of the gated delta rule (l2norm on q/k, GQA-style key head sharing).
+TEST(state_ops_conv_and_delta_rule_streaming) {
+    const i64 S = 7, Hk = 2, Hv = 4, dk = 8, dv = 6, C = 10, K = 4;
+    std::mt19937 rng(11); std::normal_distribution<float> nd(0.f, 1.f);
+    auto rnd = [&](std::size_t n) { std::vector<float> v(n); for (auto& x : v) x = nd(rng); return v; };
+    auto q = rnd(S * Hk * dk), k = rnd(S * Hk * dk), v = rnd(S * Hv * dv), gl = rnd(S * Hv), bl = rnd(S * Hv);
+    for (auto& x : gl) x = -std::fabs(x) * 0.5f;                       // log decay <= 0
+    for (auto& x : bl) x = 1.f / (1.f + std::exp(-x));                 // beta in (0, 1)
+    auto xc = rnd(S * C), wc = rnd(C * K);
+    // reference
+    std::vector<double> Sref(std::size_t(Hv * dk * dv), 0.0), oref(std::size_t(S * Hv * dv)), cref(std::size_t(S * C));
+    for (i64 t = 0; t < S; ++t) {
+        for (i64 c = 0; c < C; ++c) { double a = 0; for (i64 j = 0; j < K; ++j) { i64 tt = t - (K - 1) + j; if (tt >= 0) a += double(wc[std::size_t(c * K + j)]) * xc[std::size_t(tt * C + c)]; } cref[std::size_t(t * C + c)] = a; }
+        for (i64 h = 0; h < Hv; ++h) {
+            i64 kh = h / (Hv / Hk); std::vector<double> qn(static_cast<std::size_t>(dk)), kn(static_cast<std::size_t>(dk)); double qs = 0, ks = 0;
+            for (i64 i = 0; i < dk; ++i) { double a = q[std::size_t((t * Hk + kh) * dk + i)], b = k[std::size_t((t * Hk + kh) * dk + i)]; qn[std::size_t(i)] = a; kn[std::size_t(i)] = b; qs += a * a; ks += b * b; }
+            for (i64 i = 0; i < dk; ++i) { qn[std::size_t(i)] /= std::sqrt(qs + 1e-6) * std::sqrt(double(dk)); kn[std::size_t(i)] /= std::sqrt(ks + 1e-6); }
+            double* Sh = Sref.data() + h * dk * dv; double dec = std::exp(double(gl[std::size_t(t * Hv + h)])), be = bl[std::size_t(t * Hv + h)];
+            for (i64 x = 0; x < dk * dv; ++x) Sh[x] *= dec;
+            for (i64 j = 0; j < dv; ++j) {
+                double kv = 0; for (i64 i = 0; i < dk; ++i) kv += Sh[i * dv + j] * kn[std::size_t(i)];
+                double d = (v[std::size_t((t * Hv + h) * dv + j)] - kv) * be;
+                for (i64 i = 0; i < dk; ++i) Sh[i * dv + j] += kn[std::size_t(i)] * d;
+                double o = 0; for (i64 i = 0; i < dk; ++i) o += Sh[i * dv + j] * qn[std::size_t(i)];
+                oref[std::size_t((t * Hv + h) * dv + j)] = o;
+            }
+        }
+    }
+    auto build = [&](i64 s) {
+        graph g;
+        auto iq = g.input("q", {s, Hk, dk}), ik = g.input("k", {s, Hk, dk}), iv = g.input("v", {s, Hv, dv});
+        auto ig = g.input("g", {s, Hv}), ib = g.input("b", {s, Hv}), ix = g.input("x", {s, C});
+        auto w = g.constant(tensor({C, K}, 0.f)); g.at(w).constant->data = wc;
+        g.output("o", g.state_op("ssm", "delta_rule", {iq, ik, iv, ig, ib}));
+        g.output("c", g.state_op("conv", "causal_conv", {ix, w}));
+        return g;
+    };
+    auto feed = [&](executor& e, i64 t0, i64 s) {
+        auto sl = [&](const std::vector<float>& a, i64 row) { return std::span<const float>(a.data() + t0 * row, std::size_t(s * row)); };
+        e.set_input("q", sl(q, Hk * dk)); e.set_input("k", sl(k, Hk * dk)); e.set_input("v", sl(v, Hv * dv));
+        e.set_input("g", sl(gl, Hv)); e.set_input("b", sl(bl, Hv)); e.set_input("x", sl(xc, C)); e.run();
+    };
+    double eo = 0, ec = 0;
+    {   // whole prompt in one run
+        state_store st; auto p = compile(build(S), &st); executor e(*p, &st); feed(e, 0, S);
+        auto o = e.output("o"), c = e.output("c");
+        for (std::size_t i = 0; i < oref.size(); ++i) eo = std::max(eo, std::fabs(o.data[i] - oref[i]));
+        for (std::size_t i = 0; i < cref.size(); ++i) ec = std::max(ec, std::fabs(c.data[i] - cref[i]));
+        CHECK(st.slots["ssm"].len == S && st.slots["ssm"].fixed);
+        CHECK_THROWS(st.truncate(3));                                      // recurrent state cannot rewind
+    }
+    {   // 3-token prefill then one token at a time; then reset() restarts from zeros
+        state_store st; auto p3 = compile(build(3), &st), p1 = compile(build(1), &st);
+        executor e3(*p3, &st), e1(*p1, &st);
+        for (int pass = 0; pass < 2; ++pass) {
+            feed(e3, 0, 3);
+            for (i64 t = 0; t < 3; ++t) for (i64 j = 0; j < Hv * dv; ++j) eo = std::max(eo, std::fabs(e3.output("o").data[std::size_t(t * Hv * dv + j)] - oref[std::size_t(t * Hv * dv + j)]));
+            for (i64 t = 3; t < S; ++t) {
+                feed(e1, t, 1);
+                auto o = e1.output("o"), c = e1.output("c");
+                for (i64 j = 0; j < Hv * dv; ++j) eo = std::max(eo, std::fabs(o.data[std::size_t(j)] - oref[std::size_t(t * Hv * dv + j)]));
+                for (i64 j = 0; j < C; ++j) ec = std::max(ec, std::fabs(c.data[std::size_t(j)] - cref[std::size_t(t * C + j)]));
+            }
+            st.reset();
+        }
+    }
+    std::printf("  state ops: delta_rule max err %.2e, causal_conv max err %.2e\n", eo, ec);
+    CHECK(eo < 1e-4); CHECK(ec < 1e-4);
+}
+
 TEST(codecs_exact_and_layout) {
     // values exactly representable in a codec survive the round trip bit-for-bit
     auto rt = [](std::string_view name, std::vector<float> x) {
@@ -239,4 +311,49 @@ TEST(autodiff_matches_finite_differences) {
     CHECK_THROWS(grad(g2, am, {a}));
     graph g3; auto u = g3.input("u", {2}), v = g3.input("v", {2}); auto l3 = g3.apply(op::reduce_sum, {g3.apply(op::exp, {u})}, {{"axis", 0.0}});
     auto z3 = grad(g3, l3, {u, v}); CHECK(g3.at(z3[v]).kind == node_kind::constant);
+}
+
+// Resident device backends have no quantised kernels: compile() decodes their quantised weights to f32 only up to
+// FORGE_GPU_WEIGHT_BUDGET and keeps the rest encoded for the CPU kernels (a no-op residency stands in for a GPU).
+TEST(resident_backend_quantised_weight_budget) {
+    auto setb = [](const char* v) {
+#ifdef _WIN32
+        _putenv_s("FORGE_GPU_WEIGHT_BUDGET", v);
+#else
+        setenv("FORGE_GPU_WEIGHT_BUDGET", v, 1);
+#endif
+    };
+    const auto* c = codecs::find("q8_0");
+    CHECK(c); if (!c) return;
+    const i64 n = 8, k = 64;
+    std::vector<float> w(std::size_t(n * k));
+    for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(float(i) * 0.37f);
+    std::vector<std::uint8_t> enc(std::size_t(n) * c->bytes(std::size_t(k)));
+    c->encode(w.data(), w.size(), enc.data());
+    graph g;
+    auto x = g.input("x", {2, k});
+    g.output("y", g.apply(spec::op::matmul_t, {x, g.qweight("w", {n, k}, enc.data(), "q8_0")}));
+    auto reg = registry::make();
+    auto h = std::make_shared<device_hooks>();
+    h->begin_run = [] {}; h->end_run = [] {};
+    h->pin = h->to_host = h->host_wrote = h->release = [](const float*, std::size_t) {};
+    reg->hooks = h;
+    pass_options po; po.lowerings = reg.get();
+    std::vector<float> xs(std::size_t(2 * k));
+    for (std::size_t i = 0; i < xs.size(); ++i) xs[i] = std::cos(float(i) * 0.11f);
+    auto run = [&](const char* budget, bool& encoded) {
+        setb(budget);
+        auto p = compile(g, nullptr, po);
+        encoded = false;
+        for (auto& v : p->views) if (v.qdata) encoded = true;
+        executor e(*p); e.set_input("x", xs); e.run();
+        return e.output("y");
+    };
+    bool q0 = false, q1 = false;
+    auto y0 = run("0", q0), y1 = run("1G", q1);
+    setb("");
+    CHECK(q0);    // budget 0: the weight stays encoded (CPU quantised matmul)
+    CHECK(!q1);   // ample budget: decoded to f32 for the device
+    auto cmp = verify::compare(y0, y1, {spec::tol_kind::rel, 1e-4});
+    CHECK_MSG(cmp.ok, "%s", cmp.message.c_str());
 }

@@ -10,6 +10,15 @@
 #include <sys/time.h>
 #include <sys/utsname.h>
 #endif
+#if defined(FORGE_OS_WINDOWS)
+#include <psapi.h>   // K32GetProcessMemoryInfo lives in kernel32 (no psapi.lib)
+#endif
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#elif defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#endif
 
 namespace forge::os {
 struct os_release { std::string name, version, id, kernel, kernel_version, arch, pretty; };
@@ -141,6 +150,29 @@ inline result<process_usage> self_usage() {
     FILETIME c, e, k, us; if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &us)) return {{}, last_error("GetProcessTimes")};
     auto s = [](FILETIME f) { return double((std::uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 1e7; };
     process_usage u; u.user_s = s(us); u.system_s = s(k); return {u, {}};
+#endif
+}
+// Resident set size of this process now, in bytes (0 if unknown). Linux/Android: /proc/self/statm;
+// macOS/iOS: task_info(MACH_TASK_BASIC_INFO); FreeBSD: sysctl KERN_PROC_PID ki_rssize; Windows: working set.
+inline std::uint64_t current_rss() {
+#if defined(__linux__)
+    long pages = 0, rss = 0;
+    if (FILE* f = std::fopen("/proc/self/statm", "r")) { if (std::fscanf(f, "%ld %ld", &pages, &rss) != 2) rss = 0; std::fclose(f); }
+    return std::uint64_t(rss) * std::uint64_t(page_size());
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info{}; mach_msg_type_number_t n = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &n) != KERN_SUCCESS) return 0;
+    return std::uint64_t(info.resident_size);
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, int(::getpid())}; struct kinfo_proc kp{}; std::size_t n = sizeof kp;
+    if (::sysctl(mib, 4, &kp, &n, nullptr, 0) != 0 || n != sizeof kp) return 0;
+    return std::uint64_t(kp.ki_rssize) * std::uint64_t(page_size());
+#elif defined(FORGE_OS_WINDOWS)
+    PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) return 0;
+    return std::uint64_t(pmc.WorkingSetSize);
+#else
+    return 0;
 #endif
 }
 } // namespace forge::os

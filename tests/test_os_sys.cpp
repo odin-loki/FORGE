@@ -5,6 +5,7 @@
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/console.hpp>
 #include <atomic>
+#include <vector>
 #include "check.hpp"
 using namespace forge;
 namespace fs = forge::os::fs;
@@ -86,6 +87,11 @@ TEST(sysinfo_ext) {
     auto r = os::release_info(); CHECK(!r.name.empty());
     auto m = os::memory(); CHECK(m.total > 0);
     auto u = os::self_usage(); CHECK(u);
+    {   // current_rss grows with touched memory, on every OS
+        std::uint64_t r0 = os::current_rss(); CHECK(r0 > 0);
+        std::vector<char> big(64u << 20); volatile char* vp = big.data(); for (std::size_t i = 0; i < big.size(); i += 4096) vp[i] = char(i | 1);
+        std::uint64_t r1 = os::current_rss(); CHECK(r1 >= r0 + (32ull << 20)); CHECK(r1 < m.total); CHECK(vp[4096] != 0);
+    }
 #if defined(__linux__)
     CHECK(*os::uptime_seconds() > 0); CHECK(os::load_average());
     auto a = os::per_cpu_times(); CHECK(a); CHECK(!a->empty()); CHECK(m.available > 0);

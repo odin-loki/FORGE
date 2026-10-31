@@ -129,6 +129,89 @@ private:
     std::vector<std::uint8_t> data_;
 };
 
+// Streaming writer: tensors go to disk as they are added (the caller frees each one), so peak memory is one
+// tensor, not the whole model. Layout: [header][data section][other sections][table]; the header is patched last.
+class stream_writer {
+public:
+    explicit stream_writer(std::string path) : path_(std::move(path)), tmp_(path_ + ".part") {
+        f_ = std::fopen(tmp_.c_str(), "wb");
+        if (!f_) raise(errc::io_error, "cannot write {}", tmp_);
+        std::uint8_t z[64] = {}; emit_(z, 64);
+    }
+    stream_writer(const stream_writer&) = delete;
+    ~stream_writer() { if (f_) { std::fclose(f_); std::remove(tmp_.c_str()); } }
+    void set_section(std::string name, std::string bytes) { sections_[std::move(name)] = std::move(bytes); }
+    void set_manifest(const json::value& m) { set_section("manifest", json::dump(m)); }
+    void add_tensor(std::string name, const shape_t& shape, std::span<const float> data, std::string_view codec = "f32") {
+        auto* c = flow::codecs::find(codec);
+        if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
+        if (std::size_t(numel(shape)) != data.size()) raise(errc::shape_mismatch, "tensor {}: shape/data mismatch", name);
+        if (c->block > 1 && data.size() % std::size_t(c->block)) c = flow::codecs::find("f16");
+        std::vector<std::uint8_t> buf(c->bytes(data.size()));
+        c->encode(data.data(), data.size(), buf.data());
+        put_(std::move(name), std::string(c->name), shape, buf);
+    }
+    void add_raw(std::string name, const shape_t& shape, std::string_view codec, std::span<const std::uint8_t> bytes) {
+        auto* c = flow::codecs::find(codec);
+        if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
+        if (c->bytes(std::size_t(numel(shape))) != bytes.size()) raise(errc::format_error, "tensor {}: {} bytes do not match {} {}", name, bytes.size(), codec, shape_str(shape));
+        put_(std::move(name), std::string(c->name), shape, bytes);
+    }
+    std::size_t tensor_bytes() const { return dlen_; }
+    void finish() {
+        json::array idx;
+        for (auto& t : tensors_) {
+            json::array sh; for (auto d : t.shape) sh.push_back(double(d));
+            idx.push_back(json::object{{"name", t.name}, {"codec", t.codec}, {"shape", sh}, {"offset", double(t.offset)},
+                                       {"bytes", double(t.bytes)}, {"blake3", t.blake3}});
+        }
+        sections_["tensors"] = json::dump(idx);
+        struct ent { std::string name; std::uint64_t off, size; hash::blake3::digest h; };
+        std::vector<ent> table{{"data", 64, dlen_, dhash_.final()}};
+        for (auto& [nm, s] : sections_) {
+            pad_();
+            table.push_back({nm, at_, s.size(), hash::blake3::of({reinterpret_cast<const std::uint8_t*>(s.data()), s.size()})});
+            emit_(reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
+        }
+        pad_();
+        std::uint64_t toff = at_;
+        for (auto& e : table) {
+            std::uint8_t rec[96] = {};
+            if (e.name.size() >= 32) raise(errc::invalid_argument, "section name too long: {}", e.name);
+            std::memcpy(rec, e.name.data(), e.name.size());
+            std::memcpy(rec + 32, &e.off, 8); std::memcpy(rec + 40, &e.size, 8); std::memcpy(rec + 48, e.h.data(), 32);
+            emit_(rec, 96);
+        }
+        std::uint32_t n = std::uint32_t(table.size()); std::uint64_t fsz = at_;
+        std::uint8_t head[64] = {};
+        std::memcpy(head, magic, 8); std::memcpy(head + 8, &format_version, 4); std::memcpy(head + 12, &n, 4);
+        std::memcpy(head + 16, &toff, 8); std::memcpy(head + 24, &fsz, 8);
+        if (std::fseek(f_, 0, SEEK_SET) || std::fwrite(head, 1, 64, f_) != 64 || std::fclose(f_)) { f_ = nullptr; raise(errc::io_error, "cannot finish {}", tmp_); }
+        f_ = nullptr;
+        if (auto rs = forge::os::rename(tmp_, path_); !rs) { forge::os::remove(tmp_); raise(errc::io_error, "cannot replace {}: {}", path_, rs.err.what); }
+    }
+private:
+    void emit_(const std::uint8_t* p, std::size_t k) {
+        if (k && std::fwrite(p, 1, k, f_) != k) raise(errc::io_error, "short write {}", tmp_);
+        at_ += k;
+    }
+    void pad_() { static const std::uint8_t z[alignment] = {}; emit_(z, std::size_t((alignment - at_ % alignment) % alignment)); }
+    void put_(std::string name, std::string codec, const shape_t& shape, std::span<const std::uint8_t> b) {
+        static const std::uint8_t z[alignment] = {};
+        std::size_t padn = (alignment - dlen_ % alignment) % alignment;   // data starts at 64, so data-relative == file alignment
+        emit_(z, padn); dhash_.update(z, padn); dlen_ += padn;
+        tensor_entry e{std::move(name), std::move(codec), shape, dlen_, b.size(), hash::blake3::hex(hash::blake3::of(b))};
+        emit_(b.data(), b.size()); dhash_.update(b.data(), b.size()); dlen_ += b.size();
+        tensors_.push_back(std::move(e));
+    }
+    std::string path_, tmp_;
+    std::FILE* f_ = nullptr;
+    std::uint64_t at_ = 0, dlen_ = 0;
+    hash::blake3 dhash_;
+    std::map<std::string, std::string> sections_;
+    std::vector<tensor_entry> tensors_;
+};
+
 namespace detail {
 inline std::string hex(const std::uint8_t* p, std::size_t n) { static const char* d = "0123456789abcdef"; std::string s; for (std::size_t i = 0; i < n; ++i) { s += d[p[i] >> 4]; s += d[p[i] & 15]; } return s; }
 inline std::vector<std::uint8_t> unhex(std::string_view s) {

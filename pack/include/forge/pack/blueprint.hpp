@@ -14,7 +14,8 @@
 //   session generative_sequence
 //
 // Expressions: numbers, lists [a, b], params (dotted), arithmetic + - * /, calls with positional and
-// keyword args, `W.<path>` weight references, `state[i].append(k, v)`, tuple assignment `a, b = f(..)`.
+// keyword args, `W.<path>` weight references, `state[i].append(k, v)`, fixed-size state ops `state[i].conv(x, w)` and
+// `state[i].delta(q, k, v, g, beta)`, tuple assignment `a, b = f(..)`.
 // Any spec op is callable by name; positional numeric/list args bind to the op's declared attrs in order.
 // Built-in composites: linear(x, W) = x @ W^T, embed(W, ids) = gather, heads(x, n) / merge(x) reshapes.
 #include <forge/flow/ir.hpp>
@@ -247,6 +248,15 @@ private:
                         auto id = g_.state_append(v.path + (xs.size() == 1 ? "" : std::string(".") + sfx[i]), xs[i]);
                         if (xs.size() == 1) r.v = id; else r.tup.push_back(id);
                     }
+                    v = r; continue;
+                }
+                if (v.k == bp_val::state && (m == "conv" || m == "delta")) {   // fixed-size state ops (state_ops.hpp)
+                    ps_.expect("(");
+                    std::vector<flow::value_id> xs;
+                    if (!ps_.is(")")) { xs.push_back(as_tensor(expr())); while (ps_.accept(",")) xs.push_back(as_tensor(expr())); }
+                    ps_.expect(")");
+                    if (xs.size() != (m == "conv" ? 2u : 5u)) ps_.fail(m == "conv" ? "conv(x, w) takes 2 tensors" : "delta(q, k, v, g, beta) takes 5 tensors");
+                    bp_val r; r.k = bp_val::tensor; r.v = g_.state_op(v.path, m == "conv" ? "causal_conv" : "delta_rule", xs);
                     v = r; continue;
                 }
                 ps_.fail("unknown member '" + m + "'");
