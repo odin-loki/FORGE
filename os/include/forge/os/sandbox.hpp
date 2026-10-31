@@ -170,7 +170,7 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
 #elif defined(FORGE_OS_IOS)
     (void)p; return {-1, unsupported("child processes on iOS")};
 #else
-    pid_t c = ::fork(); if (c < 0) return {-1, last_error("fork")};
+    pid_t c = forge::os::serialized_fork(); if (c < 0) return {-1, last_error("fork")};
     if (c == 0) {
         sandbox_policy q = p; q.deny_exec = false;   // exec the target first; the filter is inherited across exec
 #if defined(__linux__)
