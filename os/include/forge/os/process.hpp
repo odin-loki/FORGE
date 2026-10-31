@@ -7,8 +7,23 @@
 #include <optional>
 #include <span>
 #include <stop_token>
+#include <thread>
 #if defined(FORGE_OS_POSIX)
 #include <sys/time.h>
+#endif
+#if defined(FORGE_OS_MACOS)
+#include <libproc.h>
+#include <sys/proc_info.h>
+#endif
+#if defined(FORGE_OS_FREEBSD)
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#endif
+#if defined(FORGE_OS_WINDOWS)
+#include <psapi.h>
+#if defined(_MSC_VER)
+#pragma comment(lib, "psapi.lib")
+#endif
 #endif
 
 namespace forge::os {
@@ -79,32 +94,110 @@ struct spawn_spec {
 inline bool kill_group(std::uint64_t pgid, int sig = SIGKILL) { return pgid > 1 && ::kill(-pid_t(pgid), sig) == 0; }
 #endif
 namespace detail_proc {
-#if defined(__linux__)
-// Sum of RSS (bytes) over processes whose process group is pgid.
-inline std::uint64_t group_rss(pid_t pgid) {
-    std::uint64_t total = 0; long pg = ::sysconf(_SC_PAGESIZE);
-    DIR* d = ::opendir("/proc"); if (!d) return 0;
+#if defined(__linux__) || defined(__ANDROID__)
+// Calls fn(pid, pgrp, sid, rss_pages) for every process in /proc.
+template <class F> inline void for_each_proc(F&& fn) {
+    DIR* d = ::opendir("/proc"); if (!d) return;
     while (dirent* e = ::readdir(d)) {
         if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
         char path[64]; std::snprintf(path, sizeof path, "/proc/%s/stat", e->d_name);
         FILE* f = std::fopen(path, "r"); if (!f) continue;
         char buf[1024]; std::size_t n = std::fread(buf, 1, sizeof buf - 1, f); std::fclose(f); buf[n] = 0;
         const char* q = std::strrchr(buf, ')'); if (!q) continue;
-        // fields after ')': state ppid pgrp ... rss is field 24 overall (22nd after the comm)
-        long long v[22] = {}; char st = 0;
-        if (std::sscanf(q + 2, "%c %lld %lld", &st, &v[0], &v[1]) != 3 || v[1] != pgid) continue;
+        // fields after ')': state ppid pgrp session ... rss is field 24 overall (22nd after the comm)
+        char st = 0; long long ppid = 0, pgrp = 0, sid = 0;
+        if (std::sscanf(q + 2, "%c %lld %lld %lld", &st, &ppid, &pgrp, &sid) != 4) continue;
         const char* r = q + 2; int field = 0;
         while (*r && field < 21) { if (*r == ' ') ++field; ++r; }
-        total += std::uint64_t(std::strtoull(r, nullptr, 10)) * std::uint64_t(pg);
+        fn(pid_t(std::atoll(e->d_name)), pid_t(pgrp), pid_t(sid), std::uint64_t(std::strtoull(r, nullptr, 10)));
     }
-    ::closedir(d); return total;
+    ::closedir(d);
+}
+// Sum of RSS (bytes) over processes whose process group is pgid.
+inline std::uint64_t group_rss(pid_t pgid) {
+    std::uint64_t total = 0; const std::uint64_t pg = std::uint64_t(::sysconf(_SC_PAGESIZE));
+    for_each_proc([&](pid_t, pid_t pgrp, pid_t, std::uint64_t rss) { if (pgrp == pgid) total += rss * pg; });
+    return total;
+}
+// Every process whose session id is sid.
+inline std::vector<pid_t> session_pids(pid_t sid) {
+    std::vector<pid_t> v;
+    for_each_proc([&](pid_t pid, pid_t, pid_t s, std::uint64_t) { if (s == sid) v.push_back(pid); });
+    return v;
+}
+#define FORGE_PROC_GROUP_RSS 1
+#elif defined(FORGE_OS_MACOS)
+inline std::vector<pid_t> list_pids(std::uint32_t type, std::uint32_t arg) {
+    int n = ::proc_listpids(type, arg, nullptr, 0); if (n <= 0) return {};
+    std::vector<pid_t> v(std::size_t(n) / sizeof(pid_t) + 16);
+    n = ::proc_listpids(type, arg, v.data(), int(v.size() * sizeof(pid_t))); if (n <= 0) return {};
+    v.resize(std::size_t(n) / sizeof(pid_t)); std::erase(v, 0); return v;
+}
+inline std::uint64_t group_rss(pid_t pgid) {
+    std::uint64_t total = 0;
+    for (pid_t pid : list_pids(PROC_PGRP_ONLY, std::uint32_t(pgid))) {
+        rusage_info_v2 ri{};
+        if (::proc_pid_rusage(pid, RUSAGE_INFO_V2, reinterpret_cast<rusage_info_t*>(&ri)) == 0) total += ri.ri_resident_size;
+    }
+    return total;
+}
+inline std::vector<pid_t> session_pids(pid_t sid) {
+    std::vector<pid_t> v;
+    for (pid_t pid : list_pids(PROC_ALL_PIDS, 0)) if (::getsid(pid) == sid) v.push_back(pid);
+    return v;
+}
+#define FORGE_PROC_GROUP_RSS 1
+#elif defined(FORGE_OS_FREEBSD)
+inline std::vector<kinfo_proc> procs(int op, int arg) {
+    int mib[4] = {CTL_KERN, KERN_PROC, op, arg}; std::size_t len = 0;
+    if (::sysctl(mib, op == KERN_PROC_PROC ? 3u : 4u, nullptr, &len, nullptr, 0) != 0 || len == 0) return {};
+    len += len / 4;
+    std::vector<kinfo_proc> v(len / sizeof(kinfo_proc) + 1);
+    len = v.size() * sizeof(kinfo_proc);
+    if (::sysctl(mib, op == KERN_PROC_PROC ? 3u : 4u, v.data(), &len, nullptr, 0) != 0) return {};
+    v.resize(len / sizeof(kinfo_proc)); return v;
+}
+inline std::uint64_t group_rss(pid_t pgid) {
+    std::uint64_t total = 0; const std::uint64_t pg = std::uint64_t(::getpagesize());
+    for (auto& k : procs(KERN_PROC_PGRP, int(pgid))) total += std::uint64_t(k.ki_rssize) * pg;
+    return total;
+}
+inline std::vector<pid_t> session_pids(pid_t sid) {
+    std::vector<pid_t> v;
+    for (auto& k : procs(KERN_PROC_SESSION, int(sid))) v.push_back(k.ki_pid);
+    return v;
+}
+#define FORGE_PROC_GROUP_RSS 1
+#endif
+#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+// SIGKILL the group pgid and, for a session leader, every other member of its session (a descendant that
+// moved to a process group of its own is still in the session). Members in other sessions are out of reach.
+inline void kill_tree(pid_t p, bool session) {
+    ::kill(-p, SIGKILL);
+#if defined(FORGE_PROC_GROUP_RSS)
+    if (session) for (pid_t m : session_pids(p)) if (m != p) ::kill(m, SIGKILL);
+#else
+    (void)session;
+#endif
+}
+// rusage ru_maxrss in bytes (Linux/FreeBSD/Android report KiB, macOS bytes).
+inline std::uint64_t maxrss_bytes(const struct rusage& ru) {
+#if defined(FORGE_OS_MACOS)
+    return std::uint64_t(ru.ru_maxrss);
+#else
+    return std::uint64_t(ru.ru_maxrss) * 1024ull;
+#endif
 }
 #endif
 }
 
-
 struct proc_result {
     bool cancelled = false, memory_killed = false;
+    // Killed (timeout / stop / watchdog) but not reaped within 2 s: a detached thread reaps it later.
+    bool unreaped = false;
+    // Peak resident memory of the child in bytes (POSIX: wait4 rusage of the direct child; Windows: peak
+    // process memory of the Job Object, i.e. of the largest process in the tree). 0 = not available.
+    std::uint64_t peak_rss_bytes = 0;
     int exit_code = -1;      // 128+signal when killed by a signal (POSIX convention)
     int term_signal = 0;
     bool timed_out = false, truncated = false;
@@ -262,6 +355,8 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     }
     if (res.timed_out || res.cancelled || res.memory_killed) { if (job) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, INFINITE); }
     for (auto t : th) if (t) { WaitForSingleObject(t, INFINITE); CloseHandle(t); }
+    if (job) { JOBOBJECT_EXTENDED_LIMIT_INFORMATION xi{}; if (QueryInformationJobObject(job, JobObjectExtendedLimitInformation, &xi, sizeof xi, nullptr)) res.peak_rss_bytes = std::uint64_t(xi.PeakProcessMemoryUsed); }
+    if (!res.peak_rss_bytes) { PROCESS_MEMORY_COUNTERS pmc{}; if (GetProcessMemoryInfo(pi.hProcess, &pmc, sizeof pmc)) res.peak_rss_bytes = std::uint64_t(pmc.PeakWorkingSetSize); }
     DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code); res.exit_code = res.timed_out ? 124 : res.cancelled ? 125 : res.memory_killed ? 137 : int(code);
     res.truncated = ro.trunc || re.trunc;
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread); closeh(out_r); closeh(err_r); if (job) CloseHandle(job);
@@ -328,7 +423,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     std::uint64_t next_mem_check = 0;
     auto check_watch = [&]() -> bool {
         if (sp.stop.stop_requested()) { res.cancelled = true; return true; }
-#if defined(__linux__)
+#if defined(FORGE_PROC_GROUP_RSS)
         const std::uint64_t now = monotonic_ns();
         if (sp.watch_memory_bytes && now >= next_mem_check && (next_mem_check = now + 50000000ull, true) && detail_proc::group_rss(p) > sp.watch_memory_bytes && detail_proc::group_rss(p) > sp.watch_memory_bytes) { res.memory_killed = true; return true; }
 #endif
@@ -345,14 +440,26 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
             if (n == 0) { cl(fd); } else if (errno == EINTR) continue;
             break; }
     };
+    // The direct child is polled too: once it exits, what is in the pipes is drained and the loop ends,
+    // even if a background grandchild still holds a pipe open (it is not waited for).
+    int st = 0;
+    struct rusage ru{};
+    bool reaped = false;
     while (pout[0] >= 0 || perr[0] >= 0 || pin[1] >= 0) {
+        if (!reaped) { pid_t w = ::wait4(p, &st, WNOHANG, &ru); if (w == p) reaped = true; }
+        if (reaped) {
+            if (pout[0] >= 0) drain(pout[0], res.out);
+            if (perr[0] >= 0) drain(perr[0], res.err);
+            break;
+        }
         struct pollfd fds[3]; int nf = 0, io = -1, ie = -1, ii = -1;
         if (pout[0] >= 0) { io = nf; fds[nf++] = {pout[0], POLLIN, 0}; }
         if (perr[0] >= 0) { ie = nf; fds[nf++] = {perr[0], POLLIN, 0}; }
         if (pin[1] >= 0) { ii = nf; fds[nf++] = {pin[1], POLLOUT, 0}; }
         int to = -1;
         if (deadline) { auto now = monotonic_ns(); if (now >= deadline) { res.timed_out = true; break; } to = int(std::min<std::uint64_t>((deadline - now) / 1000000 + 1, 1000)); }
-        if (watching) { if (check_watch()) break; to = to < 0 ? 50 : std::min(to, 50); }
+        if (watching) { if (check_watch()) break; }
+        to = to < 0 ? 50 : std::min(to, 50);
         int r = ::poll(fds, nfds_t(nf), to);
         if (r < 0) { if (errno == EINTR) continue; break; }
         if (io >= 0 && fds[io].revents) drain(pout[0], res.out);
@@ -365,17 +472,29 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         }
     }
     auto killed = [&] { return res.timed_out || res.cancelled || res.memory_killed; };
-    if (killed()) ::kill(-p, SIGKILL);
+    if (killed()) detail_proc::kill_tree(p, new_session);
     cl(pin[1]); cl(pout[0]); cl(perr[0]);
-    int st = 0;
-    for (;;) {
-        pid_t w = ::waitpid(p, &st, (deadline || watching) && !killed() ? WNOHANG : 0);
-        if (w == p) break;
-        if (w < 0 && errno != EINTR) break;
+    std::uint64_t kill_at = killed() ? monotonic_ns() : 0;
+    while (!reaped) {
+        // once killed, never block: a child stuck in uninterruptible sleep is left to a detached reaper
+        pid_t w = ::wait4(p, &st, ((deadline || watching) && !killed()) || killed() ? WNOHANG : 0, &ru);
+        if (w == p) { reaped = true; break; }
+        if (w < 0 && errno != EINTR) { reaped = true; ru = {}; break; }
         if (w == 0) {
-            if (deadline && monotonic_ns() >= deadline) res.timed_out = true; else if (watching) (void)check_watch();
-            if (killed()) ::kill(-p, SIGKILL); else sleep_ns(1000000);
+            if (!killed()) { if (deadline && monotonic_ns() >= deadline) res.timed_out = true; else if (watching) (void)check_watch(); }
+            if (killed()) {
+                if (!kill_at) kill_at = monotonic_ns();
+                detail_proc::kill_tree(p, new_session);
+                if (monotonic_ns() - kill_at > 2000000000ull) break;
+            }
+            sleep_ns(1000000);
         }
+    }
+    if (!reaped) {
+        res.unreaped = true;
+        std::thread([p] { int s2 = 0; while (::waitpid(p, &s2, 0) < 0 && errno == EINTR) {} }).detach();
+    } else {
+        res.peak_rss_bytes = detail_proc::maxrss_bytes(ru);
     }
     if (WIFEXITED(st)) res.exit_code = WEXITSTATUS(st);
     else if (WIFSIGNALED(st)) { res.term_signal = WTERMSIG(st); res.exit_code = 128 + res.term_signal; }
