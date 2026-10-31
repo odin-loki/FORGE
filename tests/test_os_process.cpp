@@ -84,6 +84,26 @@ TEST(spawn_memory_watchdog) {
     auto r = os::spawn_wait(s); CHECK(r); CHECK(r->memory_killed); CHECK(r->exit_code == 137);
 }
 #endif
+TEST(spawn_peak_rss_reported) {
+    os::spawn_spec s; s.argv = {"sh", "-c", "x=$(head -c 30000000 /dev/zero | tr '\\0' a); echo ${#x}"};
+    auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out == "30000000\n"); CHECK(r->peak_rss_bytes > (20ull << 20)); CHECK(!r->unreaped);
+}
+TEST(spawn_timeout_sweeps_session) {
+    // the grandchild moves to its own process group but stays in the session: the timeout still kills it
+    auto pidfile = std::string("/tmp/forge_sess_") + std::to_string(::getpid());
+    os::spawn_spec s; s.argv = {"sh", "-c", "(set -m; sleep 60 & echo $! > " + pidfile + "; wait) & sleep 60"};
+    s.new_session = true; s.timeout_ms = 500;
+    auto r = os::spawn_wait(s); CHECK(r); CHECK(r->timed_out); CHECK(!r->unreaped);
+    std::FILE* f = std::fopen(pidfile.c_str(), "r"); CHECK(f != nullptr);
+    long gp = 0; if (f) { CHECK(std::fscanf(f, "%ld", &gp) == 1); std::fclose(f); }
+    std::remove(pidfile.c_str());
+    bool gone = false;
+    for (int i = 0; i < 200 && !gone; ++i) { gone = gp > 0 && (::kill(pid_t(gp), 0) != 0 || [&] {  // reaped, or a zombie waiting for init
+        std::FILE* st = std::fopen(("/proc/" + std::to_string(gp) + "/stat").c_str(), "r"); if (!st) return true;
+        char b[512]{}; std::size_t n = std::fread(b, 1, sizeof b - 1, st); std::fclose(st); (void)n;
+        const char* q = std::strrchr(b, ')'); return q && q[2] == 'Z'; }()); if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(10)); }
+    CHECK(gone);
+}
 TEST(spawn_output_cap) {
     os::spawn_spec s; s.argv = {"sh", "-c", "head -c 100000 /dev/zero"}; s.max_output = 1000;
     auto r = os::spawn_wait(s); CHECK(r); CHECK(r->out.size() <= 1000); CHECK(r->truncated);
