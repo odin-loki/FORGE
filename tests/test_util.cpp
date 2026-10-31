@@ -52,8 +52,9 @@ TEST(settings_registry) {
     CHECK(kInt.get() == 7); CHECK(!kInt.is_set());
     CHECK(kSize.get() == (2ull << 30)); CHECK(kFlag.get()); CHECK(kName.get() == "abc"); CHECK(kReal.get() == 0.5);
     CHECK(S::problems().size() == 1);
-    forge_test::set_env("FORGE_TST_INT", "0x10"); CHECK(kInt.get() == 7);   // cached until reload
-    S::reload(); CHECK(kInt.get() == 16);
+    forge_test::set_env("FORGE_TST_INT", "0x10"); CHECK(kInt.get() == 16);  // a changed variable is re-read
+    forge_test::set_env("FORGE_TST_INT", nullptr); CHECK(kInt.get() == 7);  // unset: the default again
+    forge_test::set_env("FORGE_TST_INT", "0x10"); S::reload(); CHECK(kInt.get() == 16);
     CHECK(S::get_raw("FORGE_TST_NAME").value_or("") == "abc");
     CHECK_THROWS(S::get_raw("FORGE_TST_NEVER_DEFINED"));
     CHECK_THROWS(S::define<std::int64_t>("FORGE_TST_INT", 8, "conflict"));
