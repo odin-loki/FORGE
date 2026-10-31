@@ -6,13 +6,13 @@
 #include <atomic>
 #include <chrono>
 #include <vector>
-#include <pthread.h>
 #include <sstream>
 #include <cstdio>
 #include "check.hpp"
 using namespace forge;
 
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+#include <pthread.h>
 // Every FORGE fork goes through forge::os::serialized_fork (one process-wide
 // mutex), so concurrent spawn_wait calls never run pthread_atfork prepare
 // handlers at the same time. The prepare handler below fails the test if two
