@@ -3,12 +3,44 @@
 #include <forge/os/pipe.hpp>
 #include <forge/os/signal.hpp>
 #include <thread>
+#include <atomic>
+#include <chrono>
+#include <vector>
+#include <pthread.h>
 #include <sstream>
 #include <cstdio>
 #include "check.hpp"
 using namespace forge;
 
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
+// Every FORGE fork goes through forge::os::serialized_fork (one process-wide
+// mutex), so concurrent spawn_wait calls never run pthread_atfork prepare
+// handlers at the same time. The prepare handler below fails the test if two
+// forks overlap.
+namespace { std::atomic<int> g_in_fork{0}; std::atomic<int> g_overlap{0}; }
+TEST(forks_are_serialized) {
+    static bool installed = false;
+    if (!installed) {
+        installed = true;
+        ::pthread_atfork([] { if (g_in_fork.fetch_add(1) != 0) g_overlap.fetch_add(1); std::this_thread::sleep_for(std::chrono::milliseconds(1)); },
+                         [] { g_in_fork.fetch_sub(1); }, [] { g_in_fork.store(0); });
+    }
+    std::vector<std::thread> ts;
+    std::atomic<int> bad{0};
+    for (int t = 0; t < 4; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < 20; ++i) {
+                forge::os::spawn_spec sp; sp.argv = {"true"};
+                auto r = forge::os::spawn_wait(sp);
+                if (r.err || r.value.exit_code != 0) bad.fetch_add(1);
+            }
+        });
+    for (auto& t : ts) t.join();
+    CHECK(bad.load() == 0);
+    CHECK(g_overlap.load() == 0);
+    CHECK(&forge::os::fork_mutex() == &forge::os::fork_mutex());
+}
+
 TEST(spawn_captures_separately) {
     os::spawn_spec s; s.argv = {"sh", "-c", "echo out; echo err 1>&2; exit 3"};
     auto r = os::spawn_wait(s);
