@@ -1,6 +1,7 @@
 // RVV kernel table at one fixed VLEN. CMake compiles this file once per length
 // (-mrvv-vector-bits=128/256/512/1024); each copy exports forge::lane::mv_rvv<B>::table.
 #include <forge/lane/algo.hpp>
+#include <forge/lane/qdot.hpp>
 #include <forge/lane/dispatch.hpp>
 #if defined(__riscv)
 #if !defined(FORGE_HAVE_RVV_FIXED)

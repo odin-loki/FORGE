@@ -2,6 +2,7 @@
 // partition -> memory-plan -> lower -> flat plan -> replay. Plans are cached per shape bucket.
 #include <forge/flow/codecs.hpp>
 #include <forge/flow/kernels.hpp>
+#include <forge/lane/qdot.hpp>
 #include <forge/flow/kv_codec.hpp>
 #include <forge/flow/memplan.hpp>
 #include <forge/flow/passes.hpp>
@@ -94,16 +95,33 @@ inline partition_report partition(graph& g, const std::vector<grid::device>& dev
 namespace qweights {
 using codecs::codec;
 inline const codec* codec_of(const tensor_view& v) { return static_cast<const codec*>(v.qcodec); }
+inline int fmt_of(const codec* c) {
+    using lane::qfmt;
+    return int(c->name == "q8_0" ? qfmt::q8_0 : c->name == "q4_k" ? qfmt::q4_k : c->name == "q6_k" ? qfmt::q6_k
+             : c->name == "q5_k" ? qfmt::q5_k : qfmt::generic);
+}
+// Few input rows (decode): fused tile decode + dot per (row, weight row). Many rows (prefill): decode each weight
+// row once (SIMD decoders) and reuse it. Both are bit-identical to dot(x, codec.decode(row)).
 inline void gemm_nt(std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
     const auto& x = in[0]; const auto& w = in[1];
     std::size_t k = std::size_t(x.shape.back()), m = x.size() / k, n = std::size_t(w.shape[0]);
     const auto* c = codec_of(w); std::size_t rb = c->bytes(k);
+    // FORGE_QDOT=0: plain scalar codec decode + dot (the pre-SIMD path; benchmarking and bisecting)
+    static const bool native = [] { auto* e = std::getenv("FORGE_QDOT"); return !(e && std::string(e) == "0"); }();
+    int fmt = fmt_of(c);
+    bool fused = native && m <= 2 && c->block <= 256 && 256 % c->block == 0;
     task::parallel_for(n, 8, [&](std::size_t b, std::size_t e) {
+        const auto& ker = lane::active();
+        if (fused) {
+            for (std::size_t j = b; j < e; ++j)
+                for (std::size_t i = 0; i < m; ++i)
+                    out.data[i * n + j] = ker.qdot(fmt, w.qdata + j * rb, x.data + i * k, k, c->decode, c->block, c->block_bytes);
+            return;
+        }
         thread_local std::vector<float> row;
         if (row.size() < k) row.resize(k);
-        const auto& ker = lane::active();
         for (std::size_t j = b; j < e; ++j) {
-            c->decode(w.qdata + j * rb, k, row.data());
+            if (native) ker.qdecode(fmt, w.qdata + j * rb, k, row.data(), c->decode); else c->decode(w.qdata + j * rb, k, row.data());
             for (std::size_t i = 0; i < m; ++i) out.data[i * n + j] = ker.dot(x.data + i * k, row.data(), k);
         }
     });

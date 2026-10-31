@@ -1,6 +1,7 @@
 #pragma once
 // CPU feature detection (what the OS enables, not just CPUID) + dispatch table resolved once.
 #include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace forge::lane {
@@ -46,6 +47,9 @@ struct kernels {
     void (*math1)(int fn, const float*, float*, std::size_t);              // lane::fn1 ids
     void (*math2)(int fn, const float*, const float*, float*, std::size_t); // lane::fn2 ids
     float (*logsumexp)(const float*, std::size_t);
+    // quantised rows (lane/qdot.hpp): fmt is a lane::qfmt, fallback the codec's scalar decoder
+    void (*qdecode)(int, const std::uint8_t*, std::size_t, float*, void (*)(const std::uint8_t*, std::size_t, float*));
+    float (*qdot)(int, const std::uint8_t*, const float*, std::size_t, void (*)(const std::uint8_t*, std::size_t, float*), std::size_t, std::size_t);
 };
 
 const kernels& active();                // best target for this machine (FORGE_LANE_TARGET overrides)
@@ -60,5 +64,6 @@ const kernels* by_name(const char* t);  // "scalar", "avx2", "avx512"; nullptr i
         &algo::saxpy<TG>, &algo::dot<TG>, &algo::sum<TG>, &algo::softmax_row<TG>, &algo::rms_norm_row<TG>, \
         &algo::exp_n<TG>, &algo::log_n<TG>, &algo::tanh_n<TG>, &algo::sigmoid_n<TG>, &algo::silu_n<TG>, \
         &algo::gelu_n<TG>, &algo::silu_mul_n<TG>, &algo::add_n<TG>, &algo::sub_n<TG>, &algo::mul_n<TG>, \
-        &algo::gemm_nt<TG>, &algo::gemm_nn<TG>, &algo::math1_n<TG>, &algo::math2_n<TG>, &algo::logsumexp_row<TG>};                                                    \
+        &algo::gemm_nt<TG>, &algo::gemm_nn<TG>, &algo::math1_n<TG>, &algo::math2_n<TG>, &algo::logsumexp_row<TG>, \
+        &algo::qdecode<TG>, &algo::qdot<TG>};                                                    \
     }
