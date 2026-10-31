@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -96,6 +97,24 @@ extern char** environ;
 #endif
 
 namespace forge::os {
+
+// ---------------------------------------------------------------- fork
+// One process-wide lock around every fork() FORGE does (spawn_wait,
+// child::start, sandbox, exec fallback), and for an embedding program's own
+// forks: a library that registers a pthread_atfork prepare handler taking its
+// own locks (Z3's scoped_timer pool, for one) livelocks when two threads fork
+// at once. Header-only, one mutex per process (inline function, ODR).
+// POSIX only; Windows has no fork.
+#if !defined(FORGE_OS_WINDOWS)
+inline std::mutex& fork_mutex() noexcept {
+    static std::mutex m;
+    return m;
+}
+inline pid_t serialized_fork() noexcept {
+    std::lock_guard<std::mutex> lk(fork_mutex());
+    return ::fork();
+}
+#endif
 
 // ---------------------------------------------------------------- errors
 struct error { int code = 0; std::string what; explicit operator bool() const { return code != 0; } };
@@ -950,7 +969,7 @@ inline result<exec_result> run(const std::vector<std::string>& argv, bool merge_
     std::vector<char*> av; for (auto& a : argv) av.push_back(const_cast<char*>(a.c_str())); av.push_back(nullptr);
     pid_t p; int rc = 0;
 #if defined(FORGE_OS_ANDROID) && __ANDROID_API__ < 28   // posix_spawn arrives in API 28
-    p = ::fork();
+    p = serialized_fork();
     if (p == 0) { ::dup2(fds[1], 1); if (merge_stderr) ::dup2(fds[1], 2); ::close(fds[0]); ::close(fds[1]); ::execvp(av[0], av.data()); ::_exit(127); }
     if (p < 0) rc = errno;
     ::close(fds[1]);
