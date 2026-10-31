@@ -80,7 +80,12 @@ struct ps_dialect : block_dialect {
             L(var(c, g) + " = [long]$LASTEXITCODE");
             return;
         }
-        L(var(o, g) + " = (& sh -c " + pq(sh_wrapper()) + " _ " + cmd + ") -join \"`n\"");
+        // The command travels in an environment variable and the -c script has no double quotes: Windows PowerShell
+        // 5.1 (and pwsh's Legacy argument passing) hands embedded '"' to native programs unescaped, so sh lost them.
+        // IFS= and set -f keep $_FORGE_SH one unglobbed word; eval restores both before running it.
+        L("$env:_FORGE_SH = " + cmd);
+        L(var(o, g) + " = (& sh -c 'set -f; IFS=; (eval unset IFS\\; set +f\\; $_FORGE_SH); printf ''\\034%d'' $?') -join \"`n\"");
+        L("Remove-Item Env:_FORGE_SH");
         L("$_i = " + var(o, g) + ".LastIndexOf([char]0x1c)");
         L(var(c, g) + " = [long](" + var(o, g) + ".Substring($_i + 1))");
         L(var(o, g) + " = " + var(o, g) + ".Substring(0, $_i)");

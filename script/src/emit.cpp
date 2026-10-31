@@ -565,12 +565,38 @@ struct Emitter {
 std::string host_shell() {
     if (const char* e = std::getenv("FORGE_SHELL"); e && *e) return e;
 #if defined(_WIN32)
-    for (const char* s : {"pwsh", "powershell"}) if (auto* b = shells().find(s)) for (auto& x : b->exes) if (!os::find_executable(x).empty()) return s;
+    for (const char* s : {"pwsh", "powershell"}) if (auto* b = shells().find(s); b && !shell_exe(*b).empty()) return s;
     return "cmd";
 #elif defined(__ANDROID__)
-    return "mksh";
+    // /system/bin/sh is mksh, but there is usually no binary called mksh.
+    return os::find_executable("mksh").empty() ? "sh" : "mksh";
 #else
     return "sh";
+#endif
+}
+
+std::string shell_exe(const shell_backend& b) {
+#if defined(_WIN32)
+    std::string path = os::getenv("PATH");
+    for (auto& e : b.exes) {
+        if (e.find_first_of("/\\") != std::string::npos) { if (auto p = os::find_executable(e); !p.empty()) return p; continue; }
+        std::size_t i = 0;
+        while (i <= path.size()) {
+            auto j = path.find(';', i); if (j == std::string::npos) j = path.size();
+            std::string d = path.substr(i, j - i); i = j + 1;
+            if (d.empty()) continue;
+            auto p = os::find_executable(d + "\\" + e);
+            if (p.empty()) continue;
+            std::string low = p; for (auto& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+            if (e == "bash" && (low.find("\\system32\\") != std::string::npos || low.find("\\microsoft\\windowsapps\\") != std::string::npos)) continue;   // WSL relays
+            if (e == "rc" && low.find("\\windows kits\\") != std::string::npos) continue;   // the Resource Compiler, not Plan 9 rc
+            return p;
+        }
+    }
+    return {};
+#else
+    for (auto& e : b.exes) if (!os::find_executable(e).empty()) return e;
+    return {};
 #endif
 }
 

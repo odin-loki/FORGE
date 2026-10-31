@@ -723,7 +723,7 @@ TEST(emit_golden_all_shells) {
     namespace stdfs = std::filesystem;
     auto dir = stdfs::temp_directory_path() / ("forge_emit_" + std::to_string(::getpid()));
     stdfs::create_directories(dir);
-    auto avail = run("for (auto& s : forge::shells()) if (s[\"available\"] && s[\"emit\"]) std::print(\" {}={} \", s[\"name\"], s[\"exe\"]);");
+    auto avail = run("for (auto& s : forge::shells()) if (s[\"available\"] && s[\"emit\"]) std::print(\"\\t{}={}\\t\", s[\"name\"], s[\"exe\"]);");   // tabs: Windows paths have spaces
     std::string tested, refused;
     for (const char* g : {"functions", "flat", "batch"}) {
         std::string src = slurp_file("tests/data/emit/" + std::string(g) + ".cpp");
@@ -732,11 +732,14 @@ TEST(emit_golden_all_shells) {
         script::options o; std::string want; o.out = [&](std::string_view s) { want += s; };
         script::engine e(o); auto r = e.run_file(stdfs::absolute(old / "tests/data/emit" / (std::string(g) + ".cpp")).string());
         stdfs::current_path(old);
+        if (!r.ok && r.error.find("is not installed") != std::string::npos) {   // e.g. no sh on a bare Windows box
+            refused += " " + std::string(g) + "/*(" + r.error.substr(0, r.error.find('\n')) + ")"; continue;
+        }
         CHECK_MSG(r.ok, "%s interp: %s", g, r.error.c_str());
         for (auto& name : script::emit_targets()) {
-            auto at = avail.find(" " + name + "=");
+            auto at = avail.find("\t" + name + "=");
             if (at == std::string::npos) continue;
-            auto exe = avail.substr(at + name.size() + 2, avail.find(' ', at + 1) - at - name.size() - 2);
+            auto exe = avail.substr(at + name.size() + 2, avail.find('\t', at + 1) - at - name.size() - 2);
             auto full = exe;   // resolved path: the test's own shell (cmd.exe on Windows) may not share forge's PATH lookup
             exe = stdfs::path(exe).stem().string();
             std::string code;
@@ -747,7 +750,7 @@ TEST(emit_golden_all_shells) {
             auto path = (dir / (std::string(g) + "." + ext)).string();
             { std::ofstream(path, std::ios::binary) << code; }
             const char* rn = runner(exe);
-            std::string cmdline = rn ? std::string(rn) : exe;
+            std::string cmdline = rn ? std::string(rn) : "\"" + full + "\"";   // the resolved path: cmd.exe would pick System32\\bash.exe (WSL) first
             if (exe == "busybox") cmdline = "\"" + full + "\" sh";        // ash via busybox: run the binary forge found
             else if (exe == "ash") cmdline = "\"" + full + "\"";
 #if defined(_WIN32)

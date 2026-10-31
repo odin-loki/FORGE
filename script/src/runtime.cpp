@@ -886,8 +886,7 @@ Value Interp::shell(const Node& n, const std::vector<Value>& parts) {
     if (body.k == NK::Str) script = body.s;
     else for (std::size_t i = 0; i < body.kids.size() && i < parts.size(); ++i)
         script += body.kids[i]->k == NK::Str ? str(parts[i]) : quote_for(*be, str(parts[i]));
-    std::string exe;
-    for (auto& e : be->exes) if (!os::find_executable(e).empty()) { exe = e; break; }
+    std::string exe = shell_exe(*be);
     if (exe.empty()) raise("ShellError", kind + " is not installed (looked for " + [&] { std::string l; for (auto& e : be->exes) l += (l.empty() ? "'" : ", '") + e + "'"; return l; }() + " on PATH)");
     std::vector<std::string> argv = be->argv(exe, script);
     os::spawn_spec sp; sp.argv = argv; sp.max_output = sh->limits.max_output;

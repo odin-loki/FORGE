@@ -10,7 +10,12 @@ int main() { std::puts("vulkan backend not built (no vulkan headers / glslangVal
 #include <forge/mind/mind.hpp>
 #include <cmath>
 #include <filesystem>
+#if !defined(_WIN32)
 #include <unistd.h>
+#else
+#include <process.h>
+#define getpid _getpid
+#endif
 #include <random>
 using namespace forge;
 

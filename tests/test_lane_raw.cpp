@@ -1,5 +1,6 @@
 // Tier R: generated wrappers are feature-gated at compile time.
 #include "check.hpp"
+#include <forge/lane/dispatch.hpp>
 #include <forge/lane/raw/x86.gen.hpp>
 
 using namespace forge::lane;
@@ -14,7 +15,7 @@ static_assert(can_vnni<sapphire> && !can_vnni<x86_64_v4>);
 
 TEST(raw_generated_count) { CHECK(r::intrinsic_count > 200); }
 TEST(raw_avx2_executes) {
-    if (!__builtin_cpu_supports("avx2")) return;
+    if (!detect().avx2 || !detect().fma) return;
     __m256i a = _mm256_set1_epi32(20), b = _mm256_set1_epi32(22);
     __m256i c = r::avx2::mm256_add_epi32<x86_64_v3>(a, b);
     alignas(32) int out[8]; _mm256_store_si256((__m256i*)out, c);
