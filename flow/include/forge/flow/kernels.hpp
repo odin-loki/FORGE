@@ -173,7 +173,7 @@ inline kernel_fn attention() {
         const auto& ker = lane::active();
         auto kc = kv_codec(int(a.num("kv_codec_k", 0))), vc = kv_codec(int(a.num("kv_codec_v", 0)));
         if (vc != kv_codec::f32) dv = std::size_t(a.num("kv_dv", 0));
-        std::size_t kw = kc != kv_codec::f32 ? std::size_t(kv_head_words(i64(d))) : d, vw = vc != kv_codec::f32 ? std::size_t(kv_head_words(i64(dv))) : dv;
+        std::size_t kw = std::size_t(kv_head_words(i64(d), kc)), vw = std::size_t(kv_head_words(i64(dv), vc));
         if (kc != kv_codec::f32 || vc != kv_codec::f32) {   // quantised KV: decode each (row, head) on the fly
             task::parallel_for(s * hq, 1, [&](std::size_t b, std::size_t e) {
                 std::vector<float> sco(t), acc(dv), kt(d), vt(dv);

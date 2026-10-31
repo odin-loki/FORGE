@@ -3,6 +3,8 @@
 #include "tiny_model.hpp"
 #include <forge/mind/mind.hpp>
 #include <filesystem>
+#include <algorithm>
+#include <cmath>
 #include <random>
 #include <unistd.h>
 
@@ -119,6 +121,104 @@ TEST(kv_quant_vulkan) {
     auto po = rt->residency().peak_resident_bytes, pn = rt2->residency().peak_resident_bytes;
     std::printf("  peak device bytes: offload %zu, resident %zu\n", po, pn);
     CHECK(po < pn);
+#else
+    std::puts("  vulkan not built: skipped");
+#endif
+}
+
+// ---- TurboQuant (arXiv 2504.19874): random-sign FWHT rotation + Lloyd-Max scalar codes ----
+TEST(tbq_roundtrip_mse) {
+    std::mt19937 g(11); std::normal_distribution<float> nd(0, 1);
+    for (i64 d : {8, 64, 96, 128, 256}) {
+        for (auto c : {kv_codec::tbq4, kv_codec::tbq3}) {
+            double num = 0, den = 0;
+            std::vector<float> x(static_cast<std::size_t>(d)), y(static_cast<std::size_t>(d)), buf(static_cast<std::size_t>(flow::kv_head_words(d, c)));
+            for (int r = 0; r < 200; ++r) {
+                for (auto& v : x) v = nd(g) * (r % 3 == 0 ? 5.f : 1.f);
+                x[std::size_t(r) % std::size_t(d)] += 12.f;   // an outlier channel: the rotation spreads it
+                flow::kv_encode_head(x.data(), d, c, buf.data());
+                flow::kv_decode_head(buf.data(), d, c, y.data());
+                for (i64 e = 0; e < d; ++e) { num += double(x[e] - y[e]) * (x[e] - y[e]); den += double(x[e]) * x[e]; }
+            }
+            double rel = num / den;
+            std::printf("  %s d %lld: relative MSE %.4f, words/head %lld (f32 %lld)\n", c == kv_codec::tbq4 ? "tbq4" : "tbq3", (long long)d, rel,
+                        (long long)flow::kv_head_words(d, c), (long long)d);
+            // Lloyd-Max on N(0,1): 4-bit 0.0095, 3-bit 0.0345 (paper Thm 1); small d is a touch worse
+            CHECK_MSG(rel < (c == kv_codec::tbq4 ? (d < 64 ? 0.03 : 0.013) : (d < 64 ? 0.07 : 0.045)), "rel %g", rel);
+        }
+    }
+    std::vector<float> z(64, 0.f), b(std::size_t(flow::kv_head_words(64, kv_codec::tbq4))), o(64, 1.f);
+    flow::kv_encode_head(z.data(), 64, kv_codec::tbq4, b.data()); flow::kv_decode_head(b.data(), 64, kv_codec::tbq4, o.data());
+    for (float v : o) CHECK(v == 0.f);
+    auto p = flow::kv_codec_pair_from_name("k8v4");
+    CHECK(p.k == kv_codec::int8 && p.v == kv_codec::tbq4);
+    CHECK(flow::kv_codec_pair_from_name("tbq3").k == kv_codec::tbq3);
+    CHECK_THROWS(flow::kv_codec_pair_from_name("tbq9"));
+}
+
+static double kld(const std::vector<float>& p, const std::vector<float>& q) {
+    auto sm = [](const std::vector<float>& l) { float m = *std::max_element(l.begin(), l.end()); std::vector<double> o(l.size()); double s = 0;
+        for (std::size_t i = 0; i < l.size(); ++i) s += o[i] = std::exp(double(l[i] - m)); for (auto& v : o) v /= s; return o; };
+    auto a = sm(p), b = sm(q); double k = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) if (a[i] > 0) k += a[i] * std::log(a[i] / std::max(b[i], 1e-300));
+    return k;
+}
+static std::size_t argmax(const std::vector<float>& v) { return std::size_t(std::max_element(v.begin(), v.end()) - v.begin()); }
+
+static void tbq_vs_f32(const std::string& dev) {
+    for (const char* name : {"tbq4", "tbq3", "k8v4"}) {
+        auto mf = model::open(model_a()), mq = model::open(model_a());
+        if (!dev.empty()) { mf->set_device(dev); mq->set_device(dev); }
+        mind::session sf(mf), sq(mq, {.kv_codec = name});
+        auto rf = trace(sf, 24), rq = trace(sq, 24);
+        double kl = 0; std::size_t agree = 0; float w = 0;
+        for (std::size_t i = 0; i < rf.size(); ++i) { kl += kld(rf[i], rq[i]); agree += argmax(rf[i]) == argmax(rq[i]); w = std::max(w, maxdiff(rf[i], rq[i]) / maxabs(rf[i])); }
+        kl /= double(rf.size());
+        std::printf("  %s %s: mean KLD vs f32 KV %.2e, top-1 agreement %zu/%zu, max rel logit err %.2e, KV bytes %zu vs %zu\n", dev.empty() ? "cpu" : dev.c_str(), name, kl, agree,
+                    rf.size(), w, std::size_t(sq.state().bytes()), std::size_t(sf.state().bytes()));
+        CHECK(w > 0);
+        // (random tiny model: near-tied logits make KLD large in absolute terms; tbq4 ~1.5e-2, tbq3 ~4e-2 here)
+        CHECK_MSG(kl < (std::string(name) == "tbq3" ? 8e-2 : 3e-2), "kld %g", kl);
+        CHECK(agree * 10 >= rf.size() * (std::string(name) == "tbq3" ? 7 : 8));
+        CHECK(sq.state().bytes() < sf.state().bytes());
+        bool any_v = false, any_k = false;
+        for (auto& [k, sl] : sq.state().slots) {
+            i64 d = sf.state().slots.at(k).buf.shape.back();
+            CHECK(sl.buf.shape.back() == flow::kv_head_words(d, sl.codec));
+            if (std::string(name) == "k8v4") { any_k |= sl.codec == kv_codec::int8; any_v |= sl.codec == kv_codec::tbq4; }
+        }
+        if (std::string(name) == "k8v4") CHECK(any_k && any_v);
+    }
+}
+
+TEST(kv_tbq_cpu_accuracy) { tbq_vs_f32(""); }
+
+TEST(kv_tbq_cuda) {
+    std::string why;
+    if (!flow::device_registry("cuda", &why)) { std::printf("  cuda unavailable (%s): skipped\n", why.c_str()); return; }
+    tbq_vs_f32("cuda");
+    for (const char* name : {"tbq4", "tbq3", "k8v4"}) {   // CUDA fused-decode attention vs the CPU decode path, same codes
+        auto mc = model::open(model_a()), mg = model::open(model_a()); mg->set_device("cuda");
+        mind::session sc(mc, {.kv_codec = name}), sg(mg, {.kv_codec = name});
+        auto rc = trace(sc, 8), rg = trace(sg, 8);
+        float w = 0; for (std::size_t i = 0; i < rc.size(); ++i) w = std::max(w, maxdiff(rc[i], rg[i]) / maxabs(rc[i]));
+        std::printf("  cuda %s vs cpu %s: %.2e\n", name, name, w);
+        CHECK(w < 1e-3f);
+    }
+}
+
+TEST(kv_tbq_vulkan) {
+#ifdef FORGE_GRID_VULKAN
+    std::string why;
+    if (!flow::device_registry("vulkan", &why)) { std::printf("  vulkan unavailable (%s): skipped\n", why.c_str()); return; }
+    for (const char* name : {"tbq4", "tbq3", "k8v4"}) {
+        auto mc = model::open(model_a()), mv = model::open(model_a()); mv->set_device("vulkan");
+        mind::session sc(mc, {.kv_codec = name}), sv(mv, {.kv_codec = name});
+        auto rc = trace(sc, 8), rv = trace(sv, 8);
+        float w = 0; for (std::size_t i = 0; i < rc.size(); ++i) w = std::max(w, maxdiff(rc[i], rv[i]) / maxabs(rc[i]));
+        std::printf("  vulkan %s vs cpu %s: %.2e\n", name, name, w);
+        CHECK(w < 1e-3f);
+    }
 #else
     std::puts("  vulkan not built: skipped");
 #endif

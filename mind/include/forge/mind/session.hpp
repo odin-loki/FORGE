@@ -22,7 +22,7 @@ struct session_options {
     i64 context = 0;       // 0 = manifest max_position_embeddings
     bool verify = false;   // check BLAKE3 hashes on open
     i64 page_rows = 256;   // KV page size in rows; 0 = reserve the whole context up front
-    std::string kv_codec;  // "", "f32", "int8" or "fp8"; empty = $FORGE_KV_CODEC or f32
+    std::string kv_codec;  // "", "f32", "int8", "fp8", "tbq4", "tbq3" or "k8v4"; empty = $FORGE_KV_CACHE_TYPE, $FORGE_KV_CODEC or f32
     int kv_offload = -1;   // 1 = keep KV on the host, drop device copies after each attention; -1 = $FORGE_KV_OFFLOAD
 };
 
@@ -116,7 +116,7 @@ public:
 
     // plan for `n` new tokens; all_rows keeps logits for every position
     flow::plan& plan_for(i64 n, bool all_rows, flow::state_store* st, const std::string& adapter = {}) {
-        return cache_.get(std::format("{}:{}:{}:{}", all_rows ? "all" : "seq", n, adapter, st ? flow::kv_codec_name(st->codec) : "f32"), [&] {
+        return cache_.get(std::format("{}:{}:{}:{}", all_rows ? "all" : "seq", n, adapter, st ? flow::kv_codec_pair_name({st->codec, st->codec_v == flow::kv_codec::f32 ? st->codec : st->codec_v}) : "f32"), [&] {
             pack::build_options bo;
             bo.dims["seq"] = n;
             bo.all_rows = all_rows;
@@ -173,8 +173,10 @@ public:
         st_.capacity = o.context ? o.context : m_->max_context();
         st_.page_rows = o.page_rows;
         std::string kc = o.kv_codec;
+        if (kc.empty()) if (const char* e = std::getenv("FORGE_KV_CACHE_TYPE")) kc = e;
         if (kc.empty()) if (const char* e = std::getenv("FORGE_KV_CODEC")) kc = e;
-        st_.codec = flow::kv_codec_from_name(kc);
+        auto kp = flow::kv_codec_pair_from_name(kc);
+        st_.codec = kp.k; st_.codec_v = kp.v != kp.k ? kp.v : flow::kv_codec::f32;
         int off = o.kv_offload;
         if (off < 0) { const char* e = std::getenv("FORGE_KV_OFFLOAD"); off = e && *e && *e != '0'; }
         st_.offload = off != 0;

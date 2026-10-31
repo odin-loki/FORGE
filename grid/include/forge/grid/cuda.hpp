@@ -106,10 +106,11 @@ inline launch_args kernel_args(const std::string& op, const std::vector<tensor_v
         U(n); U(std::uint32_t(x.shape[ax])); U(std::uint32_t(inner)); U(std::uint32_t(st)); U(std::uint32_t(out.shape[ax])); break; }
     case sig::attention: {
         auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
+        if (std::uint32_t dd = std::uint32_t(x.shape[2]), dvv = std::uint32_t(a.num("kv_dv", 0)); (kc >= 3u && dd > 256u) || (vc >= 3u && dvv > 256u)) raise(errc::unsupported, "TurboQuant KV on the GPU supports head dims up to 256");
         std::uint32_t s = std::uint32_t(x.shape[0]), hq = std::uint32_t(x.shape[1]), d = std::uint32_t(x.shape[2]);
         U(s); U(hq); U(d); U(std::uint32_t(in[1].shape[0])); U(std::uint32_t(in[1].shape[1]));
         U(vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]));
-        U((a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 3) | (std::uint32_t(a.num("window", 0)) << 5));
+        U((a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7));
         F(float(a.num("scale", 1.0 / std::sqrt(double(d))))); L.threads = s * hq; break; }
     }
     return L;
@@ -298,10 +299,11 @@ public:
             rows = std::uint32_t(x.shape[ax]); cols = std::uint32_t(inner); k = std::uint32_t(st); u4 = std::uint32_t(out.shape[ax]); break; }
         case sig::attention: {
             auto kc = std::uint32_t(a.num("kv_codec_k", 0)), vc = std::uint32_t(a.num("kv_codec_v", 0));
+        if (std::uint32_t dd = std::uint32_t(x.shape[2]), dvv = std::uint32_t(a.num("kv_dv", 0)); (kc >= 3u && dd > 256u) || (vc >= 3u && dvv > 256u)) raise(errc::unsupported, "TurboQuant KV on the GPU supports head dims up to 256");
             rows = std::uint32_t(x.shape[0]); cols = std::uint32_t(x.shape[1]); k = std::uint32_t(x.shape[2]);
             u4 = std::uint32_t(in[1].shape[0]); u5 = std::uint32_t(in[1].shape[1]);
             u6 = vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]);
-            u7 = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 3) | (std::uint32_t(a.num("window", 0)) << 5);
+            u7 = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7);
             f0 = float(a.num("scale", 1.0 / std::sqrt(double(k)))); threads = rows * cols; break; }
         }
         std::lock_guard lk(mu_); bind();

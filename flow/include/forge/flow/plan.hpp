@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <deque>
+#include <set>
 
 namespace forge::flow {
 
@@ -27,14 +28,19 @@ struct state_store {
     // KV codec for new slots (rank-3 [rows, heads, d] slots only; others stay f32). Set before the first
     // plan is compiled against this store. Quantised slots hold [rows, heads, kv_head_words(d)] floats.
     kv_codec codec = kv_codec::f32;
+    // Value-slot codec for mixed modes (k8v4: int8 keys, tbq4 values); f32 here means "same as codec".
+    kv_codec codec_v = kv_codec::f32;
     // Host offload: drop the device copy of every slot right after the attention that reads it, so device
     // memory holds at most one layer's KV at a time (the host copy is authoritative between steps).
     bool offload = false;
     // physical row shape for a slot fed by logical rows `xs` ([rows, heads, d])
-    kv_codec codec_for(const shape_t& xs) const { return xs.size() == 3 ? codec : kv_codec::f32; }
+    kv_codec codec_for(const shape_t& xs, bool value = false) const {
+        if (xs.size() != 3) return kv_codec::f32;
+        return value && codec_v != kv_codec::f32 ? codec_v : codec;
+    }
     static shape_t physical(const shape_t& xs, kv_codec c) {
         if (c == kv_codec::f32) return xs;
-        return {xs[0], xs[1], kv_head_words(xs[2])};
+        return {xs[0], xs[1], kv_head_words(xs[2], c)};
     }
     i64 reserved_rows() const { i64 r = 0; for (auto& [k, s] : slots) r += s.capacity; return r; }
     std::size_t bytes() const { std::size_t b = 0; for (auto& [k, s] : slots) b += s.buf.data.size() * sizeof(float); return b; }
@@ -250,6 +256,13 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
                                                   case 'g': case 'G': mul = 1024.0 * 1024 * 1024; break; default: break; }
         q_budget = v > 0 ? std::size_t(v * mul) : 0;
     }
+    // state slots read as attention values (input 2): they take the store's value codec in mixed modes (k8v4)
+    std::set<value_id> value_slots;
+    for (std::size_t i = 0; i < G.size(); ++i) {
+        auto& n = G.nodes()[i];
+        if (n.kind == node_kind::op && n.op == spec::op::attention && n.inputs.size() == 3 && G.at(n.inputs[2]).kind == node_kind::state_append)
+            value_slots.insert(n.inputs[2]);
+    }
     for (std::size_t i = 0; i < G.size(); ++i) {
         auto& n = G.nodes()[i];
         auto& s = p->mem.slots[i];
@@ -271,7 +284,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             auto& sl = st->slots[n.name];
             const auto& xs = G.at(n.inputs[0]).shape;
             if (n.shape[0] > st->capacity) raise(errc::out_of_memory, "state slot '{}' exceeds capacity {}", n.name, st->capacity);
-            if (!sl.capacity) sl.codec = st->codec_for(xs);
+            if (!sl.capacity) sl.codec = st->codec_for(xs, value_slots.count(value_id(i)) != 0);
             auto ps = state_store::physical(xs, sl.codec);
             st->ensure(sl, ps, std::max<i64>(n.shape[0], 1));
             v.shape = state_store::physical(n.shape, sl.codec);
@@ -395,7 +408,7 @@ private:
                 std::size_t nphys = std::size_t(rows * row);
                 if (sl.codec != kv_codec::f32) {   // quantise on the host (the device copy of the rows is patched)
                     if (h) { h->to_host(ins[0].data, ins[0].size()); h->to_host(dst, nphys); if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
-                    i64 heads = ins[0].shape[1], d = ins[0].shape[2], hw = kv_head_words(d);
+                    i64 heads = ins[0].shape[1], d = ins[0].shape[2], hw = kv_head_words(d, sl.codec);
                     for (i64 r = 0; r < rows * heads; ++r) kv_encode_head(ins[0].data + r * d, d, sl.codec, dst + r * hw);
                     if (h) h->host_wrote(dst, nphys);
                 } else if (h && h->copy) {
