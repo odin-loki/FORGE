@@ -2,7 +2,7 @@
 // forge::os::settings: one documented table for every environment variable a program reads.
 //
 //   inline const auto& kTimeout = settings::define<std::int64_t>("PRISM_TIMEOUT_MS", 30000, "Per-query timeout");
-//   auto t = kTimeout.get();                       // parsed, defaulted, cached until settings::reload()
+//   auto t = kTimeout.get();                       // parsed, defaulted; re-parsed when the variable changes
 //   settings::markdown();                          // the table, for docs
 //   settings::undocumented("PRISM_");              // set in the environment but never defined (typos)
 //
@@ -105,12 +105,17 @@ public:
     const std::string& name() const { return name_; }
     const T& default_value() const { return dflt_; }
     bool is_set() const { return std::getenv(name_.c_str()) != nullptr; }
+    // The parsed value is cached per raw value: a setenv/unsetenv (a test's
+    // environment guard, a parent setting a child's knob) is seen by the next
+    // get(), and reload() forces a re-parse (and clears problems()).
     T get() const {
         auto& t = detail::tab();
-        { std::lock_guard g(t.m); if (gen_ == t.generation) return val_; }
+        const char* e = std::getenv(name_.c_str());
+        std::optional<std::string> raw = e ? std::optional<std::string>(e) : std::nullopt;
+        { std::lock_guard g(t.m); if (gen_ == t.generation && raw == raw_) return val_; }
         T v = dflt_;
-        if (const char* e = std::getenv(name_.c_str())) {
-            std::string s(e); bool ok = true;
+        if (raw) {
+            std::string s(*raw); bool ok = true;
             if constexpr (std::is_same_v<T, bool>) { auto p = detail::parse_bool(s); ok = bool(p); if (p) v = *p; }
             else if constexpr (std::is_same_v<T, std::uint64_t>) { auto p = detail::parse_size(s); ok = bool(p); if (p) v = *p; }
             else if constexpr (std::is_integral_v<T>) { auto p = detail::parse_int(s); ok = bool(p); if (p) v = T(*p); }
@@ -118,12 +123,12 @@ public:
             else v = T(s);
             if (!ok) { std::lock_guard g(t.m); t.problems.push_back(name_ + "=" + s + ": not a valid " + kind_name(detail::kind_of<T>()) + ", using " + detail::to_text(dflt_)); }
         }
-        std::lock_guard g(t.m); val_ = v; gen_ = t.generation; return v;
+        std::lock_guard g(t.m); val_ = v; gen_ = t.generation; raw_ = std::move(raw); return v;
     }
     operator T() const { return get(); }
 private:
     std::string name_; T dflt_;
-    mutable T val_{}; mutable unsigned gen_ = 0;
+    mutable T val_{}; mutable unsigned gen_ = 0; mutable std::optional<std::string> raw_;
 };
 template <class T> setting<T> define(std::string name, T dflt, std::string help) { return setting<T>(std::move(name), std::move(dflt), std::move(help)); }
 inline setting<std::string> define(std::string name, const char* dflt, std::string help) { return setting<std::string>(std::move(name), dflt, std::move(help)); }
