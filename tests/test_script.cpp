@@ -816,3 +816,15 @@ TEST(host_bindings) {
         CHECK(!e.call(kept, "[]").ok);
     }
 }
+
+TEST(limit_block_timeout_mem_cpu) {
+    // timeout (ms): wall clock for the block only; the outer script keeps running afterwards
+    EXPECT("try { forge::limit(std::map<std::string, int>{{\"timeout\", 30}}, [] { while (true) {} }); } catch (const std::exception& e) { std::println(\"t\"); } std::println(\"after\");", "t\nafter\n");
+    EXPECT("forge::limit(std::map<std::string, int>{{\"timeout\", 30}}, [] { while (true) {} });", "!TimeoutError");
+    // cpu_s: CPU time of the running thread
+    EXPECT("forge::limit(std::map<std::string, double>{{\"cpu_s\", 0.05}}, [] { while (true) {} });", "!LimitExceededError");
+    EXPECT("int r = forge::limit(std::map<std::string, double>{{\"cpu_s\", 5.0}}, [] { return 41 + 1; }); std::println(\"{}\", r);", "42\n");
+    // mem (bytes): the heap may grow by at most this much inside the block
+    EXPECT("forge::limit(std::map<std::string, int>{{\"mem\", 65536}}, [] { std::vector<std::string> v; for (int i = 0; i < 100000; ++i) v.push_back(std::string(64, 'x')); });", "!OutOfMemoryError");
+    EXPECT("forge::limit(std::map<std::string, int>{{\"mem\", 1048576}}, [] { std::vector<int> v; v.push_back(1); std::println(\"ok\"); });", "ok\n");
+}

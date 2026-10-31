@@ -128,7 +128,9 @@ int main() {
 
 - Scripts and modules are compiled to a **compact, verified stack bytecode** (NETMF uses a compact IL
   interpreter for the same reasons: small footprint, fast startup, no JIT, predictable on small
-  devices). A `.fsc` bytecode cache next to the source is **planned, not implemented**: nothing is cached between runs.
+  devices). Bytecode is compiled in memory on each run. **Not implemented:** an on-disk `.fsc` bytecode
+  cache (keyed by content hash and VM version) was planned. Compilation is fast enough that it has not
+  been needed, and loading untrusted bytecode from disk would widen the attack surface.
 - The **REPL and `eval`** use a direct **AST tree-walker** path: no compile step, best error locations,
   instant feedback. Functions are compiled to bytecode lazily once called `jit_threshold` times (default 2, `script::options`;
   `script/src/runtime.cpp`), so hot REPL code also runs on the VM.
@@ -203,7 +205,7 @@ int main() {
 - Built-ins are thin C++ bindings over `forge::os` (fs, proc, net, time, env, registry) and return
   handles or plain values; native resources never appear as raw addresses.
 - The managed heap uses a `forge::mem` allocator: every object allocation is charged to the script's
-  memory budget (`FORGE_MEM_LIMIT`, `forge script --heap BYTES`, or `forge::limit({mem: BYTES}, fn)`). When an allocation
+  memory budget (`FORGE_MEM_LIMIT`, `forge script --heap BYTES`, or `forge::limit({{"mem", bytes}}, fn)`). When an allocation
   would exceed the budget the runtime first evicts caches and runs the cycle collector, then throws a
   catchable `OutOfMemoryError` instead of being OOM-killed. A small reserve is kept so handlers and
   `finally` blocks can still run.
@@ -211,14 +213,16 @@ int main() {
 
 ### Resource limits
 
-Implemented (`Limits` in `script/src/interp.hpp`, CLI `--timeout MS`, `--max-steps N`, `--heap BYTES`):
+`forge::limit(opts, fn)` runs `fn` with narrower limits and restores them afterwards. The keys are
+`timeout` (wall-clock ms, raising `TimeoutError`), `cpu_s` (CPU seconds of the running thread, raising
+`LimitExceededError`), `mem` (extra heap bytes, raising `OutOfMemoryError`), and `proc_mem` / `proc_cpu`
+(OS limits for child processes started inside the block). Example:
+`forge::limit(std::map<std::string, double>{{"timeout", 500}, {"cpu_s", 0.2}}, [] { work(); });`
+
+Also implemented (`Limits` in `script/src/interp.hpp`; CLI `--timeout MS`, `--max-steps N`, `--heap BYTES`):
 step count, wall-clock timeout, managed-heap cap, call depth (default 800, checked so the C++ stack is
-safe) and per-child output size (64 MiB). `forge::limit(opts, fn)` narrows these for one call:
-`timeout` (ms), `mem` (bytes, integer), `proc_mem` and `proc_cpu` (child memory bytes / CPU seconds,
-applied at spawn through `forge::os` process limits). Exceeding a limit raises `LimitExceededError`,
-`TimeoutError` or `OutOfMemoryError`. **Planned, not implemented:** `limit {}` block syntax, string sizes
-such as `"2G"`, allocation-count, open-handle and child-count limits; unknown keys (e.g. `cpu_s`) are ignored.
-Tested by `tests/script/limits.fs`.
+safe) and per-child output size (64 MiB). Tested by `tests/script/limits.fs`. **Planned, not implemented:**
+`limit {}` block syntax, string sizes such as `"2G"`, allocation-count, open-handle and child-count limits.
 
 ### Interpreter implementation rules (safe ISO C++23)
 
@@ -356,7 +360,7 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 ## Higher-level features (approved, all in scope)
 
 1. **Parallel tasks** — `spawn fn`, `await`, `parallel(list, fn, n)`; thread pool from `forge::os`.
-2. **Resource-limited runs** — `forge::limit(opts, fn)` with an options map of integers (`mem` bytes, `timeout` ms, `proc_mem`, `proc_cpu`) (block syntax `limit {...} {}` is planned) applies to
+2. **Resource-limited runs** — `forge::limit(opts, fn)` with an options map (`timeout` ms, `cpu_s`, `mem` bytes, `proc_mem`, `proc_cpu`) (block syntax `limit {...} {}` is planned) applies to
    child processes (cgroups / Job Objects) and to script work via the `forge::mem` budget, so
    jobs fail cleanly instead of OOM-killing the box.
 3. **Job pipelines** — declare steps with dependencies (`job build after fetch { }`), run as a DAG,
@@ -514,7 +518,7 @@ All phases are in scope.
 
 1. **Core runtime**: value model, ARC heap on `forge::mem`, weak refs, exceptions, lexer/parser,
    tree-walker, REPL, `run` + `sh/bash/zsh/ps/cmd` blocks, fs/os/json built-ins, `using`/`defer`.
-2. **Bytecode VM**: compiler, verifier, lazy compilation and dual-path golden tests are done; the `.fsc` cache is planned;
+2. **Bytecode VM**: compiler, verifier, lazy REPL compilation, dual-path golden tests (the `.fsc` disk cache was dropped; see Execution model);
    classes, structs, interfaces, optional annotations and generics-lite.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).

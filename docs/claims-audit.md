@@ -74,3 +74,9 @@ Pass 3 corrections: 1.
 | .fsc cache | still absent | no "fsc" in script/src |
 Pass 3 corrections total: 5 (example literal, lazy compile, goldens, fuzz, limit test).
 Unverified: ASan/UBSan/TSan "CI jobs" (no workflow in repo; CI branch pending Odin); non-Linux sandbox behaviour; line-by-line claims in lane/grid/mind/balance/format/mobile/text-locale docs and FORGE_PLAN prose.
+
+## Pass 3 addendum 2 (after merging main 9a0b4e2, PR #10)
+- `cpu_s` now implemented (builtins.cpp:348, os::thread_cpu_time_ns); docs list it. Earlier "cpu_s ignored" note superseded.
+- PR #10 reintroduced "recursion depth default 10 000" and "--mem-limit" for scripts in the resolved section; both re-checked FALSE (interp.hpp:15 = 800; apps/forge.cpp script options) and kept corrected.
+- `.fsc` described as dropped (PR #10 wording) in scripting.md and STATUS.md.
+- Removed stray build2.log / ctest.log committed to main by PR #10.
