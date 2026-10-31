@@ -194,7 +194,7 @@ int main() {
   from `Error`. Exceptions carry message, type, script stack trace and optional `cause`.
 - Built-in hierarchy: `Error` > `IOError`, `OSError` (with `errno`/`win32` code), `TypeError`,
   `IndexError`, `KeyError`, `OverflowError`, `ObjectDisposedError`, `ShellError`, `LimitExceededError`.
-- OS errors (as in Python, all under `OSError`, so `catch (OSError e)` gets every one): `PermissionError`
+- OS errors (as in Python, all under `OSError`, so `catch (const OSError& e)` gets every one): `PermissionError`
   (and its subclass `SandboxViolationError`), `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError`,
   `FileNotFoundError`, `FileExistsError`, `NotADirectoryError`, `IsADirectoryError`, `NotSupportedError`,
   `InterruptedError`, `BlockingIOError`, `ProcessLookupError`, `NoSpaceError`, `TooManyFilesError`, `BusyError`,
@@ -439,7 +439,8 @@ worker with a JSON-representable argument and result:
 auto pp = ProcessPool(4);                                   // capabilities default to off
 auto f = pp.submit("auto task(auto x) { return x * x; }", 7);
 f.get();                                                     // 49; f.get(timeout_ms), f.done()
-pp.map("auto task(auto x) { return x + 1; }", [1, 2, 3]);    // [2, 3, 4]
+std::vector<int> xs = {1, 2, 3};
+pp.map("auto task(auto x) { return x + 1; }", xs);          // [2, 3, 4]
 pp.shutdown();                                               // also pp.size(), pp.resize(n)
 ```
 
