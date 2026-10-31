@@ -199,7 +199,7 @@ public:
     }
 
     // ---- graphs: capture the stream's work between capture_begin/capture_end and replay it ----
-    void capture_begin() { std::lock_guard lk(mu_); need_graphs(); bind(); ck(f_.capture_begin(stream_, 0), "stream begin capture"); }
+    void capture_begin() { std::lock_guard lk(mu_); need_graphs(); bind(); ck(f_.capture_begin(stream_, 2 /* RELAXED: run_op may allocate an output buffer while capturing */), "stream begin capture"); }
     std::size_t capture_end() {
         std::lock_guard lk(mu_); need_graphs(); bind();
         void* g = nullptr; ck(f_.capture_end(stream_, &g), "stream end capture");
