@@ -439,7 +439,7 @@ void install_builtins(Shared& sh) {
 #else
         int fd[2]; if (::pipe(fd) != 0) raise_last_os(in, "sandbox isolate: pipe");
         std::fflush(stdout); std::fflush(stderr);
-        pid_t pid = ::fork();
+        pid_t pid = forge::os::serialized_fork();
         if (pid < 0) { int e = errno; ::close(fd[0]); ::close(fd[1]); errno = e; raise_last_os(in, "sandbox isolate: fork"); }
         if (pid == 0) {
             ::close(fd[0]);
