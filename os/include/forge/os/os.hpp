@@ -689,6 +689,15 @@ inline std::uint64_t cpu_time_ns() {   // this process, user + system
     timespec ts; ::clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts); return std::uint64_t(ts.tv_sec) * 1000000000ull + std::uint64_t(ts.tv_nsec);
 #endif
 }
+inline std::uint64_t thread_cpu_time_ns() {   // the calling thread, user + system
+#if defined(FORGE_OS_WINDOWS)
+    FILETIME c, e, k, u; GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u);
+    auto v = [](FILETIME f) { return (std::uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    return (v(k) + v(u)) * 100;
+#else
+    timespec ts; ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts); return std::uint64_t(ts.tv_sec) * 1000000000ull + std::uint64_t(ts.tv_nsec);
+#endif
+}
 inline void sleep_ns(std::uint64_t ns) {
 #if defined(FORGE_OS_WINDOWS)
     Sleep(DWORD((ns + 999999) / 1000000));

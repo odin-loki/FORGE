@@ -128,7 +128,9 @@ int main() {
 
 - Scripts and modules are compiled to a **compact, verified stack bytecode** (NETMF uses a compact IL
   interpreter for the same reasons: small footprint, fast startup, no JIT, predictable on small
-  devices). Bytecode is cached as `.fsc` next to the source (keyed by content hash and VM version).
+  devices). Bytecode is compiled in memory on each run. **Not implemented:** an on-disk `.fsc` bytecode
+  cache (keyed by content hash and VM version) was planned. Compilation is fast enough that it has not
+  been needed, and loading untrusted bytecode from disk would widen the attack surface.
 - The **REPL and `eval`** use a direct **AST tree-walker** path: no compile step, best error locations,
   instant feedback. Functions defined at the REPL are compiled to bytecode lazily once called N times
   (default 2), so hot REPL code also runs on the VM.
@@ -197,7 +199,7 @@ int main() {
 - Built-ins are thin C++ bindings over `forge::os` (fs, proc, net, time, env, registry) and return
   handles or plain values; native resources never appear as raw addresses.
 - The managed heap uses a `forge::mem` allocator: every object allocation is charged to the script's
-  memory budget (`FORGE_MEM_LIMIT`, `--mem-limit`, or a `limit {mem: ...}` block). When an allocation
+  memory budget (`FORGE_MEM_LIMIT`, `--mem-limit`, or a `forge::limit({{"mem", bytes}}, [] { ... })` block). When an allocation
   would exceed the budget the runtime first evicts caches and runs the cycle collector, then throws a
   catchable `OutOfMemoryError` instead of being OOM-killed. A small reserve is kept so handlers and
   `finally` blocks can still run.
@@ -205,7 +207,13 @@ int main() {
 
 ### Resource limits
 
-Per script, per task, or per `limit {}` block: heap bytes, total allocations, instruction count /
+`forge::limit(opts, fn)` runs `fn` with narrower limits and restores them afterwards. The keys are
+`timeout` (wall-clock ms, raising `TimeoutError`), `cpu_s` (CPU seconds of the running thread, raising
+`LimitExceededError`), `mem` (extra heap bytes, raising `OutOfMemoryError`), and `proc_mem` / `proc_cpu`
+(OS limits for child processes started inside the block). Example:
+`forge::limit(std::map<std::string, double>{{"timeout", 500}, {"cpu_s", 0.2}}, [] { work(); });`
+
+Per script (engine options), per task, or per `forge::limit` block: heap bytes, total allocations, instruction count /
 CPU time, wall-clock timeout, recursion depth (default 10 000 frames, checked, never a C++ stack
 overflow), open handles, child processes, and output size. Child processes get OS limits (cgroups v2,
 Job Objects, setrlimit). Exceeding any limit throws `LimitExceededError` (or `OutOfMemoryError`).
@@ -499,7 +507,7 @@ All phases are in scope.
 
 1. **Core runtime**: value model, ARC heap on `forge::mem`, weak refs, exceptions, lexer/parser,
    tree-walker, REPL, `run` + `sh/bash/zsh/ps/cmd` blocks, fs/os/json built-ins, `using`/`defer`.
-2. **Bytecode VM**: compiler, verifier, `.fsc` cache, lazy REPL compilation, dual-path golden tests;
+2. **Bytecode VM**: compiler, verifier, lazy REPL compilation, dual-path golden tests (the `.fsc` disk cache was dropped; see Execution model);
    classes, structs, interfaces, optional annotations and generics-lite.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).

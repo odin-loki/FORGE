@@ -155,9 +155,9 @@ Value run_process(Interp& in, Args& a) {
 
 // run fn(args) with narrowed limits, restoring them afterwards (RAII)
 struct Scope {
-    Interp& in; Caps caps; std::uint64_t mem, cpu, to, dl, cap;
-    explicit Scope(Interp& i) : in(i), caps(i.caps), mem(i.child_mem), cpu(i.child_cpu_s), to(i.child_timeout_ms), dl(i.deadline_ns), cap(Heap::instance().soft_cap()) {}
-    ~Scope() { in.caps = caps; in.child_mem = mem; in.child_cpu_s = cpu; in.child_timeout_ms = to; in.deadline_ns = dl; Heap::instance().set_soft_cap(cap); }
+    Interp& in; Caps caps; std::uint64_t mem, cpu, to, dl, cdl, cap;
+    explicit Scope(Interp& i) : in(i), caps(i.caps), mem(i.child_mem), cpu(i.child_cpu_s), to(i.child_timeout_ms), dl(i.deadline_ns), cdl(i.cpu_deadline_ns), cap(Heap::instance().soft_cap()) {}
+    ~Scope() { in.caps = caps; in.child_mem = mem; in.child_cpu_s = cpu; in.child_timeout_ms = to; in.deadline_ns = dl; in.cpu_deadline_ns = cdl; Heap::instance().set_soft_cap(cap); }
 };
 
 } // namespace
@@ -345,6 +345,7 @@ void install_builtins(Shared& sh) {
         auto& o = m_of(in, a[0], "limit");
         if (auto* v = o.find_str("timeout")) { auto d = os::monotonic_ns() + std::uint64_t(f_of(in, *v, "timeout") * 1e6); in.deadline_ns = in.deadline_ns ? std::min(in.deadline_ns, d) : d; in.child_timeout_ms = std::uint64_t(f_of(in, *v, "timeout")); }
         if (auto* v = o.find_str("mem")) { auto cap = Heap::instance().live_bytes() + std::uint64_t(i_of(in, *v, "mem")); auto old = Heap::instance().soft_cap(); Heap::instance().set_soft_cap(old ? std::min(old, cap) : cap); }
+        if (auto* v = o.find_str("cpu_s")) { auto d = os::thread_cpu_time_ns() + std::uint64_t(f_of(in, *v, "cpu_s") * 1e9); in.cpu_deadline_ns = in.cpu_deadline_ns ? std::min(in.cpu_deadline_ns, d) : d; }
         if (auto* v = o.find_str("proc_mem")) in.child_mem = std::uint64_t(i_of(in, *v, "proc_mem"));
         if (auto* v = o.find_str("proc_cpu")) in.child_cpu_s = std::uint64_t(i_of(in, *v, "proc_cpu"));
         Args none; return in.call(a[1], none);
