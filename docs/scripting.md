@@ -128,9 +128,27 @@ int main() {
 
 - Scripts and modules are compiled to a **compact, verified stack bytecode** (NETMF uses a compact IL
   interpreter for the same reasons: small footprint, fast startup, no JIT, predictable on small
-  devices). Bytecode is compiled in memory on each run. **Not implemented:** an on-disk `.fsc` bytecode
-  cache (keyed by content hash and VM version) was planned. Compilation is fast enough that it has not
-  been needed, and loading untrusted bytecode from disk would widen the attack surface.
+  devices). Bytecode is compiled in memory from the parsed, resolved program on each run.
+- **`.fsc` cache** (`script/src/fsc.cpp`). `run_file()` can cache the parsed and resolved program (the
+  input to the bytecode compiler: bytecode chunks reference AST nodes for delegated statements, so the
+  tree is what is stored) and skip lexing, parsing and resolution on later runs. Enable it with
+  `options::fsc_cache_dir`, `forge script --cache-dir DIR`, or `$FORGE_SCRIPT_CACHE`; off otherwise.
+  - File: `<dir>/<key>.fsc`, key = BLAKE3(`"forge-fsc\0"` ‖ VM version ‖ canonical file name ‖ source).
+    A changed source, name or VM version gives a different key, so stale files are never used.
+  - Load checks: magic, VM version, the key recomputed from the current source, every length and count
+    bounds-checked, node kinds range-checked, nesting capped at 4096, no trailing bytes. Any failure means
+    the source is parsed normally; a bad cache can cost time but not change behaviour. The decoded chunks
+    still go through the bytecode verifier.
+  - Signing: with `options::fsc_sign_seed` / `--cache-sign-seed HEX` / `$FORGE_SCRIPT_CACHE_SIGN_SEED`
+    (32-byte Ed25519 seed) the files written are signed over `"forge-fsc-v1"` ‖ key ‖ BLAKE3(payload). A
+    signed file loads only if the signature verifies and the signer is in `fsc_trusted_keys` /
+    `--cache-trust HEX` (the engine's own signing key is trusted automatically).
+  - Unsigned files load only from a directory owned by the current user and not writable by group or
+    other (POSIX), and never on Windows; `fsc_require_signed` / `--cache-require-signed` rejects them
+    everywhere. That matters because the decoder trusts resolved slot numbers: anyone who can write the
+    cache directory could otherwise feed the tree-walker a crafted tree.
+  - `engine::cache_status()` reports `off`, `hit`, `miss (stored): <reason>` or `miss: <reason>`.
+  - Bump `fsc::vm_version` whenever `Node`, `FnDecl`, `ClassDecl` or the compiler change meaning.
 - The **REPL and `eval`** use a direct **AST tree-walker** path: no compile step, best error locations,
   instant feedback. Functions defined at the REPL are compiled to bytecode lazily once called N times
   (default 2), so hot REPL code also runs on the VM.
@@ -373,9 +391,26 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
    AF_UNIX; `--no-proc` → deny exec; `--no-fs` → deny file writes (reads are blocked by the interpreter
    only). It is on by default (`options::os_sandbox = best_effort`; `forge script --os-sandbox
    off|best-effort|require`), is one-way, and `engine::sandbox_status()` reports the mechanism or the
-   failure. Limits: Windows can only block child processes in-process; inner `sandbox({...}) { }` blocks
-   are interpreter-only (the OS sandbox cannot be narrowed per block); `forge rpc-serve
-   --script-no-*` keeps interpreter checks only, because the server shares the process.
+   failure.
+   - **Per-block OS sandbox:** `sandbox({net: false, isolate: true}) { ... }` runs the block in a forked
+     child that applies the narrower OS policy (only the capabilities the block turns off) and sends back
+     the block's return value (JSON-representable values only), its `print` output and any exception
+     (re-raised with its type). The child works on a copy of the heap, so assignments to captured
+     variables, globals and objects inside the block are not seen afterwards. Without `isolate` a block is
+     interpreter-only: an OS sandbox is process-wide and one-way, so it cannot be narrowed for a block and
+     then widened again in the same process. `isolate` is POSIX only (Windows and iOS have no `fork`;
+     there it raises `PermissionError` without running the block). Forking a process with other running
+     threads copies only the calling thread: avoid `isolate` while tasks hold locks the block needs.
+   - **rpc-serve:** each remote script runs in its own child (`forge script --rpc-child`, source on
+     stdin) under `--script-timeout`, a `--script-mem-mb` memory cap (default 2048), and with
+     `--os-sandbox require` whenever a `--script-no-*` flag is set, so the OS sandbox applies to remote
+     scripts without touching the server's sockets. Scripts can now run concurrently.
+   - **Windows:** a running process cannot drop fs/net access, so in-process enforcement is the job
+     object (no child processes) and the interpreter checks the rest. `os::run_sandboxed` starts children
+     in an AppContainer (no network capability unless allowed, writes only to the container folder, user
+     files unreadable unless their ACL grants ALL APPLICATION PACKAGES) inside a kill-on-close job with UI
+     limits; an exec-only policy uses a restricted token in the job. rpc-serve children on Windows use
+     `best-effort`. Not yet run on Windows (cross-compiled with llvm-mingw only).
 
 ## AI-assisted commands (implemented)
 
@@ -516,7 +551,7 @@ All phases are in scope.
 
 1. **Core runtime**: value model, ARC heap on `forge::mem`, weak refs, exceptions, lexer/parser,
    tree-walker, REPL, `run` + `sh/bash/zsh/ps/cmd` blocks, fs/os/json built-ins, `using`/`defer`.
-2. **Bytecode VM**: compiler, verifier, lazy REPL compilation, dual-path golden tests (the `.fsc` disk cache was dropped; see Execution model);
+2. **Bytecode VM**: compiler, verifier, lazy REPL compilation, dual-path golden tests, the `.fsc` cache (see Execution model);
    classes, structs, interfaces, optional annotations and generics-lite.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).

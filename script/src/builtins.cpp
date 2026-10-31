@@ -23,6 +23,11 @@
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
 #include <forge/os/signal.hpp>
+#include <forge/os/sandbox.hpp>
+#if !defined(_WIN32)
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 #include <forge/task/pool.hpp>
 #include <algorithm>
 #include <cmath>
@@ -365,8 +370,50 @@ void install_builtins(Shared& sh) {
         Scope s(in);
         auto& o = m_of(in, a[0], "sandbox");
         auto flag = [&](const char* k, bool& cap) { if (auto* v = o.find_str(k)) cap = cap && Interp::truthy(*v); };   // can only narrow
+        Caps before = in.caps;
         flag("fs", in.caps.fs); flag("net", in.caps.net); flag("proc", in.caps.proc); flag("env", in.caps.env); flag("reflect", in.caps.reflect);
-        Args none; return in.call(a[1], none);
+        const Value* iso = o.find_str("isolate");
+        if (!iso || !Interp::truthy(*iso)) { Args none; return in.call(a[1], none); }
+        // isolate: true — run the block in a forked child under a narrower OS sandbox (docs/scripting.md
+        // "Per-block OS sandbox"). The child gets a copy of the heap: changes to captured variables, globals and
+        // objects stay in the child; the block's return value (JSON-representable values only) and its print()
+        // output come back over a pipe, and an exception is re-raised here with its type and message.
+        os::sandbox_policy pol;
+        pol.deny_network = before.net && !in.caps.net; pol.deny_exec = before.proc && !in.caps.proc; pol.deny_fs_write = before.fs && !in.caps.fs;
+#if defined(_WIN32) || defined(FORGE_OS_IOS)
+        in.raise("PermissionError", "sandbox({isolate: true}) needs fork(), which this platform does not have; the block was not run");
+        return Value{};
+#else
+        int fd[2]; if (::pipe(fd) != 0) in.raise("OSError", "sandbox isolate: pipe failed");
+        std::fflush(stdout); std::fflush(stderr);
+        pid_t pid = ::fork();
+        if (pid < 0) { ::close(fd[0]); ::close(fd[1]); in.raise("OSError", "sandbox isolate: fork failed"); }
+        if (pid == 0) {
+            ::close(fd[0]);
+            json::object res; std::string out;
+            in.sh->out = [&out](std::string_view t) { if (out.size() < (16u << 20)) out += t; };
+            auto st = os::apply_sandbox(pol);
+            if (!st) { res.emplace_back("ok", false); res.emplace_back("type", std::string("SandboxViolationError")); res.emplace_back("msg", "OS sandbox could not be applied in the isolated block: " + st.err.what); }
+            else try { Args none; Value v = in.call(a[1], none); res.emplace_back("ok", true); res.emplace_back("value", to_json(in, v)); }
+            catch (...) { auto se = in.from_cpp(std::current_exception()); auto* inst = as<Instance>(se.v); res.emplace_back("ok", false); res.emplace_back("type", std::string(inst ? inst->cls->name : "Error")); res.emplace_back("msg", se.msg); }
+            res.emplace_back("out", out);
+            std::string bytes; try { bytes = json::dump(json::value(std::move(res))); } catch (...) { bytes = "{\"ok\":false,\"type\":\"ValueError\",\"msg\":\"isolated block result is not JSON-representable\"}"; }
+            for (std::size_t w = 0; w < bytes.size();) { auto n = ::write(fd[1], bytes.data() + w, bytes.size() - w); if (n <= 0) { if (errno == EINTR) continue; break; } w += std::size_t(n); }
+            ::_exit(0);
+        }
+        ::close(fd[1]);
+        std::string buf; char tmp[65536];
+        for (;;) { auto n = ::read(fd[0], tmp, sizeof tmp); if (n < 0 && errno == EINTR) continue; if (n <= 0) break; buf.append(tmp, std::size_t(n)); }
+        ::close(fd[0]);
+        int wst = 0; while (::waitpid(pid, &wst, 0) < 0 && errno == EINTR) {}
+        if (buf.empty()) in.raise("SandboxViolationError", WIFSIGNALED(wst) ? "isolated block killed by signal " + std::to_string(WTERMSIG(wst)) : std::string("isolated block exited without a result"));
+        json::value r; try { r = json::parse(buf); } catch (const std::exception& e) { in.raise("RuntimeError", std::string("sandbox isolate: bad child reply: ") + e.what()); }
+        if (!r.is_obj()) in.raise("RuntimeError", "sandbox isolate: bad child reply");
+        if (auto o2 = r.str_or("out", ""); !o2.empty()) in.sh->out(o2);
+        auto* okp = r.find("ok");
+        if (!okp || !okp->is_bool() || !okp->b()) { std::string ty = r.str_or("type", "Error"); in.raise(in.sh->errors.count(ty) ? ty : "Error", r.str_or("msg", "")); }
+        auto* vp = r.find("value"); return vp ? from_json(*vp) : Value{};
+#endif
     });
 
     // ------------------------------------------------ gc / mem (forge::mem)

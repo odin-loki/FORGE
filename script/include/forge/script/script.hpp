@@ -31,6 +31,16 @@ struct options {
     // ForgeScript treats this as a core guarantee: it is on by default whenever a capability is turned off.
     enum class os_sandbox_mode { off, best_effort, require };
     os_sandbox_mode os_sandbox = os_sandbox_mode::best_effort;
+    // .fsc cache (docs/scripting.md "Bytecode cache"): run_file() stores the parsed, resolved program under
+    // <dir>/<BLAKE3 key>.fsc and reuses it while the source, file name and VM version are unchanged.
+    // Empty dir = $FORGE_SCRIPT_CACHE, and if that is unset the cache is off. Unsigned cache files are trusted
+    // only from a directory owned by the current user and not writable by group/other (POSIX); otherwise, or
+    // with fsc_require_signed, only files signed by one of fsc_trusted_keys (Ed25519 public keys, hex) load.
+    // fsc_sign_seed (32-byte Ed25519 seed, hex; or $FORGE_SCRIPT_CACHE_SIGN_SEED) signs the files written.
+    std::string fsc_cache_dir;
+    std::vector<std::string> fsc_trusted_keys;
+    bool fsc_require_signed = false;
+    std::string fsc_sign_seed;
     std::vector<std::string> argv;      // visible to scripts as `args`
     std::function<void(std::string_view)> out;   // print(); default stdout
     // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = use FORGE_AI_ENDPOINT
@@ -65,6 +75,8 @@ public:
     std::string stats();
     // What os_sandbox did: e.g. "seccomp", "pledge", "off", or "failed: <reason>".
     const std::string& sandbox_status() const;
+    // What the .fsc cache did on the last run_file(): "off", "hit", "miss (stored)", "miss: <reason>".
+    const std::string& cache_status() const;
 
     // ---- host bindings (embedding): native C++ functions callable from scripts, and script callbacks the host
     // can invoke later. Values cross as JSON text, like the plugin ABI (plugin.h). A script function passed as an

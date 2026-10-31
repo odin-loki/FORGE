@@ -6,9 +6,16 @@
 //   OpenBSD (bonus): pledge().  macOS: sandbox_init named profiles (no-network / no-write / pure-computation);
 //   App Sandbox is detected from APP_SANDBOX_CONTAINER_ID.  iOS: apps are always sandboxed; apply() reports that.
 //   Windows: the current process joins a job object (ActiveProcessLimit=1 blocks child processes; network and
-//   filesystem denial need a restricted token, so run_sandboxed() starts children with CreateRestrictedToken +
-//   low integrity inside a kill-on-close job).
+//   filesystem denial cannot be added to a running process, so run_sandboxed() starts children in an
+//   AppContainer (no network capability unless allowed; writes only to the container folder) inside a
+//   kill-on-close job with UI limits, or, for an exec-only policy, with a restricted token in the job).
 #include <forge/os/detail.hpp>
+#if defined(_WIN32)
+#include <userenv.h>   // CreateAppContainerProfile (link userenv)
+#if defined(_MSC_VER)
+#pragma comment(lib, "userenv.lib")
+#endif
+#endif
 #if defined(__linux__)
 #include <sys/prctl.h>
 #include <linux/seccomp.h>
@@ -145,28 +152,57 @@ inline status apply_sandbox(const sandbox_policy& p) {
 inline result<int> run_sandboxed(const std::vector<std::string>& argv, const sandbox_policy& p) {
     if (argv.empty()) return {-1, {22, "run_sandboxed: empty argv"}};
 #if defined(FORGE_OS_WINDOWS)
-    HANDLE tok = nullptr, rt = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &tok)) return {-1, last_error("OpenProcessToken")};
-    BOOL ok = CreateRestrictedToken(tok, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr, 0, nullptr, &rt); CloseHandle(tok);
-    if (!ok) return {-1, last_error("CreateRestrictedToken")};
-    if (p.deny_fs_write || p.deny_network) {   // low integrity: no writes outside low-integrity locations
-        SID_IDENTIFIER_AUTHORITY ma = SECURITY_MANDATORY_LABEL_AUTHORITY; PSID low = nullptr;
-        if (AllocateAndInitializeSid(&ma, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &low)) {
-            TOKEN_MANDATORY_LABEL tml{}; tml.Label.Attributes = SE_GROUP_INTEGRITY; tml.Label.Sid = low;
-            SetTokenInformation(rt, TokenIntegrityLevel, &tml, DWORD(sizeof tml + GetLengthSid(low))); FreeSid(low);
-        }
-    }
-    HANDLE j = CreateJobObjectW(nullptr, nullptr);
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{}; li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | (p.deny_exec ? JOB_OBJECT_LIMIT_ACTIVE_PROCESS : 0);
+    // Job object for every child: kill-on-close, no breakaway, UI limits; ActiveProcessLimit=1 when exec is denied.
+    HANDLE j = CreateJobObjectW(nullptr, nullptr); if (!j) return {-1, last_error("CreateJobObject")};
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION | (p.deny_exec ? JOB_OBJECT_LIMIT_ACTIVE_PROCESS : 0);
     li.BasicLimitInformation.ActiveProcessLimit = 1; SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li);
+    JOBOBJECT_BASIC_UI_RESTRICTIONS ui{}; ui.UIRestrictionsClass = JOB_OBJECT_UILIMIT_DESKTOP | JOB_OBJECT_UILIMIT_EXITWINDOWS | JOB_OBJECT_UILIMIT_GLOBALATOMS | JOB_OBJECT_UILIMIT_HANDLES | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS;
+    SetInformationJobObject(j, JobObjectBasicUIRestrictions, &ui, sizeof ui);
     std::wstring cmd; for (auto& a : argv) { if (!cmd.empty()) cmd += L' '; cmd += L'"' + widen(a) + L'"'; }
-    STARTUPINFOW si{}; si.cb = sizeof si; PROCESS_INFORMATION pi{};
-    if (!CreateProcessAsUserW(rt, nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
-        auto e = last_error("CreateProcessAsUser"); CloseHandle(rt); CloseHandle(j); return {-1, e};
+    PROCESS_INFORMATION pi{};
+    if (p.deny_fs_write || p.deny_network) {
+        // AppContainer: the child gets a per-policy container SID. With no capabilities it has no network
+        // (internetClient / privateNetworkClientServer are not granted) and can write only to its own
+        // container folder (%LOCALAPPDATA%\Packages\<name>\AC); reads of user files are denied unless their ACL
+        // grants ALL APPLICATION PACKAGES (system directories do, so programs still load).
+        const wchar_t* name = p.deny_network && p.deny_fs_write ? L"forge.sandbox.nonet.nofs" : p.deny_network ? L"forge.sandbox.nonet" : L"forge.sandbox.nofs";
+        PSID ac = nullptr;
+        HRESULT hr = CreateAppContainerProfile(name, name, L"FORGE sandboxed child", nullptr, 0, &ac);
+        if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) hr = DeriveAppContainerSidFromAppContainerName(name, &ac);
+        if (FAILED(hr) || !ac) { CloseHandle(j); return {-1, {int(hr), "AppContainer profile failed"}}; }
+        SID_AND_ATTRIBUTES caps[1]{}; DWORD ncaps = 0; PSID net = nullptr;
+        if (!p.deny_network) {   // fs denied only: keep outbound network
+            SID_IDENTIFIER_AUTHORITY app = SECURITY_APP_PACKAGE_AUTHORITY;
+            if (AllocateAndInitializeSid(&app, SECURITY_BUILTIN_CAPABILITY_RID_COUNT, SECURITY_CAPABILITY_BASE_RID, SECURITY_CAPABILITY_INTERNET_CLIENT, 0, 0, 0, 0, 0, 0, &net)) { caps[0].Sid = net; caps[0].Attributes = SE_GROUP_ENABLED; ncaps = 1; }
+        }
+        SECURITY_CAPABILITIES sc{}; sc.AppContainerSid = ac; sc.Capabilities = ncaps ? caps : nullptr; sc.CapabilityCount = ncaps;
+        SIZE_T sz = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &sz);
+        std::vector<unsigned char> al(sz); auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(al.data());
+        bool ok = InitializeProcThreadAttributeList(attrs, 1, 0, &sz) && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &sc, sizeof sc, nullptr, nullptr);
+        STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof si; si.lpAttributeList = attrs;
+        if (ok) ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED, nullptr, nullptr, &si.StartupInfo, &pi);
+        error e{}; if (!ok) e = last_error("CreateProcess (AppContainer)");
+        if (attrs) DeleteProcThreadAttributeList(attrs);
+        if (net) FreeSid(net);
+        FreeSid(ac);
+        if (!ok) { CloseHandle(j); return {-1, e}; }
+    } else {
+        // exec-only policy: restricted token (max privileges dropped) inside the job.
+        HANDLE tok = nullptr, rt = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &tok)) { CloseHandle(j); return {-1, last_error("OpenProcessToken")}; }
+        BOOL ok = CreateRestrictedToken(tok, DISABLE_MAX_PRIVILEGE, 0, nullptr, 0, nullptr, 0, nullptr, &rt); CloseHandle(tok);
+        if (!ok) { CloseHandle(j); return {-1, last_error("CreateRestrictedToken")}; }
+        STARTUPINFOW si{}; si.cb = sizeof si;
+        if (!CreateProcessAsUserW(rt, nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &si, &pi)) {
+            auto e = last_error("CreateProcessAsUser"); CloseHandle(rt); CloseHandle(j); return {-1, e};
+        }
+        CloseHandle(rt);
     }
-    AssignProcessToJobObject(j, pi.hProcess); ResumeThread(pi.hThread); WaitForSingleObject(pi.hProcess, INFINITE);
+    if (!AssignProcessToJobObject(j, pi.hProcess)) { auto e = last_error("AssignProcessToJobObject"); TerminateProcess(pi.hProcess, 1); CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(j); return {-1, e}; }
+    ResumeThread(pi.hThread); WaitForSingleObject(pi.hProcess, INFINITE);
     DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(rt); CloseHandle(j); return {int(code), {}};
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(j); return {int(code), {}};
 #elif defined(FORGE_OS_IOS)
     (void)p; return {-1, unsupported("child processes on iOS")};
 #else

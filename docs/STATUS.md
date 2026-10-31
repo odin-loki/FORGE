@@ -1,6 +1,7 @@
 # FORGE implementation status
 
 ## forge::os::mobile (2026-10-31)
+- **ForgeScript (written, compile-checked, not yet tested):** `.fsc` cache (BLAKE3 key, optional Ed25519 signature, `--cache-dir`); `rpc-serve` runs remote scripts in sandboxed child processes; `sandbox({..., isolate: true})` runs a block in a forked child under a narrower OS sandbox; Windows `run_sandboxed` uses AppContainer + job object (llvm-mingw cross-compile only); Android builds add `-fexperimental-library`.
 - **Runtime reflection** in the script language ([scripting.md](scripting.md#reflection-implemented)): `forge::reflect::*` covers type info, fields/methods/bases/attributes, get/set/invoke by name, enum values, module symbols, signatures and construct-by-name, in both VM and tree-walker, gated by the `reflect` capability. Tested: `test_script` `reflection`, plus `docs/examples/script/reflection.cpp`.
 - New `forge_mobile` library ([mobile.md](mobile.md)): sensors, touch/gestures, device services and lifecycle on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, null and simulated backends; script built-ins `forge::mobile::device`, `forge::sensors::*`, `forge::touch::open`.
 - **Tested here (x86_64 Linux):** `test_mobile` 13/13 (simulator, gestures, services, lifecycle, geofencing, Linux IIO/evdev against fake sysfs), `test_script` `mobile_sensors_touch`.
