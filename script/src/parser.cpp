@@ -9,6 +9,7 @@
 //   - qualified names (std::println, forge::sh, Color::Red) are single identifiers looked up at run time.
 // Raw pointers, new/delete, pointer arithmetic and unsafe casts are rejected with a SyntaxError.
 #include "parser.hpp"
+#include <cstdlib>
 #include <cctype>
 #include <charconv>
 #include <map>
@@ -159,7 +160,11 @@ private:
         }
         if (idchar(peek())) throw syntax_error(line, where(line) + "bad numeric literal '" + std::string(s_.substr(b, p_ - b + 1)) + "'");
         Tok t{flt || fsuf ? T::Float : T::Int, std::string(s_.substr(b, p_ - b)), line};
-        if (t.t == T::Float) { t.d = std::stod(num); return t; }
+        if (t.t == T::Float) {   // strtod, not stod: "1e" / "1e999" are diagnostics or inf, never a stray std::exception
+            char* end = nullptr; t.d = std::strtod(num.c_str(), &end);
+            if (num.empty() || end != num.c_str() + num.size()) throw syntax_error(line, where(line) + "bad numeric literal '" + t.s + "'");
+            return t;
+        }
         std::uint64_t u = 0;
         auto r = std::from_chars(num.data(), num.data() + num.size(), u, base);
         if (r.ec != std::errc{} || u > std::uint64_t(INT64_MAX)) throw syntax_error(line, where(line) + "integer literal out of range: " + t.s);
@@ -303,6 +308,11 @@ private:
     bool ahead_op(std::size_t k, const char* o) const { return ahead(k).t == T::Op && ahead(k).s == o; }
     Tok take() { Tok t = cur(); if (i_ < t_.size() - 1) ++i_; return t; }
     [[noreturn]] void fail(const std::string& m) const { throw syntax_error(cur().line, file_ + ":" + std::to_string(cur().line) + ": " + m, at(T::End)); }
+    std::int64_t get_index(const std::string& n, int line) const {
+        std::int64_t v = 0; auto r = std::from_chars(n.data(), n.data() + n.size(), v);
+        if (r.ec != std::errc{} || r.ptr != n.data() + n.size() || v < 0) fail_at(line, "std::get index must be a non-negative integer, got '" + n + "'");
+        return v;
+    }
     [[noreturn]] void fail_at(int line, const std::string& m) const { throw syntax_error(line, file_ + ":" + std::to_string(line) + ": " + m); }
     void expect_op(const char* o) { if (!is_op(o)) fail(std::string("expected '") + o + "', got '" + (at(T::End) ? std::string("end of input") : cur().s) + "'"); take(); }
     bool accept_op(const char* o) { if (is_op(o)) { take(); return true; } return false; }
@@ -434,9 +444,15 @@ private:
         return f.consts.count(v.name + "#" + std::to_string(v.slot)) > 0;
     }
     struct BlockGuard {
-        Parser& p; std::vector<int>* out;
-        explicit BlockGuard(Parser& x, std::vector<int>* o = nullptr) : p(x), out(o) { p.fns_.back().blocks.emplace_back(); p.fns_.back().block_slots.emplace_back(); }
-        ~BlockGuard() { if (out) *out = p.fns_.back().block_slots.back(); p.fns_.back().blocks.pop_back(); p.fns_.back().block_slots.pop_back(); }
+        Parser& p; std::vector<int>* out; std::size_t depth;
+        explicit BlockGuard(Parser& x, std::vector<int>* o = nullptr) : p(x), out(o), depth(x.fns_.size()) { p.fns_.back().blocks.emplace_back(); p.fns_.back().block_slots.emplace_back(); }
+        ~BlockGuard() {
+            // A syntax error thrown inside a nested function (lambda, local class method) unwinds past its
+            // pop_fn(); drop those scopes so this guard pops its own block, not an inner function's.
+            while (p.fns_.size() > depth) p.pop_fn();
+            if (p.fns_.size() < depth || p.fns_.back().block_slots.empty()) return;
+            if (out) *out = p.fns_.back().block_slots.back(); p.fns_.back().blocks.pop_back(); p.fns_.back().block_slots.pop_back();
+        }
     };
     void push_fn(const std::string& cls = "", bool is_static = false) {
         fns_.push_back({}); fns_.back().blocks.emplace_back(); fns_.back().block_slots.emplace_back();
@@ -900,6 +916,7 @@ private:
         expect_op("["); std::vector<std::string> names;
         while (!is_op("]")) { names.push_back(ident()); if (!accept_op(",")) break; }
         expect_op("]");
+        if (names.empty()) fail_at(line, "structured binding needs at least one name");
         NodeP src;
         if (accept_op("=")) src = expr(); else if (is_op("{")) { auto l = brace_list(); if (l.size() != 1) fail("bad structured binding"); src = l[0]; } else fail("structured binding needs an initialiser");
         semi();
@@ -1071,6 +1088,7 @@ private:
             expect_op(":");
             auto src = expr();
             expect_op(")");
+            if (names.empty()) fail_at(line, "range-for binding needs a name");
             if (names.size() > 2) fail_at(line, "range-for bindings support at most two names");
             auto n = mk(NK::For, line);
             n->kids.push_back(src);
@@ -1685,7 +1703,7 @@ private:
             auto args = paren_args();
             if (args.size() != 1) fail_at(line, "std::get takes one argument");
             const TI& a = (*targs)[0];
-            return builtin_call("forge::__get", {args[0], a.name.empty() ? str_node("<type>", line) : int_node(std::stoll(a.name), line)}, line);
+            return builtin_call("forge::__get", {args[0], a.name.empty() ? str_node("<type>", line) : int_node(get_index(a.name, line), line)}, line);
         }
         if (w == "std::numeric_limits") {
             auto targs = try_template_args();
