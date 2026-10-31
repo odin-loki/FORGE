@@ -1,6 +1,7 @@
 #pragma once
 // verify -> canonicalise (CSE, constant folding, DCE, algebraic) -> fuse.
 #include <forge/flow/ir.hpp>
+#include <forge/flow/state_ops.hpp>
 #include <unordered_map>
 
 namespace forge::flow {
@@ -25,6 +26,10 @@ inline void verify_graph(graph& g, const std::map<std::string, shape_t>& state_s
             i64 past = it == state_shapes.end() ? 0 : it->second.at(0);
             s.at(0) += past;
             n.shape = s;
+        } else if (n.kind == node_kind::state_op) {
+            std::vector<shape_t> in; for (auto v : n.inputs) in.push_back(g.at(v).shape);
+            try { n.shape = state_op_shape(n.attrs.str("fn"), in, n.attrs); }
+            catch (const forge_exception& e) { raise(e.code, "node %{} (state_op {}): {}", i, n.attrs.str("fn"), e.what()); }
         }
     }
     for (auto& [nm, v] : g.outputs()) if (v >= g.size()) raise(errc::invalid_argument, "output {} undefined", nm);
@@ -35,7 +40,7 @@ inline graph dce(const graph& g) {
     std::vector<char> live(g.size(), 0);
     std::vector<value_id> stack;
     for (auto& [n, v] : g.outputs()) stack.push_back(v);
-    for (std::size_t i = 0; i < g.size(); ++i) if (g.at(value_id(i)).kind == node_kind::state_append) stack.push_back(value_id(i));
+    for (std::size_t i = 0; i < g.size(); ++i) if (g.at(value_id(i)).kind == node_kind::state_append || g.at(value_id(i)).kind == node_kind::state_op) stack.push_back(value_id(i));
     while (!stack.empty()) {
         auto v = stack.back(); stack.pop_back();
         if (live[v]) continue;

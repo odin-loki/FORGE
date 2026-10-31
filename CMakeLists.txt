@@ -810,6 +810,12 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_quant_inplace
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/quant_inplace.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_quant_inplace)
+    # Qwen3.5 (Gated DeltaNet) against transformers; skips without torch + transformers >= 5. Set
+    # FORGE_GOLDEN_PYTHON to an interpreter that has them (e.g. a venv) to run it.
+    set(FORGE_GOLDEN_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python with torch/transformers for golden_tiny_qwen3_5")
+    add_test(NAME golden_tiny_qwen3_5
+      COMMAND ${FORGE_GOLDEN_PYTHON} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_qwen3_5.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_tiny_qwen3_5)
     add_test(NAME golden_tiny_qwen3
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_qwen3.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_qwen3)
@@ -826,7 +832,7 @@ if(FORGE_BUILD_TESTS)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
-      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_quant_inplace golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
       add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)

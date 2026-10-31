@@ -15,7 +15,9 @@ namespace forge::flow {
 
 // Per-session state store: slot -> preallocated [capacity, ...] tensor + current length.
 struct state_store {
-    struct slot { tensor buf; i64 len = 0; i64 capacity = 0; kv_codec codec = kv_codec::f32; };
+    // Fixed slots (state_op: recurrent state, conv window) keep a constant-size buffer; `len` counts the rows
+    // consumed so far, and they cannot be rewound except to 0.
+    struct slot { tensor buf; i64 len = 0; i64 capacity = 0; kv_codec codec = kv_codec::f32; bool fixed = false; };
     std::map<std::string, slot> slots;
     i64 capacity = 4096;   // maximum rows per slot (context length)
     // Paged allocation: when > 0, slot storage grows in pages of `page_rows` rows on demand instead of
@@ -52,7 +54,13 @@ struct state_store {
     }
     void reset() { for (auto& [k, s] : slots) s.len = 0; }
     // rewind all slots to `len` rows (e.g. prefix reuse / speculative rollback)
-    void truncate(i64 len) { for (auto& [k, s] : slots) s.len = std::min(s.len, len); }
+    void truncate(i64 len) {
+        for (auto& [k, s] : slots) {
+            if (s.fixed && len > 0 && len < s.len)
+                raise(errc::unsupported, "state slot '{}' is recurrent and cannot be rewound to {} (has {})", k, len, s.len);
+            s.len = std::min(s.len, len);
+        }
+    }
 };
 
 struct partition_report {
@@ -126,6 +134,20 @@ inline void gemm_nt(std::span<const tensor_view> in, tensor_view out, const spec
         }
     });
 }
+// gather (embedding lookup) straight from encoded rows: a q8_0/q4_k tok_emb never gets an f32 copy.
+inline void gather_rows(std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
+    const auto& w = in[0]; const auto* c = codec_of(w);
+    std::size_t d = std::size_t(w.shape[1]), rowsn = std::size_t(w.shape[0]), rb = c->bytes(d);
+    for (std::size_t i = 0; i < in[1].size(); ++i) {
+        auto r = std::size_t(in[1].data[i]);
+        if (r >= rowsn) raise(errc::invalid_argument, "gather index {} out of range", r);
+        c->decode(w.qdata + r * rb, d, out.data + i * d);
+    }
+}
+inline const lowering& gather_lowering() {
+    static const lowering l{"cpu.qgather", spec::op::gather, 100, [](auto, auto&, auto&) { return true; }, gather_rows, 1};
+    return l;
+}
 inline const lowering& gemm_nt_lowering() {
     static const lowering l{"cpu.qgemm_nt", spec::op::matmul_t, 100, [](auto, auto&, auto&) { return true; }, gemm_nt, 1};
     return l;
@@ -147,7 +169,7 @@ struct step {
     std::vector<value_id> in;
     value_id out;
     const spec::attrs* attrs;
-    int kind; // 0 op, 1 state_append
+    int kind; // 0 op, 1 state_append, 2 state_op
 };
 
 class plan {
@@ -206,9 +228,10 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             std::size_t s = 0; for (; s < k; ++s) if ((reg.stages[s] ? reg.stages[s].get() : &registry::cpu()) == stage_of[i]) break;
             p->stage_of_node[i] = int(s); }
     }
-    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t taking it as the weight operand
+    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t (weight operand) or gather (table)
     for (auto& n : G.nodes()) for (std::size_t j = 0; j < n.inputs.size(); ++j)
-        if (!(n.kind == node_kind::op && n.op == spec::op::matmul_t && j == 1)) q_ok[n.inputs[j]] = false;
+        if (!(n.kind == node_kind::op && ((n.op == spec::op::matmul_t && j == 1) || (n.op == spec::op::gather && j == 0))))
+            q_ok[n.inputs[j]] = false;
     for (auto& [nm, v] : G.outputs()) q_ok[v] = false;
     bool q_direct = !p->hooks && reg.stages.empty();
     for (std::size_t i = 0; i < G.size(); ++i) {
@@ -247,6 +270,13 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
         (void)s;
         p->views[i] = v;
         if (n.kind == node_kind::input) p->inputs[n.name] = value_id(i);
+        if (n.kind == node_kind::state_op) {
+            if (!st) raise(errc::invalid_argument, "graph uses state slot '{}' but no state store given", n.name);
+            for (auto in : n.inputs)
+                if (G.at(in).kind == node_kind::state_append)
+                    raise(errc::unsupported, "state slot '{}' feeds state_op '{}'", G.at(in).name, n.name);
+            p->steps.push_back({nullptr, n.inputs, value_id(i), &n.attrs, 2});
+        }
         if (n.kind == node_kind::op) {
             // state views grow at run time; only consumers that read the live length are allowed
             for (auto in : n.inputs)
@@ -270,6 +300,8 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             }
             if (n.op == spec::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
                 p->steps.push_back({&qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
+            else if (n.op == spec::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
+                p->steps.push_back({&qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
@@ -310,6 +342,26 @@ private:
             ins.clear();
             for (auto v : s.in) ins.push_back(p_.views[v]);
             auto& out = p_.views[s.out];
+            if (s.kind == 2) {   // fixed-size state op: state is host memory, updated in place
+                auto& node = p_.g.at(s.out);
+                auto fn = s.attrs->str("fn");
+                std::vector<shape_t> shs; for (auto& v : ins) shs.push_back(v.shape);
+                auto ss = state_ops::state_shape(fn, shs);
+                auto& sl = st_->slots[node.name];
+                if (sl.len == 0 || sl.buf.shape != ss) { sl.buf = tensor(ss); sl.len = 0; sl.fixed = true; }   // fresh: zeros
+                if (h) { for (auto& v : ins) h->to_host(v.data, v.size()); h->to_host(out.data, out.size()); }
+                if (fn == "causal_conv")
+                    state_ops::causal_conv(ins[0].data, ins[1].data, sl.buf.data.data(), out.data, ins[0].shape[0], ins[0].shape[1], ins[1].shape[1]);
+                else if (fn == "delta_rule") {
+                    i64 dk = ins[0].shape[2];
+                    state_ops::delta_rule(ins[0].data, ins[1].data, ins[2].data, ins[3].data, ins[4].data, sl.buf.data.data(), out.data,
+                                          ins[0].shape[0], ins[0].shape[1], dk, ins[2].shape[1], ins[2].shape[2],
+                                          s.attrs->num("l2norm", 1) != 0, float(s.attrs->num("scale", 1.0 / std::sqrt(double(dk)))));
+                } else raise(errc::not_found, "unknown state op '{}'", fn);
+                sl.len += ins[0].shape[0];
+                if (h) h->host_wrote(out.data, out.size());
+                continue;
+            }
             if (s.kind == 1) {
                 auto& node = p_.g.at(s.out);
                 auto& sl = st_->slots[node.name];
