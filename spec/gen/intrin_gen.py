@@ -6,6 +6,7 @@ intrinsic the target lacks is a compile error naming the feature, not a SIGILL i
 import argparse, json, re
 
 FEAT = {"sse": "sse2", "ssse3": "sse4_2", "sse4_1": "sse4_2"}  # folded into our tag set
+TAG = {"fma": "fma3"}  # caps.hpp tag names that differ from the raw:: namespace name
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--db"); ap.add_argument("--out")
@@ -36,7 +37,7 @@ def main():
             imm_first = [tp for tp in tparams[1:]]
             tpl = ", ".join(imm_first + [tparams[0]])
             ret = "" if e["ret"] == "void" else "return "
-            L.append(f"template <{tpl}> requires ::forge::lane::Has<T, ::forge::lane::{f}>")
+            L.append(f"template <{tpl}> requires ::forge::lane::Has<T, ::forge::lane::{TAG.get(f, f)}>")
             L.append(f"[[gnu::always_inline]] inline {e['ret']} {wname}({', '.join(args)}) {{ {ret}{name}({', '.join(call)}); }}")
         L.append(f"}} // namespace {f}")
         L.append("")

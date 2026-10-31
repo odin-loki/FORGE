@@ -32,8 +32,8 @@ TEST(atomic_write_replaces_whole_file) {
     auto p = (dir / "f.txt").string();
     CHECK(!os::fs::write_file_atomic(p, "first").err);
     CHECK(!os::fs::write_file_atomic(p, std::string(100000, 'z')).err);
-    std::ifstream f(p, std::ios::binary); std::string s((std::istreambuf_iterator<char>(f)), {});
-    CHECK(s == std::string(100000, 'z'));
+    { std::ifstream f(p, std::ios::binary); std::string s((std::istreambuf_iterator<char>(f)), {});   // closed before remove_all (Windows)
+      CHECK(s == std::string(100000, 'z')); }
     int files = 0; for (auto& e : std::filesystem::directory_iterator(dir)) { (void)e; ++files; }
     CHECK(files == 1);                                             // no temp file left behind
     CHECK(os::fs::write_file_atomic((dir / "missing" / "x").string(), "x").err);

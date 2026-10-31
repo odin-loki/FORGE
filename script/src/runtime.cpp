@@ -1,4 +1,7 @@
 // forge::script runtime operations shared by the tree-walker and the VM.
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>   // _AddressOfReturnAddress
+#endif
 #include "interp.hpp"
 #include "shells/shell.hpp"
 #include "parser.hpp"
@@ -637,7 +640,11 @@ struct DepthGuard {
     Interp& in;
     bool outer = false;
     DepthGuard(Interp& i, const std::string& name, int line) : in(i) {
+#if defined(_MSC_VER) && !defined(__clang__)
+        auto here = reinterpret_cast<std::uintptr_t>(_AddressOfReturnAddress());
+#else
         auto here = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
+#endif
         if (!t_stack_base) { t_stack_base = here; outer = true; }
         else if (t_stack_base > here && t_stack_base - here > kStackBudget) in.raise("LimitExceededError", "native stack limit reached (infinite recursion?)");
         if (++in.depth > in.sh->limits.max_depth) { --in.depth; if (outer) t_stack_base = 0; in.raise("LimitExceededError", "call depth limit of " + std::to_string(in.sh->limits.max_depth) + " reached (infinite recursion?)"); }

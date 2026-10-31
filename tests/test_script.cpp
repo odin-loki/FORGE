@@ -450,7 +450,9 @@ std::println("{}", forge::modules().size());
 try { forge::import("nope_missing"); } catch (const ImportError& e) { std::println("missing"); }
 )CPP";
 #ifdef FORGE_TEST_PLUGIN
-    code += std::string("auto h = forge::plugin(\"") + FORGE_TEST_PLUGIN + "\");\n" + R"CPP(
+    // FORGE_TEST_PLUGIN_PATH: where the plugin lives when the test binary runs away from its build tree (emulator)
+    const char* plug = std::getenv("FORGE_TEST_PLUGIN_PATH"); if (!plug || !*plug) plug = FORGE_TEST_PLUGIN;
+    code += std::string("auto h = forge::plugin(\"") + plug + "\");\n" + R"CPP(
 std::println("{} {} {}", h.add(2, 3.5), h.greet("forge"), h.VERSION);
 try { h.fail(1, 2); } catch (const PluginError& e) { std::println("{}", e.message); }
 try { h.add(1); } catch (const TypeError& e) { std::println("arity"); }
@@ -735,17 +737,23 @@ TEST(emit_golden_all_shells) {
             auto at = avail.find(" " + name + "=");
             if (at == std::string::npos) continue;
             auto exe = avail.substr(at + name.size() + 2, avail.find(' ', at + 1) - at - name.size() - 2);
-            exe = stdfs::path(exe).filename().string();
+            auto full = exe;   // resolved path: the test's own shell (cmd.exe on Windows) may not share forge's PATH lookup
+            exe = stdfs::path(exe).stem().string();
             std::string code;
             try { code = script::emit(src, g, name); }
             catch (const script::emit_error&) { refused += " " + std::string(g) + "/" + name; continue; }
-            auto path = (dir / (std::string(g) + "." + name)).string();
+            // PowerShell refuses -File without .ps1
+            std::string ext = (name == "pwsh" || name == "powershell") ? "ps1" : name;
+            auto path = (dir / (std::string(g) + "." + ext)).string();
             { std::ofstream(path, std::ios::binary) << code; }
             const char* rn = runner(exe);
+            std::string cmdline = rn ? std::string(rn) : exe;
+            if (exe == "busybox") cmdline = "\"" + full + "\" sh";        // ash via busybox: run the binary forge found
+            else if (exe == "ash") cmdline = "\"" + full + "\"";
 #if defined(_WIN32)
-            auto [got, rc] = sh_capture("cd /d \"" + dir.string() + "\" && " + (rn ? std::string(rn) : exe) + " \"" + path + "\" 2>&1");
+            auto [got, rc] = sh_capture("cd /d \"" + dir.string() + "\" && " + cmdline + " \"" + path + "\" 2>&1");
 #else
-            auto [got, rc] = sh_capture("cd '" + dir.string() + "' && " + (rn ? std::string(rn) : exe) + " '" + path + "' 2>&1");
+            auto [got, rc] = sh_capture("cd '" + dir.string() + "' && " + cmdline + " '" + path + "' 2>&1");
 #endif
             if (name == "cmd") std::erase(got, '\r');   // batch output is CRLF
             CHECK_MSG(got == want, "%s/%s output:\n%s\nwant:\n%s", g, name.c_str(), got.c_str(), want.c_str());
