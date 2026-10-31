@@ -130,6 +130,24 @@ public:
                 if (it == weights_.end()) it = weights_.emplace(name, r_.load(name)).first;
                 return {it->second.shape, it->second.data.data()};
             };
+            // Weights stay in the mapped file: f32 tensors are used in place, other codecs are read in place by
+            // quantised matmul (the plan decodes a shared f32 copy only for other consumers). FORGE_DECODE_WEIGHTS=1
+            // restores the old behaviour (every weight decoded to f32 up front).
+            static const bool decode_all = [] { auto* e = std::getenv("FORGE_DECODE_WEIGHTS"); return e && std::string(e) == "1"; }();
+            if (!decode_all) bo.qweight = [&](const std::string& name) -> pack::build_options::encoded {
+                if (!adapter.empty() && adapters_.at(adapter).count(name)) return {};
+                const auto& e = r_.entry(name);
+                if (e.codec == "f32") return {};  // handled by `weight` (zero-copy below)
+                return {e.shape, r_.section_bytes("data").data() + e.offset, e.codec};
+            };
+            if (!decode_all) bo.weight = [&, inner = bo.weight](const std::string& name) -> std::pair<shape_t, const float*> {
+                const auto& e = r_.entry(name);
+                bool adapted = !adapter.empty() && adapters_.at(adapter).count(name);
+                const auto* base = r_.section_bytes("data").data() + e.offset;
+                if (!adapted && e.codec == "f32" && reinterpret_cast<std::uintptr_t>(base) % alignof(float) == 0)
+                    return {e.shape, reinterpret_cast<const float*>(base)};
+                return inner(name);
+            };
             flow::pass_options po; po.lowerings = reg_.get();
             return flow::compile(pack::build_graph(bp_, bo), st, po);
         });

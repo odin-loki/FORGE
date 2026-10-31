@@ -96,6 +96,9 @@ struct build_options {
     bool all_rows = false;            // `last(x, n)` keeps every row (speculative verification, scoring)
     // resolves a weight name (e.g. "layer.0.attn_norm") to shape + f32 data
     std::function<std::pair<shape_t, const float*>(const std::string&)> weight;
+    // optional: resolves a weight to its encoded bytes + codec name instead (null data = use `weight`)
+    struct encoded { shape_t shape; const std::uint8_t* data = nullptr; std::string codec; };
+    std::function<encoded(const std::string&)> qweight;
 };
 
 namespace detail {
@@ -196,6 +199,7 @@ private:
     flow::value_id weight(const std::string& name) {
         if (auto it = wcache_.find(name); it != wcache_.end()) return it->second;
         if (!o_.weight) raise(errc::invalid_argument, "blueprint: no weight resolver for '{}'", name);
+        if (o_.qweight) if (auto e = o_.qweight(name); e.data) return wcache_[name] = g_.qweight(name, e.shape, e.data, e.codec);
         auto [s, p] = o_.weight(name);
         return wcache_[name] = g_.weight(name, s, p);
     }
