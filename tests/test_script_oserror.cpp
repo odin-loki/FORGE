@@ -51,7 +51,7 @@ static std::string isa(const char* derived, const char* base) {
 TEST(script_catches_typed_os_errors) {
     script::engine e; std::string out;
     auto r = e.eval("std::string got = \"no\"; try { fs.read(\"/nonexistent/forge/oserror/probe\"); } catch (const FileNotFoundError& err) { got = \"yes\"; } got");
-    CHECK_MSG(r.ok && r.value == "yes", "%s %s", r.value.c_str(), r.error.c_str());
+    CHECK_MSG(r.ok && r.value == "\"yes\"", "%s %s", r.value.c_str(), r.error.c_str());
     auto r2 = e.eval(isa("FileNotFoundError", "OSError"));
     CHECK_MSG(r2.ok && r2.value == "true", "%s %s", r2.value.c_str(), r2.error.c_str());
     auto r3 = e.eval(isa("SandboxViolationError", "PermissionError"));
