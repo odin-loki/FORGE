@@ -601,3 +601,50 @@ All phases are in scope.
    and plugins).
 5. **Advanced**: features 6, 7 and 9 (AI-assisted commands, remote execution once rpc-serve has
    auth/TLS, sandboxed runs).
+
+## Static checks (implemented, compile-checked only; tests pending)
+
+`forge script --check file.fs` (add `--json` for `[{"file","line","col","severity","id","message"}]`) runs the
+static checker (`forge/script/check.hpp`, `script/src/check.cpp`) over the parsed and resolved AST without running
+anything; exit 2 when there are errors. Every normal run also runs it first: `options::static_check` (default on,
+`--no-check` turns it off) refuses a script with any **error** (exit 2, `StaticCheckError`); `options::strict_check`
+(`--strict-check`) refuses on warnings too. Errors are claimed only when the flagged operation is certain to raise
+or be refused whenever it is reached; anything uncertain is a warning. The runtime checks (BorrowError, RaceError,
+DeadlockError, PermissionError) remain the backstop.
+
+Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the line or the line above, or
+`// forge-check: ignore-file[id]` for the whole file.
+
+| id | severity | what |
+|---|---|---|
+| `use-after-move` | error on every path / warning on some path | flow-sensitive over the function's locals (branches, `&&`/`||`/`?:`, loops with a back-edge pass, try/catch) |
+| `unique-copy` | error | copy-initialising from a `std::make_unique` local |
+| `iter-mutation` | error for a list/map-literal or `list`/`map`/`vector`-typed local, else warning | size-changing method on the container a range-for is iterating |
+| `capability` | error | `fs.*`, `net.*`, `proc.*`, `service.*`, `os.env/setenv/chdir/processes/kill`, `run()`, shell blocks when the run's `--no-fs/--no-net/--no-proc` or an enclosing `sandbox({fs: false, ...}, fn)` literal denies them |
+| `pool-task` | error | `submit`/`map` with a literal task source that does not parse, does not define `task`, or whose `task` does not take one argument |
+| `pool-json` | error | a lambda or shell value (or a literal containing one) passed as a ProcessPool argument |
+| `thread-send` | warning | an argument to `forge::spawn`/`std::thread`/`std::async` that is not a literal, moved, frozen, const or `forge::shared` |
+| `thread-capture` | warning | a thread lambda reading or writing a captured mutable local |
+| `lock-order` | warning | two `forge::shared` names locked in both orders by nested `x.with(fn)` (static lock graph, 2-cycles) |
+| `unreachable` | warning | statements after return/throw/break/continue |
+| `unused-variable` | warning | local initialised from a literal and never read (names starting `_` exempt) |
+| `shadow` | warning | local redeclaring a name from an enclosing block of the same function |
+| `missing-return` | warning | function with a declared non-void return type that can fall off its end |
+| `arg-count` | warning | call of a top-level script function (never reassigned) with too few/many arguments |
+| `catch-order` | warning | a catch after `catch (...)` or after a built-in ancestor (e.g. `OSError` before `TimeoutError`) |
+| `infinite-loop` | warning | `while (true)`/`for (;;)` with no break, return, throw or exit |
+| `format` | warning | `std::format/print/println` literal with a placeholder count that does not match the arguments |
+| `syntax` | error | parse failure |
+
+Considered and not built (yet): **undefined variables** (the resolver already rejects unknown locals; unknown globals
+may be host-injected, so only a warning would be sound); **type inference** (dynamic values and implicit conversions
+make anything beyond literals unsound; planned as warnings over literal-typed locals); **await outside async**
+(`await` on a task value is legal anywhere in ForgeScript, so there is nothing to flag); **deprecated APIs** (no API
+is marked deprecated yet; the check needs an attribute table first); **channel send of non-sendable values** and
+**lock cycles longer than two** (planned).
+
+Known gaps: top-level `let`s are globals, so move/unique/unused checks see function locals only; columns are
+found by searching the source line for the flagged name (the AST stores lines only); aliasing (`auto& r = v`) and
+`forge::shared` values reached through fields are not tracked; capability checks cover only direct `lib.fn(...)`
+calls on the built-in library globals and literal `sandbox({...}, lambda)` blocks. Scripts in the test suite that
+deliberately trigger BorrowError now need `--no-check` or a suppression comment.

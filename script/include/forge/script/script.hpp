@@ -22,6 +22,10 @@ struct options {
     std::uint64_t deadlock_ms = 1000;   // debug: how long every thread may be blocked before DeadlockError
     int jit_threshold = 2;              // calls before a function is compiled
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
+    // Static checks (forge/script/check.hpp) run after parsing, before execution. A script with a static
+    // error is refused (exit 2, StaticCheckError). strict_check also refuses on warnings.
+    bool static_check = true;
+    bool strict_check = false;
     // OS-level enforcement of the capability flags (forge/os/sandbox.hpp: seccomp / Capsicum / pledge /
     // macOS sandbox_init / Windows job object). Applied once, process-wide and irreversibly, by the
     // engine constructor when any of fs/net/proc is off: !allow_net -> deny_network, !allow_proc ->

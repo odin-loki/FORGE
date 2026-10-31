@@ -2,6 +2,7 @@
 #include <forge/script/script.hpp>
 #include "interp.hpp"
 #include "parser.hpp"
+#include <forge/script/check.hpp>
 #include "vm.hpp"
 #include "fsc.hpp"
 #include <forge/os/fs.hpp>
@@ -29,6 +30,7 @@ struct engine::impl {
     std::shared_ptr<Shared> sh = std::make_shared<Shared>();
     std::unique_ptr<Interp> in;
     std::string sandbox = "off";
+    bool static_check = true, strict_check = false; check_options chk;
     bool cancel_signals = true;
     std::string fsc_dir, cache = "off";
     fsc::trust fsc_trust;
@@ -79,6 +81,13 @@ struct engine::impl {
         result r;
         if (!top) try { top = parse_program(src, name); }
         catch (const syntax_error& e) { r.ok = false; r.exit_code = 2; r.error_type = "SyntaxError"; r.line = e.line; r.error = std::string("SyntaxError: ") + e.what(); return r; }
+        if (static_check && name != "<repl>") {
+            chk.warnings = strict_check;
+            auto ds = check_parsed(*top, src, name, chk);
+            bool refuse = strict_check ? !ds.empty() : has_errors(ds);
+            if (refuse) { r.ok = false; r.exit_code = 2; r.error_type = "StaticCheckError"; r.line = ds.front().line;
+                r.error = "StaticCheckError: script refused by static checks (forge script --check for details)\n" + to_text(ds); return r; }
+        }
         sh->keep.push_back(top);
         sh->start_ns = os::monotonic_ns();
         in->deadline_ns = sh->limits.timeout_ms ? sh->start_ns + sh->limits.timeout_ms * 1000000 : 0;
@@ -113,6 +122,7 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     sh.limits.max_steps = o.max_steps; sh.limits.timeout_ms = o.timeout_ms; sh.limits.heap_bytes = o.heap_bytes; sh.limits.max_depth = o.max_depth;
     sh.caps = Caps{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
     p_->sandbox = "off"; p_->cancel_signals = o.cancel_signals;
+    p_->static_check = o.static_check; p_->strict_check = o.strict_check; p_->chk = check_options{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env, true};
     {
         auto hex32 = [](const std::string& h, const char* what) {
             std::array<std::uint8_t, 32> k{};

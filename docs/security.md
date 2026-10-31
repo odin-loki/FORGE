@@ -71,3 +71,12 @@ Everything above describes `main`. The following work is on feature branches and
 | Building FORGE as a subproject | local fix, not pushed | Lets FORGE build inside another project's CMake build | Not on remote |
 
 Known gaps still open on those branches: nested `sandbox{}` blocks are interpreter-checked only; on Windows only process creation is blocked.
+
+## Static capability checks
+
+Before a script runs, the static checker (docs/scripting.md "Static checks") reports every direct call to an
+`fs`, `net`, `proc`, `service` or environment builtin, `run()` and every shell block that the run's capabilities,
+or an enclosing literal `sandbox({...}, fn)` block, deny. These are errors, so by default the script is refused
+before any of it executes rather than failing part-way with PermissionError. It is a convenience layer: indirect
+calls (a builtin stored in a variable, `eval`, imported modules) are not seen statically, and the interpreter's
+capability checks and the OS sandbox remain the enforcement.
