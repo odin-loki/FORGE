@@ -69,7 +69,7 @@ State merge(const State& a, const State& b) {
     return r;
 }
 
-struct Binding { const char* cap = nullptr; bool chan = false; char lit = 0; std::string name; int line = 0; bool used = false; bool report = false; bool unique = false; bool list = false; bool cnst = false; };
+struct Binding { bool param = false; bool container_cap = false; std::string alias; const char* cap = nullptr; bool chan = false; char lit = 0; std::string name; int line = 0; bool used = false; bool report = false; bool unique = false; bool list = false; bool cnst = false; };
 
 struct Fn {
     const FnDecl* decl = nullptr;
@@ -109,7 +109,15 @@ struct Checker {
         const Node* at = &n; if (n.k == NK::Call && !n.kids.empty() && n.kids[0]->col) at = n.kids[0].get();
         if (sev == L::warning && !opt.warnings) return;
         if (!seen.emplace(n.line, std::string(id) + msg).second) return;
-        out.push_back({sev, id, std::move(msg), file, n.line, at->col && at->line == n.line ? at->col : col_of(n.line, needle)});
+        int sc = start_col(*at, n.line);
+        out.push_back({sev, id, std::move(msg), file, n.line, sc ? sc : col_of(n.line, needle)});
+    }
+    // start column: leftmost recorded column among the node and its sub-expressions on the same line
+    static int start_col(const Node& n, int line) {
+        int c = n.line == line ? n.col : 0;
+        if (n.k == NK::Block || n.k == NK::Lambda) return c;
+        for (auto& k : n.kids) if (k) { int x = start_col(*k, line); if (x && (!c || x < c)) c = x; }
+        return c;
     }
     Fn& cur() { return fns.back(); }
     std::map<std::string, Binding*> gbind;             // globals declared by this script's top level
@@ -154,8 +162,10 @@ struct Checker {
 
     // ---------------------------------------------------------------- expressions
     void read_var(const Node& n, State& st) {
-        if (auto* b = bind_of(n.var)) b->used = true;
+        auto* b = bind_of(n.var); if (b) b->used = true;
         check_key(n, lkey(n), st);
+        if (b && !b->alias.empty()) if (auto it = st.find(skey(b->alias)); it != st.end() && it->second)
+            D(L::warning, "use-after-move", n, "reference '" + n.s + "' refers to a value that may have been moved", n.s);
     }
     void check_key(const Node& n, const std::string& k, State& st) {
         if (k.empty()) return;
@@ -209,8 +219,10 @@ struct Checker {
             if (auto* cp = cap_of(lib, c->s); cp && !caps.get(cp))
                 D(L::error, "capability", n, lib + "." + c->s + " needs the '" + cp + "' capability, which this run denies (raises PermissionError)", c->s);
         }
-        if (c && c->k == NK::Var) if (auto* b = bind_of(c->var); b && b->cap && !caps.get(b->cap))
-            D(b->cnst ? L::error : L::warning, "capability", n, "'" + c->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies", c->s);
+        if (c && c->k == NK::Index && !c->kids.empty() && c->kids[0]->k == NK::Var) if (auto* b = bind_of(c->kids[0]->var); b && b->cap && b->container_cap && !caps.get(b->cap))
+            D(L::warning, "capability", n, "'" + c->kids[0]->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies; calling an element may raise PermissionError", c->kids[0]->s);
+        if (c && c->k == NK::Var) if (auto* b = bind_of(c->var); b && b->cap && !b->container_cap && !caps.get(b->cap))
+            D(b->cnst && !b->param ? L::error : L::warning, "capability", n, "'" + c->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies", c->s);
         if (c && (is_builtin_var(*c, "eval") || is_builtin_var(*c, "forge::eval")) && argc == 1 && n.kids[1]->k == NK::Str) sub_check(n, n.kids[1]->s, "eval");
         if (c) deprecated(n, *c);
         if (c && is_builtin_var(*c, "run") && !caps.proc) D(L::error, "capability", n, "run() needs the 'proc' capability, which this run denies (raises PermissionError)", "run");
@@ -267,12 +279,26 @@ struct Checker {
         }
         if (at_top() && !(c && c->k == NK::Field && c->kids.size() && c->kids[0]->k == NK::Var && c->kids[0]->var.global() && !gbind.count(c->kids[0]->s))) after_call(st);
     }
+    std::set<std::string> imported;
+    void import_check(const Node& n) {
+        if (n.s.ends_with(".so") || n.s.ends_with(".dylib") || n.s.ends_with(".dll")) return;
+        std::string dir = file; auto sl = dir.find_last_of('/'); dir = sl == std::string::npos ? std::string(".") : dir.substr(0, sl);
+        for (auto cand : {n.s, n.s + ".fs", n.s + ".fsx"}) {
+            std::string path = cand.size() && cand[0] == '/' ? cand : dir + "/" + cand;
+            std::FILE* f = std::fopen(path.c_str(), "rb"); if (!f) continue;
+            std::string code; char buf[4096]; std::size_t r; while ((r = std::fread(buf, 1, sizeof buf, f)) > 0) code.append(buf, r); std::fclose(f);
+            if (!imported.insert(path).second) return;
+            sub_check(n, code, "import");
+            return;
+        }
+    }
     void sub_check(const Node& at, const std::string& code, const char* what) {
         std::shared_ptr<const FnDecl> t;
         try { t = parse_program(code, std::string("<") + what + ">"); } catch (const std::exception& e) { D(L::warning, "syntax", at, std::string(what) + " source does not parse: " + e.what()); return; }
-        Checker sub; sub.src = code; sub.file = file; sub.opt = opt; sub.opt.warnings = false; sub.caps = caps;
+        Checker sub; sub.src = code; sub.file = file; sub.opt = opt; sub.opt.warnings = false; sub.caps = caps; sub.imported = imported;
         if (t->body) sub.collect(*t->body, false);
         sub.fn(*t);
+        imported.insert(sub.imported.begin(), sub.imported.end());
         for (auto& d : sub.out) if (d.severity == L::error) D(L::error, d.id.c_str(), at, std::string("in ") + what + " source: " + d.message);
     }
     // Deprecated APIs: built-in table plus script functions marked [[deprecated]] / [[deprecated("why")]].
@@ -283,6 +309,11 @@ struct Checker {
             {"std::ptr_fun", "removed in C++17; use a lambda"}, {"std::gets", "removed in C++14; use std::getline"},
             {"std::aligned_storage", "deprecated in C++23; use alignas storage"}, {"std::aligned_union", "deprecated in C++23"},
         };
+        if (c.k == NK::Field && !c.kids.empty() && !(c.kids[0]->k == NK::Var && c.kids[0]->var.global() && !gbind.count(c.kids[0]->s) && !globals_fn.count(c.kids[0]->s)))
+            if (auto it = method_dep.find(c.s); it != method_dep.end() && it->second.first > 0) {
+                bool all = it->second.first == it->second.second;
+                D(L::warning, "deprecated", n, "method " + c.s + "() is marked [[deprecated]]" + (all ? std::string() : std::string(" in some classes that define it")), c.s);
+                return; }
         std::string name = c.k == NK::Var ? c.s : std::string();
         if (name.empty()) return;
         if (auto it = table.find(name); it != table.end()) { D(L::warning, "deprecated", n, name + " is deprecated: " + it->second, name); return; }
@@ -354,7 +385,9 @@ struct Checker {
         case NK::Field: if (!n.kids.empty() && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field)) { expr(*n.kids[0], st); check_key(n, lkey(n), st); return; } break;
         case NK::Binary: type_check(n); break;
         case NK::Move:
-            if (!n.kids.empty() && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field)) { auto& v = *n.kids[0]; expr(v, st); auto k = lkey(v); if (!k.empty()) st[skey(k)] = DEF; return; }
+            if (!n.kids.empty() && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field)) { auto& v = *n.kids[0]; expr(v, st); auto k = lkey(v); if (!k.empty()) st[skey(k)] = DEF;
+                if (v.k == NK::Var) if (auto* b = bind_of(v.var); b && !b->alias.empty()) { auto& t = st[skey(b->alias)]; t = std::max(t, int(MAYBE)); }
+                return; }
             break;
         case NK::Copy:
             if (!n.kids.empty() && n.kids[0]->k == NK::Var) if (auto* b = bind_of(n.kids[0]->var); b && b->unique)
@@ -413,15 +446,17 @@ struct Checker {
             if (n.type) { static const std::set<std::string> cont = {"list", "map", "set", "dict", "vector", "deque", "std::vector", "std::deque", "std::list",
                 "std::forward_list", "std::map", "std::unordered_map", "std::multimap", "std::set", "std::unordered_set", "std::multiset", "std::array"};
                 if (cont.count(n.type->name)) list = true; }
-            const char* cap = nullptr; bool chan = false; char lit = 0;
+            const char* cap = nullptr; bool chan = false, ctr = false; char lit = 0;
             if (!n.kids.empty() && n.kids[0]) { auto& i = n.kids[0]->k == NK::Copy && !n.kids[0]->kids.empty() ? *n.kids[0]->kids[0] : *n.kids[0];
                 if (i.k == NK::Field && !i.kids.empty() && i.kids[0]->k == NK::Var && i.kids[0]->var.global()) cap = cap_of(i.kids[0]->s, i.s);
                 if (auto* c = callee(i); c && (is_builtin_var(*c, "forge::channel") || is_builtin_var(*c, "channel"))) chan = true;
                 if (auto* c = callee(i); c && c->k == NK::Var && c->var.global() && (c->s == "std::vector" || c->s == "std::deque" || c->s == "std::list" || c->s == "std::map" || c->s == "std::unordered_map" || c->s == "std::set" || c->s == "std::unordered_set")) list = true;
-                lit = i.k == NK::Int ? 'i' : i.k == NK::Float ? 'f' : i.k == NK::Str ? 's' : 0; }
+                lit = i.k == NK::Int ? 'i' : i.k == NK::Float ? 'f' : i.k == NK::Str ? 's' : 0;
+                if (!cap && (i.k == NK::List || i.k == NK::Map || (i.k == NK::Call && list))) for (auto& e : i.kids) if (e && e->k == NK::Field && !e->kids.empty() && e->kids[0]->k == NK::Var && e->kids[0]->var.global()) if (auto* c2 = cap_of(e->kids[0]->s, e->s)) { cap = c2; ctr = true; } }
+            std::string alias = n.ref && !n.kids.empty() && n.kids[0] && (n.kids[0]->k == NK::Var || n.kids[0]->k == NK::Field) ? lkey(*n.kids[0]) : std::string();
             if (n.var.global() && !at_top()) return true;
             declare(n.var, n.s, n.line, report, n.flag);
-            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; }
+            if (auto* b = bind_of(n.var.global() ? VarRef{n.s, -1, -1} : VarRef{n.s, 0, n.var.slot})) { b->unique = uniq; b->list = list; b->cap = cap; b->chan = chan; b->lit = n.flag ? lit : 0; b->alias = alias; b->container_cap = ctr; }
             { auto k = n.var.global() ? "g" + n.s : "l" + std::to_string(n.var.slot); kill(st, k); }
             return true;
         }
@@ -483,6 +518,7 @@ struct Checker {
             st = any ? after : st;
             return any;
         }
+        case NK::Import: import_check(n); return true;
         case NK::Defer: for (auto& k : n.kids) if (k) { State d = st; stmt(*k, d); } return true;
         default:
             for (auto& k : n.kids) if (k) expr(*k, st);
@@ -524,7 +560,8 @@ struct Checker {
     }
     void fn(const FnDecl& f) {
         fns.emplace_back(); cur().decl = &f; cur().scopes.emplace_back();
-        for (auto& p : f.params) declare(VarRef{p.name, 0, p.slot}, p.name, f.line, false, p.cnst);
+        for (std::size_t pi = 0; pi < f.params.size(); ++pi) { auto& p = f.params[pi]; declare(VarRef{p.name, 0, p.slot}, p.name, f.line, false, p.cnst);
+            if (auto it = param_caps.find({f.name, pi}); it != param_caps.end() && !f.is_top) if (auto* b = cur().slot[p.slot]) { b->cap = it->second; b->param = true; } }
         State st;
         if (f.body) stmt(*f.body, st);
         static const std::set<std::string> no_value = {"", "void", "auto", "any"};
@@ -532,7 +569,16 @@ struct Checker {
             diag(L::warning, "missing-return", f.line, "function '" + f.name + "' is declared to return " + f.ret_name + " but can reach its end without returning (returns nil)", f.name);
         end_fn();
     }
+    std::map<std::pair<std::string, std::size_t>, const char*> param_caps;   // script fn, param index -> builtin capability passed there
+    std::map<std::string, std::pair<int, int>> method_dep;                   // method name -> (deprecated defs, all defs)
     void collect(const Node& n, bool in_fn) {
+        if (n.k == NK::Call && n.kids.size() > 1 && n.kids[0]->k == NK::Var && n.kids[0]->var.global())
+            for (std::size_t i = 1; i < n.kids.size(); ++i) { auto& e = *n.kids[i];
+                if (e.k == NK::Field && !e.kids.empty() && e.kids[0]->k == NK::Var && e.kids[0]->var.global()) if (auto* cp = cap_of(e.kids[0]->s, e.s)) param_caps[{n.kids[0]->s, i - 1}] = cp; }
+        if (n.k == NK::ClassStmt && n.cls) for (auto& m : n.cls->methods) if (m) {
+            auto& d = method_dep[m->name]; ++d.second;
+            for (auto& a : m->attrs) if (a.rfind("deprecated", 0) == 0) { ++d.first; break; }
+            if (m->body) collect(*m->body, true); }
         if (n.k == NK::Var && n.var.global()) gread.insert(n.s);
         if (in_fn && n.k == NK::Assign && !n.kids.empty() && n.kids[0]->k == NK::Var && n.kids[0]->var.global()) fn_assigned.insert(n.kids[0]->s);
         if (in_fn && n.k == NK::Move && !n.kids.empty() && n.kids[0]->k == NK::Var && n.kids[0]->var.global()) fn_assigned.insert(n.kids[0]->s);

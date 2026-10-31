@@ -907,7 +907,7 @@ private:
         }
         if (ti.ref && !ti.cnst && init->k == NK::Copy) init = init->kids[0];   // T& r = x: alias (objects share; scalars copy)
         auto let = mk(NK::Let, line);
-        let->s = name; let->flag = ti.cnst;
+        let->s = name; let->flag = ti.cnst; let->ref = ti.ref;
         let->kids.push_back(init);
         if (ti.k != TK::Auto && ti.k != TK::Any && ti.k != TK::Fn && ti.k != TK::Class && ti.k != TK::Enum) let->type = ti.ann();
         let->var = declare(name, ti.cnst);   // declared after the initialiser: `int x = x;` refers to an outer x

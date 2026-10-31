@@ -59,6 +59,7 @@ struct Node {
     std::string s;               // op / name / string literal / shell kind
     std::int64_t i = 0; double d = 0;
     bool flag = false;           // let: const; using: declares var; field: optional
+    bool ref = false;            // Let: declared as a reference (T& r = x / auto& r = x)
     bool wb = false;             // Call: may bind lvalue arguments to non-const T& parameters (write back after the call)
     VarRef var;                  // Var, Let, For, FnStmt, Using, Import, catch var
     std::shared_ptr<TypeAnn> type;

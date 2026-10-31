@@ -655,9 +655,18 @@ may be host-injected, so only a warning would be sound); **await outside async**
 anywhere in ForgeScript, so there is nothing to flag); **type inference beyond literals** (values are dynamic and
 conversions implicit).
 
-Known gaps: references (`auto& r = v`) are not tracked as aliases, because the AST does not record that a `let` is a
-reference; capability checks do not follow `import`ed modules or builtins passed through function parameters or
-containers; `Node::col` is the column of the last token consumed when the node was built, so for some compound nodes
-it points at the end of the construct (the checker prefers the callee or variable column); `[[deprecated]]` is only
-honoured on top-level script functions. Test scripts that deliberately trigger the runtime errors carry
+References: `let` nodes carry a `ref` flag (`T& r = x`), so a reference is an alias of its target: moving
+through the reference marks the target as maybe moved, and reading a reference whose target may have been moved is a
+warning. Capability flow also follows: string-path `import`s of script modules (checked once each, cycles stopped,
+same capabilities; errors reported on the import line), builtins passed as arguments to top-level script functions
+(the parameter is tainted; calls through it are warnings, since other call sites may pass something else), and
+builtins stored in list/map literals (calling an element is a warning). Columns are the start of the construct: the
+leftmost recorded token column among the node and its sub-expressions on that line. `[[deprecated]]` on class
+methods warns at `obj.m()` calls (the receiver's class is unknown statically, so the message says when only some
+classes defining `m` mark it).
+
+Known gaps: builtins put into containers by constructor syntax (`std::vector<auto> t = {fs.read}`) or by
+`push_back` are not tracked; capability taint does not flow through return values, lambdas' captures or methods'
+parameters; native `.so/.dylib/.dll` imports and module-path (non-relative) lookups are not followed; statements
+with no sub-expressions (e.g. `import`) report the column of their last token. Test scripts that deliberately trigger the runtime errors carry
 `// forge-check: ignore-file`.
