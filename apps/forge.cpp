@@ -49,6 +49,8 @@ int usage() {
         "usage: forge <command> [options]\n"
         "  info                                   CPU features, lane target, grid backends, memory budget\n"
         "  import <hf_dir|model.gguf> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|fp8_e5m2|q8_0|q4_k|q4_g32|q8_g32|mxfp8|mxfp6|mxfp4|mxint8|nvfp4|tq2] [--template llama] [--emb-codec q8_0|q4_k|f32]\n"
+        "      mixed precision (hf inputs): --codec q4_k_m|q5_k_m [--recipe forge|llama] [--output-tensor-type T] [--token-embedding-type T]\n"
+        "      [--tensor-type REGEX=TYPE[,..]] [--pure] [--bf16-head]   (llama.cpp llama-quant.cpp rules; forge adds q6_k DeltaNet/attn_output, q8_0 head)\n"
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
@@ -110,6 +112,15 @@ int cmd_info() {
 int cmd_import(const args& a) {
     if (a.pos.empty() || a.get("o").empty()) return usage();
     import::import_options o; o.codec = a.get("codec", "f32"); o.template_name = a.get("template"); o.emb_codec = a.get("emb-codec");
+    o.recipe.recipe = a.get("recipe", "forge");
+    o.recipe.output_type = a.get("output-tensor-type");
+    o.recipe.token_embedding_type = a.get("token-embedding-type");
+    o.recipe.pure = a.has("pure");
+    o.recipe.head_bf16 = a.has("bf16-head");
+    for (std::string tt = a.get("tensor-type"); !tt.empty();) {   // REGEX=TYPE[,REGEX=TYPE...]
+        auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
+        tt = c == std::string::npos ? "" : tt.substr(c + 1);
+    }
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     return 0;
