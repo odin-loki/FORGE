@@ -23,6 +23,28 @@ Added in PRs #5-#9. Header-only unless noted.
   first, FIFO within a priority; a task cancelled before it starts throws `task::cancelled` from its future.
 - `pending()`, `wait_idle()`; the destructor drains the queue.
 
+## Process pool (PENDING: branch `forge-multiprocess`, not on main yet): `os/include/forge/os/process_pool.hpp` (test: `tests/test_process_pool.cpp`)
+- `forge::process_pool` (alias of `forge::os::process_pool`) mirrors the thread pool with worker processes:
+  `submit(name, payload)` returns `std::future<std::string>`; `wait_all()`, `pending()`, `size()`,
+  `set_workers(n)` (grow, or retire workers gracefully after their current task), `shutdown()` (drains the
+  queue, sends each worker a quit message, reaps it; also run by the destructor). Worker count defaults to
+  `FORGE_PROCESSES`, then `hardware_concurrency()`.
+- Tasks are named `std::string(std::string)` functions registered with `FORGE_PROCESS_TASK(name, fn)` or
+  `register_process_task`; payloads and results are byte strings you serialise yourself.
+- Modes: `fork` (default on Linux, macOS, FreeBSD, Android) and `spawn` (re-launch this binary with
+  `--forge-process-worker=...`: fork+exec on POSIX, `CreateProcess` with pipe stdin/stdout on Windows, where
+  it is the only mode; `fork` throws `not_supported` there). Spawn mode needs
+  `process_pool::run_worker_if_requested(argc, argv)` at the top of `main()`. On iOS the constructor throws
+  `os_exception{not_supported}`.
+- IPC: one pipe pair per worker, length-prefixed frames (type, id, task name, payload).
+- Errors: a task that throws fails its future with `os::os_exception` (kind carried across from the worker's
+  exception type). A worker that dies mid-task fails that future with `os_errc::signal` and `signo`
+  (POSIX signal, or Windows access violation / illegal instruction / divide by zero as 1/2/3) or `os_errc::io`
+  for a non-zero exit; the worker is respawned for the next task.
+- `options.sandbox` applies `os::apply_sandbox` in every worker before its first task.
+- Verified so far: Linux (all tests in `tests/test_process_pool.cpp` pass); Windows (mingw) and Android build
+  cleanly. macOS, FreeBSD, Windows runtime and iOS are untested. Not exposed in ForgeScript yet.
+
 ## Cache: `support/include/forge/cache/cache.hpp` (test: `tests/test_cache.cpp`)
 - `cache::store(dir, {.max_bytes})`; `put(value)` returns its BLAKE3 content key; `key_of({...})` builds memo keys.
 - `get()` verifies integrity and deletes corrupt entries; writes use `os::fs::write_file_atomic`; LRU eviction

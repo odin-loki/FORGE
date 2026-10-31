@@ -1,3 +1,4 @@
+#include <forge/os/oserror.hpp>
 // forge::script runtime operations shared by the tree-walker and the VM.
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>   // _AddressOfReturnAddress
@@ -235,12 +236,13 @@ ScriptError Interp::from_cpp(std::exception_ptr ep) {
     catch (const heap_exhausted& e) { return mk("OutOfMemoryError", e.what()); }
     catch (const std::bad_alloc&) { return mk("OutOfMemoryError", "out of memory"); }
     catch (const syntax_error& e) { return mk("SyntaxError", e.what()); }
+    catch (const os::os_exception& e) { return mk(e.script_type(), e.what()); }   // typed OS errors, faults, crashed workers
     catch (const forge_exception& e) {
         switch (e.code) {
         case errc::out_of_memory: return mk("OutOfMemoryError", e.what());
         case errc::io_error: case errc::not_found: return mk("IOError", e.what());
         case errc::invalid_argument: case errc::parse_error: case errc::format_error: return mk("ValueError", e.what());
-        case errc::unsupported: return mk("OSError", e.what());
+        case errc::unsupported: return mk("NotSupportedError", e.what());
         default: return mk("Error", e.what());
         }
     }
@@ -256,7 +258,11 @@ void Interp::step() {
     auto n = sh->steps.fetch_add(1, std::memory_order_relaxed);
     if (sh->limits.max_steps && n >= sh->limits.max_steps) raise("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
     if ((n & 255) == 0) {
-        if (sh->interrupt.load()) { sh->interrupt = false; raise("CancelledError", "interrupted"); }
+        if (sh->interrupt.load()) {
+            sh->interrupt = false;
+            int sig = os::take_cancel_signal();
+            raise("CancelledError", sig ? os::cancellation_exception(sig).what() : std::string("interrupted"));
+        }
         if (task && task->cancel.load()) raise("CancelledError", "task cancelled");
         if (deadline_ns && os::monotonic_ns() > deadline_ns) { deadline_ns = 0; raise("TimeoutError", "time limit reached"); }
         if (cpu_deadline_ns && os::thread_cpu_time_ns() > cpu_deadline_ns) { cpu_deadline_ns = 0; raise("LimitExceededError", "CPU time limit reached"); }

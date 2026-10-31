@@ -171,11 +171,11 @@ try { throw MyErr("m"); } catch (const std::exception& e) { std::println("{}", e
 }
 
 TEST(ownership_moves_and_borrows) {
-    EXPECT("auto p = std::make_unique<int>(5);\nauto q = std::move(p);\nstd::println(\"{}\", *q);\nstd::println(\"{}\", *p);", "5\n!BorrowError");
-    EXPECT("std::vector<int> a{1, 2};\nauto b = std::move(a);\nstd::println(\"{}\", b);\na.size();", "[1, 2]\n!BorrowError");
+    EXPECT("auto p = std::make_unique<int>(5);\nauto q = std::move(p);\nstd::println(\"{}\", *q);\nstd::println(\"{}\", *p);\n// forge-check: ignore-file", "5\n!BorrowError");
+    EXPECT("std::vector<int> a{1, 2};\nauto b = std::move(a);\nstd::println(\"{}\", b);\na.size();\n// forge-check: ignore-file", "[1, 2]\n!BorrowError");
     EXPECT("auto s = std::make_shared<std::vector<int>>();\nauto t = s;\nt->push_back(1);\nstd::println(\"{} {}\", s->size(), t->size());", "1 1\n");
     EXPECT("struct N { int v = 0; };\nauto p = std::make_shared<N>();\nstd::weak_ptr<N> w = p;\nstd::println(\"{}\", w.expired());\np = nullptr;\nstd::println(\"{}\", w.expired());", "false\ntrue\n");
-    EXPECT("auto p = std::make_unique<int>(1);\nauto q = p;", "!BorrowError");
+    EXPECT("auto p = std::make_unique<int>(1);\nauto q = p;\n// forge-check: ignore-file", "!BorrowError");
 }
 
 TEST(namespaces_enums_templates) {
@@ -306,7 +306,7 @@ int main() {
 }
 
 TEST(borrow_rules_while_iterating) {
-    EXPECT("std::vector<int> v{1, 2};\ntry { for (int x : v) v.push_back(x); } catch (const BorrowError& e) { std::println(\"{}\", e.what()); }\nv.push_back(3); std::println(\"{}\", v.size());",
+    EXPECT("std::vector<int> v{1, 2};\ntry { for (int x : v) v.push_back(x); } catch (const BorrowError& e) { std::println(\"{}\", e.what()); }\nv.push_back(3); std::println(\"{}\", v.size());\n// forge-check: ignore-file",
            "cannot call push_back() on a vector while it is being iterated\n3\n");
     EXPECT("std::map<std::string, int> m{{\"a\", 1}};\nfor (auto& [k, x] : m) m[k] = x + 1;\ntry { for (auto& [k, x] : m) m[\"new\"] = 1; } catch (const BorrowError&) { std::println(\"blocked\"); }\nstd::println(\"{}\", m[\"a\"]);",
            "blocked\n2\n");
@@ -471,7 +471,7 @@ try { h.add(1); } catch (const TypeError& e) { std::println("arity"); }
     CHECK_MSG(text == want, "%s", text.c_str());
     // Sandboxed runs refuse native code.
 #ifdef FORGE_TEST_PLUGIN
-    script::options so; so.allow_proc = false; std::string t2; so.out = [&](std::string_view s) { t2 += s; };
+    script::options so; so.allow_proc = false; so.os_sandbox = script::options::os_sandbox_mode::off;   // keep the test process unsandboxed std::string t2; so.out = [&](std::string_view s) { t2 += s; };
     script::engine se(so);
     auto r2 = se.eval(std::string("forge::plugin(\"") + FORGE_TEST_PLUGIN + "\");");
     CHECK(!r2.ok); CHECK_MSG(r2.error_type == "PermissionError", "%s", r2.error_type.c_str());

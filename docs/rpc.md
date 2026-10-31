@@ -29,9 +29,11 @@ Client settings (device `rpc:host:port` and `forge::remote`) come from the envir
 
 ## Remote scripts
 
-`--allow-scripts` (requires authentication) accepts `FRPS` frames and runs them in a fresh
-`forge::script` engine, one at a time, with `--script-timeout MS` (default 60000) and optional
-`--script-no-proc/--script-no-fs/--script-no-net`. From a script:
+`--allow-scripts` (requires authentication) accepts `FRPS` frames and runs each one in its own child
+process (`forge script --rpc-child`, source on stdin) with `--script-timeout MS` (default 60000), a
+`--script-mem-mb N` memory cap (default 2048) and optional `--script-no-proc/--script-no-fs/--script-no-net`.
+When any `--script-no-*` flag is set the child applies the OS sandbox with `require` (best-effort on
+Windows; see docs/scripting.md), so a sandbox failure fails the script instead of running it unconfined. From a script:
 
 ```cpp
 auto r = forge::remote("box2:7000", "std::println(\"{}\", os.hostname());",

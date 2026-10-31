@@ -22,6 +22,33 @@ struct options {
     std::uint64_t deadlock_ms = 1000;   // debug: how long every thread may be blocked before DeadlockError
     int jit_threshold = 2;              // calls before a function is compiled
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
+    // Static checks (forge/script/check.hpp) run after parsing, before execution. A script with a static
+    // error is refused (exit 2, StaticCheckError). strict_check also refuses on warnings.
+    bool static_check = true;
+    bool strict_check = false;
+    // OS-level enforcement of the capability flags (forge/os/sandbox.hpp: seccomp / Capsicum / pledge /
+    // macOS sandbox_init / Windows job object). Applied once, process-wide and irreversibly, by the
+    // engine constructor when any of fs/net/proc is off: !allow_net -> deny_network, !allow_proc ->
+    // deny_exec, !allow_fs -> deny_fs_write (the OS layer blocks writes; reads stay blocked by the
+    // interpreter only). off = interpreter checks only (embedders, rpc-serve, which must keep its own
+    // sockets); best_effort (default) = apply, record any failure in sandbox_status(); require = throw if it fails.
+    // ForgeScript treats this as a core guarantee: it is on by default whenever a capability is turned off.
+    enum class os_sandbox_mode { off, best_effort, require };
+    os_sandbox_mode os_sandbox = os_sandbox_mode::best_effort;
+    // .fsc cache (docs/scripting.md "Bytecode cache"): run_file() stores the parsed, resolved program under
+    // <dir>/<BLAKE3 key>.fsc and reuses it while the source, file name and VM version are unchanged.
+    // Empty dir = $FORGE_SCRIPT_CACHE, and if that is unset the cache is off. Unsigned cache files are trusted
+    // only from a directory owned by the current user and not writable by group/other (POSIX); otherwise, or
+    // with fsc_require_signed, only files signed by one of fsc_trusted_keys (Ed25519 public keys, hex) load.
+    // fsc_sign_seed (32-byte Ed25519 seed, hex; or $FORGE_SCRIPT_CACHE_SIGN_SEED) signs the files written.
+    std::string fsc_cache_dir;
+    std::vector<std::string> fsc_trusted_keys;
+    bool fsc_require_signed = false;
+    std::string fsc_sign_seed;
+    // SIGINT / SIGTERM (Windows: Ctrl-C, Ctrl-Break, console close) raise CancelledError in the running script
+    // during top-level run()/run_file()/eval(); the previous handlers are restored afterwards. Embedders that
+    // own those signals set this to false (engine::interrupt() still works).
+    bool cancel_signals = true;
     std::vector<std::string> argv;      // visible to scripts as `args`
     std::function<void(std::string_view)> out;   // print(); default stdout
     // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = use FORGE_AI_ENDPOINT
@@ -54,6 +81,10 @@ public:
     void reset();                                                              // drop all globals
     int repl();                                                                // interactive loop on stdin/stdout
     std::string stats();
+    // What os_sandbox did: e.g. "seccomp", "pledge", "off", or "failed: <reason>".
+    const std::string& sandbox_status() const;
+    // What the .fsc cache did on the last run_file(): "off", "hit", "miss (stored)", "miss: <reason>".
+    const std::string& cache_status() const;
 
     // ---- host bindings (embedding): native C++ functions callable from scripts, and script callbacks the host
     // can invoke later. Values cross as JSON text, like the plugin ABI (plugin.h). A script function passed as an
@@ -79,4 +110,7 @@ std::string emit(std::string_view src, const std::string& file, const std::strin
 std::vector<std::string> emit_targets();      // backends that have an emitter
 std::string host_shell();                     // default shell for this OS ("pwsh"/"cmd" on Windows, "sh" elsewhere)
 
+// Programs that use ForgeScript's ProcessPool in spawn mode (Windows, or spawn on POSIX) call this first in
+// main(): returns true if this process was started as a pool worker and has finished serving.
+bool run_process_worker_if_requested(int argc, char** argv);
 } // namespace forge::script

@@ -128,9 +128,27 @@ int main() {
 
 - Scripts and modules are compiled to a **compact, verified stack bytecode** (NETMF uses a compact IL
   interpreter for the same reasons: small footprint, fast startup, no JIT, predictable on small
-  devices). Bytecode is compiled in memory on each run. **Not implemented:** an on-disk `.fsc` bytecode
-  cache (keyed by content hash and VM version) was planned. Compilation is fast enough that it has not
-  been needed, and loading untrusted bytecode from disk would widen the attack surface.
+  devices). Bytecode is compiled in memory from the parsed, resolved program on each run.
+- **`.fsc` cache** (`script/src/fsc.cpp`). `run_file()` can cache the parsed and resolved program (the
+  input to the bytecode compiler: bytecode chunks reference AST nodes for delegated statements, so the
+  tree is what is stored) and skip lexing, parsing and resolution on later runs. Enable it with
+  `options::fsc_cache_dir`, `forge script --cache-dir DIR`, or `$FORGE_SCRIPT_CACHE`; off otherwise.
+  - File: `<dir>/<key>.fsc`, key = BLAKE3(`"forge-fsc\0"` ‖ VM version ‖ canonical file name ‖ source).
+    A changed source, name or VM version gives a different key, so stale files are never used.
+  - Load checks: magic, VM version, the key recomputed from the current source, every length and count
+    bounds-checked, node kinds range-checked, nesting capped at 4096, no trailing bytes. Any failure means
+    the source is parsed normally; a bad cache can cost time but not change behaviour. The decoded chunks
+    still go through the bytecode verifier.
+  - Signing: with `options::fsc_sign_seed` / `--cache-sign-seed HEX` / `$FORGE_SCRIPT_CACHE_SIGN_SEED`
+    (32-byte Ed25519 seed) the files written are signed over `"forge-fsc-v1"` ‖ key ‖ BLAKE3(payload). A
+    signed file loads only if the signature verifies and the signer is in `fsc_trusted_keys` /
+    `--cache-trust HEX` (the engine's own signing key is trusted automatically).
+  - Unsigned files load only from a directory owned by the current user and not writable by group or
+    other (POSIX), and never on Windows; `fsc_require_signed` / `--cache-require-signed` rejects them
+    everywhere. That matters because the decoder trusts resolved slot numbers: anyone who can write the
+    cache directory could otherwise feed the tree-walker a crafted tree.
+  - `engine::cache_status()` reports `off`, `hit`, `miss (stored): <reason>` or `miss: <reason>`.
+  - Bump `fsc::vm_version` whenever `Node`, `FnDecl`, `ClassDecl` or the compiler change meaning.
 - The **REPL and `eval`** use a direct **AST tree-walker** path: no compile step, best error locations,
   instant feedback. Functions are compiled to bytecode lazily once called `jit_threshold` times (default 2, `script::options`;
   `script/src/runtime.cpp`), so hot REPL code also runs on the VM.
@@ -175,8 +193,18 @@ int main() {
 - `try { } catch e: IOError { } catch e { } finally { }`, `throw Error("msg")`; user classes derive
   from `Error`. Exceptions carry message, type, script stack trace and optional `cause`.
 - Built-in hierarchy: `Error` > `IOError`, `OSError` (with `errno`/`win32` code), `TypeError`,
-  `IndexError`, `KeyError`, `OverflowError`, `OutOfMemoryError`, `TimeoutError`, `CancelledError`,
-  `ObjectDisposedError`, `ShellError`, `PermissionError`, `LimitExceededError`.
+  `IndexError`, `KeyError`, `OverflowError`, `ObjectDisposedError`, `ShellError`, `LimitExceededError`.
+- OS errors (as in Python, all under `OSError`, so `catch (const OSError& e)` gets every one): `PermissionError`
+  (and its subclass `SandboxViolationError`), `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError`,
+  `FileNotFoundError`, `FileExistsError`, `NotADirectoryError`, `IsADirectoryError`, `NotSupportedError`,
+  `InterruptedError`, `BlockingIOError`, `ProcessLookupError`, `NoSpaceError`, `TooManyFilesError`, `BusyError`,
+  `ReadOnlyFileSystemError`, `SignalError` (a fault caught by `fault_guard`, or a crashed process-pool worker), and
+  `ConnectionError` with `ConnectionRefusedError`, `ConnectionResetError`, `BrokenPipeError`. The mapping from
+  errno / GetLastError / WSA / NTSTATUS / Mach codes is in `forge/os/oserror.hpp`. `EPERM` is reported as
+  `SandboxViolationError` only when the active OS sandbox policy denies that kind of operation (network, exec,
+  file write); `EACCES` stays `PermissionError`. SIGINT/SIGTERM (Ctrl-C/Ctrl-Break/console close on Windows)
+  raise `CancelledError` during a top-level run (`options::cancel_signals`, default on; the previous handlers
+  are restored afterwards).
 - C++ exceptions are mapped to script exceptions by `Interp::from_cpp` (`script/src/runtime.cpp`):
   `heap_exhausted`/`std::bad_alloc` -> `OutOfMemoryError`, `syntax_error` -> `SyntaxError`, `forge_exception`
   by `errc` (`IOError`, `ValueError`, `OSError`, `OutOfMemoryError`, else `Error`), `std::out_of_range` ->
@@ -372,8 +400,55 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 7. **Remote execution** — `forge::remote("host:7000", source, opts)` runs on `forge rpc-serve
    --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS. Implemented; see docs/rpc.md.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
-9. **Sandboxed runs** — `forge::sandbox(opts, fn)` and `--no-fs/--no-net/--no-proc` turn interpreter
-   capabilities off. This is an in-interpreter check only; it does **not** use `os/sandbox.hpp` (planned). See docs/security.md.
+9. **Sandboxed runs** — run untrusted scripts with fs/net/proc capabilities off. ForgeScript enforces
+   the flags twice: the interpreter raises `PermissionError`, and the engine applies the OS sandbox from
+   `forge/os/sandbox.hpp` to the whole process (Linux/Android seccomp-BPF, FreeBSD Capsicum, OpenBSD
+   pledge, macOS `sandbox_init`, Windows job object). Mapping: `--no-net` → deny sockets other than
+   AF_UNIX; `--no-proc` → deny exec; `--no-fs` → deny file writes (reads are blocked by the interpreter
+   only). It is on by default (`options::os_sandbox = best_effort`; `forge script --os-sandbox
+   off|best-effort|require`), is one-way, and `engine::sandbox_status()` reports the mechanism or the
+   failure.
+   - **Per-block OS sandbox:** `sandbox({net: false, isolate: true}) { ... }` runs the block in a forked
+     child that applies the narrower OS policy (only the capabilities the block turns off) and sends back
+     the block's return value (JSON-representable values only), its `print` output and any exception
+     (re-raised with its type). The child works on a copy of the heap, so assignments to captured
+     variables, globals and objects inside the block are not seen afterwards. Without `isolate` a block is
+     interpreter-only: an OS sandbox is process-wide and one-way, so it cannot be narrowed for a block and
+     then widened again in the same process. `isolate` is POSIX only (Windows and iOS have no `fork`;
+     there it raises `PermissionError` without running the block). Forking a process with other running
+     threads copies only the calling thread: avoid `isolate` while tasks hold locks the block needs.
+   - **rpc-serve:** each remote script runs in its own child (`forge script --rpc-child`, source on
+     stdin) under `--script-timeout`, a `--script-mem-mb` memory cap (default 2048), and with
+     `--os-sandbox require` whenever a `--script-no-*` flag is set, so the OS sandbox applies to remote
+     scripts without touching the server's sockets. Scripts can now run concurrently.
+   - **Windows:** a running process cannot drop fs/net access, so in-process enforcement is the job
+     object (no child processes) and the interpreter checks the rest. `os::run_sandboxed` starts children
+     in an AppContainer (no network capability unless allowed, writes only to the container folder, user
+     files unreadable unless their ACL grants ALL APPLICATION PACKAGES) inside a kill-on-close job with UI
+     limits; an exec-only policy uses a restricted token in the job. rpc-serve children on Windows use
+     `best-effort`. Not yet run on Windows (cross-compiled with llvm-mingw only). See docs/security.md.
+
+## Process pools (implemented)
+
+`ProcessPool(workers, {fs, net, proc, env, timeout})` runs tasks in worker *processes* (`forge::os::process_pool`:
+fork on Linux/macOS/FreeBSD/Android, spawn of the same executable on Windows; not available on iOS, where it raises
+`NotSupportedError`). A task is ForgeScript source that defines `task(arg)`; each call runs it in a fresh engine in the
+worker with a JSON-representable argument and result:
+
+```
+auto pp = ProcessPool(4);                                   // capabilities default to off
+auto f = pp.submit("auto task(auto x) { return x * x; }", 7);
+f.get();                                                     // 49; f.get(timeout_ms), f.done()
+std::vector<int> xs = {1, 2, 3};
+pp.map("auto task(auto x) { return x + 1; }", xs);          // [2, 3, 4]
+pp.shutdown();                                               // also pp.size(), pp.resize(n)
+```
+
+Workers never get a capability the calling script lacks, and the pool applies the matching OS sandbox to each
+worker process (no network / no exec / no file writes unless enabled). Errors keep their type (`ValueError` raised
+in the task is `ValueError` in the caller); a worker that crashes raises `SignalError` and is replaced. A task's
+`print` output is replayed in the caller when the result is collected. Programs embedding the engine that use spawn
+mode must call `forge::script::run_process_worker_if_requested(argc, argv)` first in `main()` (the `forge` CLI does).
 
 ## AI-assisted commands (implemented)
 
@@ -518,7 +593,7 @@ All phases are in scope.
 
 1. **Core runtime**: value model, ARC heap on `forge::mem`, weak refs, exceptions, lexer/parser,
    tree-walker, REPL, `run` + `sh/bash/zsh/ps/cmd` blocks, fs/os/json built-ins, `using`/`defer`.
-2. **Bytecode VM**: compiler, verifier, lazy REPL compilation, dual-path golden tests (the `.fsc` disk cache was dropped; see Execution model);
+2. **Bytecode VM**: compiler, verifier, lazy REPL compilation, dual-path golden tests, the `.fsc` cache (see Execution model);
    classes, structs, interfaces, optional annotations and generics-lite.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).
@@ -527,3 +602,89 @@ All phases are in scope.
    and plugins).
 5. **Advanced**: features 6, 7 and 9 (AI-assisted commands, remote execution once rpc-serve has
    auth/TLS, sandboxed runs).
+
+## Static checks (implemented, compile-checked only; tests pending)
+
+`forge script --check file.fs` (add `--json` for `[{"file","line","col","severity","id","message"}]`) runs the
+static checker (`forge/script/check.hpp`, `script/src/check.cpp`) over the parsed and resolved AST without running
+anything; exit 2 when there are errors. Every normal run also runs it first: `options::static_check` (default on,
+`--no-check` turns it off) refuses a script with any **error** (exit 2, `StaticCheckError`); `options::strict_check`
+(`--strict-check`) refuses on warnings too. Errors are claimed only when the flagged operation is certain to raise
+or be refused whenever it is reached; anything uncertain is a warning. The runtime checks (BorrowError, RaceError,
+DeadlockError, PermissionError) remain the backstop.
+
+Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the line or the line above, or
+`// forge-check: ignore-file[id]` for the whole file.
+
+| id | severity | what |
+|---|---|---|
+| `use-after-move` | error on every path / warning on some path | flow-sensitive over the function's locals (branches, `&&`/`||`/`?:`, loops with a back-edge pass, try/catch) |
+| `unique-copy` | error | copy-initialising from a `std::make_unique` local |
+| `iter-mutation` | error for a list/map-literal or `list`/`map`/`vector`-typed local, else warning | size-changing method on the container a range-for is iterating |
+| `capability` | error | `fs.*`, `net.*`, `proc.*`, `service.*`, `os.env/setenv/chdir/processes/kill`, `run()`, shell blocks when the run's `--no-fs/--no-net/--no-proc` or an enclosing `sandbox({fs: false, ...}, fn)` literal denies them |
+| `pool-task` | error | `submit`/`map` with a literal task source that does not parse, does not define `task`, or whose `task` does not take one argument |
+| `pool-json` | error | a lambda or shell value (or a literal containing one) passed as a ProcessPool argument |
+| `thread-send` | warning | an argument to `forge::spawn`/`std::thread`/`std::async` that is not a literal, moved, frozen, const or `forge::shared` |
+| `thread-capture` | warning | a thread lambda reading or writing a captured mutable local |
+| `lock-order` | warning | two `forge::shared` names locked in both orders by nested `x.with(fn)` (static lock graph, 2-cycles) |
+| `unreachable` | warning | statements after return/throw/break/continue |
+| `unused-variable` | warning | local initialised from a literal and never read (names starting `_` exempt) |
+| `shadow` | warning | local redeclaring a name from an enclosing block of the same function |
+| `missing-return` | warning | function with a declared non-void return type that can fall off its end |
+| `arg-count` | warning | call of a top-level script function (never reassigned) with too few/many arguments |
+| `catch-order` | warning | a catch after `catch (...)` or after a built-in ancestor (e.g. `OSError` before `TimeoutError`) |
+| `infinite-loop` | warning | `while (true)`/`for (;;)` with no break, return, throw or exit |
+| `format` | warning | `std::format/print/println` literal with a placeholder count that does not match the arguments |
+| `syntax` | error | parse failure |
+
+| `channel-send` | warning | a non-moved, non-frozen, non-const, non-shared value sent with `.send/.push` on a local made by `channel()` |
+| `deprecated` | warning | built-in table (`std::random_shuffle`, `std::auto_ptr`, `std::bind1st/2nd`, `std::ptr_fun`, `std::gets`, `std::aligned_storage/union`) and calls of script functions marked `[[deprecated]]` |
+| `type` | warning | arithmetic/comparison between a string and a number where both sides are literals or `const` locals initialised from literals |
+
+Scope of the flow checks: function locals, and **script globals at top level**: a global declared by the script's
+own top-level `let` is tracked through the top-level statements; globals the host injects are never tracked. A move
+of a global is downgraded to "maybe" after any call to script code when some function assigns or moves that global.
+Field paths (`std::move(o.f)` then `o.f`) are tracked; assigning `o` or `o.f` clears them. `capability` also covers a
+builtin stored in a local (`auto r = fs.read; r(p)`: error when the local is `const`, warning otherwise) and
+`eval("literal")`, whose source is checked with the same capabilities. `iter-mutation` recognises `std::vector`,
+`deque`, `list`, `forward_list`, `map`, `unordered_map`, `multimap`, `set`, `unordered_set`, `multiset` and `array`.
+`lock-order` finds cycles of any length in the nested-`with` graph (strongly connected components). Columns come from
+the token positions recorded on AST nodes (`Node::col`).
+
+Considered and not built (yet): **undefined variables** (the resolver already rejects unknown locals; unknown globals
+may be host-injected, so only a warning would be sound); **await outside async** (`await` on a task value is legal
+anywhere in ForgeScript, so there is nothing to flag); **type inference beyond literals** (values are dynamic and
+conversions implicit).
+
+References: `let` nodes carry a `ref` flag (`T& r = x`), so a reference is an alias of its target: moving
+through the reference marks the target as maybe moved, and reading a reference whose target may have been moved is a
+warning. Capability flow also follows: string-path `import`s of script modules (checked once each, cycles stopped,
+same capabilities; errors reported on the import line), builtins passed as arguments to top-level script functions
+(the parameter is tainted; calls through it are warnings, since other call sites may pass something else), and
+builtins stored in list/map literals (calling an element is a warning). Columns are the start of the construct: the
+leftmost recorded token column among the node and its sub-expressions on that line. `[[deprecated]]` on class
+methods warns at `obj.m()` calls (the receiver's class is unknown statically, so the message says when only some
+classes defining `m` mark it).
+
+Capability taint is a small value analysis: a builtin (`fs.read`, ...) taints the local it is stored in, a container
+built from it (literal, `std::vector<auto> t = {fs.read}` and other standard constructors, `push_back`/`insert`/
+`emplace*`/`append`), an element read from such a container, the return value of a script function or method that
+returns it, and the parameters of script functions and methods it is passed to. Lambdas see the taint of captured
+locals. Calls through any tainted value are warnings (the value may differ at run time); only a `const` local
+initialised directly from the builtin is an error. `import` resolves modules like the runtime (`module_search_path`:
+script dir, `FORGE_SCRIPT_PATH`, `~/.forge/modules`, cwd; `name.fs`, `name.cpp`, `name/mod.fs`, `name/mod.cpp`), and
+with `fs` denied an import is itself an error (the runtime refuses it). A native `.so/.dylib/.dll` import is an error
+unless every capability is granted, matching `load_plugin`. Statement nodes carry the column of their first token.
+
+The checker runs in two passes: the first summarises every function and lambda (returned builtins, builtins
+stored into object fields) and the second reports with those summaries, so a call may come before the definition.
+Builtins assigned to an object field taint that field name on every object (coarse, warning only); calling such a
+field warns. Calling a lambda, a local holding a lambda, or a method whose body returns a builtin taints the result.
+`forge::import("lit")` and `forge::plugin("lit")` are checked like `import` statements. Extra import directories:
+`forge script --check --module-dir DIR` (repeatable) or `check_options::module_dirs`; the engine passes its
+`base_dir` automatically, so embedded runs resolve modules like the runtime.
+
+Known gaps: field taint is by field name, not per object or class (warnings only); summaries iterate twice, so
+taint passed through more than two levels of function-returns-function may be missed; non-literal paths to
+`forge::import`/`plugin` are not followed; taint is per variable, not per element or key. Test scripts that deliberately trigger the runtime errors carry
+`// forge-check: ignore-file`.

@@ -1,4 +1,6 @@
 #include <iterator>
+#include <iostream>
+#include <forge/os/process.hpp>
 // forge — command-line front end: info | import | inspect | run | bench
 #include <sys/stat.h>
 #include <forge/import/gguf.hpp>
@@ -15,6 +17,7 @@
 #include <chrono>
 #include <forge/grid/prims.hpp>
 #include <forge/script/script.hpp>
+#include <forge/script/check.hpp>
 
 using namespace forge;
 
@@ -310,7 +313,7 @@ int cmd_bench(const args& a) {
 
 // forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]
 //   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]... [--tls-cert C --tls-key K]
-//   [--allow-scripts [--script-timeout MS] [--script-no-proc] [--script-no-fs] [--script-no-net]]
+//   [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
 // Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
     std::string why, dev = a.get("device", "cpu");
@@ -337,18 +340,44 @@ int cmd_rpc_serve(const args& a) {
     if (!sec.auth_required() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
         std::fprintf(stderr, "forge rpc: WARNING: no authentication and bound to %s; anyone who can reach it can use it\n", bind.c_str());
     flow::rpc::server srv(reg.get(), int(a.num("port", 7000)), bind, sec);
-    std::mutex script_m;
     if (sec.allow_scripts) {
         auto def_tmo = std::uint64_t(a.num("script-timeout", 60000));
+        auto mem_mb = std::uint64_t(a.num("script-mem-mb", 2048));
         bool no_proc = a.has("script-no-proc"), no_fs = a.has("script-no-fs"), no_net = a.has("script-no-net");
-        srv.script_handler = [&script_m, def_tmo, no_proc, no_fs, no_net](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
-            std::lock_guard g(script_m);   // one remote script at a time (engine globals, memory budget)
-            forge::script::options o; std::string out;
-            o.argv = argv; o.timeout_ms = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
-            o.allow_proc = !no_proc; o.allow_fs = !no_fs; o.allow_net = !no_net;
-            o.out = [&out](std::string_view s) { if (out.size() < (32u << 20)) out += s; };
-            forge::script::engine e(o); auto r = e.run(src, name.empty() ? "<remote>" : name);
-            return flow::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
+        std::string self = os::exe_path();
+        if (self.empty()) throw std::runtime_error("rpc-serve --allow-scripts: cannot find this executable to start script children");
+        // Each remote script runs in its own child process (`forge script --rpc-child`), so ForgeScript's OS sandbox
+        // (seccomp / Capsicum / pledge / sandbox_init / restricted token) applies to the script without touching the
+        // server's own sockets, and a crash, leak or runaway loop dies with the child. The source goes over stdin.
+        srv.script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
+            auto t = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
+            os::spawn_spec sp;
+            sp.argv = {self, "script", "--rpc-child", name.empty() ? "<remote>" : name, "--timeout", std::to_string(t)};
+            if (no_proc) sp.argv.push_back("--no-proc");
+            if (no_fs) sp.argv.push_back("--no-fs");
+            if (no_net) sp.argv.push_back("--no-net");
+            // Windows cannot deny fs/net inside a running process (only run_sandboxed's AppContainer can), so there the
+            // child applies what it can (job object) and the interpreter checks the rest.
+#if defined(_WIN32)
+            if (no_proc || no_fs || no_net) { sp.argv.push_back("--os-sandbox"); sp.argv.push_back("best-effort"); }
+#else
+            if (no_proc || no_fs || no_net) { sp.argv.push_back("--os-sandbox"); sp.argv.push_back("require"); }
+#endif
+            sp.argv.push_back("--args"); for (auto& x : argv) sp.argv.push_back(x);
+            sp.stdin_data = src; sp.timeout_ms = t + 5000; sp.max_output = 32u << 20;
+            sp.limits.memory_bytes = mem_mb << 20;
+            sp.env_unset = {"FORGE_SCRIPT_CACHE_SIGN_SEED", "FORGE_RPC_TOKEN", "FORGE_RPC_KEY"};
+            auto r = os::spawn_wait(sp);
+            if (!r) return flow::rpc::server::script_result{false, "RuntimeError", "could not start script child: " + r.err.what, ""};
+            auto& pr = r.value;
+            if (pr.timed_out) return flow::rpc::server::script_result{false, "TimeoutError", "script exceeded " + std::to_string(t) + " ms", pr.out};
+            if (pr.exit_code == 0) return flow::rpc::server::script_result{true, "", "", pr.out};
+            // child protocol: stderr = "<ErrorType>\n<message>"; a signal death or sandbox failure has none.
+            std::string et = "RuntimeError", em = pr.err;
+            if (auto nl = pr.err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && pr.err.find(' ') > nl) { et = pr.err.substr(0, nl); em = pr.err.substr(nl + 1); }
+            if (pr.term_signal) { et = "RuntimeError"; em = "script child killed by signal " + std::to_string(pr.term_signal) + (pr.err.empty() ? "" : ": " + pr.err); }
+            while (!em.empty() && em.back() == '\n') em.pop_back();
+            return flow::rpc::server::script_result{false, et, em, pr.out};
         };
     }
     std::printf("forge rpc: listening on %s:%d (%s)%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
@@ -363,28 +392,42 @@ int cmd_rpc_serve(const args& a) {
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
-    std::string file, code, emit_target, emit_out; bool have_code = false;
+    std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
+    std::string rpc_child;
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
         auto val = [&](const char* what) -> std::string { if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + what); return argv[++i]; };
         if (s == "-e") { code = val("-e"); have_code = true; ++i; break; }
+        else if (s == "--rpc-child") { rpc_child = val("--rpc-child"); have_code = true; }   // rpc-serve: source on stdin
+        else if (s == "--args") { ++i; break; }
         else if (s == "--emit") emit_target = val("--emit");
         else if (s == "-o") emit_out = val("-o");
         else if (s == "--emit-targets") { for (auto& t : forge::script::emit_targets()) std::printf("%s\n", t.c_str()); return 0; }
+        else if (s == "--check") check_only = true;           // static checks only (docs/scripting.md "Static checks")
+        else if (s == "--json") check_json = true;
+        else if (s == "--module-dir") module_dirs.push_back(val("--module-dir"));   // extra import dir for --check
+        else if (s == "--no-check") o.static_check = false;
+        else if (s == "--strict-check") o.strict_check = true;
         else if (s == "--tree") o.use_vm = false;
         else if (s == "--debug") o.debug = true;
         else if (s == "--timeout") o.timeout_ms = std::stoull(val("--timeout"));
         else if (s == "--max-steps") o.max_steps = std::stoull(val("--max-steps"));
         else if (s == "--heap") o.heap_bytes = std::stoull(val("--heap"));
         else if (s == "--no-proc") o.allow_proc = false;
+        else if (s == "--cache-dir") o.fsc_cache_dir = val("--cache-dir");
+        else if (s == "--cache-trust") o.fsc_trusted_keys.push_back(val("--cache-trust"));
+        else if (s == "--cache-require-signed") o.fsc_require_signed = true;
+        else if (s == "--cache-sign-seed") o.fsc_sign_seed = val("--cache-sign-seed");
         else if (s == "--no-fs") o.allow_fs = false;
         else if (s == "--no-net") o.allow_net = false;
+        else if (s == "--os-sandbox") { os_sandbox_set = true; auto m = val("--os-sandbox"); o.os_sandbox = m == "off" ? forge::script::options::os_sandbox_mode::off : m == "require" ? forge::script::options::os_sandbox_mode::require : m == "best-effort" ? forge::script::options::os_sandbox_mode::best_effort : throw std::runtime_error("--os-sandbox takes off|best-effort|require"); }
         else if (s == "--") { ++i; if (i < argc) file = argv[i++]; break; }
         else if (s.starts_with("--")) throw std::runtime_error("unknown script option " + s);
         else { file = s; ++i; break; }
     }
     for (; i < argc; ++i) o.argv.push_back(argv[i]);
+    (void)os_sandbox_set;   // ForgeScript enforces cap flags at the OS level by default (options::os_sandbox)
     // AI-drafted code (forge::ai_run / ai_eval) runs only after an explicit "y" on the terminal.
     o.confirm = [](const std::string& code) {
         std::fprintf(stderr, "\nAI drafted:\n%s\nRun it? [y/N] ", code.c_str()); std::fflush(stderr);
@@ -392,6 +435,14 @@ int cmd_script(int argc, char** argv) {
         return buf[0] == 'y' || buf[0] == 'Y';
     };
     if (!emit_target.empty()) for (std::size_t k = 0; k + 1 < o.argv.size(); ++k) if (o.argv[k] == "-o") { emit_out = o.argv[k + 1]; o.argv.erase(o.argv.begin() + k, o.argv.begin() + k + 2); break; }
+    if (check_only) {
+        if (!have_code) { if (file.empty()) throw std::runtime_error("--check needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
+        forge::script::check_options co{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env, true, module_dirs};
+        auto ds = forge::script::check(code, have_code ? "<-e>" : file, co);
+        auto txt = check_json ? forge::script::to_json(ds) + "\n" : forge::script::to_text(ds);
+        std::fwrite(txt.data(), 1, txt.size(), check_json ? stdout : stderr);
+        return forge::script::has_errors(ds) || (o.strict_check && !ds.empty()) ? 2 : 0;
+    }
     if (!emit_target.empty()) {   // write once, emit anywhere: translate instead of running
         if (!have_code) { if (file.empty()) throw std::runtime_error("--emit needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
         try {
@@ -400,6 +451,15 @@ int cmd_script(int argc, char** argv) {
             else { std::ofstream f(emit_out, std::ios::binary); f << text; f.close(); std::filesystem::permissions(emit_out, std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec | std::filesystem::perms::others_exec, std::filesystem::perm_options::add); }
             return 0;
         } catch (const forge::script::emit_error& ex) { std::fprintf(stderr, "%s:%d: emit %s: %s\n", file.empty() ? "<-e>" : file.c_str(), ex.line, emit_target.c_str(), ex.what()); return 2; }
+    }
+    if (!rpc_child.empty()) {
+        code.assign(std::istreambuf_iterator<char>(std::cin), {});
+        o.confirm = nullptr;   // no terminal: AI-drafted code never runs remotely
+        forge::script::engine e(o);
+        auto r = e.run(code, rpc_child);
+        std::fflush(stdout);
+        if (!r.ok) { std::fprintf(stderr, "%s\n%s", r.error_type.empty() ? "RuntimeError" : r.error_type.c_str(), r.error.c_str()); return r.exit_code ? r.exit_code : 1; }
+        return r.exit_code;
     }
     forge::script::engine e(o);
     if (!have_code && file.empty()) return e.repl();
@@ -410,6 +470,7 @@ int cmd_script(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
     if (argc < 2) return usage();
     std::string c = argv[1];
     if (c == "script") {

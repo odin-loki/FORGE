@@ -12,8 +12,10 @@ android)
   b="$bin/android-$2"
   cmake -S "$src" -B "$b" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$ndk/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI="$2" -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DFORGE_JNI=ON \
-    -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_APPS=OFF >/dev/null
-  cmake --build "$b" --target forge_jni -j "${FORGE_MOBILE_JOBS:-4}"
+    -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_APPS=OFF \
+    -DCMAKE_CXX_FLAGS="-fexperimental-library" -DCMAKE_EXE_LINKER_FLAGS="-fexperimental-library" \
+    -DCMAKE_SHARED_LINKER_FLAGS="-fexperimental-library" >/dev/null   # NDK libc++: jthread/stop_token/<format> (CMakeLists.txt adds it too)
+  cmake --build "$b" --target forge_jni -j "${FORGE_MOBILE_JOBS:-3}"
   nm=$(ls "$ndk"/toolchains/llvm/prebuilt/*/bin/llvm-nm | head -1)
   n=$("$nm" -D --defined-only "$b/libforge_jni.so" | grep -c ' T Java_dev_forge_ForgeModel_native')
   want=$(grep -c '^JNIEXPORT' "$src/bindings/android/jni/forge_jni.c")
