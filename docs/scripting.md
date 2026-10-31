@@ -128,9 +128,10 @@ int main() {
 
 - Scripts and modules are compiled to a **compact, verified stack bytecode** (NETMF uses a compact IL
   interpreter for the same reasons: small footprint, fast startup, no JIT, predictable on small
-  devices). A `.fsc` bytecode cache next to the source is **planned, not implemented**: scripts are compiled on every run.
+  devices). A `.fsc` bytecode cache next to the source is **planned, not implemented**: nothing is cached between runs.
 - The **REPL and `eval`** use a direct **AST tree-walker** path: no compile step, best error locations,
-  instant feedback. Lazy compilation of hot REPL functions to bytecode is **planned**; REPL code currently stays on the tree-walker.
+  instant feedback. Functions are compiled to bytecode lazily once called `jit_threshold` times (default 2, `script::options`;
+  `script/src/runtime.cpp`), so hot REPL code also runs on the VM.
 - Both paths share one value model, one object heap and one built-in table, so behaviour is identical;
   golden tests run every test script through both paths.
 - The verifier checks stack depth, jump targets, constant/local indices and opcode operands before a
@@ -216,7 +217,8 @@ safe) and per-child output size (64 MiB). `forge::limit(opts, fn)` narrows these
 `timeout` (ms), `mem` (bytes, integer), `proc_mem` and `proc_cpu` (child memory bytes / CPU seconds,
 applied at spawn through `forge::os` process limits). Exceeding a limit raises `LimitExceededError`,
 `TimeoutError` or `OutOfMemoryError`. **Planned, not implemented:** `limit {}` block syntax, string sizes
-such as `"2G"`, allocation-count, open-handle and child-count limits. `forge::limit` has no dedicated test yet.
+such as `"2G"`, allocation-count, open-handle and child-count limits; unknown keys (e.g. `cpu_s`) are ignored.
+Tested by `tests/script/limits.fs`.
 
 ### Interpreter implementation rules (safe ISO C++23)
 
@@ -231,7 +233,7 @@ such as `"2G"`, allocation-count, open-handle and child-count limits. `forge::li
   assertions enabled in all builds); bytecode reads go through a checked reader.
 - Errors via exceptions/`std::expected` internally; mapped to script exceptions as described under Errors.
 - Enforced by clang-tidy (cppcoreguidelines, bugprone), `-Wall -Wextra -Werror`, ASan/UBSan/TSan CI
-  jobs; fuzzing of the lexer, parser, compiler and verifier is planned (no fuzz target yet).
+  jobs and fuzzing of the lexer, parser, compiler and verifier (`fuzz/fuzz_script.cpp`).
 
 ## REPL
 
@@ -500,10 +502,11 @@ in both execution modes.
 
 ## Testing
 
-Implemented: `tests/test_script.cpp` runs every snippet through both the VM and the tree-walker and fails on
-any divergence, plus per-built-in cases, emit goldens (`tests/data/emit/`) and shell tests that skip when the
-shell is missing. **Planned, not implemented:** a `tests/script/*.fs` golden corpus and a parser/compiler fuzz
-target (the 8 targets in `fuzz/` cover model formats, JSON, grammar and the tokenizer, not the script parser).
+`tests/test_script.cpp` runs every snippet through both the VM and the tree-walker and fails on any divergence,
+plus per-built-in cases, emit goldens (`tests/data/emit/`) and shell tests that skip when the shell is missing.
+`tests/test_script_golden.cpp` runs every `tests/script/*.fs` on both paths against `<name>.out`
+(`FORGE_GOLDEN_UPDATE=1` rewrites them). `fuzz/fuzz_script.cpp` fuzzes the lexer, parser, resolver, compiler
+and verifier without executing anything.
 
 ## Phasing
 
@@ -511,7 +514,7 @@ All phases are in scope.
 
 1. **Core runtime**: value model, ARC heap on `forge::mem`, weak refs, exceptions, lexer/parser,
    tree-walker, REPL, `run` + `sh/bash/zsh/ps/cmd` blocks, fs/os/json built-ins, `using`/`defer`.
-2. **Bytecode VM**: compiler, verifier and dual-path tests are done; `.fsc` cache and lazy REPL compilation are planned;
+2. **Bytecode VM**: compiler, verifier, lazy compilation and dual-path golden tests are done; the `.fsc` cache is planned;
    classes, structs, interfaces, optional annotations and generics-lite.
 3. **Concurrency and limits**: tasks, async, channels, freeze/move sharing rules, cycle collector,
    resource limits and `OutOfMemoryError`, FORGE built-ins (model, gpu, mem, serve).

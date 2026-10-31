@@ -55,5 +55,5 @@ catches all of them, so an embedder never sees a C++ exception from `run`/`eval`
 - Scripts are not OS-sandboxed; a planned design runs sandboxed scripts in a child under `run_sandboxed`
   with a memory-budget cap, mapping OS denials to `PermissionError`.
 - `limit {}` block syntax (only `forge::limit(opts, fn)` exists), no allocation/handle/child-count limits.
-- No script parser fuzz target; no escape tests for the capability checks.
+- No escape tests for the capability checks (the parser is fuzzed by `fuzz/fuzz_script.cpp`).
 - RPC: no mTLS or per-key permissions (docs/STATUS.md, Deferred).

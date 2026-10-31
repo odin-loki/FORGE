@@ -2,8 +2,7 @@
 
 ## Known gaps / not yet implemented (verified 2026-10-31, see docs/security.md)
 - Script sandboxing is interpreter capability checks only; `script/` does not call `os/sandbox.hpp`.
-- No `.fsc` bytecode cache, no lazy REPL compilation, no `limit {}` block syntax (only `forge::limit(opts, fn)`).
-- No `tests/script/*.fs` golden corpus and no script parser fuzz target.
+- No `.fsc` bytecode cache and no `limit {}` block syntax (only `forge::limit(opts, fn)`).
 - No `os/dynlib.hpp` (dynamic libraries are `os::library` in `os.hpp`).
 - Logger: no async sink, Windows event log sink or CMake strip option.
 
