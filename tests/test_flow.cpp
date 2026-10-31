@@ -246,6 +246,9 @@ TEST(codecs_roundtrip) {
 // lane target this machine can run, including a partial final tile (k not a multiple of 256 for q8_0).
 TEST(qdot_matches_decode_exactly) {
     std::mt19937 r(11);
+    { const auto& f = lane::detect();   // logged so a SIGILL in a VM shows which features the guest reports
+      std::printf("  cpu: avx=%d avx2=%d fma=%d f16c=%d bmi2=%d popcnt=%d avx512f=%d bw=%d dq=%d vl=%d cd=%d\n", f.avx, f.avx2, f.fma, f.f16c,
+                  f.bmi2, f.popcnt, f.avx512f, f.avx512bw, f.avx512dq, f.avx512vl, f.avx512cd); std::fflush(stdout); }
     for (const char* tgt : {"scalar", "avx2", "avx512"}) {
         const auto* ker = lane::by_name(tgt);
         if (!ker) { std::printf("  qdot: target %s not available\n", tgt); continue; }

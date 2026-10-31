@@ -225,7 +225,9 @@ static void zones() {
     CHECK(a && b && b.value - a.value == std::chrono::seconds(3600));
     auto r = L::from_time(std::chrono::system_clock::time_point(std::chrono::seconds(1793000000)), "Australia/Sydney");
     CHECK(r && r.value.hour == 18 && r.value.minute == 33 && abbrev_is(r.value.zone_abbrev, "AEDT", "GMT+11"));
-    if (r) { EQ(L::format_pattern(r.value, "HH:mm zzz xxx", "en"), "18:33 AEDT +11:00"); EQ(L::format_pattern(r.value, "VV O", "en"), "Australia/Sydney GMT+11"); }
+    // Windows' ICU-backed tzdb only knows numeric abbreviations (GMT+11), like abbrev_is above.
+    if (r) { auto hm = L::format_pattern(r.value, "HH:mm zzz xxx", "en");
+             CHECK(hm == "18:33 AEDT +11:00" || hm == "18:33 GMT+11 +11:00"); EQ(L::format_pattern(r.value, "VV O", "en"), "Australia/Sydney GMT+11"); }
     auto names = L::zone_names(); CHECK(names.size() > 300);
 }
 static void messages() {

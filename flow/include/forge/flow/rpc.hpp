@@ -183,6 +183,9 @@ public:
     // Accepts connections until stop(); one thread per connection.
     void run() {
         while (!stop_) {
+            // macOS/BSD: shutdown() on a listening socket does not wake a blocked accept() (Linux's does), so
+            // wait for a connection in 200 ms slices and re-check stop_.
+            if (!ls_.wait_readable(200)) continue;
             auto c = ls_.accept();
             if (!c) { if (stop_) break; continue; }
             auto ch = std::make_shared<channel>(std::move(c.value));
@@ -200,7 +203,7 @@ public:
         ls_.close();                            // Winsock: shutdown() does not wake a blocked accept(); closesocket() does
         if (th_.joinable()) th_.join();
 #else
-        ls_.shutdown_both();                    // wakes accept(); close only after the accept thread is gone
+        ls_.shutdown_both();                    // wakes accept() on Linux (run() polls elsewhere); close after the thread is gone
         if (th_.joinable()) th_.join();
         ls_.close();
 #endif

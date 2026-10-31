@@ -273,7 +273,10 @@ TEST(file_watching) {
 }
 // ---------------------------------------------------------------- 14 timers + perf counters
 TEST(timers_and_perf) {
-    auto c0 = os::cycle_counter(); volatile double x = 1; for (int i = 0; i < 100000; ++i) x = x * 1.0000001 + 1e-9; auto c1 = os::cycle_counter();
+    // spin for 1 ms of wall time (a fixed loop count can finish inside one tick of a 24 MHz counter on a fast core)
+    auto c0 = os::cycle_counter(); volatile double x = 1;
+    for (auto s0 = os::monotonic_ns(); os::monotonic_ns() - s0 < 1000000;) x = x * 1.0000001 + 1e-9;
+    auto c1 = os::cycle_counter();
     CHECK(c1 > c0); auto hz = os::counter_hz(); CHECK(hz > 1000000);
     std::printf("  counter %.1f MHz, timer res %llu ns\n", double(hz) / 1e6, (unsigned long long)os::timer_resolution_ns());
     auto t0 = os::monotonic_ns(); os::precise_sleep_ns(2000000); auto dt = os::monotonic_ns() - t0;
