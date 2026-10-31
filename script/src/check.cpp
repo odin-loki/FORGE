@@ -77,6 +77,13 @@ struct Fn {
     std::map<int, Binding*> slot;                      // current binding per slot
     std::vector<std::unique_ptr<Binding>> all;
     std::vector<std::set<std::string>> scopes;         // names per block, for shadowing
+    // Move-only: MSVC's vector<Fn> reallocation otherwise picks the (ill-formed) copy,
+    // because std::map's move constructor is not noexcept there.
+    Fn() = default;
+    Fn(const Fn&) = delete;
+    Fn& operator=(const Fn&) = delete;
+    Fn(Fn&&) = default;
+    Fn& operator=(Fn&&) = default;
 };
 
 struct Checker {
