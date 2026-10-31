@@ -131,7 +131,7 @@ public:
         return r;
     }
     ~runtime() {
-        try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); } catch (...) {}
+        try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear(); } catch (...) {}
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
@@ -148,7 +148,7 @@ public:
     std::map<std::string, std::size_t> dispatches() { std::lock_guard lk(mu_); return dispatches_; }
     struct mem_info { std::size_t free = 0, total = 0; };
     mem_info memory() { mem_info m; if (f_.mem_info) { bind(); f_.mem_info(&m.free, &m.total); } return m; }
-    struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0; };
+    struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0, qweight_bytes = 0; };
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
 
     // ---- residency protocol (see flow::device_hooks) ----
@@ -223,6 +223,50 @@ public:
     void device_free(std::uint64_t p) { std::lock_guard lk(mu_); bind(); f_.free_(p); }
     void upload(std::uint64_t d, const void* h, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(f_.htod_async(d, h, bytes, stream_), "memcpy HtoD"); sync(); }
     void download(void* h, std::uint64_t d, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(f_.dtoh_async(h, d, bytes, stream_), "memcpy DtoH"); sync(); }
+
+    // Quantised matmul_t (forge_qmatmul_t): y[rows, cols] = x[rows, k] . W[cols, k]^T with W in its encoded rows
+    // (fmt 1 q8_0, 2 q4_k, 3 q6_k, 4 q5_k; rb bytes per row). The encoded weight is uploaded once and stays on the
+    // device for the runtime's lifetime (keyed by host address and size); x/out follow the residency protocol.
+    bool has_function(const std::string& n) {
+        std::lock_guard lk(mu_); bind();
+        if (fn_.count(n)) return true;
+        void* f = nullptr; if (f_.get_fn(&f, mod_, n.c_str()) != 0 || !f) return false;
+        fn_[n] = f; return true;
+    }
+    bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
+        if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
+        std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
+        if (!k || k % 32 || out.size() != std::size_t(rows) * cols) return false;
+        std::lock_guard lk(mu_); bind();
+        ++dispatches_["qmatmul_t"];
+        void* fn = function("forge_qmatmul_t");
+        std::size_t qbytes = rb * cols;
+        auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
+        if (!qd) {
+            std::uint64_t d = 0; ck(f_.malloc_(&d, std::max<std::size_t>(4, qbytes)), "malloc");
+            qd = d; ck(f_.htod_async(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        }
+        std::vector<std::uint64_t> temps;
+        auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
+        try {
+            std::uint64_t xd = 0, yd = 0;
+            if (in_run_) {
+                xd = acquire(x.data, x.size(), false).ptr;
+                auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
+            } else {
+                ck(f_.malloc_(&xd, std::max<std::size_t>(4, x.size() * 4)), "malloc"); temps.push_back(xd);
+                ck(f_.htod_async(xd, x.data, x.size() * 4, stream_), "memcpy HtoD");
+                ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
+            }
+            std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
+            void* args[] = {&xd, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
+            unsigned grid = cols * ((rows + 3) / 4);
+            if (grid) ck(f_.launch(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (!in_run_) { ck(f_.dtoh_async(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+        } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
+        if (!temps.empty()) { sync(); free_temps(); }
+        return true;
+    }
 
     // Run one op over host views; false if there is no kernel for this op/shape. Inside a run (begin_run)
     // buffers stay resident; outside, every buffer is uploaded and the output downloaded.
@@ -448,6 +492,7 @@ private:
     std::mutex mu_;
     bool in_run_ = false;
     std::map<std::uintptr_t, entry> res_;
+    std::map<std::pair<std::uintptr_t, std::size_t>, std::uint64_t> qres_;   // encoded weights (run_qmatmul)
     std::vector<std::pair<const float*, std::size_t>> pinned_;
     std::vector<std::pair<void*, void*>> graphs_;
     std::map<std::string, void*> fn_;

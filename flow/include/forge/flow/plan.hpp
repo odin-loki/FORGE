@@ -1,5 +1,6 @@
 #pragma once
 // partition -> memory-plan -> lower -> flat plan -> replay. Plans are cached per shape bucket.
+#include <algorithm>
 #include <forge/flow/codecs.hpp>
 #include <forge/flow/kernels.hpp>
 #include <forge/lane/qdot.hpp>
@@ -237,9 +238,12 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
     // Resident device backends have no quantised kernels, so a weight they consume is decoded to an f32 host copy
     // and mirrored on the device (4 bytes/param on both sides: a 9B q4_k model needed ~36 GB of RAM). Decode only up
     // to FORGE_GPU_WEIGHT_BUDGET bytes of f32 (default 8G; accepts K/M/G suffixes); the remaining matmul_t/gather
-    // weights stay encoded in the mapped file and run on the CPU quantised kernels.
+    // weights stay encoded in the mapped file and run on the CPU quantised kernels. Backends with a device quantised
+    // matmul (registry::device_qgemm) keep those codecs encoded and run them on the device instead.
     bool q_spill = p->hooks && reg.stages.empty();
     std::size_t q_budget = std::size_t(8) << 30, q_used = 0;
+    auto dev_q = [&](const std::string& codec) {
+        return p->hooks && reg.device_qgemm && std::find(reg.device_qgemm_codecs.begin(), reg.device_qgemm_codecs.end(), codec) != reg.device_qgemm_codecs.end(); };
     if (auto* e = std::getenv("FORGE_GPU_WEIGHT_BUDGET"); e && *e) {
         char* end = nullptr; double v = std::strtod(e, &end);
         double mul = 1; if (end) switch (*end) { case 'k': case 'K': mul = 1024.0; break; case 'm': case 'M': mul = 1024.0 * 1024; break;
@@ -255,7 +259,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             if (!c) raise(errc::unsupported, "weight {}: unknown codec {}", n.name, n.qcodec);
             bool direct_ok = q_ok[i] && n.shape.size() == 2 && std::size_t(n.shape[1]) % c->block == 0;
             std::size_t f32_bytes = std::size_t(numel(n.shape)) * sizeof(float);
-            bool keep_q = direct_ok && (q_direct || (q_spill && q_used + f32_bytes > q_budget));
+            bool keep_q = direct_ok && (q_direct || dev_q(n.qcodec) || (q_spill && q_used + f32_bytes > q_budget));
             if (direct_ok && q_spill && !keep_q) q_used += f32_bytes;
             if (keep_q) { v.qdata = n.qweight; v.qcodec = c; }
             else { auto t = qweights::decoded(n.qweight, c, n.shape); v.data = t->data.data(); p->decoded_weights.push_back(std::move(t)); }
@@ -315,7 +319,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
                 }
             }
             if (n.op == spec::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
-                p->steps.push_back({&qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
+                p->steps.push_back({dev_q(G.at(n.inputs[1]).qcodec) ? &*reg.device_qgemm : &qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
             else if (n.op == spec::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
                 p->steps.push_back({&qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
