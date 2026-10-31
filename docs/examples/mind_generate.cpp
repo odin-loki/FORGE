@@ -7,7 +7,7 @@ int main(int argc, char** argv) {
     if (argc < 2) { std::fprintf(stderr, "usage: %s model.fpk [prompt]\n", argv[0]); return 2; }
     using namespace forge::mind;
     session_options opt; opt.context = 256;
-    session s(argv[1], opt);
+    forge::mind::session s(argv[1], opt);   // qualified: FreeBSD <sys/user.h> declares a global struct session
     const auto* tok = s.tokenizer();
     if (!tok) { std::fprintf(stderr, "model has no tokenizer\n"); return 1; }
     std::vector<int> prompt = tok->encode(argc > 2 ? argv[2] : "Hello");

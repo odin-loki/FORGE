@@ -45,14 +45,25 @@ inline std::string cpu_brand() {
 }
 #if defined(FORGE_OS_HAVE_CPUID)
 inline void cpuid_caches(std::vector<cpu_cache>& out) {   // deterministic cache parameters (Intel leaf 4 / AMD 0x8000001D)
-    unsigned a, b, c, d; __get_cpuid(0, &a, &b, &c, &d); bool amd = b == 0x68747541;
+    unsigned a, b, c, d; __get_cpuid(0, &a, &b, &c, &d); bool amd = b == 0x68747541; unsigned max_std = a;
+    unsigned max_ext = __get_cpuid_max(0x80000000, nullptr);
     unsigned leaf = amd ? 0x8000001D : 4;
-    for (unsigned i = 0; i < 16; ++i) {
+    std::size_t first = out.size();
+    // Only walk the deterministic leaf when the CPU reports it (QEMU's qemu64 is "AMD" without 0x8000001D/topoext).
+    bool have = amd ? max_ext >= 0x8000001D : max_std >= 4;
+    for (unsigned i = 0; have && i < 16; ++i) {
         __cpuid_count(leaf, i, a, b, c, d); unsigned t = a & 31; if (!t) break;
         cpu_cache k; k.level = (a >> 5) & 7; k.type = t == 1 ? 'D' : t == 2 ? 'I' : 'U';
         k.line = (b & 0xfff) + 1; k.size = std::uint64_t(((b >> 22) & 0x3ff) + 1) * (((b >> 12) & 0x3ff) + 1) * k.line * (c + 1);
         out.push_back(k);
     }
+    if (out.size() > first || max_ext < 0x80000006) return;
+    // Legacy AMD-style leaves (also filled by QEMU/TCG CPU models): L1D/L1I from 0x80000005, L2/L3 from 0x80000006.
+    auto add = [&](unsigned lvl, char ty, std::uint64_t bytes, unsigned line) { if (bytes) { cpu_cache k; k.level = lvl; k.type = ty; k.size = bytes; k.line = line ? line : 64; out.push_back(k); } };
+    __get_cpuid(0x80000005, &a, &b, &c, &d);
+    add(1, 'D', std::uint64_t(c >> 24) << 10, c & 0xff); add(1, 'I', std::uint64_t(d >> 24) << 10, d & 0xff);
+    __get_cpuid(0x80000006, &a, &b, &c, &d);
+    add(2, 'U', std::uint64_t(c >> 16) << 10, c & 0xff); add(3, 'U', std::uint64_t(d >> 18) * 512 * 1024, d & 0xff);
 }
 #endif
 inline void classify_by_capacity(cpu_topology& t) {   // heterogeneous capacity/frequency => big.LITTLE
