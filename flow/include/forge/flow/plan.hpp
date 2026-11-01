@@ -62,6 +62,15 @@ struct state_store {
         return r;
     }
     void reset() { for (auto& [k, s] : slots) s.len = 0; }
+    // Device runs may leave slot contents on the device only (device_hooks::keep): flush() brings the host copies
+    // up to date, forget() also drops the device copies (before the host buffers are replaced or freed).
+    device_hooks* hooks = nullptr;
+    void flush() const { if (hooks && hooks->to_host) for (auto& [k, s] : slots) if (!s.buf.data.empty()) hooks->to_host(s.buf.data.data(), s.buf.data.size()); }
+    void forget() { if (hooks && hooks->release) for (auto& [k, s] : slots) if (!s.buf.data.empty()) hooks->release(s.buf.data.data(), s.buf.data.size()); }
+    state_store() = default;
+    state_store(const state_store& o) : slots((o.flush(), o.slots)), capacity(o.capacity), page_rows(o.page_rows), codec(o.codec), codec_v(o.codec_v), offload(o.offload) {}
+    state_store& operator=(const state_store&) = delete;
+    ~state_store() { try { forget(); } catch (...) {} }
     // rewind all slots to `len` rows (e.g. prefix reuse / speculative rollback)
     void truncate(i64 len) {
         for (auto& [k, s] : slots) {
@@ -372,7 +381,10 @@ public:
         // only outputs and persistent state outlive the run: fetch those, drop the device intermediates unread
         try {
             for (auto& [nm, v] : p_.g.outputs()) if (p_.views[v].data) h->to_host(p_.views[v].data, p_.views[v].size());
-            if (st_) for (auto& [k, sl] : st_->slots) if (!sl.buf.data.empty()) h->to_host(sl.buf.data.data(), sl.buf.data.size());
+            if (st_) for (auto& [k, sl] : st_->slots) if (!sl.buf.data.empty()) {
+                if (h->keep) { st_->hooks = h; h->keep(sl.buf.data.data(), sl.buf.data.size()); }
+                else h->to_host(sl.buf.data.data(), sl.buf.data.size());
+            }
         } catch (...) { h->end_run(); throw; }
         h->end_run_discard();
     }

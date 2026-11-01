@@ -170,11 +170,13 @@ public:
         std::lock_guard lk(mu_); bind();
         for (auto it = res_.begin(); it != res_.end();) {
             auto& e = it->second;
+            if (e.kept) { ++it; continue; }   // stays resident, host copy fetched on demand
             if (e.pinned) { if (!e.host_valid) download(e); ++it; continue; }
             drop(e); it = res_.erase(it);
         }
         sync(); in_run_ = false;
     }
+    void keep(const float* p, std::size_t n) { std::lock_guard lk(mu_); each_overlap(p, n, [&](entry& e) { e.kept = true; }); }
     bool resident() { std::lock_guard lk(mu_); return in_run_; }
     void pin(const float* p, std::size_t n) { std::lock_guard lk(mu_); pinned_.push_back({p, n}); }
     void to_host(const float* p, std::size_t n) {
@@ -463,7 +465,7 @@ private:
             std::vector<char> t(n); int r = dtoh(t.data(), s, n); return r ? r : htod(d, t.data(), n);
         }
     };
-    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false; };
+    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false; };
     struct bound { entry* e; std::uint64_t ptr; };
 
     template<class F> bool sym(F& f, const char* n) { f = reinterpret_cast<F>(dlsym(lib_, n)); return f != nullptr; }

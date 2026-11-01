@@ -205,6 +205,7 @@ public:
         if (o.m_ != m_) raise(errc::invalid_argument, "copy_prefix: sessions use different models");
         n = std::min(n, o.pos_);
         if (o.st_.codec != st_.codec) raise(errc::invalid_argument, "copy_prefix: sessions use different KV codecs");
+        o.st_.flush(); st_.forget();
         st_.reset();
         for (auto& [k, s] : o.st_.slots) {
             auto& d = st_.slots[k];
