@@ -358,6 +358,61 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
   bar_();
   for (unsigned st = 64u; st > 0u; st >>= 1) { if (t < st) for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] += red[rr * 128u + t + st]; bar_(); }
   if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[t * 128u]; }
+#if defined(__NVPTX__)
+// Decode path after llama.cpp's mmvq (ggml-cuda/mmvq.cu, vecdotq.cuh; MIT, the ggml authors): activations are
+// quantised to q8_1-style blocks (40 bytes: float d, pad, 32 x int8) and dotted with dp4a against the encoded weights.
+FORGE_DEV int dp4a_us(unsigned a, int b, int c) { int r; asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r; }
+FORGE_DEV float wmax_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) v = __builtin_fmaxf(v, __nvvm_shfl_sync_bfly_f32(0xffffffffu, v, o, 31)); return v; }
+FORGE_GLOBAL void forge_quant_q81(const float* x, unsigned char* xq, unsigned nb) {   // a warp per 32-value block, 8 per block
+  unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i >= nb) return;
+  float v = x[(unsigned long long)i * 32u + l], am = wmax_(fabs_(v)), d = am / 127.0f;
+  int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
+  unsigned char* b = xq + (unsigned long long)i * 40u; ((signed char*)(b + 8u))[l] = (signed char)q;
+  if (l == 0u) *(float*)b = d; }
+FORGE_DEV unsigned ld32u(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
+// y[rows, cols] = xq . W^T for q4_k (fmt 2) and q6_k (fmt 3); grid and reduction as forge_qmatmul_t.
+FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
+  __attribute__((shared)) float red[4u * 128u];
+  unsigned t = tid_(), bi = bid_(), c = bi % cols, r0 = (bi / cols) * 4u, l = t & 31u, nbk = k / 32u;
+  const unsigned char* row = w + (unsigned long long)c * rb;
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  unsigned nr = rows - r0 < 4u ? rows - r0 : 4u;
+  if (fmt == 2u) {
+    unsigned j = l >> 3, o = (l & 7u) * 4u;
+    for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
+      const unsigned char* b = row + sb * 144u;
+      float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned s0, m0, s1, m1;
+      scmin(2u * j, b + 4u, &s0, &m0); scmin(2u * j + 1u, b + 4u, &s1, &m1);
+      float d0 = d * (float)s0, n0 = dm * (float)m0, d1 = d * (float)s1, n1 = dm * (float)m1;
+      unsigned q = *(const unsigned*)(b + 16u + j * 32u + o), lo = q & 0x0F0F0F0Fu, hi = (q >> 4) & 0x0F0F0F0Fu;
+      unsigned gA = sb * 8u + 2u * j;
+      for (unsigned rr = 0; rr < nr; ++rr) {
+        const unsigned char* xa = xq + ((unsigned long long)(r0 + rr) * nbk + gA) * 40u; const unsigned char* xb = xa + 40u;
+        int ia = *(const int*)(xa + 8u + o), ib = *(const int*)(xb + 8u + o);
+        float da = *(const float*)xa, db = *(const float*)xb;
+        acc[rr] += da * (d0 * (float)dp4a_us(lo, ia, 0) - n0 * (float)dp4a_us(0x01010101u, ia, 0))
+                 + db * (d1 * (float)dp4a_us(hi, ib, 0) - n1 * (float)dp4a_us(0x01010101u, ib, 0)); } }
+  } else {   // q6_k
+    unsigned h = l >> 4, p = (l & 15u) * 4u, tb = p >= 32u ? 1u : 0u, lo0 = p & 31u;
+    for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
+      const unsigned char* b = row + sb * 210u;
+      unsigned ql = ld32u(b + 64u * h + p), qh = ld32u(b + 128u + 32u * h + lo0);
+      const signed char* sc = (const signed char*)(b + 192u + 8u * h);
+      float d = h2f(ld16(b + 208u)), dA = d * (float)sc[(lo0 >> 4) + 2u * tb], dB = d * (float)sc[(lo0 >> 4) + 2u * (tb + 2u)];
+      unsigned vA = (ql & 0x0F0F0F0Fu) | (((qh >> (2u * tb)) & 0x03030303u) << 4);
+      unsigned vB = ((ql >> 4) & 0x0F0F0F0Fu) | (((qh >> (2u * (tb + 2u))) & 0x03030303u) << 4);
+      unsigned gA = sb * 8u + 4u * h + tb, gB = gA + 2u;
+      for (unsigned rr = 0; rr < nr; ++rr) {
+        const unsigned char* xa = xq + ((unsigned long long)(r0 + rr) * nbk + gA) * 40u; const unsigned char* xb = xq + ((unsigned long long)(r0 + rr) * nbk + gB) * 40u;
+        int ia = *(const int*)(xa + 8u + lo0), ib = *(const int*)(xb + 8u + lo0);
+        acc[rr] += *(const float*)xa * dA * (float)(dp4a_us(vA, ia, 0) - 32 * dp4a_us(0x01010101u, ia, 0))
+                 + *(const float*)xb * dB * (float)(dp4a_us(vB, ib, 0) - 32 * dp4a_us(0x01010101u, ib, 0)); } }
+  }
+  for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] = acc[rr];
+  bar_();
+  for (unsigned st = 64u; st > 0u; st >>= 1) { if (t < st) for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] += red[rr * 128u + t + st]; bar_(); }
+  if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[t * 128u]; }
+#endif
 // Embedding lookup from encoded rows: one 256-thread block per index; out-of-range indices give zeros.
 FORGE_GLOBAL void forge_qgather(const float* idx, const unsigned char* w, float* y, unsigned n, unsigned d, unsigned fmt, unsigned rb, unsigned nrows) {
   unsigned t = tid_(), i = bid_(); float fi = idx[i]; unsigned r = fi < 0.0f ? nrows : (unsigned)fi;

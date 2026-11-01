@@ -117,7 +117,18 @@ static int mock_qmm(const float* a, const unsigned char* w, float* y, unsigned r
         for (g = 0; g < k / 32u; ++g) { m_qgroup(fmt, w + (size_t)c * rb, g, v); for (l = 0; l < 32u; ++l) s = fmaf(a[(size_t)r * k + g * 32u + l], v[l], s); }
         y[(size_t)r * cols + c] = s; }
     return 0; }
+/* forge_quant_q81 / forge_qmatmul_q81: q8_1 activation blocks (float d, pad, 32 x int8) */
+static void mock_q81(const float* x, unsigned char* xq, unsigned nb) {
+    unsigned i, l;
+    for (i = 0; i < nb; ++i) { float am = 0, d; for (l = 0; l < 32u; ++l) { float a = fabsf(x[i * 32u + l]); if (a > am) am = a; }
+        d = am / 127.0f; memcpy(xq + i * 40u, &d, 4);
+        for (l = 0; l < 32u; ++l) ((signed char*)(xq + i * 40u + 8u))[l] = (signed char)(d == 0.0f ? 0 : (int)rintf(x[i * 32u + l] / d)); } }
+static int mock_qmm81(const unsigned char* xq, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
+    float* a = malloc(sizeof(float) * rows * k); unsigned i, l;
+    for (i = 0; i < rows * (k / 32u); ++i) { float d; memcpy(&d, xq + i * 40u, 4); for (l = 0; l < 32u; ++l) a[i * 32u + l] = d * (float)((const signed char*)(xq + i * 40u + 8u))[l]; }
+    mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
+    if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
     if (!strcmp(op, "delta_rule")) return 14; if (!strcmp(op, "causal_conv")) return 7;
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
@@ -187,6 +198,9 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < cols * ((rows + 3) / 4) || bx != 128) return 1;   /* run_qmatmul's launch shape */
         return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
+    if (!strcmp(op, "quant_q81")) { mock_q81(P(ARG(0, dptr)), (unsigned char*)(uintptr_t)ARG(1, dptr), ARG(2, unsigned)); return 0; }
+    if (!strcmp(op, "qmatmul_q81")) { const unsigned char* xq = (const unsigned char*)(uintptr_t)ARG(0, dptr); float* y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
+        return mock_qmm81(xq, w, y, ARG(3, unsigned), ARG(4, unsigned), ARG(5, unsigned), ARG(6, unsigned), ARG(7, unsigned)); }
     if (!strcmp(op, "qmatmul_mmq")) { float *a = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < ((cols + 63) / 64) * ((rows + 63) / 64) || bx != 256) return 1;   /* MMQ 64x64-tile launch shape */
