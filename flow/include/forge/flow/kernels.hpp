@@ -41,6 +41,8 @@ struct device_hooks {
     std::function<void(const float*, std::size_t)> keep;
     std::function<void(const float*, std::size_t)> pin, to_host, host_wrote, release;
     std::function<void(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off)> copy;  // device-side
+    // optional strided copy: dst_base[off + r * ds + c] = src[r * w + c] for r < rows, c < w; false = unsupported
+    std::function<bool(float* src, std::size_t sn, float* dst_base, std::size_t dst_count, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off)> copy2d;
     // fixed-size state op (state_ops.hpp: delta_rule, causal_conv) run on the device with the slot `S` kept resident;
     // false when the backend has no kernel for it (the executor then runs the host version).
     std::function<bool(const std::string& fn, std::span<const tensor_view> in, float* S, std::size_t sn, tensor_view out, const spec::attrs& a)> state;
@@ -81,6 +83,7 @@ public:
     // Resident device backends: matmul_t over an encoded weight (tensor_view::qdata) on the device, for these codecs.
     std::optional<lowering> device_qgemm;
     std::vector<std::string> device_qgemm_codecs;
+    std::optional<lowering> device_qgather;   // gather (embedding lookup) over an encoded table on the device
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);

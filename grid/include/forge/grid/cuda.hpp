@@ -75,6 +75,19 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     return false;
 }
 
+// Broadcast binaries the CUDA/HIP runtime runs with forge_bcast: the smaller input's shape (leading 1s dropped)
+// is a suffix of the larger one's. Other GPU backends keep these on the CPU.
+inline int bcast_op(const std::string& op, const std::vector<shape_t>& in) {
+    int o = op == "add" ? 0 : op == "sub" ? 1 : op == "mul" ? 2 : op == "div" ? 3 : -1;
+    if (o < 0 || in.size() != 2 || numel(in[0]) == numel(in[1])) return -1;
+    auto strip = [](shape_t s) { while (s.size() > 1 && s[0] == 1) s.erase(s.begin()); return s; };
+    shape_t a = strip(in[0]), b = strip(in[1]);
+    const shape_t& big = numel(in[0]) > numel(in[1]) ? a : b; const shape_t& sm = numel(in[0]) > numel(in[1]) ? b : a;
+    if (sm.size() > big.size() || numel(sm) == 0) return -1;
+    for (std::size_t i = 0; i < sm.size(); ++i) if (sm[sm.size() - 1 - i] != big[big.size() - 1 - i]) return -1;
+    return o;
+}
+
 // Scalar arguments and launch size for a kernel, shared by the OpenCL and Level Zero runtimes (cuda.hpp's own
 // run_op packs the same values). Buffers come first in kernel order (inputs, the rope table after pos, output).
 struct scalar { bool is_float; std::uint32_t u; float f; };
@@ -203,6 +216,41 @@ public:
         if (!ks.empty()) sync();
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
     }
+    static constexpr bool has_bcast = true;
+    bool run_bcast(int op, const std::vector<tensor_view>& in, tensor_view out) {
+        std::uint32_t n = std::uint32_t(out.size()), ma = std::uint32_t(in[0].size()), mb = std::uint32_t(in[1].size()), o = std::uint32_t(op);
+        if (!ma || !mb || n % ma || n % mb) return false;
+        std::lock_guard lk(mu_); bind();
+        if (!has_fn_locked("forge_bcast")) return false;
+        if (!in_run_) {   // outside a run the views are host memory
+            for (std::uint32_t i = 0; i < n; ++i) { float x = in[0].data[i % ma], z = in[1].data[i % mb];
+                out.data[i] = o == 0 ? x + z : o == 1 ? x - z : o == 2 ? x * z : x / z; }
+            return true;
+        }
+        ++dispatches_["bcast"];
+        auto ad = acquire(in[0].data, in[0].size(), false).ptr;
+        auto bd = acquire(in[1].data, in[1].size(), false).ptr;
+        ad = acquire(in[0].data, in[0].size(), false).ptr;
+        auto y = acquire(out.data, out.size(), true); y.e->host_valid = false; std::uint64_t yd = y.ptr;
+        void* args[] = {&ad, &bd, &yd, &n, &ma, &mb, &o};
+        if (n) ck(f_.launch(function("forge_bcast"), (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        return true;
+    }
+    // dst_base[off + r * ds + c] = src[r * w + c] on the device (concat)
+    bool copy2d_resident(float* src, std::size_t sn, float* dst_base, std::size_t dst_count, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off) {
+        std::lock_guard lk(mu_); bind();
+        if (!has_fn_locked("forge_copy2d")) return false;
+        if (!rows || !w) return true;
+        ++dispatches_["copy2d"];
+        auto d = acquire(dst_base, dst_count, false);
+        auto s = acquire(src, sn, false);
+        d = acquire(dst_base, dst_count, false);
+        d.e->host_valid = false;
+        std::uint64_t sp = s.ptr, dp = d.ptr + off * 4; std::uint32_t r = std::uint32_t(rows), ww = std::uint32_t(w), dss = std::uint32_t(ds);
+        void* args[] = {&sp, &dp, &r, &ww, &dss};
+        ck(f_.launch(function("forge_copy2d"), unsigned((rows * w + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        return true;
+    }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); bind();
         if (!n) return;
@@ -257,6 +305,39 @@ public:
         if (fn_.count(n)) return true;
         void* f = nullptr; if (f_.get_fn(&f, mod_, n.c_str()) != 0 || !f) return false;
         fn_[n] = f; return true;
+    }
+    // Embedding gather over an encoded table (forge_qgather); the table is uploaded once, like run_qmatmul's weights.
+    bool run_qgather(const tensor_view& idx, const std::uint8_t* q, std::size_t rb, std::uint32_t nrows, std::uint32_t d, std::uint32_t fmt, tensor_view out) {
+        if (!q || fmt < 1 || fmt > 4 || !d || d % 32 || out.size() != idx.size() * d) return false;
+        std::lock_guard lk(mu_); bind();
+        if (!has_fn_locked("forge_qgather")) return false;
+        ++dispatches_["qgather"];
+        std::size_t qbytes = rb * nrows;
+        auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
+        if (!qd) {
+            std::uint64_t dp = 0; ck(f_.malloc_(&dp, std::max<std::size_t>(4, qbytes)), "malloc");
+            qd = dp; ck(f_.htod_async(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        }
+        std::vector<std::uint64_t> temps;
+        auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
+        std::uint32_t n = std::uint32_t(idx.size());
+        try {
+            std::uint64_t xd = 0, yd = 0;
+            if (in_run_) {
+                xd = acquire(idx.data, idx.size(), false).ptr;
+                auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
+            } else {
+                ck(f_.malloc_(&xd, std::max<std::size_t>(4, idx.size() * 4)), "malloc"); temps.push_back(xd);
+                ck(f_.htod_async(xd, idx.data, idx.size() * 4, stream_), "memcpy HtoD");
+                ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
+            }
+            std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
+            void* args[] = {&xd, &wd, &yd, &n, &d, &fmt, &rb32, &nrows};
+            if (n) ck(f_.launch(function("forge_qgather"), n, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (!in_run_) { ck(f_.dtoh_async(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+        } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
+        if (!temps.empty()) { sync(); free_temps(); }
+        return true;
     }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;

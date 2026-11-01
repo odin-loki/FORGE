@@ -72,6 +72,9 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
         h->host_wrote = [raw](const float* p, std::size_t n) { raw->host_wrote(p, n); };
         h->release = [raw](const float* p, std::size_t n) { raw->release(p, n); };
         h->copy = [raw](float* s, std::size_t n, float* d, std::size_t dn, std::size_t off) { raw->copy_resident(s, n, d, dn, off); };
+        if constexpr (requires { raw->copy2d_resident((float*)nullptr, std::size_t(0), (float*)nullptr, std::size_t(0), std::size_t(0), std::size_t(0), std::size_t(0), std::size_t(0)); })
+            h->copy2d = [raw](float* s, std::size_t sn, float* d, std::size_t dn, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off) {
+                return raw->copy2d_resident(s, sn, d, dn, rows, w, ds, off); };
         if constexpr (requires { raw->run_state(std::string(), std::vector<tensor_view>(), (float*)nullptr, std::size_t(0), tensor_view(), spec::attrs()); })
             if (!std::getenv("FORGE_GPU_NO_STATE_OPS"))
                 h->state = [raw](const std::string& fn, std::span<const tensor_view> in, float* S, std::size_t sn, tensor_view out, const spec::attrs& a) {
@@ -84,8 +87,17 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
         grid::gpu::sig sg; if (!grid::gpu::kernel_sig(name, sg)) continue;
         r->add({pre + "." + name, o, 20,
                 [name](std::span<const shape_t> in, const shape_t&, const spec::attrs& a) {
-                    return grid::gpu::supports(name, std::vector<shape_t>(in.begin(), in.end()), a); },
+                    std::vector<shape_t> v(in.begin(), in.end());
+                    if constexpr (requires { RT::has_bcast; }) if (grid::gpu::bcast_op(name, v) >= 0) return true;
+                    return grid::gpu::supports(name, v, a); },
                 [rt, name](std::span<const tensor_view> in, tensor_view out, const spec::attrs& a) {
+                    if constexpr (requires { RT::has_bcast; }) {
+                        std::vector<shape_t> v; for (auto& t : in) v.push_back(t.shape);
+                        if (int bo = grid::gpu::bcast_op(name, v); bo >= 0 && numel(out.shape) == std::max(numel(v[0]), numel(v[1]))) {
+                            if (!rt->run_bcast(bo, std::vector<tensor_view>(in.begin(), in.end()), out))
+                                raise(errc::unsupported, "{}: broadcast {} rejected its inputs", rt->backend(), name);
+                            return; }
+                    }
                     if (!rt->run_op(name, std::vector<tensor_view>(in.begin(), in.end()), a, out))
                         raise(errc::unsupported, "{}: {} rejected its inputs", rt->backend(), name); }, -1, resident});
     }
@@ -103,6 +115,18 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                         raise(errc::unsupported, "{}: qmatmul_t rejected a {} weight", rt->backend(), c->name); },
                 1, resident};
             r->device_qgemm_codecs = {"q8_0", "q4_k", "q5_k", "q6_k"};
+            if constexpr (requires(RT& t, const tensor_view& v, tensor_view o) { t.run_qgather(v, nullptr, std::size_t(0), 0u, 0u, 0u, o); }) {
+                auto* ge = std::getenv("FORGE_GPU_QGATHER");
+                if (!(ge && std::string(ge) == "0") && rt->has_function("forge_qgather"))
+                    r->device_qgather = lowering{pre + ".qgather", spec::op::gather, 30, [](auto, auto&, auto&) { return true; },
+                        [rt](std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
+                            const auto* c = static_cast<const codecs::codec*>(in[0].qcodec);
+                            std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : c->name == "q5_k" ? 4 : 0;
+                            std::size_t d = std::size_t(in[0].shape[1]);
+                            if (!rt->run_qgather(in[1], in[0].qdata, c->bytes(d), std::uint32_t(in[0].shape[0]), std::uint32_t(d), fmt, out))
+                                raise(errc::unsupported, "{}: qgather rejected a {} table", rt->backend(), c->name); },
+                        1, resident};
+            }
         }
     }
     return r;

@@ -332,6 +332,23 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
         const float* ap = a + (unsigned long long)(r0 + rr) * k + sb * 256u + 64u * j + o; float sacc = acc[rr];
         for (unsigned i = 0; i < 4u; ++i) { sacc = fma_(ap[i], v0[i], sacc); sacc = fma_(ap[32u + i], v1[i], sacc); }
         acc[rr] = sacc; } }
+  } else if (fmt == 3u) {   // q6_k: a warp per 210-byte super-block; lane = 4 ql bytes (byte loads: blocks are not 4-aligned)
+    unsigned h = l >> 4, p = (l & 15u) * 4u, tb = p >= 32u ? 1u : 0u, lo0 = p & 31u;
+#pragma unroll 2
+    for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
+      const unsigned char* b = row + sb * 210u;
+      const unsigned char* ql = b + 64u * h + p; const unsigned char* qh = b + 128u + 32u * h + lo0;
+      const signed char* sc = (const signed char*)(b + 192u + 8u * h);
+      float d = h2f(ld16(b + 208u)), dA = d * (float)sc[(lo0 >> 4) + 2u * tb], dB = d * (float)sc[(lo0 >> 4) + 2u * (tb + 2u)];
+      float vA[4], vB[4];
+      for (unsigned i = 0; i < 4u; ++i) { unsigned qb = ql[i], hb = qh[i];
+        vA[i] = dA * (float)((int)((qb & 15u) | (((hb >> (2u * tb)) & 3u) << 4)) - 32);
+        vB[i] = dB * (float)((int)((qb >> 4) | (((hb >> (2u * (tb + 2u))) & 3u) << 4)) - 32); }
+      unsigned base = sb * 256u + 128u * h + lo0;
+      for (unsigned rr = 0; rr < nr; ++rr) {
+        const float* ap = a + (unsigned long long)(r0 + rr) * k + base; float sacc = acc[rr];
+        for (unsigned i = 0; i < 4u; ++i) { sacc = fma_(ap[32u * tb + i], vA[i], sacc); sacc = fma_(ap[32u * (tb + 2u) + i], vB[i], sacc); }
+        acc[rr] = sacc; } }
   } else
 #pragma unroll 4
   for (unsigned g = t >> 5; g < k / 32u; g += 4u) {   // 4 warps, one group each; lane l owns element l
@@ -341,6 +358,22 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
   bar_();
   for (unsigned st = 64u; st > 0u; st >>= 1) { if (t < st) for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] += red[rr * 128u + t + st]; bar_(); }
   if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[t * 128u]; }
+// Embedding lookup from encoded rows: one 256-thread block per index; out-of-range indices give zeros.
+FORGE_GLOBAL void forge_qgather(const float* idx, const unsigned char* w, float* y, unsigned n, unsigned d, unsigned fmt, unsigned rb, unsigned nrows) {
+  unsigned t = tid_(), i = bid_(); float fi = idx[i]; unsigned r = fi < 0.0f ? nrows : (unsigned)fi;
+  float* yo = y + (unsigned long long)i * d;
+  if (r >= nrows) { for (unsigned e = t; e < d; e += 256u) yo[e] = 0.0f; return; }
+  const unsigned char* row = w + (unsigned long long)r * rb;
+  for (unsigned e = t; e < d; e += 256u) yo[e] = qelem(fmt, row, e >> 5, e & 31u); }
+// Broadcast binary (op 0 add, 1 sub, 2 mul, 3 div): y[i] = a[i % ma] op b[i % mb] (the smaller input is a suffix).
+FORGE_GLOBAL void forge_bcast(const float* a, const float* b, float* y, unsigned n, unsigned ma, unsigned mb, unsigned op) {
+  unsigned i = bid_() * 256u + tid_(); if (i >= n) return;
+  float x = a[i % ma], z = b[i % mb];
+  y[i] = op == 0u ? x + z : op == 1u ? x - z : op == 2u ? x * z : x / z; }
+// Strided 2-D copy (concat on the device): dst[r * ds + c] = src[r * w + c].
+FORGE_GLOBAL void forge_copy2d(const float* src, float* dst, unsigned rows, unsigned w, unsigned ds) {
+  unsigned i = bid_() * 256u + tid_(); if (i >= rows * w) return;
+  unsigned r = i / w, c = i - r * w; dst[(unsigned long long)r * ds + c] = src[i]; }
 // RMS norm, one 256-thread block per row (the per-row-thread version in cuda() is serial over cols).
 FORGE_GLOBAL void forge_rms_norm_b(const float* x, const float* w, float* y, unsigned rows, unsigned cols, float eps) {
   __attribute__((shared)) float red[256];

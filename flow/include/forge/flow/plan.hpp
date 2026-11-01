@@ -347,7 +347,8 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             if (n.op == spec::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
                 p->steps.push_back({dev_q(G.at(n.inputs[1]).qcodec) ? &*reg.device_qgemm : &qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
             else if (n.op == spec::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
-                p->steps.push_back({&qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
+                p->steps.push_back({dev_q(G.at(n.inputs[0]).qcodec) && reg.device_qgather && G.at(n.inputs[0]).shape.size() == 2 && G.at(n.inputs[0]).shape[1] % 32 == 0
+                                    ? &*reg.device_qgather : &qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
@@ -487,7 +488,15 @@ private:
         i64 total = 0;
         for (auto& v : ins) { if (i64(v.shape.size()) != r || !v.data) return false; total += v.shape[ax] * inner;
             if (v.data < out.data + out.size() && out.data < v.data + v.size()) return false; }
-        if (total * outer != i64(out.size()) || outer * i64(ins.size()) > 4096) return false;
+        if (total * outer != i64(out.size())) return false;
+        if (h.copy2d) {   // one strided copy per input
+            bool ok = true; i64 off = 0;
+            for (auto& v : ins) { i64 len = v.shape[ax] * inner;
+                if (len && !h.copy2d(const_cast<float*>(v.data), v.size(), out.data, out.size(), std::size_t(outer), std::size_t(len), std::size_t(total), std::size_t(off))) { ok = false; break; }
+                off += len; }
+            if (ok) return true;
+        }
+        if (outer * i64(ins.size()) > 4096) return false;
         for (i64 o = 0; o < outer; ++o) { i64 off = 0;
             for (auto& v : ins) { i64 len = v.shape[ax] * inner;
                 if (len) h.copy(const_cast<float*>(v.data) + o * len, std::size_t(len), out.data, out.size(), std::size_t(o * total + off));

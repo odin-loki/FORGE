@@ -123,6 +123,7 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
+    if (!strcmp(op, "qgather")) return 8; if (!strcmp(op, "bcast")) return 7; if (!strcmp(op, "copy2d")) return 5;
     return 0; }
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args);
 int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh,
@@ -145,6 +146,17 @@ int N_(cuGraphLaunch, hipGraphLaunch)(void* e, void* s) {
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     const char* op = (const char*)f + 6;   /* skip "forge_" */
     unsigned threads = gx * bx, i;
+    if (!strcmp(op, "qgather")) { float *idx = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
+        unsigned n = ARG(3, unsigned), d = ARG(4, unsigned), fmt = ARG(5, unsigned), rb = ARG(6, unsigned), nrows = ARG(7, unsigned), g, l; float v[32];
+        if (gx < n || bx != 256) return 1;
+        for (i = 0; i < n; ++i) { float fi = idx[i]; unsigned r = fi < 0.0f ? nrows : (unsigned)fi; float* yo = y + (size_t)i * d;
+            if (r >= nrows) { for (l = 0; l < d; ++l) yo[l] = 0; continue; }
+            for (g = 0; g < d / 32u; ++g) { m_qgroup(fmt, w + (size_t)r * rb, g, v); for (l = 0; l < 32u; ++l) yo[g * 32u + l] = v[l]; } }
+        return 0; }
+    if (!strcmp(op, "bcast")) { float *a = P(ARG(0, dptr)), *b = P(ARG(1, dptr)), *y = P(ARG(2, dptr)); unsigned n = ARG(3, unsigned), ma = ARG(4, unsigned), mb = ARG(5, unsigned), o = ARG(6, unsigned);
+        for (i = 0; i < n && i < threads; ++i) { float x = a[i % ma], z = b[i % mb]; y[i] = o == 0u ? x + z : o == 1u ? x - z : o == 2u ? x * z : x / z; } return 0; }
+    if (!strcmp(op, "copy2d")) { float *src = P(ARG(0, dptr)), *dst = P(ARG(1, dptr)); unsigned rows = ARG(2, unsigned), w = ARG(3, unsigned), ds = ARG(4, unsigned);
+        for (i = 0; i < rows * w && i < threads; ++i) { unsigned r = i / w, c = i - r * w; dst[(size_t)r * ds + c] = src[i]; } return 0; }
     if (!strcmp(op, "rope")) { float *x = P(ARG(0, dptr)), *pos = P(ARG(1, dptr)), *inv = P(ARG(2, dptr)), *y = P(ARG(3, dptr));
         unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), d = ARG(6, unsigned), neox = ARG(7, unsigned), half = d / 2;
         for (i = 0; i < rows * cols * half && i < threads; ++i) { unsigned j = i % half, row = i / half, s = row / cols, o = row * d;
