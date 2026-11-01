@@ -147,7 +147,7 @@ public:
     }
     ~runtime() {
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); } catch (...) {}
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
@@ -338,6 +338,8 @@ public:
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
     }
+    static bool use_mmvq() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ"); return !(e && std::string(e) == "0"); }(); return on; }
+    std::uint64_t q81_ = 0; std::size_t q81_cap_ = 0;   // q8_1 activation scratch (stream-ordered reuse)
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
         std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
@@ -369,6 +371,16 @@ public:
                 ++dispatches_["qmatmul_mmq"];
                 unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
                 if (grid) ck(f_.launch(function("forge_qmatmul_mmq"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            } else if ((fmt == 2 || fmt == 3) && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
+                ++dispatches_["qmatmul_q81"];   // decode: q8_1 activations + dp4a (llama.cpp mmvq)
+                std::uint32_t nb = rows * (k / 32); std::size_t need = std::size_t(nb) * 40;
+                if (q81_cap_ < need) { if (q81_) f_.free_(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
+                std::uint64_t qx = q81_;
+                void* qa[] = {&xd, &qx, &nb};
+                ck(f_.launch(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
+                unsigned grid = cols * ((rows + 3) / 4);
+                if (grid) ck(f_.launch(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
             } else {
                 unsigned grid = cols * ((rows + 3) / 4);
                 if (grid) ck(f_.launch(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
