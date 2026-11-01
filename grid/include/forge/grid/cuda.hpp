@@ -75,6 +75,19 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     return false;
 }
 
+// Broadcast binaries the CUDA/HIP runtime runs with forge_bcast: the smaller input's shape (leading 1s dropped)
+// is a suffix of the larger one's. Other GPU backends keep these on the CPU.
+inline int bcast_op(const std::string& op, const std::vector<shape_t>& in) {
+    int o = op == "add" ? 0 : op == "sub" ? 1 : op == "mul" ? 2 : op == "div" ? 3 : -1;
+    if (o < 0 || in.size() != 2 || numel(in[0]) == numel(in[1])) return -1;
+    auto strip = [](shape_t s) { while (s.size() > 1 && s[0] == 1) s.erase(s.begin()); return s; };
+    shape_t a = strip(in[0]), b = strip(in[1]);
+    const shape_t& big = numel(in[0]) > numel(in[1]) ? a : b; const shape_t& sm = numel(in[0]) > numel(in[1]) ? b : a;
+    if (sm.size() > big.size() || numel(sm) == 0) return -1;
+    for (std::size_t i = 0; i < sm.size(); ++i) if (sm[sm.size() - 1 - i] != big[big.size() - 1 - i]) return -1;
+    return o;
+}
+
 // Scalar arguments and launch size for a kernel, shared by the OpenCL and Level Zero runtimes (cuda.hpp's own
 // run_op packs the same values). Buffers come first in kernel order (inputs, the rope table after pos, output).
 struct scalar { bool is_float; std::uint32_t u; float f; };
@@ -201,6 +214,41 @@ public:
         each_overlap(p, n, [&](entry& e) { if (!e.host_valid) download(e); ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         if (!ks.empty()) sync();
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+    }
+    static constexpr bool has_bcast = true;
+    bool run_bcast(int op, const std::vector<tensor_view>& in, tensor_view out) {
+        std::uint32_t n = std::uint32_t(out.size()), ma = std::uint32_t(in[0].size()), mb = std::uint32_t(in[1].size()), o = std::uint32_t(op);
+        if (!ma || !mb || n % ma || n % mb) return false;
+        std::lock_guard lk(mu_); bind();
+        if (!has_fn_locked("forge_bcast")) return false;
+        if (!in_run_) {   // outside a run the views are host memory
+            for (std::uint32_t i = 0; i < n; ++i) { float x = in[0].data[i % ma], z = in[1].data[i % mb];
+                out.data[i] = o == 0 ? x + z : o == 1 ? x - z : o == 2 ? x * z : x / z; }
+            return true;
+        }
+        ++dispatches_["bcast"];
+        auto ad = acquire(in[0].data, in[0].size(), false).ptr;
+        auto bd = acquire(in[1].data, in[1].size(), false).ptr;
+        ad = acquire(in[0].data, in[0].size(), false).ptr;
+        auto y = acquire(out.data, out.size(), true); y.e->host_valid = false; std::uint64_t yd = y.ptr;
+        void* args[] = {&ad, &bd, &yd, &n, &ma, &mb, &o};
+        if (n) ck(f_.launch(function("forge_bcast"), (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        return true;
+    }
+    // dst_base[off + r * ds + c] = src[r * w + c] on the device (concat)
+    bool copy2d_resident(float* src, std::size_t sn, float* dst_base, std::size_t dst_count, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off) {
+        std::lock_guard lk(mu_); bind();
+        if (!has_fn_locked("forge_copy2d")) return false;
+        if (!rows || !w) return true;
+        ++dispatches_["copy2d"];
+        auto d = acquire(dst_base, dst_count, false);
+        auto s = acquire(src, sn, false);
+        d = acquire(dst_base, dst_count, false);
+        d.e->host_valid = false;
+        std::uint64_t sp = s.ptr, dp = d.ptr + off * 4; std::uint32_t r = std::uint32_t(rows), ww = std::uint32_t(w), dss = std::uint32_t(ds);
+        void* args[] = {&sp, &dp, &r, &ww, &dss};
+        ck(f_.launch(function("forge_copy2d"), unsigned((rows * w + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        return true;
     }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); bind();

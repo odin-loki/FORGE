@@ -365,6 +365,15 @@ FORGE_GLOBAL void forge_qgather(const float* idx, const unsigned char* w, float*
   if (r >= nrows) { for (unsigned e = t; e < d; e += 256u) yo[e] = 0.0f; return; }
   const unsigned char* row = w + (unsigned long long)r * rb;
   for (unsigned e = t; e < d; e += 256u) yo[e] = qelem(fmt, row, e >> 5, e & 31u); }
+// Broadcast binary (op 0 add, 1 sub, 2 mul, 3 div): y[i] = a[i % ma] op b[i % mb] (the smaller input is a suffix).
+FORGE_GLOBAL void forge_bcast(const float* a, const float* b, float* y, unsigned n, unsigned ma, unsigned mb, unsigned op) {
+  unsigned i = bid_() * 256u + tid_(); if (i >= n) return;
+  float x = a[i % ma], z = b[i % mb];
+  y[i] = op == 0u ? x + z : op == 1u ? x - z : op == 2u ? x * z : x / z; }
+// Strided 2-D copy (concat on the device): dst[r * ds + c] = src[r * w + c].
+FORGE_GLOBAL void forge_copy2d(const float* src, float* dst, unsigned rows, unsigned w, unsigned ds) {
+  unsigned i = bid_() * 256u + tid_(); if (i >= rows * w) return;
+  unsigned r = i / w, c = i - r * w; dst[(unsigned long long)r * ds + c] = src[i]; }
 // RMS norm, one 256-thread block per row (the per-row-thread version in cuda() is serial over cols).
 FORGE_GLOBAL void forge_rms_norm_b(const float* x, const float* w, float* y, unsigned rows, unsigned cols, float eps) {
   __attribute__((shared)) float red[256];

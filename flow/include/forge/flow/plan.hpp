@@ -488,7 +488,15 @@ private:
         i64 total = 0;
         for (auto& v : ins) { if (i64(v.shape.size()) != r || !v.data) return false; total += v.shape[ax] * inner;
             if (v.data < out.data + out.size() && out.data < v.data + v.size()) return false; }
-        if (total * outer != i64(out.size()) || outer * i64(ins.size()) > 4096) return false;
+        if (total * outer != i64(out.size())) return false;
+        if (h.copy2d) {   // one strided copy per input
+            bool ok = true; i64 off = 0;
+            for (auto& v : ins) { i64 len = v.shape[ax] * inner;
+                if (len && !h.copy2d(const_cast<float*>(v.data), v.size(), out.data, out.size(), std::size_t(outer), std::size_t(len), std::size_t(total), std::size_t(off))) { ok = false; break; }
+                off += len; }
+            if (ok) return true;
+        }
+        if (outer * i64(ins.size()) > 4096) return false;
         for (i64 o = 0; o < outer; ++o) { i64 off = 0;
             for (auto& v : ins) { i64 len = v.shape[ax] * inner;
                 if (len) h.copy(const_cast<float*>(v.data) + o * len, std::size_t(len), out.data, out.size(), std::size_t(o * total + off));
