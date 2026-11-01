@@ -1,6 +1,7 @@
 #pragma once
 // Hugging Face directory (config.json + *.safetensors + tokenizer.json) -> .fpk
 #include <forge/import/safetensors.hpp>
+#include <forge/import/quant_recipe.hpp>
 #include <forge/pack/blueprint.hpp>
 #include <forge/pack/fpk.hpp>
 #include <filesystem>
@@ -41,6 +42,9 @@ inline std::string instantiate(std::string tpl, const json::value& cfg) {
 struct import_options {
     std::string codec = "f32"; std::string template_name;
     std::string emb_codec;   // tok_emb codec; empty = q8_0 when codec is quantised, else f32
+    // Mixed precision (codec "q4_k_m"/"q5_k_m", or any override set): per-tensor types from quant_recipe.hpp.
+    quant_recipe recipe;
+    bool mixed() const { return is_mix_ftype(codec) || !recipe.output_type.empty() || !recipe.token_embedding_type.empty() || !recipe.tensor_types.empty() || recipe.head_bf16; }
 };
 
 struct import_report { std::string arch, template_name; std::size_t tensors = 0, bytes = 0; };
@@ -145,13 +149,29 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
 
     pack::stream_writer w(out);   // each tensor is encoded, written and freed before the next is loaded
     import_report rep{arch, tname, 0, 0};
-    auto put = [&](const std::string& n, const tensor& t, bool quantisable) {
-        w.add_tensor(n, t.shape, t.data, quantisable ? opt.codec : std::string("f32")); ++rep.tensors;
-    };
     i64 L = i64(bp.param("n_layers"));
+    quant_recipe rc = opt.recipe;
+    rc.ftype = opt.codec; rc.n_layer = int(L);
+    if (rc.n_expert == 0 && bp.params.count("n_experts")) rc.n_expert = int(bp.param("n_experts"));
+    std::vector<int> v_index(std::size_t(L), -1);
+    for (i64 l = 0; l < L; ++l)
+        if (has(std::format("{}layers.{}.self_attn.v_proj.weight", mp, l))) v_index[std::size_t(l)] = rc.n_attn_v++;
+    bool in_deltanet = false;
+    auto put = [&](const std::string& n, const tensor& t, bool quantisable) {
+        std::string c = "f32";
+        if (quantisable) {
+            if (opt.mixed()) {
+                int il = recipe_layer(n);
+                c = recipe_type(rc, n, t.shape.empty() ? 1 : t.shape.back(), in_deltanet, il >= 0 ? v_index[std::size_t(il)] : -1);
+                if (c == "q4_k_m" || c == "q5_k_m") c = mix_base(c);
+            } else c = opt.codec;
+        }
+        w.add_tensor(n, t.shape, t.data, c); ++rep.tensors;
+    };
     {   // quantised embeddings: the runtime gathers rows straight from q8_0/q4_k blocks
         std::string ec = opt.emb_codec.empty() ? (opt.codec == "f32" || opt.codec == "f16" || opt.codec == "bf16" ? opt.codec : std::string("q8_0")) : opt.emb_codec;
         auto t = find(mp + "embed_tokens.weight");
+        if (opt.mixed() && opt.emb_codec.empty()) ec = recipe_type(rc, "tok_emb", t.shape.back());
         w.add_tensor("tok_emb", t.shape, t.data, ec); ++rep.tensors;
     }
     auto mlp = [&](const std::string& P, const std::string& Q, const char* g, const char* u, const char* d) {
@@ -163,10 +183,12 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     auto plus1 = [&](tensor t) { if (q35) for (auto& x : t.data) x += 1.f; return t; };   // Qwen3.5 RMSNorm: x * (1 + w)
     for (i64 l = 0; l < L; ++l) {
         auto P = std::format("{}layers.{}.", mp, l); auto Q = std::format("layer.{}.", l);
+        in_deltanet = false;
         put(Q + "attn_norm", plus1(find(P + "input_layernorm.weight")), false);
         put(Q + "ffn_norm", plus1(find(P + "post_attention_layernorm.weight")), false);
         if (q35 && has(P + "linear_attn.in_proj_qkv.weight")) {
             auto A = P + "linear_attn.";
+            in_deltanet = true;
             put(Q + "w_qkv", find(A + "in_proj_qkv.weight"), true);
             put(Q + "w_z", find(A + "in_proj_z.weight"), true);
             put(Q + "w_a", find(A + "in_proj_a.weight"), false);
