@@ -47,12 +47,16 @@ inline result<std::vector<pci_device>> pci() {
 #if defined(__linux__)
     std::vector<pci_device> out; std::string root = "/sys/bus/pci/devices";
     if (!stat(root).is_dir) return {{}, unsupported("pci (no /sys/bus/pci)")};
+    std::size_t listed = 0;
     for (auto& a : sysfs_list_(root)) {
+        ++listed;
         std::string b = root + "/" + a; pci_device d; d.address = a;
         d.vendor_id = sysfs_read_(b + "/vendor"); d.device_id = sysfs_read_(b + "/device"); d.class_id = sysfs_read_(b + "/class");
+        if (d.vendor_id.empty()) continue;   // attributes not readable (Android SELinux denies them to apps and shell)
         char lk[512]; auto n = ::readlink((b + "/driver").c_str(), lk, sizeof lk - 1); if (n > 0) d.driver = basename(std::string(lk, std::size_t(n)));
         out.push_back(std::move(d));
     }
+    if (listed && out.empty()) return {{}, unsupported("pci (sysfs device attributes not readable)")};
     return {std::move(out), {}};
 #else
     return {{}, unsupported("pci enumeration")};

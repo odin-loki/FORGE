@@ -11,6 +11,9 @@
 #if defined(FORGE_OS_POSIX)
 #include <sys/time.h>
 #endif
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#endif
 #if defined(FORGE_OS_MACOS)
 #include <libproc.h>
 #include <sys/proc_info.h>
@@ -29,8 +32,8 @@
 namespace forge::os {
 
 struct proc_limits {
-    std::uint64_t memory_bytes = 0;   // address-space cap (RLIMIT_AS / Job Object process memory; macOS: resident-size
-                                      // watchdog that SIGKILLs the group, see detail_proc::memory_watchdog); 0 = none
+    std::uint64_t memory_bytes = 0;   // address-space cap (RLIMIT_AS / Job Object process memory; macOS and Android:
+                                      // resident-size watchdog that SIGKILLs the group, see detail_proc::memory_watchdog); 0 = none
     std::uint64_t cpu_seconds = 0;    // RLIMIT_CPU / Job Object user time; 0 = none
     std::uint64_t open_files = 0;     // RLIMIT_NOFILE; 0 = inherit
     std::uint64_t file_size_bytes = 0;// RLIMIT_FSIZE (largest file the process may write); 0 = none. POSIX only
@@ -53,7 +56,10 @@ inline bool apply_limits(const proc_limits& lim) noexcept {
         struct rlimit r{soft, hard};
         if (::setrlimit(which, &r) != 0) ok = false;
     };
-#if !defined(FORGE_OS_MACOS)   // macOS: RLIMIT_AS aliases RLIMIT_RSS, which the kernel ignores; see memory_watchdog
+#if !defined(FORGE_OS_MACOS) && !defined(__ANDROID__)
+    // macOS: RLIMIT_AS aliases RLIMIT_RSS, which the kernel ignores. Android: bionic's linker and allocator reserve
+    // far more address space than they use, so a realistic RLIMIT_AS stops even `sh` from linking. Both keep
+    // memory_bytes with the resident-size memory_watchdog instead.
     if (lim.memory_bytes) set(RLIMIT_AS, rlim_t(lim.memory_bytes), rlim_t(lim.memory_bytes));
 #endif
     if (lim.cpu_seconds) set(RLIMIT_CPU, rlim_t(lim.cpu_seconds), rlim_t(lim.cpu_seconds + 1));
@@ -129,6 +135,61 @@ inline std::vector<pid_t> session_pids(pid_t sid) {
     return v;
 }
 #define FORGE_PROC_GROUP_RSS 1
+#if defined(__ANDROID__)
+// Android keeps proc_limits::memory_bytes with a watchdog (see apply_limits): a double-forked grandchild polls the
+// resident size of process group `pgid` every 2 ms through /proc and SIGKILLs the group once it passes `cap`; it
+// exits when the group is empty. Raw syscalls only (open/read/getdents64, stack buffers): the caller may be
+// multithreaded. Inherited descriptors are closed first so it never holds a child's pipe open.
+inline std::uint64_t raw_dec(const char*& p) { std::uint64_t v = 0; while (*p >= '0' && *p <= '9') v = v * 10 + std::uint64_t(*p++ - '0'); return v; }
+inline void memory_watchdog(pid_t pgid, std::uint64_t cap) {
+    pid_t m = ::fork();
+    if (m < 0) return;
+    if (m == 0) {
+        if (::fork() != 0) ::_exit(0);
+        struct rlimit nf{}; const int top = ::getrlimit(RLIMIT_NOFILE, &nf) == 0 && nf.rlim_cur != RLIM_INFINITY && nf.rlim_cur < 65536 ? int(nf.rlim_cur) : 1024;
+        for (int fd = 0; fd < top; ++fd) ::close(fd);
+        const std::uint64_t pg = std::uint64_t(::sysconf(_SC_PAGESIZE));
+        for (;;) {
+            int dfd = ::open("/proc", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+            if (dfd < 0) ::_exit(0);
+            std::uint64_t total = 0; int live = 0;
+            alignas(8) char dbuf[8192];
+            for (;;) {
+                long n = ::syscall(SYS_getdents64, dfd, dbuf, sizeof dbuf);
+                if (n <= 0) break;
+                for (long off = 0; off < n;) {
+                    const char* rec = dbuf + off;
+                    unsigned short reclen; std::memcpy(&reclen, rec + 16, sizeof reclen);
+                    const char* name = rec + 19; off += reclen;
+                    if (name[0] < '0' || name[0] > '9') continue;
+                    char path[48] = "/proc/"; std::size_t k = 6;
+                    for (const char* q = name; *q && k < 36; ++q) path[k++] = *q;
+                    std::memcpy(path + k, "/stat", 6);
+                    int f = ::open(path, O_RDONLY | O_CLOEXEC); if (f < 0) continue;
+                    char buf[1024]; long r = ::read(f, buf, sizeof buf - 1); ::close(f);
+                    if (r <= 0) continue;
+                    buf[r] = 0;
+                    const char* q = nullptr; for (long i = r - 1; i >= 0; --i) if (buf[i] == ')') { q = buf + i; break; }
+                    if (!q || q[1] != ' ') continue;
+                    // after ") ": state ppid pgrp ...; rss is the 22nd field after the comm
+                    const char* t = q + 2; int field = 0;
+                    std::uint64_t pgrp = 0;
+                    while (*t && field < 21) { if (*t == ' ') { ++field; ++t; if (field == 2) pgrp = raw_dec(t); continue; } ++t; }
+                    if (pid_t(pgrp) != pgid) continue;
+                    if (q[2] == 'Z') continue;
+                    total += raw_dec(t) * pg; ++live;
+                }
+            }
+            ::close(dfd);
+            if (!live) ::_exit(0);
+            if (total > cap) { ::kill(-pgid, SIGKILL); ::_exit(0); }
+            struct timespec ts{0, 2000000}; ::nanosleep(&ts, nullptr);
+        }
+    }
+    int st; while (::waitpid(m, &st, 0) < 0 && errno == EINTR) {}
+}
+#define FORGE_PROC_MEMORY_WATCHDOG 1
+#endif
 #elif defined(FORGE_OS_MACOS)
 inline std::vector<pid_t> list_pids(std::uint32_t type, std::uint32_t arg) {
     int n = ::proc_listpids(type, arg, nullptr, 0); if (n <= 0) return {};
