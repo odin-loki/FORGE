@@ -66,8 +66,9 @@ TEST(spawn_missing_command) {
     auto r = os::spawn_wait(s); CHECK(!r);
 }
 TEST(spawn_memory_limit) {
-#if defined(__APPLE__)
-    // macOS has no enforced memory rlimit: the cap is a resident-size watchdog, so check that it kills a child
+#if defined(__APPLE__) || defined(__ANDROID__)
+    // macOS has no enforced memory rlimit, and Android's bionic cannot start a process under a realistic
+    // RLIMIT_AS: the cap is a resident-size watchdog, so check that it kills a child
     // that holds 256 MiB (dd keeps its 64 MiB buffer for every block; 8 blocks take far longer than 2 ms polls).
     os::spawn_spec s; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=64 of=/dev/null 2>/dev/null"};
     s.limits.memory_bytes = 32ull << 20;
@@ -207,7 +208,7 @@ TEST(child_start_spec_env_cwd_and_exec_error) {
 }
 TEST(child_start_memory_limit) {
     // count=16: the 64 MiB buffer stays resident across blocks, long enough for the macOS watchdog (2 ms polls);
-    // elsewhere the allocation itself fails under RLIMIT_AS / the Job Object.
+    // elsewhere the allocation itself fails under RLIMIT_AS / the Job Object (Android: the watchdog, as on macOS).
     os::spawn_spec s; s.argv = {"sh", "-c", "exec dd if=/dev/zero bs=64M count=16 of=/dev/null 2>/dev/null"};
     s.limits.memory_bytes = 32ull << 20;
     auto c = os::child::start(s); CHECK(c); CHECK(c->wait() != 0);   // 64 MiB buffer cannot fit in 32 MiB
