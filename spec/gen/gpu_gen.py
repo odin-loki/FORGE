@@ -311,6 +311,36 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
   bar_();
   for (unsigned st = 64u; st > 0u; st >>= 1) { if (t < st) for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] += red[rr * 128u + t + st]; bar_(); }
   if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[t * 128u]; }
+// Batched (prefill) quantised matmul, after llama.cpp's MMQ tiling (ggml-cuda/mmq.cuh, MIT, the ggml authors):
+// a 64x64 output tile per 256-thread block; each 64-wide k slice decodes every weight group once into shared memory
+// and reuses it for all 64 activation rows (the per-4-row kernel above re-decodes it rows/4 times).
+// Grid: ceil(cols/64) * ceil(rows/64) blocks. Requires k % 32 == 0.
+FORGE_GLOBAL void forge_qmatmul_mmq(const float* a, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
+  __attribute__((shared)) float As[64u * 65u];
+  __attribute__((shared)) float Ws[64u * 65u];
+  unsigned t = tid_(), ncb = (cols + 63u) / 64u, bi = bid_(), c0 = (bi % ncb) * 64u, r0 = (bi / ncb) * 64u;
+  unsigned tx = t & 15u, ty = t >> 4;
+  float acc[16];
+  for (unsigned i = 0; i < 16u; ++i) acc[i] = 0.0f;
+  float v[32];
+  for (unsigned kb = 0; kb < k; kb += 64u) {
+    for (unsigned i = t; i < 4096u; i += 256u) {
+      unsigned rr = i >> 6, kk = i & 63u, r = r0 + rr;
+      As[rr * 65u + kk] = (r < rows && kb + kk < k) ? a[(unsigned long long)r * k + kb + kk] : 0.0f; }
+    if (t < 128u) {
+      unsigned cc = t >> 1, gg = t & 1u, c = c0 + cc;
+      if (c < cols && kb + gg * 32u < k) qgroup(fmt, w + (unsigned long long)c * rb, (kb >> 5) + gg, v);
+      else for (unsigned l = 0; l < 32u; ++l) v[l] = 0.0f;
+      for (unsigned l = 0; l < 32u; ++l) Ws[cc * 65u + gg * 32u + l] = v[l]; }
+    bar_();
+    for (unsigned kk = 0; kk < 64u; ++kk) {
+      float av[4], wv[4];
+      for (unsigned i = 0; i < 4u; ++i) { av[i] = As[(ty + 16u * i) * 65u + kk]; wv[i] = Ws[(tx + 16u * i) * 65u + kk]; }
+      for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) acc[i * 4u + j] = fma_(av[i], wv[j], acc[i * 4u + j]); }
+    bar_(); }
+  for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) {
+    unsigned r = r0 + ty + 16u * i, c = c0 + tx + 16u * j;
+    if (r < rows && c < cols) y[(unsigned long long)r * cols + c] = acc[i * 4u + j]; } }
 """
 
 CU_MATH = r"""// sin/cos in double after reduction by pi/2 (no libdevice/ocml needed); |x| up to ~1e9 is exact enough.

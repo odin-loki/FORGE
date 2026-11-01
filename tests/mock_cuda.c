@@ -111,8 +111,14 @@ static void m_qgroup(unsigned fmt, const unsigned char* row, unsigned g, float* 
       if (fmt == 2u) { const unsigned char* q = b + 16u + (s >> 1) * 32u; for (l = 0; l < 32u; ++l) v[l] = d1 * (float)(hi ? (q[l] >> 4) : (q[l] & 15u)) - m1; }
       else { const unsigned char* qh = b + 16u; const unsigned char* q = b + 48u + (s >> 1) * 32u; unsigned u = 1u << s;
           for (l = 0; l < 32u; ++l) v[l] = d1 * (float)((hi ? (q[l] >> 4) : (q[l] & 15u)) + ((qh[l] & u) ? 16u : 0u)) - m1; } } }
+static int mock_qmm(const float* a, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
+    unsigned r, c, g, l; float v[32];
+    for (r = 0; r < rows; ++r) for (c = 0; c < cols; ++c) { float s = 0;
+        for (g = 0; g < k / 32u; ++g) { m_qgroup(fmt, w + (size_t)c * rb, g, v); for (l = 0; l < 32u; ++l) s = fmaf(a[(size_t)r * k + g * 32u + l], v[l], s); }
+        y[(size_t)r * cols + c] = s; }
+    return 0; }
 static int nargs_of(const char* op) {
-    if (!strcmp(op, "qmatmul_t")) return 8;
+    if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
     if (!strcmp(op, "attention")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
@@ -165,12 +171,13 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
             for (e = 0; e < dv; ++e) yp[e] *= sum > 0 ? 1 / sum : 0; }
         return 0; }
     if (!strcmp(op, "qmatmul_t")) { float *a = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
-        unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned), r, c, g, l; float v[32];
+        unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < cols * ((rows + 3) / 4) || bx != 128) return 1;   /* run_qmatmul's launch shape */
-        for (r = 0; r < rows; ++r) for (c = 0; c < cols; ++c) { float s = 0;
-            for (g = 0; g < k / 32u; ++g) { m_qgroup(fmt, w + (size_t)c * rb, g, v); for (l = 0; l < 32u; ++l) s = fmaf(a[(size_t)r * k + g * 32u + l], v[l], s); }
-            y[(size_t)r * cols + c] = s; }
-        return 0; }
+        return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
+    if (!strcmp(op, "qmatmul_mmq")) { float *a = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
+        unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
+        if (gx < ((cols + 63) / 64) * ((rows + 63) / 64) || bx != 256) return 1;   /* MMQ 64x64-tile launch shape */
+        return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
     if (!strcmp(op, "scale")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned); float a = ARG(3, float);
         for (i = 0; i < threads && i < n; ++i) y[i] = a * x[i]; return 0; }
     if (!strcmp(op, "softmax")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned rows = ARG(2, unsigned), cols = ARG(3, unsigned);

@@ -14,6 +14,7 @@
 //   * stream capture into a graph and replay (`capture_begin/capture_end/graph_launch`) where the driver
 //     exports the graph API;
 //   * multiple devices (`open(api, ordinal)`, `device_count`) and peer copies between runtimes.
+#include <cstdlib>
 #include <forge/grid/gpu_images.gen.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/spec/ops.gen.hpp>
@@ -234,6 +235,16 @@ public:
         void* f = nullptr; if (f_.get_fn(&f, mod_, n.c_str()) != 0 || !f) return false;
         fn_[n] = f; return true;
     }
+    // rows at or above which run_qmatmul uses the tiled MMQ kernel ($FORGE_MMQ_MIN_ROWS, default 16; 0 disables)
+    static std::uint32_t mmq_min_rows() {
+        static const std::uint32_t v = [] { const char* e = std::getenv("FORGE_MMQ_MIN_ROWS"); if (!e) return 16u; auto n = std::uint32_t(std::strtoul(e, nullptr, 10)); return n ? n : 0xffffffffu; }();
+        return v;
+    }
+    bool has_fn_locked(const std::string& n) {   // caller holds mu_
+        if (fn_.count(n)) return true;
+        void* f = nullptr; if (f_.get_fn(&f, mod_, n.c_str()) != 0 || !f) return false;
+        fn_[n] = f; return true;
+    }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
         std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
@@ -261,8 +272,14 @@ public:
             }
             std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
             void* args[] = {&xd, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-            unsigned grid = cols * ((rows + 3) / 4);
-            if (grid) ck(f_.launch(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
+                ++dispatches_["qmatmul_mmq"];
+                unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
+                if (grid) ck(f_.launch(function("forge_qmatmul_mmq"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            } else {
+                unsigned grid = cols * ((rows + 3) / 4);
+                if (grid) ck(f_.launch(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
+            }
             if (!in_run_) { ck(f_.dtoh_async(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
