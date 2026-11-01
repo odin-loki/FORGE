@@ -34,6 +34,11 @@ struct lowering {
 // duration of run(); the executor asks for host copies before CPU work and reports host writes after it.
 struct device_hooks {
     std::function<void()> begin_run, end_run;
+    // optional: end a run without copying device intermediates back (the executor has already fetched outputs/state)
+    std::function<void()> end_run_discard;
+    // optional (with end_run_discard): keep this buffer's device copy across runs without syncing the host copy;
+    // to_host / release still fetch it on demand (state slots: KV cache, recurrent state)
+    std::function<void(const float*, std::size_t)> keep;
     std::function<void(const float*, std::size_t)> pin, to_host, host_wrote, release;
     std::function<void(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off)> copy;  // device-side
     // fixed-size state op (state_ops.hpp: delta_rule, causal_conv) run on the device with the slot `S` kept resident;

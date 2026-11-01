@@ -295,22 +295,61 @@ FORGE_DEV void qgroup(unsigned fmt, const unsigned char* row, unsigned g, float*
     for (unsigned l = 0; l < 32u; ++l) { unsigned n = hi ? (q[l] >> 4) : (q[l] & 15u); v[l] = d1 * (float)n - m1; } }
   else { const unsigned char* qh = b + 16u; const unsigned char* q = b + 48u + (s >> 1) * 32u; unsigned u = 1u << s;
     for (unsigned l = 0; l < 32u; ++l) { unsigned n = (hi ? (q[l] >> 4) : (q[l] & 15u)) + ((qh[l] & u) ? 16u : 0u); v[l] = d1 * (float)n - m1; } } }
+// Element l of group g (the per-lane form of qgroup): a warp decodes one group with coalesced byte/float loads.
+FORGE_DEV float qelem(unsigned fmt, const unsigned char* row, unsigned g, unsigned l) {
+  if (fmt == 1u) { const unsigned char* b = row + g * 34u; return h2f(ld16(b)) * (float)(signed char)b[2u + l]; }
+  unsigned s = g & 7u;
+  if (fmt == 3u) {
+    const unsigned char* b = row + (g >> 3) * 210u; unsigned h = s >> 2, t = s & 3u;
+    const unsigned char* ql = b + 64u * h; const unsigned char* qh = b + 128u + 32u * h; const signed char* sc = (const signed char*)(b + 192u + 8u * h);
+    unsigned lo = (t & 1u) ? ql[l + 32u] : ql[l]; lo = (t & 2u) ? (lo >> 4) : (lo & 15u);
+    int q = (int)(lo | (((qh[l] >> (2u * t)) & 3u) << 4)) - 32;
+    return h2f(ld16(b + 208u)) * (float)sc[(l >> 4) + 2u * t] * (float)q; }
+  const unsigned char* b = row + (g >> 3) * (fmt == 2u ? 144u : 176u);
+  float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned sc, mn; scmin(s, b + 4u, &sc, &mn);
+  unsigned hi = s & 1u, n;
+  if (fmt == 2u) { const unsigned char* q = b + 16u + (s >> 1) * 32u; n = hi ? (q[l] >> 4) : (q[l] & 15u); }
+  else { const unsigned char* q = b + 48u + (s >> 1) * 32u; n = (hi ? (q[l] >> 4) : (q[l] & 15u)) + ((b[16u + l] & (1u << s)) ? 16u : 0u); }
+  return d * (float)sc * (float)n - dm * (float)mn; }
 FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
   __attribute__((shared)) float red[4u * 128u];
-  unsigned t = tid_(), bi = bid_(), c = bi % cols, r0 = (bi / cols) * 4u;
+  unsigned t = tid_(), bi = bid_(), c = bi % cols, r0 = (bi / cols) * 4u, l = t & 31u;
   const unsigned char* row = w + (unsigned long long)c * rb;
-  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f}; float v[32];
+  float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   unsigned nr = rows - r0 < 4u ? rows - r0 : 4u;
-  for (unsigned g = t; g < k / 32u; g += 128u) {
-    qgroup(fmt, row, g, v);
-    for (unsigned rr = 0; rr < nr; ++rr) {
-      const float* ap = a + (unsigned long long)(r0 + rr) * k + g * 32u; float s = 0.0f;
-      for (unsigned l = 0; l < 32u; ++l) s = fma_(ap[l], v[l], s);
-      acc[rr] += s; } }
+  if (fmt == 2u) {   // q4_k: a warp per 256-value super-block, lane = 4 bytes = 8 values (two groups' nibbles)
+    unsigned j = l >> 3, o = (l & 7u) * 4u;
+#pragma unroll 2
+    for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
+      const unsigned char* b = row + sb * 144u;
+      float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned s0, m0, s1, m1;
+      scmin(2u * j, b + 4u, &s0, &m0); scmin(2u * j + 1u, b + 4u, &s1, &m1);
+      float d0 = d * (float)s0, n0 = dm * (float)m0, d1 = d * (float)s1, n1 = dm * (float)m1;
+      unsigned q = *(const unsigned*)(b + 16u + j * 32u + o);
+      float v0[4], v1[4];
+      for (unsigned i = 0; i < 4u; ++i) { v0[i] = d0 * (float)((q >> (8u * i)) & 15u) - n0; v1[i] = d1 * (float)((q >> (8u * i + 4u)) & 15u) - n1; }
+      for (unsigned rr = 0; rr < nr; ++rr) {
+        const float* ap = a + (unsigned long long)(r0 + rr) * k + sb * 256u + 64u * j + o; float sacc = acc[rr];
+        for (unsigned i = 0; i < 4u; ++i) { sacc = fma_(ap[i], v0[i], sacc); sacc = fma_(ap[32u + i], v1[i], sacc); }
+        acc[rr] = sacc; } }
+  } else
+#pragma unroll 4
+  for (unsigned g = t >> 5; g < k / 32u; g += 4u) {   // 4 warps, one group each; lane l owns element l
+    float v = qelem(fmt, row, g, l);
+    for (unsigned rr = 0; rr < nr; ++rr) acc[rr] = fma_(a[(unsigned long long)(r0 + rr) * k + g * 32u + l], v, acc[rr]); }
   for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] = acc[rr];
   bar_();
   for (unsigned st = 64u; st > 0u; st >>= 1) { if (t < st) for (unsigned rr = 0; rr < 4u; ++rr) red[rr * 128u + t] += red[rr * 128u + t + st]; bar_(); }
   if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[t * 128u]; }
+// RMS norm, one 256-thread block per row (the per-row-thread version in cuda() is serial over cols).
+FORGE_GLOBAL void forge_rms_norm_b(const float* x, const float* w, float* y, unsigned rows, unsigned cols, float eps) {
+  __attribute__((shared)) float red[256];
+  unsigned t = tid_(), r = bid_(); const float* xr = x + (unsigned long long)r * cols; float s = 0.0f;
+  for (unsigned j = t; j < cols; j += 256u) s = fma_(xr[j], xr[j], s);
+  red[t] = s; bar_();
+  for (unsigned st = 128u; st > 0u; st >>= 1) { if (t < st) red[t] += red[t + st]; bar_(); }
+  float inv = 1.0f / fsqrt(red[0] / (float)cols + eps);
+  for (unsigned j = t; j < cols; j += 256u) y[(unsigned long long)r * cols + j] = xr[j] * inv * w[j]; }
 // Batched (prefill) quantised matmul, after llama.cpp's MMQ tiling (ggml-cuda/mmq.cuh, MIT, the ggml authors):
 // a 64x64 output tile per 256-thread block; each 64-wide k slice decodes every weight group once into shared memory
 // and reuses it for all 64 activation rows (the per-4-row kernel above re-decodes it rows/4 times).

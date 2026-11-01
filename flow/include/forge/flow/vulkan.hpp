@@ -62,6 +62,11 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
         RT* raw = rt.get();
         h->begin_run = [raw] { raw->begin_run(); };
         h->end_run = [raw] { raw->end_run(); };
+        if constexpr (requires { raw->end_run_discard(); })
+            if (!std::getenv("FORGE_GPU_EAGER_SYNC")) {
+                h->end_run_discard = [raw] { raw->end_run_discard(); };
+                h->keep = [raw](const float* p, std::size_t n) { raw->keep(p, n); };
+            }
         h->pin = [raw](const float* p, std::size_t n) { raw->pin(p, n); };
         h->to_host = [raw](const float* p, std::size_t n) { raw->to_host(p, n); };
         h->host_wrote = [raw](const float* p, std::size_t n) { raw->host_wrote(p, n); };

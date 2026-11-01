@@ -63,7 +63,7 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     auto& x = in[0];
     switch (s) {
     case sig::unary: case sig::scale: return in.size() == 1;
-    case sig::binary: return in.size() == 2 && in[1] == x;
+    case sig::binary: return in.size() == 2 && (in[1] == x || numel(in[1]) == numel(x));   // [n] op [1, n]: same elements
     case sig::rows: return !x.empty() && (a.num("axis", -1) == -1 || a.num("axis", -1) == double(x.size()) - 1);
     case sig::rms: return in.size() == 2 && !x.empty() && in[1].size() == 1 && in[1][0] == x.back();
     case sig::matmul: return in.size() == 2 && x.size() >= 2 && in[1].size() == 2 && in[1][1] == x.back();
@@ -134,7 +134,8 @@ public:
         return r;
     }
     ~runtime() {
-        try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear(); } catch (...) {}
+        try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear();
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); } catch (...) {}
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
@@ -166,6 +167,17 @@ public:
         }
         sync(); in_run_ = false;
     }
+    void end_run_discard() {   // like end_run, but non-pinned intermediates go back to the pool without a download
+        std::lock_guard lk(mu_); bind();
+        for (auto it = res_.begin(); it != res_.end();) {
+            auto& e = it->second;
+            if (e.kept) { ++it; continue; }   // stays resident, host copy fetched on demand
+            if (e.pinned) { if (!e.host_valid) download(e); ++it; continue; }
+            drop(e); it = res_.erase(it);
+        }
+        sync(); in_run_ = false;
+    }
+    void keep(const float* p, std::size_t n) { std::lock_guard lk(mu_); each_overlap(p, n, [&](entry& e) { e.kept = true; }); }
     bool resident() { std::lock_guard lk(mu_); return in_run_; }
     void pin(const float* p, std::size_t n) { std::lock_guard lk(mu_); pinned_.push_back({p, n}); }
     void to_host(const float* p, std::size_t n) {
@@ -380,8 +392,10 @@ public:
             for (std::size_t i = 0; i < in.size(); ++i) {
                 ptrs.push_back(buf(in[i].data, in[i].size(), false));
                 if (s == sig::rope && i == 1) {   // the inverse-frequency table goes after pos
-                    std::uint64_t d = 0; ck(f_.malloc_(&d, std::max<std::size_t>(4, extra.size() * 4)), "malloc"); temps.push_back(d);
-                    ck(f_.htod_async(d, extra.data(), extra.size() * 4, stream_), "memcpy HtoD"); ptrs.push_back(d);
+                    auto& d = rope_[extra];   // the table depends only on (base, dim): upload once
+                    if (!d) { ck(f_.malloc_(&d, std::max<std::size_t>(4, extra.size() * 4)), "malloc");
+                              ck(f_.htod_async(d, extra.data(), extra.size() * 4, stream_), "memcpy HtoD"); }
+                    ptrs.push_back(d);
                 }
             }
             ptrs.push_back(buf(out.data, out.size(), true));
@@ -402,6 +416,7 @@ public:
             unsigned block = 64, grid = (threads + block - 1) / block;
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
                 fn = function("forge_attention_fa"); block = 128; grid = rows * cols; }
+            if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
             if (grid) ck(f_.launch(fn, grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
             if (!in_run_) { ck(f_.dtoh_async(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
@@ -452,7 +467,7 @@ private:
             std::vector<char> t(n); int r = dtoh(t.data(), s, n); return r ? r : htod(d, t.data(), n);
         }
     };
-    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false; };
+    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false; };
     struct bound { entry* e; std::uint64_t ptr; };
 
     template<class F> bool sym(F& f, const char* n) { f = reinterpret_cast<F>(dlsym(lib_, n)); return f != nullptr; }
@@ -473,7 +488,24 @@ private:
         for (auto& [k, e] : res_) { auto el = k, eh = k + e.count * 4; if (el < hi && lo < eh) f(e); }
     }
     void download(entry& e) { ck(f_.dtoh_async(e.host, e.d, e.count * 4, stream_), "memcpy DtoH"); e.host_valid = true; ++stats_.downloads; }
-    void drop(entry& e) { f_.free_(e.d); stats_.resident_bytes -= e.count * 4; }
+    // freed device buffers are pooled by size and reused: decode runs the same shapes every token
+    void drop(entry& e) {
+        stats_.resident_bytes -= e.count * 4;
+        if (pool_bytes_ + e.count * 4 > pool_cap()) { f_.free_(e.d); return; }
+        pool_.emplace(std::max<std::size_t>(4, e.count * 4), e.d); pool_bytes_ += std::max<std::size_t>(4, e.count * 4);
+    }
+    void dev_alloc(std::uint64_t* d, std::size_t bytes) {
+        bytes = std::max<std::size_t>(4, bytes);
+        if (auto it = pool_.find(bytes); it != pool_.end()) { *d = it->second; pool_.erase(it); pool_bytes_ -= bytes; return; }
+        if (f_.malloc_(d, bytes) != 0) {   // out of memory: give the pool back and retry
+            for (auto& [k, p] : pool_) f_.free_(p); pool_.clear(); pool_bytes_ = 0;
+            ck(f_.malloc_(d, bytes), "malloc");
+        }
+    }
+    static std::size_t pool_cap() {
+        static const std::size_t v = [] { const char* e = std::getenv("FORGE_GPU_POOL_MB"); return (e ? std::strtoull(e, nullptr, 10) : 4096ull) << 20; }();
+        return v;
+    }
     bound acquire(float* h, std::size_t count, bool is_out) {
         auto key = reinterpret_cast<std::uintptr_t>(h);
         if (auto it = res_.find(key); it != res_.end() && it->second.count == count) return {&it->second, it->second.d};
@@ -487,7 +519,7 @@ private:
         if (dl || !ks.empty()) sync();
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
         entry e{h, count, 0};
-        ck(f_.malloc_(&e.d, std::max<std::size_t>(4, count * 4)), "malloc");
+        dev_alloc(&e.d, count * 4);
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
         if (!is_out) { ck(f_.htod_async(e.d, h, count * 4, stream_), "memcpy HtoD"); ++stats_.uploads; }
         stats_.resident_bytes += count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
@@ -555,7 +587,9 @@ private:
     std::mutex mu_;
     bool in_run_ = false;
     std::map<std::uintptr_t, entry> res_;
-    std::map<std::pair<std::uintptr_t, std::size_t>, std::uint64_t> qres_;   // encoded weights (run_qmatmul)
+    std::map<std::pair<std::uintptr_t, std::size_t>, std::uint64_t> qres_;
+    std::multimap<std::size_t, std::uint64_t> pool_; std::size_t pool_bytes_ = 0;
+    std::map<std::vector<float>, std::uint64_t> rope_;   // encoded weights (run_qmatmul)
     std::vector<std::pair<const float*, std::size_t>> pinned_;
     std::vector<std::pair<void*, void*>> graphs_;
     std::map<std::string, void*> fn_;
