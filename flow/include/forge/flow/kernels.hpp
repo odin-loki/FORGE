@@ -36,6 +36,9 @@ struct device_hooks {
     std::function<void()> begin_run, end_run;
     std::function<void(const float*, std::size_t)> pin, to_host, host_wrote, release;
     std::function<void(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off)> copy;  // device-side
+    // fixed-size state op (state_ops.hpp: delta_rule, causal_conv) run on the device with the slot `S` kept resident;
+    // false when the backend has no kernel for it (the executor then runs the host version).
+    std::function<bool(const std::string& fn, std::span<const tensor_view> in, float* S, std::size_t sn, tensor_view out, const spec::attrs& a)> state;
 };
 
 inline kernel_fn reference_kernel(spec::op o) {

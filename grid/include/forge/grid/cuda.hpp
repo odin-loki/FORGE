@@ -286,6 +286,46 @@ public:
         return true;
     }
 
+    // Gated DeltaNet state ops (flow/state_ops.hpp) on the device. The state slot S is pinned, so it stays resident
+    // across runs (tokens) like the weights; inputs/output follow the residency protocol. Only inside a run.
+    bool run_state(const std::string& fn, const std::vector<tensor_view>& in, float* S, std::size_t sn, tensor_view out, const spec::attrs& a) {
+        std::lock_guard lk(mu_); bind();
+        if (!in_run_ || !has_fn_locked("forge_" + fn)) return false;
+        std::uint32_t u[6] = {}; std::uint32_t grid = 0; float sc = 0;
+        if (fn == "delta_rule" && in.size() == 5) {
+            u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[0].shape[2]);
+            u[3] = std::uint32_t(in[2].shape[1]); u[4] = std::uint32_t(in[2].shape[2]); u[5] = a.num("l2norm", 1) != 0;
+            if (u[2] > 256u || !u[1] || u[3] % u[1]) return false;
+            sc = float(a.num("scale", 1.0 / std::sqrt(double(u[2])))); grid = u[3];
+        } else if (fn == "causal_conv" && in.size() == 2) {
+            u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[1].shape[1]);
+            if (u[2] < 1u || u[2] > 9u) return false;
+            grid = (u[1] + 127u) / 128u;
+        } else return false;
+        bool known = false; for (auto& [p, n] : pinned_) if (p == S && n == sn) known = true;
+        if (!known) pinned_.push_back({S, sn});
+        // the kernels are not in-place safe: an output overlapping an input or the state goes to the host path
+        auto overlaps = [](const float* a, std::size_t an, const float* b, std::size_t bn) { return a < b + bn && b < a + an; };
+        for (auto& v : in) if (overlaps(out.data, out.size(), v.data, v.size())) return false;
+        if (overlaps(out.data, out.size(), S, sn)) return false;
+        // acquire twice: a later acquire may replace (and free) a resident buffer an earlier one returned when the
+        // ranges overlap, so the pointers are only final once a full pass hits the cache
+        std::vector<std::uint64_t> ptrs;
+        for (int pass = 0; pass < 2; ++pass) {
+            ptrs.clear();
+            for (auto& v : in) ptrs.push_back(acquire(v.data, v.size(), false).ptr);
+            auto sb = acquire(S, sn, false); sb.e->pinned = true; ptrs.push_back(sb.ptr);
+            ptrs.push_back(acquire(out.data, out.size(), pass == 0).ptr);
+        }
+        for (auto& [k, e] : res_) { auto kp = reinterpret_cast<const float*>(k); if (overlaps(kp, e.count, S, sn) || overlaps(kp, e.count, out.data, out.size())) e.host_valid = false; }
+        std::vector<void*> args; for (auto& p : ptrs) args.push_back(&p);
+        if (fn == "delta_rule") { for (int i = 0; i < 6; ++i) args.push_back(&u[i]); args.push_back(&sc); }
+        else for (int i = 0; i < 3; ++i) args.push_back(&u[i]);
+        ++dispatches_[fn];
+        if (grid) ck(f_.launch(function("forge_" + fn), grid, 1, 1, 128, 1, 1, 0, stream_, args.data(), nullptr), "launch");
+        return true;
+    }
+
     // Run one op over host views; false if there is no kernel for this op/shape. Inside a run (begin_run)
     // buffers stay resident; outside, every buffer is uploaded and the output downloaded.
     bool run_op(const std::string& op, const std::vector<tensor_view>& in, const spec::attrs& a, tensor_view out) {

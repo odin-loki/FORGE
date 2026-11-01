@@ -119,6 +119,7 @@ static int mock_qmm(const float* a, const unsigned char* w, float* y, unsigned r
     return 0; }
 static int nargs_of(const char* op) {
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
+    if (!strcmp(op, "delta_rule")) return 14; if (!strcmp(op, "causal_conv")) return 7;
     if (!strcmp(op, "attention")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
@@ -178,6 +179,30 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < ((cols + 63) / 64) * ((rows + 63) / 64) || bx != 256) return 1;   /* MMQ 64x64-tile launch shape */
         return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
+    if (!strcmp(op, "delta_rule")) {   /* flow/state_ops.hpp delta_rule; one block per value head */
+        float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *g = P(ARG(3, dptr)), *be = P(ARG(4, dptr)), *S = P(ARG(5, dptr)), *o = P(ARG(6, dptr));
+        unsigned s = ARG(7, unsigned), hk = ARG(8, unsigned), dk = ARG(9, unsigned), hv = ARG(10, unsigned), dv = ARG(11, unsigned), l2 = ARG(12, unsigned); float sc = ARG(13, float);
+        unsigned h, t, a, j; if (gx < hv || bx != 128 || dk > 256) return 1;
+        for (h = 0; h < hv; ++h) { float* Sh = S + (size_t)h * dk * dv; unsigned kh = h / (hv / hk);
+            for (t = 0; t < s; ++t) { const float *qt = q + ((size_t)t * hk + kh) * dk, *kt = k + ((size_t)t * hk + kh) * dk, *vt = v + ((size_t)t * hv + h) * dv;
+                float qs = 0, ks = 0, qf, kf, dec = expf(g[t * hv + h]), bt = be[t * hv + h]; float* ot = o + ((size_t)t * hv + h) * dv;
+                for (a = 0; a < dk; ++a) { qs += qt[a] * qt[a]; ks += kt[a] * kt[a]; }
+                qf = l2 ? sc / sqrtf(qs + 1e-6f) : sc; kf = l2 ? 1.0f / sqrtf(ks + 1e-6f) : 1.0f;
+                for (j = 0; j < dv; ++j) { float kv = 0, d, acc = 0;
+                    for (a = 0; a < dk; ++a) { Sh[a * dv + j] *= dec; kv = fmaf(Sh[a * dv + j], kt[a] * kf, kv); }
+                    d = (vt[j] - kv) * bt;
+                    for (a = 0; a < dk; ++a) { Sh[a * dv + j] = fmaf(kt[a] * kf, d, Sh[a * dv + j]); acc = fmaf(Sh[a * dv + j], qt[a] * qf, acc); }
+                    ot[j] = acc; } } }
+        return 0; }
+    if (!strcmp(op, "causal_conv")) {
+        float *x = P(ARG(0, dptr)), *w = P(ARG(1, dptr)), *st = P(ARG(2, dptr)), *o = P(ARG(3, dptr));
+        unsigned s = ARG(4, unsigned), C = ARG(5, unsigned), K = ARG(6, unsigned), c, t, j, P_ = K - 1; float nw[8];
+        if (gx * bx < C || K > 9) return 1;
+        for (c = 0; c < C; ++c) {
+            for (t = 0; t < s; ++t) { float acc = 0; for (j = 0; j < K; ++j) { unsigned p = t + j; acc = fmaf(w[c * K + j], p < P_ ? st[p * C + c] : x[(size_t)(p - P_) * C + c], acc); } o[(size_t)t * C + c] = acc; }
+            for (j = 0; j < P_; ++j) { unsigned p = s + j; nw[j] = p < P_ ? st[p * C + c] : x[(size_t)(p - P_) * C + c]; }
+            for (j = 0; j < P_; ++j) st[j * C + c] = nw[j]; }
+        return 0; }
     if (!strcmp(op, "scale")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned); float a = ARG(3, float);
         for (i = 0; i < threads && i < n; ++i) y[i] = a * x[i]; return 0; }
     if (!strcmp(op, "softmax")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned rows = ARG(2, unsigned), cols = ARG(3, unsigned);
