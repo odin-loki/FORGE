@@ -53,6 +53,8 @@ struct state_store {
         i64 want = page_rows > 0 ? std::min(capacity, (rows + page_rows - 1) / page_rows * page_rows) : capacity;
         shape_t cap = row_shape; cap[0] = want;
         tensor nb(cap);
+        // the old buffer is about to be freed: sync any device-only rows back and drop the device copy keyed by it
+        if (sl.capacity && hooks && hooks->release) hooks->release(sl.buf.data.data(), sl.buf.data.size());
         if (sl.capacity) std::copy_n(sl.buf.data.data(), std::size_t(numel(sl.buf.shape) / std::max<i64>(sl.capacity, 1) * sl.len), nb.data.data());
         sl.buf = std::move(nb); sl.capacity = want;
     }
