@@ -67,6 +67,10 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
         h->host_wrote = [raw](const float* p, std::size_t n) { raw->host_wrote(p, n); };
         h->release = [raw](const float* p, std::size_t n) { raw->release(p, n); };
         h->copy = [raw](float* s, std::size_t n, float* d, std::size_t dn, std::size_t off) { raw->copy_resident(s, n, d, dn, off); };
+        if constexpr (requires { raw->run_state(std::string(), std::vector<tensor_view>(), (float*)nullptr, std::size_t(0), tensor_view(), spec::attrs()); })
+            if (!std::getenv("FORGE_GPU_NO_STATE_OPS"))
+                h->state = [raw](const std::string& fn, std::span<const tensor_view> in, float* S, std::size_t sn, tensor_view out, const spec::attrs& a) {
+                    return raw->run_state(fn, std::vector<tensor_view>(in.begin(), in.end()), S, sn, out, a); };
         r->hooks = h;
     }
     for (std::size_t i = 0; i < spec::op_count; ++i) {

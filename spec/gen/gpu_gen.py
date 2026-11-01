@@ -341,6 +341,41 @@ FORGE_GLOBAL void forge_qmatmul_mmq(const float* a, const unsigned char* w, floa
   for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) {
     unsigned r = r0 + ty + 16u * i, c = c0 + tx + 16u * j;
     if (r < rows && c < cols) y[(unsigned long long)r * cols + c] = acc[i * 4u + j]; } }
+// Gated DeltaNet state ops on the device (flow/state_ops.hpp semantics; the state slot stays resident).
+// delta_rule: one 128-thread block per value head; each thread owns whole columns j of S[h] (dk x dv), so the
+// recurrence S *= exp(g); delta = (v - S^T k) * beta; S += k delta^T; out = S^T q needs no cross-thread sync
+// except for the per-token q/k l2 norms. Requires dk <= 256.
+FORGE_GLOBAL void forge_delta_rule(const float* q, const float* k, const float* v, const float* g, const float* beta, float* S, float* out,
+                                   unsigned s, unsigned hk, unsigned dk, unsigned hv, unsigned dv, unsigned l2, float scale) {
+  __attribute__((shared)) float qn[256]; __attribute__((shared)) float kn[256]; __attribute__((shared)) float red[2 * 128];
+  unsigned h = bid_(), t0 = tid_(), kh = h / (hv / hk);
+  float* Sh = S + (unsigned long long)h * dk * dv;
+  for (unsigned t = 0; t < s; ++t) {
+    const float* qt = q + ((unsigned long long)t * hk + kh) * dk; const float* kt = k + ((unsigned long long)t * hk + kh) * dk;
+    float qs = 0.0f, ks = 0.0f;
+    for (unsigned i = t0; i < dk; i += 128u) { float a = qt[i], b = kt[i]; qn[i] = a; kn[i] = b; qs += a * a; ks += b * b; }
+    red[t0] = qs; red[128u + t0] = ks; bar_();
+    for (unsigned st = 64u; st > 0u; st >>= 1) { if (t0 < st) { red[t0] += red[t0 + st]; red[128u + t0] += red[128u + t0 + st]; } bar_(); }
+    float qf = l2 ? scale / fsqrt(red[0] + 1e-6f) : scale, kf = l2 ? 1.0f / fsqrt(red[128] + 1e-6f) : 1.0f;
+    float decay = fexp(g[t * hv + h]), bt = beta[t * hv + h];
+    const float* vt = v + ((unsigned long long)t * hv + h) * dv; float* o = out + ((unsigned long long)t * hv + h) * dv;
+    for (unsigned j = t0; j < dv; j += 128u) {
+      float kv = 0.0f;
+      for (unsigned i = 0; i < dk; ++i) { float r = Sh[i * dv + j] * decay; Sh[i * dv + j] = r; kv = fma_(r, kn[i] * kf, kv); }
+      float d = (vt[j] - kv) * bt, acc = 0.0f;
+      for (unsigned i = 0; i < dk; ++i) { float r = fma_(kn[i] * kf, d, Sh[i * dv + j]); Sh[i * dv + j] = r; acc = fma_(r, qn[i] * qf, acc); }
+      o[j] = acc; }
+    bar_(); } }
+// causal_conv: one thread per channel; state [K-1, C] is the previous K-1 inputs. Requires K <= 9.
+FORGE_GLOBAL void forge_causal_conv(const float* x, const float* w, float* st, float* out, unsigned s, unsigned C, unsigned K) {
+  unsigned c = bid_() * 128u + tid_(); if (c >= C) return;
+  unsigned P = K - 1u;
+  for (unsigned t = 0; t < s; ++t) { float acc = 0.0f;
+    for (unsigned j = 0; j < K; ++j) { unsigned p = t + j; float xv = p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]; acc = fma_(w[c * K + j], xv, acc); }
+    out[(unsigned long long)t * C + c] = acc; }
+  float nw[8];
+  for (unsigned i = 0; i < P; ++i) { unsigned p = s + i; nw[i] = p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]; }
+  for (unsigned i = 0; i < P; ++i) st[i * C + c] = nw[i]; }
 """
 
 CU_MATH = r"""// sin/cos in double after reduction by pi/2 (no libdevice/ocml needed); |x| up to ~1e9 is exact enough.

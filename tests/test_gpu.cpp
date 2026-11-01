@@ -74,6 +74,47 @@ template<class RT> static int qmatmul_check(flow::registry& reg, const std::stri
     return fails;
 }
 
+// Gated DeltaNet state ops on the device (run_state) vs the CPU executor: 3-token prefill, then token by token,
+// then reset() and again (the resident state must restart from zeros).
+static int state_ops_check(flow::registry& reg, const std::string& api) {
+    if (!reg.hooks || !reg.hooks->state) { std::printf("note %s: no device state ops\n", api.c_str()); return 0; }
+    using namespace flow;
+    const i64 S = 7, Hk = 2, Hv = 4, dk = 40, dv = 136, C = 150, K = 4;   // dv > 128 and C > 128: multi-column threads / blocks
+    auto rnd = [](std::size_t n, float ph) { std::vector<float> v(n); for (std::size_t i = 0; i < n; ++i) v[i] = std::sin(float(i) * 0.37f + ph); return v; };
+    auto q = rnd(S * Hk * dk, 1), k = rnd(S * Hk * dk, 2), v = rnd(S * Hv * dv, 3), gl = rnd(S * Hv, 4), bl = rnd(S * Hv, 5), xc = rnd(S * C, 6), wc = rnd(C * K, 7);
+    for (auto& x : gl) x = -std::fabs(x) * 0.5f;
+    for (auto& x : bl) x = 1.f / (1.f + std::exp(-x));
+    auto build = [&](i64 s) {
+        graph g;
+        auto iq = g.input("q", {s, Hk, dk}), ik = g.input("k", {s, Hk, dk}), iv = g.input("v", {s, Hv, dv});
+        auto ig = g.input("g", {s, Hv}), ib = g.input("b", {s, Hv}), ix = g.input("x", {s, C});
+        auto w = g.constant(tensor({C, K}, 0.f)); g.at(w).constant->data = wc;
+        g.output("o", g.state_op("ssm", "delta_rule", {iq, ik, iv, ig, ib}));
+        g.output("c", g.state_op("conv", "causal_conv", {ix, w}));
+        return g;
+    };
+    auto run = [&](registry* r) {
+        std::vector<float> out;
+        state_store st; pass_options po; po.lowerings = r;
+        auto p3 = compile(build(3), &st, po), p1 = compile(build(1), &st, po);
+        executor e3(*p3, &st), e1(*p1, &st);
+        auto feed = [&](executor& e, i64 t0, i64 s) {
+            auto sl = [&](const std::vector<float>& a, i64 row) { return std::span<const float>(a.data() + t0 * row, std::size_t(s * row)); };
+            e.set_input("q", sl(q, Hk * dk)); e.set_input("k", sl(k, Hk * dk)); e.set_input("v", sl(v, Hv * dv));
+            e.set_input("g", sl(gl, Hv)); e.set_input("b", sl(bl, Hv)); e.set_input("x", sl(xc, C)); e.run();
+            for (auto nm : {"o", "c"}) { auto t = e.output(nm); out.insert(out.end(), t.data.begin(), t.data.end()); }
+        };
+        for (int pass = 0; pass < 2; ++pass) { feed(e3, 0, 3); for (i64 t = 3; t < S; ++t) feed(e1, t, 1); st.reset(); }
+        return out;
+    };
+    auto dev = run(&reg), cpu = run(nullptr);
+    double worst = dev.size() == cpu.size() ? 0 : 1e9;
+    for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) worst = std::max(worst, std::fabs(double(dev[i]) - cpu[i]) / (1.0 + std::fabs(double(cpu[i]))));
+    bool ok = worst < 1e-4;
+    std::printf("%s %s delta_rule/causal_conv on the device match the CPU (worst rel %.3g)\n", ok ? "ok  " : "FAIL", api.c_str(), worst);
+    return ok ? 0 : 1;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
@@ -89,6 +130,7 @@ template<class RT, class Open> static int device_t(Open open) {
     }
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     fails += qmatmul_check<RT>(*reg, api);
+    fails += state_ops_check(*reg, api);
     return fails ? 1 : 0;
 }
 

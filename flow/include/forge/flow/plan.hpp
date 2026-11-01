@@ -381,8 +381,13 @@ private:
                 std::vector<shape_t> shs; for (auto& v : ins) shs.push_back(v.shape);
                 auto ss = state_ops::state_shape(fn, shs);
                 auto& sl = st_->slots[node.name];
-                if (sl.len == 0 || sl.buf.shape != ss) { sl.buf = tensor(ss); sl.len = 0; sl.fixed = true; }   // fresh: zeros
-                if (h) { for (auto& v : ins) h->to_host(v.data, v.size()); h->to_host(out.data, out.size()); }
+                if (sl.len == 0 || sl.buf.shape != ss) {   // fresh: zeros (in place when the shape is unchanged, so a device copy stays keyed)
+                    if (sl.buf.shape == ss && !sl.buf.data.empty()) { std::fill(sl.buf.data.begin(), sl.buf.data.end(), 0.f); if (h) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
+                    else { if (h && !sl.buf.data.empty()) h->release(sl.buf.data.data(), sl.buf.data.size()); sl.buf = tensor(ss); }
+                    sl.len = 0; sl.fixed = true;
+                }
+                if (h && h->state && h->state(fn, ins, sl.buf.data.data(), sl.buf.data.size(), out, *s.attrs)) { sl.len += ins[0].shape[0]; continue; }
+                if (h) { for (auto& v : ins) h->to_host(v.data, v.size()); h->to_host(out.data, out.size()); h->to_host(sl.buf.data.data(), sl.buf.data.size()); }
                 if (fn == "causal_conv")
                     state_ops::causal_conv(ins[0].data, ins[1].data, sl.buf.data.data(), out.data, ins[0].shape[0], ins[0].shape[1], ins[1].shape[1]);
                 else if (fn == "delta_rule") {
@@ -392,7 +397,7 @@ private:
                                           s.attrs->num("l2norm", 1) != 0, float(s.attrs->num("scale", 1.0 / std::sqrt(double(dk)))));
                 } else raise(errc::not_found, "unknown state op '{}'", fn);
                 sl.len += ins[0].shape[0];
-                if (h) h->host_wrote(out.data, out.size());
+                if (h) { h->host_wrote(out.data, out.size()); h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
                 continue;
             }
             if (s.kind == 1) {
