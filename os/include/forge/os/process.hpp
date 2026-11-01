@@ -146,7 +146,7 @@ inline void memory_watchdog(pid_t pgid, std::uint64_t cap) {
     if (m < 0) return;
     if (m == 0) {
         if (::fork() != 0) ::_exit(0);
-        const int top = ::getdtablesize();
+        struct rlimit nf{}; const int top = ::getrlimit(RLIMIT_NOFILE, &nf) == 0 && nf.rlim_cur != RLIM_INFINITY && nf.rlim_cur < 65536 ? int(nf.rlim_cur) : 1024;
         for (int fd = 0; fd < top; ++fd) ::close(fd);
         const std::uint64_t pg = std::uint64_t(::sysconf(_SC_PAGESIZE));
         for (;;) {
