@@ -120,7 +120,7 @@ static int mock_qmm(const float* a, const unsigned char* w, float* y, unsigned r
 static int nargs_of(const char* op) {
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
     if (!strcmp(op, "delta_rule")) return 14; if (!strcmp(op, "causal_conv")) return 7;
-    if (!strcmp(op, "attention")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
+    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
     return 0; }
@@ -155,7 +155,7 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         for (i = 0; i < n && i < threads; ++i) { unsigned r = (unsigned)idx[i / cols]; y[i] = r < rows ? t[r * cols + i % cols] : 0; } return 0; }
     if (!strcmp(op, "slice")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned), lin = ARG(3, unsigned), inner = ARG(4, unsigned), st = ARG(5, unsigned), len = ARG(6, unsigned);
         for (i = 0; i < n && i < threads; ++i) { unsigned in_ = i % inner, r = (i / inner) % len, o = i / (inner * len); y[i] = x[(o * lin + st + r) * inner + in_]; } return 0; }
-    if (!strcmp(op, "attention")) { float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *y = P(ARG(3, dptr));
+    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) { float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *y = P(ARG(3, dptr));
         unsigned s = ARG(4, unsigned), hq = ARG(5, unsigned), d = ARG(6, unsigned), t = ARG(7, unsigned), hk = ARG(8, unsigned), dv = ARG(9, unsigned), fl = ARG(10, unsigned);
         float sc = ARG(11, float);
         unsigned causal = fl & 1, kc = (fl >> 1) & 3, vc = (fl >> 3) & 3, window = fl >> 5;
