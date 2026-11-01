@@ -63,7 +63,7 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     auto& x = in[0];
     switch (s) {
     case sig::unary: case sig::scale: return in.size() == 1;
-    case sig::binary: return in.size() == 2 && in[1] == x;
+    case sig::binary: return in.size() == 2 && (in[1] == x || numel(in[1]) == numel(x));   // [n] op [1, n]: same elements
     case sig::rows: return !x.empty() && (a.num("axis", -1) == -1 || a.num("axis", -1) == double(x.size()) - 1);
     case sig::rms: return in.size() == 2 && !x.empty() && in[1].size() == 1 && in[1][0] == x.back();
     case sig::matmul: return in.size() == 2 && x.size() >= 2 && in[1].size() == 2 && in[1][1] == x.back();

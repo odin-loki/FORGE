@@ -455,11 +455,15 @@ private:
                 if (ins[0].data != out.data) h->copy(const_cast<float*>(ins[0].data), out.size(), out.data, out.size(), 0);   // stays on the device (aliased: no-op)
                 continue;
             }
+            if (h && h->copy && p_.g.at(s.out).op == spec::op::concat && !ins.empty() && concat_on_device(*h, ins, out, *s.attrs)) continue;
             if (h && !s.low->on_device) {
                 if (std::getenv("FORGE_PLAN_TRACE")) {   // which ops round-trip through the host on a device run
                     static std::map<std::string, std::size_t> c; static bool reg = false;
                     if (!reg) { reg = true; std::atexit([] { for (auto& [k, n] : c) std::fprintf(stderr, "host-op %s %zu\n", k.c_str(), n); }); }
-                    ++c[std::string(spec::info(p_.g.at(s.out).op).name) + " " + std::to_string(out.size())];
+                    std::string key(spec::info(p_.g.at(s.out).op).name);
+                    for (auto& v : ins) { key += " ["; for (auto d : v.shape) key += std::to_string(d) + ","; key += "]"; }
+                    for (auto& [ak, av] : s.attrs->v) if (auto* d = std::get_if<double>(&av)) key += " " + ak + "=" + std::to_string(int(*d));
+                    ++c[key];
                 }
                 for (auto& v : ins) if (v.data) h->to_host(v.data, v.size());   // encoded weights (qdata) live on the host only
                 h->to_host(out.data, out.size());
@@ -472,6 +476,21 @@ private:
                     h->release(sl.buf.data.data(), sl.buf.data.size());
                 }
         }
+    }
+    // concat as strided device-to-device copies (one per outer index and input); false = leave it to the host kernel
+    static bool concat_on_device(device_hooks& h, const std::vector<tensor_view>& ins, tensor_view out, const spec::attrs& a) {
+        auto r = i64(out.shape.size()); if (!r) return false;
+        i64 ax = i64(a.num("axis", 0)); if (ax < 0) ax += r; if (ax < 0 || ax >= r) return false;
+        i64 outer = 1, inner = 1; for (i64 i = 0; i < ax; ++i) outer *= out.shape[i]; for (i64 i = ax + 1; i < r; ++i) inner *= out.shape[i];
+        i64 total = 0;
+        for (auto& v : ins) { if (i64(v.shape.size()) != r || !v.data) return false; total += v.shape[ax] * inner;
+            if (v.data < out.data + out.size() && out.data < v.data + v.size()) return false; }
+        if (total * outer != i64(out.size()) || outer * i64(ins.size()) > 4096) return false;
+        for (i64 o = 0; o < outer; ++o) { i64 off = 0;
+            for (auto& v : ins) { i64 len = v.shape[ax] * inner;
+                if (len) h.copy(const_cast<float*>(v.data) + o * len, std::size_t(len), out.data, out.size(), std::size_t(o * total + off));
+                off += len; } }
+        return true;
     }
 public:
     tensor output(const std::string& name) const {
