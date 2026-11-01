@@ -148,6 +148,7 @@ public:
     ~runtime() {
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear();
             for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); } catch (...) {}
+        for (auto e : segx_) if (e && f_.gexec_destroy) f_.gexec_destroy(e);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
@@ -168,7 +169,7 @@ public:
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
 
     // ---- residency protocol (see flow::device_hooks) ----
-    void begin_run() { std::lock_guard lk(mu_); in_run_ = true; }
+    void begin_run() { std::lock_guard lk(mu_); in_run_ = true; seg_ = 0; }
     void end_run() {
         std::lock_guard lk(mu_); bind();
         for (auto it = res_.begin(); it != res_.end();) {
@@ -204,7 +205,7 @@ public:
         each_overlap(p, n, [&](entry& e) {
             auto el = reinterpret_cast<std::uintptr_t>(e.host), eh = el + e.count * 4;
             auto a = std::max(lo, el), b = std::min(hi, eh);
-            ck(f_.htod_async(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
+            ck(htod_s(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
         });
         sync();
     }
@@ -232,7 +233,7 @@ public:
         ad = acquire(in[0].data, in[0].size(), false).ptr;
         auto y = acquire(out.data, out.size(), true); y.e->host_valid = false; std::uint64_t yd = y.ptr;
         void* args[] = {&ad, &bd, &yd, &n, &ma, &mb, &o};
-        if (n) ck(f_.launch(function("forge_bcast"), (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        if (n) ck(launch_s(function("forge_bcast"), (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         return true;
     }
     // dst_base[off + r * ds + c] = src[r * w + c] on the device (concat)
@@ -247,7 +248,7 @@ public:
         d.e->host_valid = false;
         std::uint64_t sp = s.ptr, dp = d.ptr + off * 4; std::uint32_t r = std::uint32_t(rows), ww = std::uint32_t(w), dss = std::uint32_t(ds);
         void* args[] = {&sp, &dp, &r, &ww, &dss};
-        ck(f_.launch(function("forge_copy2d"), unsigned((rows * w + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        ck(launch_s(function("forge_copy2d"), unsigned((rows * w + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         return true;
     }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
@@ -261,8 +262,8 @@ public:
     }
 
     // ---- graphs: capture the stream's work between capture_begin/capture_end and replay it ----
-    void capture_begin() { std::lock_guard lk(mu_); need_graphs(); bind(); ck(f_.capture_begin(stream_, 2 /* RELAXED: run_op may allocate an output buffer while capturing */), "stream begin capture"); }
-    std::size_t capture_end() {
+    void capture_begin() { std::lock_guard lk(mu_); need_graphs(); bind(); flush(); user_cap_ = true; ck(f_.capture_begin(stream_, 2 /* RELAXED: run_op may allocate an output buffer while capturing */), "stream begin capture"); }
+    std::size_t capture_end() { user_cap_ = false;
         std::lock_guard lk(mu_); need_graphs(); bind();
         void* g = nullptr; ck(f_.capture_end(stream_, &g), "stream end capture");
         void* e = nullptr; ck(f_.graph_inst(&e, g, 0), "graph instantiate");
@@ -278,13 +279,13 @@ public:
             return;
         }
         std::vector<char> tmp(bytes);
-        { std::lock_guard lk(mu_); bind(); ck(f_.dtoh_async(tmp.data(), src_ptr, bytes, stream_), "memcpy DtoH"); sync(); }
-        std::lock_guard lk(dst.mu_); dst.bind(); dst.ck(dst.f_.htod_async(dst_ptr, tmp.data(), bytes, dst.stream_), "memcpy HtoD"); dst.sync();
+        { std::lock_guard lk(mu_); bind(); ck(dtoh_s(tmp.data(), src_ptr, bytes, stream_), "memcpy DtoH"); sync(); }
+        std::lock_guard lk(dst.mu_); dst.bind(); dst.ck(dst.htod_s(dst_ptr, tmp.data(), bytes, dst.stream_), "memcpy HtoD"); dst.sync();
     }
     std::uint64_t device_alloc(std::size_t bytes) { std::lock_guard lk(mu_); bind(); std::uint64_t p = 0; ck(f_.malloc_(&p, std::max<std::size_t>(4, bytes)), "malloc"); return p; }
     void device_free(std::uint64_t p) { std::lock_guard lk(mu_); bind(); f_.free_(p); }
-    void upload(std::uint64_t d, const void* h, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(f_.htod_async(d, h, bytes, stream_), "memcpy HtoD"); sync(); }
-    void download(void* h, std::uint64_t d, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(f_.dtoh_async(h, d, bytes, stream_), "memcpy DtoH"); sync(); }
+    void upload(std::uint64_t d, const void* h, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(htod_s(d, h, bytes, stream_), "memcpy HtoD"); sync(); }
+    void download(void* h, std::uint64_t d, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(dtoh_s(h, d, bytes, stream_), "memcpy DtoH"); sync(); }
 
     // Quantised matmul_t (forge_qmatmul_t): y[rows, cols] = x[rows, k] . W[cols, k]^T with W in its encoded rows
     // (fmt 1 q8_0, 2 q4_k, 3 q6_k, 4 q5_k; rb bytes per row). The encoded weight is uploaded once and stays on the
@@ -315,7 +316,7 @@ public:
         auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
         if (!qd) {
             std::uint64_t dp = 0; ck(f_.malloc_(&dp, std::max<std::size_t>(4, qbytes)), "malloc");
-            qd = dp; ck(f_.htod_async(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+            qd = dp; ck(htod_s(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
         }
         std::vector<std::uint64_t> temps;
         auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
@@ -327,13 +328,13 @@ public:
                 auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
             } else {
                 ck(f_.malloc_(&xd, std::max<std::size_t>(4, idx.size() * 4)), "malloc"); temps.push_back(xd);
-                ck(f_.htod_async(xd, idx.data, idx.size() * 4, stream_), "memcpy HtoD");
+                ck(htod_s(xd, idx.data, idx.size() * 4, stream_), "memcpy HtoD");
                 ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
             }
             std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
             void* args[] = {&xd, &wd, &yd, &n, &d, &fmt, &rb32, &nrows};
-            if (n) ck(f_.launch(function("forge_qgather"), n, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
-            if (!in_run_) { ck(f_.dtoh_async(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+            if (n) ck(launch_s(function("forge_qgather"), n, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (!in_run_) { ck(dtoh_s(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
@@ -351,7 +352,7 @@ public:
         auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
         if (!qd) {
             std::uint64_t d = 0; ck(f_.malloc_(&d, std::max<std::size_t>(4, qbytes)), "malloc");
-            qd = d; ck(f_.htod_async(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+            qd = d; ck(htod_s(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
         }
         std::vector<std::uint64_t> temps;
         auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
@@ -362,7 +363,7 @@ public:
                 auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
             } else {
                 ck(f_.malloc_(&xd, std::max<std::size_t>(4, x.size() * 4)), "malloc"); temps.push_back(xd);
-                ck(f_.htod_async(xd, x.data, x.size() * 4, stream_), "memcpy HtoD");
+                ck(htod_s(xd, x.data, x.size() * 4, stream_), "memcpy HtoD");
                 ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
             }
             std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
@@ -370,22 +371,22 @@ public:
             if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
                 ++dispatches_["qmatmul_mmq"];
                 unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
-                if (grid) ck(f_.launch(function("forge_qmatmul_mmq"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+                if (grid) ck(launch_s(function("forge_qmatmul_mmq"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
             } else if ((fmt == 2 || fmt == 3) && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
                 ++dispatches_["qmatmul_q81"];   // decode: q8_1 activations + dp4a (llama.cpp mmvq)
                 std::uint32_t nb = rows * (k / 32); std::size_t need = std::size_t(nb) * 40;
-                if (q81_cap_ < need) { if (q81_) f_.free_(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
+                if (q81_cap_ < need) { if (q81_) free_s(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
                 std::uint64_t qx = q81_;
                 void* qa[] = {&xd, &qx, &nb};
-                ck(f_.launch(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                 void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
                 unsigned grid = cols * ((rows + 3) / 4);
-                if (grid) ck(f_.launch(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
+                if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
             } else {
                 unsigned grid = cols * ((rows + 3) / 4);
-                if (grid) ck(f_.launch(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
+                if (grid) ck(launch_s(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
             }
-            if (!in_run_) { ck(f_.dtoh_async(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+            if (!in_run_) { ck(dtoh_s(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
@@ -427,7 +428,7 @@ public:
         if (fn == "delta_rule") { for (int i = 0; i < 6; ++i) args.push_back(&u[i]); args.push_back(&sc); }
         else for (int i = 0; i < 3; ++i) args.push_back(&u[i]);
         ++dispatches_[fn];
-        if (grid) ck(f_.launch(function("forge_" + fn), grid, 1, 1, 128, 1, 1, 0, stream_, args.data(), nullptr), "launch");
+        if (grid) ck(launch_s(function("forge_" + fn), grid, 1, 1, 128, 1, 1, 0, stream_, args.data(), nullptr), "launch");
         return true;
     }
 
@@ -477,7 +478,7 @@ public:
             auto buf = [&](const float* h, std::size_t cnt, bool is_out) {
                 if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, is_out); if (is_out) b.e->host_valid = false; return b.ptr; }
                 std::uint64_t d = 0; ck(f_.malloc_(&d, std::max<std::size_t>(4, cnt * 4)), "malloc"); temps.push_back(d);
-                if (!is_out) ck(f_.htod_async(d, h, cnt * 4, stream_), "memcpy HtoD");
+                if (!is_out) ck(htod_s(d, h, cnt * 4, stream_), "memcpy HtoD");
                 return d;
             };
             for (std::size_t i = 0; i < in.size(); ++i) {
@@ -485,7 +486,7 @@ public:
                 if (s == sig::rope && i == 1) {   // the inverse-frequency table goes after pos
                     auto& d = rope_[extra];   // the table depends only on (base, dim): upload once
                     if (!d) { ck(f_.malloc_(&d, std::max<std::size_t>(4, extra.size() * 4)), "malloc");
-                              ck(f_.htod_async(d, extra.data(), extra.size() * 4, stream_), "memcpy HtoD"); }
+                              ck(htod_s(d, extra.data(), extra.size() * 4, stream_), "memcpy HtoD"); }
                     ptrs.push_back(d);
                 }
             }
@@ -508,8 +509,8 @@ public:
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
                 fn = function("forge_attention_fa"); block = 128; grid = rows * cols; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
-            if (grid) ck(f_.launch(fn, grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
-            if (!in_run_) { ck(f_.dtoh_async(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+            if (grid) ck(launch_s(fn, grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
+            if (!in_run_) { ck(dtoh_s(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
@@ -548,6 +549,7 @@ private:
         int (*graph_launch)(void*, void*) = nullptr;
         int (*gexec_destroy)(void*) = nullptr;
         int (*graph_destroy)(void*) = nullptr;
+        int (*exec_update)(void*, void*, void*) = nullptr;   // cuGraphExecUpdate_v2 (CUDA only)
         int (*peer)(std::uint64_t, std::uintptr_t, std::uint64_t, std::uintptr_t, std::size_t) = nullptr;
         int (*mem_info)(std::size_t*, std::size_t*) = nullptr;
         // wrappers that fall back to the synchronous copies when the async ones are missing
@@ -566,9 +568,36 @@ private:
     void ck(int r, const char* what) {
         if (r != 0) throw std::runtime_error(std::string(api_name(api_)) + ": " + what + " failed (" + std::to_string(r) + ")");
     }
+    // ---- decode graphs (FORGE_GRAPHS=1, CUDA): inside a run, kernel launches are stream-captured; a host copy, a
+    // free or a sync ends the segment, which is replayed through an exec graph cached per segment index and refreshed
+    // with cuGraphExecUpdate (same topology every token, only pointers/scalars change), as llama.cpp's ggml-cuda does.
+    bool gmode() const {
+        static const bool on = [] { auto* e = std::getenv("FORGE_GRAPHS"); return e && std::string(e) == "1"; }();
+        return on && api_ == api::cuda && stream_ && has_graphs();
+    }
+    bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0; std::vector<void*> segx_;
+    int launch_s(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void* st, void** a, void** ex) {
+        if (in_run_ && !capturing_ && !user_cap_ && gmode()) { ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; }
+        return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
+    }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); return f_.htod_async(d, h, n, st); }
+    int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); return f_.dtoh_async(h, d, n, st); }
+    int free_s(std::uint64_t p) { flush(); return f_.free_(p); }
+    void flush() {
+        if (!capturing_) return;
+        capturing_ = false;
+        void* g = nullptr; ck(f_.capture_end(stream_, &g), "stream end capture");
+        if (seg_ >= segx_.size()) segx_.resize(seg_ + 1, nullptr);
+        void*& e = segx_[seg_++];
+        alignas(8) char info[64] = {};
+        if (e && !(f_.exec_update && f_.exec_update(e, g, info) == 0)) { if (f_.gexec_destroy) f_.gexec_destroy(e); e = nullptr; }
+        if (!e) ck(f_.graph_inst(&e, g, 0), "graph instantiate");
+        ck(f_.graph_launch(e, stream_), "graph launch");
+        if (f_.graph_destroy) f_.graph_destroy(g);
+    }
     void need_graphs() { if (!has_graphs()) throw std::runtime_error(std::string(api_name(api_)) + ": driver has no graph API"); }
     void bind() { if (api_ == api::cuda) { if (f_.ctx_set && ctx_) f_.ctx_set(ctx_); } else if (f_.set_device) f_.set_device(ordinal_); }
-    void sync() { if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
+    void sync() { flush(); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
         void* f = nullptr; ck(f_.get_fn(&f, mod_, n.c_str()), ("get function " + n).c_str());
@@ -578,18 +607,18 @@ private:
         auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + std::max<std::size_t>(n, 1) * 4;
         for (auto& [k, e] : res_) { auto el = k, eh = k + e.count * 4; if (el < hi && lo < eh) f(e); }
     }
-    void download(entry& e) { ck(f_.dtoh_async(e.host, e.d, e.count * 4, stream_), "memcpy DtoH"); e.host_valid = true; ++stats_.downloads; }
+    void download(entry& e) { ck(dtoh_s(e.host, e.d, e.count * 4, stream_), "memcpy DtoH"); e.host_valid = true; ++stats_.downloads; }
     // freed device buffers are pooled by size and reused: decode runs the same shapes every token
     void drop(entry& e) {
         stats_.resident_bytes -= e.count * 4;
-        if (pool_bytes_ + e.count * 4 > pool_cap()) { f_.free_(e.d); return; }
+        if (pool_bytes_ + e.count * 4 > pool_cap()) { free_s(e.d); return; }
         pool_.emplace(std::max<std::size_t>(4, e.count * 4), e.d); pool_bytes_ += std::max<std::size_t>(4, e.count * 4);
     }
     void dev_alloc(std::uint64_t* d, std::size_t bytes) {
         bytes = std::max<std::size_t>(4, bytes);
         if (auto it = pool_.find(bytes); it != pool_.end()) { *d = it->second; pool_.erase(it); pool_bytes_ -= bytes; return; }
         if (f_.malloc_(d, bytes) != 0) {   // out of memory: give the pool back and retry
-            for (auto& [k, p] : pool_) f_.free_(p); pool_.clear(); pool_bytes_ = 0;
+            for (auto& [k, p] : pool_) free_s(p); pool_.clear(); pool_bytes_ = 0;
             ck(f_.malloc_(d, bytes), "malloc");
         }
     }
@@ -605,27 +634,43 @@ private:
             auto& c = std::prev(it)->second; auto cl = std::prev(it)->first;
             if (cl + c.count * 4 >= key + count * 4 && count) return {&c, c.d + (key - cl)};
         }
-        // Resident entries that overlap [h, h+count): ones wholly inside the new range move device-to-device into the
-        // new buffer (no download, no sync: decode re-views the same host arenas with new extents every token);
-        // ones sticking out are fetched to the host first, as before.
-        std::vector<std::uintptr_t> ks, inner; bool dl = false;
+        // Resident entries overlapping [h, h+count) (decode re-views the same host arenas with new extents every
+        // token): the overlapping part moves device-to-device into the new buffer and any part sticking out stays
+        // resident as its own entry, so nothing goes through the host and the stream never syncs. Pinned/kept
+        // entries that stick out are fetched to the host as before.
+        std::vector<std::uintptr_t> olds, fetched; bool dl = false;
         const auto lo = key, hi = key + std::max<std::size_t>(count, 1) * 4;
-        each_overlap(h, count, [&](entry& e) {
-            auto el = reinterpret_cast<std::uintptr_t>(e.host), eh = el + e.count * 4;
-            if (el >= lo && eh <= hi && count) { inner.push_back(el); return; }
-            if (!e.host_valid) { download(e); dl = true; } ks.push_back(el); });
+        each_overlap(h, count, [&](entry& o) {
+            auto ol = reinterpret_cast<std::uintptr_t>(o.host), oh = ol + o.count * 4;
+            if ((o.pinned || o.kept) && !(ol >= lo && oh <= hi)) { if (!o.host_valid) { download(o); dl = true; } fetched.push_back(ol); }
+            else olds.push_back(ol); });
         if (dl) sync();
-        for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        for (auto k : fetched) { drop(res_[k]); res_.erase(k); }
         entry e{h, count, 0};
         dev_alloc(&e.d, count * 4);
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
-        if (!is_out) { ck(f_.htod_async(e.d, h, count * 4, stream_), "memcpy HtoD"); ++stats_.uploads; }
-        for (auto k : inner) {
-            auto& o = res_[k];
-            if (!o.host_valid) { ck(f_.dtod_async(e.d + (k - key), o.d, o.count * 4, stream_), "memcpy DtoD"); e.host_valid = false; }
-            if (o.kept) e.kept = true;
-            drop(o); res_.erase(k);
+        std::sort(olds.begin(), olds.end());
+        if (!is_out) {   // upload only the gaps the resident pieces do not cover
+            std::uintptr_t at = lo;
+            auto up = [&](std::uintptr_t x, std::uintptr_t y) { if (y > x) { ck(htod_s(e.d + (x - lo), reinterpret_cast<const void*>(x), y - x, stream_), "memcpy HtoD"); ++stats_.uploads; } };
+            for (auto k : olds) { up(at, std::max(k, lo)); at = std::max(at, std::min(hi, k + res_[k].count * 4)); }
+            up(at, lo + count * 4);
         }
+        std::vector<entry> rest;
+        for (auto k : olds) {
+            entry o = res_[k]; res_.erase(k);
+            auto ol = k, oh = k + o.count * 4, a = std::max(ol, lo), z = std::min(oh, hi);
+            if (!is_out && z > a) ck(f_.dtod_async(e.d + (a - lo), o.d + (a - ol), z - a, stream_), "memcpy DtoD");
+            if (!o.host_valid) e.host_valid = false;
+            if (o.kept) e.kept = true;
+            if (!o.host_valid) for (auto [x, y] : {std::pair{ol, std::min(oh, lo)}, std::pair{std::max(ol, hi), oh}}) if (y > x) {
+                entry r{reinterpret_cast<float*>(x), (y - x) / 4, 0}; r.host_valid = false;
+                dev_alloc(&r.d, y - x); ck(f_.dtod_async(r.d, o.d + (x - ol), y - x, stream_), "memcpy DtoD");
+                stats_.resident_bytes += y - x; rest.push_back(r);
+            }
+            drop(o);
+        }
+        for (auto& r : rest) res_.emplace(reinterpret_cast<std::uintptr_t>(r.host), r);
         stats_.resident_bytes += count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
         auto& r = res_.emplace(key, e).first->second; return {&r, r.d};
     }
@@ -645,7 +690,7 @@ private:
             opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
             opt(f_.stream_create, "cuStreamCreate"); opt(f_.stream_destroy, "cuStreamDestroy_v2"); opt(f_.stream_sync, "cuStreamSynchronize");
             opt(f_.capture_begin, "cuStreamBeginCapture_v2"); opt(f_.capture_end, "cuStreamEndCapture");
-            opt(f_.graph_inst, "cuGraphInstantiateWithFlags"); opt(f_.graph_launch, "cuGraphLaunch");
+            opt(f_.graph_inst, "cuGraphInstantiateWithFlags"); opt(f_.exec_update, "cuGraphExecUpdate_v2"); opt(f_.graph_launch, "cuGraphLaunch");
             opt(f_.gexec_destroy, "cuGraphExecDestroy"); opt(f_.graph_destroy, "cuGraphDestroy");
             opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2");
         } else {
