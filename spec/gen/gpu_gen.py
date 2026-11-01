@@ -376,6 +376,52 @@ FORGE_GLOBAL void forge_causal_conv(const float* x, const float* w, float* st, f
   float nw[8];
   for (unsigned i = 0; i < P; ++i) { unsigned p = s + i; nw[i] = p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]; }
   for (unsigned i = 0; i < P; ++i) st[i * C + c] = nw[i]; }
+// attention_fa: same contract as forge_attention, one 128-thread block per (query row, head). Keys are taken in
+// tiles of 128 (one score per thread), with an online softmax kept in shared memory; each thread then owns output
+// columns e = tid, tid+128 and accumulates the tile's V rows (coalesced). Head dims up to 256.
+FORGE_GLOBAL void forge_attention_fa(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq, unsigned d,
+                                     unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
+  __attribute__((shared)) float qs[256]; __attribute__((shared)) float ws[128]; __attribute__((shared)) float red[128];
+  __attribute__((shared)) float ys[256]; __attribute__((shared)) float mrun[2];
+  unsigned id = bid_(), tx = tid_(); if (id >= s * hq) return;
+  unsigned i = id / hq, h = id % hq, kh = h / (hq / hk);
+  unsigned causal = flags & 1u, kc = (flags >> 1) & 7u, vc = (flags >> 4) & 7u, window = flags >> 7;
+  unsigned kw = kvwords(kc, d), vw = kvwords(vc, dv);
+  int pos = (int)t - (int)s + (int)i; const float* qp = q + (unsigned long long)id * d; float* yp = y + (unsigned long long)id * dv;
+  unsigned dk = kc >= 3u ? tbqdim(d) : d, dvp = vc >= 3u ? tbqdim(dv) : dv;
+  for (unsigned e = tx; e < dk; e += 128u) qs[e] = e < d ? (kc >= 3u ? qp[e] * tbqsign(e) : qp[e]) : 0.0f;
+  bar_();
+  if (kc >= 3u && tx == 0u) { FORGE_FWHT(qs, dk) }
+  float acc0 = 0.0f, acc1 = 0.0f;
+  if (tx == 0u) { mrun[0] = -__builtin_inff(); mrun[1] = 0.0f; }
+  bar_();
+  unsigned jend = t; if (causal) { int lim = pos + 1; jend = lim < 0 ? 0u : ((unsigned)lim < t ? (unsigned)lim : t); }
+  unsigned jbeg = 0u; if (window && pos - (int)window + 1 > 0) jbeg = (unsigned)(pos - (int)window + 1);
+  for (unsigned j0 = jbeg; j0 < jend; j0 += 128u) {
+    unsigned j = j0 + tx; float sc = -__builtin_inff();
+    if (j < jend) { const float* kp = k + ((unsigned long long)j * hk + kh) * kw; float dot = 0.0f;
+      for (unsigned e = 0; e < dk; ++e) dot = fma_(qs[e], kvat(kp, kc, e), dot); sc = dot * scale; }
+    red[tx] = sc; bar_();
+    for (unsigned st = 64u; st > 0u; st >>= 1) { if (tx < st) red[tx] = red[tx + st] > red[tx] ? red[tx + st] : red[tx]; bar_(); }
+    float mold = mrun[0], mnew = red[0] > mold ? red[0] : mold;
+    float w = j < jend ? fexp(sc - mnew) : 0.0f; ws[tx] = w; bar_();
+    red[tx] = w; bar_();
+    for (unsigned st = 64u; st > 0u; st >>= 1) { if (tx < st) red[tx] += red[tx + st]; bar_(); }
+    float rs = mold == -__builtin_inff() ? 0.0f : fexp(mold - mnew);
+    acc0 *= rs; acc1 *= rs;
+    unsigned nt = jend - j0 < 128u ? jend - j0 : 128u;
+    for (unsigned jj = 0; jj < nt; ++jj) { const float* vp = v + ((unsigned long long)(j0 + jj) * hk + kh) * vw; float wj = ws[jj];
+      if (tx < dvp) acc0 = fma_(wj, kvat(vp, vc, tx), acc0);
+      if (tx + 128u < dvp) acc1 = fma_(wj, kvat(vp, vc, tx + 128u), acc1); }
+    bar_();
+    if (tx == 0u) { mrun[1] = mrun[1] * rs + red[0]; mrun[0] = mnew; }
+    bar_(); }
+  float sum = mrun[1], inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+  if (vc >= 3u) {
+    if (tx < dvp) ys[tx] = acc0; if (tx + 128u < dvp) ys[tx + 128u] = acc1; bar_();
+    if (tx == 0u) { FORGE_FWHT(ys, dvp) } bar_();
+    for (unsigned e = tx; e < dv; e += 128u) yp[e] = ys[e] * tbqsign(e) * inv;
+  } else { if (tx < dv) yp[tx] = acc0 * inv; if (tx + 128u < dv) yp[tx + 128u] = acc1 * inv; } }
 """
 
 CU_MATH = r"""// sin/cos in double after reduction by pi/2 (no libdevice/ocml needed); |x| up to ~1e9 is exact enough.
