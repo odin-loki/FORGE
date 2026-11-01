@@ -367,8 +367,14 @@ public:
             p_.pinned = true;
         }
         h->begin_run();
-        struct guard { device_hooks* h; ~guard() { h->end_run(); } } g{h};
-        run_steps(h);
+        try { run_steps(h); } catch (...) { h->end_run(); throw; }
+        if (!h->end_run_discard) return h->end_run();
+        // only outputs and persistent state outlive the run: fetch those, drop the device intermediates unread
+        try {
+            for (auto& [nm, v] : p_.g.outputs()) if (p_.views[v].data) h->to_host(p_.views[v].data, p_.views[v].size());
+            if (st_) for (auto& [k, sl] : st_->slots) if (!sl.buf.data.empty()) h->to_host(sl.buf.data.data(), sl.buf.data.size());
+        } catch (...) { h->end_run(); throw; }
+        h->end_run_discard();
     }
 private:
     void run_steps(device_hooks* h) {
