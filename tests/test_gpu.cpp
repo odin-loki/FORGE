@@ -50,7 +50,7 @@ static int images() {
 template<class RT> static int qmatmul_check(flow::registry& reg, const std::string& api) {
     if (!reg.device_qgemm) { std::printf("note %s: no device quantised matmul\n", api.c_str()); return 0; }
     int fails = 0, n = 0;
-    for (std::string cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) for (std::size_t rows : {1, 3, 6}) {
+    for (std::string cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) for (std::size_t rows : {1, 3, 6, 16, 70, 130}) {   // >= 16 rows: the tiled MMQ kernel
         const auto* c = flow::codecs::find(cn);
         const std::size_t k = 512, cols = 37, rb = c->bytes(k);
         std::vector<float> wf(cols * k), x(rows * k);
