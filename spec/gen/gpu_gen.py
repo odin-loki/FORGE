@@ -317,6 +317,23 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
   const unsigned char* row = w + (unsigned long long)c * rb;
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   unsigned nr = rows - r0 < 4u ? rows - r0 : 4u;
+  if (fmt == 2u) {   // q4_k: a warp per 256-value super-block, lane = 4 bytes = 8 values (two groups' nibbles)
+    unsigned j = l >> 3, o = (l & 7u) * 4u;
+#pragma unroll 2
+    for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
+      const unsigned char* b = row + sb * 144u;
+      float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned s0, m0, s1, m1;
+      scmin(2u * j, b + 4u, &s0, &m0); scmin(2u * j + 1u, b + 4u, &s1, &m1);
+      float d0 = d * (float)s0, n0 = dm * (float)m0, d1 = d * (float)s1, n1 = dm * (float)m1;
+      unsigned q = *(const unsigned*)(b + 16u + j * 32u + o);
+      float v0[4], v1[4];
+      for (unsigned i = 0; i < 4u; ++i) { v0[i] = d0 * (float)((q >> (8u * i)) & 15u) - n0; v1[i] = d1 * (float)((q >> (8u * i + 4u)) & 15u) - n1; }
+      for (unsigned rr = 0; rr < nr; ++rr) {
+        const float* ap = a + (unsigned long long)(r0 + rr) * k + sb * 256u + 64u * j + o; float sacc = acc[rr];
+        for (unsigned i = 0; i < 4u; ++i) { sacc = fma_(ap[i], v0[i], sacc); sacc = fma_(ap[32u + i], v1[i], sacc); }
+        acc[rr] = sacc; } }
+  } else
+#pragma unroll 4
   for (unsigned g = t >> 5; g < k / 32u; g += 4u) {   // 4 warps, one group each; lane l owns element l
     float v = qelem(fmt, row, g, l);
     for (unsigned rr = 0; rr < nr; ++rr) acc[rr] = fma_(a[(unsigned long long)(r0 + rr) * k + g * 32u + l], v, acc[rr]); }
