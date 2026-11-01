@@ -1,5 +1,7 @@
 #pragma once
 // partition -> memory-plan -> lower -> flat plan -> replay. Plans are cached per shape bucket.
+#include <map>
+#include <cstdio>
 #include <algorithm>
 #include <forge/flow/codecs.hpp>
 #include <forge/flow/kernels.hpp>
@@ -430,7 +432,17 @@ private:
                 out.shape[0] = sl.len;   // symbolic length: downstream kernels read it at run time
                 continue;
             }
+            if (h && p_.g.at(s.out).op == spec::op::reshape && ins.size() == 1 && ins[0].size() == out.size() &&
+                (ins[0].data == out.data || ins[0].data + ins[0].size() <= out.data || out.data + out.size() <= ins[0].data)) {
+                if (ins[0].data != out.data) h->copy(const_cast<float*>(ins[0].data), out.size(), out.data, out.size(), 0);   // stays on the device (aliased: no-op)
+                continue;
+            }
             if (h && !s.low->on_device) {
+                if (std::getenv("FORGE_PLAN_TRACE")) {   // which ops round-trip through the host on a device run
+                    static std::map<std::string, std::size_t> c; static bool reg = false;
+                    if (!reg) { reg = true; std::atexit([] { for (auto& [k, n] : c) std::fprintf(stderr, "host-op %s %zu\n", k.c_str(), n); }); }
+                    ++c[std::string(spec::info(p_.g.at(s.out).op).name) + " " + std::to_string(out.size())];
+                }
                 for (auto& v : ins) if (v.data) h->to_host(v.data, v.size());   // encoded weights (qdata) live on the host only
                 h->to_host(out.data, out.size());
                 s.low->fn(ins, out, *s.attrs);
