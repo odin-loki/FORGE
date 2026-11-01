@@ -605,14 +605,27 @@ private:
             auto& c = std::prev(it)->second; auto cl = std::prev(it)->first;
             if (cl + c.count * 4 >= key + count * 4 && count) return {&c, c.d + (key - cl)};
         }
-        std::vector<std::uintptr_t> ks; bool dl = false;
-        each_overlap(h, count, [&](entry& e) { if (!e.host_valid) { download(e); dl = true; } ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
-        if (dl || !ks.empty()) sync();
+        // Resident entries that overlap [h, h+count): ones wholly inside the new range move device-to-device into the
+        // new buffer (no download, no sync: decode re-views the same host arenas with new extents every token);
+        // ones sticking out are fetched to the host first, as before.
+        std::vector<std::uintptr_t> ks, inner; bool dl = false;
+        const auto lo = key, hi = key + std::max<std::size_t>(count, 1) * 4;
+        each_overlap(h, count, [&](entry& e) {
+            auto el = reinterpret_cast<std::uintptr_t>(e.host), eh = el + e.count * 4;
+            if (el >= lo && eh <= hi && count) { inner.push_back(el); return; }
+            if (!e.host_valid) { download(e); dl = true; } ks.push_back(el); });
+        if (dl) sync();
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
         entry e{h, count, 0};
         dev_alloc(&e.d, count * 4);
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
         if (!is_out) { ck(f_.htod_async(e.d, h, count * 4, stream_), "memcpy HtoD"); ++stats_.uploads; }
+        for (auto k : inner) {
+            auto& o = res_[k];
+            if (!o.host_valid) { ck(f_.dtod_async(e.d + (k - key), o.d, o.count * 4, stream_), "memcpy DtoD"); e.host_valid = false; }
+            if (o.kept) e.kept = true;
+            drop(o); res_.erase(k);
+        }
         stats_.resident_bytes += count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
         auto& r = res_.emplace(key, e).first->second; return {&r, r.d};
     }
