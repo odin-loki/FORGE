@@ -121,7 +121,7 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
     if (!strcmp(op, "delta_rule")) return 14; if (!strcmp(op, "causal_conv")) return 7;
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
-    if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "matmul_t")) return 6;
+    if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
     return 0; }
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args);
@@ -209,7 +209,7 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         for (unsigned r = 0; r < rows && r < threads; ++r) { float m = x[r * cols], s = 0; unsigned j;
             for (j = 1; j < cols; ++j) m = fmaxf(m, x[r * cols + j]); for (j = 0; j < cols; ++j) s += expf(x[r * cols + j] - m);
             for (j = 0; j < cols; ++j) y[r * cols + j] = expf(x[r * cols + j] - m) / s; } return 0; }
-    if (!strcmp(op, "rms_norm")) { float *x = P(ARG(0, dptr)), *w = P(ARG(1, dptr)), *y = P(ARG(2, dptr));
+    if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b")) { float *x = P(ARG(0, dptr)), *w = P(ARG(1, dptr)), *y = P(ARG(2, dptr));
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned); float eps = ARG(5, float);
         for (unsigned r = 0; r < rows && r < threads; ++r) { float s = 0; unsigned j; for (j = 0; j < cols; ++j) s += x[r * cols + j] * x[r * cols + j];
             float inv = 1.0f / sqrtf(s / (float)cols + eps); for (j = 0; j < cols; ++j) y[r * cols + j] = x[r * cols + j] * inv * w[j]; } return 0; }

@@ -412,6 +412,7 @@ public:
             unsigned block = 64, grid = (threads + block - 1) / block;
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
                 fn = function("forge_attention_fa"); block = 128; grid = rows * cols; }
+            if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
             if (grid) ck(f_.launch(fn, grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
             if (!in_run_) { ck(f_.dtoh_async(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
