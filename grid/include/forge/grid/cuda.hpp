@@ -257,6 +257,39 @@ public:
         void* f = nullptr; if (f_.get_fn(&f, mod_, n.c_str()) != 0 || !f) return false;
         fn_[n] = f; return true;
     }
+    // Embedding gather over an encoded table (forge_qgather); the table is uploaded once, like run_qmatmul's weights.
+    bool run_qgather(const tensor_view& idx, const std::uint8_t* q, std::size_t rb, std::uint32_t nrows, std::uint32_t d, std::uint32_t fmt, tensor_view out) {
+        if (!q || fmt < 1 || fmt > 4 || !d || d % 32 || out.size() != idx.size() * d) return false;
+        std::lock_guard lk(mu_); bind();
+        if (!has_fn_locked("forge_qgather")) return false;
+        ++dispatches_["qgather"];
+        std::size_t qbytes = rb * nrows;
+        auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
+        if (!qd) {
+            std::uint64_t dp = 0; ck(f_.malloc_(&dp, std::max<std::size_t>(4, qbytes)), "malloc");
+            qd = dp; ck(f_.htod_async(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        }
+        std::vector<std::uint64_t> temps;
+        auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
+        std::uint32_t n = std::uint32_t(idx.size());
+        try {
+            std::uint64_t xd = 0, yd = 0;
+            if (in_run_) {
+                xd = acquire(idx.data, idx.size(), false).ptr;
+                auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
+            } else {
+                ck(f_.malloc_(&xd, std::max<std::size_t>(4, idx.size() * 4)), "malloc"); temps.push_back(xd);
+                ck(f_.htod_async(xd, idx.data, idx.size() * 4, stream_), "memcpy HtoD");
+                ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
+            }
+            std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
+            void* args[] = {&xd, &wd, &yd, &n, &d, &fmt, &rb32, &nrows};
+            if (n) ck(f_.launch(function("forge_qgather"), n, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (!in_run_) { ck(f_.dtoh_async(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+        } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
+        if (!temps.empty()) { sync(); free_temps(); }
+        return true;
+    }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
         std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;

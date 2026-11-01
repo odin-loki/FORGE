@@ -81,6 +81,7 @@ public:
     // Resident device backends: matmul_t over an encoded weight (tensor_view::qdata) on the device, for these codecs.
     std::optional<lowering> device_qgemm;
     std::vector<std::string> device_qgemm_codecs;
+    std::optional<lowering> device_qgather;   // gather (embedding lookup) over an encoded table on the device
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);

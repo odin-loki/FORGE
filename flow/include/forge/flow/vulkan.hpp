@@ -103,6 +103,18 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                         raise(errc::unsupported, "{}: qmatmul_t rejected a {} weight", rt->backend(), c->name); },
                 1, resident};
             r->device_qgemm_codecs = {"q8_0", "q4_k", "q5_k", "q6_k"};
+            if constexpr (requires(RT& t, const tensor_view& v, tensor_view o) { t.run_qgather(v, nullptr, std::size_t(0), 0u, 0u, 0u, o); }) {
+                auto* ge = std::getenv("FORGE_GPU_QGATHER");
+                if (!(ge && std::string(ge) == "0") && rt->has_function("forge_qgather"))
+                    r->device_qgather = lowering{pre + ".qgather", spec::op::gather, 30, [](auto, auto&, auto&) { return true; },
+                        [rt](std::span<const tensor_view> in, tensor_view out, const spec::attrs&) {
+                            const auto* c = static_cast<const codecs::codec*>(in[0].qcodec);
+                            std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : c->name == "q5_k" ? 4 : 0;
+                            std::size_t d = std::size_t(in[0].shape[1]);
+                            if (!rt->run_qgather(in[1], in[0].qdata, c->bytes(d), std::uint32_t(in[0].shape[0]), std::uint32_t(d), fmt, out))
+                                raise(errc::unsupported, "{}: qgather rejected a {} table", rt->backend(), c->name); },
+                        1, resident};
+            }
         }
     }
     return r;

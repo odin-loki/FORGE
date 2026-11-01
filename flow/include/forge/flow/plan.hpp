@@ -347,7 +347,8 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
             if (n.op == spec::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
                 p->steps.push_back({dev_q(G.at(n.inputs[1]).qcodec) ? &*reg.device_qgemm : &qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
             else if (n.op == spec::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
-                p->steps.push_back({&qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
+                p->steps.push_back({dev_q(G.at(n.inputs[0]).qcodec) && reg.device_qgather && G.at(n.inputs[0]).shape.size() == 2 && G.at(n.inputs[0]).shape[1] % 32 == 0
+                                    ? &*reg.device_qgather : &qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
