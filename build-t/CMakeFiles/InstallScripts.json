@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/workspace/FORGE-q35/build-t/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

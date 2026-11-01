@@ -1,0 +1,12 @@
+95:test_gpu_cuda_mock
+96:test_gpu_opencl_mock
+97:test_gpu_features_opencl_mock
+98:test_gpu_ze_mock
+99:test_gpu_features_ze_mock
+100:test_gpu_hip_mock
+101:test_gpu_features_cuda_mock
+102:test_gpu_features_hip_mock
+103:golden_tiny_llama_cuda_mock
+104:golden_tiny_llama_opencl_mock
+105:golden_tiny_llama_ze_mock
+106:golden_tiny_llama_hip_mock

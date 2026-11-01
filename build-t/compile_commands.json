@@ -1,0 +1,836 @@
+[
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_mobile.dir/os/src/mobile/mobile.cpp.o -c /workspace/FORGE-q35/os/src/mobile/mobile.cpp",
+  "file": "/workspace/FORGE-q35/os/src/mobile/mobile.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_mobile.dir/os/src/mobile/mobile.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_mobile.dir/os/src/mobile/linux.cpp.o -c /workspace/FORGE-q35/os/src/mobile/linux.cpp",
+  "file": "/workspace/FORGE-q35/os/src/mobile/linux.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_mobile.dir/os/src/mobile/linux.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_mobile.dir/os/src/mobile/android.cpp.o -c /workspace/FORGE-q35/os/src/mobile/android.cpp",
+  "file": "/workspace/FORGE-q35/os/src/mobile/android.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_mobile.dir/os/src/mobile/android.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_mobile.dir/os/src/mobile/services.cpp.o -c /workspace/FORGE-q35/os/src/mobile/services.cpp",
+  "file": "/workspace/FORGE-q35/os/src/mobile/services.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_mobile.dir/os/src/mobile/services.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_mobile.dir/os/src/mobile/windows.cpp.o -c /workspace/FORGE-q35/os/src/mobile/windows.cpp",
+  "file": "/workspace/FORGE-q35/os/src/mobile/windows.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_mobile.dir/os/src/mobile/windows.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_mobile.dir/os/src/mobile/freebsd.cpp.o -c /workspace/FORGE-q35/os/src/mobile/freebsd.cpp",
+  "file": "/workspace/FORGE-q35/os/src/mobile/freebsd.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_mobile.dir/os/src/mobile/freebsd.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/bidi.cpp.o -c /workspace/FORGE-q35/os/src/text/bidi.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/bidi.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/bidi.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/case.cpp.o -c /workspace/FORGE-q35/os/src/text/case.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/case.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/case.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/collate.cpp.o -c /workspace/FORGE-q35/os/src/text/collate.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/collate.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/collate.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/console.cpp.o -c /workspace/FORGE-q35/os/src/text/console.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/console.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/console.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/encoding.cpp.o -c /workspace/FORGE-q35/os/src/text/encoding.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/encoding.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/encoding.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/fuzzy.cpp.o -c /workspace/FORGE-q35/os/src/text/fuzzy.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/fuzzy.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/fuzzy.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_calendar.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_calendar.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_calendar.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_calendar.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_core.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_core.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_core.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_core.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_date.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_date.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_date.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_date.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_gettext.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_gettext.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_gettext.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_gettext.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_message.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_message.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_message.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_message.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_number.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_number.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_number.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_number.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_tz.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_tz.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_tz.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_tz.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/locale_units.cpp.o -c /workspace/FORGE-q35/os/src/text/locale_units.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/locale_units.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/locale_units.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/normalize.cpp.o -c /workspace/FORGE-q35/os/src/text/normalize.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/normalize.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/normalize.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/regex.cpp.o -c /workspace/FORGE-q35/os/src/text/regex.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/regex.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/regex.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/segment.cpp.o -c /workspace/FORGE-q35/os/src/text/segment.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/segment.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/segment.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/translit.cpp.o -c /workspace/FORGE-q35/os/src/text/translit.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/translit.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/translit.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/ucd.cpp.o -c /workspace/FORGE-q35/os/src/text/ucd.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/ucd.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/ucd.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/utf.cpp.o -c /workspace/FORGE-q35/os/src/text/utf.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/utf.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/utf.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_text.dir/os/src/text/width.cpp.o -c /workspace/FORGE-q35/os/src/text/width.cpp",
+  "file": "/workspace/FORGE-q35/os/src/text/width.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_text.dir/os/src/text/width.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -I/workspace/FORGE-q35/third_party/monocypher -O3 -DNDEBUG -std=gnu99 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_trust.dir/third_party/monocypher/monocypher.c.o -c /workspace/FORGE-q35/third_party/monocypher/monocypher.c",
+  "file": "/workspace/FORGE-q35/third_party/monocypher/monocypher.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_trust.dir/third_party/monocypher/monocypher.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -I/workspace/FORGE-q35/third_party/monocypher -O3 -DNDEBUG -std=gnu99 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_trust.dir/third_party/monocypher/monocypher-ed25519.c.o -c /workspace/FORGE-q35/third_party/monocypher/monocypher-ed25519.c",
+  "file": "/workspace/FORGE-q35/third_party/monocypher/monocypher-ed25519.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_trust.dir/third_party/monocypher/monocypher-ed25519.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/cmd.cpp.o -c /workspace/FORGE-q35/script/src/shells/cmd.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/cmd.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/cmd.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/csh.cpp.o -c /workspace/FORGE-q35/script/src/shells/csh.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/csh.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/csh.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/elvish.cpp.o -c /workspace/FORGE-q35/script/src/shells/elvish.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/elvish.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/elvish.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/fish.cpp.o -c /workspace/FORGE-q35/script/src/shells/fish.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/fish.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/fish.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/nushell.cpp.o -c /workspace/FORGE-q35/script/src/shells/nushell.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/nushell.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/nushell.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/posix.cpp.o -c /workspace/FORGE-q35/script/src/shells/posix.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/posix.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/posix.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/powershell.cpp.o -c /workspace/FORGE-q35/script/src/shells/powershell.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/powershell.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/powershell.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/rc.cpp.o -c /workspace/FORGE-q35/script/src/shells/rc.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/rc.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/rc.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/shells/xonsh.cpp.o -c /workspace/FORGE-q35/script/src/shells/xonsh.cpp",
+  "file": "/workspace/FORGE-q35/script/src/shells/xonsh.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/shells/xonsh.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/generated/shells_registry.cpp.o -c /workspace/FORGE-q35/build-t/generated/shells_registry.cpp",
+  "file": "/workspace/FORGE-q35/build-t/generated/shells_registry.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/generated/shells_registry.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/heap.cpp.o -c /workspace/FORGE-q35/script/src/heap.cpp",
+  "file": "/workspace/FORGE-q35/script/src/heap.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/heap.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/parser.cpp.o -c /workspace/FORGE-q35/script/src/parser.cpp",
+  "file": "/workspace/FORGE-q35/script/src/parser.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/parser.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/runtime.cpp.o -c /workspace/FORGE-q35/script/src/runtime.cpp",
+  "file": "/workspace/FORGE-q35/script/src/runtime.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/runtime.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/tree.cpp.o -c /workspace/FORGE-q35/script/src/tree.cpp",
+  "file": "/workspace/FORGE-q35/script/src/tree.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/tree.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/vm.cpp.o -c /workspace/FORGE-q35/script/src/vm.cpp",
+  "file": "/workspace/FORGE-q35/script/src/vm.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/vm.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/builtins.cpp.o -c /workspace/FORGE-q35/script/src/builtins.cpp",
+  "file": "/workspace/FORGE-q35/script/src/builtins.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/builtins.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/cppstd.cpp.o -c /workspace/FORGE-q35/script/src/cppstd.cpp",
+  "file": "/workspace/FORGE-q35/script/src/cppstd.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/cppstd.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/automation.cpp.o -c /workspace/FORGE-q35/script/src/automation.cpp",
+  "file": "/workspace/FORGE-q35/script/src/automation.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/automation.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/ai.cpp.o -c /workspace/FORGE-q35/script/src/ai.cpp",
+  "file": "/workspace/FORGE-q35/script/src/ai.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/ai.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/remote.cpp.o -c /workspace/FORGE-q35/script/src/remote.cpp",
+  "file": "/workspace/FORGE-q35/script/src/remote.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/remote.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/mobile.cpp.o -c /workspace/FORGE-q35/script/src/mobile.cpp",
+  "file": "/workspace/FORGE-q35/script/src/mobile.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/mobile.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/text.cpp.o -c /workspace/FORGE-q35/script/src/text.cpp",
+  "file": "/workspace/FORGE-q35/script/src/text.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/text.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/reflect.cpp.o -c /workspace/FORGE-q35/script/src/reflect.cpp",
+  "file": "/workspace/FORGE-q35/script/src/reflect.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/reflect.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/emit.cpp.o -c /workspace/FORGE-q35/script/src/emit.cpp",
+  "file": "/workspace/FORGE-q35/script/src/emit.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/emit.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/debug.cpp.o -c /workspace/FORGE-q35/script/src/debug.cpp",
+  "file": "/workspace/FORGE-q35/script/src/debug.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/debug.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -Wall -Wextra -o CMakeFiles/forge_script.dir/script/src/engine.cpp.o -c /workspace/FORGE-q35/script/src/engine.cpp",
+  "file": "/workspace/FORGE-q35/script/src/engine.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script.dir/script/src/engine.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -Dforge_script_example_plugin_EXPORTS -I/workspace/FORGE-q35/script/include -O3 -DNDEBUG -fPIC -fvisibility=hidden -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_script_example_plugin.dir/examples/script_plugin/hello_plugin.c.o -c /workspace/FORGE-q35/examples/script_plugin/hello_plugin.c",
+  "file": "/workspace/FORGE-q35/examples/script_plugin/hello_plugin.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_script_example_plugin.dir/examples/script_plugin/hello_plugin.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -Dforge_c_EXPORTS -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -fvisibility=default -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_c.dir/mind/capi/forge_c.cpp.o -c /workspace/FORGE-q35/mind/capi/forge_c.cpp",
+  "file": "/workspace/FORGE-q35/mind/capi/forge_c.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_c.dir/mind/capi/forge_c.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_lane_mv.dir/lane/src/kernels_scalar.cpp.o -c /workspace/FORGE-q35/lane/src/kernels_scalar.cpp",
+  "file": "/workspace/FORGE-q35/lane/src/kernels_scalar.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_lane_mv.dir/lane/src/kernels_scalar.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -mavx2 -mfma -mf16c -o CMakeFiles/forge_lane_mv.dir/lane/src/kernels_avx2.cpp.o -c /workspace/FORGE-q35/lane/src/kernels_avx2.cpp",
+  "file": "/workspace/FORGE-q35/lane/src/kernels_avx2.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_lane_mv.dir/lane/src/kernels_avx2.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -o CMakeFiles/forge_lane_mv.dir/lane/src/kernels_avx512.cpp.o -c /workspace/FORGE-q35/lane/src/kernels_avx512.cpp",
+  "file": "/workspace/FORGE-q35/lane/src/kernels_avx512.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_lane_mv.dir/lane/src/kernels_avx512.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_lane_mv.dir/lane/src/dispatch.cpp.o -c /workspace/FORGE-q35/lane/src/dispatch.cpp",
+  "file": "/workspace/FORGE-q35/lane/src/dispatch.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_lane_mv.dir/lane/src/dispatch.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_AMX=1 -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -mamx-tile -mamx-bf16 -mamx-int8 -o CMakeFiles/forge_lane_mv.dir/lane/src/tile_amx.cpp.o -c /workspace/FORGE-q35/lane/src/tile_amx.cpp",
+  "file": "/workspace/FORGE-q35/lane/src/tile_amx.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_lane_mv.dir/lane/src/tile_amx.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_lane_mv.dir/lane/src/tile_sme.cpp.o -c /workspace/FORGE-q35/lane/src/tile_sme.cpp",
+  "file": "/workspace/FORGE-q35/lane/src/tile_sme.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_lane_mv.dir/lane/src/tile_sme.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge_video.dir/support/src/video.cpp.o -c /workspace/FORGE-q35/support/src/video.cpp",
+  "file": "/workspace/FORGE-q35/support/src/video.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge_video.dir/support/src/video.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/script/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge.dir/apps/forge.cpp.o -c /workspace/FORGE-q35/apps/forge.cpp",
+  "file": "/workspace/FORGE-q35/apps/forge.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge.dir/apps/forge.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/forge-serve.dir/apps/forge_serve.cpp.o -c /workspace/FORGE-q35/apps/forge_serve.cpp",
+  "file": "/workspace/FORGE-q35/apps/forge_serve.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/forge-serve.dir/apps/forge_serve.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_aio.dir/tests/test_aio.cpp.o -c /workspace/FORGE-q35/tests/test_aio.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_aio.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_aio.dir/tests/test_aio.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_balance.dir/tests/test_balance.cpp.o -c /workspace/FORGE-q35/tests/test_balance.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_balance.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_balance.dir/tests/test_balance.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_cache.dir/tests/test_cache.cpp.o -c /workspace/FORGE-q35/tests/test_cache.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_cache.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_cache.dir/tests/test_cache.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_dtypes.dir/tests/test_dtypes.cpp.o -c /workspace/FORGE-q35/tests/test_dtypes.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_dtypes.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_dtypes.dir/tests/test_dtypes.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_flow.dir/tests/test_flow.cpp.o -c /workspace/FORGE-q35/tests/test_flow.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_flow.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_flow.dir/tests/test_flow.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_gpu.dir/tests/test_gpu.cpp.o -c /workspace/FORGE-q35/tests/test_gpu.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_gpu.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_gpu.dir/tests/test_gpu.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_grid.dir/tests/test_grid.cpp.o -c /workspace/FORGE-q35/tests/test_grid.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_grid.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_grid.dir/tests/test_grid.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_interop.dir/tests/test_interop.cpp.o -c /workspace/FORGE-q35/tests/test_interop.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_interop.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_interop.dir/tests/test_interop.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_kvquant.dir/tests/test_kvquant.cpp.o -c /workspace/FORGE-q35/tests/test_kvquant.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_kvquant.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_kvquant.dir/tests/test_kvquant.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_lane.dir/tests/test_lane.cpp.o -c /workspace/FORGE-q35/tests/test_lane.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_lane.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_lane.dir/tests/test_lane.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -mavx2 -mfma -mf16c -o CMakeFiles/test_lane_raw.dir/tests/test_lane_raw.cpp.o -c /workspace/FORGE-q35/tests/test_lane_raw.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_lane_raw.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_lane_raw.dir/tests/test_lane_raw.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_locale.dir/tests/test_locale.cpp.o -c /workspace/FORGE-q35/tests/test_locale.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_locale.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_locale.dir/tests/test_locale.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_log.dir/tests/test_log.cpp.o -c /workspace/FORGE-q35/tests/test_log.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_log.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_log.dir/tests/test_log.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_log_strip.dir/tests/test_log_strip.cpp.o -c /workspace/FORGE-q35/tests/test_log_strip.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_log_strip.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_log_strip.dir/tests/test_log_strip.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_memory.dir/tests/test_memory.cpp.o -c /workspace/FORGE-q35/tests/test_memory.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_memory.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_memory.dir/tests/test_memory.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_mind.dir/tests/test_mind.cpp.o -c /workspace/FORGE-q35/tests/test_mind.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_mind.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_mind.dir/tests/test_mind.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_mobile.dir/tests/test_mobile.cpp.o -c /workspace/FORGE-q35/tests/test_mobile.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_mobile.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_mobile.dir/tests/test_mobile.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_os.dir/tests/test_os.cpp.o -c /workspace/FORGE-q35/tests/test_os.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_os.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_os.dir/tests/test_os.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_os_dev.dir/tests/test_os_dev.cpp.o -c /workspace/FORGE-q35/tests/test_os_dev.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_os_dev.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_os_dev.dir/tests/test_os_dev.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_os_ext.dir/tests/test_os_ext.cpp.o -c /workspace/FORGE-q35/tests/test_os_ext.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_os_ext.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_os_ext.dir/tests/test_os_ext.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_os_net.dir/tests/test_os_net.cpp.o -c /workspace/FORGE-q35/tests/test_os_net.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_os_net.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_os_net.dir/tests/test_os_net.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_os_process.dir/tests/test_os_process.cpp.o -c /workspace/FORGE-q35/tests/test_os_process.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_os_process.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_os_process.dir/tests/test_os_process.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_os_sys.dir/tests/test_os_sys.cpp.o -c /workspace/FORGE-q35/tests/test_os_sys.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_os_sys.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_os_sys.dir/tests/test_os_sys.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_pack.dir/tests/test_pack.cpp.o -c /workspace/FORGE-q35/tests/test_pack.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_pack.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_pack.dir/tests/test_pack.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_pool.dir/tests/test_pool.cpp.o -c /workspace/FORGE-q35/tests/test_pool.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_pool.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_pool.dir/tests/test_pool.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_rpc.dir/tests/test_rpc.cpp.o -c /workspace/FORGE-q35/tests/test_rpc.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_rpc.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_rpc.dir/tests/test_rpc.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -DFORGE_TEST_PLUGIN=\\\"/workspace/FORGE-q35/build-t/libhello_plugin.so\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -I/workspace/FORGE-q35/script/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_script.dir/tests/test_script.cpp.o -c /workspace/FORGE-q35/tests/test_script.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_script.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_script.dir/tests/test_script.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -DFORGE_TEST_PLUGIN=\\\"/workspace/FORGE-q35/build-t/libhello_plugin.so\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -I/workspace/FORGE-q35/script/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_script_golden.dir/tests/test_script_golden.cpp.o -c /workspace/FORGE-q35/tests/test_script_golden.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_script_golden.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_script_golden.dir/tests/test_script_golden.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_sessions.dir/tests/test_sessions.cpp.o -c /workspace/FORGE-q35/tests/test_sessions.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_sessions.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_sessions.dir/tests/test_sessions.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_support.dir/tests/test_support.cpp.o -c /workspace/FORGE-q35/tests/test_support.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_support.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_support.dir/tests/test_support.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_support2.dir/tests/test_support2.cpp.o -c /workspace/FORGE-q35/tests/test_support2.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_support2.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_support2.dir/tests/test_support2.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_text.dir/tests/test_text.cpp.o -c /workspace/FORGE-q35/tests/test_text.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_text.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_text.dir/tests/test_text.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/support/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_text_conformance.dir/tests/test_text_conformance.cpp.o -c /workspace/FORGE-q35/tests/test_text_conformance.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_text_conformance.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_text_conformance.dir/tests/test_text_conformance.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_tile.dir/tests/test_tile.cpp.o -c /workspace/FORGE-q35/tests/test_tile.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_tile.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_tile.dir/tests/test_tile.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_util.dir/tests/test_util.cpp.o -c /workspace/FORGE-q35/tests/test_util.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_util.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_util.dir/tests/test_util.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_video.dir/tests/test_video.cpp.o -c /workspace/FORGE-q35/tests/test_video.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_video.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_video.dir/tests/test_video.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/tests -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -I/workspace/FORGE-q35/balance/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/test_vulkan.dir/tests/test_vulkan.cpp.o -c /workspace/FORGE-q35/tests/test_vulkan.cpp",
+  "file": "/workspace/FORGE-q35/tests/test_vulkan.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/test_vulkan.dir/tests/test_vulkan.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -Dmock_cuda_EXPORTS -O3 -DNDEBUG -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/mock_cuda.dir/tests/mock_cuda.c.o -c /workspace/FORGE-q35/tests/mock_cuda.c",
+  "file": "/workspace/FORGE-q35/tests/mock_cuda.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/mock_cuda.dir/tests/mock_cuda.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -DMOCK_HIP -Dmock_hip_EXPORTS -O3 -DNDEBUG -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/mock_hip.dir/tests/mock_cuda.c.o -c /workspace/FORGE-q35/tests/mock_cuda.c",
+  "file": "/workspace/FORGE-q35/tests/mock_cuda.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/mock_hip.dir/tests/mock_cuda.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -Dmock_opencl_EXPORTS -I/workspace/FORGE-q35/build-t/generated/gpu -I/workspace/FORGE-q35/third_party -O3 -DNDEBUG -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/mock_opencl.dir/tests/mock_opencl.c.o -c /workspace/FORGE-q35/tests/mock_opencl.c",
+  "file": "/workspace/FORGE-q35/tests/mock_opencl.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/mock_opencl.dir/tests/mock_opencl.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -Dmock_ze_EXPORTS -I/workspace/FORGE-q35/build-t/generated/gpu -I/workspace/FORGE-q35/third_party -O3 -DNDEBUG -fPIC -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/mock_ze.dir/tests/mock_ze.c.o -c /workspace/FORGE-q35/tests/mock_ze.c",
+  "file": "/workspace/FORGE-q35/tests/mock_ze.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/mock_ze.dir/tests/mock_ze.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -I/workspace/FORGE-q35/mind/include -O3 -DNDEBUG -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/capi_smoke.dir/tests/capi_smoke.c.o -c /workspace/FORGE-q35/tests/capi_smoke.c",
+  "file": "/workspace/FORGE-q35/tests/capi_smoke.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/capi_smoke.dir/tests/capi_smoke.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang -I/workspace/FORGE-q35/mind/include -O3 -DNDEBUG -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_capi_generate.dir/docs/examples/capi_generate.c.o -c /workspace/FORGE-q35/docs/examples/capi_generate.c",
+  "file": "/workspace/FORGE-q35/docs/examples/capi_generate.c",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_capi_generate.dir/docs/examples/capi_generate.c.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_lane_dispatch.dir/docs/examples/lane_dispatch.cpp.o -c /workspace/FORGE-q35/docs/examples/lane_dispatch.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/lane_dispatch.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_lane_dispatch.dir/docs/examples/lane_dispatch.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_grid_graph.dir/docs/examples/grid_graph.cpp.o -c /workspace/FORGE-q35/docs/examples/grid_graph.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/grid_graph.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_grid_graph.dir/docs/examples/grid_graph.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_pack_roundtrip.dir/docs/examples/pack_roundtrip.cpp.o -c /workspace/FORGE-q35/docs/examples/pack_roundtrip.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/pack_roundtrip.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_pack_roundtrip.dir/docs/examples/pack_roundtrip.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_flow_graph.dir/docs/examples/flow_graph.cpp.o -c /workspace/FORGE-q35/docs/examples/flow_graph.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/flow_graph.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_flow_graph.dir/docs/examples/flow_graph.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_os_features.dir/docs/examples/os_features.cpp.o -c /workspace/FORGE-q35/docs/examples/os_features.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/os_features.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_os_features.dir/docs/examples/os_features.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -I/workspace/FORGE-q35/balance/include -I/workspace/FORGE-q35/os/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_balance_pool.dir/docs/examples/balance_pool.cpp.o -c /workspace/FORGE-q35/docs/examples/balance_pool.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/balance_pool.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_balance_pool.dir/docs/examples/balance_pool.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/doc_example_mind_generate.dir/docs/examples/mind_generate.cpp.o -c /workspace/FORGE-q35/docs/examples/mind_generate.cpp",
+  "file": "/workspace/FORGE-q35/docs/examples/mind_generate.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/doc_example_mind_generate.dir/docs/examples/mind_generate.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_json.dir/fuzz/fuzz_json.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_json.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_json.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_json.dir/fuzz/fuzz_json.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_json.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_json.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_blueprint.dir/fuzz/fuzz_blueprint.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_blueprint.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_blueprint.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_blueprint.dir/fuzz/fuzz_blueprint.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_blueprint.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_blueprint.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_fpk.dir/fuzz/fuzz_fpk.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_fpk.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_fpk.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_fpk.dir/fuzz/fuzz_fpk.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_fpk.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_fpk.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_safetensors.dir/fuzz/fuzz_safetensors.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_safetensors.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_safetensors.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_safetensors.dir/fuzz/fuzz_safetensors.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_safetensors.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_safetensors.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_gguf.dir/fuzz/fuzz_gguf.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_gguf.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_gguf.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_gguf.dir/fuzz/fuzz_gguf.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_gguf.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_gguf.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_tokenizer.dir/fuzz/fuzz_tokenizer.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_tokenizer.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_tokenizer.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_tokenizer.dir/fuzz/fuzz_tokenizer.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_tokenizer.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_tokenizer.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_grammar.dir/fuzz/fuzz_grammar.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_grammar.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_grammar.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_grammar.dir/fuzz/fuzz_grammar.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_grammar.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_grammar.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_onnx.dir/fuzz/fuzz_onnx.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_onnx.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_onnx.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_onnx.dir/fuzz/fuzz_onnx.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_onnx.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_onnx.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_script.dir/fuzz/fuzz_script.cpp.o -c /workspace/FORGE-q35/fuzz/fuzz_script.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/fuzz_script.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_script.dir/fuzz/fuzz_script.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_HAVE_TLS=1 -I/workspace/FORGE-q35/script/src -I/workspace/FORGE-q35/script/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/fuzz_script.dir/fuzz/driver.cpp.o -c /workspace/FORGE-q35/fuzz/driver.cpp",
+  "file": "/workspace/FORGE-q35/fuzz/driver.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/fuzz_script.dir/fuzz/driver.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/example_camera_detector.dir/examples/integrations/camera_detector.cpp.o -c /workspace/FORGE-q35/examples/integrations/camera_detector.cpp",
+  "file": "/workspace/FORGE-q35/examples/integrations/camera_detector.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/example_camera_detector.dir/examples/integrations/camera_detector.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/example_cypha_classifier.dir/examples/integrations/cypha_classifier.cpp.o -c /workspace/FORGE-q35/examples/integrations/cypha_classifier.cpp",
+  "file": "/workspace/FORGE-q35/examples/integrations/cypha_classifier.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/example_cypha_classifier.dir/examples/integrations/cypha_classifier.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/example_fuse_runtime.dir/examples/integrations/fuse_runtime.cpp.o -c /workspace/FORGE-q35/examples/integrations/fuse_runtime.cpp",
+  "file": "/workspace/FORGE-q35/examples/integrations/fuse_runtime.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/example_fuse_runtime.dir/examples/integrations/fuse_runtime.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/example_neuralvfx_stream.dir/examples/integrations/neuralvfx_stream.cpp.o -c /workspace/FORGE-q35/examples/integrations/neuralvfx_stream.cpp",
+  "file": "/workspace/FORGE-q35/examples/integrations/neuralvfx_stream.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/example_neuralvfx_stream.dir/examples/integrations/neuralvfx_stream.cpp.o"
+},
+{
+  "directory": "/workspace/FORGE-q35/build-t",
+  "command": "/workspace/opt/llvm23/bin/clang++ -DFORGE_SOURCE_DIR=\\\"/workspace/FORGE-q35\\\" -I/workspace/FORGE-q35/mind/include -I/workspace/FORGE-q35/pack/include -I/workspace/FORGE-q35/flow/include -I/workspace/FORGE-q35/spec/include -I/workspace/FORGE-q35/build-t/generated -I/workspace/FORGE-q35/core/include -I/workspace/FORGE-q35/os/include -I/workspace/FORGE-q35/lane/include -I/workspace/FORGE-q35/grid/include -I/workspace/FORGE-q35/support/include -I/workspace/FORGE-q35/third_party -I/workspace/FORGE-q35/third_party/monocypher -I/workspace/FORGE-q35/verify/include -stdlib=libc++ -O3 -DNDEBUG -std=c++23 -ffile-prefix-map=/workspace/FORGE-q35=. -ffile-prefix-map=/workspace/FORGE-q35/build-t=build -o CMakeFiles/example_seatbelt_one_shot.dir/examples/integrations/seatbelt_one_shot.cpp.o -c /workspace/FORGE-q35/examples/integrations/seatbelt_one_shot.cpp",
+  "file": "/workspace/FORGE-q35/examples/integrations/seatbelt_one_shot.cpp",
+  "output": "/workspace/FORGE-q35/build-t/CMakeFiles/example_seatbelt_one_shot.dir/examples/integrations/seatbelt_one_shot.cpp.o"
+}
+]

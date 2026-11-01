@@ -1,0 +1,2771 @@
+Start testing: Oct 31 15:26 AEDT
+----------------------------------------------------------
+95/140 Testing: test_gpu_cuda_mock
+95/140 Test: test_gpu_cuda_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "cuda"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_cuda_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: cuda: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_cuda_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_cuda_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+96/140 Testing: test_gpu_opencl_mock
+96/140 Test: test_gpu_opencl_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "opencl"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_opencl_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+opencl device: forge mock opencl 0 (image opencl-c)
+ok   31/31 opencl lowerings pass the oracle
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_opencl_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_opencl_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+97/140 Testing: test_gpu_features_opencl_mock
+97/140 Test: test_gpu_features_opencl_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "opencl"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_opencl_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+opencl: 2 device(s), streams 1, graphs 1
+ok   resident exp*x chain matches the host
+ok   residency: one upload, no downloads mid-run
+ok   end_run frees unpinned buffers
+ok   copy_resident writes the slot on the device
+ok   captured graph replays on updated input
+ok   open device 1
+ok   peer copy device 0 -> 1
+ok   an out-of-range ordinal fails with a reason
+     memory: 1073741824 / 1073741824 bytes free
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_opencl_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_features_opencl_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+98/140 Testing: test_gpu_ze_mock
+98/140 Test: test_gpu_ze_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "ze"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_ze_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+level_zero device: forge mock level zero 0 (image spirv)
+ok   31/31 level_zero lowerings pass the oracle
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_ze_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_ze_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+99/140 Testing: test_gpu_features_ze_mock
+99/140 Test: test_gpu_features_ze_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "ze"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_ze_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+level_zero: 2 device(s), streams 1, graphs 1
+ok   resident exp*x chain matches the host
+ok   residency: one upload, no downloads mid-run
+ok   end_run frees unpinned buffers
+ok   copy_resident writes the slot on the device
+ok   captured graph replays on updated input
+ok   open device 1
+ok   peer copy device 0 -> 1
+ok   an out-of-range ordinal fails with a reason
+     memory: 1073741824 / 1073741824 bytes free
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_ze_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_features_ze_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+100/140 Testing: test_gpu_hip_mock
+100/140 Test: test_gpu_hip_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "hip"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_hip_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: hip: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_hip_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_hip_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+101/140 Testing: test_gpu_features_cuda_mock
+101/140 Test: test_gpu_features_cuda_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "cuda"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_cuda_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: cuda: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_cuda_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_features_cuda_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+102/140 Testing: test_gpu_features_hip_mock
+102/140 Test: test_gpu_features_hip_mock
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "hip"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_hip_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: hip: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_hip_mock" end time: Oct 31 15:26 AEDT
+"test_gpu_features_hip_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+105/140 Testing: golden_tiny_llama_ze_mock
+105/140 Test: golden_tiny_llama_ze_mock
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_llama.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_zemock"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_llama_ze_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+verify    ok (all sections and tensors match BLAKE3)
+[ok] f32: prefill logits max|err| 1.13e-06, cosine 1.000000
+[ok] greedy decode (KV cache) matches reference: forge [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]... ref [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]...
+verify    ok (all sections and tensors match BLAKE3)
+[ok] q8_0: prefill logits max|err| 5.09e-02, cosine 0.999896
+[skip] gguf python package not installed
+[ok] text prompt path: '\x08 theï¿½'
+golden: PASS
+<end of output>
+Test time =   0.26 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_llama_ze_mock" end time: Oct 31 15:26 AEDT
+"golden_tiny_llama_ze_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+104/140 Testing: golden_tiny_llama_opencl_mock
+104/140 Test: golden_tiny_llama_opencl_mock
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_llama.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_clmock"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_llama_opencl_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+verify    ok (all sections and tensors match BLAKE3)
+[ok] f32: prefill logits max|err| 1.13e-06, cosine 1.000000
+[ok] greedy decode (KV cache) matches reference: forge [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]... ref [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]...
+verify    ok (all sections and tensors match BLAKE3)
+[ok] q8_0: prefill logits max|err| 5.09e-02, cosine 0.999896
+[skip] gguf python package not installed
+[ok] text prompt path: '\x08 theï¿½'
+golden: PASS
+<end of output>
+Test time =   0.26 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_llama_opencl_mock" end time: Oct 31 15:26 AEDT
+"golden_tiny_llama_opencl_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+103/140 Testing: golden_tiny_llama_cuda_mock
+103/140 Test: golden_tiny_llama_cuda_mock
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_llama.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_cumock"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_llama_cuda_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+verify    ok (all sections and tensors match BLAKE3)
+[ok] f32: prefill logits max|err| 9.57e-07, cosine 1.000000
+[ok] greedy decode (KV cache) matches reference: forge [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]... ref [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]...
+verify    ok (all sections and tensors match BLAKE3)
+[ok] q8_0: prefill logits max|err| 5.09e-02, cosine 0.999896
+[skip] gguf python package not installed
+[ok] text prompt path: '\x08 theï¿½'
+golden: PASS
+<end of output>
+Test time =   0.28 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_llama_cuda_mock" end time: Oct 31 15:26 AEDT
+"golden_tiny_llama_cuda_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+106/140 Testing: golden_tiny_llama_hip_mock
+106/140 Test: golden_tiny_llama_hip_mock
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_llama.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_hipmock"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_llama_hip_mock" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+verify    ok (all sections and tensors match BLAKE3)
+[ok] f32: prefill logits max|err| 9.57e-07, cosine 1.000000
+[ok] greedy decode (KV cache) matches reference: forge [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]... ref [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]...
+verify    ok (all sections and tensors match BLAKE3)
+[ok] q8_0: prefill logits max|err| 5.09e-02, cosine 0.999896
+[skip] gguf python package not installed
+[ok] text prompt path: '\x08 theï¿½'
+golden: PASS
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_llama_hip_mock" end time: Oct 31 15:26 AEDT
+"golden_tiny_llama_hip_mock" time elapsed: 00:00:00
+----------------------------------------------------------
+
+121/140 Testing: golden_tiny_llama
+121/140 Test: golden_tiny_llama
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_llama.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_llama" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+verify    ok (all sections and tensors match BLAKE3)
+[ok] f32: prefill logits max|err| 9.57e-07, cosine 1.000000
+[ok] greedy decode (KV cache) matches reference: forge [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]... ref [259, 84, 139, 53, 185, 191, 278, 270, 264, 51]...
+verify    ok (all sections and tensors match BLAKE3)
+[ok] q8_0: prefill logits max|err| 5.09e-02, cosine 0.999896
+[skip] gguf python package not installed
+[ok] text prompt path: '\x08 theï¿½'
+golden: PASS
+<end of output>
+Test time =   0.22 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_llama" end time: Oct 31 15:26 AEDT
+"golden_tiny_llama" time elapsed: 00:00:00
+----------------------------------------------------------
+
+83/140 Testing: xos_text_x86_64-windows-gnu
+83/140 Test: xos_text_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=x86_64-windows-gnu" "-DOUT=/workspace/FORGE-q35/build-t/xos/text_x86_64-windows-gnu" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/text/bidi.cpp|/workspace/FORGE-q35/os/src/text/case.cpp|/workspace/FORGE-q35/os/src/text/collate.cpp|/workspace/FORGE-q35/os/src/text/console.cpp|/workspace/FORGE-q35/os/src/text/encoding.cpp|/workspace/FORGE-q35/os/src/text/fuzzy.cpp|/workspace/FORGE-q35/os/src/text/locale_calendar.cpp|/workspace/FORGE-q35/os/src/text/locale_core.cpp|/workspace/FORGE-q35/os/src/text/locale_date.cpp|/workspace/FORGE-q35/os/src/text/locale_gettext.cpp|/workspace/FORGE-q35/os/src/text/locale_message.cpp|/workspace/FORGE-q35/os/src/text/locale_number.cpp|/workspace/FORGE-q35/os/src/text/locale_tz.cpp|/workspace/FORGE-q35/os/src/text/locale_units.cpp|/workspace/FORGE-q35/os/src/text/normalize.cpp|/workspace/FORGE-q35/os/src/text/regex.cpp|/workspace/FORGE-q35/os/src/text/segment.cpp|/workspace/FORGE-q35/os/src/text/translit.cpp|/workspace/FORGE-q35/os/src/text/ucd.cpp|/workspace/FORGE-q35/os/src/text/utf.cpp|/workspace/FORGE-q35/os/src/text/width.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_text_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.27 sec
+----------------------------------------------------------
+Test Passed.
+"xos_text_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_text_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+82/140 Testing: xos_text_aarch64-macos
+82/140 Test: xos_text_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=aarch64-macos" "-DOUT=/workspace/FORGE-q35/build-t/xos/text_aarch64-macos" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/text/bidi.cpp|/workspace/FORGE-q35/os/src/text/case.cpp|/workspace/FORGE-q35/os/src/text/collate.cpp|/workspace/FORGE-q35/os/src/text/console.cpp|/workspace/FORGE-q35/os/src/text/encoding.cpp|/workspace/FORGE-q35/os/src/text/fuzzy.cpp|/workspace/FORGE-q35/os/src/text/locale_calendar.cpp|/workspace/FORGE-q35/os/src/text/locale_core.cpp|/workspace/FORGE-q35/os/src/text/locale_date.cpp|/workspace/FORGE-q35/os/src/text/locale_gettext.cpp|/workspace/FORGE-q35/os/src/text/locale_message.cpp|/workspace/FORGE-q35/os/src/text/locale_number.cpp|/workspace/FORGE-q35/os/src/text/locale_tz.cpp|/workspace/FORGE-q35/os/src/text/locale_units.cpp|/workspace/FORGE-q35/os/src/text/normalize.cpp|/workspace/FORGE-q35/os/src/text/regex.cpp|/workspace/FORGE-q35/os/src/text/segment.cpp|/workspace/FORGE-q35/os/src/text/translit.cpp|/workspace/FORGE-q35/os/src/text/ucd.cpp|/workspace/FORGE-q35/os/src/text/utf.cpp|/workspace/FORGE-q35/os/src/text/width.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_text_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.19 sec
+----------------------------------------------------------
+Test Passed.
+"xos_text_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_text_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+79/140 Testing: xos_mobile_x86_64-windows-gnu
+79/140 Test: xos_mobile_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=x86_64-windows-gnu" "-DOUT=/workspace/FORGE-q35/build-t/xos/mobile_x86_64-windows-gnu" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/mobile/mobile.cpp|/workspace/FORGE-q35/os/src/mobile/services.cpp|/workspace/FORGE-q35/os/src/mobile/linux.cpp|/workspace/FORGE-q35/os/src/mobile/windows.cpp|/workspace/FORGE-q35/os/src/mobile/freebsd.cpp|/workspace/FORGE-q35/os/src/mobile/android.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_mobile_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"xos_mobile_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_mobile_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+84/140 Testing: xos_text_aarch64-linux-musl
+84/140 Test: xos_text_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=aarch64-linux-musl" "-DOUT=/workspace/FORGE-q35/build-t/xos/text_aarch64-linux-musl" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/text/bidi.cpp|/workspace/FORGE-q35/os/src/text/case.cpp|/workspace/FORGE-q35/os/src/text/collate.cpp|/workspace/FORGE-q35/os/src/text/console.cpp|/workspace/FORGE-q35/os/src/text/encoding.cpp|/workspace/FORGE-q35/os/src/text/fuzzy.cpp|/workspace/FORGE-q35/os/src/text/locale_calendar.cpp|/workspace/FORGE-q35/os/src/text/locale_core.cpp|/workspace/FORGE-q35/os/src/text/locale_date.cpp|/workspace/FORGE-q35/os/src/text/locale_gettext.cpp|/workspace/FORGE-q35/os/src/text/locale_message.cpp|/workspace/FORGE-q35/os/src/text/locale_number.cpp|/workspace/FORGE-q35/os/src/text/locale_tz.cpp|/workspace/FORGE-q35/os/src/text/locale_units.cpp|/workspace/FORGE-q35/os/src/text/normalize.cpp|/workspace/FORGE-q35/os/src/text/regex.cpp|/workspace/FORGE-q35/os/src/text/segment.cpp|/workspace/FORGE-q35/os/src/text/translit.cpp|/workspace/FORGE-q35/os/src/text/ucd.cpp|/workspace/FORGE-q35/os/src/text/utf.cpp|/workspace/FORGE-q35/os/src/text/width.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_text_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.43 sec
+----------------------------------------------------------
+Test Passed.
+"xos_text_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_text_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+80/140 Testing: xos_mobile_aarch64-linux-musl
+80/140 Test: xos_mobile_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=aarch64-linux-musl" "-DOUT=/workspace/FORGE-q35/build-t/xos/mobile_aarch64-linux-musl" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/mobile/mobile.cpp|/workspace/FORGE-q35/os/src/mobile/services.cpp|/workspace/FORGE-q35/os/src/mobile/linux.cpp|/workspace/FORGE-q35/os/src/mobile/windows.cpp|/workspace/FORGE-q35/os/src/mobile/freebsd.cpp|/workspace/FORGE-q35/os/src/mobile/android.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_mobile_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"xos_mobile_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_mobile_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+78/140 Testing: xos_mobile_aarch64-macos
+78/140 Test: xos_mobile_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=aarch64-macos" "-DOUT=/workspace/FORGE-q35/build-t/xos/mobile_aarch64-macos" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/mobile/mobile.cpp|/workspace/FORGE-q35/os/src/mobile/services.cpp|/workspace/FORGE-q35/os/src/mobile/linux.cpp|/workspace/FORGE-q35/os/src/mobile/windows.cpp|/workspace/FORGE-q35/os/src/mobile/freebsd.cpp|/workspace/FORGE-q35/os/src/mobile/android.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_mobile_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"xos_mobile_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_mobile_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+81/140 Testing: xos_text_x86_64-freebsd
+81/140 Test: xos_text_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=x86_64-freebsd" "-DOUT=/workspace/FORGE-q35/build-t/xos/text_x86_64-freebsd" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/text/bidi.cpp|/workspace/FORGE-q35/os/src/text/case.cpp|/workspace/FORGE-q35/os/src/text/collate.cpp|/workspace/FORGE-q35/os/src/text/console.cpp|/workspace/FORGE-q35/os/src/text/encoding.cpp|/workspace/FORGE-q35/os/src/text/fuzzy.cpp|/workspace/FORGE-q35/os/src/text/locale_calendar.cpp|/workspace/FORGE-q35/os/src/text/locale_core.cpp|/workspace/FORGE-q35/os/src/text/locale_date.cpp|/workspace/FORGE-q35/os/src/text/locale_gettext.cpp|/workspace/FORGE-q35/os/src/text/locale_message.cpp|/workspace/FORGE-q35/os/src/text/locale_number.cpp|/workspace/FORGE-q35/os/src/text/locale_tz.cpp|/workspace/FORGE-q35/os/src/text/locale_units.cpp|/workspace/FORGE-q35/os/src/text/normalize.cpp|/workspace/FORGE-q35/os/src/text/regex.cpp|/workspace/FORGE-q35/os/src/text/segment.cpp|/workspace/FORGE-q35/os/src/text/translit.cpp|/workspace/FORGE-q35/os/src/text/ucd.cpp|/workspace/FORGE-q35/os/src/text/utf.cpp|/workspace/FORGE-q35/os/src/text/width.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_text_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.43 sec
+----------------------------------------------------------
+Test Passed.
+"xos_text_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_text_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+74/140 Testing: xos_emit_aarch64-macos
+74/140 Test: xos_emit_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=aarch64-macos" "-DOUT=/workspace/FORGE-q35/build-t/xos/emit_aarch64-macos" "-DINCS=-I/workspace/FORGE-q35/script/include|-I/workspace/FORGE-q35/script/src|-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/build-t" "-DSRCS=/workspace/FORGE-q35/script/src/emit.cpp|/workspace/FORGE-q35/script/src/shells/cmd.cpp|/workspace/FORGE-q35/script/src/shells/csh.cpp|/workspace/FORGE-q35/script/src/shells/elvish.cpp|/workspace/FORGE-q35/script/src/shells/fish.cpp|/workspace/FORGE-q35/script/src/shells/nushell.cpp|/workspace/FORGE-q35/script/src/shells/posix.cpp|/workspace/FORGE-q35/script/src/shells/powershell.cpp|/workspace/FORGE-q35/script/src/shells/rc.cpp|/workspace/FORGE-q35/script/src/shells/xonsh.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_emit_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"xos_emit_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_emit_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+75/140 Testing: xos_emit_x86_64-windows-gnu
+75/140 Test: xos_emit_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=x86_64-windows-gnu" "-DOUT=/workspace/FORGE-q35/build-t/xos/emit_x86_64-windows-gnu" "-DINCS=-I/workspace/FORGE-q35/script/include|-I/workspace/FORGE-q35/script/src|-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/build-t" "-DSRCS=/workspace/FORGE-q35/script/src/emit.cpp|/workspace/FORGE-q35/script/src/shells/cmd.cpp|/workspace/FORGE-q35/script/src/shells/csh.cpp|/workspace/FORGE-q35/script/src/shells/elvish.cpp|/workspace/FORGE-q35/script/src/shells/fish.cpp|/workspace/FORGE-q35/script/src/shells/nushell.cpp|/workspace/FORGE-q35/script/src/shells/posix.cpp|/workspace/FORGE-q35/script/src/shells/powershell.cpp|/workspace/FORGE-q35/script/src/shells/rc.cpp|/workspace/FORGE-q35/script/src/shells/xonsh.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_emit_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"xos_emit_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_emit_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+77/140 Testing: xos_mobile_x86_64-freebsd
+77/140 Test: xos_mobile_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=x86_64-freebsd" "-DOUT=/workspace/FORGE-q35/build-t/xos/mobile_x86_64-freebsd" "-DINCS=-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/core/include|-I/workspace/FORGE-q35/support/include" "-DSRCS=/workspace/FORGE-q35/os/src/mobile/mobile.cpp|/workspace/FORGE-q35/os/src/mobile/services.cpp|/workspace/FORGE-q35/os/src/mobile/linux.cpp|/workspace/FORGE-q35/os/src/mobile/windows.cpp|/workspace/FORGE-q35/os/src/mobile/freebsd.cpp|/workspace/FORGE-q35/os/src/mobile/android.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_mobile_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.20 sec
+----------------------------------------------------------
+Test Passed.
+"xos_mobile_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_mobile_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+76/140 Testing: xos_emit_aarch64-linux-musl
+76/140 Test: xos_emit_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=aarch64-linux-musl" "-DOUT=/workspace/FORGE-q35/build-t/xos/emit_aarch64-linux-musl" "-DINCS=-I/workspace/FORGE-q35/script/include|-I/workspace/FORGE-q35/script/src|-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/build-t" "-DSRCS=/workspace/FORGE-q35/script/src/emit.cpp|/workspace/FORGE-q35/script/src/shells/cmd.cpp|/workspace/FORGE-q35/script/src/shells/csh.cpp|/workspace/FORGE-q35/script/src/shells/elvish.cpp|/workspace/FORGE-q35/script/src/shells/fish.cpp|/workspace/FORGE-q35/script/src/shells/nushell.cpp|/workspace/FORGE-q35/script/src/shells/posix.cpp|/workspace/FORGE-q35/script/src/shells/powershell.cpp|/workspace/FORGE-q35/script/src/shells/rc.cpp|/workspace/FORGE-q35/script/src/shells/xonsh.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_emit_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.19 sec
+----------------------------------------------------------
+Test Passed.
+"xos_emit_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_emit_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+73/140 Testing: xos_emit_x86_64-freebsd
+73/140 Test: xos_emit_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/cmake/data/bin/cmake" "-DZIG=/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "-DTARGET=x86_64-freebsd" "-DOUT=/workspace/FORGE-q35/build-t/xos/emit_x86_64-freebsd" "-DINCS=-I/workspace/FORGE-q35/script/include|-I/workspace/FORGE-q35/script/src|-I/workspace/FORGE-q35/os/include|-I/workspace/FORGE-q35/build-t" "-DSRCS=/workspace/FORGE-q35/script/src/emit.cpp|/workspace/FORGE-q35/script/src/shells/cmd.cpp|/workspace/FORGE-q35/script/src/shells/csh.cpp|/workspace/FORGE-q35/script/src/shells/elvish.cpp|/workspace/FORGE-q35/script/src/shells/fish.cpp|/workspace/FORGE-q35/script/src/shells/nushell.cpp|/workspace/FORGE-q35/script/src/shells/posix.cpp|/workspace/FORGE-q35/script/src/shells/powershell.cpp|/workspace/FORGE-q35/script/src/shells/rc.cpp|/workspace/FORGE-q35/script/src/shells/xonsh.cpp" "-P" "/workspace/FORGE-q35/cmake/xos_compile_each.cmake"
+Directory: /workspace/FORGE-q35/build-t
+"xos_emit_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.19 sec
+----------------------------------------------------------
+Test Passed.
+"xos_emit_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_emit_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+54/140 Testing: xos_test_os_ext_x86_64-macos
+54/140 Test: xos_test_os_ext_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_ext.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_ext.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_ext_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_ext_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_ext_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+68/140 Testing: xos_test_os_ext_aarch64-linux-musl
+68/140 Test: xos_test_os_ext_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_ext.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_ext.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_ext_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_ext_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_os_ext_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+47/140 Testing: xos_test_os_ext_aarch64-macos
+47/140 Test: xos_test_os_ext_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_ext.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_ext.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_ext_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_ext_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_ext_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+40/140 Testing: xos_test_os_ext_x86_64-freebsd
+40/140 Test: xos_test_os_ext_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_ext.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_ext.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_ext_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_ext_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_os_ext_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+61/140 Testing: xos_test_os_ext_x86_64-windows-gnu
+61/140 Test: xos_test_os_ext_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_ext.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_ext.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_ext_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_ext_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_os_ext_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+64/140 Testing: xos_test_os_net_x86_64-windows-gnu
+64/140 Test: xos_test_os_net_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_net.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_net.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_net_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_net_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_os_net_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+60/140 Testing: xos_test_balance_x86_64-windows-gnu
+60/140 Test: xos_test_balance_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_balance.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_balance.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_balance_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_balance_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_balance_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+71/140 Testing: xos_test_os_net_aarch64-linux-musl
+71/140 Test: xos_test_os_net_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_net.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_net.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_net_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_net_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_os_net_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+50/140 Testing: xos_test_os_net_aarch64-macos
+50/140 Test: xos_test_os_net_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_net.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_net.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_net_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_net_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_net_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+53/140 Testing: xos_test_balance_x86_64-macos
+53/140 Test: xos_test_balance_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_balance.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_balance.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_balance_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_balance_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_balance_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+67/140 Testing: xos_test_balance_aarch64-linux-musl
+67/140 Test: xos_test_balance_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_balance.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_balance.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_balance_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_balance_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_balance_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+46/140 Testing: xos_test_balance_aarch64-macos
+46/140 Test: xos_test_balance_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_balance.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_balance.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_balance_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_balance_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_balance_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+16/140 Testing: test_mind
+16/140 Test: test_mind
+Command: "/workspace/FORGE-q35/build-t/test_mind"
+Directory: /workspace/FORGE-q35
+"test_mind" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] paged_kv_matches_preallocated
+[ ok ] forward_all_rows_match_incremental
+[ ok ] rewind_and_copy_prefix
+  draft=forge_test_1285253_a.fpk k=3 rounds=10 acceptance=1.00
+  draft=forge_test_1285253_q.fpk k=3 rounds=10 acceptance=1.00
+  draft=forge_test_1285253_b.fpk k=3 rounds=40 acceptance=0.00
+[ ok ] speculative_greedy_equals_target_greedy
+  total variation vs target = 0.048
+[ ok ] speculative_sampling_preserves_distribution
+  lookup k=4 rounds=11 drafted=26 acceptance=0.35
+[ ok ] lookup_speculation_exact
+[ ok ] presence_frequency_penalties
+[ ok ] grammar_parse_and_match
+  seed 1: {"name": "srmbm", "age": 69}
+  seed 2: {"name": "cazgm", "age": 69}
+  seed 3: {"name": "srpmz", "age": 69}
+[ ok ] grammar_constrained_generation
+  steps=30 peak_active=3 prefix_hits=3 reused=3 peak_kv=14336B
+[ ok ] batch_scheduler_matches_sequential
+[ ok ] batch_scheduler_priority_and_cancel
+[ ok ] batch_scheduler_threaded
+[ ok ] sampler_typical_and_mirostat
+[ ok ] json_schema_grammar
+[ ok ] lora_hot_swap
+[ ok ] lora_adapter_file
+0 failure(s)
+<end of output>
+Test time =   2.07 sec
+----------------------------------------------------------
+Test Passed.
+"test_mind" end time: Oct 31 15:26 AEDT
+"test_mind" time elapsed: 00:00:02
+----------------------------------------------------------
+
+57/140 Testing: xos_test_os_net_x86_64-macos
+57/140 Test: xos_test_os_net_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_net.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_net.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_net_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_net_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_net_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+39/140 Testing: xos_test_balance_x86_64-freebsd
+39/140 Test: xos_test_balance_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_balance.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_balance.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_balance_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_balance_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_balance_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+43/140 Testing: xos_test_os_net_x86_64-freebsd
+43/140 Test: xos_test_os_net_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_net.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_net.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_net_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_net_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_os_net_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+63/140 Testing: xos_test_os_sys_x86_64-windows-gnu
+63/140 Test: xos_test_os_sys_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_sys.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_sys.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_sys_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_sys_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_os_sys_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+70/140 Testing: xos_test_os_sys_aarch64-linux-musl
+70/140 Test: xos_test_os_sys_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_sys.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_sys.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_sys_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_sys_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_os_sys_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+49/140 Testing: xos_test_os_sys_aarch64-macos
+49/140 Test: xos_test_os_sys_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_sys.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_sys.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_sys_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_sys_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_sys_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+56/140 Testing: xos_test_os_sys_x86_64-macos
+56/140 Test: xos_test_os_sys_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_sys.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_sys.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_sys_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_sys_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_sys_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+42/140 Testing: xos_test_os_sys_x86_64-freebsd
+42/140 Test: xos_test_os_sys_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_sys.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_sys.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_sys_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_sys_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_os_sys_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+72/140 Testing: xos_test_os_dev_aarch64-linux-musl
+72/140 Test: xos_test_os_dev_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_dev.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_dev.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_dev_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.05 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_dev_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_os_dev_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+59/140 Testing: xos_test_os_x86_64-windows-gnu
+59/140 Test: xos_test_os_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_os.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_os_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/140 Testing: test_balance
+2/140 Test: test_balance
+Command: "/workspace/FORGE-q35/build-t/test_balance"
+Directory: /workspace/FORGE-q35
+"test_balance" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] round_robin_and_weighted
+[ ok ] least_connections
+[ ok ] least_latency_ewma
+[ ok ] power_of_two_choices
+[ ok ] consistent_hash_stability_and_bounded_load
+[ ok ] prefix_affinity
+[ ok ] circuit_breaker
+[ ok ] health_checks
+[ ok ] retries_on_other_backends
+[ ok ] backpressure_queue
+[ ok ] dynamic_membership_and_concurrency
+[ ok ] l4_proxy
+[ ok ] l7_proxy
+0 failure(s)
+<end of output>
+Test time =   2.93 sec
+----------------------------------------------------------
+Test Passed.
+"test_balance" end time: Oct 31 15:26 AEDT
+"test_balance" time elapsed: 00:00:02
+----------------------------------------------------------
+
+69/140 Testing: xos_test_os_process_aarch64-linux-musl
+69/140 Test: xos_test_os_process_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_process.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_process.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_process_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_process_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_os_process_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+45/140 Testing: xos_test_os_aarch64-macos
+45/140 Test: xos_test_os_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+66/140 Testing: xos_test_os_aarch64-linux-musl
+66/140 Test: xos_test_os_aarch64-linux-musl
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-linux-musl" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os.aarch64-linux-musl"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_aarch64-linux-musl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_aarch64-linux-musl" end time: Oct 31 15:26 AEDT
+"xos_test_os_aarch64-linux-musl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+52/140 Testing: xos_test_os_x86_64-macos
+52/140 Test: xos_test_os_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+55/140 Testing: xos_test_os_process_x86_64-macos
+55/140 Test: xos_test_os_process_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_process.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_process.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_process_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_process_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_process_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+38/140 Testing: xos_test_os_x86_64-freebsd
+38/140 Test: xos_test_os_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_os_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+41/140 Testing: xos_test_os_process_x86_64-freebsd
+41/140 Test: xos_test_os_process_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_process.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_process.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_process_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_process_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_os_process_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+48/140 Testing: xos_test_os_process_aarch64-macos
+48/140 Test: xos_test_os_process_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_process.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_process.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_process_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_process_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_process_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+51/140 Testing: xos_test_os_dev_aarch64-macos
+51/140 Test: xos_test_os_dev_aarch64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "aarch64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_dev.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_dev.aarch64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_dev_aarch64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_dev_aarch64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_dev_aarch64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+62/140 Testing: xos_test_os_process_x86_64-windows-gnu
+62/140 Test: xos_test_os_process_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_process.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_process.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_process_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_process_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_os_process_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+65/140 Testing: xos_test_os_dev_x86_64-windows-gnu
+65/140 Test: xos_test_os_dev_x86_64-windows-gnu
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-windows-gnu" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_dev.cpp" "-lws2_32" "-lbcrypt" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_dev.x86_64-windows-gnu"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_dev_x86_64-windows-gnu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_dev_x86_64-windows-gnu" end time: Oct 31 15:26 AEDT
+"xos_test_os_dev_x86_64-windows-gnu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+58/140 Testing: xos_test_os_dev_x86_64-macos
+58/140 Test: xos_test_os_dev_x86_64-macos
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-macos" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_dev.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_dev.x86_64-macos"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_dev_x86_64-macos" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_dev_x86_64-macos" end time: Oct 31 15:26 AEDT
+"xos_test_os_dev_x86_64-macos" time elapsed: 00:00:00
+----------------------------------------------------------
+
+21/140 Testing: test_os_net
+21/140 Test: test_os_net
+Command: "/workspace/FORGE-q35/build-t/test_os_net"
+Directory: /workspace/FORGE-q35
+"test_os_net" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] tree_watch_native
+[ ok ] tree_watch_polling
+[ ok ] url_parse
+[ ok ] resolve_and_interfaces
+[ ok ] http_client_against_local_server
+[ ok ] service_units
+[ ok ] registry_portable
+0 failure(s)
+<end of output>
+Test time =   1.18 sec
+----------------------------------------------------------
+Test Passed.
+"test_os_net" end time: Oct 31 15:26 AEDT
+"test_os_net" time elapsed: 00:00:01
+----------------------------------------------------------
+
+44/140 Testing: xos_test_os_dev_x86_64-freebsd
+44/140 Test: xos_test_os_dev_x86_64-freebsd
+Command: "/home/box/.local/lib/python3.13/site-packages/ziglang/zig" "c++" "-target" "x86_64-freebsd" "-std=c++20" "-O1" "-I/workspace/FORGE-q35/os/include" "-I/workspace/FORGE-q35/balance/include" "-I/workspace/FORGE-q35/tests" "/workspace/FORGE-q35/tests/test_os_dev.cpp" "-o" "/workspace/FORGE-q35/build-t/xos/test_os_dev.x86_64-freebsd"
+Directory: /workspace/FORGE-q35/build-t
+"xos_test_os_dev_x86_64-freebsd" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"xos_test_os_dev_x86_64-freebsd" end time: Oct 31 15:26 AEDT
+"xos_test_os_dev_x86_64-freebsd" time elapsed: 00:00:00
+----------------------------------------------------------
+
+22/140 Testing: test_os_process
+22/140 Test: test_os_process
+Command: "/workspace/FORGE-q35/build-t/test_os_process"
+Directory: /workspace/FORGE-q35
+"test_os_process" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] spawn_captures_separately
+[ ok ] spawn_stdin_env_cwd
+[ ok ] spawn_merge_stderr
+[ ok ] spawn_timeout_kills_tree
+[ ok ] spawn_missing_command
+[ ok ] spawn_memory_limit
+[ ok ] spawn_output_cap
+[ ok ] child_stream_and_kill
+[ ok ] pipe_roundtrip
+[ ok ] signals
+[ ok ] process_list
+[ ok ] find_exe
+[ ok ] child_start_spec_env_cwd_and_exec_error
+[ ok ] child_start_memory_limit
+[ ok ] wait_any_picks_first_and_wait_all
+0 failure(s)
+<end of output>
+Test time =   0.98 sec
+----------------------------------------------------------
+Test Passed.
+"test_os_process" end time: Oct 31 15:26 AEDT
+"test_os_process" time elapsed: 00:00:00
+----------------------------------------------------------
+
+118/140 Testing: golden_quant_inplace
+118/140 Test: golden_quant_inplace
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/quant_inplace.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_quant_inplace"
+Directory: /workspace/FORGE-q35/build-t
+"golden_quant_inplace" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ok] f32: in-place vs decoded logits rel err 0.0e+00, tokens equal
+[ok] f16: in-place vs decoded logits rel err 1.0e-07, tokens equal
+[ok] q8_0: in-place vs decoded logits rel err 8.2e-08, tokens equal
+[ok] q4_k: in-place vs decoded logits rel err 8.3e-08, tokens equal
+[ok] q8_g32: in-place vs decoded logits rel err 9.3e-08, tokens equal
+[skip] gguf python package not installed
+quant in-place: PASS
+<end of output>
+Test time =   0.46 sec
+----------------------------------------------------------
+Test Passed.
+"golden_quant_inplace" end time: Oct 31 15:26 AEDT
+"golden_quant_inplace" time elapsed: 00:00:00
+----------------------------------------------------------
+
+10/140 Testing: test_lane
+10/140 Test: test_lane
+Command: "/workspace/FORGE-q35/build-t/test_lane"
+Directory: /workspace/FORGE-q35
+"test_lane" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+  cpu: GenuineIntel | Intel(R) Xeon(R) Processor sse4.2 avx avx2 fma f16c avx512f avx512bw avx512dq avx512vl avx512vnni avx512bf16 avx512fp16 avx512ifma avx512vbmi avxvnni amx-tile (amx-permitted)
+  active: avx512
+[ ok ] detection_reports
+[ ok ] strip_tails_all_lengths
+  exp      scalar  max 1 ulp (x=52.395)
+  exp      avx2    max 1 ulp (x=52.395)
+  exp      avx512  max 1 ulp (x=52.395)
+  exp-sub  scalar  max 0 ulp (x=0)
+  exp-sub  avx2    max 0 ulp (x=0)
+  exp-sub  avx512  max 0 ulp (x=0)
+  log      scalar  max 1 ulp (x=2.30624e+28)
+  log      avx2    max 1 ulp (x=2.30624e+28)
+  log      avx512  max 1 ulp (x=2.30624e+28)
+  log01    scalar  max 0 ulp (x=0)
+  log01    avx2    max 0 ulp (x=0)
+  log01    avx512  max 0 ulp (x=0)
+  tanh     scalar  max 3 ulp (x=-3.91515)
+  tanh     avx2    max 3 ulp (x=-3.91515)
+  tanh     avx512  max 3 ulp (x=-3.91515)
+  sigmoid  scalar  max 0 ulp (x=0)
+  sigmoid  avx2    max 0 ulp (x=0)
+  sigmoid  avx512  max 0 ulp (x=0)
+  silu     scalar  max 1 ulp (x=16.6561)
+  silu     avx2    max 1 ulp (x=16.6561)
+  silu     avx512  max 1 ulp (x=16.6561)
+  gelu     scalar  max 0 ulp (x=0)
+  gelu     avx2    max 0 ulp (x=0)
+  gelu     avx512  max 0 ulp (x=0)
+[ ok ] math_ulp_harness
+  exp2      scalar  max 1 ulp (x=-107.09)
+  exp2      avx2    max 1 ulp (x=-107.09)
+  exp2      avx512  max 1 ulp (x=-107.09)
+  expm1     scalar  max 2 ulp (x=0.887635)
+  expm1     avx2    max 2 ulp (x=0.887635)
+  expm1     avx512  max 2 ulp (x=0.887635)
+  expm1-0   scalar  max 1 ulp (x=-0.454947)
+  expm1-0   avx2    max 1 ulp (x=-0.454947)
+  expm1-0   avx512  max 1 ulp (x=-0.454947)
+  log2      scalar  max 3 ulp (x=1.08302)
+  log2      avx2    max 3 ulp (x=1.08302)
+  log2      avx512  max 3 ulp (x=1.08302)
+  log10     scalar  max 2 ulp (x=1.2999e+29)
+  log10     avx2    max 2 ulp (x=1.2999e+29)
+  log10     avx512  max 2 ulp (x=1.2999e+29)
+  log1p     scalar  max 1 ulp (x=45051.9)
+  log1p     avx2    max 1 ulp (x=45051.9)
+  log1p     avx512  max 1 ulp (x=45051.9)
+  log1p-0   scalar  max 2 ulp (x=0.000217996)
+  log1p-0   avx2    max 2 ulp (x=0.000217996)
+  log1p-0   avx512  max 2 ulp (x=0.000217996)
+  sqrt      scalar  max 0 ulp (x=0)
+  sqrt      avx2    max 0 ulp (x=0)
+  sqrt      avx512  max 0 ulp (x=0)
+  rsqrt     scalar  max 1 ulp (x=0.648153)
+  rsqrt     avx2    max 1 ulp (x=0.648153)
+  rsqrt     avx512  max 1 ulp (x=0.648153)
+  cbrt      scalar  max 1 ulp (x=-6.62236e+29)
+  cbrt      avx2    max 1 ulp (x=-6.62236e+29)
+  cbrt      avx512  max 1 ulp (x=-6.62236e+29)
+  cbrt-sub  scalar  max 1 ulp (x=2.25386e-33)
+  cbrt-sub  avx2    max 1 ulp (x=2.25386e-33)
+  cbrt-sub  avx512  max 1 ulp (x=2.25386e-33)
+  sin       scalar  max 0 ulp (x=0)
+  sin       avx2    max 0 ulp (x=0)
+  sin       avx512  max 0 ulp (x=0)
+  cos       scalar  max 0 ulp (x=0)
+  cos       avx2    max 0 ulp (x=0)
+  cos       avx512  max 0 ulp (x=0)
+  sin-0     scalar  max 1 ulp (x=-2.54135)
+  sin-0     avx2    max 1 ulp (x=-2.54135)
+  sin-0     avx512  max 1 ulp (x=-2.54135)
+  tan       scalar  max 3 ulp (x=-290.566)
+  tan       avx2    max 3 ulp (x=-290.566)
+  tan       avx512  max 3 ulp (x=-290.566)
+  asin      scalar  max 2 ulp (x=0.510597)
+  asin      avx2    max 2 ulp (x=0.510597)
+  asin      avx512  max 2 ulp (x=0.510597)
+  acos      scalar  max 1 ulp (x=-0.655735)
+  acos      avx2    max 1 ulp (x=-0.655735)
+  acos      avx512  max 1 ulp (x=-0.655735)
+  atan      scalar  max 1 ulp (x=-62.7741)
+  atan      avx2    max 1 ulp (x=-62.7741)
+  atan      avx512  max 1 ulp (x=-62.7741)
+  atan-0    scalar  max 3 ulp (x=-0.419097)
+  atan-0    avx2    max 3 ulp (x=-0.419097)
+  atan-0    avx512  max 3 ulp (x=-0.419097)
+  sinh      scalar  max 3 ulp (x=0.818123)
+  sinh      avx2    max 3 ulp (x=0.818123)
+  sinh      avx512  max 3 ulp (x=0.818123)
+  cosh      scalar  max 1 ulp (x=-61.816)
+  cosh      avx2    max 1 ulp (x=-61.816)
+  cosh      avx512  max 1 ulp (x=-61.816)
+  erf       scalar  max 2 ulp (x=-0.408141)
+  erf       avx2    max 2 ulp (x=-0.408141)
+  erf       avx512  max 2 ulp (x=-0.408141)
+  erfc      scalar  max 4 ulp (x=7.4138)
+  erfc      avx2    max 4 ulp (x=7.4138)
+  erfc      avx512  max 4 ulp (x=7.4138)
+  gelu_erf  scalar  max 4 ulp (x=-7.13362)
+  gelu_erf  avx2    max 4 ulp (x=-7.13362)
+  gelu_erf  avx512  max 4 ulp (x=-7.13362)
+  softplus  scalar  max 3 ulp (x=-16.1958)
+  softplus  avx2    max 3 ulp (x=-16.1958)
+  softplus  avx512  max 3 ulp (x=-16.1958)
+  lgamma    scalar  max 2 ulp (x=127.73)
+  lgamma    avx2    max 2 ulp (x=127.73)
+  lgamma    avx512  max 2 ulp (x=127.73)
+  lgamma-l  scalar  max 2 ulp (x=1.47391e+07)
+  lgamma-l  avx2    max 2 ulp (x=1.47391e+07)
+  lgamma-l  avx512  max 2 ulp (x=1.47391e+07)
+  lgamma-n  scalar  max 0 ulp (x=0)
+  lgamma-n  avx2    max 0 ulp (x=0)
+  lgamma-n  avx512  max 0 ulp (x=0)
+  pow       scalar  max 2 ulp
+  pow       avx2    max 2 ulp
+  pow       avx512  max 2 ulp
+  atan2     scalar  max 3 ulp
+  atan2     avx2    max 3 ulp
+  atan2     avx512  max 3 ulp
+  hypot     scalar  max 2 ulp
+  hypot     avx2    max 2 ulp
+  hypot     avx512  max 2 ulp
+[ ok ] math_extended_ulp
+[ ok ] math_special_values
+[ ok ] kernels_vs_spec_oracle
+[ ok ] gemm_vs_oracle
+0 failure(s)
+<end of output>
+Test time =   0.72 sec
+----------------------------------------------------------
+Test Passed.
+"test_lane" end time: Oct 31 15:26 AEDT
+"test_lane" time elapsed: 00:00:00
+----------------------------------------------------------
+
+116/140 Testing: onnx_import
+116/140 Test: onnx_import
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/tests/onnx_test.py" "/workspace/FORGE-q35/build-t/forge"
+Directory: /workspace/FORGE-q35/build-t
+"onnx_import" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+mlp_b3.probs: 12 values, max err 5.96e-08
+mlp_b3.sg: 12 values, max err 5.96e-08
+mlp_b5.probs: 20 values, max err 5.96e-08
+mlp_b5.sg: 20 values, max err 5.96e-08
+encoder.flat: 48 values, max err 3.96e-07
+unsupported op rejected: forge: error: onnx: operator 'Conv' (node ?) is not supported by the FORGE importer
+onnx import OK
+<end of output>
+Test time =   0.24 sec
+----------------------------------------------------------
+Test Passed.
+"onnx_import" end time: Oct 31 15:26 AEDT
+"onnx_import" time elapsed: 00:00:00
+----------------------------------------------------------
+
+15/140 Testing: test_memory
+15/140 Test: test_memory
+Command: "/workspace/FORGE-q35/build-t/test_memory"
+Directory: /workspace/FORGE-q35
+"test_memory" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] parse_and_format_sizes
+  physical=15.6 GiB available=12.4 GiB cgroup=0 B
+[ ok ] host_limits_detected
+[ ok ] budget_reserve_release_and_tags
+[ ok ] budget_evicts_caches_lowest_priority_lru_first
+[ ok ] budget_try_reserve_evicts_to_fit
+[ ok ] budget_reserve_waits_for_release
+[ ok ] budget_set_usage_and_prometheus
+[ ok ] pmr_resource_charges_budget
+[ ok ] governor_env_and_pressure
+[ ok ] spill_roundtrip_and_cap
+[ ok ] scheduler_reports_kv_and_defers_under_budget
+[ ok ] spawn_leased_charges_and_returns_cap
+0 failure(s)
+<end of output>
+Test time =   0.48 sec
+----------------------------------------------------------
+Test Passed.
+"test_memory" end time: Oct 31 15:26 AEDT
+"test_memory" time elapsed: 00:00:00
+----------------------------------------------------------
+
+117/140 Testing: golden_moe_mla
+117/140 Test: golden_moe_mla
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_moe.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_moe"
+Directory: /workspace/FORGE-q35/build-t
+"golden_moe_mla" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ok] mixtral: prefill logits max|err| 6.05e-07
+[ok] mixtral: cached greedy decode matches full recompute: [197, 15, 75, 229, 155, 16, 207, 233] vs [197, 15, 75, 229, 155, 16, 207, 233]
+[ok] deepseek_v2: prefill logits max|err| 8.02e-07
+[ok] deepseek_v2: cached greedy decode matches full recompute: [46, 205, 188, 277, 289, 123, 40, 135] vs [46, 205, 188, 277, 289, 123, 40, 135]
+[ok] deepseek_v2_lite: prefill logits max|err| 9.16e-07
+[ok] deepseek_v2_lite: cached greedy decode matches full recompute: [34, 150, 18, 251, 80, 22, 149, 272] vs [34, 150, 18, 251, 80, 22, 149, 272]
+golden moe: PASS
+<end of output>
+Test time =   0.23 sec
+----------------------------------------------------------
+Test Passed.
+"golden_moe_mla" end time: Oct 31 15:26 AEDT
+"golden_moe_mla" time elapsed: 00:00:00
+----------------------------------------------------------
+
+130/140 Testing: fuzz_safetensors
+130/140 Test: fuzz_safetensors
+Command: "/workspace/FORGE-q35/build-t/fuzz_safetensors" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/safetensors"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_safetensors" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 2 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.24 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_safetensors" end time: Oct 31 15:26 AEDT
+"fuzz_safetensors" time elapsed: 00:00:00
+----------------------------------------------------------
+
+20/140 Testing: test_os_ext
+20/140 Test: test_os_ext
+Command: "/workspace/FORGE-q35/build-t/test_os_ext"
+Directory: /workspace/FORGE-q35
+"test_os_ext" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+  node 0: 8 cpus, 16002 MiB
+[ ok ] numa
+  sizes: 2M 1G thp=1
+  2M request -> thp
+  strict 1G -> mmap MAP_HUGE_1GB: Cannot allocate memory
+[ ok ] huge_pages
+  backend io_uring
+[ ok ] async_file_io
+  Intel(R) Xeon(R) Processor: 8 logical, 8 physical, 1 pkg, hybrid=0 P=8 E=0
+  L1D 48K line 64
+  L1I 32K line 64
+  L2U 2M line 64
+  L3U 320M line 64
+[ ok ] cpu_topology
+  [sysfs] battery=0 -1% on_battery=0 charging=0 low_power=0 thermal=unknown throttled=0 temp=-1.0C
+[ ok ] power_thermal
+  source psi, sampled normal
+[ ok ] memory_pressure
+[ ok ] shared_memory
+  no GPUs visible
+[ ok ] gpu_discovery
+[ ok ] local_ipc
+#0  0x56027779320c ?? (test_os_ext+0x1020c)
+#1  0x56027779320c ?? (test_os_ext+0x1020c)
+#2  0x56027778b9d3 ?? (test_os_ext+0x89d3)
+#3  0x560277788155 ?? (test_os_ext+0x5155)
+#4  0x7f83b3bebca8 ?? (libc.so.6+0x29ca8)
+[ ok ] crash_handling
+  current: sandboxed=0 
+[ ok ] sandboxing
+  default backend libsecret
+[ ok ] key_storage
+  backend inotify
+  modified model.fpk
+[ ok ] file_watching
+  counter 2400.0 MHz, timer res 1 ns
+  precise_sleep 2ms -> 2.000 ms
+  skip hw counters: perf_event_open cycles (perf_event_paranoid=2): No such file or directory
+  [cycle_counter] cycles = 7238824
+[ ok ] timers_and_perf
+  kind not_required
+[ ok ] background_execution
+  manager ''
+[ ok ] service_integration
+0 failure(s)
+<end of output>
+Test time =   0.21 sec
+----------------------------------------------------------
+Test Passed.
+"test_os_ext" end time: Oct 31 15:26 AEDT
+"test_os_ext" time elapsed: 00:00:00
+----------------------------------------------------------
+
+131/140 Testing: fuzz_gguf
+131/140 Test: fuzz_gguf
+Command: "/workspace/FORGE-q35/build-t/fuzz_gguf" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/gguf"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_gguf" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 1 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.31 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_gguf" end time: Oct 31 15:26 AEDT
+"fuzz_gguf" time elapsed: 00:00:00
+----------------------------------------------------------
+
+120/140 Testing: golden_tiny_qwen3
+120/140 Test: golden_tiny_qwen3
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_qwen3.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_qwen3"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_qwen3" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ok] hf f32: prefill logits max|err| 5.12e-06, cosine 1.000000
+[ok] greedy decode matches reference: forge [119, 119, 119, 119, 119, 119, 119, 119]... ref [119, 119, 119, 119, 119, 119, 119, 119]...
+[ok] hf q8_0: prefill logits max|err| 2.91e-01, cosine 0.999930
+[skip] gguf python package not installed
+golden qwen3: PASS
+<end of output>
+Test time =   0.19 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_qwen3" end time: Oct 31 15:26 AEDT
+"golden_tiny_qwen3" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/140 Testing: test_cache
+3/140 Test: test_cache
+Command: "/workspace/FORGE-q35/build-t/test_cache"
+Directory: /workspace/FORGE-q35
+"test_cache" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] content_address_roundtrip
+[ ok ] memo_keys_and_overwrite_and_erase
+[ ok ] corrupt_entry_is_dropped
+[ ok ] lru_eviction_keeps_recent
+[ ok ] concurrent_writers
+0 failure(s)
+<end of output>
+Test time =   0.16 sec
+----------------------------------------------------------
+Test Passed.
+"test_cache" end time: Oct 31 15:26 AEDT
+"test_cache" time elapsed: 00:00:00
+----------------------------------------------------------
+
+18/140 Testing: test_os
+18/140 Test: test_os
+Command: "/workspace/FORGE-q35/build-t/test_os"
+Directory: /workspace/FORGE-q35
+"test_os" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+  linux/x86_64 cpus=8 ram=16002 MiB avail=12749 MiB page=4096 host=grok-bot-vm-343070857
+[ ok ] identity_and_sysinfo
+[ ok ] files_and_fs
+[ ok ] paths
+[ ok ] mmap_and_memory
+[ ok ] time_and_sleep
+[ ok ] threads_and_sync
+[ ok ] env_and_dl
+[ ok ] entropy
+[ ok ] signals
+[ ok ] process
+  poller backend: epoll
+[ ok ] sockets_and_poller
+  completion backend: emulated
+[ ok ] completion_port
+0 failure(s)
+<end of output>
+Test time =   0.18 sec
+----------------------------------------------------------
+Test Passed.
+"test_os" end time: Oct 31 15:26 AEDT
+"test_os" time elapsed: 00:00:00
+----------------------------------------------------------
+
+123/140 Testing: python_bindings
+123/140 Test: python_bindings
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/tests/python_bindings.py" "/workspace/FORGE-q35/build-t/golden/tiny_f32.fpk" "/workspace/FORGE-q35/build-t/forge" "/workspace/FORGE-q35/build-t/golden/tiny_q8_0.fpk"
+Directory: /workspace/FORGE-q35/build-t
+"python_bindings" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+python bindings ok: 0.1.0 abi 3 grammar -> yes
+<end of output>
+Test time =   0.16 sec
+----------------------------------------------------------
+Test Passed.
+"python_bindings" end time: Oct 31 15:26 AEDT
+"python_bindings" time elapsed: 00:00:00
+----------------------------------------------------------
+
+126/140 Testing: sbom_spdx
+126/140 Test: sbom_spdx
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/tests/sbom_test.py" "/workspace/FORGE-q35"
+Directory: /workspace/FORGE-q35/build-t
+"sbom_spdx" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+sbom ok: 370 files, 2 packages
+<end of output>
+Test time =   0.18 sec
+----------------------------------------------------------
+Test Passed.
+"sbom_spdx" end time: Oct 31 15:26 AEDT
+"sbom_spdx" time elapsed: 00:00:00
+----------------------------------------------------------
+
+124/140 Testing: serve_http
+124/140 Test: serve_http
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/tests/serve_test.py" "/workspace/FORGE-q35/build-t/forge-serve" "/workspace/FORGE-q35/build-t/forge" "/workspace/FORGE-q35/build-t/golden/tiny_f32.fpk"
+Directory: /workspace/FORGE-q35/build-t
+"serve_http" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+serve ok; forge_steps 57 forge_completed 12 forge_prefix_hits 9 forge_prefix_tokens_reused 25 forge_peak_active 3 forge_peak_kv_bytes 196608 forge_queue_waiting 0 forge_queue_active 0 forge_admission_deferred_total 0 forge_rejected_total 0 forge_kv_evictions_total 0 forge_mem_limit_bytes{pool="host"} 14262694707 forge_mem_used_bytes{pool="host"} 0 forge_mem_peak_bytes{pool="host"} 196608 forge_mem_cache_bytes{pool="host"} 262144 forge_mem_reservations_total{pool="host"} 0 forge_mem_denials_total{pool="host"} 0 forge_mem_waits_total{pool="host"} 0 forge_mem_evictions_total{pool="host"} 0 forge_mem_evicted_bytes_total{pool="host"} 0 forge_mem_pressure_events_total 0 
+serve mem-limit ok
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"serve_http" end time: Oct 31 15:26 AEDT
+"serve_http" time elapsed: 00:00:00
+----------------------------------------------------------
+
+23/140 Testing: test_os_sys
+23/140 Test: test_os_sys
+Command: "/workspace/FORGE-q35/build-t/test_os_sys"
+Directory: /workspace/FORGE-q35
+"test_os_sys" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] glob_match_rules
+[ ok ] fs_tree_ops
+[ ok ] file_lock_exclusive
+[ ok ] mounts_list
+[ ok ] users_dirs
+[ ok ] time_civil_and_iso
+[ ok ] timer_queue_runs
+[ ok ] sysinfo_ext
+[ ok ] console_bits
+0 failure(s)
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"test_os_sys" end time: Oct 31 15:26 AEDT
+"test_os_sys" time elapsed: 00:00:00
+----------------------------------------------------------
+
+27/140 Testing: test_script
+27/140 Test: test_script
+Command: "/workspace/FORGE-q35/build-t/test_script"
+Directory: /workspace/FORGE-q35
+"test_script" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] arithmetic_and_types
+[ ok ] variables_scopes_lambdas
+[ ok ] control_flow
+[ ok ] strings
+[ ok ] collections
+[ ok ] classes_inheritance_operators
+[ ok ] exceptions
+[ ok ] ownership_moves_and_borrows
+[ ok ] namespaces_enums_templates
+[ ok ] reflection
+[ ok ] destructors_raii
+[ ok ] borrow_rules_while_iterating
+[ ok ] references_write_through
+[ ok ] debug_race_and_deadlock_detection
+[ ok ] arc_weak_and_cycles
+[ ok ] limits
+[ ok ] tasks_channels
+[ ok ] mobile_sensors_touch
+[ ok ] shell_and_processes
+[ ok ] modules
+[ ok ] modules_and_plugins
+[ ok ] repl_eval_keeps_state
+[ ok ] errors_carry_lines_and_traces
+[ ok ] os_phase2_surface
+[ ok ] automation_pipeline
+[ ok ] automation_incremental
+[ ok ] automation_schedule
+[ ok ] automation_watch
+[ ok ] os_phase3_surface
+[ ok ] ai_assisted_commands
+[ ok ] remote_scripts
+shells tested: sh bash zsh dash ash mksh oksh yash fish tcsh csh nu xonsh elvish pwsh powershell rc es
+shells skipped (not installed): ksh posh osh ysh hush cmd
+[ ok ] shell_backends_golden
+emit tested: functions/elvish functions/fish functions/nu functions/sh functions/bash functions/zsh functions/dash functions/ash(via busybox) functions/mksh functions/oksh functions/yash functions/pwsh functions/powershell(via pwsh) functions/rc functions/es functions/xonsh flat/tcsh flat/csh(via tcsh) flat/elvish flat/fish flat/nu flat/sh flat/bash flat/zsh flat/dash flat/ash(via busybox) flat/mksh flat/oksh flat/yash flat/pwsh flat/powershell(via pwsh) flat/rc flat/es flat/xonsh batch/tcsh batch/csh(via tcsh) batch/elvish batch/fish batch/nu batch/sh batch/bash batch/zsh batch/dash batch/ash(via busybox) batch/mksh batch/oksh batch/yash batch/pwsh batch/powershell(via pwsh) batch/rc batch/es batch/xonsh
+emit refused (outside the target's subset): functions/tcsh functions/csh
+[ ok ] emit_golden_all_shells
+[ ok ] emit_errors_and_host_shell
+[ ok ] host_bindings
+[ ok ] limit_block_timeout_mem_cpu
+0 failure(s)
+<end of output>
+Test time =   6.77 sec
+----------------------------------------------------------
+Test Passed.
+"test_script" end time: Oct 31 15:26 AEDT
+"test_script" time elapsed: 00:00:06
+----------------------------------------------------------
+
+133/140 Testing: fuzz_grammar
+133/140 Test: fuzz_grammar
+Command: "/workspace/FORGE-q35/build-t/fuzz_grammar" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/grammar"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_grammar" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 2 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.12 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_grammar" end time: Oct 31 15:26 AEDT
+"fuzz_grammar" time elapsed: 00:00:00
+----------------------------------------------------------
+
+132/140 Testing: fuzz_tokenizer
+132/140 Test: fuzz_tokenizer
+Command: "/workspace/FORGE-q35/build-t/fuzz_tokenizer" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/tokenizer"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_tokenizer" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 1 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.13 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_tokenizer" end time: Oct 31 15:26 AEDT
+"fuzz_tokenizer" time elapsed: 00:00:00
+----------------------------------------------------------
+
+119/140 Testing: golden_tiny_qwen3_5
+119/140 Test: golden_tiny_qwen3_5
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/verify/golden/tiny_qwen3_5.py" "--forge" "/workspace/FORGE-q35/build-t/forge" "--work" "/workspace/FORGE-q35/build-t/golden_tiny_qwen3_5"
+Directory: /workspace/FORGE-q35/build-t
+"golden_tiny_qwen3_5" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[skip] torch / transformers with qwen3_5 not installed
+golden qwen3_5: SKIP
+<end of output>
+Test time =   0.10 sec
+----------------------------------------------------------
+Test Passed.
+"golden_tiny_qwen3_5" end time: Oct 31 15:26 AEDT
+"golden_tiny_qwen3_5" time elapsed: 00:00:00
+----------------------------------------------------------
+
+129/140 Testing: fuzz_fpk
+129/140 Test: fuzz_fpk
+Command: "/workspace/FORGE-q35/build-t/fuzz_fpk" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/fpk"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_fpk" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 1 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.16 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_fpk" end time: Oct 31 15:26 AEDT
+"fuzz_fpk" time elapsed: 00:00:00
+----------------------------------------------------------
+
+35/140 Testing: test_util
+35/140 Test: test_util
+Command: "/workspace/FORGE-q35/build-t/test_util"
+Directory: /workspace/FORGE-q35
+"test_util" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] stopwatch_and_deadline
+[ ok ] atomic_write_replaces_whole_file
+[ ok ] settings_registry
+0 failure(s)
+<end of output>
+Test time =   0.09 sec
+----------------------------------------------------------
+Test Passed.
+"test_util" end time: Oct 31 15:26 AEDT
+"test_util" time elapsed: 00:00:00
+----------------------------------------------------------
+
+115/140 Testing: pack_signing
+115/140 Test: pack_signing
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/tests/sign_test.py" "/workspace/FORGE-q35/build-t/forge" "/workspace/FORGE-q35/build-t/golden/tiny_f32.fpk"
+Directory: /workspace/FORGE-q35/build-t
+"pack_signing" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+signature ok   key e3d381de
+/tmp/tmpj4ns91zd/s.fpk: VERIFIED
+[ok] signature verified by pyca/cryptography Ed25519
+[ok] two signers
+[ok] tampered files rejected: /tmp/tmpj4ns91zd/t.fpk: content does not match signed digest (file modified after signing)
+[ok] strict mode refuses unsigned / tampered files, accepts trusted signatures
+sign: PASS
+<end of output>
+Test time =   0.11 sec
+----------------------------------------------------------
+Test Passed.
+"pack_signing" end time: Oct 31 15:26 AEDT
+"pack_signing" time elapsed: 00:00:00
+----------------------------------------------------------
+
+25/140 Testing: test_pool
+25/140 Test: test_pool
+Command: "/workspace/FORGE-q35/build-t/test_pool"
+Directory: /workspace/FORGE-q35
+"test_pool" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] submit_returns_values_and_exceptions
+[ ok ] priority_order_with_one_worker
+[ ok ] cancellation_before_and_during
+[ ok ] single_thread_pool_runs_inline_and_wait_idle
+[ ok ] parallel_for_still_works_alongside_tasks
+[ ok ] destructor_drains_queue
+0 failure(s)
+<end of output>
+Test time =   0.08 sec
+----------------------------------------------------------
+Test Passed.
+"test_pool" end time: Oct 31 15:26 AEDT
+"test_pool" time elapsed: 00:00:00
+----------------------------------------------------------
+
+135/140 Testing: fuzz_script
+135/140 Test: fuzz_script
+Command: "/workspace/FORGE-q35/build-t/fuzz_script" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/script"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_script" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 12 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_script" end time: Oct 31 15:26 AEDT
+"fuzz_script" time elapsed: 00:00:00
+----------------------------------------------------------
+
+28/140 Testing: test_script_golden
+28/140 Test: test_script_golden
+Command: "/workspace/FORGE-q35/build-t/test_script_golden"
+Directory: /workspace/FORGE-q35
+"test_script_golden" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] golden_scripts
+[ ok ] fuzz_regressions_are_syntax_errors
+0 failure(s)
+<end of output>
+Test time =   0.07 sec
+----------------------------------------------------------
+Test Passed.
+"test_script_golden" end time: Oct 31 15:26 AEDT
+"test_script_golden" time elapsed: 00:00:00
+----------------------------------------------------------
+
+26/140 Testing: test_rpc
+26/140 Test: test_rpc
+Command: "/workspace/FORGE-q35/build-t/test_rpc"
+Directory: /workspace/FORGE-q35
+"test_rpc" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] rpc_loopback_matches_cpu
+[ ok ] rpc_errors_propagate
+[ ok ] rpc_connect_failure_falls_back
+[ ok ] pipeline_split_two_stages
+skip: no vulkan (device 'vulkan' not available in this build)
+[ ok ] pipeline_with_vulkan_if_present
+[ ok ] pipeline_multi_gpu_if_present
+[ ok ] rpc_token_auth
+[ ok ] rpc_key_auth_and_scripts
+[ ok ] rpc_tls
+0 failure(s)
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"test_rpc" end time: Oct 31 15:26 AEDT
+"test_rpc" time elapsed: 00:00:00
+----------------------------------------------------------
+
+128/140 Testing: fuzz_blueprint
+128/140 Test: fuzz_blueprint
+Command: "/workspace/FORGE-q35/build-t/fuzz_blueprint" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/blueprint"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_blueprint" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 3 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.06 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_blueprint" end time: Oct 31 15:26 AEDT
+"fuzz_blueprint" time elapsed: 00:00:00
+----------------------------------------------------------
+
+127/140 Testing: fuzz_json
+127/140 Test: fuzz_json
+Command: "/workspace/FORGE-q35/build-t/fuzz_json" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/json"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_json" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 2 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_json" end time: Oct 31 15:26 AEDT
+"fuzz_json" time elapsed: 00:00:00
+----------------------------------------------------------
+
+134/140 Testing: fuzz_onnx
+134/140 Test: fuzz_onnx
+Command: "/workspace/FORGE-q35/build-t/fuzz_onnx" "--iters" "4000" "/workspace/FORGE-q35/fuzz/corpus/onnx"
+Directory: /workspace/FORGE-q35/build-t
+"fuzz_onnx" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuzz: 2 seeds + 4000 mutated inputs, no findings
+<end of output>
+Test time =   0.03 sec
+----------------------------------------------------------
+Test Passed.
+"fuzz_onnx" end time: Oct 31 15:26 AEDT
+"fuzz_onnx" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/140 Testing: test_dtypes
+4/140 Test: test_dtypes
+Command: "/workspace/FORGE-q35/build-t/test_dtypes"
+Directory: /workspace/FORGE-q35
+"test_dtypes" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] f16_roundtrip_exhaustive
+[ ok ] f16_known_values
+[ ok ] f16_rounding_matches_bruteforce
+[ ok ] bf16_roundtrip_exhaustive
+[ ok ] fp8_e4m3_exhaustive
+[ ok ] fp8_e5m2_exhaustive
+[ ok ] int4_packing_exhaustive
+[ ok ] mx_element_formats_exhaustive
+[ ok ] stochastic_rounding_unbiased
+[ ok ] dtype_names
+0 failure(s)
+<end of output>
+Test time =   0.04 sec
+----------------------------------------------------------
+Test Passed.
+"test_dtypes" end time: Oct 31 15:26 AEDT
+"test_dtypes" time elapsed: 00:00:00
+----------------------------------------------------------
+
+1/140 Testing: test_aio
+1/140 Test: test_aio
+Command: "/workspace/FORGE-q35/build-t/test_aio"
+Directory: /workspace/FORGE-q35
+"test_aio" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+backend=io_uring
+backend=threads
+aio ok
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"test_aio" end time: Oct 31 15:26 AEDT
+"test_aio" time elapsed: 00:00:00
+----------------------------------------------------------
+
+125/140 Testing: docs_up_to_date
+125/140 Test: docs_up_to_date
+Command: "/usr/bin/python3.13" "/workspace/FORGE-q35/tools/gen_docs.py" "--check"
+Directory: /workspace/FORGE-q35/build-t
+"docs_up_to_date" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+docs/reference.md up to date
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"docs_up_to_date" end time: Oct 31 15:26 AEDT
+"docs_up_to_date" time elapsed: 00:00:00
+----------------------------------------------------------
+
+31/140 Testing: test_support2
+31/140 Test: test_support2
+Command: "/workspace/FORGE-q35/build-t/test_support2"
+Directory: /workspace/FORGE-q35
+"test_support2" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] threefry_kat
+[ ok ] linalg_eig_svd_gmres
+[ ok ] tlsf_random_ops_and_leaks
+[ ok ] reflect_round_trip
+[ ok ] audio_resample_biquad
+[ ok ] vision_roi_align
+0 failure(s)
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"test_support2" end time: Oct 31 15:26 AEDT
+"test_support2" time elapsed: 00:00:00
+----------------------------------------------------------
+
+139/140 Testing: example_neuralvfx_stream
+139/140 Test: example_neuralvfx_stream
+Command: "/workspace/FORGE-q35/build-t/example_neuralvfx_stream"
+Directory: /workspace/FORGE-q35/build-t
+"example_neuralvfx_stream" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+neuralvfx: 92 frames, 0 dropped, 0 overruns, worst 0.326 ms
+neuralvfx: 92 frames, 0 dropped, 0 overruns, worst 0.060 ms
+neuralvfx: reproducible across runs: yes
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"example_neuralvfx_stream" end time: Oct 31 15:26 AEDT
+"example_neuralvfx_stream" time elapsed: 00:00:00
+----------------------------------------------------------
+
+32/140 Testing: test_text
+32/140 Test: test_text
+Command: "/workspace/FORGE-q35/build-t/test_text"
+Directory: /workspace/FORGE-q35
+"test_text" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+test_text: 114/114 checks passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_text" end time: Oct 31 15:26 AEDT
+"test_text" time elapsed: 00:00:00
+----------------------------------------------------------
+
+24/140 Testing: test_pack
+24/140 Test: test_pack
+Command: "/workspace/FORGE-q35/build-t/test_pack"
+Directory: /workspace/FORGE-q35
+"test_pack" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] blake3_matches_reference_implementation
+[ ok ] json_roundtrip_and_errors
+[ ok ] fpk_write_read_verify_and_corruption
+[ ok ] bpe_tokenizer_merges_and_roundtrip
+[ ok ] blueprint_parse_build_and_errors
+[ ok ] sampler_chain
+[ ok ] blueprint_composite_ops
+[ ok ] fpk_encryption_hook
+0 failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_pack" end time: Oct 31 15:26 AEDT
+"test_pack" time elapsed: 00:00:00
+----------------------------------------------------------
+
+5/140 Testing: test_flow
+5/140 Test: test_flow
+Command: "/workspace/FORGE-q35/build-t/test_flow"
+Directory: /workspace/FORGE-q35
+"test_flow" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] verify_reports_location
+[ ok ] cse_fold_simplify_fuse_dce
+[ ok ] pass_equivalence_random_graphs
+  arena 4096 naive 4096 in-place 20
+[ ok ] memory_plan_reuse_and_peak
+  18 lowerings verified
+[ ok ] lowerings_pass_oracle
+  62/62 ops pass
+[ ok ] oracle_matrix_all_ops
+[ ok ] state_append_symbolic_length
+  state ops: delta_rule max err 4.49e-08, causal_conv max err 2.28e-07
+[ ok ] state_ops_conv_and_delta_rule_streaming
+[ ok ] codecs_exact_and_layout
+  f32        4000 bytes  max err 0.00000
+  f16        2000 bytes  max err 0.00098
+  bf16       2000 bytes  max err 0.00780
+  fp8_e4m3   1000 bytes  max err 0.12460
+  q8_0       1088 bytes  max err 0.01205
+  q4_k        576 bytes  max err 0.19481
+  fp8_e5m2   1000 bytes  max err 0.24996
+  q4_g32      640 bytes  max err 0.19508
+  q8_g32     1152 bytes  max err 0.01149
+  mxfp8      1056 bytes  max err 0.12460
+  mxfp6       800 bytes  max err 0.12460
+  mxfp4       544 bytes  max err 0.49910
+  mxint8     1056 bytes  max err 0.01561
+  nvfp4       567 bytes  max err 0.49910
+  tq2         288 bytes  max err 1.31230
+  q6_k        840 bytes  max err 0.04808
+  q5_k        704 bytes  max err 0.09468
+[ ok ] codecs_roundtrip
+  qdot: scalar exact for q8_0 q4_k q6_k q5_k f16 q8_g32
+  qdot: avx2 exact for q8_0 q4_k q6_k q5_k f16 q8_g32
+  qdot: avx512 exact for q8_0 q4_k q6_k q5_k f16 q8_g32
+[ ok ] qdot_matches_decode_exactly
+  autodiff worst relative error vs finite differences: 6.48e-03
+[ ok ] autodiff_matches_finite_differences
+0 failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_flow" end time: Oct 31 15:26 AEDT
+"test_flow" time elapsed: 00:00:00
+----------------------------------------------------------
+
+9/140 Testing: test_kvquant
+9/140 Test: test_kvquant
+Command: "/workspace/FORGE-q35/build-t/test_kvquant"
+Directory: /workspace/FORGE-q35
+"test_kvquant" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] codec_roundtrip_bounds
+  cpu: max logit error vs f32 KV: int8 6.80e-03, fp8 3.11e-02 (relative to max |logit|)
+  greedy tokens identical to f32 KV: 8/12
+[ ok ] kv_quant_cpu_accuracy
+[ ok ] kv_quant_prefix_copy_and_rewind
+  vulkan not built: skipped
+[ ok ] kv_quant_vulkan
+0 failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_kvquant" end time: Oct 31 15:26 AEDT
+"test_kvquant" time elapsed: 00:00:00
+----------------------------------------------------------
+
+30/140 Testing: test_support
+30/140 Test: test_support
+Command: "/workspace/FORGE-q35/build-t/test_support"
+Directory: /workspace/FORGE-q35
+"test_support" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] arena_alignment_and_scope
+[ ok ] linalg_lu_chol_qr_cg
+[ ok ] fft_matches_dft_any_length
+[ ok ] stft_and_mel
+[ ok ] vision_resize_colour_nms
+[ ok ] prof_chrome_trace
+[ ok ] prims_segmented_bitonic_hash
+0 failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_support" end time: Oct 31 15:26 AEDT
+"test_support" time elapsed: 00:00:00
+----------------------------------------------------------
+
+7/140 Testing: test_grid
+7/140 Test: test_grid
+Command: "/workspace/FORGE-q35/build-t/test_grid"
+Directory: /workspace/FORGE-q35
+"test_grid" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] graph_first_record_compile_replay
+  cpu        yes avx512
+  cuda       no  runtime not found: libcuda.so.1
+  hip        no  runtime not found: libamdhip64.so
+  level_zero no  runtime not found: libze_loader.so.1
+  vulkan     yes loaded libvulkan.so.1
+  metal      no  metal backend not built on this platform
+[ ok ] backend_probe_and_caps
+[ ok ] prims_reduce_scan_compact
+[ ok ] prims_radix_sort_topk
+[ ok ] prims_gemm_and_philox
+0 failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_grid" end time: Oct 31 15:26 AEDT
+"test_grid" time elapsed: 00:00:00
+----------------------------------------------------------
+
+122/140 Testing: capi_smoke
+122/140 Test: capi_smoke
+Command: "/workspace/FORGE-q35/build-t/capi_smoke" "/workspace/FORGE-q35/build-t/golden/tiny_f32.fpk"
+Directory: /workspace/FORGE-q35/build-t
+"capi_smoke" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+tokens 6, roundtrip "the theory", generated 8 (callbacks 8), vocab 300
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"capi_smoke" end time: Oct 31 15:26 AEDT
+"capi_smoke" time elapsed: 00:00:00
+----------------------------------------------------------
+
+12/140 Testing: test_locale
+12/140 Test: test_locale
+Command: "/workspace/FORGE-q35/build-t/test_locale"
+Directory: /workspace/FORGE-q35
+"test_locale" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+  tz backend: tzif:/usr/share/zoneinfo, local zone: Australia/Sydney
+test_locale: 223/223 checks passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_locale" end time: Oct 31 15:26 AEDT
+"test_locale" time elapsed: 00:00:00
+----------------------------------------------------------
+
+19/140 Testing: test_os_dev
+19/140 Test: test_os_dev
+Command: "/workspace/FORGE-q35/build-t/test_os_dev"
+Directory: /workspace/FORGE-q35
+"test_os_dev" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] devices_enumerate
+[ ok ] clipboard_roundtrip_or_unsupported
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_os_dev" end time: Oct 31 15:26 AEDT
+"test_os_dev" time elapsed: 00:00:00
+----------------------------------------------------------
+
+17/140 Testing: test_mobile
+17/140 Test: test_mobile
+Command: "/workspace/FORGE-q35/build-t/test_mobile"
+Directory: /workspace/FORGE-q35
+"test_mobile" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] sim_device_basics
+[ ok ] sim_sensor_stream
+[ ok ] sim_touch_and_gestures
+[ ok ] gesture_pinch_double_long
+[ ok ] sim_bad_trace
+[ ok ] bridge_feed
+[ ok ] null_device_unsupported
+[ ok ] platform_open
+[ ok ] sim_services
+[ ok ] sim_lifecycle
+[ ok ] geofencing
+[ ok ] gesture_rotate
+[ ok ] linux_iio_fake_sysfs
+0 failure(s)
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"test_mobile" end time: Oct 31 15:26 AEDT
+"test_mobile" time elapsed: 00:00:00
+----------------------------------------------------------
+
+114/140 Testing: doc_example_mind_generate
+114/140 Test: doc_example_mind_generate
+Command: "/workspace/FORGE-q35/build-t/doc_example_mind_generate" "/workspace/FORGE-q35/build-t/golden/tiny_f32.fpk" "Hi"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_mind_generate" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+16 tokens: õ¹º‰onˆ8+
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_mind_generate" end time: Oct 31 15:26 AEDT
+"doc_example_mind_generate" time elapsed: 00:00:00
+----------------------------------------------------------
+
+107/140 Testing: doc_example_capi_generate
+107/140 Test: doc_example_capi_generate
+Command: "/workspace/FORGE-q35/build-t/doc_example_capi_generate" "/workspace/FORGE-q35/build-t/golden/tiny_f32.fpk"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_capi_generate" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+forge 0.1.0 abi 3: 16 tokens (16 callbacks), position 21
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_capi_generate" end time: Oct 31 15:26 AEDT
+"doc_example_capi_generate" time elapsed: 00:00:00
+----------------------------------------------------------
+
+13/140 Testing: test_log
+13/140 Test: test_log
+Command: "/workspace/FORGE-q35/build-t/test_log"
+Directory: /workspace/FORGE-q35
+"test_log" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] levels_and_threshold
+[ ok ] module_tags_and_overrides
+[ ok ] json_format_escapes
+[ ok ] file_sink_and_threads_do_not_interleave
+[ ok ] env_spec_parsing
+[ ok ] fatal_level_and_macros_skip_arguments
+[ ok ] file_sink_rotation
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_log" end time: Oct 31 15:26 AEDT
+"test_log" time elapsed: 00:00:00
+----------------------------------------------------------
+
+140/140 Testing: example_seatbelt_one_shot
+140/140 Test: example_seatbelt_one_shot
+Command: "/workspace/FORGE-q35/build-t/example_seatbelt_one_shot"
+Directory: /workspace/FORGE-q35/build-t
+"example_seatbelt_one_shot" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+seatbelt: worn, 2 box(es) after NMS, 0.17 ms (budget 20.0)
+seatbelt: 0/10 frames over budget
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"example_seatbelt_one_shot" end time: Oct 31 15:26 AEDT
+"example_seatbelt_one_shot" time elapsed: 00:00:00
+----------------------------------------------------------
+
+34/140 Testing: test_tile
+34/140 Test: test_tile
+Command: "/workspace/FORGE-q35/build-t/test_tile"
+Directory: /workspace/FORGE-q35
+"test_tile" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] amx_bf16_and_s8
+  skip: no SME
+[ ok ] sme_f32
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_tile" end time: Oct 31 15:26 AEDT
+"test_tile" time elapsed: 00:00:00
+----------------------------------------------------------
+
+112/140 Testing: doc_example_os_features
+112/140 Test: doc_example_os_features
+Command: "/workspace/FORGE-q35/build-t/doc_example_os_features"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_os_features" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+Intel(R) Xeon(R) Processor: 8 logical / 8 physical, hybrid=0
+numa nodes: 1
+pin to P-core: ok
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_os_features" end time: Oct 31 15:26 AEDT
+"doc_example_os_features" time elapsed: 00:00:00
+----------------------------------------------------------
+
+138/140 Testing: example_fuse_runtime
+138/140 Test: example_fuse_runtime
+Command: "/workspace/FORGE-q35/build-t/example_fuse_runtime"
+Directory: /workspace/FORGE-q35/build-t
+"example_fuse_runtime" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+fuse: 8 workers, lane avx512, blended mean 1.750
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"example_fuse_runtime" end time: Oct 31 15:26 AEDT
+"example_fuse_runtime" time elapsed: 00:00:00
+----------------------------------------------------------
+
+111/140 Testing: doc_example_flow_graph
+111/140 Test: doc_example_flow_graph
+Command: "/workspace/FORGE-q35/build-t/doc_example_flow_graph"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_flow_graph" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+y[1]=1.98722 (ref 1.98722), dx[0]=0.50000
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_flow_graph" end time: Oct 31 15:26 AEDT
+"doc_example_flow_graph" time elapsed: 00:00:00
+----------------------------------------------------------
+
+29/140 Testing: test_sessions
+29/140 Test: test_sessions
+Command: "/workspace/FORGE-q35/build-t/test_sessions"
+Directory: /workspace/FORGE-q35
+"test_sessions" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] diffusion_ddim_converges_all_predictions
+[ ok ] diffusion_guidance_and_cache_resume
+[ ok ] diffusion_ddpm_stochastic_but_seeded
+[ ok ] diffusion_euler_flow
+[ ok ] streaming_framing_matches_offline
+[ ok ] streaming_latency_budget_drops_oldest
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_sessions" end time: Oct 31 15:26 AEDT
+"test_sessions" time elapsed: 00:00:00
+----------------------------------------------------------
+
+110/140 Testing: doc_example_pack_roundtrip
+110/140 Test: doc_example_pack_roundtrip
+Command: "/workspace/FORGE-q35/build-t/doc_example_pack_roundtrip"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_pack_roundtrip" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+name=demo verify=ok w[255]=2.55 wq codec=q8_0
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_pack_roundtrip" end time: Oct 31 15:26 AEDT
+"doc_example_pack_roundtrip" time elapsed: 00:00:00
+----------------------------------------------------------
+
+109/140 Testing: doc_example_grid_graph
+109/140 Test: doc_example_grid_graph
+Command: "/workspace/FORGE-q35/build-t/doc_example_grid_graph"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_grid_graph" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+cpu        available
+cuda       absent
+hip        absent
+level_zero absent
+vulkan     available
+metal      absent
+back[0]=3 scan[4]=14
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_grid_graph" end time: Oct 31 15:26 AEDT
+"doc_example_grid_graph" time elapsed: 00:00:00
+----------------------------------------------------------
+
+36/140 Testing: test_video
+36/140 Test: test_video
+Command: "/workspace/FORGE-q35/build-t/test_video"
+Directory: /workspace/FORGE-q35
+"test_video" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] annexb_split
+[ ok ] avcc_to_annexb
+[ ok ] sps_dimensions
+  skip: no DRM render node /dev/dri/renderD128
+[ ok ] vaapi_probe_or_skip
+  skip: vaapi: no DRM render node /dev/dri/renderD128; 
+[ ok ] hw_decode_or_skip
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_video" end time: Oct 31 15:26 AEDT
+"test_video" time elapsed: 00:00:00
+----------------------------------------------------------
+
+108/140 Testing: doc_example_lane_dispatch
+108/140 Test: doc_example_lane_dispatch
+Command: "/workspace/FORGE-q35/build-t/doc_example_lane_dispatch"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_lane_dispatch" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+cpu: GenuineIntel | Intel(R) Xeon(R) Processor sse4.2 avx avx2 fma f16c avx512f avx512bw avx512dq avx512vl avx512vnni avx512bf16 avx512fp16 avx512ifma avx512vbmi avxvnni amx-tile (amx-permitted)
+target: avx512
+dot = 5000.0
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_lane_dispatch" end time: Oct 31 15:26 AEDT
+"doc_example_lane_dispatch" time elapsed: 00:00:00
+----------------------------------------------------------
+
+136/140 Testing: example_camera_detector
+136/140 Test: example_camera_detector
+Command: "/workspace/FORGE-q35/build-t/example_camera_detector"
+Directory: /workspace/FORGE-q35/build-t
+"example_camera_detector" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+camera_detector: macro+micro max err 0.0000, output 64x64
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"example_camera_detector" end time: Oct 31 15:26 AEDT
+"example_camera_detector" time elapsed: 00:00:00
+----------------------------------------------------------
+
+137/140 Testing: example_cypha_classifier
+137/140 Test: example_cypha_classifier
+Command: "/workspace/FORGE-q35/build-t/example_cypha_classifier"
+Directory: /workspace/FORGE-q35/build-t
+"example_cypha_classifier" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+cypha (avx512 lane): code (1.70)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"example_cypha_classifier" end time: Oct 31 15:26 AEDT
+"example_cypha_classifier" time elapsed: 00:00:00
+----------------------------------------------------------
+
+14/140 Testing: test_log_strip
+14/140 Test: test_log_strip
+Command: "/workspace/FORGE-q35/build-t/test_log_strip"
+Directory: /workspace/FORGE-q35
+"test_log_strip" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] compile_time_strip
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_log_strip" end time: Oct 31 15:26 AEDT
+"test_log_strip" time elapsed: 00:00:00
+----------------------------------------------------------
+
+11/140 Testing: test_lane_raw
+11/140 Test: test_lane_raw
+Command: "/workspace/FORGE-q35/build-t/test_lane_raw"
+Directory: /workspace/FORGE-q35
+"test_lane_raw" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+[ ok ] raw_generated_count
+[ ok ] raw_avx2_executes
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_lane_raw" end time: Oct 31 15:26 AEDT
+"test_lane_raw" time elapsed: 00:00:00
+----------------------------------------------------------
+
+113/140 Testing: doc_example_balance_pool
+113/140 Test: doc_example_balance_pool
+Command: "/workspace/FORGE-q35/build-t/doc_example_balance_pool"
+Directory: /workspace/FORGE-q35/build-t
+"doc_example_balance_pool" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+picked gpu0
+call ok=1 after 2 backends
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"doc_example_balance_pool" end time: Oct 31 15:26 AEDT
+"doc_example_balance_pool" time elapsed: 00:00:00
+----------------------------------------------------------
+
+8/140 Testing: test_interop
+8/140 Test: test_interop
+Command: "/workspace/FORGE-q35/build-t/test_interop"
+Directory: /workspace/FORGE-q35
+"test_interop" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+  skip: Vulkan not built
+[ ok ] vk_not_built
+0 failure(s)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_interop" end time: Oct 31 15:26 AEDT
+"test_interop" time elapsed: 00:00:00
+----------------------------------------------------------
+
+6/140 Testing: test_gpu
+6/140 Test: test_gpu
+Command: "/workspace/FORGE-q35/build-t/test_gpu"
+Directory: /workspace/FORGE-q35
+"test_gpu" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP images: built without a GPU-capable clang
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu" end time: Oct 31 15:26 AEDT
+"test_gpu" time elapsed: 00:00:00
+----------------------------------------------------------
+
+33/140 Testing: test_text_conformance
+33/140 Test: test_text_conformance
+Command: "/workspace/FORGE-q35/build-t/test_text_conformance"
+Directory: /workspace/FORGE-q35
+"test_text_conformance" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+no UCD test data in tests/data/ucd (set FORGE_UCD_DIR or -DFORGE_FETCH_UCD=ON); skipping
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_text_conformance" end time: Oct 31 15:26 AEDT
+"test_text_conformance" time elapsed: 00:00:00
+----------------------------------------------------------
+
+37/140 Testing: test_vulkan
+37/140 Test: test_vulkan
+Command: "/workspace/FORGE-q35/build-t/test_vulkan"
+Directory: /workspace/FORGE-q35
+"test_vulkan" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+vulkan backend not built (no vulkan headers / glslangValidator)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_vulkan" end time: Oct 31 15:26 AEDT
+"test_vulkan" time elapsed: 00:00:00
+----------------------------------------------------------
+
+85/140 Testing: test_vulkan_align256
+85/140 Test: test_vulkan_align256
+Command: "/workspace/FORGE-q35/build-t/test_vulkan"
+Directory: /workspace/FORGE-q35
+"test_vulkan_align256" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+vulkan backend not built (no vulkan headers / glslangValidator)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_vulkan_align256" end time: Oct 31 15:26 AEDT
+"test_vulkan_align256" time elapsed: 00:00:00
+----------------------------------------------------------
+
+86/140 Testing: test_gpu_cuda
+86/140 Test: test_gpu_cuda
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "cuda"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_cuda" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: cuda: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_cuda" end time: Oct 31 15:26 AEDT
+"test_gpu_cuda" time elapsed: 00:00:00
+----------------------------------------------------------
+
+87/140 Testing: test_gpu_hip
+87/140 Test: test_gpu_hip
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "hip"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_hip" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: hip: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_hip" end time: Oct 31 15:26 AEDT
+"test_gpu_hip" time elapsed: 00:00:00
+----------------------------------------------------------
+
+88/140 Testing: test_gpu_features_cuda
+88/140 Test: test_gpu_features_cuda
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "cuda"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_cuda" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: cuda: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_cuda" end time: Oct 31 15:26 AEDT
+"test_gpu_features_cuda" time elapsed: 00:00:00
+----------------------------------------------------------
+
+89/140 Testing: test_gpu_features_hip
+89/140 Test: test_gpu_features_hip
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "hip"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_hip" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: hip: this build has no embedded kernel image (no clang with the GPU target at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_hip" end time: Oct 31 15:26 AEDT
+"test_gpu_features_hip" time elapsed: 00:00:00
+----------------------------------------------------------
+
+90/140 Testing: test_gpu_metal
+90/140 Test: test_gpu_metal
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "metal"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_metal" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: metal: not an Apple platform build
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_metal" end time: Oct 31 15:26 AEDT
+"test_gpu_metal" time elapsed: 00:00:00
+----------------------------------------------------------
+
+91/140 Testing: test_gpu_opencl
+91/140 Test: test_gpu_opencl
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "opencl"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_opencl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: opencl: no devices
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_opencl" end time: Oct 31 15:26 AEDT
+"test_gpu_opencl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+92/140 Testing: test_gpu_features_opencl
+92/140 Test: test_gpu_features_opencl
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "opencl"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_opencl" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: opencl: no devices
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_opencl" end time: Oct 31 15:26 AEDT
+"test_gpu_features_opencl" time elapsed: 00:00:00
+----------------------------------------------------------
+
+93/140 Testing: test_gpu_ze
+93/140 Test: test_gpu_ze
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "ze"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_ze" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: level_zero: this build has no SPIR-V kernel image (llvm-spirv was not found at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_ze" end time: Oct 31 15:26 AEDT
+"test_gpu_ze" time elapsed: 00:00:00
+----------------------------------------------------------
+
+94/140 Testing: test_gpu_features_ze
+94/140 Test: test_gpu_features_ze
+Command: "/workspace/FORGE-q35/build-t/test_gpu" "features" "ze"
+Directory: /workspace/FORGE-q35/build-t
+"test_gpu_features_ze" start time: Oct 31 15:26 AEDT
+Output:
+----------------------------------------------------------
+SKIP: level_zero: this build has no SPIR-V kernel image (llvm-spirv was not found at build time)
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"test_gpu_features_ze" end time: Oct 31 15:26 AEDT
+"test_gpu_features_ze" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 31 15:26 AEDT
+
+cross =   3.97 sec*proc
+
+fuzz =   1.15 sec*proc
+
+gpu =   1.04 sec*proc
+
+integration =   0.03 sec*proc
+
+slow =   3.97 sec*proc
+

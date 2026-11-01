@@ -1,0 +1,17 @@
+6:test_gpu
+33:test_text_conformance
+37:test_vulkan
+85:test_vulkan_align256
+86:test_gpu_cuda
+87:test_gpu_hip
+88:test_gpu_features_cuda
+89:test_gpu_features_hip
+90:test_gpu_metal
+91:test_gpu_opencl
+92:test_gpu_features_opencl
+93:test_gpu_ze
+94:test_gpu_features_ze
+95:test_gpu_cuda_mock
+100:test_gpu_hip_mock
+101:test_gpu_features_cuda_mock
+102:test_gpu_features_hip_mock

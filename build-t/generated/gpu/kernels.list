@@ -1,0 +1,1 @@
+abs;cos;exp;exp2;gelu_tanh;log;log2;neg;recip;relu;rsqrt;sigmoid;silu;sin;softplus;sqrt;square;tanh;add;div;maximum;minimum;mul;sub;scale;softmax;rms_norm;matmul_t;silu_mul;rope;gather;attention;slice
