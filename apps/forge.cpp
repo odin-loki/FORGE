@@ -312,6 +312,12 @@ int cmd_bench(const args& a) {
     int p = int(a.num("p", 32)), n = int(a.num("n", 32));
     std::vector<int> prompt(std::size_t(p), 1);
     mind::sampler smp;
+    // --warmup N (default 1): untimed short runs first, so one-off weight uploads / page-ins of the mmapped
+    // model and kernel loads are not counted as prefill or decode time (llama-bench does the same).
+    for (int w = int(a.num("warmup", 1)); w > 0; --w) {
+        std::vector<int> wp(std::size_t(std::min(p, 64)), 1); mind::generate_stats ws;
+        s.generate(wp, 2, smp, {}, &ws); s.reset();
+    }
     mind::generate_stats st;
     s.generate(prompt, n, smp, {}, &st);
     std::printf("prefill %d tokens: %.1f tok/s\ndecode  %zu tokens: %.1f tok/s\n", p, p / st.prefill_s, st.new_tokens,
