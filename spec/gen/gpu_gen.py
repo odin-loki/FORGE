@@ -362,7 +362,7 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
 // Decode path after llama.cpp's mmvq (ggml-cuda/mmvq.cu, vecdotq.cuh; MIT, the ggml authors): activations are
 // quantised to q8_1-style blocks (40 bytes: float d, pad, 32 x int8) and dotted with dp4a against the encoded weights.
 FORGE_DEV int dp4a_us(unsigned a, int b, int c) { int r; asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r; }
-FORGE_DEV float wmax_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) v = __builtin_fmaxf(v, __nvvm_shfl_sync_bfly_f32(0xffffffffu, v, o, 31)); return v; }
+FORGE_DEV float wmax_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v = __builtin_fmaxf(v, w); } return v; }
 FORGE_GLOBAL void forge_quant_q81(const float* x, unsigned char* xq, unsigned nb) {   // a warp per 32-value block, 8 per block
   unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i >= nb) return;
   float v = x[(unsigned long long)i * 32u + l], am = wmax_(fabs_(v)), d = am / 127.0f;
