@@ -4,8 +4,8 @@
 # Usage: ci/merge-when-green.sh <pr-number> [extra gh pr merge args]
 set -euo pipefail
 pr="${1:?usage: $0 <pr-number> [gh pr merge args]}"; shift
-if ! gh pr checks "$pr" --required=false >/dev/null 2>&1; then
-  rc=$?
+rc=0; gh pr checks "$pr" >/dev/null 2>&1 || rc=$?
+if [ "$rc" -ne 0 ]; then
   gh pr checks "$pr" || true
   echo "PR #$pr: not all CI checks passed (gh pr checks exit $rc); refusing to merge." >&2
   exit 1
