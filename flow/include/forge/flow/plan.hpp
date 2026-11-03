@@ -206,6 +206,12 @@ public:
     partition_report part;
     std::vector<int> stage_of_node;    // pipeline stage per node (empty = single device)
     device_hooks* hooks = nullptr;     // device residency protocol (null = everything on the host)
+    std::shared_ptr<device_hooks> hooks_ref;   // keeps the hooks (and the runtime behind them) alive for ~plan
+    bool arena_resident = false;       // arena held on the device across runs (device_hooks::arena)
+    plan() = default;
+    plan(const plan&) = delete;
+    plan& operator=(const plan&) = delete;
+    ~plan() { if (arena_resident && hooks_ref && hooks_ref->forget) try { hooks_ref->forget(arena.data(), arena.size()); } catch (...) {} }
     bool pinned = false;
     bool deterministic = true;        // CPU kernels use fixed reduction orders
     std::string describe() const {
@@ -230,6 +236,7 @@ inline std::unique_ptr<plan> compile(graph g, state_store* st = nullptr, const p
     p->views.resize(G.size());
     auto& reg = po.lowerings ? *po.lowerings : registry::cpu();
     p->hooks = reg.stages.empty() ? reg.hooks.get() : nullptr;
+    if (p->hooks) p->hooks_ref = reg.hooks;
     // Pipeline split: contiguous node ranges per stage, balanced by spec cost x output size.
     std::vector<registry*> stage_of(G.size(), &reg);
     if (!reg.stages.empty()) {
@@ -379,6 +386,12 @@ public:
             p_.pinned = true;
         }
         h->begin_run();
+        // a resident arena (up to $FORGE_GPU_ARENA_MB, default 1024; 0 = off): fixed device addresses for every
+        // intermediate, no per-run allocations or re-splits
+        static const std::size_t arena_cap = [] { auto* e = std::getenv("FORGE_GPU_ARENA_MB"); return std::size_t(e ? std::strtoull(e, nullptr, 10) : 1024) << 20; }();
+        if (h->arena && h->forget && p_.arena.size() * sizeof(float) <= arena_cap) {
+            try { h->arena(p_.arena.data(), p_.arena.size()); p_.arena_resident = true; } catch (...) { h->end_run(); throw; }
+        }
         try { run_steps(h); } catch (...) { h->end_run(); throw; }
         if (!h->end_run_discard) return h->end_run();
         // only outputs and persistent state outlive the run: fetch those, drop the device intermediates unread

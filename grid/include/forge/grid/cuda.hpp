@@ -208,12 +208,32 @@ public:
         sync(); in_run_ = false;
     }
     void keep(const float* p, std::size_t n) { std::lock_guard lk(mu_); each_overlap(p, n, [&](entry& e) { e.kept = true; }); }
+    // a plan arena held as one device buffer across runs (flow::device_hooks::arena): intermediates are sub-ranges
+    // of it, so they keep their device addresses run after run
+    void arena(float* h, std::size_t n) {
+        std::lock_guard lk(mu_); bind();
+        auto key = reinterpret_cast<std::uintptr_t>(h);
+        if (auto it = res_.find(key); it != res_.end() && it->second.count == n && it->second.arena) return;
+        auto b = acquire(h, n, false); b.e->kept = true; b.e->arena = true;
+    }
+    void forget(const float* p, std::size_t n) {   // drop device copies without fetching them
+        std::lock_guard lk(mu_); bind(); flush();
+        std::vector<std::uintptr_t> ks;
+        each_overlap(p, n, [&](entry& e) { ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
+        for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+    }
     bool resident() { std::lock_guard lk(mu_); return in_run_; }
     void pin(const float* p, std::size_t n) { std::lock_guard lk(mu_); pinned_.push_back({p, n}); }
     void to_host(const float* p, std::size_t n) {
         std::lock_guard lk(mu_); bind();
         bool any = false;
-        each_overlap(p, n, [&](entry& e) { if (!e.host_valid) { download(e); any = true; } });
+        each_overlap(p, n, [&](entry& e) {
+            if (e.host_valid) return;
+            if (!e.arena) { download(e); any = true; return; }
+            auto el = reinterpret_cast<std::uintptr_t>(e.host), lo = std::max(el, reinterpret_cast<std::uintptr_t>(p)),
+                 hi = std::min(el + e.count * 4, reinterpret_cast<std::uintptr_t>(p) + n * 4);   // just the asked range
+            if (hi > lo) { ck(dtoh_s(reinterpret_cast<void*>(lo), e.d + (lo - el), hi - lo, stream_), "memcpy DtoH"); ++stats_.downloads; any = true; }
+        });
         if (any) sync();
     }
     void host_wrote(const float* p, std::size_t n) {
@@ -619,7 +639,7 @@ private:
             std::vector<char> t(n); int r = dtoh(t.data(), s, n); return r ? r : htod(d, t.data(), n);
         }
     };
-    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false; };
+    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false, arena = false; };
     struct bound { entry* e; std::uint64_t ptr; };
 
     template<class F> bool sym(F& f, const char* n) { f = reinterpret_cast<F>(dlsym(lib_, n)); return f != nullptr; }
