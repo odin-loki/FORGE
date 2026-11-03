@@ -75,6 +75,7 @@ Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backen
 - **CUDA/HIP host runtime**: dlopens libcuda/libamdhip64 at run time and loads the embedded PTX/HSACO. Tested against a mock driver library; the hardware tests skip when there is no device.
 - **pack**:
   - `.fpk` container (mmap, BLAKE3) and **Ed25519 signing** (`forge keygen/sign/verify`, vendored Monocypher, cross-checked against pyca/cryptography).
+  - **Signed bundles** (`forge/pack/bundle.hpp`): Ed25519 over any directory of artefacts via a `FORGE-SIGNATURE.json` manifest of (path, size, BLAKE3). Verification re-hashes the files and reports modified, missing and unsigned-extra files. Supports multiple signers and refuses paths that escape the root. Also domain-separated detached `sign_bytes` / `verify_bytes`.
   - JSON, BPE tokenizer, blueprint language, GBNF grammars.
 - **import**:
   - HF safetensors: Llama, Mixtral **MoE**, and DeepSeek-V2 **MLA** (absorbed).
