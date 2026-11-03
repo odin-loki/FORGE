@@ -132,7 +132,8 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
     if (!strcmp(op, "delta_rule")) return 14; if (!strcmp(op, "causal_conv")) return 7;
-    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) return 12; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
+    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) return 12; if (!strcmp(op, "attention_dec")) return 13;
+    if (!strcmp(op, "attention_comb")) return 5; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
     if (!strcmp(op, "qgather")) return 8; if (!strcmp(op, "bcast")) return 7; if (!strcmp(op, "copy2d")) return 5;
@@ -179,7 +180,16 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         for (i = 0; i < n && i < threads; ++i) { unsigned r = (unsigned)idx[i / cols]; y[i] = r < rows ? t[r * cols + i % cols] : 0; } return 0; }
     if (!strcmp(op, "slice")) { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned), lin = ARG(3, unsigned), inner = ARG(4, unsigned), st = ARG(5, unsigned), len = ARG(6, unsigned);
         for (i = 0; i < n && i < threads; ++i) { unsigned in_ = i % inner, r = (i / inner) % len, o = i / (inner * len); y[i] = x[(o * lin + st + r) * inner + in_]; } return 0; }
-    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa")) { float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *y = P(ARG(3, dptr));
+    if (!strcmp(op, "attention_comb")) { const float* pp = P(ARG(0, dptr)); float* y = P(ARG(1, dptr)); unsigned nrow = ARG(2, unsigned), ns = ARG(3, unsigned), dv = ARG(4, unsigned);
+        for (unsigned id = 0; id < nrow && id < gx; ++id) { const float* p0 = pp + (size_t)id * ns * (dv + 2); float M = -INFINITY, L = 0; unsigned u, e;
+            for (u = 0; u < ns; ++u) if (p0[u * (dv + 2)] > M) M = p0[u * (dv + 2)];
+            for (u = 0; u < ns; ++u) if (p0[u * (dv + 2)] != -INFINITY) L += p0[u * (dv + 2) + 1] * expf(p0[u * (dv + 2)] - M);
+            for (e = 0; e < dv; ++e) { float a = 0; for (u = 0; u < ns; ++u) if (p0[u * (dv + 2)] != -INFINITY) a += p0[u * (dv + 2) + 2 + e] * expf(p0[u * (dv + 2)] - M); y[id * dv + e] = L > 0 ? a / L : 0; } }
+        return 0; }
+    /* attention_dec: the exact result goes in split 0 as (max 0, sum 1, y); the other splits are empty. */
+    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strcmp(op, "attention_dec")) { float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *y = P(ARG(3, dptr));
+        int dec = !strcmp(op, "attention_dec"); unsigned dns = dec ? ARG(12, unsigned) : 1, ddv = ARG(9, unsigned), dn = ARG(4, unsigned) * ARG(5, unsigned);
+        float* part = y; if (dec) { y = (float*)malloc((size_t)dn * ddv * 4 + 4); threads = dn; }
         unsigned s = ARG(4, unsigned), hq = ARG(5, unsigned), d = ARG(6, unsigned), t = ARG(7, unsigned), hk = ARG(8, unsigned), dv = ARG(9, unsigned), fl = ARG(10, unsigned);
         float sc = ARG(11, float);
         unsigned causal = fl & 1, kc = (fl >> 1) & 3, vc = (fl >> 3) & 3, window = fl >> 5;
@@ -194,6 +204,9 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
                 float dot = 0; for (e = 0; e < d; ++e) dot = fmaf(qp[e], kvat(k + (j * hk + kh) * kw, kc, e), dot);
                 float w = expf(dot * sc - m); sum += w; for (e = 0; e < dv; ++e) yp[e] = fmaf(w, kvat(v + (j * hk + kh) * vw, vc, e), yp[e]); }
             for (e = 0; e < dv; ++e) yp[e] *= sum > 0 ? 1 / sum : 0; }
+        if (dec) { for (unsigned id = 0; id < dn; ++id) for (unsigned u = 0; u < dns; ++u) { float* pp = part + ((size_t)id * dns + u) * (ddv + 2);
+                       pp[0] = u ? -INFINITY : 0; pp[1] = u ? 0 : 1; for (unsigned e2 = 0; e2 < ddv; ++e2) pp[2 + e2] = u ? 0 : y[id * ddv + e2]; }
+                   free(y); }
         return 0; }
     if (!strcmp(op, "qmatmul_t")) { float *a = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
