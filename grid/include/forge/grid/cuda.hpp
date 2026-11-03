@@ -249,6 +249,7 @@ public:
         ad = acquire(in[0].data, in[0].size(), false).ptr;
         auto y = acquire(out.data, out.size(), true); y.e->host_valid = false; std::uint64_t yd = y.ptr;
         void* args[] = {&ad, &bd, &yd, &n, &ma, &mb, &o};
+        writes(yd, std::size_t(n) * 4);
         if (n) ck(launch_s(function("forge_bcast"), (n + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         return true;
     }
@@ -264,6 +265,7 @@ public:
         d.e->host_valid = false;
         std::uint64_t sp = s.ptr, dp = d.ptr + off * 4; std::uint32_t r = std::uint32_t(rows), ww = std::uint32_t(w), dss = std::uint32_t(ds);
         void* args[] = {&sp, &dp, &r, &ww, &dss};
+        writes(d.ptr, dst_count * 4);
         ck(launch_s(function("forge_copy2d"), unsigned((rows * w + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         return true;
     }
@@ -362,6 +364,18 @@ public:
     // may change that buffer, so launch_s/htod_s/dtod/free_s drop it (q81_keep_ marks run_qmatmul's own launches).
     std::uint64_t q81_src_ = 0; std::uint32_t q81_n_ = 0; bool q81_keep_ = false;
     void q81_drop() { q81_src_ = 0; }
+    // Device ranges the next launch writes (set by callers that know them). launch_s keeps the q8_1 scratch when
+    // none of them overlaps its source, so e.g. the a/b/z matmuls of a DeltaNet layer reuse the quantised input of
+    // in_proj_qkv across the conv/slice kernels in between; a launch with no declared writes drops it.
+    std::uint64_t wr_[3][2] = {}; unsigned nwr_ = 0;
+    void writes(std::uint64_t p, std::size_t bytes) { if (nwr_ < 3) { wr_[nwr_][0] = p; wr_[nwr_][1] = p + bytes; } ++nwr_; }
+    void q81_reserve(std::size_t need) {
+        if (q81_cap_ >= need) return;
+        q81_drop(); if (q81_) free_s(q81_); q81_ = 0;
+        ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20);
+    }
+    // Decode rms_norm / silu_mul also emit the q8_1 form of their output for the next matmul ($FORGE_FUSE_Q81=0 off).
+    static bool fuse_q81() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q81"); return !(e && std::string(e) == "0"); }(); return on; }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
         std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
@@ -396,7 +410,7 @@ public:
             } else if (fmt <= 3 && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
                 ++dispatches_["qmatmul_q81"];   // decode: q8_1 activations + dp4a (llama.cpp mmvq)
                 std::uint32_t nb = rows * (k / 32); std::size_t need = std::size_t(nb) * 40;
-                if (q81_cap_ < need) { q81_drop(); if (q81_) free_s(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
+                q81_reserve(need);
                 std::uint64_t qx = q81_;
                 q81_keep_ = true;
                 if (q81_src_ != xd || q81_n_ != nb) {
@@ -408,7 +422,7 @@ public:
                 unsigned grid = ((cols + 3) / 4) * ((rows + 3) / 4);   // a warp per column, 4 columns per block
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
                 q81_keep_ = false;
-                if (yd == xd) q81_drop();
+                if (yd < xd + std::uint64_t(nb) * 128 && xd < yd + std::uint64_t(out.size()) * 4) q81_drop();   // y overwrote the source
             } else {
                 unsigned grid = cols * ((rows + 3) / 4);
                 if (grid) ck(launch_s(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
@@ -455,6 +469,7 @@ public:
         if (fn == "delta_rule") { for (int i = 0; i < 6; ++i) args.push_back(&u[i]); args.push_back(&sc); }
         else for (int i = 0; i < 3; ++i) args.push_back(&u[i]);
         ++dispatches_[fn];
+        writes(ptrs.back(), out.size() * 4); writes(ptrs[ptrs.size() - 2], sn * 4);
         if (grid) ck(launch_s(function("forge_" + fn), grid, 1, 1, 128, 1, 1, 0, stream_, args.data(), nullptr), "launch");
         return true;
     }
@@ -537,7 +552,17 @@ public:
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
                 fn = function("forge_attention_fa"); block = 128; grid = rows * cols; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
+            std::uint32_t fnb = 0; std::uint64_t qx = 0;
+            if (in_run_ && fuse_q81() && use_mmvq() && rows < mmq_min_rows()) {
+                if (s == sig::rms && cols % 32 == 0 && has_fn_locked("forge_rms_norm_q81")) {
+                    fn = function("forge_rms_norm_q81"); fnb = rows * (cols / 32); }
+                else if (op == "silu_mul" && n % 32 == 0 && n <= (1u << 18) && has_fn_locked("forge_silu_mul_q81")) {
+                    fn = function("forge_silu_mul_q81"); fnb = n / 32; block = 256; grid = (fnb + 7) / 8; }
+                if (fnb) { q81_reserve(std::size_t(fnb) * 40); qx = q81_; args.push_back(&qx); ++dispatches_["fused_q81"]; }
+            }
+            writes(ptrs.back(), out.size() * 4);
             if (grid) ck(launch_s(fn, grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
+            if (fnb) { q81_src_ = ptrs.back(); q81_n_ = fnb; }
             if (!in_run_) { ck(dtoh_s(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
@@ -605,7 +630,12 @@ private:
     }
     bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0; std::vector<void*> segx_;
     int launch_s(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void* st, void** a, void** ex) {
-        if (!q81_keep_) q81_drop();
+        if (!q81_keep_ && q81_src_) {
+            bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q81_src_, hi = lo + std::uint64_t(q81_n_) * 128;
+            for (unsigned i = 0; i < nwr_ && i < 3; ++i) if (wr_[i][0] < hi && lo < wr_[i][1]) hit = true;
+            if (hit) q81_drop();
+        }
+        nwr_ = 0;
         if (in_run_ && !capturing_ && !user_cap_ && gmode()) { ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; }
         count(capturing_ || user_cap_ ? counters().captured : counters().launches);
         return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);

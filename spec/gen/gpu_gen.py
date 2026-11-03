@@ -369,6 +369,25 @@ FORGE_GLOBAL void forge_quant_q81(const float* x, unsigned char* xq, unsigned nb
   int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
   unsigned char* b = xq + (unsigned long long)i * 40u; ((signed char*)(b + 8u))[l] = (signed char)q;
   if (l == 0u) *(float*)b = d; }
+FORGE_DEV void q81_put(float v, unsigned l, unsigned char* b) {   // one 32-value block per warp, as forge_quant_q81
+  float am = wmax_(fabs_(v)), d = am / 127.0f; int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
+  ((signed char*)(b + 8u))[l] = (signed char)q; if (l == 0u) *(float*)b = d; }
+// Fused decode producers: write y as the unfused kernel does and also its q8_1 blocks into xq, so the matmul that
+// consumes y skips forge_quant_q81 (bit-identical: the blocks are quantised from the same float values).
+FORGE_GLOBAL void forge_rms_norm_q81(const float* x, const float* w, float* y, unsigned rows, unsigned cols, float eps, unsigned char* xq) {
+  __attribute__((shared)) float red[256];
+  unsigned t = tid_(), r = bid_(), l = t & 31u; const float* xr = x + (unsigned long long)r * cols; float s = 0.0f;
+  for (unsigned j = t; j < cols; j += 256u) s = fma_(xr[j], xr[j], s);
+  red[t] = s; bar_();
+  for (unsigned st = 128u; st > 0u; st >>= 1) { if (t < st) red[t] += red[t + st]; bar_(); }
+  float inv = 1.0f / fsqrt(red[0] / (float)cols + eps); unsigned nb = cols / 32u;
+  for (unsigned b = t >> 5; b < nb; b += 8u) {
+    unsigned j = b * 32u + l; float v = xr[j] * inv * w[j]; y[(unsigned long long)r * cols + j] = v;
+    q81_put(v, l, xq + ((unsigned long long)r * nb + b) * 40u); } }
+FORGE_GLOBAL void forge_silu_mul_q81(const float* a, const float* b, float* y, unsigned n, unsigned char* xq) {
+  unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i * 32u >= n) return;
+  unsigned j = i * 32u + l; float v = a[j] / (1.0f + fexp(-a[j])) * b[j]; y[j] = v;
+  q81_put(v, l, xq + (unsigned long long)i * 40u); }
 FORGE_DEV unsigned ld32u(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
 FORGE_DEV int dp4a_ss(int a, int b, int c) { int r; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r; }
 FORGE_DEV float wsum_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v += w; } return v; }
