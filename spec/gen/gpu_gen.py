@@ -466,6 +466,8 @@ FORGE_GLOBAL void forge_bcast(const float* a, const float* b, float* y, unsigned
   unsigned i = bid_() * 256u + tid_(); if (i >= n) return;
   float x = a[i % ma], z = b[i % mb];
   y[i] = op == 0u ? x + z : op == 1u ? x - z : op == 2u ? x * z : x / z; }
+// Word copy (device-to-device copies inside a graph-mode run, so graph segments hold only kernel nodes).
+FORGE_GLOBAL void forge_copy_words(const unsigned* src, unsigned* dst, unsigned n) { unsigned i = bid_() * 256u + tid_(); if (i < n) dst[i] = src[i]; }
 // Strided 2-D copy (concat on the device): dst[r * ds + c] = src[r * w + c].
 FORGE_GLOBAL void forge_copy2d(const float* src, float* dst, unsigned rows, unsigned w, unsigned ds) {
   unsigned i = bid_() * 256u + tid_(); if (i >= rows * w) return;

@@ -21,6 +21,7 @@
 #include <forge/core/dl.hpp>
 #include <algorithm>
 #include <atomic>
+#include <unordered_map>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -39,11 +40,11 @@ enum class api { cuda, hip };
 // kernels are issued (directly or recorded into a captured graph), graphs replayed, copies and syncs. Relaxed
 // atomics, so the cost is one uncontended increment per call.
 struct call_counters {
-    std::atomic<std::uint64_t> launches{0}, captured{0}, graph_launches{0}, dtoh{0}, htod{0}, dtod{0}, syncs{0};
-    struct snapshot { std::uint64_t launches = 0, captured = 0, graph_launches = 0, dtoh = 0, htod = 0, dtod = 0, syncs = 0; };
+    std::atomic<std::uint64_t> launches{0}, captured{0}, graph_launches{0}, dtoh{0}, htod{0}, dtod{0}, syncs{0}, instantiates{0}, node_updates{0};
+    struct snapshot { std::uint64_t launches = 0, captured = 0, graph_launches = 0, dtoh = 0, htod = 0, dtod = 0, syncs = 0, instantiates = 0, node_updates = 0; };
     snapshot read() const {
         auto r = [](const std::atomic<std::uint64_t>& a) { return a.load(std::memory_order_relaxed); };
-        return {r(launches), r(captured), r(graph_launches), r(dtoh), r(htod), r(dtod), r(syncs)};
+        return {r(launches), r(captured), r(graph_launches), r(dtoh), r(htod), r(dtod), r(syncs), r(instantiates), r(node_updates)};
     }
 };
 inline call_counters& counters() { static call_counters c; return c; }
@@ -164,11 +165,11 @@ public:
     ~runtime() {
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear();
             for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); } catch (...) {}
-        for (auto e : segx_) if (e && f_.gexec_destroy) f_.gexec_destroy(e);
+        for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
-        if (ctx_ && f_.ctx_destroy) f_.ctx_destroy(ctx_);
+        if (ctx_ && f_.ctx_destroy) { f_.ctx_destroy(ctx_); ctx_epoch().fetch_add(1, std::memory_order_acq_rel); }
         if (lib_) dlclose(lib_);
     }
     api which() const { return api_; }
@@ -276,7 +277,7 @@ public:
         auto s = acquire(src, n, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
-        gpu::count(counters().dtod); q81_drop(); ck(f_.dtod_async(d.ptr + off * 4, s.ptr, n * 4, stream_), "memcpy DtoD");
+        ck(dtod_s(d.ptr + off * 4, s.ptr, n * 4), "memcpy DtoD");
     }
 
     // ---- graphs: capture the stream's work between capture_begin/capture_end and replay it ----
@@ -603,6 +604,11 @@ private:
         int (*gexec_destroy)(void*) = nullptr;
         int (*graph_destroy)(void*) = nullptr;
         int (*exec_update)(void*, void*, void*) = nullptr;   // cuGraphExecUpdate_v2 (CUDA only)
+        int (*param_info)(void*, std::size_t, std::size_t*, std::size_t*) = nullptr;   // cuFuncGetParamInfo (CUDA 12.4+)
+        int (*kn_set)(void*, void*, const void*) = nullptr;                             // cuGraphExecKernelNodeSetParams
+        int (*g_roots)(void*, void**, std::size_t*) = nullptr;                          // cuGraphGetRootNodes
+        int (*g_deps)(void*, void**, std::size_t*) = nullptr;                           // cuGraphNodeGetDependentNodes
+        int (*g_type)(void*, int*) = nullptr;                                           // cuGraphNodeGetType
         int (*peer)(std::uint64_t, std::uintptr_t, std::uint64_t, std::uintptr_t, std::size_t) = nullptr;
         int (*mem_info)(std::size_t*, std::size_t*) = nullptr;
         // wrappers that fall back to the synchronous copies when the async ones are missing
@@ -628,7 +634,46 @@ private:
         static const bool on = [] { auto* e = std::getenv("FORGE_GRAPHS"); return e && std::string(e) == "1"; }();
         return on && api_ == api::cuda && stream_ && has_graphs();
     }
-    bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0; std::vector<void*> segx_;
+    bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0;
+    // A segment's kernels (function, launch shape, argument bytes). Once a segment has been captured and instantiated,
+    // later tokens replay it without capturing: launches are only recorded, and if the sequence of functions and
+    // shapes matches, flush() patches the kernel nodes whose arguments changed (cuGraphExecKernelNodeSetParams) and
+    // relaunches the exec graph -- no capture, no cuGraphExecUpdate. A mismatch falls back to capturing the recorded
+    // launches. Needs cuFuncGetParamInfo (CUDA 12.4+); without it every segment is captured and exec-updated.
+    struct krec { void* fn; unsigned d[7]; std::uint32_t off, len; };
+    struct segc { void* exec = nullptr; void* graph = nullptr; std::vector<void*> nodes; std::vector<krec> recs; std::vector<unsigned char> bytes; bool replay = false; };
+    std::vector<segc> segc_;
+    std::vector<krec> prec_; std::vector<unsigned char> pbytes_;
+    bool recording_ = false, deferring_ = false;
+    std::unordered_map<void*, std::vector<std::uint32_t>> psize_;   // per function: parameter sizes
+    bool replay_ok() const {
+        static const bool on = [] { auto* e = std::getenv("FORGE_GRAPH_REPLAY"); return !(e && std::string(e) == "0"); }();
+        return on && f_.param_info && f_.kn_set && f_.g_roots && f_.g_deps && f_.g_type;
+    }
+    const std::vector<std::uint32_t>* params_of(void* fn) {
+        auto it = psize_.find(fn); if (it != psize_.end()) return &it->second;
+        std::vector<std::uint32_t> v;
+        for (std::size_t i = 0; i < 64; ++i) { std::size_t o = 0, z = 0; if (f_.param_info(fn, i, &o, &z) != 0) break; v.push_back(std::uint32_t(z)); }
+        return &(psize_[fn] = std::move(v));
+    }
+    void record(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void** a) {
+        krec r{fn, {gx, gy, gz, bx, by, bz, sh}, std::uint32_t(pbytes_.size()), 0};
+        if (replay_ok()) for (auto z : *params_of(fn)) {
+            std::size_t at = (pbytes_.size() + 7) & ~std::size_t(7); pbytes_.resize(at + z);
+            std::memcpy(pbytes_.data() + at, *a++, z);
+        }
+        r.len = std::uint32_t(pbytes_.size() - r.off); prec_.push_back(r);
+    }
+    // the kernelParams array of record r, pointing into bytes
+    void arg_ptrs(const krec& r, unsigned char* bytes, std::vector<void*>& out) {
+        out.clear(); std::size_t at = r.off;
+        for (auto z : *params_of(r.fn)) { at = (at + 7) & ~std::size_t(7); out.push_back(bytes + at); at += z; }
+    }
+    void reissue_captured() {   // begin capturing and launch every recorded kernel of the segment
+        ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; deferring_ = false;
+        std::vector<void*> ap;
+        for (auto& r : prec_) { arg_ptrs(r, pbytes_.data(), ap); ck(f_.launch(r.fn, r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6], stream_, ap.data(), nullptr), "launch"); }
+    }
     int launch_s(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void* st, void** a, void** ex) {
         if (!q81_keep_ && q81_src_) {
             bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q81_src_, hi = lo + std::uint64_t(q81_n_) * 128;
@@ -636,27 +681,121 @@ private:
             if (hit) q81_drop();
         }
         nwr_ = 0;
-        if (in_run_ && !capturing_ && !user_cap_ && gmode()) { ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; }
-        count(capturing_ || user_cap_ ? counters().captured : counters().launches);
-        return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
+        if (!(in_run_ && !user_cap_ && gmode() && st == stream_ && !ex)) {
+            count(user_cap_ ? counters().captured : counters().launches);
+            return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
+        }
+        if (!recording_) {
+            recording_ = true; prec_.clear(); pbytes_.clear();
+            if (seg_ >= segc_.size()) segc_.resize(seg_ + 1);
+            auto& c = segc_[seg_];
+            deferring_ = replay_ok() && c.replay && c.exec;
+            if (!deferring_) { ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; }
+        }
+        record(fn, gx, gy, gz, bx, by, bz, sh, a);
+        count(counters().captured);
+        int r = 0;
+        if (deferring_) {
+            auto& c = segc_[seg_]; std::size_t i = prec_.size() - 1;
+            if (i >= c.recs.size() || c.recs[i].fn != fn || std::memcmp(c.recs[i].d, prec_[i].d, sizeof prec_[i].d) || c.recs[i].len != prec_[i].len)
+                reissue_captured();   // the segment changed shape: capture it after all
+        } else r = f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
+        // Split long segments so the GPU runs one while the host records the next ($FORGE_GRAPH_SEG kernels, 0 = off).
+        if (r == 0 && ++seg_kernels_ >= graph_seg()) flush();
+        return r;
+    }
+    std::size_t seg_kernels_ = 0;
+    static std::size_t graph_seg() {
+        static const std::size_t v = [] { auto* e = std::getenv("FORGE_GRAPH_SEG"); std::size_t n = e ? std::strtoul(e, nullptr, 10) : 64; return n ? n : ~std::size_t(0); }();
+        return v;
     }
     int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); gpu::count(counters().htod); return f_.htod_async(d, h, n, st); }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); gpu::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); q81_drop(); return f_.free_(p); }
+    // device-to-device copy on the stream; inside a graph-mode run it is a kernel (forge_copy_words), so segments hold
+    // kernel nodes only and replay can patch them
+    int dtod_s(std::uint64_t d, std::uint64_t s, std::size_t n) {
+        gpu::count(counters().dtod); q81_drop();
+        if (in_run_ && gmode() && n % 4 == 0 && n / 4 < (1ull << 32) && has_fn_locked("forge_copy_words")) {
+            std::uint32_t w = std::uint32_t(n / 4); void* args[] = {&s, &d, &w}; writes(d, n);
+            return w ? launch_s(function("forge_copy_words"), (w + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr) : 0;
+        }
+        if (deferring_) reissue_captured();   // a memcpy node: this segment is captured (and not replayed)
+        return f_.dtod_async(d, s, n, stream_);
+    }
+    void drop_seg(segc& c) {
+        if (c.exec && f_.gexec_destroy) f_.gexec_destroy(c.exec);
+        if (c.graph && f_.graph_destroy) f_.graph_destroy(c.graph);
+        c = segc{};
+    }
+    // the kernel nodes of a captured single-stream graph, in launch order (a chain from its one root)
+    bool chain(void* g, std::vector<void*>& out) {
+        out.clear(); std::size_t n = 1; void* node = nullptr;
+        if (f_.g_roots(g, &node, &n) != 0 || n != 1) return false;
+        while (node) {
+            int t = -1; if (f_.g_type(node, &t) != 0 || t != 0 /* CU_GRAPH_NODE_TYPE_KERNEL */) return false;
+            out.push_back(node);
+            void* next = nullptr; std::size_t m = 0;
+            if (f_.g_deps(node, nullptr, &m) != 0 || m > 1) return false;
+            if (m == 1 && f_.g_deps(node, &next, &m) != 0) return false;
+            node = m ? next : nullptr;
+        }
+        return true;
+    }
     void flush() {
-        if (!capturing_) return;
+        if (!recording_) return;
+        recording_ = false; seg_kernels_ = 0;
+        auto& c = segc_[seg_++];
+        if (deferring_) {
+            deferring_ = false;
+            bool ok = prec_.size() == c.recs.size();
+            std::vector<void*> ap;
+            for (std::size_t i = 0; ok && i < prec_.size(); ++i) {
+                auto& r = prec_[i];
+                if (!std::memcmp(pbytes_.data() + r.off, c.bytes.data() + c.recs[i].off, r.len)) continue;
+                arg_ptrs(r, pbytes_.data(), ap);
+                struct { void* fn; unsigned d[7]; void** kp; void** ex; } kp{r.fn, {r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6]}, ap.data(), nullptr};
+                if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) ok = false; else gpu::count(counters().node_updates);
+            }
+            if (ok) {
+                c.recs.swap(prec_); c.bytes.swap(pbytes_);
+                gpu::count(counters().graph_launches); ck(f_.graph_launch(c.exec, stream_), "graph launch");
+                return;
+            }
+            reissue_captured();   // fewer kernels than last time, or a patch failed (exec state is suspect: rebuild)
+            drop_seg(c);
+        }
         capturing_ = false;
         void* g = nullptr; ck(f_.capture_end(stream_, &g), "stream end capture");
-        if (seg_ >= segx_.size()) segx_.resize(seg_ + 1, nullptr);
-        void*& e = segx_[seg_++];
-        alignas(8) char info[64] = {};
-        if (e && !(f_.exec_update && f_.exec_update(e, g, info) == 0)) { if (f_.gexec_destroy) f_.gexec_destroy(e); e = nullptr; }
-        if (!e) ck(f_.graph_inst(&e, g, 0), "graph instantiate");
-        gpu::count(counters().graph_launches); ck(f_.graph_launch(e, stream_), "graph launch");
-        if (f_.graph_destroy) f_.graph_destroy(g);
+        void* done = nullptr;   // destroyed after the launch (a driver may share storage between graph and exec)
+        if (replay_ok()) {   // keep the graph: replay patches its nodes
+            drop_seg(c);
+            ck(f_.graph_inst(&c.exec, g, 0), "graph instantiate"); gpu::count(counters().instantiates);
+            c.graph = g; c.replay = chain(g, c.nodes) && c.nodes.size() == prec_.size();
+            c.recs.swap(prec_); c.bytes.swap(pbytes_);
+        } else {
+            alignas(8) char info[64] = {};
+            if (c.exec && !(f_.exec_update && f_.exec_update(c.exec, g, info) == 0)) { f_.gexec_destroy(c.exec); c.exec = nullptr; }
+            if (!c.exec) { ck(f_.graph_inst(&c.exec, g, 0), "graph instantiate"); gpu::count(counters().instantiates); }
+            done = g;
+        }
+        gpu::count(counters().graph_launches); ck(f_.graph_launch(c.exec, stream_), "graph launch");
+        if (done && f_.graph_destroy) f_.graph_destroy(done);
     }
     void need_graphs() { if (!has_graphs()) throw std::runtime_error(std::string(api_name(api_)) + ": driver has no graph API"); }
-    void bind() { if (api_ == api::cuda) { if (f_.ctx_set && ctx_) f_.ctx_set(ctx_); } else if (f_.set_device) f_.set_device(ordinal_); }
+    // The context made current on this thread by the last bind() (any runtime): cuCtxSetCurrent is skipped when it is
+    // already ours, instead of once per op.
+    // already ours, instead of once per op. Destroying any context bumps the epoch, which invalidates every cache.
+    struct bound_t { void* c = nullptr; unsigned long e = 0; };
+    static bound_t& bound_ctx() { thread_local bound_t b; return b; }
+    static std::atomic<unsigned long>& ctx_epoch() { static std::atomic<unsigned long> e{1}; return e; }
+    void bind() {
+        if (api_ == api::cuda) {
+            auto& b = bound_ctx(); const unsigned long e = ctx_epoch().load(std::memory_order_acquire);
+            if (f_.ctx_set && ctx_ && (b.c != ctx_ || b.e != e)) { f_.ctx_set(ctx_); b.c = ctx_; b.e = e; }
+        }
+        else if (f_.set_device) f_.set_device(ordinal_);
+    }
     void sync() { flush(); gpu::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
@@ -720,12 +859,12 @@ private:
         for (auto k : olds) {
             entry o = res_[k]; res_.erase(k);
             auto ol = k, oh = k + o.count * 4, a = std::max(ol, lo), z = std::min(oh, hi);
-            if (!is_out && z > a) { gpu::count(counters().dtod); q81_drop(); ck(f_.dtod_async(e.d + (a - lo), o.d + (a - ol), z - a, stream_), "memcpy DtoD"); }
+            if (!is_out && z > a) { ck(dtod_s(e.d + (a - lo), o.d + (a - ol), z - a), "memcpy DtoD"); }
             if (!o.host_valid) e.host_valid = false;
             if (o.kept) e.kept = true;
             if (!o.host_valid) for (auto [x, y] : {std::pair{ol, std::min(oh, lo)}, std::pair{std::max(ol, hi), oh}}) if (y > x) {
                 entry r{reinterpret_cast<float*>(x), (y - x) / 4, 0}; r.host_valid = false;
-                dev_alloc(&r.d, y - x); gpu::count(counters().dtod); q81_drop(); ck(f_.dtod_async(r.d, o.d + (x - ol), y - x, stream_), "memcpy DtoD");
+                dev_alloc(&r.d, y - x); ck(dtod_s(r.d, o.d + (x - ol), y - x), "memcpy DtoD");
                 stats_.resident_bytes += y - x; rest.push_back(r);
             }
             drop(o);
@@ -750,7 +889,9 @@ private:
             opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
             opt(f_.stream_create, "cuStreamCreate"); opt(f_.stream_destroy, "cuStreamDestroy_v2"); opt(f_.stream_sync, "cuStreamSynchronize");
             opt(f_.capture_begin, "cuStreamBeginCapture_v2"); opt(f_.capture_end, "cuStreamEndCapture");
-            opt(f_.graph_inst, "cuGraphInstantiateWithFlags"); opt(f_.exec_update, "cuGraphExecUpdate_v2"); opt(f_.graph_launch, "cuGraphLaunch");
+            opt(f_.graph_inst, "cuGraphInstantiateWithFlags"); opt(f_.exec_update, "cuGraphExecUpdate_v2");
+            opt(f_.param_info, "cuFuncGetParamInfo"); opt(f_.kn_set, "cuGraphExecKernelNodeSetParams");
+            opt(f_.g_roots, "cuGraphGetRootNodes"); opt(f_.g_deps, "cuGraphNodeGetDependentNodes"); opt(f_.g_type, "cuGraphNodeGetType"); opt(f_.graph_launch, "cuGraphLaunch");
             opt(f_.gexec_destroy, "cuGraphExecDestroy"); opt(f_.graph_destroy, "cuGraphDestroy");
             opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2");
         } else {
