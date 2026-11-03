@@ -40,6 +40,11 @@ struct device_hooks {
     // to_host / release still fetch it on demand (state slots: KV cache, recurrent state)
     std::function<void(const float*, std::size_t)> keep;
     std::function<void(const float*, std::size_t)> pin, to_host, host_wrote, release;
+    // optional: hold a plan's whole activation arena as one device buffer that outlives the run, so every
+    // intermediate keeps the same device address token after token (to_host then fetches just the asked range);
+    // forget drops that device copy without fetching it (the plan is going away)
+    std::function<void(float*, std::size_t)> arena;
+    std::function<void(const float*, std::size_t)> forget;
     std::function<void(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off)> copy;  // device-side
     // optional strided copy: dst_base[off + r * ds + c] = src[r * w + c] for r < rows, c < w; false = unsupported
     std::function<bool(float* src, std::size_t sn, float* dst_base, std::size_t dst_count, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off)> copy2d;
