@@ -21,6 +21,7 @@
 #include <forge/core/dl.hpp>
 #include <algorithm>
 #include <atomic>
+#include <unordered_map>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
