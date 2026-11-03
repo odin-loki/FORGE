@@ -38,7 +38,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`; without `--out` the outputs are printed.
 
 ### `forge bench <model.fpk> [-p 32] [-n 32]` / `forge bench --gemm 512`
-Measures prefill (`-p` prompt tokens) and decode (`-n` tokens) throughput, or an N×N GEMM.
+Measures prefill (`-p` prompt tokens) and decode (`-n` tokens) throughput, or an N×N GEMM. On a GPU device (`FORGE_DEVICE=cuda`) it also prints driver calls for the prefill and per decode token: kernels launched directly or captured into a CUDA graph (`FORGE_GRAPHS=1`), graph launches, DtoH/HtoD/DtoD copies and stream syncs. `tools/bench_llm.sh` wraps it for a side-by-side run against llama.cpp.
 
 ### `forge dump <model.fpk> <tensor> <out.f32>`
 Decodes one tensor to raw f32.

@@ -20,6 +20,7 @@
 #include <forge/spec/ops.gen.hpp>
 #include <forge/core/dl.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -33,6 +34,20 @@
 namespace forge::grid::gpu {
 
 enum class api { cuda, hip };
+
+// Process-wide driver call counters for the benchmark harness (forge bench, tools/bench_llm.sh): how many
+// kernels are issued (directly or recorded into a captured graph), graphs replayed, copies and syncs. Relaxed
+// atomics, so the cost is one uncontended increment per call.
+struct call_counters {
+    std::atomic<std::uint64_t> launches{0}, captured{0}, graph_launches{0}, dtoh{0}, htod{0}, dtod{0}, syncs{0};
+    struct snapshot { std::uint64_t launches = 0, captured = 0, graph_launches = 0, dtoh = 0, htod = 0, dtod = 0, syncs = 0; };
+    snapshot read() const {
+        auto r = [](const std::atomic<std::uint64_t>& a) { return a.load(std::memory_order_relaxed); };
+        return {r(launches), r(captured), r(graph_launches), r(dtoh), r(htod), r(dtod), r(syncs)};
+    }
+};
+inline call_counters& counters() { static call_counters c; return c; }
+inline void count(std::atomic<std::uint64_t>& a) { a.fetch_add(1, std::memory_order_relaxed); }
 inline const char* api_name(api a) { return a == api::cuda ? "cuda" : "hip"; }
 
 // Kernels in kernels.cu and how their arguments are laid out.
@@ -259,7 +274,7 @@ public:
         auto s = acquire(src, n, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
-        ck(f_.dtod_async(d.ptr + off * 4, s.ptr, n * 4, stream_), "memcpy DtoD");
+        gpu::count(counters().dtod); ck(f_.dtod_async(d.ptr + off * 4, s.ptr, n * 4, stream_), "memcpy DtoD");
     }
 
     // ---- graphs: capture the stream's work between capture_begin/capture_end and replay it ----
@@ -270,7 +285,7 @@ public:
         void* e = nullptr; ck(f_.graph_inst(&e, g, 0), "graph instantiate");
         graphs_.push_back({e, g}); return graphs_.size() - 1;
     }
-    void graph_launch(std::size_t id) { std::lock_guard lk(mu_); need_graphs(); bind(); ck(f_.graph_launch(graphs_.at(id).first, stream_), "graph launch"); sync(); }
+    void graph_launch(std::size_t id) { std::lock_guard lk(mu_); need_graphs(); bind(); gpu::count(counters().graph_launches); ck(f_.graph_launch(graphs_.at(id).first, stream_), "graph launch"); sync(); }
 
     // ---- multi-device: copy device memory to another runtime (peer copy where available, else via host) ----
     void copy_to_peer(runtime& dst, std::uint64_t dst_ptr, std::uint64_t src_ptr, std::size_t bytes) {
@@ -580,10 +595,11 @@ private:
     bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0; std::vector<void*> segx_;
     int launch_s(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void* st, void** a, void** ex) {
         if (in_run_ && !capturing_ && !user_cap_ && gmode()) { ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; }
+        count(capturing_ || user_cap_ ? counters().captured : counters().launches);
         return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
     }
-    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); return f_.htod_async(d, h, n, st); }
-    int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); return f_.dtoh_async(h, d, n, st); }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); gpu::count(counters().htod); return f_.htod_async(d, h, n, st); }
+    int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); gpu::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); return f_.free_(p); }
     void flush() {
         if (!capturing_) return;
@@ -594,12 +610,12 @@ private:
         alignas(8) char info[64] = {};
         if (e && !(f_.exec_update && f_.exec_update(e, g, info) == 0)) { if (f_.gexec_destroy) f_.gexec_destroy(e); e = nullptr; }
         if (!e) ck(f_.graph_inst(&e, g, 0), "graph instantiate");
-        ck(f_.graph_launch(e, stream_), "graph launch");
+        gpu::count(counters().graph_launches); ck(f_.graph_launch(e, stream_), "graph launch");
         if (f_.graph_destroy) f_.graph_destroy(g);
     }
     void need_graphs() { if (!has_graphs()) throw std::runtime_error(std::string(api_name(api_)) + ": driver has no graph API"); }
     void bind() { if (api_ == api::cuda) { if (f_.ctx_set && ctx_) f_.ctx_set(ctx_); } else if (f_.set_device) f_.set_device(ordinal_); }
-    void sync() { flush(); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
+    void sync() { flush(); gpu::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
         void* f = nullptr; ck(f_.get_fn(&f, mod_, n.c_str()), ("get function " + n).c_str());
@@ -662,12 +678,12 @@ private:
         for (auto k : olds) {
             entry o = res_[k]; res_.erase(k);
             auto ol = k, oh = k + o.count * 4, a = std::max(ol, lo), z = std::min(oh, hi);
-            if (!is_out && z > a) ck(f_.dtod_async(e.d + (a - lo), o.d + (a - ol), z - a, stream_), "memcpy DtoD");
+            if (!is_out && z > a) { gpu::count(counters().dtod); ck(f_.dtod_async(e.d + (a - lo), o.d + (a - ol), z - a, stream_), "memcpy DtoD"); }
             if (!o.host_valid) e.host_valid = false;
             if (o.kept) e.kept = true;
             if (!o.host_valid) for (auto [x, y] : {std::pair{ol, std::min(oh, lo)}, std::pair{std::max(ol, hi), oh}}) if (y > x) {
                 entry r{reinterpret_cast<float*>(x), (y - x) / 4, 0}; r.host_valid = false;
-                dev_alloc(&r.d, y - x); ck(f_.dtod_async(r.d, o.d + (x - ol), y - x, stream_), "memcpy DtoD");
+                dev_alloc(&r.d, y - x); gpu::count(counters().dtod); ck(f_.dtod_async(r.d, o.d + (x - ol), y - x, stream_), "memcpy DtoD");
                 stats_.resident_bytes += y - x; rest.push_back(r);
             }
             drop(o);
