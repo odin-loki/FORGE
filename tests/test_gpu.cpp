@@ -66,9 +66,9 @@ template<class RT> static int qmatmul_check(flow::registry& reg, const std::stri
         tensor_view oc; oc.data = yc.data(); oc.shape = og.shape;
         std::vector<tensor_view> ins{xv, wv};
         reg.device_qgemm->fn(ins, og, {});
-        // rows < 16 on q4_k/q6_k: the MMVQ path quantises x to q8_1 (32-value blocks, d = amax/127) like llama.cpp,
+        // rows < 16 on q8_0/q4_k/q6_k: the MMVQ path quantises x to q8_1 (32-value blocks, d = amax/127) like llama.cpp,
         // so the reference uses the same rounded activations.
-        const bool mmvq = rows < 16 && (cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0");
+        const bool mmvq = rows < 16 && (cn == "q8_0" || cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0");
         std::vector<float> xr(x);
         if (mmvq) for (std::size_t b = 0; b < xr.size(); b += 32) {
             float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xr[b + i]));

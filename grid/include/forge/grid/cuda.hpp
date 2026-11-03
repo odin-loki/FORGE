@@ -388,7 +388,7 @@ public:
                 ++dispatches_["qmatmul_mmq"];
                 unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
                 if (grid) ck(launch_s(function("forge_qmatmul_mmq"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
-            } else if ((fmt == 2 || fmt == 3) && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
+            } else if (fmt <= 3 && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
                 ++dispatches_["qmatmul_q81"];   // decode: q8_1 activations + dp4a (llama.cpp mmvq)
                 std::uint32_t nb = rows * (k / 32); std::size_t need = std::size_t(nb) * 40;
                 if (q81_cap_ < need) { if (q81_) free_s(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
@@ -396,7 +396,7 @@ public:
                 void* qa[] = {&xd, &qx, &nb};
                 ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                 void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-                unsigned grid = cols * ((rows + 3) / 4);
+                unsigned grid = ((cols + 3) / 4) * ((rows + 3) / 4);   // a warp per column, 4 columns per block
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
             } else {
                 unsigned grid = cols * ((rows + 3) / 4);
