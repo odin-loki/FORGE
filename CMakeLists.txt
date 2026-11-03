@@ -245,6 +245,13 @@ else()
 endif()
 # CUDA / HIP kernel images, built from the generated kernels.cu with clang (no SDK) and embedded for the
 # dlopen-based host runtime (grid/cuda.hpp). HIP code objects need lld; zig's bundled ld.lld works too.
+# When the host compiler is clang, the GPU images use that same toolchain (one LLVM for host and device);
+# otherwise the first clang on PATH. Override with -DFORGE_GPU_CLANG=... / -DFORGE_LLD=...
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
+  get_filename_component(_host_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  find_program(FORGE_GPU_CLANG NAMES clang PATHS ${_host_llvm_bin} NO_DEFAULT_PATH)
+  find_program(FORGE_LLD NAMES ld.lld lld PATHS ${_host_llvm_bin} NO_DEFAULT_PATH)
+endif()
 find_program(FORGE_GPU_CLANG NAMES clang-19 clang-18 clang-20 clang)
 find_program(FORGE_LLD NAMES ld.lld ld.lld-19 ld.lld-18 lld)
 if(NOT FORGE_LLD)
