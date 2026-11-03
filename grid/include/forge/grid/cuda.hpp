@@ -185,7 +185,7 @@ public:
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
 
     // ---- residency protocol (see flow::device_hooks) ----
-    void begin_run() { std::lock_guard lk(mu_); in_run_ = true; seg_ = 0; }
+    void begin_run() { std::lock_guard lk(mu_); q81_drop(); in_run_ = true; seg_ = 0; }
     void end_run() {
         std::lock_guard lk(mu_); bind();
         for (auto it = res_.begin(); it != res_.end();) {
@@ -274,7 +274,7 @@ public:
         auto s = acquire(src, n, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
-        gpu::count(counters().dtod); ck(f_.dtod_async(d.ptr + off * 4, s.ptr, n * 4, stream_), "memcpy DtoD");
+        gpu::count(counters().dtod); q81_drop(); ck(f_.dtod_async(d.ptr + off * 4, s.ptr, n * 4, stream_), "memcpy DtoD");
     }
 
     // ---- graphs: capture the stream's work between capture_begin/capture_end and replay it ----
@@ -357,6 +357,11 @@ public:
     }
     static bool use_mmvq() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ"); return !(e && std::string(e) == "0"); }(); return on; }
     std::uint64_t q81_ = 0; std::size_t q81_cap_ = 0;   // q8_1 activation scratch (stream-ordered reuse)
+    // The scratch holds the q8_1 form of device buffer q81_src_ ([q81_n_] blocks). Consecutive decode matmuls that
+    // read the same activation (qkv/z/a/b, gate/up) reuse it instead of re-quantising; any other kernel, copy or free
+    // may change that buffer, so launch_s/htod_s/dtod/free_s drop it (q81_keep_ marks run_qmatmul's own launches).
+    std::uint64_t q81_src_ = 0; std::uint32_t q81_n_ = 0; bool q81_keep_ = false;
+    void q81_drop() { q81_src_ = 0; }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
         std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
@@ -391,19 +396,25 @@ public:
             } else if (fmt <= 3 && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
                 ++dispatches_["qmatmul_q81"];   // decode: q8_1 activations + dp4a (llama.cpp mmvq)
                 std::uint32_t nb = rows * (k / 32); std::size_t need = std::size_t(nb) * 40;
-                if (q81_cap_ < need) { if (q81_) free_s(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
+                if (q81_cap_ < need) { q81_drop(); if (q81_) free_s(q81_); q81_ = 0; ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20); }
                 std::uint64_t qx = q81_;
-                void* qa[] = {&xd, &qx, &nb};
-                ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                q81_keep_ = true;
+                if (q81_src_ != xd || q81_n_ != nb) {
+                    void* qa[] = {&xd, &qx, &nb};
+                    ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                    q81_src_ = xd; q81_n_ = nb;
+                } else ++dispatches_["quant_q81_reused"];
                 void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
                 unsigned grid = ((cols + 3) / 4) * ((rows + 3) / 4);   // a warp per column, 4 columns per block
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
+                q81_keep_ = false;
+                if (yd == xd) q81_drop();
             } else {
                 unsigned grid = cols * ((rows + 3) / 4);
                 if (grid) ck(launch_s(fn, grid, 1, 1, 128, 1, 1, 0, stream_, args, nullptr), "launch");
             }
             if (!in_run_) { ck(dtoh_s(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
-        } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
+        } catch (...) { q81_keep_ = false; q81_drop(); if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
     }
@@ -594,13 +605,14 @@ private:
     }
     bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0; std::vector<void*> segx_;
     int launch_s(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void* st, void** a, void** ex) {
+        if (!q81_keep_) q81_drop();
         if (in_run_ && !capturing_ && !user_cap_ && gmode()) { ck(f_.capture_begin(stream_, 2), "stream begin capture"); capturing_ = true; }
         count(capturing_ || user_cap_ ? counters().captured : counters().launches);
         return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
     }
-    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); gpu::count(counters().htod); return f_.htod_async(d, h, n, st); }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); gpu::count(counters().htod); return f_.htod_async(d, h, n, st); }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); gpu::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
-    int free_s(std::uint64_t p) { flush(); return f_.free_(p); }
+    int free_s(std::uint64_t p) { flush(); q81_drop(); return f_.free_(p); }
     void flush() {
         if (!capturing_) return;
         capturing_ = false;
@@ -678,12 +690,12 @@ private:
         for (auto k : olds) {
             entry o = res_[k]; res_.erase(k);
             auto ol = k, oh = k + o.count * 4, a = std::max(ol, lo), z = std::min(oh, hi);
-            if (!is_out && z > a) { gpu::count(counters().dtod); ck(f_.dtod_async(e.d + (a - lo), o.d + (a - ol), z - a, stream_), "memcpy DtoD"); }
+            if (!is_out && z > a) { gpu::count(counters().dtod); q81_drop(); ck(f_.dtod_async(e.d + (a - lo), o.d + (a - ol), z - a, stream_), "memcpy DtoD"); }
             if (!o.host_valid) e.host_valid = false;
             if (o.kept) e.kept = true;
             if (!o.host_valid) for (auto [x, y] : {std::pair{ol, std::min(oh, lo)}, std::pair{std::max(ol, hi), oh}}) if (y > x) {
                 entry r{reinterpret_cast<float*>(x), (y - x) / 4, 0}; r.host_valid = false;
-                dev_alloc(&r.d, y - x); gpu::count(counters().dtod); ck(f_.dtod_async(r.d, o.d + (x - ol), y - x, stream_), "memcpy DtoD");
+                dev_alloc(&r.d, y - x); gpu::count(counters().dtod); q81_drop(); ck(f_.dtod_async(r.d, o.d + (x - ol), y - x, stream_), "memcpy DtoD");
                 stats_.resident_bytes += y - x; rest.push_back(r);
             }
             drop(o);
