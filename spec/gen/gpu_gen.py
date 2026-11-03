@@ -391,6 +391,45 @@ FORGE_GLOBAL void forge_silu_mul_q81(const float* a, const float* b, float* y, u
 FORGE_DEV unsigned ld32u(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
 FORGE_DEV int dp4a_ss(int a, int b, int c) { int r; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r; }
 FORGE_DEV float wsum_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v += w; } return v; }
+// Decode attention, split over keys (flash-decoding): block b = (row-head id, split sp) takes a contiguous chunk of
+// the visible keys; its 4 warps take every 4th key, a warp computing one score with a shuffle reduction (coalesced K
+// and V rows) and keeping an online softmax. Each block writes (max, sum, acc[dv]) to part[b]; forge_attention_comb
+// merges the ns splits. Plain f32 K/V, head dims up to 256 in steps of 32. The split count is fixed, so the launch
+// shape does not change as the context grows.
+FORGE_GLOBAL void forge_attention_dec(const float* q, const float* k, const float* v, float* part, unsigned s, unsigned hq,
+                                      unsigned d, unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale, unsigned ns) {
+  __attribute__((shared)) float sm[4]; __attribute__((shared)) float sl[4]; __attribute__((shared)) float sa[4 * 256];
+  unsigned b = bid_(), id = b / ns, sp = b % ns, tx = tid_(), w = tx >> 5, l = tx & 31u; if (id >= s * hq) return;
+  unsigned i = id / hq, h = id % hq, kh = h / (hq / hk), causal = flags & 1u, window = flags >> 7;
+  int pos = (int)t - (int)s + (int)i;
+  unsigned jend = t; if (causal) { int lim = pos + 1; jend = lim < 0 ? 0u : ((unsigned)lim < t ? (unsigned)lim : t); }
+  unsigned jbeg = 0u; if (window && pos - (int)window + 1 > 0) jbeg = (unsigned)(pos - (int)window + 1);
+  unsigned len = jend > jbeg ? jend - jbeg : 0u, ch = (len + ns - 1u) / ns, c0 = jbeg + sp * ch, c1 = c0 + ch < jend ? c0 + ch : jend;
+  const float* qp = q + (unsigned long long)id * d; float qr[8], acc[8];
+  for (unsigned r = 0; r < 8u; ++r) { unsigned e = l + 32u * r; qr[r] = e < d ? qp[e] : 0.0f; acc[r] = 0.0f; }
+  float m = -__builtin_inff(), ls = 0.0f;
+  for (unsigned j = c0 + w; j < c1; j += 4u) {
+    const float* kp = k + ((unsigned long long)j * hk + kh) * d; float dot = 0.0f;
+    for (unsigned r = 0; r < 8u; ++r) { unsigned e = l + 32u * r; if (e < d) dot = fma_(qr[r], kp[e], dot); }
+    float sc = wsum_(dot) * scale, mn = sc > m ? sc : m, rs = m == -__builtin_inff() ? 0.0f : fexp(m - mn), pw = fexp(sc - mn);
+    ls = ls * rs + pw; m = mn; const float* vp = v + ((unsigned long long)j * hk + kh) * dv;
+    for (unsigned r = 0; r < 8u; ++r) { unsigned e = l + 32u * r; if (e < dv) acc[r] = fma_(pw, vp[e], acc[r] * rs); } }
+  if (l == 0u) { sm[w] = m; sl[w] = ls; }
+  for (unsigned r = 0; r < 8u; ++r) { unsigned e = l + 32u * r; if (e < dv) sa[w * 256u + e] = acc[r]; }
+  bar_();
+  float M = sm[0]; for (unsigned u = 1; u < 4u; ++u) M = sm[u] > M ? sm[u] : M;
+  float f[4], L = 0.0f; for (unsigned u = 0; u < 4u; ++u) { f[u] = sm[u] == -__builtin_inff() ? 0.0f : fexp(sm[u] - M); L += sl[u] * f[u]; }
+  float* pp = part + (unsigned long long)b * (dv + 2u);
+  for (unsigned e = tx; e < dv; e += 128u) { float a = 0.0f; for (unsigned u = 0; u < 4u; ++u) a = fma_(sa[u * 256u + e], f[u], a); pp[2u + e] = a; }
+  if (tx == 0u) { pp[0] = M; pp[1] = L; } }
+FORGE_GLOBAL void forge_attention_comb(const float* part, float* y, unsigned nrow, unsigned ns, unsigned dv) {
+  unsigned id = bid_(), tx = tid_(); if (id >= nrow) return; const float* pp = part + (unsigned long long)id * ns * (dv + 2u);
+  float M = -__builtin_inff(); for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; M = mu > M ? mu : M; }
+  float L = 0.0f; for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; L += mu == -__builtin_inff() ? 0.0f : pp[u * (dv + 2u) + 1u] * fexp(mu - M); }
+  float inv = L > 0.0f ? 1.0f / L : 0.0f;
+  for (unsigned e = tx; e < dv; e += 128u) { float a = 0.0f;
+    for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu != -__builtin_inff()) a = fma_(pp[u * (dv + 2u) + 2u + e], fexp(mu - M), a); }
+    y[(unsigned long long)id * dv + e] = a * inv; } }
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 // y[rows, cols] = xq . W^T for q8_0 (fmt 1), q4_k (fmt 2) and q6_k (fmt 3). A warp per output column (4 per 128-thread
 // block, no shared memory or barriers: the warp reduces with shuffles), up to 4 activation rows per block, as in

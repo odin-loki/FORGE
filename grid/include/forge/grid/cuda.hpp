@@ -165,7 +165,7 @@ public:
     }
     ~runtime() {
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (att_) f_.free_(att_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
@@ -424,6 +424,9 @@ public:
         return true;
     }
     static bool use_mmvq() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ"); return !(e && std::string(e) == "0"); }(); return on; }
+    // Split-K decode attention ($FORGE_ATTN_DEC=0 off) and its partials scratch.
+    static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on; }
+    std::uint64_t att_ = 0; std::size_t att_cap_ = 0;
     std::uint64_t q81_ = 0; std::size_t q81_cap_ = 0;   // q8_1 activation scratch (stream-ordered reuse)
     // The scratch holds the q8_1 form of device buffer q81_src_ ([q81_n_] blocks). Consecutive decode matmuls that
     // read the same activation (qkv/z/a/b, gate/up) reuse it instead of re-quantising; any other kernel, copy or free
@@ -617,6 +620,16 @@ public:
             unsigned block = 64, grid = (threads + block - 1) / block;
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
                 fn = function("forge_attention_fa"); block = 128; grid = rows * cols; }
+            if (s == sig::attention && rows * cols <= 256 && (u7 & 0x7Eu) == 0 && k % 32 == 0 && k <= 256 && u6 % 32 == 0 && u6 <= 256 &&
+                ptrs.size() == 4 && attn_dec() && has_fn_locked("forge_attention_dec") && has_fn_locked("forge_attention_comb")) {
+                std::uint32_t ns = 16, nrow = rows * cols; std::size_t need = std::size_t(nrow) * ns * (u6 + 2) * 4;
+                if (att_cap_ < need) { if (att_) free_s(att_); att_ = 0; ck(f_.malloc_(&att_, need), "malloc"); att_cap_ = need; }
+                std::uint64_t pa = att_;
+                void* a1[] = {&ptrs[0], &ptrs[1], &ptrs[2], &pa, &rows, &cols, &k, &u4, &u5, &u6, &u7, &f0, &ns};
+                writes(pa, need);
+                ck(launch_s(function("forge_attention_dec"), nrow * ns, 1, 1, 128, 1, 1, 0, stream_, a1, nullptr), "launch");
+                fn = function("forge_attention_comb"); args = {&pa, &ptrs[3], &nrow, &ns, &u6}; block = 128; grid = nrow;
+                ++dispatches_["attention_dec"]; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
             std::uint32_t fnb = 0; std::uint64_t qx = 0;
             if (in_run_ && fuse_q81() && use_mmvq() && rows < mmq_min_rows()) {
