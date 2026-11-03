@@ -47,3 +47,5 @@ By default each fuzz target is linked with a small built-in mutation driver (`fu
 
 ## Performance baselines
 `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T]` runs `forge bench` and records or checks throughput against the stored baseline. It is not part of ctest.
+
+`tools/bench_llm.sh --gguf <model.gguf> [--fpk <model.fpk>] [-p 512] [-n 128] [-r 3] [--nsys <prefix>]` compares FORGE with llama.cpp's `llama-bench` on the same GGUF: prefill and decode tok/s for both, FORGE with and without `FORGE_GRAPHS=1`, and FORGE's GPU driver calls per decode token as printed by `forge bench` (kernels launched directly or captured into a CUDA graph, graph launches, DtoH/HtoD/DtoD copies, stream syncs). `--nsys` adds an Nsight Systems kernel summary per FORGE run. It needs a GPU and a model, so it is not part of ctest.
