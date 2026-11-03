@@ -5,6 +5,7 @@
 #include <forge/flow/vulkan.hpp>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 #include <cmath>
 #include <cstring>
@@ -65,10 +66,20 @@ template<class RT> static int qmatmul_check(flow::registry& reg, const std::stri
         tensor_view oc; oc.data = yc.data(); oc.shape = og.shape;
         std::vector<tensor_view> ins{xv, wv};
         reg.device_qgemm->fn(ins, og, {});
-        flow::qweights::gemm_nt(ins, oc, {});
+        // rows < 16 on q4_k/q6_k: the MMVQ path quantises x to q8_1 (32-value blocks, d = amax/127) like llama.cpp,
+        // so the reference uses the same rounded activations.
+        const bool mmvq = rows < 16 && (cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0");
+        std::vector<float> xr(x);
+        if (mmvq) for (std::size_t b = 0; b < xr.size(); b += 32) {
+            float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xr[b + i]));
+            const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+            for (int i = 0; i < 32; ++i) xr[b + i] = d * float(int(std::nearbyint(xr[b + i] * id)));
+        }
+        std::vector<tensor_view> insr{xv, wv}; insr[0].data = xr.data();
+        flow::qweights::gemm_nt(insr, oc, {});
         double worst = 0;
         for (std::size_t i = 0; i < yc.size(); ++i) worst = std::max(worst, std::fabs(double(yg[i]) - yc[i]) / (1.0 + std::fabs(double(yc[i]))));
-        ++n; if (worst > 1e-4) { std::printf("FAIL %s.qmatmul_t %s rows %zu: worst rel error %.3g\n", api.c_str(), cn.c_str(), rows, worst); ++fails; }
+        ++n; if (worst > (mmvq ? 2e-3 : 1e-4)) { std::printf("FAIL %s.qmatmul_t %s rows %zu: worst rel error %.3g\n", api.c_str(), cn.c_str(), rows, worst); ++fails; }
     }
     std::printf("%s %d/%d %s quantised matmul_t cases match the CPU kernel\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails;
