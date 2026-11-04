@@ -42,6 +42,9 @@ static void encodings() {
     EQ(t::decode("\x80", "windows-1252").value, std::string("\xE2\x82\xAC"));
     EQ(t::decode("\xC9", "cp437").value, std::string("\xE2\x95\x94"));
     EQ(t::decode("\xC1", "koi8-r").value, std::string("\xD0\xB0"));
+    EQ(t::decode("\xD0\xFD", "iso-8859-9").value, std::string("\xC4\x9E\xC4\xB1"));   // WHATWG: Latin-5 is windows-1254
+    EQ(t::decode("\xD0", "latin5").value, std::string("\xC4\x9E"));
+    EQ(t::decode("\x80", "ISO8859-9").value, std::string("\xE2\x82\xAC"));
     EQ(t::decode("\xA4\xA4", "big5").value, std::string("\xE4\xB8\xAD"));
     EQ(t::decode("\xB0\xA1", "euc-kr").value, std::string("\xEA\xB0\x80"));
     EQ(t::decode("\xC6\xFC", "euc-jp").value, std::string("\xE6\x97\xA5"));
@@ -125,6 +128,11 @@ static void console() {
     EQ(t::style("x", st, t::color_level::ansi256), std::string("\x1b[1;38;5;196mx\x1b[0m"));
     EQ(t::style("x", st, t::color_level::basic), std::string("\x1b[1;91mx\x1b[0m"));
     EQ(t::style("x", st, t::color_level::none), std::string("x"));
+    {   // OSC 8: nothing at color_level::none; controls in the URI cannot close the OSC string early
+        t::text_style ln; ln.link = "http://a/\x1b\\\x07" "b\xC2\x9C" "c\xC3\xA9";
+        EQ(t::style("x", ln, t::color_level::none), std::string("x"));
+        EQ(t::style("x", ln, t::color_level::basic), std::string("\x1b]8;;http://a/\\bc\xC3\xA9\x1b\\x\x1b]8;;\x1b\\"));
+    }
     auto ps = t::parse_style("bold red on #202020 underline"); CHECK(ps && ps->bold && ps->fg16 == 1 && ps->bg && ps->bg->r == 0x20 && ps->underline);
     CHECK(!t::parse_style("bold chartreuse-ish"));
     EQ(t::strip_ansi("\x1b[31mred\x1b[0m \x1b]8;;http://x\x1b\\link\x1b]8;;\x1b\\"), std::string("red link"));

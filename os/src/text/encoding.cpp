@@ -22,6 +22,9 @@ const std::vector<std::pair<std::string, std::string>>& labels() {
         {"ascii", "us-ascii"}, {"us-ascii", "us-ascii"}, {"ansi_x3.4-1968", "us-ascii"}, {"646", "us-ascii"},
         {"latin1", "iso-8859-1"}, {"l1", "iso-8859-1"}, {"iso8859-1", "iso-8859-1"}, {"iso_8859-1", "iso-8859-1"}, {"iso-8859-1", "iso-8859-1"}, {"cp819", "iso-8859-1"},
         {"cp1252", "windows-1252"}, {"x-cp1252", "windows-1252"}, {"ansi", "windows-1252"},
+        // WHATWG: every ISO-8859-9 (Latin-5) label decodes as windows-1254, its superset.
+        {"iso-8859-9", "windows-1254"}, {"iso8859-9", "windows-1254"}, {"iso88599", "windows-1254"}, {"iso_8859-9", "windows-1254"}, {"iso_8859-9:1989", "windows-1254"},
+        {"iso-ir-148", "windows-1254"}, {"csisolatin5", "windows-1254"}, {"latin5", "windows-1254"}, {"l5", "windows-1254"}, {"x-cp1254", "windows-1254"},
         {"cp874", "windows-874"}, {"tis-620", "windows-874"}, {"iso-8859-11", "windows-874"},
         {"latin2", "iso-8859-2"}, {"latin3", "iso-8859-3"}, {"latin4", "iso-8859-4"}, {"cyrillic", "iso-8859-5"}, {"arabic", "iso-8859-6"},
         {"greek", "iso-8859-7"}, {"hebrew", "iso-8859-8"}, {"latin6", "iso-8859-10"}, {"latin9", "iso-8859-15"}, {"latin10", "iso-8859-16"},
