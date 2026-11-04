@@ -71,7 +71,7 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                     h->forget = [rt](const float* p, std::size_t n) { rt->forget(p, n); };
                 }
                 if constexpr (requires { raw->ran((const void*)nullptr, true); raw->replay((const void*)nullptr); })
-                    if (!std::getenv("FORGE_GPU_NO_REPLAY")) {
+                    if (std::getenv("FORGE_GPU_REPLAY")) {   // opt-in while experimental (no measured gain yet)
                         h->ran = [raw](const void* k, bool c) { raw->ran(k, c); };
                         h->replay = [raw](const void* k) { return raw->replay(k); };
                     }
