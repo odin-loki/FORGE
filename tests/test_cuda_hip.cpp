@@ -93,12 +93,20 @@ template<class RT> static int qmatmul_check(graph::registry& reg, const std::str
     return fails;
 }
 
+static int state_ops_check_one(graph::registry& reg, const std::string& api, const i64 dk, const i64 dv);
 // Gated DeltaNet state ops on the device (run_state) vs the CPU executor: 3-token prefill, then token by token,
 // then reset() and again (the resident state must restart from zeros).
 static int state_ops_check(graph::registry& reg, const std::string& api) {
     if (!reg.hooks || !reg.hooks->state) { std::printf("note %s: no device state ops\n", api.c_str()); return 0; }
+    int fails = 0;
+    for (auto [dk, dv] : {std::pair<i64, i64>{40, 136}, {128, 128}, {64, 32}}) fails += state_ops_check_one(reg, api, dk, dv);
+    return fails;
+}
+// One shape: dk 40 / dv 136 takes the per-head kernel (dv > 128 and C > 128: multi-column threads / blocks); dk = dv = 128
+// (Qwen3.5) and dk 64 / dv 32 take the register-state kernels forge_delta_rule_r16 / _r8.
+static int state_ops_check_one(graph::registry& reg, const std::string& api, const i64 dk, const i64 dv) {
     using namespace graph;
-    const i64 S = 7, Hk = 2, Hv = 4, dk = 40, dv = 136, C = 150, K = 4;   // dv > 128 and C > 128: multi-column threads / blocks
+    const i64 S = 7, Hk = 2, Hv = 4, C = 150, K = 4;
     auto rnd = [](std::size_t n, float ph) { std::vector<float> v(n); for (std::size_t i = 0; i < n; ++i) v[i] = std::sin(float(i) * 0.37f + ph); return v; };
     auto q = rnd(S * Hk * dk, 1), k = rnd(S * Hk * dk, 2), v = rnd(S * Hv * dv, 3), gl = rnd(S * Hv, 4), bl = rnd(S * Hv, 5), xc = rnd(S * C, 6), wc = rnd(C * K, 7);
     for (auto& x : gl) x = -std::fabs(x) * 0.5f;
@@ -130,7 +138,8 @@ static int state_ops_check(graph::registry& reg, const std::string& api) {
     double worst = dev.size() == cpu.size() ? 0 : 1e9;
     for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) worst = std::max(worst, std::fabs(double(dev[i]) - cpu[i]) / (1.0 + std::fabs(double(cpu[i]))));
     bool ok = worst < 1e-4;
-    std::printf("%s %s delta_rule/causal_conv on the device match the CPU (worst rel %.3g)\n", ok ? "ok  " : "FAIL", api.c_str(), worst);
+    std::printf("%s %s delta_rule/causal_conv (dk %lld, dv %lld) on the device match the CPU (worst rel %.3g)\n", ok ? "ok  " : "FAIL", api.c_str(),
+                (long long)dk, (long long)dv, worst);
     return ok ? 0 : 1;
 }
 
@@ -359,12 +368,14 @@ static int bench_qmm(int argc, char** argv) {
     rt->begin_run();
     rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv);   // upload + warm up
     rt->wait();
-    // single timed calls, fastest kept: the GPU may be shared, and the minimum best approximates an idle device
+    // batches of `reps` back-to-back calls, one wait each; the fastest batch is kept (the GPU may be shared, and
+    // the minimum best approximates an idle device). Per-call time = batch time / reps.
     std::vector<double> ts;
-    for (int i = 0; i < reps; ++i) {
+    for (int b = 0; b < 7; ++b) {
         auto t0 = std::chrono::steady_clock::now();
-        rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv); rt->wait();
-        ts.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        for (int i = 0; i < reps; ++i) rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv);
+        rt->wait();
+        ts.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
     }
     std::sort(ts.begin(), ts.end()); const double us = ts.front(), med = ts[ts.size() / 2];
     rt->end_run();

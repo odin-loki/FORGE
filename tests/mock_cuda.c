@@ -42,8 +42,13 @@ static size_t g_live = 0;
 /* MOCK_MEM_LIMIT (bytes): allocations past it fail with CUDA_ERROR_OUT_OF_MEMORY / hipErrorOutOfMemory (2). */
 int N_(cuMemAlloc_v2, hipMalloc)(dptr* p, size_t n) {
     const char* lim = getenv("MOCK_MEM_LIMIT"); if (lim && g_live + n > (size_t)strtoull(lim, NULL, 10)) return 2;
-    size_t* b = malloc(n + 16); if (!b) return 2; b[0] = n; g_live += n; *p = (dptr)(uintptr_t)(b + 2); return 0; }
-int N_(cuMemFree_v2, hipFree)(dptr p) { if (!p) return 0; size_t* b = (size_t*)(uintptr_t)p - 2; g_live -= b[0]; free(b); return 0; }
+    size_t* b = malloc(n + 16); if (!b) return 2; b[0] = n; g_live += n; *p = (dptr)(uintptr_t)(b + 2);
+    if (getenv("MOCK_TRACE")) fprintf(stderr, "mock: alloc %#llx %zu\n", (unsigned long long)*p, n);
+    return 0; }
+int N_(cuMemFree_v2, hipFree)(dptr p) {
+    if (!p) return 0; size_t* b = (size_t*)(uintptr_t)p - 2;
+    if (getenv("MOCK_TRACE")) fprintf(stderr, "mock: free %#llx %zu\n", (unsigned long long)p, b[0]);
+    g_live -= b[0]; free(b); return 0; }
 int N_(cuMemcpyHtoD_v2, hipMemcpyHtoD)(dptr d, const void* s, size_t n) { memcpy(P(d), s, n); return 0; }
 int N_(cuMemcpyDtoH_v2, hipMemcpyDtoH)(void* d, dptr s, size_t n) { memcpy(d, P(s), n); return 0; }
 int N_(cuMemcpyHtoDAsync_v2, hipMemcpyHtoDAsync)(dptr d, const void* s, size_t n, void* st) { (void)st; memcpy(P(d), s, n); return 0; }
@@ -102,6 +107,8 @@ static void m_scmin(unsigned j, const unsigned char* q, unsigned* d, unsigned* m
 static void m_qgroup(unsigned fmt, const unsigned char* row, unsigned g, float* v) {
     unsigned l, s = g & 7u;
     if (fmt == 1u) { const unsigned char* b = row + g * 34u; float d = m_h2f(m_ld16(b)); for (l = 0; l < 32u; ++l) v[l] = d * (float)(signed char)b[2u + l]; return; }
+    if (fmt == 6u) { const unsigned char* b = row + (g >> 3) * 272u; float d = m_h2f(m_ld16(b + 2u * (g & 7u)));   /* regrouped q8_0 */
+        for (l = 0; l < 32u; ++l) v[l] = d * (float)(signed char)b[16u + 32u * (g & 7u) + l]; return; }
     if (fmt == 3u || fmt == 5u) { const unsigned char* b = row + (g >> 3) * (fmt == 5u ? 224u : 210u); unsigned h = s >> 2, t = s & 3u;   /* 5: padded q6_k */
         const unsigned char* ql = b + 64u * h; const unsigned char* qh = b + 128u + 32u * h; const signed char* sc = (const signed char*)(b + 192u + 8u * h);
         float d = m_h2f(m_ld16(b + 208u));
@@ -146,7 +153,7 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
-    if (!strcmp(op, "delta_rule")) return 14; if (!strcmp(op, "causal_conv")) return 7;
+    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32 */ if (!strcmp(op, "causal_conv")) return 7;
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13)) return 12; if (!strcmp(op, "attention_dec")) return 13;
     if (!strcmp(op, "attention_comb")) return 5; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
@@ -165,7 +172,10 @@ int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, unsigned gy,
         for (int i = 0; i < n; ++i) memcpy(&r->vals[i], args[i], 8);   /* every arg is <= 8 bytes */
         return 0;
     }
-    return run_kernel(f, gx, bx, args);
+    if (getenv("MOCK_TRACE")) fprintf(stderr, "mock: launch %s grid %u block %u\n", (const char*)f, gx, bx);
+    { int rc = run_kernel(f, gx, bx, args);
+      if (rc && getenv("MOCK_TRACE")) fprintf(stderr, "mock: launch %s grid %u block %u rejected\n", (const char*)f, gx, bx);
+      return rc; }
 }
 int N_(cuGraphLaunch, hipGraphLaunch)(void* e, void* s) {
     (void)s; graph* g = e;
@@ -241,7 +251,7 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     if (!strcmp(op, "quant_q8r")) { unsigned nb = ARG(3, unsigned); if (gx * 8u < nb) return 1;
         mock_q8r(P(ARG(0, dptr)), (signed char*)(uintptr_t)ARG(1, dptr), P(ARG(2, dptr)), nb); return 0; }
     if (!strncmp(op, "qmatmul_mma_", 12)) {   /* qmatmul_mma_q8_0 / _q4_k / _q6_k */ unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned);
-        if (gx < ((cols + 127) / 128) * ((rows + 63) / 64) || bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u)) return 1;   /* 64x64 tiles, 128 threads */
+        if (gx < ((cols + 127) / 128) * ((rows + 63) / 64) || bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u || fmt == 6u)) return 1;   /* 64x64 tiles, 128 threads */
         return mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), P(ARG(3, dptr)), rows, cols, k, fmt, rb); }
     if (!strcmp(op, "quant_q81")) { mock_q81(P(ARG(0, dptr)), (unsigned char*)(uintptr_t)ARG(1, dptr), ARG(2, unsigned)); return 0; }
     if (!strcmp(op, "qmatmul_q81")) { const unsigned char* xq = (const unsigned char*)(uintptr_t)ARG(0, dptr); float* y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
@@ -250,10 +260,11 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < ((cols + 63) / 64) * ((rows + 63) / 64) || bx != 256) return 1;   /* MMQ 64x64-tile launch shape */
         return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
-    if (!strcmp(op, "delta_rule")) {   /* flow/state_ops.hpp delta_rule; one block per value head */
+    if (!strncmp(op, "delta_rule", 10)) {   /* flow/state_ops.hpp delta_rule; delta_rule: a block per value head, _rN: per (head, 32 columns) */
         float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *g = P(ARG(3, dptr)), *be = P(ARG(4, dptr)), *S = P(ARG(5, dptr)), *o = P(ARG(6, dptr));
         unsigned s = ARG(7, unsigned), hk = ARG(8, unsigned), dk = ARG(9, unsigned), hv = ARG(10, unsigned), dv = ARG(11, unsigned), l2 = ARG(12, unsigned); float sc = ARG(13, float);
-        unsigned h, t, a, j; if (gx < hv || bx != 128 || dk > 256) return 1;
+        unsigned h, t, a, j; int rv = op[10] == '_';
+        if ((!rv && (gx < hv || bx != 128)) || (rv && (gx < hv * (dv / 32u) || bx != 256 || dv % 32u || dk != 8u * (unsigned)atoi(op + 12))) || dk > 256) return 1;
         for (h = 0; h < hv; ++h) { float* Sh = S + (size_t)h * dk * dv; unsigned kh = h / (hv / hk);
             for (t = 0; t < s; ++t) { const float *qt = q + ((size_t)t * hk + kh) * dk, *kt = k + ((size_t)t * hk + kh) * dk, *vt = v + ((size_t)t * hv + h) * dv;
                 float qs = 0, ks = 0, qf, kf, dec = expf(g[t * hv + h]), bt = be[t * hv + h]; float* ot = o + ((size_t)t * hv + h) * dv;

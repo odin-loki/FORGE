@@ -446,7 +446,7 @@ public:
     static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on; }
     std::uint64_t att_ = 0; std::size_t att_cap_ = 0;
     std::set<void*> mma_attr_;   // kernels (qmatmul_mma_*, attention_fa2_*) whose dynamic shared memory limit was raised
-    static const char* mma_fn(std::uint32_t fmt) { return fmt == 1 ? "forge_qmatmul_mma_q8_0" : fmt == 2 ? "forge_qmatmul_mma_q4_k" : "forge_qmatmul_mma_q6_k"; }
+    static const char* mma_fn(std::uint32_t fmt) { return fmt == 1 ? "forge_qmatmul_mma_q8_0" : fmt == 6 ? "forge_qmatmul_mma_q8_0g" : fmt == 2 ? "forge_qmatmul_mma_q4_k" : "forge_qmatmul_mma_q6_k"; }
     std::uint64_t q8r_ = 0; std::size_t q8r_cap_ = 0;   // int8 activation rows + per-group (d, d*sum) for the mma path
     void q8r_reserve(std::size_t need) {
         if (q8r_cap_ >= need) return;
@@ -481,8 +481,11 @@ public:
         // q6_k on the sm_80 image: blocks padded from 210 to 224 bytes on upload (fmt 5), so both the tensor-core and
         // the decode kernel read them with aligned 16-byte loads. Cached under the padded size, apart from raw copies.
         const bool pad6 = fmt == 3 && k % 256 == 0 && use_mma() && use_mmvq() && has_fn_locked("forge_qmatmul_mma_q6_k") && has_fn_locked("forge_qmatmul_q81");
+        // q8_0 likewise regrouped (fmt 6): each 8 blocks become 8 fp16 scales then 256 int8, the same 272 bytes, aligned.
+        // Same size as the raw copy, so the cache key's low address bit tells them apart (block data is >= 2-aligned).
+        const bool grp8 = fmt == 1 && k % 256 == 0 && use_mma() && use_mmvq() && has_fn_locked("forge_qmatmul_mma_q8_0g") && has_fn_locked("forge_qmatmul_q81");
         const std::size_t drb = pad6 ? rb / 210 * 224 : rb, qbytes = drb * cols;
-        auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}]; qe.last = ++clock_;
+        auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(q) | (grp8 ? 1u : 0u), qbytes}]; qe.last = ++clock_;
         if (!qe.d) {
             std::uint64_t d = dmalloc(qbytes, "weights");
             qe.d = d;
@@ -491,10 +494,19 @@ public:
                 for (std::size_t c = 0, nb = rb / 210; c < cols; ++c)
                     for (std::size_t b = 0; b < nb; ++b) std::memcpy(tmp.data() + c * drb + b * 224, q + c * rb + b * 210, 210);
                 ck(htod_s(qe.d, tmp.data(), qbytes, stream_), "memcpy HtoD");
+            } else if (grp8) {
+                std::vector<std::uint8_t> tmp(qbytes);
+                for (std::size_t c = 0, ng = rb / 272; c < cols; ++c)
+                    for (std::size_t g = 0; g < ng; ++g) {
+                        std::uint8_t* o = tmp.data() + c * rb + g * 272; const std::uint8_t* b = q + c * rb + g * 272;
+                        for (int j = 0; j < 8; ++j) { std::memcpy(o + 2 * j, b + 34 * j, 2); std::memcpy(o + 16 + 32 * j, b + 34 * j + 2, 32); }
+                    }
+                ck(htod_s(qe.d, tmp.data(), qbytes, stream_), "memcpy HtoD");
             } else ck(htod_s(qe.d, q, qbytes, stream_), "memcpy HtoD");
             ++stats_.uploads; stats_.qweight_bytes += qbytes;
         }
         if (pad6) { fmt = 5; rb = drb; }
+        if (grp8) fmt = 6;
         const std::uint64_t qd = qe.d;
         std::vector<std::uint64_t> temps;
         auto free_temps = [&] { for (auto p : temps) dfree(p); };
@@ -510,7 +522,7 @@ public:
             }
             std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
             void* args[] = {&xd, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-            if (rows >= mmq_min_rows() && (fmt == 1 || fmt == 2 || fmt == 5) && k % 256 == 0 && use_mma() && has_fn_locked(mma_fn(fmt)) && has_fn_locked("forge_quant_q8r")) {
+            if (rows >= mmq_min_rows() && (fmt == 1 || fmt == 2 || fmt == 5 || fmt == 6) && k % 256 == 0 && use_mma() && has_fn_locked(mma_fn(fmt)) && has_fn_locked("forge_quant_q8r")) {
                 ++dispatches_["qmatmul_mma"];   // batched prefill on int8 tensor cores
                 std::uint32_t nb = rows * (k / 32);
                 std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256;
@@ -520,7 +532,7 @@ public:
                 ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                 void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
                 // 128 weight rows x 64 tokens per 256-thread block; dynamic shared memory sized per format
-                const unsigned smem = fmt == 2 ? 48128u : fmt == 5 ? 60416u : 64512u;
+                const unsigned smem = fmt == 2 ? 48128u : fmt == 5 ? 60416u : 64512u;   // q8_0 (1, 6): 64512
                 void* mf = function(mma_fn(fmt));
                 if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, 64512), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
                 unsigned grid = ((rows + 63) / 64) * ((cols + 127) / 128);
@@ -529,7 +541,7 @@ public:
                 ++dispatches_["qmatmul_mmq"];
                 unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
                 if (grid) ck(launch_s(function("forge_qmatmul_mmq"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
-            } else if ((fmt <= 3 || fmt == 5) && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
+            } else if ((fmt <= 3 || fmt == 5 || fmt == 6) && use_mmvq() && has_fn_locked("forge_qmatmul_q81") && has_fn_locked("forge_quant_q81")) {
                 ++dispatches_["qmatmul_q81"];   // decode: q8_1 activations + dp4a (llama.cpp mmvq)
                 std::uint32_t nb = rows * (k / 32); std::size_t need = std::size_t(nb) * 40;
                 q81_reserve(need);
@@ -560,12 +572,16 @@ public:
     bool run_state(const std::string& fn, const std::vector<tensor_view>& in, float* S, std::size_t sn, tensor_view out, const ops::attrs& a) {
         std::lock_guard lk(mu_); bind(); begin_op();
         if (!in_run_ || !has_fn_locked("forge_" + fn)) return false;
-        std::uint32_t u[6] = {}; std::uint32_t grid = 0; float sc = 0;
+        std::uint32_t u[6] = {}; std::uint32_t grid = 0; float sc = 0; std::string kfn = "forge_" + fn; unsigned block = 128;
         if (fn == "delta_rule" && in.size() == 5) {
             u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[0].shape[2]);
             u[3] = std::uint32_t(in[2].shape[1]); u[4] = std::uint32_t(in[2].shape[2]); u[5] = a.num("l2norm", 1) != 0;
             if (u[2] > 256u || !u[1] || u[3] % u[1]) return false;
             sc = float(a.num("scale", 1.0 / std::sqrt(double(u[2])))); grid = u[3];
+            // state in registers: a block per (value head, 32 columns), dk = 8 * {8, 16, 32}
+            if ((u[2] == 64 || u[2] == 128 || u[2] == 256) && u[4] % 32 == 0 && !std::getenv("FORGE_DELTA_RULE_OLD")) {
+                std::string rn = "forge_delta_rule_r" + std::to_string(u[2] / 8);
+                if (has_fn_locked(rn)) { kfn = rn; grid = u[3] * (u[4] / 32); block = 256; } }
         } else if (fn == "causal_conv" && in.size() == 2) {
             u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[1].shape[1]);
             if (u[2] < 1u || u[2] > 9u) return false;
@@ -592,7 +608,7 @@ public:
         else for (int i = 0; i < 3; ++i) args.push_back(&u[i]);
         ++dispatches_[fn];
         writes(ptrs.back(), out.size() * 4); writes(ptrs[ptrs.size() - 2], sn * 4);
-        if (grid) ck(launch_s(function("forge_" + fn), grid, 1, 1, 128, 1, 1, 0, stream_, args.data(), nullptr), "launch");
+        if (grid) ck(launch_s(function(kfn), grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
         return true;
     }
 
