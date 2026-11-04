@@ -1,10 +1,12 @@
 #pragma once
 // forge::os::service control: define, install, start, stop, query and uninstall a per-user background service.
 //   Linux/FreeBSD with systemd: a user unit in $XDG_CONFIG_HOME/systemd/user driven by `systemctl --user`.
-//   macOS: a LaunchAgent plist in ~/Library/LaunchAgents driven by `launchctl`.
+//   macOS: a LaunchAgent plist in ~/Library/LaunchAgents driven by `launchctl bootstrap/bootout/kickstart gui/<uid>`;
+//   query parses `launchctl print gui/<uid>/<label>` (loaded but not running is stopped, a non-zero last exit failed).
 //   Windows: a Service Control Manager service via `sc.exe` (needs an elevated process).
 //   Android / iOS: unsupported.
-// The unit-file text is produced by render_*() so it can be inspected or tested without touching the system;
+// The unit-file text is produced by render_*() so it can be inspected or tested without touching the system; install()
+// rejects control characters (validate()), and systemd text escapes %, $ (ExecStart only), quotes and a lone ";".
 // set service_spec::dir to install somewhere other than the per-user default (also used by tests).
 // Guide: docs/os-wrapper.md.
 #include <forge/os/process.hpp>
@@ -30,21 +32,69 @@ inline bool valid_name(const std::string& n) {
     for (char c : n) if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_' || c == '.' || c == '@')) return false;
     return true;
 }
-inline std::string quote_systemd_(const std::string& a) {
-    bool plain = !a.empty(); for (char c : a) plain &= !(c == ' ' || c == '"' || c == '\\' || c == '\'' || c == '$' || c == '%' || c == '\t');
-    if (plain) return a;
-    std::string o = "\""; for (char c : a) { if (c == '"' || c == '\\') o += '\\'; if (c == '%') { o += "%%"; continue; } if (c == '$') { o += "$$"; continue; } o += c; } return o + "\"";
+// Control characters (newline above all) would start new unit directives or break the plist: rejected by
+// validate() (and install()); the renderers also neutralise them so their output is always one directive per line.
+inline bool has_ctl_(const std::string& s) { for (unsigned char c : s) if (c < 0x20 || c == 0x7f) return true; return false; }
+inline status validate(const service_spec& s) {
+    auto bad = [](const std::string& why) { return status{{}, {EINVAL, "service: " + why}}; };
+    if (!valid_name(s.name)) return bad("invalid name '" + s.name + "'");
+    if (s.argv.empty()) return bad("argv is empty");
+    if (s.argv[0].empty() || std::string_view("@-:+!|").find(s.argv[0][0]) != std::string_view::npos) return bad("argv[0] is empty or starts with a systemd prefix character");
+    if (has_ctl_(s.description) || has_ctl_(s.working_dir)) return bad("control character in description or working_dir");
+    for (auto& a : s.argv) if (has_ctl_(a)) return bad("control character in argv");
+    for (auto& [k, v] : s.env) if (k.empty() || k.find('=') != std::string::npos || has_ctl_(k) || has_ctl_(v)) return bad("invalid environment entry '" + k + "'");
+    return {};
 }
-inline std::string xml_esc_(const std::string& s) { std::string o; for (char c : s) { if (c == '&') o += "&amp;"; else if (c == '<') o += "&lt;"; else if (c == '>') o += "&gt;"; else if (c == '"') o += "&quot;"; else o += c; } return o; }
+inline void esc_ctl_(std::string& o, char c) { char b[8]; std::snprintf(b, sizeof b, "\\x%02x", unsigned(static_cast<unsigned char>(c))); o += b; }
+// ExecStart= word (systemd.service "Command lines"): specifiers (%) and $VAR expansion are escaped by doubling,
+// quotes and backslashes are C-escaped inside "...", and a lone ";" (the command separator) becomes "\;".
+inline std::string quote_systemd_(const std::string& a) {
+    if (a == ";") return "\\;";
+    bool plain = !a.empty(); for (char c : a) plain &= !(c == ' ' || c == '"' || c == '\\' || c == '\'' || c == '$' || c == '%' || c == ';' || static_cast<unsigned char>(c) < 0x20 || c == 0x7f);
+    if (plain) return a;
+    std::string o = "\"";
+    for (char c : a) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; } else if (c == '%') o += "%%"; else if (c == '$') o += "$$";
+        else if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) esc_ctl_(o, c); else o += c;
+    }
+    return o + "\"";
+}
+// Environment= assignment (systemd.exec): quoted and C-unescaped, specifiers expanded, but no $ expansion.
+inline std::string quote_systemd_env_(const std::string& kv) {
+    std::string o = "\"";
+    for (char c : kv) {
+        if (c == '"' || c == '\\') { o += '\\'; o += c; } else if (c == '%') o += "%%";
+        else if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) esc_ctl_(o, c); else o += c;
+    }
+    return o + "\"";
+}
+// Description= / WorkingDirectory=: taken verbatim to the end of the line (no unquoting), specifiers expanded.
+inline std::string systemd_verbatim_(const std::string& s) {
+    std::string o; for (char c : s) { if (c == '%') o += "%%"; else if (static_cast<unsigned char>(c) < 0x20 || c == 0x7f) o += ' '; else o += c; } return o;
+}
+inline std::string xml_esc_(const std::string& s) {
+    std::string o; for (char c : s) { if (c == '&') o += "&amp;"; else if (c == '<') o += "&lt;"; else if (c == '>') o += "&gt;"; else if (c == '"') o += "&quot;"; else if (static_cast<unsigned char>(c) < 0x20 && c != '\t') o += ' '; else o += c; } return o;
+}
 inline std::string render_systemd_unit(const service_spec& s) {
-    std::string u = "[Unit]\nDescription=" + (s.description.empty() ? s.name : s.description) + "\n\n[Service]\nType=simple\nExecStart=";
+    std::string u = "[Unit]\nDescription=" + systemd_verbatim_(s.description.empty() ? s.name : s.description) + "\n\n[Service]\nType=simple\nExecStart=";
     for (std::size_t i = 0; i < s.argv.size(); ++i) u += (i ? " " : "") + quote_systemd_(s.argv[i]);
     u += "\n";
-    if (!s.working_dir.empty()) u += "WorkingDirectory=" + quote_systemd_(s.working_dir) + "\n";
-    for (auto& [k, v] : s.env) u += "Environment=" + quote_systemd_(k + "=" + v) + "\n";
+    if (!s.working_dir.empty()) u += "WorkingDirectory=" + systemd_verbatim_(s.working_dir) + "\n";
+    for (auto& [k, v] : s.env) u += "Environment=" + quote_systemd_env_(k + "=" + v) + "\n";
     u += std::string("Restart=") + (s.restart_on_failure ? "on-failure" : "no") + "\n";
     u += "\n[Install]\nWantedBy=default.target\n";
     return u;
+}
+// `launchctl print gui/<uid>/<label>` output -> state: top-level (one-tab) "state = running" is running; otherwise a
+// non-zero "last exit code" is failed, anything else stopped.
+inline service_state parse_launchctl_print(const std::string& out) {
+    auto field = [&](const char* k) -> std::string {
+        std::string key = std::string("\n\t") + k + " = "; auto t = "\n" + out; auto p = t.find(key); if (p == std::string::npos) return {};
+        p += key.size(); auto e = t.find('\n', p); return t.substr(p, e == std::string::npos ? std::string::npos : e - p);
+    };
+    auto st = field("state"); if (st == "running") return service_state::running;
+    auto lx = field("last exit code"); if (!lx.empty() && lx[0] != '(' && std::strtol(lx.c_str(), nullptr, 10) != 0) return service_state::failed;
+    return service_state::stopped;
 }
 inline std::string render_launchd_plist(const service_spec& s) {
     std::string p = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n";
@@ -80,12 +130,15 @@ inline status ctl_ok_(std::vector<std::string> argv) {
     if (r->exit_code != 0) return {{}, {r->exit_code, what + ": " + (r->err.empty() ? r->out : r->err)}};
     return {};
 }
+#if defined(__APPLE__)
+inline std::string launchd_domain_() { return "gui/" + std::to_string(::getuid()); }
+inline std::string launchd_target_(const service_spec& s) { return launchd_domain_() + "/" + s.name; }
+#endif
 inline bool systemd_user_available_() { return !find_executable("systemctl").empty() && (!getenv("XDG_RUNTIME_DIR").empty() || !getenv("DBUS_SESSION_BUS_ADDRESS").empty()); }
 
 // Write the unit (and register it with the manager unless spec.dir overrides the location).
 inline status install(const service_spec& s) {
-    if (!valid_name(s.name)) return {{}, {EINVAL, "service: invalid name '" + s.name + "'"}};
-    if (s.argv.empty()) return {{}, {EINVAL, "service: argv is empty"}};
+    if (auto v = validate(s); !v) return v;
 #if defined(FORGE_OS_ANDROID) || defined(FORGE_OS_IOS)
     return {{}, unsupported("service install")};
 #elif defined(FORGE_OS_WINDOWS)
@@ -117,7 +170,10 @@ inline status start(const service_spec& s) {
 #if defined(FORGE_OS_WINDOWS)
     return ctl_ok_({"sc.exe", "start", s.name});
 #elif defined(__APPLE__) && !defined(FORGE_OS_IOS)
-    return ctl_ok_({"launchctl", "load", "-w", unit_path(s)});
+    ctl_({"launchctl", "enable", launchd_target_(s)});   // clear a disabled override (what load -w did)
+    if (auto r = ctl_({"launchctl", "print", launchd_target_(s)}); !r || r->exit_code != 0)
+        if (auto b = ctl_ok_({"launchctl", "bootstrap", launchd_domain_(), unit_path(s)}); !b) return b;
+    return ctl_ok_({"launchctl", "kickstart", launchd_target_(s)});
 #elif defined(FORGE_OS_ANDROID) || defined(FORGE_OS_IOS)
     (void)s; return {{}, unsupported("service start")};
 #else
@@ -129,7 +185,7 @@ inline status stop(const service_spec& s) {
 #if defined(FORGE_OS_WINDOWS)
     return ctl_ok_({"sc.exe", "stop", s.name});
 #elif defined(__APPLE__) && !defined(FORGE_OS_IOS)
-    return ctl_ok_({"launchctl", "unload", unit_path(s)});
+    return ctl_ok_({"launchctl", "bootout", launchd_target_(s)});
 #elif defined(FORGE_OS_ANDROID) || defined(FORGE_OS_IOS)
     (void)s; return {{}, unsupported("service stop")};
 #else
@@ -149,8 +205,8 @@ inline service_state query(const service_spec& s) {
 #else
     if (!fs::exists(unit_path(s))) return service_state::not_installed;
 #if defined(__APPLE__)
-    auto r = ctl_({"launchctl", "list", s.name}); if (!r) return service_state::unknown;
-    return r->exit_code == 0 ? service_state::running : service_state::stopped;
+    auto r = ctl_({"launchctl", "print", launchd_target_(s)}); if (!r) return service_state::unknown;
+    return r->exit_code != 0 ? service_state::stopped : parse_launchctl_print(r->out);   // not bootstrapped = stopped
 #else
     if (!systemd_user_available_() || !s.dir.empty()) return service_state::stopped;
     auto r = ctl_({"systemctl", "--user", "is-active", s.name + ".service"}); if (!r) return service_state::unknown;
@@ -167,7 +223,7 @@ inline status uninstall(const service_spec& s) {
 #else
     if (s.dir.empty()) {
 #if defined(__APPLE__)
-        ctl_({"launchctl", "unload", unit_path(s)});
+        ctl_({"launchctl", "bootout", launchd_target_(s)});
 #else
         if (systemd_user_available_()) { ctl_({"systemctl", "--user", "disable", "--now", s.name + ".service"}); }
 #endif

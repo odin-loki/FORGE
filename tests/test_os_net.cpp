@@ -91,6 +91,33 @@ TEST(service_units) {
     CHECK(u.find("Environment=\"A=1 2\"") != std::string::npos); CHECK(u.find("Restart=on-failure") != std::string::npos);
     auto p = os::service::render_launchd_plist(s); CHECK(p.find("<string>my file.fg</string>") != std::string::npos);
     CHECK(!os::service::valid_name("bad name")); CHECK(!os::service::install({}));
+    CHECK(os::service::validate(s));
+    {   // injection: a newline must not start a new directive; install refuses control characters
+        auto bad = s; bad.description = "x\nExecStartPre=/bin/evil"; CHECK(!os::service::validate(bad)); CHECK(!os::service::install(bad));
+        auto t = os::service::render_systemd_unit(bad); CHECK(t.find("\nExecStartPre=") == std::string::npos);
+        bad = s; bad.argv.push_back("a\nExecStartPre=/bin/evil"); CHECK(!os::service::validate(bad));
+        t = os::service::render_systemd_unit(bad); CHECK(t.find("\nExecStartPre=") == std::string::npos); CHECK(t.find("\"a\\x0aExecStartPre=/bin/evil\"") != std::string::npos);
+        bad = s; bad.env["B"] = "1\nExecStartPre=/bin/evil"; CHECK(!os::service::validate(bad)); CHECK(os::service::render_systemd_unit(bad).find("\nExecStartPre=") == std::string::npos);
+        bad = s; bad.working_dir = "/tmp\nExecStartPre=/bin/evil"; CHECK(!os::service::validate(bad)); CHECK(os::service::render_systemd_unit(bad).find("\nExecStartPre=") == std::string::npos);
+        bad = s; bad.env["A=B"] = "1"; CHECK(!os::service::validate(bad));
+        bad = s; bad.argv[0] = "-/usr/bin/forge"; CHECK(!os::service::validate(bad));
+    }
+    {   // escaping per systemd.syntax / systemd.exec
+        auto e = s; e.argv = {"/bin/sh", "-c", "echo $HOME 100%", ";", "x;y"}; e.env = {{"P", "$HOME 5%"}}; e.description = "50% done"; e.working_dir = "/srv/my dir";
+        auto t = os::service::render_systemd_unit(e);
+        CHECK(t.find("ExecStart=/bin/sh -c \"echo $$HOME 100%%\" \\; \"x;y\"\n") != std::string::npos);
+        CHECK(t.find("Environment=\"P=$HOME 5%%\"\n") != std::string::npos);   // Environment= does not expand $
+        CHECK(t.find("Description=50%% done\n") != std::string::npos); CHECK(t.find("WorkingDirectory=/srv/my dir\n") != std::string::npos);
+        e.argv = {"/bin/x", "a\"b\\c"}; CHECK(os::service::render_systemd_unit(e).find("ExecStart=/bin/x \"a\\\"b\\\\c\"\n") != std::string::npos);
+    }
+    {   // macOS `launchctl print` parsing
+        using st = os::service::service_state;
+        CHECK(os::service::parse_launchctl_print("gui/501/x = {\n\tactive count = 1\n\tstate = running\n\tpid = 4242\n\tendpoints = {\n\t\tstate = active\n\t}\n}\n") == st::running);
+        CHECK(os::service::parse_launchctl_print("gui/501/x = {\n\tstate = not running\n\tlast exit code = (never exited)\n}\n") == st::stopped);
+        CHECK(os::service::parse_launchctl_print("gui/501/x = {\n\tstate = not running\n\tlast exit code = 0\n}\n") == st::stopped);
+        CHECK(os::service::parse_launchctl_print("gui/501/x = {\n\tstate = not running\n\tlast exit code = 78: EX_CONFIG\n}\n") == st::failed);
+        CHECK(os::service::parse_launchctl_print("gui/501/x = {\n\tstate = waiting\n\t\tstate = running\n}\n") == st::stopped);
+    }
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_ANDROID) && !defined(FORGE_OS_IOS)
     auto d = fs::make_temp_dir(); CHECK(d); s.dir = *d;
     CHECK(os::service::query(s) == os::service::service_state::not_installed);

@@ -381,6 +381,13 @@ TEST(service_integration) {
 #endif
     auto l = os::service::log(os::log_level::info, "forge test_os_ext service log line");
     if (!l) skip("service log", l.err.what);
+#if !defined(_WIN32)
+    {   // concurrent idents: openlog must never see a freed ident string
+        std::vector<std::thread> ts; std::atomic<int> bad{0};
+        for (int t = 0; t < 4; ++t) ts.emplace_back([t, &bad] { for (int i = 0; i < 25; ++i) if (!os::service::log(os::log_level::debug, "forge concurrent log", "forge-test-" + std::to_string(t) + "-" + std::to_string(i % 3))) ++bad; });
+        for (auto& t : ts) t.join(); CHECK(bad == 0 || !l);
+    }
+#endif
     int ran = 0; auto r = os::service::run_as_service("forge-test", [&] { ++ran; return 0; }, [] {});
     CHECK(r); CHECK(ran == 1);
 }
