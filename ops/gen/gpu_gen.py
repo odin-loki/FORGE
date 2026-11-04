@@ -275,6 +275,10 @@ FORGE_DEV float h2f(unsigned h) {
   return __builtin_bit_cast(float, b); }
 #endif
 FORGE_DEV unsigned ld16(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+FORGE_DEV unsigned hb_(unsigned a, unsigned b, unsigned c, unsigned i) { unsigned w = i < 4u ? a : i < 8u ? b : c; return (w >> (8u * (i & 3u))) & 255u; }
+FORGE_DEV void scmin_w(unsigned j, unsigned a, unsigned b, unsigned c, unsigned* d, unsigned* m) {   // scmin from words
+  if (j < 4u) { *d = hb_(a, b, c, j) & 63u; *m = hb_(a, b, c, j + 4u) & 63u; }
+  else { *d = (hb_(a, b, c, j + 4u) & 15u) | ((hb_(a, b, c, j - 4u) >> 6) << 4); *m = (hb_(a, b, c, j + 4u) >> 4) | ((hb_(a, b, c, j) >> 6) << 4); } }
 FORGE_DEV void scmin(unsigned j, const unsigned char* q, unsigned* d, unsigned* m) {
   if (j < 4u) { *d = q[j] & 63u; *m = q[j + 4u] & 63u; }
   else { *d = (q[j + 4u] & 15u) | ((q[j - 4u] >> 6) << 4); *m = (q[j + 4u] >> 4) | ((q[j] >> 6) << 4); } }
@@ -452,9 +456,9 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
     unsigned j = (l & 7u) >> 1, o = (l & 1u) * 16u;
     for (unsigned sb = (l >> 3) + 4u * wq; sb < k / 256u; sb += 16u) {
       const unsigned char* b = row + sb * 144u;
-      u32x4 q = *(const u32x4*)(b + 16u + j * 32u + o);
-      float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned s0, m0, s1, m1;
-      scmin(2u * j, b + 4u, &s0, &m0); scmin(2u * j + 1u, b + 4u, &s1, &m1);
+      u32x4 q = *(const u32x4*)(b + 16u + j * 32u + o), hd = *(const u32x4*)b;   // quants and the 16-byte header
+      float d = h2f(hd[0] & 0xFFFFu), dm = h2f(hd[0] >> 16); unsigned s0, m0, s1, m1;
+      scmin_w(2u * j, hd[1], hd[2], hd[3], &s0, &m0); scmin_w(2u * j + 1u, hd[1], hd[2], hd[3], &s1, &m1);
       float d0 = d * (float)s0, n0 = dm * (float)m0, d1 = d * (float)s1, n1 = dm * (float)m1;
       unsigned gA = sb * 8u + 2u * j;
 #pragma unroll
@@ -524,7 +528,7 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
         acc[rr] += *(const float*)xa * dw * (float)dp4a_ss(wv, *(const int*)(xa + 8u + part), 0); } }
   }
 #pragma unroll
-  for (unsigned rr = 0; rr < 4u; ++rr) { float v = wsum_(acc[rr]); if (l == 0u) red[wq][rr] = v; }
+  for (unsigned rr = 0; rr < 4u; ++rr) { if (rr >= nr) break; float v = wsum_(acc[rr]); if (l == 0u) red[wq][rr] = v; }
   bar_();
   if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[0][t] + red[1][t] + red[2][t] + red[3][t]; }
 // delta_rule with the state in registers (same contract and arguments as forge_delta_rule): a 256-thread block per
