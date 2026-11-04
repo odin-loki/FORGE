@@ -94,16 +94,16 @@ The work is split by file ownership so changes can proceed in parallel without c
 | E11 | D | CI: iOS builds only `forge_c` (apple.mm UIKit never compiled); Android runs no `test_mobile`/`test_locale` — **fixed (62d9687): iOS builds forge_mobile + forge_text; Android emulator runs test_mobile/test_locale/test_text** |
 
 ## Wave 2: new backends (after wave 1)
-| ID | Item |
-|---|---|
+| ID | Item | Status |
+|---|---|---|
 | W2-1 | HTTPS in `net::http` (reuse FORGE's TLS when built; Schannel / Network.framework otherwise) |
 | W2-2 | Windows services through the SCM API (env, working dir, status), per-user services through Task Scheduler; FreeBSD rc.d |
 | W2-3 | Windows process_pool sandbox through AppContainer; Linux Landlock for `deny_exec` and file policy |
 | W2-4 | Keystore key wrapping through TPM / Argon2id passphrase |
 | W2-5 | Windows mobile backends (Sensor API, Media Foundation cameras, brightness, Bluetooth, audio, notifications) |
 | W2-6 | Linux mobile backends (GeoClue, V4L2 capture, more IIO channels, logind brightness and inhibit); FreeBSD keep_awake/backlight |
-| W2-7 | Apple mobile backends (deviceMotion, pedometer, proximity, pasteboard, macOS notifications/cameras/location/biometrics) |
-| W2-8 | FSEvents on macOS; `load_average` emulation on Windows |
+| W2-7 | Apple mobile backends (deviceMotion, pedometer, proximity, pasteboard, macOS notifications/cameras/location/biometrics) | fixed: iOS deviceMotion → rotation_vector/gravity/linear_acceleration on the shared CMMotionManager, CMPedometer step_counter/step_detector, UIDevice proximity (refcounted, main thread), UIPasteboard; macOS CoreLocation (async on the main run loop), AVCaptureDeviceDiscoverySession cameras + camera/location permission, LAContext Touch ID, NSPasteboard; macOS notifications (UNUserNotificationCenter / osascript) verified. Compiled in CI only (no Mac/device) |
+| W2-8 | FSEvents on macOS; `load_average` emulation on Windows | FSEvents fixed: `file_watcher::add_tree` opens one recursive stream (CoreServices late-bound, FileEvents/NoDefer/WatchRoot, 50 ms, dispatch queue waking the kqueue through EVFILT_USER; drops → `overflow`); `tree_watcher` uses it (`fsevents = false` for kqueue); kqueue kept for `add`/`add_file`. macOS CI only |
 
 ## Inherent limits (not fixed)
 Windows: `chown`, POSIX signals beyond kill/terminate, user-mode PMCs, THP, per-process open-file/file-size limits,
