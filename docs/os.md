@@ -43,10 +43,10 @@ One header each. The table lists the mechanism each header uses per platform.
 | `local_ipc.hpp` | `local_listener`, `local_stream`, `local_endpoint` | AF_UNIX, abstract `@name` | same | named pipes | AF_UNIX | AF_UNIX |
 | `crash.hpp` | `stack_trace`, `crash_handler::install`, `write_dump_now` | signal handler → `.crash` text report | same | SEH → minidump `.dmp` + text | signal handler | signal handler |
 | `sandbox.hpp` | `apply_sandbox`, `run_sandboxed`, `sandbox_status` | `no_new_privs` + seccomp-BPF | same | job object; children in an AppContainer or restricted token | `sandbox_init` (macOS); iOS is always sandboxed | Capsicum |
-| `keystore.hpp` | `keystore::put/get/remove`, `backend()` | libsecret, else file | backend set from JNI, else file | DPAPI | Keychain | file |
+| `keystore.hpp` | `keystore::put/get/remove`, `backend()` | libsecret, else encrypted file | backend set from JNI, else file under `FORGE_KEYSTORE_DIR` | DPAPI | Keychain | libsecret, else encrypted file |
 | `file_watch.hpp` | `file_watcher::add/poll` | inotify | inotify | `ReadDirectoryChangesW` | kqueue | kqueue |
 | `perf.hpp` | `cycle_counter`, `counter_hz`, `precise_sleep_ns`, `perf_counters` | `perf_event_open`, else TSC | same | `QueryThreadCycleTime` (cycles only) | `mach_absolute_time`; kperf counters need root | TSC cycles only |
-| `background.hpp` | `background::begin/end`, `background_scope` | not required | JNI hooks, else unsupported | `SetThreadExecutionState` | IOPMAssertion / `beginBackgroundTask` | not required |
+| `background.hpp` | `background::begin/end`, `background_scope` | logind `sleep:idle` inhibitor, else not required | JNI hooks, else unsupported | power request (`PowerSetRequest`) | IOPMAssertion / `beginBackgroundTask` with expiration handler | not required |
 | `service.hpp` | `service::ready/reloading/stopping/watchdog`, `log`, `run_as_service` | `sd_notify` + journald, else syslog | liblog | SCM + Event Log | launchd detection + syslog | rc.d detection + syslog |
 
 Process control, pipes, signals, `fs`, users, time, sysinfo, console, networking, recursive file watching, service control, registry, devices, clipboard, `dynlib` and `process_pool` are described in [os-wrapper.md](os-wrapper.md). `settings.hpp` is in [support.md](support.md).
@@ -67,7 +67,7 @@ if (!pin && os::is_unsupported(pin.err)) { /* platform lacks it: carry on */ }
 
 ## Platform notes and limits
 - **Local IPC names.** On Linux and Android, `local_endpoint(name)` returns the abstract socket `@forge-<name>`, because Android's SELinux policy refuses socket files in `/data/local/tmp`. Other POSIX systems use `<temp>/<name>.sock` unless the name is absolute. Windows uses the bare pipe name.
-- **File keystore.** One mode-0600 file per secret in a 0700 directory, obfuscated with a per-store pad. It is a fallback, not real secret storage; `keystore::backend()` reports when it is in use.
+- **File keystore.** One mode-0600 file per secret, sealed with XChaCha20-Poly1305 under a store key kept in the same directory (DPAPI-wrapped on Windows). It stops other users and detects tampering, but same-user code can read the key; `keystore::backend()` reports when it is in use. Needs Monocypher (`forge_os` links `forge_trust`).
 - **Mobile hooks.** `power_hooks`, `memory_pressure::on_trim_memory`, `background::set_hooks` and `keystore::set_backend` are plain C++ entry points. The app's JNI or Swift code must call them.
 - **Windows sandbox.** Network and filesystem denial cannot be added to a running process. `apply_sandbox` only blocks child processes; `run_sandboxed` starts a child under the full policy.
 - **Tests.** `tests/test_os.cpp` (core) and `tests/test_os_ext.cpp` (one test per extension module). `test_os_ext` re-runs itself with `FORGE_OS_EXT_CHILD` set for the sandbox and crash cases, so never export that variable. When `zig` is installed, the `xos_*` ctests (label `cross;slow`) compile and link these tests for FreeBSD, macOS, MinGW Windows and aarch64 musl.

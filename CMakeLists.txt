@@ -128,6 +128,7 @@ if(WIN32)
 elseif(UNIX AND NOT APPLE)
   target_link_libraries(forge_os INTERFACE ${CMAKE_DL_LIBS})
 endif()
+target_link_libraries(forge_os INTERFACE forge_trust)   # keystore.hpp file backend: Monocypher AEAD (forge_trust is defined below)
 target_link_libraries(forge_core INTERFACE forge_os)
 if(WIN32)
   target_link_libraries(forge_core INTERFACE advapi32)   # log.hpp: RegisterEventSourceW / ReportEventW
@@ -391,7 +392,7 @@ if(FORGE_TLS)
   endif()
 endif()
 
-# Vendored Monocypher 4.0.2 (BSD-2-Clause / CC0): Ed25519 for .fpk signing.
+# Vendored Monocypher 4.0.2 (BSD-2-Clause / CC0): Ed25519 for .fpk signing, XChaCha20-Poly1305 for the os keystore file backend.
 add_library(forge_trust STATIC third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c)
 target_include_directories(forge_trust PUBLIC third_party/monocypher)
 set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
@@ -717,7 +718,8 @@ if(FORGE_BUILD_TESTS)
           set(_lib -lws2_32 -lbcrypt)
         endif()
         add_test(NAME xos_${src}_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++20 -O1 -I${PROJECT_SOURCE_DIR}/os/include
-                 -I${PROJECT_SOURCE_DIR}/loadbalancer/include -I${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tests/${src}.cpp ${_lib}
+                 -I${PROJECT_SOURCE_DIR}/loadbalancer/include -I${PROJECT_SOURCE_DIR}/tests -I${PROJECT_SOURCE_DIR}/third_party/monocypher
+                 ${PROJECT_SOURCE_DIR}/tests/${src}.cpp ${PROJECT_SOURCE_DIR}/third_party/monocypher/monocypher.c ${_lib}
                  -o ${PROJECT_BINARY_DIR}/xos/${src}.${tg})
         set_tests_properties(xos_${src}_${tg} PROPERTIES LABELS "cross;slow")
       endforeach()

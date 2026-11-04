@@ -67,6 +67,33 @@ TEST(users_dirs) {
     CHECK(u.sid.empty());
 #endif
     CHECK(!os::config_dir().empty()); CHECK(!os::cache_dir().empty());
+#if defined(FORGE_OS_WINDOWS)
+    std::printf("  full name '%s', %zu groups\n", u.full_name.c_str(), u.groups.size()); CHECK(!u.groups.empty());
+    {   // Known Folders, as the shell resolves them (OneDrive / GPO redirection included)
+        auto r = os::run({"powershell", "-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; foreach ($f in 'Desktop','MyDocuments','ApplicationData','LocalApplicationData') { [Environment]::GetFolderPath($f) }"});
+        CHECK(r); std::vector<std::string> want; std::string cur;
+        if (r) for (char c : r->out) { if (c == '\n') { if (!cur.empty()) want.push_back(cur); cur.clear(); } else if (c != '\r') cur += c; }
+        CHECK(want.size() == 4);
+        if (want.size() == 4) {
+            CHECK_MSG(os::user_directory(os::user_dir::desktop) == want[0], "%s vs %s", os::user_directory(os::user_dir::desktop).c_str(), want[0].c_str());
+            CHECK(os::user_directory(os::user_dir::documents) == want[1]); CHECK(os::config_dir() == want[2]); CHECK(os::user_directory(os::user_dir::state) == want[3]);
+        }
+    }
+#elif !defined(__APPLE__)
+    {   // user-dirs.dirs wins over the environment and the defaults
+        auto cfg = os::join(os::temp_dir(), "forge_userdirs_" + std::to_string(os::pid())); os::mkdirs(cfg);
+        CHECK(os::write_file(os::join(cfg, "user-dirs.dirs"), "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Schreibtisch\"\n  XDG_DOWNLOAD_DIR=\"/srv/dl\"\nXDG_DOCUMENTS_DIR=\"$HOME/My \\\"Docs\\\"\"\nXDG_MUSIC_DIR=relative\n"));
+        auto old = os::getenv("XDG_CONFIG_HOME"); bool had = os::has_env("XDG_CONFIG_HOME"); auto oldd = os::getenv("XDG_DESKTOP_DIR"); bool hadd = os::has_env("XDG_DESKTOP_DIR");
+        os::setenv("XDG_CONFIG_HOME", cfg); os::setenv("XDG_DESKTOP_DIR", "/env/desktop");
+        auto h = os::home_dir();
+        CHECK(os::user_directory(os::user_dir::desktop) == h + "/Schreibtisch"); CHECK(os::user_directory(os::user_dir::downloads) == "/srv/dl");
+        CHECK(os::user_directory(os::user_dir::documents) == h + "/My \"Docs\"");
+        CHECK(os::write_file(os::join(cfg, "user-dirs.dirs"), "XDG_DOWNLOAD_DIR=\"/srv/dl\"\n")); CHECK(os::user_directory(os::user_dir::desktop) == "/env/desktop");
+        if (had) os::setenv("XDG_CONFIG_HOME", old); else os::unsetenv("XDG_CONFIG_HOME");
+        if (hadd) os::setenv("XDG_DESKTOP_DIR", oldd); else os::unsetenv("XDG_DESKTOP_DIR");
+        os::remove_all(cfg);
+    }
+#endif
 }
 TEST(time_civil_and_iso) {
     CHECK(os::format_iso8601(0) == "1970-01-01T00:00:00.000Z");

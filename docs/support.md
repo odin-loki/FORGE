@@ -78,7 +78,7 @@ auto t = kTimeout.get();          // parsed and defaulted; re-parsed when the va
 ```
 | API | Meaning |
 |---|---|
-| `define<T>(name, default, help)` | Kinds: string, int, bool (`1/0/true/false/yes/no/on/off`), size (K/M/G/T suffixes, base 1024), real |
+| `define<T>(name, default, help)` | Kinds: string, int (decimal or `0x` hex; `010` is ten; out of range for `T` is a problem), bool (`1/0/true/false/yes/no/on/off`), size (K/M/G/T suffixes, base 1024), real. Windows reads the UTF-16 environment |
 | `get_raw(name)` | Raw value; throws for a name that was never defined, so stray `getenv` calls can be replaced one by one |
 | `reload()`, `problems()` | Re-read the environment; values that did not parse (the default is used) |
 | `markdown(prefix)`, `all()`, `defined(name)` | The table as Markdown, all entries |

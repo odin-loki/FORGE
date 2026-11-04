@@ -67,16 +67,16 @@ The work is split by file ownership so changes can proceed in parallel without c
 ### W1-D: services, keystore, users, settings, registry, background (`keystore.hpp`, `service.hpp`, `service_control.hpp`, `background.hpp`, `users.hpp`, `registry.hpp`, `settings.hpp`)
 | ID | Cat | Item |
 |---|---|---|
-| D1 | C | Keystore file fallback is XOR obfuscation with no integrity; pad races; permissions set after writing; chmod of any dir; replace with XChaCha20-Poly1305 (monocypher, already in `third_party/`) and a wrapped key |
-| D2 | B | Keystore: libsecret failures silently fall back to the file while reporting "libsecret"; FreeBSD never tries libsecret; Android default dir unusable; Apple put deletes before add |
-| D3 | C | `service::log`: `openlog` keeps a pointer into a string that is reassigned on every call |
-| D4 | C | systemd unit rendering: newline injection, `$` doubling, unquoted `;` |
-| D5 | B | macOS service `query` reports loaded-but-stopped as running; deprecated `load`/`unload` |
-| D6 | B | `background`: Windows per-thread `SetThreadExecutionState`; iOS nil expiration handler; Linux/FreeBSD no inhibitor |
-| D7 | B | `user_directory` ignores Known Folders (OneDrive redirection) and `user-dirs.dirs`; Windows `current_user` groups/full name |
-| D8 | B | Registry: no WOW64 view, type changes on write, no MULTI_SZ/BINARY |
-| D9 | B | `settings`: ANSI `getenv` on Windows; `strtoll` base 0 parses "010" as octal |
-| D10 | D | Tests: backends that silently pass when `put` fails, services, registry, user_directory, settings |
+| D1 | C | Keystore file fallback is XOR obfuscation with no integrity; pad races; permissions set after writing; chmod of any dir; replace with XChaCha20-Poly1305 (monocypher, already in `third_party/`) and a wrapped key — **fixed** (0b76e23): XChaCha20-Poly1305 per secret, exclusive 0600 store key (DPAPI-wrapped on Windows), XOR files migrated; key wrapping is W2-4 |
+| D2 | B | Keystore: libsecret failures silently fall back to the file while reporting "libsecret"; FreeBSD never tries libsecret; Android default dir unusable; Apple put deletes before add — **fixed** (0b76e23) |
+| D3 | C | `service::log`: `openlog` keeps a pointer into a string that is reassigned on every call — **fixed** (d3ec150) |
+| D4 | C | systemd unit rendering: newline injection, `$` doubling, unquoted `;` — **fixed** (d3ec150): `validate()` rejects control characters; escaping per systemd.syntax/exec |
+| D5 | B | macOS service `query` reports loaded-but-stopped as running; deprecated `load`/`unload` — **fixed** (d3ec150): `bootstrap`/`kickstart`/`bootout gui/<uid>`, state from `launchctl print` (macOS CI only) |
+| D6 | B | `background`: Windows per-thread `SetThreadExecutionState`; iOS nil expiration handler; Linux/FreeBSD no inhibitor — **fixed** (86d413e): power requests, iOS expiration block, logind `sleep:idle` inhibitor; FreeBSD has no idle-suspend policy (documented) |
+| D7 | B | `user_directory` ignores Known Folders (OneDrive redirection) and `user-dirs.dirs`; Windows `current_user` groups/full name — **fixed** (97badb0): `SHGetKnownFolderPath`, `user-dirs.dirs`, token groups + full name |
+| D8 | B | Registry: no WOW64 view, type changes on write, no MULTI_SZ/BINARY — **fixed** (01d2232): `view`, type-preserving `set`, `set_as`/`value_type`, MULTI_SZ/BINARY |
+| D9 | B | `settings`: ANSI `getenv` on Windows; `strtoll` base 0 parses "010" as octal — **fixed** (4d87ece): UTF-16 environment, decimal or `0x` integers, range checks |
+| D10 | D | Tests: backends that silently pass when `put` fails, services, registry, user_directory, settings — **fixed** (all of the above): keystore must work + tamper/swap/migration/6-process race, unit injection/escaping, `launchctl print` parsing, registry types/list/views, Known Folders vs the shell, `user-dirs.dirs`, settings `010`/non-ASCII; Linux, Windows (MinGW), FreeBSD |
 
 ### W1-E: mobile, text, locale (`os/src/mobile`, `os/src/text`, `mobile.hpp`, `text.hpp`, `locale.hpp`)
 | ID | Cat | Item |

@@ -8,6 +8,7 @@
 //   os_log on macOS 10.12+; os_log_impl itself is a private-ABI macro target).  FreeBSD: syslog + rc.d detection.
 #include <forge/os/detail.hpp>
 #if defined(FORGE_OS_POSIX)
+#include <set>
 #include <sys/un.h>
 #include <syslog.h>
 #endif
@@ -83,7 +84,12 @@ inline status log(log_level l, const std::string& msg, const std::string& ident 
     if (!ok) return {{}, last_error("ReportEvent")}; return {};
 #elif defined(FORGE_OS_POSIX)
     int pr = l == log_level::debug ? LOG_DEBUG : l == log_level::info ? LOG_INFO : l == log_level::notice ? LOG_NOTICE : l == log_level::warning ? LOG_WARNING : l == log_level::error ? LOG_ERR : LOG_CRIT;
-    static std::string id; id = ident; ::openlog(id.c_str(), LOG_PID, LOG_USER); ::syslog(pr, "%s", msg.c_str()); return {};
+    // openlog keeps the ident pointer: idents live in a never-shrinking set (stable nodes), switched under a lock.
+    static std::mutex mu; static std::set<std::string> idents; static const char* cur = nullptr;
+    std::lock_guard<std::mutex> g(mu);
+    const char* id = idents.insert(ident).first->c_str();
+    if (id != cur) { ::openlog(id, LOG_PID, LOG_USER); cur = id; }
+    ::syslog(pr, "%s", msg.c_str()); return {};
 #else
     (void)l; (void)msg; (void)ident; return {{}, unsupported("service log")};
 #endif
