@@ -2,10 +2,16 @@
 // Huge pages for allocations and mappings.
 //   Linux/Android: MAP_HUGETLB (+MAP_HUGE_2MB/1GB) from the hugetlbfs pool, else an aligned mapping with
 //   madvise(MADV_HUGEPAGE) (transparent huge pages).  Windows: VirtualAlloc(MEM_LARGE_PAGES) after enabling
-//   SeLockMemoryPrivilege (needs the "Lock pages in memory" right).  macOS x86_64: VM_FLAGS_SUPERPAGE_SIZE_2MB;
-//   Apple Silicon/iOS have no superpage API (16K pages): falls back.  FreeBSD: MAP_ALIGNED_SUPER (transparent
-//   superpage promotion).  With fallback=true a normal allocation is returned and `kind` says what you got.
+//   SeLockMemoryPrivilege (needs the "Lock pages in memory" right); 1G through VirtualAlloc2 + NONPAGED_HUGE.
+//   macOS x86_64: VM_FLAGS_SUPERPAGE_SIZE_2MB; Apple Silicon/iOS have no superpage API (16K pages): falls back.
+//   FreeBSD: 2M/1G from shm_create_largepage (13+, guaranteed), else MAP_ALIGNED_SUPER (transparent superpage
+//   promotion).  With fallback=true a normal allocation is returned and `kind` says what you got; with
+//   fallback=false the requested kind or an error.
 #include <forge/os/detail.hpp>
+#if defined(FORGE_OS_FREEBSD)
+#include <sys/param.h>
+#include <sys/mman.h>
+#endif
 
 namespace forge::os {
 enum class page_kind { normal, transparent_huge, huge_2m, huge_1g };
@@ -43,12 +49,25 @@ inline bool thp_enabled() {
 }
 #if defined(FORGE_OS_WINDOWS)
 inline bool enable_lock_memory_privilege() {
-    static int st = -1; if (st >= 0) return st == 1;
-    HANDLE t = nullptr; st = 0;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &t)) return false;
-    TOKEN_PRIVILEGES tp{}; tp.PrivilegeCount = 1; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid) && AdjustTokenPrivileges(t, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS) st = 1;
-    CloseHandle(t); return st == 1;
+    static const bool ok = [] {   // once, thread-safe (magic static)
+        HANDLE t = nullptr; bool r = false;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &t)) return false;
+        TOKEN_PRIVILEGES tp{}; tp.PrivilegeCount = 1; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (LookupPrivilegeValueW(nullptr, L"SeLockMemoryPrivilege", &tp.Privileges[0].Luid) && AdjustTokenPrivileges(t, FALSE, &tp, 0, nullptr, nullptr) && GetLastError() == ERROR_SUCCESS) r = true;
+        CloseHandle(t); return r;
+    }();
+    return ok;
+}
+namespace detail {
+// 1 GiB pages: VirtualAlloc2 with MEM_EXTENDED_PARAMETER_NONPAGED_HUGE (Windows 10 1803+; kernelbase, late-bound).
+inline void* virtual_alloc_1g(std::size_t len) {
+    struct ext_param { std::uint64_t type; std::uint64_t value; };   // MEM_EXTENDED_PARAMETER: Type:8 | Reserved:56, then a 64-bit union
+    using fn = void*(WINAPI*)(HANDLE, void*, SIZE_T, ULONG, ULONG, ext_param*, ULONG);
+    static const auto f = [] { HMODULE k = GetModuleHandleW(L"kernelbase.dll"); return k ? reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(k, "VirtualAlloc2"))) : fn(nullptr); }();
+    if (!f) { SetLastError(ERROR_CALL_NOT_IMPLEMENTED); return nullptr; }
+    ext_param p{5 /*MemExtendedParameterAttributeFlags*/, 0x10 /*MEM_EXTENDED_PARAMETER_NONPAGED_HUGE*/};
+    return f(nullptr, nullptr, len, MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, PAGE_READWRITE, &p, 1);
+}
 }
 #endif
 namespace detail {
@@ -92,6 +111,14 @@ inline result<huge_region> huge_alloc(std::size_t n, page_kind want = page_kind:
         return {{p, len, thp ? page_kind::transparent_huge : page_kind::normal}, {}};
     }
 #elif defined(FORGE_OS_WINDOWS)
+    if (want == page_kind::huge_1g) {
+        if (enable_lock_memory_privilege()) {
+            std::size_t len = detail::round_up(n, gig);
+            if (void* p = detail::virtual_alloc_1g(len)) return {{p, len, page_kind::huge_1g}, {}};
+            last = last_error("VirtualAlloc2 MEM_EXTENDED_PARAMETER_NONPAGED_HUGE");
+        } else last = {1314, "large pages: SeLockMemoryPrivilege not held (grant 'Lock pages in memory')"};
+        if (!fallback) return {r, last};
+    }
     if (want != page_kind::normal && want != page_kind::transparent_huge) {
         if (std::size_t lp = GetLargePageMinimum(); lp && enable_lock_memory_privilege()) {
             std::size_t len = detail::round_up(n, lp);
@@ -106,10 +133,28 @@ inline result<huge_region> huge_alloc(std::size_t n, page_kind want = page_kind:
     if (!p) return {r, last_error("VirtualAlloc")};
     return {{p, len, page_kind::normal}, {}};
 #elif defined(FORGE_OS_FREEBSD)
+    // Guaranteed pages: an anonymous largepage shm object (FreeBSD 13+), mapped MAP_SHARED (a fork shares it).
+    auto large = [&](std::size_t sz, page_kind k) -> huge_region {
+#if __FreeBSD_version >= 1300000
+        std::size_t ps[8] = {}; int np = ::getpagesizes(ps, 8), psind = -1;
+        for (int i = 1; i < np; ++i) if (ps[i] == sz) psind = i;
+        if (psind < 0) { last = unsupported(std::string(page_kind_name(k)) + " pages on this machine"); return {}; }
+        std::size_t len = detail::round_up(n, sz);
+        int fd = ::shm_create_largepage(SHM_ANON, O_RDWR | O_CLOEXEC, psind, SHM_LARGEPAGE_ALLOC_DEFAULT, 0600);
+        if (fd < 0) { last = last_error("shm_create_largepage"); return {}; }
+        if (::ftruncate(fd, off_t(len))) { last = last_error("shm_create_largepage: reserve " + std::to_string(len >> 20) + " MiB"); ::close(fd); return {}; }
+        void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (p == MAP_FAILED) { last = last_error("mmap largepage"); ::close(fd); return {}; }
+        ::close(fd); return {p, len, k};
+#else
+        (void)sz; (void)k; return {};
+#endif
+    };
+    if (want == page_kind::huge_1g) { if (auto h = large(gig, page_kind::huge_1g)) return {h, {}}; if (!fallback) return {r, last}; }
+    if (want == page_kind::huge_1g || want == page_kind::huge_2m) { if (auto h = large(two, page_kind::huge_2m)) return {h, {}}; if (!fallback) return {r, last}; }
     std::size_t len = detail::round_up(n, two);
     void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_ALIGNED_SUPER, -1, 0);
     if (p == MAP_FAILED) return {r, last_error("mmap MAP_ALIGNED_SUPER")};
-    if (!fallback && want == page_kind::huge_1g) { ::munmap(p, len); return {r, unsupported("1G superpages")}; }
     return {{p, len, thp_enabled() ? page_kind::transparent_huge : page_kind::normal}, {}};
 #else
 #if defined(FORGE_OS_MACOS) && defined(__x86_64__)
