@@ -395,4 +395,138 @@ status device::request_permission(permission p) { FORGE_MOBILE_NEED(); return b_
 status device::notify(std::string_view t, std::string_view body) { FORGE_MOBILE_NEED(); return b_->notify(t, body); }
 std::vector<sim_record> device::sim_log() const { return b_ ? b_->sim_log() : std::vector<sim_record>{}; }
 
+// ------------------------------------------------------------------ pure helpers shared by the backends
+namespace detail {
+std::vector<float> remix(const float* in, std::size_t frames, int in_ch, int in_rate, int out_ch, int out_rate) {
+    if (!in || frames == 0 || in_ch < 1 || out_ch < 1 || in_rate <= 0 || out_rate <= 0) return {};
+    std::vector<float> mixed(frames * std::size_t(out_ch));
+    for (std::size_t f = 0; f < frames; ++f) {
+        const float* s = in + f * std::size_t(in_ch); float* d = mixed.data() + f * std::size_t(out_ch);
+        if (out_ch == in_ch) std::copy(s, s + in_ch, d);
+        else if (out_ch == 1) { float a = 0; for (int c = 0; c < in_ch; ++c) a += s[c]; d[0] = a / float(in_ch); }
+        else for (int c = 0; c < out_ch; ++c) d[c] = in_ch == 1 ? s[0] : c < in_ch ? s[c] : 0.0f;
+    }
+    if (in_rate == out_rate) return mixed;
+    std::size_t out_frames = std::size_t((double(frames) * out_rate + in_rate / 2) / in_rate); if (out_frames == 0) out_frames = 1;
+    std::vector<float> out(out_frames * std::size_t(out_ch));
+    double step = double(in_rate) / out_rate;
+    for (std::size_t f = 0; f < out_frames; ++f) {
+        double pos = double(f) * step; std::size_t i = std::size_t(pos); double t = pos - double(i);
+        if (i >= frames - 1) { i = frames - 1; t = 0; }
+        for (int c = 0; c < out_ch; ++c) {
+            float a = mixed[i * std::size_t(out_ch) + std::size_t(c)], b = t > 0 ? mixed[(i + 1) * std::size_t(out_ch) + std::size_t(c)] : a;
+            out[f * std::size_t(out_ch) + std::size_t(c)] = float(a + (b - a) * t);
+        }
+    }
+    return out;
+}
+
+// ITU T.81 Annex K.3 tables (also libjpeg's std_huff_tables): class/id, 16 code-length counts, values.
+static const std::uint8_t k_dc_bits[2][16] = {{0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0}, {0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0}};
+static const std::uint8_t k_ac_bits[2][16] = {{0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d}, {0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77}};
+static const std::uint8_t k_ac_vals[2][162] = {
+    {0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08,
+     0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+     0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+     0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+     0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6,
+     0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+     0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa},
+    {0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91,
+     0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
+     0x27, 0x28, 0x29, 0x2a, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+     0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+     0x88, 0x89, 0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4,
+     0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda,
+     0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa}};
+
+std::vector<std::uint8_t> jpeg_with_dht(std::vector<std::uint8_t> f) {
+    if (f.size() < 4 || f[0] != 0xFF || f[1] != 0xD8) return f;
+    std::size_t i = 2;
+    while (i + 4 <= f.size()) {
+        if (f[i] != 0xFF) return f;
+        std::uint8_t m = f[i + 1];
+        if (m == 0xFF) { ++i; continue; }                 // fill byte
+        if (m == 0xC4) return f;                          // has its own tables
+        if (m == 0xDA) {
+            std::vector<std::uint8_t> seg = {0xFF, 0xC4, 0, 0};
+            for (int t = 0; t < 2; ++t) {                 // DC 0/1 (values 0..11), AC 0/1
+                seg.push_back(std::uint8_t(0x00 | t)); seg.insert(seg.end(), k_dc_bits[t], k_dc_bits[t] + 16); for (std::uint8_t v = 0; v < 12; ++v) seg.push_back(v);
+                seg.push_back(std::uint8_t(0x10 | t)); seg.insert(seg.end(), k_ac_bits[t], k_ac_bits[t] + 16); seg.insert(seg.end(), k_ac_vals[t], k_ac_vals[t] + 162);
+            }
+            std::size_t len = seg.size() - 2; seg[2] = std::uint8_t(len >> 8); seg[3] = std::uint8_t(len);
+            f.insert(f.begin() + std::ptrdiff_t(i), seg.begin(), seg.end());
+            return f;
+        }
+        if (m == 0x01 || (m >= 0xD0 && m <= 0xD7)) { i += 2; continue; }   // standalone markers
+        std::size_t len = std::size_t(f[i + 2]) << 8 | f[i + 3]; if (len < 2) return f;
+        i += 2 + len;
+    }
+    return f;
+}
+
+std::vector<iio_channel> iio_channels(std::vector<std::string> attrs) {
+    struct def { const char* type; sensor_kind k; int axes; double mul; };
+    static const def defs[] = {
+        {"accel", sensor_kind::accelerometer, 3, 1.0}, {"anglvel", sensor_kind::gyroscope, 3, 1.0},
+        {"magn", sensor_kind::magnetometer, 3, 100.0 /* gauss -> uT */}, {"gravity", sensor_kind::gravity, 3, 1.0},
+        {"illuminance", sensor_kind::light, 1, 1.0}, {"proximity", sensor_kind::proximity, 1, 1.0},
+        {"pressure", sensor_kind::pressure, 1, 10.0 /* kPa -> hPa */}, {"temp", sensor_kind::temperature, 1, 0.001 /* milli degC */},
+        {"humidityrelative", sensor_kind::humidity, 1, 0.001 /* milli %RH */}, {"steps", sensor_kind::step_counter, 1, 1.0},
+        {"rot", sensor_kind::rotation_vector, 4, 1.0}};
+    struct core { std::string type, index, mod; };
+    std::vector<core> cores;
+    std::sort(attrs.begin(), attrs.end());
+    for (auto& a : attrs) {
+        std::string_view s = a;
+        if (s.substr(0, 3) != "in_") continue;
+        if (s.size() > 4 && s.substr(s.size() - 4) == "_raw") s.remove_suffix(4);
+        else if (s.size() > 6 && s.substr(s.size() - 6) == "_input") s.remove_suffix(6);
+        else continue;
+        s.remove_prefix(3);
+        std::size_t i = 0; while (i < s.size() && s[i] >= 'a' && s[i] <= 'z') ++i;
+        std::size_t j = i; while (j < s.size() && s[j] >= '0' && s[j] <= '9') ++j;
+        if (i == 0 || (j < s.size() && s[j] != '_')) continue;
+        cores.push_back({std::string(s.substr(0, i)), std::string(s.substr(i, j - i)), j < s.size() ? std::string(s.substr(j + 1)) : std::string()});
+    }
+    // Unindexed channels first, then by index number (in_temp before in_temp0 before in_temp10).
+    auto idx = [](const core& c) { return c.index.empty() ? -1L : c.index.size() > 9 ? 999999999L : std::strtol(c.index.c_str(), nullptr, 10); };
+    std::stable_sort(cores.begin(), cores.end(), [&](const core& a, const core& b) { return idx(a) < idx(b); });
+    auto has = [&](const std::string& t, const std::string& idx, const char* mod) {
+        return std::any_of(cores.begin(), cores.end(), [&](const core& c) { return c.type == t && c.index == idx && c.mod == mod; });
+    };
+    std::vector<iio_channel> out;
+    for (auto& d : defs) {
+        std::optional<iio_channel> pick;
+        for (auto& c : cores) {
+            if (c.type != d.type) continue;
+            std::string stem = "in_" + c.type + c.index;
+            if (d.axes == 3) { if (c.mod == "x" && has(c.type, c.index, "y") && has(c.type, c.index, "z")) { pick = iio_channel{d.k, stem, "in_" + c.type, 3, d.mul}; break; } }
+            else if (d.axes == 4) { if (c.mod == "quaternion") { pick = iio_channel{d.k, stem + "_quaternion", "in_" + c.type, 4, d.mul}; break; } }
+            else if (c.mod.empty() || (d.k == sensor_kind::temperature && c.mod == "ambient")) {
+                iio_channel ch{d.k, c.mod.empty() ? stem : stem + "_" + c.mod, "in_" + c.type, 1, d.mul};
+                if (d.k == sensor_kind::temperature && c.mod == "ambient") { pick = ch; break; }   // ambient beats die/object temperature
+                if (!pick) pick = ch;
+            }
+        }
+        if (pick) out.push_back(*pick);
+    }
+    return out;
+}
+
+xset_saver parse_xset_q(std::string_view t) {
+    xset_saver r;
+    auto num_after = [&](std::string_view key) {
+        auto p = t.find(key); if (p == std::string_view::npos) return -1;
+        p += key.size(); while (p < t.size() && t[p] == ' ') ++p;
+        int v = 0; bool any = false; while (p < t.size() && t[p] >= '0' && t[p] <= '9') { v = v * 10 + (t[p++] - '0'); any = true; if (v > 1000000) return -1; }
+        return any ? v : -1;
+    };
+    r.timeout = num_after("timeout:"); r.cycle = num_after("cycle:");
+    if (t.find("DPMS is Enabled") != std::string_view::npos) r.dpms = 1;
+    else if (t.find("DPMS is Disabled") != std::string_view::npos) r.dpms = 0;
+    return r;
+}
+} // namespace detail
+
 } // namespace forge::os::mobile
