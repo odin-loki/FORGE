@@ -8,7 +8,7 @@
 - **Errors are values.** Calls return `result<T>` or `status`. When a platform lacks a feature the error satisfies `os::is_unsupported(err)` (code `os::unsupported_code`, `0x0F0E5`), so callers can degrade gracefully.
 
 ## Core API (`os.hpp`)
-Files and filesystem; `mapping` (mmap / file mapping); processes (`run`, `exe_path`; `run` is unsupported on iOS); threads and synchronisation; time (`monotonic_ns`, `wall_ns`, `cpu_time_ns`, `sleep_ns`); TCP `socket`, `poller` (epoll / kqueue / WSAPoll) and `completion_port` (IOCP on Windows, emulated elsewhere); dynamic libraries (`library`); environment; signals (`on_signal`); memory; system info; standard paths; entropy; `os::rename` (atomic replace, also on Windows).
+Files and filesystem; `mapping` (mmap / file mapping); processes (`run`, `exe_path`; `run` is unsupported on iOS); threads and synchronisation; time (`monotonic_ns`, `wall_ns`, `cpu_time_ns`, `sleep_ns`); TCP `socket`, `poller` (epoll / kqueue / WSAPoll) and `completion_port` (IOCP on Windows, emulated elsewhere); dynamic libraries (`library`; `dynlib.hpp` adds search dirs, typed `get<F>`, `path()` and exported-symbol listing via `symbols()` / `file_symbols(path)` for ELF, PE and Mach-O); environment; signals (`on_signal`); memory; system info; standard paths; entropy; `os::rename` (atomic replace, also on Windows).
 
 ## Extension modules
 One header each. The table lists the mechanism used per platform, as documented in each header.

@@ -584,6 +584,38 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(${n} PROPERTIES SKIP_RETURN_CODE 77)
       continue()
     endif()
+    if(n STREQUAL "test_os_dynlib")   # os::dynlib: a fixture library to load, plus foreign-format copies to parse
+      add_library(forge_test_fixture SHARED tests/dynlib_fixture.c)
+      set_target_properties(forge_test_fixture PROPERTIES OUTPUT_NAME forge_fixture PREFIX "lib" C_VISIBILITY_PRESET hidden
+                            LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/dynlib_fixture RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/dynlib_fixture)
+      if(WIN32)
+        set_target_properties(forge_test_fixture PROPERTIES PREFIX "")   # os::library::decorate("forge_fixture") == forge_fixture.dll
+      endif()
+      add_executable(${n} ${t})
+      target_link_libraries(${n} PRIVATE forge_os)
+      target_include_directories(${n} PRIVATE tests)
+      add_dependencies(${n} forge_test_fixture)
+      target_compile_definitions(${n} PRIVATE FORGE_TEST_FIXTURE_DIR="${PROJECT_BINARY_DIR}/dynlib_fixture")
+      find_program(FORGE_FIXTURE_CLANG NAMES clang clang-18)
+      if(FORGE_FIXTURE_CLANG AND NOT CMAKE_CROSSCOMPILING)
+        find_program(FORGE_FIXTURE_LLD_LINK NAMES lld-link lld-link-18)
+        find_program(FORGE_FIXTURE_LD64 NAMES ld64.lld ld64.lld-18)
+        find_program(FORGE_FIXTURE_LIPO NAMES llvm-lipo llvm-lipo-18)
+        find_program(FORGE_FIXTURE_OBJCOPY NAMES llvm-objcopy llvm-objcopy-18)
+        set(_xf ${PROJECT_BINARY_DIR}/dynlib_fixture/xfmt)
+        add_custom_command(OUTPUT ${_xf}/stamp
+          COMMAND ${CMAKE_COMMAND} -DCLANG=${FORGE_FIXTURE_CLANG} -DLLD_LINK=${FORGE_FIXTURE_LLD_LINK} -DLD64=${FORGE_FIXTURE_LD64}
+                  -DLIPO=${FORGE_FIXTURE_LIPO} -DOBJCOPY=${FORGE_FIXTURE_OBJCOPY} -DSRC=${PROJECT_SOURCE_DIR}/tests/dynlib_fixture.c
+                  -DOUT=${_xf} -P ${PROJECT_SOURCE_DIR}/cmake/dynlib_fixtures.cmake
+          DEPENDS ${PROJECT_SOURCE_DIR}/tests/dynlib_fixture.c ${PROJECT_SOURCE_DIR}/cmake/dynlib_fixtures.cmake
+          COMMENT "Cross-linking os::dynlib parser fixtures (PE, Mach-O, ELF variants)" VERBATIM)
+        add_custom_target(forge_test_fixture_xfmt DEPENDS ${_xf}/stamp)
+        add_dependencies(${n} forge_test_fixture_xfmt)
+        target_compile_definitions(${n} PRIVATE FORGE_TEST_XFMT_DIR="${_xf}")
+      endif()
+      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      continue()
+    endif()
     if(n STREQUAL "test_mobile")   # only needs the device layer
       add_executable(${n} ${t})
       target_link_libraries(${n} PRIVATE forge_mobile)
@@ -653,7 +685,7 @@ if(FORGE_BUILD_TESTS)
   find_program(FORGE_ZIG NAMES zig HINTS $ENV{ZIG_PATH})
   if(FORGE_ZIG)
     foreach(tg x86_64-freebsd aarch64-macos x86_64-macos x86_64-windows-gnu aarch64-linux-musl)
-      foreach(src test_os test_balance test_os_ext test_os_process test_os_sys test_os_net test_os_dev)
+      foreach(src test_os test_balance test_os_ext test_os_process test_os_sys test_os_net test_os_dev test_os_dynlib)
         set(_lib)
         if(tg MATCHES windows)
           set(_lib -lws2_32 -lbcrypt)
