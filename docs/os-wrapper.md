@@ -99,12 +99,12 @@ How it works per platform:
 
   | Call | Linux | Android | Windows | macOS / iOS | FreeBSD |
   |---|---|---|---|---|---|
-  | `release_info` | os-release | yes | `RtlGetVersion` | sysctl | sysctl |
+  | `release_info` | os-release | yes | `RtlGetVersion` (`version` "10" / "11" by build; NT version in `kernel_version`) | sysctl | sysctl |
   | `uptime_seconds` | `/proc/uptime` | yes | `GetTickCount64` | `kern.boottime` | `kern.boottime` |
   | `load_average` | `getloadavg` | `/proc/loadavg` | unsupported (no run-queue average) | `getloadavg` | `getloadavg` |
-  | `memory()` | incl. swap and the root cgroup v1/v2 limit | yes | yes | yes | yes |
+  | `memory()` | `/proc/meminfo`; cgroup v2/v1 of this process (`/proc/self/cgroup`), tightest `memory.max` up the tree | yes | free = zeroed + free lists (else available − cache); page file as swap | free pages; `vm.swapusage` | `v_free_count`; swap from `vm.swap_info` |
   | `per_cpu_times`, `cpu_usage` | `/proc/stat` | yes | `NtQuerySystemInformationEx` per processor group | `host_processor_info` | `kern.cp_times` |
-  | `self_usage`, `current_rss` | yes | yes | yes | yes | yes |
+  | `self_usage`, `current_rss` | yes | yes | peak working set, page faults (soft and hard, in `minor_faults`) | yes | yes |
 
 - **`console.hpp`.** `is_tty`, `size`, `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo), `read_password`, `confirm`.
 
@@ -114,11 +114,15 @@ How it works per platform:
 | `resolve(host)` | IPv4 and IPv6 address strings |
 | `interfaces()` | name, addresses, up, loopback: `getifaddrs`; `GetAdaptersAddresses` (iphlpapi, loaded at run time) on Windows; Android `getifaddrs` from API 24, else an IPv4-only `SIOCGIFCONF` fallback |
 | `port_open(host, port, timeout_ms)` | TCP connect probe |
-| `parse_url(url)` | scheme, host, port, path, query |
+| `parse_url(url)` | scheme, host, port, path, query; `resolve_reference(base, ref)` (RFC 3986), `to_string(url)`, `host_port(url)` (IPv6 in brackets) |
 | `http(request)`, `http_get(url)` | Blocking HTTP/1.1 client: Content-Length and chunked bodies, redirects, size cap. `https://` returns unsupported |
+
+`http` rejects a method, header name or header value with CR, LF, NUL or other non-token bytes (`EINVAL`) and percent-encodes the path and query. Redirects resolve relative `Location` values against the current URL and drop `Authorization`, `Proxy-Authorization` and `Cookie` when the scheme, host or port changes. A body shorter than its `Content-Length`, a chunked body without its final chunk or with a bad chunk size, or conflicting lengths are `EPROTO` errors. `timeout_ms` bounds the connect and each read; `deadline_ms` (default 120 s) bounds the whole exchange including redirects (`ETIMEDOUT`). Response headers are in `headers` (repeats joined by ", ", `Set-Cookie` by "\n") and, one per line, in `header_list` / `values(name)`; `url` is the URL that answered.
 
 ## Recursive file watching (`file_watch_tree.hpp`)
 `tree_watcher::open(root, {debounce_ms = 50, force_polling, include_hidden, ignore})` registers every directory with the native `file_watcher` (inotify, kqueue, `ReadDirectoryChangesW`) and picks up new directories as they appear, reporting their existing contents as created. A per-path snapshot turns coarse kqueue directory events into exact created / modified / removed events. Where native watching is unavailable, or with `force_polling`, it rescans on each `poll()`. `poll(ms)` waits until the tree has been quiet for `debounce_ms` and coalesces bursts: create + modify → created, create + remove → nothing, one event per path. FSEvents is not used on macOS. A plain kqueue `file_watcher` on a directory also rescans and reports per-name created / removed / modified events; an in-place edit of a file inside a watched directory needs `add_file()` for that file.
+
+Limits and loss. kqueue holds a descriptor per watched path, capped at half the `RLIMIT_NOFILE` soft limit (at most 8192; `max_native_handles` or `file_watcher::set_max_handles` to change it); a directory or file past the cap, or any directory the native backend refuses, is polled every 100 ms instead (`polled_dirs()`, backend "native+polling"). Windows completes all directories through one I/O completion port, so there is no 64-handle limit, and matches names case-insensitively. When the kernel drops events (inotify `IN_Q_OVERFLOW`, a Windows buffer overflow) `file_watcher::poll` returns `watch_kind::overflow` for each affected directory and `tree_watcher` rescans the whole tree. Directories are entered once by identity (device and inode; volume and file id on Windows), so symlink and junction loops are not followed. `file_watcher::remove(path)` drops a watch.
 
 ## Service control (`service_control.hpp`)
 A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_on_failure`, `start_at_login`, optional `dir`) becomes a per-user service:
@@ -135,7 +139,7 @@ A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_
 ## Registry, devices, clipboard
 - **`registry.hpp`.** Windows only: `get` / `set` string and 64-bit integer values (`REG_SZ`, `REG_DWORD`, `REG_QWORD`), `remove_value`, `remove_key`, `list`. Every call is unsupported elsewhere.
 - **`devices.hpp`.** Read-only enumeration: `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver), `usb()` (vendor/product ids, strings, bus/devnum). Linux and Android read sysfs. Windows lists `PhysicalDriveN` disks with drive letters as partitions (storage IOCTLs, no admin needed) and PCI/USB through SetupAPI loaded at run time; USB `bus` / `devnum` are the hub number and hub port (Windows has no USB address). FreeBSD uses the GEOM sysctls, `/dev/pci` (`PCIOCGETCONF`) and the newbus device tree. macOS uses IOKit loaded at run time. Unsupported on iOS.
-- **`clipboard.hpp`.** Text get/set: Win32 clipboard on Windows, `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux and FreeBSD. Unsupported without a display or helper, and on mobile.
+- **`clipboard.hpp`.** Text get/set: Win32 clipboard on Windows (retried for ~100 ms while another program holds it; foreign text bounded by its allocation), `pbcopy`/`pbpaste` on macOS (run with a UTF-8 locale), `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux and FreeBSD. An empty selection reads as "". Unsupported without a display or helper, and on mobile.
 
 ## Dynamic libraries (`dynlib.hpp`)
 `os::dynlib` sits on top of `os::library`.
@@ -187,7 +191,7 @@ int main(int argc, char** argv) {
 ## Platform notes
 - **iOS.** No spawning: `spawn_wait`, `child` and `os::run` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
 - **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control.
-- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM through `sc.exe`, registry, event-log service log. `pipe.hpp`, `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error.
+- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM through `sc.exe`, registry, event-log service log. `pipe.hpp`, `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error. CPU ids past what the OS mask holds are `EINVAL` everywhere (Linux allocates a larger set with `CPU_ALLOC` beyond `CPU_SETSIZE`). System DLLs loaded at run time (`iphlpapi`, `setupapi`, `powrprof`, `dxgi`, `dxcore`) come from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`).
 - **macOS.** `RLIMIT_AS` is ignored by the kernel, so `memory_bytes` uses a resident-size watchdog. kqueue for file watching.
 - **Linux.** fork/exec, inotify, `/proc` and `/sys`.
 
@@ -208,8 +212,8 @@ int main(int argc, char** argv) {
 |---|---|
 | `test_os_process` | spawn, limits, timeouts, tree kill, redirection, cancellation, memory watchdog, `find_executable` |
 | `test_os_sys` | `fs`, users, time, sysinfo, console |
-| `test_os_net` | net, local HTTP server, native and polling tree watch, service units in a temp dir |
-| `test_os_dev` | devices, clipboard |
+| `test_os_net` | net, local HTTP servers (injection, cross-origin redirects, truncated bodies, deadline, `Set-Cookie`), native and polling tree watch (80 directories, overflow, symlink/junction loop, kqueue cap), service units in a temp dir |
+| `test_os_dev` | devices, FreeBSD GEOM partition fixture, clipboard |
 | `test_os_dynlib` | loads `tests/dynlib_fixture.c` through search dirs and an env var, calls it through `get<>` and through enumerated addresses, enumerates libm; when clang + lld are installed, parses fixtures cross-linked by `cmake/dynlib_fixtures.cmake` (PE32/PE32+ with a forwarder, arm64/x86_64/exports-trie/fat Mach-O, ELF32, big-endian ELF, section-stripped ELF, versions + IFUNC + TLS), plus ~14k truncated and mutated inputs |
 | `test_process_pool` | fork and spawn modes, crash recovery, typed task errors, grow/shrink, shutdown, `terminate`, sandboxed workers, Windows spawn |
 | `test_script` `os_phase2_surface`, `os_phase3_surface`; `test_script_oserror` `script_process_pool` | script bindings |

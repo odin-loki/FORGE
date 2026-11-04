@@ -4,7 +4,7 @@
 `forge::os` (`os/include/forge/os/`) is a header-only OS layer for Linux, Android, Windows, macOS, iOS and FreeBSD. The rest of FORGE (mapped files, sockets, RPC, async I/O, dynamic loading, entropy, the memory governor, the logger) goes through it.
 
 - **Targets.** `forge_os` is a CMake INTERFACE target. It links `Threads::Threads`, plus `ws2_32` and `bcrypt` on Windows and `libdl` on Linux, Android and FreeBSD. Nothing else is needed at link time.
-- **Late binding.** Optional system libraries are loaded at run time: `dbghelp`, `crypt32`, `powrprof` and `dxgi` on Windows; CoreFoundation, IOKit, Security, kperf and `libobjc` on Apple; `libsecret` and `liblog` on Linux and Android. With MSVC, `process.hpp` and `sandbox.hpp` add `psapi` and `userenv` through `#pragma comment`.
+- **Late binding.** Optional system libraries are loaded at run time: `dbghelp`, `crypt32`, `powrprof`, `dxgi` and `dxcore` on Windows (system DLLs from System32 only); CoreFoundation, IOKit, Security, kperf and `libobjc` on Apple; `libpmc` on FreeBSD; `libsecret` and `liblog` on Linux and Android. With MSVC, `process.hpp` and `sandbox.hpp` add `psapi` and `userenv` through `#pragma comment`.
 - **Errors are values.** Calls return `os::result<T>` (`.value`, `.err`, `operator bool`) or `os::status`. `error{code, what}` holds the native code and a message. Nothing in `os.hpp` throws.
 - **Unsupported features.** When a platform lacks a feature the call returns `os::unsupported(what)`. Test it with `os::is_unsupported(err)` (code `os::unsupported_code`, `0x0F0E5`) and carry on.
 - **Typed errors (optional).** `oserror.hpp` maps errno, Win32 and NTSTATUS codes to `os_errc` (`classify`, `classify_errno`, `classify_win32`), throws `os_exception` from `throw_if(err)`, turns fault signals into exceptions with `fault_guard`, and sets a flag on Ctrl-C / SIGTERM with `install_cancel_signals`.
@@ -32,20 +32,20 @@ One header each. The table lists the mechanism each header uses per platform.
 
 | Header | Main API | Linux | Android | Windows | macOS / iOS | FreeBSD |
 |---|---|---|---|---|---|---|
-| `numa.hpp` | `numa_nodes`, `bind_thread_to_node`, `numa_alloc`/`numa_free`, `numa_node_of_address` | sysfs + `mbind` | same | `VirtualAllocExNuma`, group affinity | one node (UMA) | `cpuset_setdomain` |
-| `hugepages.hpp` | `huge_page_sizes`, `huge_alloc`, `advise_huge`, `thp_enabled` | `MAP_HUGETLB` 2M/1G, else THP | THP | large pages (needs "Lock pages in memory") | superpages on x86_64 macOS; Apple Silicon and iOS fall back | `MAP_ALIGNED_SUPER` |
+| `numa.hpp` | `numa_nodes`, `bind_thread_to_node`, `numa_alloc`/`numa_free`, `numa_node_of_address` | sysfs + `mbind` | same | `VirtualAllocExNuma`, group affinity, nodes across groups, `QueryWorkingSetEx` | one node (UMA) | `cpuset_setdomain`, per-domain free pages |
+| `hugepages.hpp` | `huge_page_sizes`, `huge_alloc`, `advise_huge`, `thp_enabled` | `MAP_HUGETLB` 2M/1G, else THP | THP | large pages (needs "Lock pages in memory"); 1G via `VirtualAlloc2` | superpages on x86_64 macOS; Apple Silicon and iOS fall back | `shm_create_largepage` 2M/1G, else `MAP_ALIGNED_SUPER` |
 | `async_file.hpp` | `async_file_io` read/write/wait | io_uring (raw syscalls), else threads | same (seccomp often forces threads) | IOCP | POSIX AIO + `aio_suspend` | POSIX AIO + kqueue |
 | `cpu_topology.hpp` | `cpu_topology_query`, `core_kind` P/E, caches, `pin_thread_to`, `pin_thread_to_kind` | sysfs `cpu_core`/`cpu_atom`, capacity | capacity (big.LITTLE) | `EfficiencyClass` | `hw.perflevelN` + QoS | sysctl |
 | `power.hpp` | `power_status`, `power_hooks::report` | sysfs power_supply / thermal | sysfs + app hooks | `GetSystemPowerStatus` | NSProcessInfo, IOKit (macOS), UIDevice (iOS) | `hw.acpi.*` |
-| `memory_pressure.hpp` | `memory_pressure::instance().subscribe`, `on_trim_memory`, `notify` | PSI triggers | PSI + `onTrimMemory` hook | memory resource notification | dispatch source | 1 s poll |
+| `memory_pressure.hpp` | `memory_pressure::instance().subscribe`, `on_trim_memory`, `notify` | PSI triggers (the cgroup's own `memory.pressure` first) | PSI + `onTrimMemory` hook | memory resource notification | dispatch source | 1 s poll |
 | `shared_memory.hpp` | `shared_memory::create/open/unlink` | `shm_open` | file under `$TMPDIR` | `CreateFileMappingW` `Local\forge-*` | `shm_open` | `shm_open` |
-| `gpu_devices.hpp` | `gpu_devices()` (no compute runtime initialised) | PCI sysfs + DRM | kgsl / mali / EGL property | DXGI | IOKit (macOS), model lookup (iOS) | `/dev/pci` |
+| `gpu_devices.hpp` | `gpu_devices()` (no compute runtime initialised) | PCI sysfs + DRM (NVIDIA names from the driver) | kgsl / mali / EGL property | DXGI + DXCore `IsIntegrated` | IOKit (macOS), model lookup (iOS) | `/dev/pci` |
 | `local_ipc.hpp` | `local_listener`, `local_stream`, `local_endpoint` | AF_UNIX, abstract `@name` | same | named pipes | AF_UNIX | AF_UNIX |
 | `crash.hpp` | `stack_trace`, `crash_handler::install`, `write_dump_now` | signal handler → `.crash` text report | same | SEH → minidump `.dmp` + text | signal handler | signal handler |
 | `sandbox.hpp` | `apply_sandbox`, `run_sandboxed`, `sandbox_status` | `no_new_privs` + seccomp-BPF | same | job object; children in an AppContainer or restricted token | `sandbox_init` (macOS); iOS is always sandboxed | Capsicum |
 | `keystore.hpp` | `keystore::put/get/remove`, `backend()` | libsecret, else file | backend set from JNI, else file | DPAPI | Keychain | file |
-| `file_watch.hpp` | `file_watcher::add/poll` | inotify | inotify | `ReadDirectoryChangesW` | kqueue | kqueue |
-| `perf.hpp` | `cycle_counter`, `counter_hz`, `precise_sleep_ns`, `perf_counters` | `perf_event_open`, else TSC | same | `QueryThreadCycleTime` (cycles only) | `mach_absolute_time`; kperf counters need root | TSC cycles only |
+| `file_watch.hpp` | `file_watcher::add/remove/poll` (+ `overflow` events) | inotify | inotify | `ReadDirectoryChangesW` on one IOCP | kqueue (descriptor cap) | kqueue (descriptor cap) |
+| `perf.hpp` | `cycle_counter`, `counter_hz`, `precise_sleep_ns`, `perf_counters` | `perf_event_open` (a group per hybrid PMU, multiplex scaling), else TSC | same | `QueryThreadCycleTime` (cycles only) | `mach_absolute_time`; kperf counters (root), else `proc_pid_rusage` cycles/instructions | libpmc (needs `hwpmc`), else TSC cycles |
 | `background.hpp` | `background::begin/end`, `background_scope` | not required | JNI hooks, else unsupported | `SetThreadExecutionState` | IOPMAssertion / `beginBackgroundTask` | not required |
 | `service.hpp` | `service::ready/reloading/stopping/watchdog`, `log`, `run_as_service` | `sd_notify` + journald, else syslog | liblog | SCM + Event Log | launchd detection + syslog | rc.d detection + syslog |
 
