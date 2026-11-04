@@ -57,9 +57,9 @@ TEST(url_parse) {
 }
 TEST(resolve_and_interfaces) {
     auto r = os::net::resolve("localhost"); CHECK(r); CHECK(!r->empty());
-#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_ANDROID)
-    auto i = os::net::interfaces(); CHECK(i); bool lo = false; for (auto& x : *i) lo |= x.loopback; CHECK(lo);
-#endif
+    auto i = os::net::interfaces(); CHECK(i); bool lo = false, lo4 = false;
+    for (auto& x : *i) { CHECK(!x.name.empty()); lo |= x.loopback; if (x.loopback) for (auto& a : x.addresses) lo4 |= a.ip == "127.0.0.1"; }
+    CHECK(lo); CHECK(lo4);
 }
 TEST(http_client_against_local_server) {
     auto l = os::socket::listen("127.0.0.1", 0); CHECK(l); int port = l->local_port();
