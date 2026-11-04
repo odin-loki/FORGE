@@ -799,7 +799,8 @@ private:
     // free or a sync ends the segment, which is replayed through an exec graph cached per segment index and refreshed
     // with cuGraphExecUpdate (same topology every token, only pointers/scalars change), as llama.cpp's ggml-cuda does.
     bool gmode() const {
-        static const bool on = [] { auto* e = std::getenv("FORGE_GRAPHS"); return e && std::string(e) == "1"; }();
+        // on by default (decode: one graph launch per segment instead of a launch per kernel); FORGE_GRAPHS=0 turns it off
+        static const bool on = [] { auto* e = std::getenv("FORGE_GRAPHS"); return !(e && std::string(e) == "0"); }();
         return on && api_ == api::cuda && stream_ && has_graphs();
     }
     bool capturing_ = false, user_cap_ = false; std::size_t seg_ = 0;
