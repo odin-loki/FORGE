@@ -10,8 +10,20 @@
 #include <map>
 #include <mutex>
 #include <sstream>
+#include <cctype>
+#include <cstdio>
 #if defined(__ANDROID__)
 #  include <sys/system_properties.h>
+#endif
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 #if defined(_MSC_VER) && defined(__cpp_lib_chrono) && __cpp_lib_chrono >= 201907L
 #  define FORGE_TZ_CHRONO 1
@@ -160,35 +172,227 @@ std::string tz_dir() {
     static std::string d = [] { for (auto& x : tz_dirs()) { std::error_code ec; if (fs::exists(fs::path(x) / "UTC", ec) || fs::exists(fs::path(x) / "Etc" / "UTC", ec)) return x; } return std::string(); }();
     return d;
 }
-std::mutex z_mu; std::map<std::string, std::shared_ptr<const tzif>, std::less<>> z_cache;
-std::shared_ptr<const tzif> load_zone(std::string_view name) {
-    std::lock_guard lk(z_mu);
-    if (auto it = z_cache.find(name); it != z_cache.end()) return it->second;
-    std::shared_ptr<const tzif> res;
-    if (name.find("..") == std::string_view::npos && !name.empty()) {
-        std::vector<fs::path> cands;
-        if (name.front() == '/') cands.push_back(fs::path(name)); else if (!tz_dir().empty()) cands.push_back(fs::path(tz_dir()) / name);
-        for (auto& p : cands) {
-            std::ifstream f(p, std::ios::binary); if (!f) continue;
-            std::stringstream ss; ss << f.rdbuf();
-            if (auto z = parse_tzif(ss.str())) { res = std::make_shared<const tzif>(std::move(*z)); break; }
-        }
-        if (!res) {   // a bare POSIX TZ string ("EST5EDT,M3.2.0,M11.1.0")
-            auto p = parse_posix(name);
-            if (p.ok) { tzif z; z.footer = p; z.has_footer = true; res = std::make_shared<const tzif>(std::move(z)); }
+
+// Zone files are read only when they are regular files of at most 1 MiB (a name like "../../dev/zero" or a FIFO
+// must neither exhaust memory nor block). Opened non-blocking and checked on the descriptor, so a file swapped
+// for a FIFO between a stat and the open cannot hang the read.
+constexpr std::uintmax_t k_max_zone_file = 1u << 20;
+bool read_regular(const fs::path& p, std::string& out, std::uintmax_t max, std::uint64_t offset = 0, std::uint64_t len = UINT64_MAX) {
+#if defined(_WIN32)
+    std::error_code ec; auto st = fs::status(p, ec);
+    if (ec || !fs::is_regular_file(st)) return false;
+    auto size = fs::file_size(p, ec); if (ec || (len == UINT64_MAX && size > max)) return false;
+    std::ifstream f(p, std::ios::binary); if (!f) return false;
+#else
+    int fd = ::open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOCTTY); if (fd < 0) return false;
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (len == UINT64_MAX && std::uintmax_t(st.st_size) > max)) { ::close(fd); return false; }
+    std::uint64_t size = std::uint64_t(st.st_size);
+#endif
+    if (len == UINT64_MAX) { offset = 0; len = size; }
+    if (offset > size || len > size - offset || len > max) {
+#if !defined(_WIN32)
+        ::close(fd);
+#endif
+        return false;
+    }
+    out.assign(std::size_t(len), '\0');
+#if defined(_WIN32)
+    f.seekg(std::streamoff(offset)); f.read(out.data(), std::streamsize(len)); return f.gcount() == std::streamsize(len);
+#else
+    std::size_t got = 0;
+    while (got < len) {
+        auto n = ::pread(fd, out.data() + got, std::size_t(len) - got, off_t(offset + got));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += std::size_t(n);
+    }
+    ::close(fd); return got == len;
+#endif
+}
+
+// IANA-style names only: letters, digits, '_', '+', '-', '/' with no empty, "." or ".." component.
+bool valid_zone_name(std::string_view n) {
+    if (n.empty() || n.size() > 255 || n.front() == '/' || n.back() == '/') return false;
+    for (char c : n) if (!(std::isalnum((unsigned char)c) || c == '_' || c == '+' || c == '-' || c == '/')) return false;
+    return n.find("//") == std::string_view::npos;   // '.' is not in the set, so "..", "." components cannot occur
+}
+// An absolute zone path is trusted only when it is what $TZ names (":/etc/localtime", "/opt/tz/Custom").
+bool is_abs_path(std::string_view n) { return !n.empty() && (n.front() == '/' || fs::path(std::string(n)).is_absolute()); }
+std::string tz_env_path() {
+    const char* tz = std::getenv("TZ"); if (!tz || !*tz) return {};
+    std::string s = tz[0] == ':' ? tz + 1 : tz;
+    return is_abs_path(s) && s.find("zoneinfo/") == std::string::npos ? s : std::string();
+}
+
+// Android keeps every zone in one bundle: "tzdata2024a\0", then big-endian offsets of the index, the data and the
+// final section; index entries are 52 bytes (name[40], offset from data start, length, unused).
+std::vector<std::string> tz_bundles() {
+    std::vector<std::string> r;
+    if (const char* d = std::getenv("TZDIR"); d && *d) r.push_back(std::string(d) + "/tzdata");
+#if defined(__ANDROID__)
+    if (const char* d = std::getenv("ANDROID_TZDATA_ROOT"); d && *d) r.push_back(std::string(d) + "/etc/tz/tzdata");
+    for (auto d : {"/apex/com.android.tzdata/etc/tz/tzdata", "/data/misc/zoneinfo/current/tzdata", "/system/usr/share/zoneinfo/tzdata"}) r.push_back(d);
+#endif
+    return r;
+}
+struct bundle_entry { std::string name; std::uint32_t off, len; };
+std::optional<std::vector<bundle_entry>> bundle_index(const std::string& path, std::uint32_t& data_at) {
+    std::string h;
+    if (!read_regular(path, h, 24, 0, 24) || h.compare(0, 6, "tzdata") != 0 || h[11] != '\0') return std::nullopt;
+    auto u = reinterpret_cast<const unsigned char*>(h.data());
+    std::uint32_t idx = be32(u + 12), data = be32(u + 16);
+    if (idx < 24 || data < idx || (data - idx) % 52 != 0 || data - idx > 52u * 4096) return std::nullopt;
+    std::string ix; if (!read_regular(path, ix, 52u * 4096, idx, data - idx)) return std::nullopt;
+    std::vector<bundle_entry> r; auto p = reinterpret_cast<const unsigned char*>(ix.data());
+    for (std::size_t i = 0; i + 52 <= ix.size(); i += 52) {
+        std::string name(ix.data() + i, 40); name.resize(std::strlen(name.c_str()));
+        r.push_back({name, be32(p + i + 40), be32(p + i + 44)});
+    }
+    data_at = data; return r;
+}
+std::optional<tzif> bundle_zone(std::string_view name) {
+    for (auto& b : tz_bundles()) {
+        std::uint32_t data = 0; auto ix = bundle_index(b, data); if (!ix) continue;
+        for (auto& e : *ix) if (e.name == name) {
+            std::string z; if (e.len > k_max_zone_file || !read_regular(b, z, k_max_zone_file, std::uint64_t(data) + e.off, e.len)) return std::nullopt;
+            return parse_tzif(z);
         }
     }
+    return std::nullopt;
+}
+
+#if defined(_WIN32)
+// CLDR windowsZones (territory 001): Windows time zone key -> IANA zone.
+constexpr std::pair<const char*, const char*> k_win_zones[] = {
+    {"Dateline Standard Time", "Etc/GMT+12"}, {"UTC-11", "Etc/GMT+11"}, {"Aleutian Standard Time", "America/Adak"},
+    {"Hawaiian Standard Time", "Pacific/Honolulu"}, {"Marquesas Standard Time", "Pacific/Marquesas"}, {"Alaskan Standard Time", "America/Anchorage"},
+    {"UTC-09", "Etc/GMT+9"}, {"Pacific Standard Time (Mexico)", "America/Tijuana"}, {"UTC-08", "Etc/GMT+8"},
+    {"Pacific Standard Time", "America/Los_Angeles"}, {"US Mountain Standard Time", "America/Phoenix"},
+    {"Mountain Standard Time (Mexico)", "America/Mazatlan"}, {"Mountain Standard Time", "America/Denver"}, {"Yukon Standard Time", "America/Whitehorse"},
+    {"Central America Standard Time", "America/Guatemala"}, {"Central Standard Time", "America/Chicago"}, {"Easter Island Standard Time", "Pacific/Easter"},
+    {"Central Standard Time (Mexico)", "America/Mexico_City"}, {"Canada Central Standard Time", "America/Regina"}, {"SA Pacific Standard Time", "America/Bogota"},
+    {"Eastern Standard Time (Mexico)", "America/Cancun"}, {"Eastern Standard Time", "America/New_York"}, {"Haiti Standard Time", "America/Port-au-Prince"},
+    {"Cuba Standard Time", "America/Havana"}, {"US Eastern Standard Time", "America/Indiana/Indianapolis"}, {"Turks And Caicos Standard Time", "America/Grand_Turk"},
+    {"Paraguay Standard Time", "America/Asuncion"}, {"Atlantic Standard Time", "America/Halifax"}, {"Venezuela Standard Time", "America/Caracas"},
+    {"Central Brazilian Standard Time", "America/Cuiaba"}, {"SA Western Standard Time", "America/La_Paz"}, {"Pacific SA Standard Time", "America/Santiago"},
+    {"Newfoundland Standard Time", "America/St_Johns"}, {"Tocantins Standard Time", "America/Araguaina"}, {"E. South America Standard Time", "America/Sao_Paulo"},
+    {"SA Eastern Standard Time", "America/Cayenne"}, {"Argentina Standard Time", "America/Argentina/Buenos_Aires"}, {"Greenland Standard Time", "America/Nuuk"},
+    {"Montevideo Standard Time", "America/Montevideo"}, {"Magallanes Standard Time", "America/Punta_Arenas"}, {"Saint Pierre Standard Time", "America/Miquelon"},
+    {"Bahia Standard Time", "America/Bahia"}, {"UTC-02", "Etc/GMT+2"}, {"Azores Standard Time", "Atlantic/Azores"}, {"Cape Verde Standard Time", "Atlantic/Cape_Verde"},
+    {"UTC", "Etc/UTC"}, {"GMT Standard Time", "Europe/London"}, {"Greenwich Standard Time", "Atlantic/Reykjavik"}, {"Sao Tome Standard Time", "Africa/Sao_Tome"},
+    {"Morocco Standard Time", "Africa/Casablanca"}, {"W. Europe Standard Time", "Europe/Berlin"}, {"Central Europe Standard Time", "Europe/Budapest"},
+    {"Romance Standard Time", "Europe/Paris"}, {"Central European Standard Time", "Europe/Warsaw"}, {"W. Central Africa Standard Time", "Africa/Lagos"},
+    {"Jordan Standard Time", "Asia/Amman"}, {"GTB Standard Time", "Europe/Bucharest"}, {"Middle East Standard Time", "Asia/Beirut"},
+    {"Egypt Standard Time", "Africa/Cairo"}, {"E. Europe Standard Time", "Europe/Chisinau"}, {"Syria Standard Time", "Asia/Damascus"},
+    {"West Bank Standard Time", "Asia/Hebron"}, {"South Africa Standard Time", "Africa/Johannesburg"}, {"FLE Standard Time", "Europe/Kyiv"},
+    {"Israel Standard Time", "Asia/Jerusalem"}, {"South Sudan Standard Time", "Africa/Juba"}, {"Kaliningrad Standard Time", "Europe/Kaliningrad"},
+    {"Sudan Standard Time", "Africa/Khartoum"}, {"Libya Standard Time", "Africa/Tripoli"}, {"Namibia Standard Time", "Africa/Windhoek"},
+    {"Arabic Standard Time", "Asia/Baghdad"}, {"Turkey Standard Time", "Europe/Istanbul"}, {"Arab Standard Time", "Asia/Riyadh"},
+    {"Belarus Standard Time", "Europe/Minsk"}, {"Russian Standard Time", "Europe/Moscow"}, {"E. Africa Standard Time", "Africa/Nairobi"},
+    {"Volgograd Standard Time", "Europe/Volgograd"}, {"Iran Standard Time", "Asia/Tehran"}, {"Arabian Standard Time", "Asia/Dubai"},
+    {"Astrakhan Standard Time", "Europe/Astrakhan"}, {"Azerbaijan Standard Time", "Asia/Baku"}, {"Russia Time Zone 3", "Europe/Samara"},
+    {"Mauritius Standard Time", "Indian/Mauritius"}, {"Saratov Standard Time", "Europe/Saratov"}, {"Georgian Standard Time", "Asia/Tbilisi"},
+    {"Caucasus Standard Time", "Asia/Yerevan"}, {"Afghanistan Standard Time", "Asia/Kabul"}, {"West Asia Standard Time", "Asia/Tashkent"},
+    {"Ekaterinburg Standard Time", "Asia/Yekaterinburg"}, {"Pakistan Standard Time", "Asia/Karachi"}, {"Qyzylorda Standard Time", "Asia/Qyzylorda"},
+    {"India Standard Time", "Asia/Kolkata"}, {"Sri Lanka Standard Time", "Asia/Colombo"}, {"Nepal Standard Time", "Asia/Kathmandu"},
+    {"Central Asia Standard Time", "Asia/Bishkek"}, {"Bangladesh Standard Time", "Asia/Dhaka"}, {"Omsk Standard Time", "Asia/Omsk"},
+    {"Myanmar Standard Time", "Asia/Yangon"}, {"SE Asia Standard Time", "Asia/Bangkok"}, {"Altai Standard Time", "Asia/Barnaul"},
+    {"W. Mongolia Standard Time", "Asia/Hovd"}, {"North Asia Standard Time", "Asia/Krasnoyarsk"}, {"N. Central Asia Standard Time", "Asia/Novosibirsk"},
+    {"Tomsk Standard Time", "Asia/Tomsk"}, {"China Standard Time", "Asia/Shanghai"}, {"North Asia East Standard Time", "Asia/Irkutsk"},
+    {"Singapore Standard Time", "Asia/Singapore"}, {"W. Australia Standard Time", "Australia/Perth"}, {"Taipei Standard Time", "Asia/Taipei"},
+    {"Ulaanbaatar Standard Time", "Asia/Ulaanbaatar"}, {"Aus Central W. Standard Time", "Australia/Eucla"}, {"Transbaikal Standard Time", "Asia/Chita"},
+    {"Tokyo Standard Time", "Asia/Tokyo"}, {"North Korea Standard Time", "Asia/Pyongyang"}, {"Korea Standard Time", "Asia/Seoul"},
+    {"Yakutsk Standard Time", "Asia/Yakutsk"}, {"Cen. Australia Standard Time", "Australia/Adelaide"}, {"AUS Central Standard Time", "Australia/Darwin"},
+    {"E. Australia Standard Time", "Australia/Brisbane"}, {"AUS Eastern Standard Time", "Australia/Sydney"}, {"West Pacific Standard Time", "Pacific/Port_Moresby"},
+    {"Tasmania Standard Time", "Australia/Hobart"}, {"Vladivostok Standard Time", "Asia/Vladivostok"}, {"Lord Howe Standard Time", "Australia/Lord_Howe"},
+    {"Bougainville Standard Time", "Pacific/Bougainville"}, {"Russia Time Zone 10", "Asia/Srednekolymsk"}, {"Magadan Standard Time", "Asia/Magadan"},
+    {"Norfolk Standard Time", "Pacific/Norfolk"}, {"Sakhalin Standard Time", "Asia/Sakhalin"}, {"Central Pacific Standard Time", "Pacific/Guadalcanal"},
+    {"Russia Time Zone 11", "Asia/Kamchatka"}, {"New Zealand Standard Time", "Pacific/Auckland"}, {"UTC+12", "Etc/GMT-12"},
+    {"Fiji Standard Time", "Pacific/Fiji"}, {"Chatham Islands Standard Time", "Pacific/Chatham"}, {"UTC+13", "Etc/GMT-13"},
+    {"Tonga Standard Time", "Pacific/Tongatapu"}, {"Samoa Standard Time", "Pacific/Apia"}, {"Line Islands Standard Time", "Pacific/Kiritimati"}};
+std::wstring widen(std::string_view s) { std::wstring w; for (char c : s) w += wchar_t((unsigned char)c); return w; }   // key names are ASCII
+std::string narrow(const wchar_t* w) { std::string s; for (; *w; ++w) s += *w < 128 ? char(*w) : '?'; return s; }
+// Current rules of a Windows zone from HKLM\...\Time Zones\<key>\TZI (REG_TZI_FORMAT), as a POSIX rule pair.
+std::optional<tzif> registry_zone(std::string_view name) {
+    std::string key(name);
+    for (auto& [w, i] : k_win_zones) if (name == i) { key = w; break; }
+    if (key.empty() || key.find_first_of("\\/") != std::string::npos || key.size() > 128) return std::nullopt;
+    struct reg_tzi { LONG bias, std_bias, dlt_bias; SYSTEMTIME std_date, dlt_date; } t{};
+    DWORD size = sizeof t;
+    auto path = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\" + widen(key);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, path.c_str(), L"TZI", RRF_RT_REG_BINARY, nullptr, &t, &size) != ERROR_SUCCESS || size != sizeof t) return std::nullopt;
+    auto abbr = [](int off) { int a = off < 0 ? -off : off; char b[16]; std::snprintf(b, sizeof b, a % 3600 ? "%c%02d%02d" : "%c%02d", off < 0 ? '-' : '+', a / 3600, a % 3600 / 60); return std::string(b); };
+    tzif z; z.has_footer = true; auto& p = z.footer; p.ok = true;
+    p.std_off = -int(t.bias + t.std_bias) * 60; p.std_name = abbr(p.std_off);
+    if (t.dlt_date.wMonth && t.std_date.wMonth && t.dlt_bias != t.std_bias) {
+        p.has_dst = true; p.dst_off = -int(t.bias + t.dlt_bias) * 60; p.dst_name = abbr(p.dst_off);
+        auto rule = [](const SYSTEMTIME& s) { return posix_rule{'M', s.wMonth, s.wDay, s.wDayOfWeek, 0, s.wHour * 3600 + s.wMinute * 60 + s.wSecond}; };
+        p.start = rule(t.dlt_date); p.end = rule(t.std_date);
+    }
+    return z;
+}
+std::string windows_local_zone() {
+    DYNAMIC_TIME_ZONE_INFORMATION d{};
+    if (GetDynamicTimeZoneInformation(&d) == TIME_ZONE_ID_INVALID || !d.TimeZoneKeyName[0]) return {};
+    auto key = narrow(d.TimeZoneKeyName);
+    for (auto& [w, i] : k_win_zones) if (key == w) return i;
+    return key;   // unmapped: the registry key itself, which zone_at resolves through the registry
+}
+#endif
+
+// "Etc/GMT+5" (POSIX sign: five hours west) without any zone files.
+std::optional<tzif> etc_gmt(std::string_view n) {
+    if (!n.starts_with("Etc/GMT") || n.size() < 9 || (n[7] != '+' && n[7] != '-')) return std::nullopt;
+    int h = 0; for (char c : n.substr(8)) { if (!std::isdigit((unsigned char)c)) return std::nullopt; h = h * 10 + (c - '0'); }
+    if (h > 14) return std::nullopt;
+    tzif z; z.has_footer = true; z.footer.ok = true; z.footer.std_off = (n[7] == '+' ? -h : h) * 3600;
+    char b[8]; std::snprintf(b, sizeof b, "%c%02d", n[7] == '+' ? '-' : '+', h); z.footer.std_name = b;
+    return z;
+}
+
+// Parsed zones, bounded; only successes are cached (a failure may be a zone file that is being replaced).
+constexpr std::size_t k_zone_cache_max = 64;
+std::mutex z_mu; std::map<std::string, std::shared_ptr<const tzif>, std::less<>> z_cache;
+std::shared_ptr<const tzif> load_zone(std::string_view name) {
+    { std::lock_guard lk(z_mu); if (auto it = z_cache.find(name); it != z_cache.end()) return it->second; }
+    std::optional<tzif> z;
+    std::string data;
+    if (is_abs_path(name)) {
+        if (name == tz_env_path() && read_regular(fs::path(std::string(name)), data, k_max_zone_file)) z = parse_tzif(data);
+    } else if (valid_zone_name(name)) {
+        if (!tz_dir().empty() && read_regular(fs::path(tz_dir()) / std::string(name), data, k_max_zone_file)) z = parse_tzif(data);
+        if (!z) z = bundle_zone(name);
+#if defined(_WIN32)
+        if (!z) z = registry_zone(name);
+#endif
+        if (!z) z = etc_gmt(name);
+    }
+    if (!z && !is_abs_path(name)) {   // a bare POSIX TZ string ("EST5EDT,M3.2.0,M11.1.0")
+        auto p = parse_posix(name);
+        if (p.ok) { z.emplace(); z->footer = p; z->has_footer = true; }
+    }
+    if (!z) return nullptr;
+    auto res = std::make_shared<const tzif>(std::move(*z));
+    std::lock_guard lk(z_mu);
+    if (z_cache.size() >= k_zone_cache_max) z_cache.clear();
     z_cache.emplace(std::string(name), res);
     return res;
 }
-std::string read_first_line(const char* path) { std::ifstream f(path); std::string l; std::getline(f, l); while (!l.empty() && (l.back() == ' ' || l.back() == '\r')) l.pop_back(); return l; }
+std::string read_first_line(const char* path) { std::string d; if (!read_regular(path, d, 4096)) return {}; auto l = d.substr(0, d.find('\n')); while (!l.empty() && (l.back() == ' ' || l.back() == '\r')) l.pop_back(); return l; }
 }  // namespace
 
 std::string tz_backend() {
 #if FORGE_TZ_CHRONO
     return "chrono-tzdb";
 #else
-    auto d = tz_dir(); return d.empty() ? "utc-only" : "tzif:" + d;
+    if (auto d = tz_dir(); !d.empty()) return "tzif:" + d;
+    for (auto& b : tz_bundles()) { std::uint32_t data; if (bundle_index(b, data)) return "tzdata:" + b; }
+#  if defined(_WIN32)
+    return "windows-registry";
+#  else
+    return "utc-only";
+#  endif
 #endif
 }
 std::string local_zone() {
@@ -198,7 +402,10 @@ std::string local_zone() {
         return s;
     }
 #if FORGE_TZ_CHRONO
-    try { return std::string(std::chrono::current_zone()->name()); } catch (...) { return "UTC"; }
+    try { return std::string(std::chrono::current_zone()->name()); } catch (...) {}
+#endif
+#if defined(_WIN32)
+    if (auto z = windows_local_zone(); !z.empty()) return z;
 #elif defined(__APPLE__)
     if (auto z = apple_local_zone(); !z.empty()) return z;
 #elif defined(__ANDROID__)
@@ -218,7 +425,16 @@ std::vector<std::string> zone_names() {
 #if FORGE_TZ_CHRONO
     try { for (auto& z : std::chrono::get_tzdb().zones) r.emplace_back(z.name()); } catch (...) {}
 #else
-    auto d = tz_dir(); if (d.empty()) return {"UTC"};
+    auto d = tz_dir();
+    if (d.empty()) {   // Android's single-file bundle, or Windows' registry zones mapped to IANA names
+        for (auto& b : tz_bundles()) { std::uint32_t data; if (auto ix = bundle_index(b, data)) { for (auto& e : *ix) r.push_back(e.name); break; } }
+#  if defined(_WIN32)
+        if (r.empty()) for (auto& [w, i] : k_win_zones) if (registry_zone(w)) r.emplace_back(i);
+#  endif
+        if (r.empty()) r.emplace_back("UTC");
+        std::sort(r.begin(), r.end()); r.erase(std::unique(r.begin(), r.end()), r.end());
+        return r;
+    }
     std::error_code ec;
     for (auto it = fs::recursive_directory_iterator(d, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         auto rel = fs::relative(it->path(), d, ec).generic_string();

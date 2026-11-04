@@ -7,6 +7,9 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/stat.h>
+#endif
 namespace L = forge::os::locale;
 static int fails = 0, checks = 0;
 #define CHECK(x) do { ++checks; if (!(x)) { ++fails; std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); } } while (0)
@@ -201,6 +204,7 @@ static void dates() {
 // MSVC's std::chrono::tzdb takes abbreviations from Windows ICU, which gives "GMT-5" where the IANA data says "EST"
 // (whether a zone gets a letter abbreviation depends on the user's display locale).
 static bool abbrev_is(const std::string& got, const char* iana, const char* gmt_form) {
+    if (L::tz_backend() == "windows-registry") return got == std::string(gmt_form).substr(3) || got == "+" + std::string(gmt_form).substr(4) || (got.size() == 3 && got.substr(1) == "0" + std::string(gmt_form).substr(4));   // "+11", "-05"
     return got == iana || (L::tz_backend() == "chrono-tzdb" && got == gmt_form);
 }
 static void zones() {
@@ -227,8 +231,61 @@ static void zones() {
     CHECK(r && r.value.hour == 18 && r.value.minute == 33 && abbrev_is(r.value.zone_abbrev, "AEDT", "GMT+11"));
     // Windows' ICU-backed tzdb only knows numeric abbreviations (GMT+11), like abbrev_is above.
     if (r) { auto hm = L::format_pattern(r.value, "HH:mm zzz xxx", "en");
-             CHECK(hm == "18:33 AEDT +11:00" || hm == "18:33 GMT+11 +11:00"); EQ(L::format_pattern(r.value, "VV O", "en"), "Australia/Sydney GMT+11"); }
-    auto names = L::zone_names(); CHECK(names.size() > 300);
+             CHECK(hm == "18:33 AEDT +11:00" || hm == "18:33 GMT+11 +11:00" || hm == "18:33 +11 +11:00"); EQ(L::format_pattern(r.value, "VV O", "en"), "Australia/Sydney GMT+11"); }
+    auto names = L::zone_names(); CHECK(names.size() > (L::tz_backend() == "windows-registry" ? 100u : 300u));
+}
+static void set_env(const char* k, const char* v) {   // v = nullptr unsets
+#if defined(_WIN32)
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) ::setenv(k, v, 1); else ::unsetenv(k);
+#endif
+}
+static std::string be32(std::uint32_t v) { return {char(v >> 24), char(v >> 16), char(v >> 8), char(v)}; }
+static std::string nul(std::size_t n = 1) { return std::string(n, '\0'); }
+// TZif v1 with one fixed type (no transitions).
+static std::string tzif_fixed(int off, const std::string& abbr) {
+    std::string h = "TZif" + nul(16);
+    h += be32(0) + be32(0) + be32(0) + be32(0) + be32(1) + be32(std::uint32_t(abbr.size() + 1));
+    return h + be32(std::uint32_t(off)) + nul() + nul() + abbr + nul();
+}
+static void zone_safety() {
+    // Zone names are IANA-style; paths, traversal and devices never reach the file system.
+    for (const char* bad : {"../../../../../../dev/zero", "/dev/zero", "/etc/passwd", "Europe/../../etc/passwd", "a//b", "/"})
+        CHECK(!L::zone_at(bad, L::sys_seconds{}));
+    auto tmp = std::filesystem::temp_directory_path() / "forge_test_locale_tz";
+    std::filesystem::remove_all(tmp); std::filesystem::create_directories(tmp);
+    auto zf = tmp / "Custom";
+    { std::ofstream f(zf, std::ios::binary); auto z = tzif_fixed(3 * 3600 + 1800, "XYZ"); f.write(z.data(), std::streamsize(z.size())); }
+    auto abs = zf.string();
+    CHECK(!L::zone_at(abs, L::sys_seconds{}));                    // absolute: only the path $TZ names
+    const char* old_tz = std::getenv("TZ"); std::string saved = old_tz ? old_tz : ""; bool had_tz = old_tz != nullptr;
+    set_env("TZ", (":" + abs).c_str());
+    auto z = L::zone_at("", L::sys_seconds{}); CHECK(z && z.value.offset.count() == 12600 && z.value.abbrev == "XYZ");
+    set_env("TZ", had_tz ? saved.c_str() : nullptr);
+    // Android's tzdata bundle, found through $TZDIR/tzdata.
+    std::string a = tzif_fixed(-7 * 3600, "AAA"), b = tzif_fixed(5 * 3600 + 2700, "BBB");
+    auto entry = [](std::string name, std::uint32_t off, std::uint32_t len) { name.resize(40, '\0'); return name + be32(off) + be32(len) + be32(0); };
+    std::string idx = entry("Forge/Alpha", 0, std::uint32_t(a.size())) + entry("Forge/Beta", std::uint32_t(a.size()), std::uint32_t(b.size()));
+    std::string bundle = "tzdata2099z" + nul() + be32(24) + be32(24 + std::uint32_t(idx.size())) + be32(24 + std::uint32_t(idx.size() + a.size() + b.size()));
+    bundle += idx + a + b;
+    { std::ofstream f(tmp / "tzdata", std::ios::binary); f.write(bundle.data(), std::streamsize(bundle.size())); }
+    const char* old_dir = std::getenv("TZDIR"); std::string saved_dir = old_dir ? old_dir : ""; bool had_dir = old_dir != nullptr;
+    set_env("TZDIR", tmp.string().c_str());
+    auto zb = L::zone_at("Forge/Beta", L::sys_seconds{}); CHECK(zb && zb.value.offset.count() == 20700 && zb.value.abbrev == "BBB");
+    auto za = L::zone_at("Forge/Alpha", L::sys_seconds{}); CHECK(za && za.value.offset.count() == -25200);
+    CHECK(!L::zone_at("Forge/Gamma", L::sys_seconds{}));
+    set_env("TZDIR", had_dir ? saved_dir.c_str() : nullptr);
+    auto eg = L::zone_at("Etc/GMT+5", L::sys_seconds{}); CHECK(eg && eg.value.offset.count() == -18000);
+#if !defined(_WIN32)
+    auto fifo = tmp / "fifo";   // a FIFO named by $TZ must not block the read
+    if (::mkfifo(fifo.c_str(), 0600) == 0) {
+        set_env("TZ", fifo.c_str());
+        CHECK(!L::zone_at("", L::sys_seconds{}));
+        set_env("TZ", had_tz ? saved.c_str() : nullptr);
+    }
+#endif
+    std::filesystem::remove_all(tmp);
 }
 static void messages() {
     auto m = L::format_message("{n, plural, =0 {no files} one {# file} other {# files}} in {dir}", {{"n", 1234}, {"dir", "/tmp"}}, "en");
@@ -297,7 +354,7 @@ static void gettext() {
     std::filesystem::remove_all(dir);
 }
 int main() {
-    tags(); region(); plurals_numbers(); lists_units(); calendars(); dates(); zones(); messages(); gettext();
+    tags(); region(); plurals_numbers(); lists_units(); calendars(); dates(); zones(); zone_safety(); messages(); gettext();
     std::printf("test_locale: %d/%d checks passed\n", checks - fails, checks);
     return fails ? 1 : 0;
 }
