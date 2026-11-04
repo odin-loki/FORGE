@@ -1,11 +1,14 @@
-// forge_mobile iOS / iPadOS backend (Objective-C++, ARC). On macOS this file only provides the null backend.
-//   sensors   CMMotionManager (accelerometer, gyro, magnetometer), CMAltimeter (pressure),
+// forge_mobile Apple backends (Objective-C++, ARC): iOS / iPadOS below, then macOS, and the null backend on watchOS.
+//   sensors   one shared CMMotionManager (accelerometer, gyro, magnetometer; fanned out per kind), CMAltimeter (pressure),
 //             CLLocationManager (location), UIDevice battery. Light/proximity: not exposed by iOS.
 //   touch     FORGETouchView (a UIView subclass the app adds or subclasses) forwards UITouch phases.
-//   haptics   UIImpactFeedbackGenerator (amplitude -> intensity); AudioServices vibrate as fallback.
+//   haptics   UIImpactFeedbackGenerator for short pulses on iPhone (amplitude -> intensity); otherwise the
+//             AudioServices system vibration.
 //   display   UIScreen nativeBounds/scale/maximumFramesPerSecond + UIDevice orientation.
 //   cameras   AVCaptureDeviceDiscoverySession.  permissions: AVCaptureDevice / CLLocationManager / UNUserNotificationCenter.
 #include "internal.hpp"
+#include <algorithm>
+#include <array>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE && !TARGET_OS_WATCH   // iOS, iPadOS, tvOS-less UIKit targets; watchOS uses the null backend + glue
 #import <AVFoundation/AVFoundation.h>
@@ -51,19 +54,61 @@ namespace forge::os::mobile::detail {
 namespace {
 template <class F> void on_main(F&& f) { if ([NSThread isMainThread]) f(); else dispatch_sync(dispatch_get_main_queue(), ^{ f(); }); }
 
+// One CMMotionManager per app (Apple's advice) shared by every stream: each motion kind has one handler that fans
+// events out to all of that kind's subscribers, runs at the fastest rate any of them asked for, and stops when the
+// last subscriber goes. (Starting a second handler would replace the first; stopping per stream would stop both.)
+struct motion_hub : std::enable_shared_from_this<motion_hub> {
+    CMMotionManager* mm = [CMMotionManager new]; NSOperationQueue* oq = [NSOperationQueue new];
+    struct sub { std::weak_ptr<queue> q; double hz; };
+    std::mutex m; std::array<std::vector<sub>, 3> subs;   // accelerometer, gyroscope, magnetometer
+    static int slot(sensor_kind k) { return k == sensor_kind::accelerometer ? 0 : k == sensor_kind::gyroscope ? 1 : 2; }
+    void fan_out(int s, const sensor_event& e) {
+        std::lock_guard g(m);
+        for (auto& x : subs[std::size_t(s)]) if (auto q = x.q.lock()) q->push({false, e, {}});
+    }
+    void set_rate(int s) {   // called with m held
+        double hz = 0; for (auto& x : subs[std::size_t(s)]) hz = std::max(hz, x.hz);
+        if (hz <= 0) return;
+        if (s == 0) mm.accelerometerUpdateInterval = 1.0 / hz; else if (s == 1) mm.gyroUpdateInterval = 1.0 / hz; else mm.magnetometerUpdateInterval = 1.0 / hz;
+    }
+    void add(sensor_kind k, const std::shared_ptr<queue>& q, double hz) {
+        int s = slot(k); const double g = 9.80665;
+        std::lock_guard lk(m);
+        bool first = subs[std::size_t(s)].empty();
+        subs[std::size_t(s)].push_back({q, hz}); set_rate(s);
+        if (!first) return;
+        std::weak_ptr<motion_hub> weak_hub = weak_from_this();
+        if (s == 0) [mm startAccelerometerUpdatesToQueue:oq withHandler:^(CMAccelerometerData* d, NSError*) {
+            if (auto h = weak_hub.lock(); h && d) h->fan_out(0, {k, std::uint64_t(d.timestamp * 1e9), {d.acceleration.x * g, d.acceleration.y * g, d.acceleration.z * g}, 3}); }];
+        else if (s == 1) [mm startGyroUpdatesToQueue:oq withHandler:^(CMGyroData* d, NSError*) {
+            if (auto h = weak_hub.lock(); h && d) h->fan_out(1, {k, std::uint64_t(d.timestamp * 1e9), {d.rotationRate.x, d.rotationRate.y, d.rotationRate.z}, 3}); }];
+        else [mm startMagnetometerUpdatesToQueue:oq withHandler:^(CMMagnetometerData* d, NSError*) {
+            if (auto h = weak_hub.lock(); h && d) h->fan_out(2, {k, std::uint64_t(d.timestamp * 1e9), {d.magneticField.x, d.magneticField.y, d.magneticField.z}, 3}); }];
+    }
+    void remove(sensor_kind k, const queue* q) {
+        int s = slot(k);
+        std::lock_guard lk(m); auto& v = subs[std::size_t(s)];
+        std::erase_if(v, [&](const sub& x) { auto p = x.q.lock(); return !p || p.get() == q; });
+        if (!v.empty()) { set_rate(s); return; }
+        if (s == 0) [mm stopAccelerometerUpdates]; else if (s == 1) [mm stopGyroUpdates]; else [mm stopMagnetometerUpdates];
+    }
+};
+
 // RAII owner of whatever CoreMotion/CoreLocation object feeds one stream; stops updates on destruction.
 struct apple_sub {
-    CMMotionManager* mm = nil; CMAltimeter* alt = nil; CLLocationManager* lm = nil; FORGELocationDelegate* del = nil;
+    std::shared_ptr<motion_hub> hub; const queue* hq = nullptr;
+    CMAltimeter* alt = nil; CLLocationManager* lm = nil; FORGELocationDelegate* del = nil;
     NSOperationQueue* oq = nil; sensor_kind k{}; std::shared_ptr<worker> battery;
     ~apple_sub() {
-        if (mm) { switch (k) { case sensor_kind::accelerometer: [mm stopAccelerometerUpdates]; break; case sensor_kind::gyroscope: [mm stopGyroUpdates]; break; default: [mm stopMagnetometerUpdates]; } }
+        if (hub) hub->remove(k, hq);
         if (alt) [alt stopRelativeAltitudeUpdates];
         if (lm) { CLLocationManager* l = lm; on_main([l] { [l stopUpdatingLocation]; }); }
     }
 };
 
 struct apple_backend final : backend {
-    CMMotionManager* mm = [CMMotionManager new];
+    std::shared_ptr<motion_hub> hub = std::make_shared<motion_hub>();
+    CMMotionManager* mm = hub->mm;
     std::string name() const override { return "ios"; }
     result<std::vector<sensor_info>> sensors() override {
         std::vector<sensor_info> v;
@@ -78,23 +123,13 @@ struct apple_backend final : backend {
     result<sensor_stream> open_sensor(sensor_kind k, double hz) override {
         auto q = std::make_shared<queue>(); bridge::get().add_sensor(k, q);
         auto sub = std::make_shared<apple_sub>(); sub->k = k; sub->oq = [NSOperationQueue new];
-        const double g = 9.80665;
         switch (k) {
-        case sensor_kind::accelerometer:
-            if (!mm.accelerometerAvailable) return {{}, unsupported("accelerometer")};
-            sub->mm = mm; mm.accelerometerUpdateInterval = 1.0 / hz;
-            [mm startAccelerometerUpdatesToQueue:sub->oq withHandler:^(CMAccelerometerData* d, NSError*) { if (d) q->push({false, {k, std::uint64_t(d.timestamp * 1e9), {d.acceleration.x * g, d.acceleration.y * g, d.acceleration.z * g}, 3}, {}}); }];
+        case sensor_kind::accelerometer: case sensor_kind::gyroscope: case sensor_kind::magnetometer: {
+            bool avail = k == sensor_kind::accelerometer ? mm.accelerometerAvailable : k == sensor_kind::gyroscope ? mm.gyroAvailable : mm.magnetometerAvailable;
+            if (!avail) return {{}, unsupported(sensor_name(k))};
+            hub->add(k, q, hz); sub->hub = hub; sub->hq = q.get();
             break;
-        case sensor_kind::gyroscope:
-            if (!mm.gyroAvailable) return {{}, unsupported("gyroscope")};
-            sub->mm = mm; mm.gyroUpdateInterval = 1.0 / hz;
-            [mm startGyroUpdatesToQueue:sub->oq withHandler:^(CMGyroData* d, NSError*) { if (d) q->push({false, {k, std::uint64_t(d.timestamp * 1e9), {d.rotationRate.x, d.rotationRate.y, d.rotationRate.z}, 3}, {}}); }];
-            break;
-        case sensor_kind::magnetometer:
-            if (!mm.magnetometerAvailable) return {{}, unsupported("magnetometer")};
-            sub->mm = mm; mm.magnetometerUpdateInterval = 1.0 / hz;
-            [mm startMagnetometerUpdatesToQueue:sub->oq withHandler:^(CMMagnetometerData* d, NSError*) { if (d) q->push({false, {k, std::uint64_t(d.timestamp * 1e9), {d.magneticField.x, d.magneticField.y, d.magneticField.z}, 3}, {}}); }];
-            break;
+        }
         case sensor_kind::pressure:
             if (![CMAltimeter isRelativeAltitudeAvailable]) return {{}, unsupported("barometer")};
             sub->alt = [CMAltimeter new];
@@ -122,7 +157,11 @@ struct apple_backend final : backend {
     result<touch_stream> open_touch() override { auto q = std::make_shared<queue>(); bridge::get().add_touch(q); return {make_touch(q, nullptr), {}}; }
     status vibrate(int ms, double amp) override {
         if (auto h = backend::vibrate(ms, amp); !is_unsupported(h.err)) return h;
-        on_main([amp] { auto* g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy]; [g prepare]; [g impactOccurredWithIntensity:amp]; });
+        // Short pulses: a Taptic Engine impact (amplitude -> intensity). Longer ones, or devices without haptic
+        // feedback support (iPad, iPod), use the system vibration (a fixed ~400 ms buzz where there is a motor).
+        bool taptic = [[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPhone;
+        if (taptic && ms <= 100) on_main([amp] { auto* g = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy]; [g prepare]; [g impactOccurredWithIntensity:amp]; });
+        else AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
         return {};
     }
     result<display_info> display() override {
@@ -204,6 +243,7 @@ struct apple_backend final : backend {
         d.torchMode = on ? AVCaptureTorchModeOn : AVCaptureTorchModeOff; [d unlockForConfiguration]; return {};
     }
     status open_url(std::string_view u) override {
+        if (auto c = check_url(u); !c) return c;
         NSURL* url = [NSURL URLWithString:ns(u)]; if (!url) return {{}, {22, "open_url: bad URL"}};
         on_main([url] { [UIApplication.sharedApplication openURL:url options:@{} completionHandler:nil]; }); return {};
     }
@@ -238,8 +278,9 @@ std::shared_ptr<backend> make_apple() { return std::make_shared<apple_backend>()
 } // namespace forge::os::mobile::detail
 #elif defined(__APPLE__) && TARGET_OS_OSX
 // macOS: trackpad touches/gestures come from the app's NSView via feed_touch; location via CoreLocation in
-// the app (feed_sensor). Here: IOKit power assertions (keep-awake), NSWorkspace open_url, user notifications,
-// device info; everything else uses the portable defaults (power, clipboard, connectivity) or is not_supported.
+// the app (provide_sensor + feed_sensor). Here: IOKit power assertions (keep-awake), NSWorkspace open_url, user
+// notifications (UNUserNotificationCenter, osascript when unbundled), device info; everything else uses the portable
+// defaults (power, clipboard, connectivity) or is not_supported.
 #import <AppKit/AppKit.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <UserNotifications/UserNotifications.h>
@@ -260,9 +301,35 @@ struct mac_backend final : backend {
         return {};
     }
     status open_url(std::string_view u) override {
+        if (auto c = check_url(u); !c) return c;
         NSURL* url = [NSURL URLWithString:[[NSString alloc] initWithBytes:u.data() length:u.size() encoding:NSUTF8StringEncoding]];
         if (!url) return {{}, {22, "open_url: bad URL"}};
         return [NSWorkspace.sharedWorkspace openURL:url] ? status{} : status{{}, {1, "NSWorkspace openURL failed"}};
+    }
+    // UNUserNotificationCenter (macOS 10.14+) for bundled apps; it raises in a bare executable, so command-line
+    // tools post through Notification Center's AppleScript bridge instead.
+    status notify(std::string_view t, std::string_view b) override {
+        if (auto h = backend::notify(t, b); !is_unsupported(h.err)) return h;
+        NSString* title = [[NSString alloc] initWithBytes:t.data() length:t.size() encoding:NSUTF8StringEncoding];
+        NSString* body = [[NSString alloc] initWithBytes:b.data() length:b.size() encoding:NSUTF8StringEncoding];
+        if (!title || !body) return {{}, {22, "notify: text is not UTF-8"}};
+        if (@available(macOS 10.14, *)) {
+            if (NSBundle.mainBundle.bundleIdentifier != nil) {
+                UNUserNotificationCenter* center = [UNUserNotificationCenter currentNotificationCenter];
+                [center requestAuthorizationWithOptions:(UNAuthorizationOptionAlert | UNAuthorizationOptionSound) completionHandler:^(BOOL, NSError*) {}];
+                UNMutableNotificationContent* c = [UNMutableNotificationContent new]; c.title = title; c.body = body;
+                [center addNotificationRequest:[UNNotificationRequest requestWithIdentifier:[NSUUID UUID].UUIDString content:c trigger:nil] withCompletionHandler:nil];
+                return {};
+            }
+        }
+        auto quote = [](std::string_view s) {
+            std::string r = "\"";
+            for (char ch : s) { if (ch == '"' || ch == '\\') r += '\\'; r += (static_cast<unsigned char>(ch) < 0x20) ? ' ' : ch; }
+            return r + "\"";
+        };
+        int rc = run_tool({"osascript", "-e", "display notification " + quote(b) + " with title " + quote(t)});
+        if (rc < 0) return {{}, unsupported("notifications (no osascript)")};
+        return rc == 0 ? status{} : status{{}, {rc, "osascript display notification failed"}};
     }
     result<device_info> info() override {
         auto d = backend::info(); if (!d) return d; d.value.manufacturer = "Apple";

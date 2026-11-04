@@ -1,8 +1,8 @@
 // forge_mobile FreeBSD backend.
 //   sensors   temperature: sysctl dev.cpu.0.temperature / hw.acpi.thermal.tz0.temperature (deci-kelvin);
 //             battery: hw.acpi.battery.life / hw.acpi.acline (via forge::os::power).
-//   touch     evdev (/dev/input/event*, `kldload evdev` + hw.usb.usbhid.enable) multitouch protocol B,
-//             devices picked by EVIOCGBIT(EV_ABS) having ABS_MT_POSITION_X.
+//   touch     evdev (/dev/input/event*, `kldload evdev` + hw.usb.usbhid.enable) multitouch protocol B and
+//             single touch, every node with INPUT_PROP_DIRECT (touchscreens; touchpads are skipped).
 //   display   not exposed without X/Wayland: app glue calls report_display().  Hot-plug arrives via devd(8);
 //             apps can forward it with feed_lifecycle/feed_sensor.
 #include "internal.hpp"
@@ -42,19 +42,25 @@ struct freebsd_backend final : backend {
         });
         return {make_sensor(k, q, w), {}};
     }
+    // Every direct-touch evdev node (INPUT_PROP_DIRECT: touchscreens, not touchpads); positions in display pixels
+    // once the app has reported the display size (report_display), else in device units.
     result<touch_stream> open_touch() override {
-        for (int i = 0; i < 32; ++i) {
+        int w_px = 0, h_px = 0; if (auto d = display()) { w_px = d.value.width_px; h_px = d.value.height_px; }
+        std::vector<evdev_node> nodes;
+        for (int i = 0; i < 64; ++i) {
             std::string p = "/dev/input/event" + std::to_string(i);
             int fd = ::open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC); if (fd < 0) continue;
-            unsigned long bits[(ABS_CNT + 63) / 64] = {};
-            if (::ioctl(fd, EVIOCGBIT(EV_ABS, sizeof bits), bits) >= 0 && (bits[ABS_MT_POSITION_X / 64] >> (ABS_MT_POSITION_X % 64) & 1)) {
-                auto q = std::make_shared<queue>(); bridge::get().add_touch(q); auto w = std::make_shared<worker>();
-                w->start([fd, q, wp = w.get()] { evdev_loop(fd, *q, *wp); ::close(fd); });
-                return {make_touch(q, w), {}};
-            }
-            ::close(fd);
+            constexpr int B = int(8 * sizeof(unsigned long));
+            unsigned long bits[(ABS_CNT + B - 1) / B] = {}, keys[(KEY_CNT + B - 1) / B] = {};
+            bool abs = ::ioctl(fd, EVIOCGBIT(EV_ABS, sizeof bits), bits) >= 0, key = ::ioctl(fd, EVIOCGBIT(EV_KEY, sizeof keys), keys) >= 0;
+            auto bit = [](const unsigned long* b, int n) { return (b[n / B] >> (n % B)) & 1ul; };
+            bool touch = abs && (bit(bits, ABS_MT_POSITION_X) || (bit(bits, ABS_X) && key && bit(keys, BTN_TOUCH)));
+            if (touch && evdev_is_direct(fd)) nodes.push_back(evdev_setup(fd, w_px, h_px)); else ::close(fd);
         }
-        return {{}, unsupported("touch input (no evdev multitouch device)")};
+        if (nodes.empty()) return {{}, unsupported("touch input (no evdev touchscreen)")};
+        auto q = std::make_shared<queue>(); bridge::get().add_touch(q); auto w = std::make_shared<worker>();
+        w->start([nodes = std::move(nodes), q, wp = w.get()]() mutable { evdev_loop(std::move(nodes), *q, *wp); });
+        return {make_touch(q, w), {}};
     }
     result<permission_state> permission_status(permission p) override { if (auto b = backend::permission_status(p)) return b; return {permission_state::not_required, {}}; }
     status request_permission(permission) override { return {}; }
