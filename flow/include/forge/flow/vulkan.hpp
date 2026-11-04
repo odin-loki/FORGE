@@ -70,6 +70,11 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                     h->arena = [rt](float* p, std::size_t n) { rt->arena(p, n); };      // owning: plans may outlive the registry
                     h->forget = [rt](const float* p, std::size_t n) { rt->forget(p, n); };
                 }
+                if constexpr (requires { raw->ran((const void*)nullptr, true); raw->replay((const void*)nullptr); })
+                    if (!std::getenv("FORGE_GPU_NO_REPLAY")) {
+                        h->ran = [raw](const void* k, bool c) { raw->ran(k, c); };
+                        h->replay = [raw](const void* k) { return raw->replay(k); };
+                    }
             }
         h->pin = [raw](const float* p, std::size_t n) { raw->pin(p, n); };
         h->to_host = [raw](const float* p, std::size_t n) { raw->to_host(p, n); };
