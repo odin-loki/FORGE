@@ -380,8 +380,7 @@ public:
         if (it == p_.inputs.end()) return; // input eliminated by DCE
         auto& v = p_.views[it->second];
         if (data.size() != v.size()) raise(errc::shape_mismatch, "input {} expects {} elements, got {}", name, v.size(), data.size());
-        auto* h = p_.hooks;
-        if (h) h->to_host(v.data, v.size());
+        auto* h = p_.hooks;   // the whole view is overwritten: no need to fetch the device copy first
         std::copy(data.begin(), data.end(), v.data);
         if (h) h->host_wrote(v.data, v.size());
     }

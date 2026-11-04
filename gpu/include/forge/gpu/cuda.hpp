@@ -305,7 +305,9 @@ public:
             auto a = std::max(lo, el), b = std::min(hi, eh);
             ck(htod_s(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
         });
-        sync();
+        // No sync: the copy is stream-ordered before later kernels, and a pageable source may be reused once the
+        // call returns (the driver has staged it). Only launch any recorded kernels so ordering is kept.
+        flush();
     }
     void release(const float* p, std::size_t n) {
         std::lock_guard lk(mu_); bind();

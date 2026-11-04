@@ -315,7 +315,7 @@ public:
         std::vector<int> hist(prompt.begin(), prompt.end()), out;
         using clk = std::chrono::steady_clock;
         auto t0 = clk::now();
-        auto logits = forward(prompt);
+        auto logits = run_view(prompt, false);   // the executor's output buffer, valid until the next run
         auto t1 = clk::now();
         int eos = tokenizer() ? tokenizer()->eos() : -1;
         for (int i = 0; i < max_new; ++i) {
@@ -324,7 +324,7 @@ public:
             if (on_token && !on_token(t)) break;
             if (stop_at_eos && t == eos) break;
             if (i + 1 == max_new || pos_ >= st_.capacity) break;
-            logits = forward(std::span<const int>(&t, 1));
+            logits = run_view(std::span<const int>(&t, 1), false);
         }
         auto t2 = clk::now();
         if (stats) *stats = {prompt.size(), out.size(), std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count()};
@@ -350,7 +350,8 @@ public:
         return out;
     }
 private:
-    std::vector<float> run(std::span<const int> ids, bool all) {
+    std::vector<float> run(std::span<const int> ids, bool all) { auto v = run_view(ids, all); return {v.begin(), v.end()}; }
+    std::span<const float> run_view(std::span<const int> ids, bool all) {
         if (ids.empty()) raise(errc::invalid_argument, "forward: no tokens");
         if (pos_ + i64(ids.size()) > st_.capacity) raise(errc::out_of_memory, "context {} exceeded", st_.capacity);
         i64 n = i64(ids.size());
@@ -366,7 +367,7 @@ private:
         ex.run();
         pos_ += n;
         auto v = ex.output_view(blueprint().outputs.front().name);
-        return {v.data, v.data + v.size()};
+        return {v.data, v.size()};
     }
     std::shared_ptr<model> m_;
     session_options opt_;
