@@ -19,6 +19,10 @@ FORGE_PROCESS_TASK(chatty, [](std::string in) {
 #endif
     return in + ":" + std::to_string(n);
 });
+FORGE_PROCESS_TASK(sb_mech, [](std::string) { return os::sandbox_status().mechanism; });
+// "connected" / "refused" for a TCP connect to 127.0.0.1:<port>; "wrote" / "denied" for a file write.
+FORGE_PROCESS_TASK(probe_connect, [](std::string port) { return os::socket::connect("127.0.0.1", std::stoi(port), 3000) ? std::string("connected") : std::string("refused"); });
+FORGE_PROCESS_TASK(probe_write, [](std::string path) { return os::write_file(path, "x") ? std::string("wrote") : std::string("denied"); });
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 FORGE_PROCESS_TASK(segv, [](std::string) -> std::string { ::raise(SIGSEGV); return {}; });
 FORGE_PROCESS_TASK(pid, [](std::string) { return std::to_string(::getpid()); });
@@ -103,6 +107,11 @@ TEST(pp_sandboxed_worker_denies_write) {
     process_pool pp({.workers = 1, .sandbox = p});
     try { pp.submit("try_write", "/tmp/forge_pp_sandbox_probe").get(); CHECK(false); }
     catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::sandbox_violation || e.kind == os::os_errc::permission_denied); }
+    // seccomp always; Landlock on top where the kernel has it
+    std::string mech = pp.submit("sb_mech", "").get(); std::printf("  worker sandbox: %s\n", mech.c_str());
+    CHECK(mech.rfind("seccomp-bpf", 0) == 0);
+    CHECK((mech.find("landlock") != std::string::npos) == (os::sandbox_status().landlock_abi > 0));
+    CHECK(pp.submit("square", "6").get() == "36");
 }
 #endif
 #endif
@@ -121,17 +130,50 @@ TEST(pp_windows_task_stdio_does_not_corrupt_ipc) {
     for (int i = 0; i < 5; ++i) CHECK(pp.submit("chatty", "p" + std::to_string(i)).get() == "p" + std::to_string(i) + ":0");
     CHECK(pp.submit("square", "11").get() == "121");
 }
-TEST(pp_windows_sandbox_unsupported_fails_task) {
-    // Network / file-write denial cannot be applied to a running Windows process: the worker must refuse to
-    // run (exit 70) rather than serve tasks unconfined under a policy recorded as applied.
-    os::sandbox_policy p; p.deny_network = true;
-    process_pool pp({.workers = 1, .sandbox = p});
-    try { (void)pp.submit("square", "3").get(); CHECK(false); }
-    catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::io); CHECK(std::string(e.what()).find("sandbox") != std::string::npos); }
+TEST(pp_windows_sandbox_appcontainer) {
+    // Network / file-write denial: workers run in an AppContainer. Loopback is blocked for AppContainers (no
+    // privateNetworkClientServer / loopback exemption), writes outside the container folder are denied, tasks run.
+    auto lis = os::socket::listen("127.0.0.1", 0); CHECK(lis); if (!lis) return;
+    const std::string port = std::to_string(lis->local_port());
+    const std::string dir = os::join(os::temp_dir(), "forge_pp_ac_" + std::to_string(GetCurrentProcessId()));
+    os::remove_all(dir); os::mkdirs(dir);
+    {
+        process_pool open_pool({.workers = 1});   // control: an unconfined worker reaches the listener and writes
+        CHECK(open_pool.submit("probe_connect", port).get() == "connected");
+        CHECK(open_pool.submit("probe_write", os::join(dir, "open.txt")).get() == "wrote");
+    }
+    bool ran = false;
+    {
+        os::sandbox_policy p; p.deny_network = true;
+        process_pool pp({.workers = 1, .sandbox = p});
+        std::string sq;
+        try { sq = pp.submit("square", "3").get(); }
+        catch (const os::os_exception& e) { std::printf("  skip AppContainer pool: %s\n", e.what()); }
+        if (!sq.empty()) {
+            ran = true;
+            CHECK(sq == "9");
+            std::string mech = pp.submit("sb_mech", "").get(); std::printf("  worker sandbox: %s\n", mech.c_str());
+            CHECK(mech.rfind("appcontainer", 0) == 0);
+            CHECK(pp.submit("probe_connect", port).get() == "refused");
+            CHECK(pp.submit("square", "12").get() == "144");
+        }
+    }
+    if (ran) {
+        os::sandbox_policy p; p.deny_fs_write = true; p.deny_exec = true;
+        process_pool pp({.workers = 2, .sandbox = p});
+        CHECK(pp.submit("probe_write", os::join(dir, "nofs.txt")).get() == "denied");
+        CHECK(!os::exists(os::join(dir, "nofs.txt")));
+        std::string mech = pp.submit("sb_mech", "").get();
+        CHECK_MSG(mech == "appcontainer+job-object", "%s", mech.c_str());
+        std::vector<std::future<std::string>> fs; for (int i = 0; i < 8; ++i) fs.push_back(pp.submit("square", std::to_string(i)));
+        for (int i = 0; i < 8; ++i) CHECK(fs[std::size_t(i)].get() == std::to_string(i * i));
+        try { (void)pp.submit("fail", "").get(); CHECK(false); } catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::not_found); }
+    }
     // exec denial alone is applied in process (job object): tasks run
     os::sandbox_policy x; x.deny_exec = true;
-    process_pool px({.workers = 1, .sandbox = x});
-    CHECK(px.submit("square", "4").get() == "16");
+    { process_pool px({.workers = 1, .sandbox = x}); CHECK(px.submit("square", "4").get() == "16"); }
+    os::remove_all(dir);
+    for (const wchar_t* n : {L"forge.sandbox.nonet", L"forge.sandbox.nofs", L"forge.sandbox.nonet.nofs"}) DeleteAppContainerProfile(n);
 }
 TEST(pp_windows_fork_rejected) {
     try { process_pool pp({.workers = 1, .mode = process_pool::spawn_mode::fork}); CHECK(false); }
