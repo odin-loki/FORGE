@@ -20,6 +20,11 @@ static int child_main(const std::string& mode) {
         auto s = os::shared_memory::open(arg); if (!s) return 2;
         std::memcpy(s->data() + 64, "child-was-here", 15); return 0;
     }
+    if (mode.rfind("ks:", 0) == 0) {   // keystore store-key creation race: wait for the go file, then put + get
+        auto d = os::getenv("FORGE_KEYSTORE_DIR"); for (int i = 0; i < 1000 && !os::exists(os::join(d, "go")); ++i) os::sleep_ns(5000000);
+        if (auto p = os::keystore::put("race", arg, "v" + arg); !p) { std::printf("put: %s\n", p.err.what.c_str()); return 2; }
+        auto g = os::keystore::get("race", arg); if (!g) std::printf("get: %s\n", g.err.what.c_str()); return g && g.value == "v" + arg ? 0 : 3;
+    }
     os::sandbox_policy p;
     if (mode == "noop") return 0;
     if (mode == "sandbox_net") p.deny_network = true;
@@ -237,16 +242,60 @@ TEST(key_storage) {
     auto d = scratch("keys"); os::setenv("FORGE_KEYSTORE_DIR", d);
     std::printf("  default backend %s\n", os::keystore::backend().c_str());
     std::string svc = "forge-test-" + std::to_string(os::pid()), secret = std::string("s3cr\0et\xff", 8);
-    auto p = os::keystore::put(svc, "alice", secret);
-    if (p) { auto g = os::keystore::get(svc, "alice"); CHECK(g); CHECK(g.value == secret); CHECK(os::keystore::remove(svc, "alice")); CHECK(!os::keystore::get(svc, "alice")); }
-    else skip("default keystore", p.err.what);
+    // The platform backend must work: a failing put is a test failure, not a skip.
+    auto p = os::keystore::put(svc, "alice", secret); CHECK_MSG(p, "default keystore put: %s", p.err.what.c_str());
+    { auto g = os::keystore::get(svc, "alice"); CHECK(g); CHECK(g.value == secret); CHECK(os::keystore::remove(svc, "alice")); CHECK(!os::keystore::get(svc, "alice")); CHECK(os::keystore::remove(svc, "alice")); }
     os::setenv("FORGE_KEYSTORE", "file"); CHECK(os::keystore::backend() == "file");
-    CHECK(os::keystore::put(svc, "bob", secret)); CHECK(os::keystore::put(svc, "bob", "v2"));
-    auto g = os::keystore::get(svc, "bob"); CHECK(g && g.value == "v2");
-    auto raw = os::list_dir(d); bool plain = false;
-    if (raw) for (auto& e : raw.value) { auto t = os::read_file(os::join(d, e.name)); if (t && t->find("v2") != std::string::npos && e.name != ".pad") plain = true; }
-    CHECK(!plain);
-    CHECK(os::keystore::remove(svc, "bob")); CHECK(!os::keystore::get(svc, "bob"));
+    CHECK(os::keystore::put(svc, "bob", secret)); CHECK(os::keystore::put(svc, "bob", "v2-plaintext-marker"));
+    auto g = os::keystore::get(svc, "bob"); CHECK(g && g.value == "v2-plaintext-marker");
+    CHECK(os::keystore::put(svc, "carol", secret)); CHECK(os::keystore::get(svc, "carol").value == secret);
+    auto fnv = [&](const std::string& s, const std::string& a) { std::uint64_t h = 1469598103934665603ull; for (char c : s + '\x1f' + a) { h ^= std::uint8_t(c); h *= 1099511628211ull; }
+        char b[24]; std::snprintf(b, sizeof b, "%016llx.key", (unsigned long long)h); return os::join(d, b); };
+    auto raw = os::list_dir(d); bool plain = false, tmp_left = false;
+    if (raw) for (auto& e : raw.value) { auto t = os::read_file(os::join(d, e.name)); plain |= t && t->find("plaintext-marker") != std::string::npos; tmp_left |= e.name.find(".tmp") != std::string::npos; }
+    CHECK(!plain); CHECK(!tmp_left); CHECK(os::exists(os::join(d, ".master")));
+#if defined(FORGE_OS_POSIX)
+    { struct stat st{}; CHECK(::stat(os::join(d, ".master").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600); CHECK(::stat(fnv(svc, "bob").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600); }
+#endif
+    {   // tamper: any flipped byte (header, nonce, tag or ciphertext) fails authentication
+        auto f = fnv(svc, "bob"); auto orig = os::read_file(f); CHECK(orig && orig->size() > 44);
+        for (std::size_t i : {std::size_t(5), std::size_t(30), orig->size() - 1}) { auto t = *orig; t[i] = char(t[i] ^ 1); CHECK(os::write_file(f, t)); auto r = os::keystore::get(svc, "bob"); CHECK(!r); CHECK(r.err.code != 2); }
+        CHECK(os::write_file(f, orig->substr(0, 40))); CHECK(!os::keystore::get(svc, "bob"));
+        CHECK(os::write_file(f, os::read_file(fnv(svc, "carol")).value)); CHECK(!os::keystore::get(svc, "bob"));   // swapped entries: AD binds (service, account)
+        CHECK(os::write_file(f, *orig)); CHECK(os::keystore::get(svc, "bob").value == "v2-plaintext-marker");
+    }
+    {   // old XOR-pad format: read once, migrated to the encrypted format, pad removed when no old file remains
+        std::string pad(64, '\0'); for (int i = 0; i < 64; ++i) pad[std::size_t(i)] = char(i * 37 + 11);
+        CHECK(os::write_file(os::join(d, ".pad"), pad));
+        std::string old = std::string("legacy\0sec", 10); for (std::size_t i = 0; i < old.size(); ++i) old[i] = char(old[i] ^ pad[i % 64]);
+        CHECK(os::write_file(fnv(svc, "old1"), old)); CHECK(os::write_file(fnv(svc, "old2"), old));
+        auto r = os::keystore::get(svc, "old1"); CHECK(r && r.value == std::string("legacy\0sec", 10));
+        CHECK(os::read_file(fnv(svc, "old1"))->rfind("FKS1", 0) == 0); CHECK(os::exists(os::join(d, ".pad")));   // old2 still needs it
+        r = os::keystore::get(svc, "old2"); CHECK(r && r.value == std::string("legacy\0sec", 10)); CHECK(!os::exists(os::join(d, ".pad")));
+        CHECK(os::keystore::get(svc, "old1").value == std::string("legacy\0sec", 10));
+        CHECK(os::keystore::remove(svc, "old1")); CHECK(os::keystore::remove(svc, "old2"));
+    }
+    {   // replaced store key: existing secrets fail loudly instead of decoding to garbage
+        auto mk = os::read_file(os::join(d, ".master")).value; auto bad = mk; bad.back() = char(bad.back() ^ 1);
+        CHECK(os::write_file(os::join(d, ".master"), bad)); CHECK(!os::keystore::get(svc, "bob"));
+        CHECK(os::write_file(os::join(d, ".master"), mk)); CHECK(os::keystore::get(svc, "bob"));
+    }
+    CHECK(os::keystore::remove(svc, "bob")); CHECK(!os::keystore::get(svc, "bob")); CHECK(os::keystore::remove(svc, "carol"));
+#if !defined(FORGE_OS_IOS)
+    {   // several processes create the store key at once: all must end up with the same key
+        auto rd = scratch("keys_race"); std::vector<os::child> kids;
+        for (int i = 0; i < 6; ++i) {
+            os::spawn_spec sp; sp.argv = {os::exe_path()}; sp.capture_stdout = sp.capture_stderr = false;
+            sp.env_set = {{"FORGE_OS_EXT_CHILD", "ks:" + std::to_string(i)}, {"FORGE_KEYSTORE", "file"}, {"FORGE_KEYSTORE_DIR", rd}};
+            auto c = os::child::start(sp); CHECK(c); if (c) kids.push_back(std::move(c.value));
+        }
+        os::sleep_ns(100000000); CHECK(os::write_file(os::join(rd, "go"), "1"));
+        for (auto& k : kids) CHECK(k.wait(60000) == 0);
+        os::setenv("FORGE_KEYSTORE_DIR", rd);
+        for (int i = 0; i < 6; ++i) { auto r = os::keystore::get("race", std::to_string(i)); CHECK_MSG(r && r.value == "v" + std::to_string(i), "race %d: %s", i, r.err.what.c_str()); }
+        os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(rd);
+    }
+#endif
     os::unsetenv("FORGE_KEYSTORE");
     std::map<std::string, std::string> mem;
     os::keystore::set_backend({"mem", [&](auto& s, auto& a, auto& v) { mem[s + "/" + a] = v; return os::status{}; },
