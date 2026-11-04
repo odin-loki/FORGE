@@ -81,17 +81,17 @@ The work is split by file ownership so changes can proceed in parallel without c
 ### W1-E: mobile, text, locale (`os/src/mobile`, `os/src/text`, `mobile.hpp`, `text.hpp`, `locale.hpp`)
 | ID | Cat | Item |
 |---|---|---|
-| E1 | C | `zone_at` opens caller-supplied absolute paths with no type or size check; unbounded cache |
-| E2 | C | `open_url` accepts any string containing `://` (local executables, option injection) |
-| E3 | C | gettext plural expression `!` recursion unbounded |
-| E4 | C | Windows pointer timestamps in QPC ticks; iOS shared `CMMotionManager` across streams |
-| E5 | B | Sensors with no native source cannot use the bridge feed |
-| E6 | B | Linux/FreeBSD touch picks touchpads, raw units, REALTIME clock |
-| E7 | B | Windows keep_awake per thread, device info; Android rotation vector `w`, unchecked `registerSensor` |
-| E8 | B | Linux cameras/torch/brightness/biometrics/form factor/bluetooth/nmcli parsing; services paths on Android/Windows/Linux; audio hooks; network type |
-| E9 | B | Locale categories (`LC_TIME`/`LC_NUMERIC`), OS user overrides, console code page, `TERM`, mintty |
-| E10 | A | Android tzdata bundle; MinGW local zone; ISO-8859-9 |
-| E11 | D | CI: iOS builds only `forge_c` (apple.mm UIKit never compiled); Android runs no `test_mobile`/`test_locale` |
+| E1 | C | `zone_at` opens caller-supplied absolute paths with no type or size check; unbounded cache — **fixed (6831dbf): IANA-style names only, regular files ≤ 1 MiB opened non-blocking, absolute paths only from `$TZ`, 64-entry cache of successes** |
+| E2 | C | `open_url` accepts any string containing `://` (local executables, option injection) — **fixed (c4f1ea2): RFC 3986 scheme at position 0 on an allow-list (`set_url_schemes`, default http/https/mailto/tel), no controls/spaces, checked before hook and opener** |
+| E3 | C | gettext plural expression `!` recursion unbounded — **fixed (bd3c9bd)** |
+| E4 | C | Windows pointer timestamps in QPC ticks; iOS shared `CMMotionManager` across streams — **fixed (314202b, c4f1ea2): OSC 8 dropped at `none` and sanitised; QPC → ns, GetPointerFrameInfo count; shared CMMotionManager with per-kind fan-out (iOS compiled in CI only)** |
+| E5 | B | Sensors with no native source cannot use the bridge feed — **fixed (c4f1ea2): `provide_sensor(kind)` gives a bridge-only stream on any backend without a native source** |
+| E6 | B | Linux/FreeBSD touch picks touchpads, raw units, REALTIME clock — **fixed (c4f1ea2): INPUT_PROP_DIRECT, EVIOCGABS → display pixels, EVIOCSCLOCKID monotonic, every matching node** |
+| E7 | B | Windows keep_awake per thread, device info; Android rotation vector `w`, unchecked `registerSensor` — **fixed (c4f1ea2): PowerCreateRequest/PowerSetRequest, SMBIOS registry info; rotation `w`, registerSensor errors returned** |
+| E8 | B | Linux cameras/torch/brightness/biometrics/form factor/bluetooth/nmcli parsing; services paths on Android/Windows/Linux; audio hooks; network type — **fixed (c4f1ea2): QUERYCAP capture nodes, checked sysfs writes, fprintd exit code, DT chassis-type form factor, scan-only BLE devices, `nmcli -e yes`; Android paths need the hook, Known Folders, user-dirs.dirs; audio samples both ways; haptic timing; kernel transport detection, link-local excluded** |
+| E9 | B | Locale categories (`LC_TIME`/`LC_NUMERIC`), OS user overrides, console code page, `TERM`, mintty — **fixed (be71f3d, 314202b): `category` time/numeric, Windows/Apple user overrides; code page restored at exit, VT-mode check, mintty** |
+| E10 | A | Android tzdata bundle; MinGW local zone; ISO-8859-9 — **fixed (6831dbf, 314202b): tzdata bundle index, registry TZI + windowsZones (MinGW), ISO-8859-9 → windows-1254** |
+| E11 | D | CI: iOS builds only `forge_c` (apple.mm UIKit never compiled); Android runs no `test_mobile`/`test_locale` — **fixed (62d9687): iOS builds forge_mobile + forge_text; Android emulator runs test_mobile/test_locale/test_text** |
 
 ## Wave 2: new backends (after wave 1)
 | ID | Item |
