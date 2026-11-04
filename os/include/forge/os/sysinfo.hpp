@@ -12,7 +12,6 @@
 #endif
 #if defined(FORGE_OS_WINDOWS)
 #include <psapi.h>   // K32GetProcessMemoryInfo lives in kernel32 (no psapi.lib)
-#include <pdh.h>     // types only: pdh.dll is loaded at run time
 #include <cmath>
 #include <thread>
 #endif
@@ -95,18 +94,28 @@ namespace detail {
 // exp(-5/300), exp(-5/900). The first call measures 100 ms and seeds all three averages with that instantaneous
 // value, so early values follow the current load rather than starting from 0. Blocked I/O waits (Linux D state)
 // are not counted. The sampler thread and its state are deliberately leaked (no join at exit).
+// The few PDH declarations used, written out here: <pdh.h> and <lm.h> (users.hpp) both define HLOG.
+struct pdh_ {
+    using query_t = void*; using counter_t = void*;
+    struct fmt_value { DWORD CStatus; union { LONG longValue; double doubleValue; LONGLONG largeValue; LPCWSTR WideStringValue; }; };
+    static constexpr DWORD fmt_double = 0x00000200;   // PDH_FMT_DOUBLE
+    using open_t = LONG(WINAPI*)(LPCWSTR, DWORD_PTR, query_t*);
+    using add_t = LONG(WINAPI*)(query_t, LPCWSTR, DWORD_PTR, counter_t*);
+    using collect_t = LONG(WINAPI*)(query_t);
+    using value_t = LONG(WINAPI*)(counter_t, DWORD, LPDWORD, fmt_value*);
+};
 struct win_load_ {
     std::mutex mu; double avg[3] = {0, 0, 0};
-    decltype(&::PdhCollectQueryData) collect = nullptr; decltype(&::PdhGetFormattedCounterValue) value = nullptr;
-    PDH_HQUERY query = nullptr; PDH_HCOUNTER counter = nullptr;
+    pdh_::collect_t collect = nullptr; pdh_::value_t value = nullptr;
+    pdh_::query_t query = nullptr; pdh_::counter_t counter = nullptr;
     ULONGLONG idle = 0, total = 0; double ncpu = 1;
     static ULONGLONG ft_(const FILETIME& f) { return (ULONGLONG(f.dwHighDateTime) << 32) | f.dwLowDateTime; }
     static void times_(ULONGLONG& i, ULONGLONG& t) { FILETIME a{}, k{}, u{}; if (GetSystemTimes(&a, &k, &u)) { i = ft_(a); t = ft_(k) + ft_(u); } }   // kernel includes idle
     win_load_() {
         DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); ncpu = n ? double(n) : 1.0;
         if (HMODULE h = LoadLibraryExW(L"pdh.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/)) {
-            auto open = reinterpret_cast<decltype(&::PdhOpenQueryW)>(reinterpret_cast<void*>(GetProcAddress(h, "PdhOpenQueryW")));
-            auto add = reinterpret_cast<decltype(&::PdhAddEnglishCounterW)>(reinterpret_cast<void*>(GetProcAddress(h, "PdhAddEnglishCounterW")));
+            auto open = reinterpret_cast<pdh_::open_t>(reinterpret_cast<void*>(GetProcAddress(h, "PdhOpenQueryW")));
+            auto add = reinterpret_cast<pdh_::add_t>(reinterpret_cast<void*>(GetProcAddress(h, "PdhAddEnglishCounterW")));
             collect = reinterpret_cast<decltype(collect)>(reinterpret_cast<void*>(GetProcAddress(h, "PdhCollectQueryData")));
             value = reinterpret_cast<decltype(value)>(reinterpret_cast<void*>(GetProcAddress(h, "PdhGetFormattedCounterValue")));
             if (!(open && add && collect && value && open(nullptr, 0, &query) == ERROR_SUCCESS && add(query, L"\\System\\Processor Queue Length", 0, &counter) == ERROR_SUCCESS)) counter = nullptr;
@@ -117,7 +126,7 @@ struct win_load_ {
         ULONGLONG i = idle, t = total; times_(idle, total);
         double busy = total > t ? (1.0 - double(idle - i) / double(total - t)) * ncpu : 0.0;
         double q = 0;
-        if (counter && collect(query) == ERROR_SUCCESS) { PDH_FMT_COUNTERVALUE v{}; if (value(counter, PDH_FMT_DOUBLE, nullptr, &v) == ERROR_SUCCESS && v.CStatus == ERROR_SUCCESS) q = v.doubleValue; }
+        if (counter && collect(query) == ERROR_SUCCESS) { pdh_::fmt_value v{}; if (value(counter, pdh_::fmt_double, nullptr, &v) == ERROR_SUCCESS && v.CStatus == ERROR_SUCCESS) q = v.doubleValue; }
         double x = busy + q; return x > 0 ? x : 0.0;
     }
 };
