@@ -83,6 +83,7 @@ By default each fuzz target links a small built-in mutation driver (`fuzz/driver
 
 ## Performance tools (not part of ctest)
 - `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T]` runs `forge bench` and records or checks throughput against a stored baseline.
+- `test_cuda_hip bench <codec> <rows> <cols> <k> [reps]` times one quantised matmul on CUDA device 0 (e.g. `q4_k 512 25600 5120`). Inputs stay resident inside a run, so only the kernels are timed; it reports the fastest of 7 batches of `reps` calls (default 20), the median, TOPS, weight GB/s and the kernel path (`qmatmul_mma`, `qmatmul_mmq` or `qmatmul_q81`).
 - `tools/bench_llm.sh --gguf <model.gguf> [--fpk <model.fpk>] [--forge PATH] [--llama-bench PATH] [-p 512] [-n 128] [-r 3] [--device cuda] [--codec q4_k] [--nsys PREFIX] [--no-llama]` compares FORGE with llama.cpp's `llama-bench` on the same model: prefill and decode tok/s, FORGE with and without `FORGE_GRAPHS=1`, and FORGE's GPU driver calls per decode token from `forge bench`. `--nsys` adds an Nsight Systems kernel summary per FORGE run. It needs a GPU and a model.
 
 ## Golden test Python environment

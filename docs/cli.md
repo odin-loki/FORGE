@@ -58,7 +58,7 @@ Models whose blueprint session is not `generative_sequence` (for example importe
 ### `forge bench <model> [-p 32] [-n 32] [--warmup 1] [--codec C]` / `forge bench --gemm N`
 Measures prefill (`-p` prompt tokens) and decode (`-n` new tokens, always all of them) throughput after `--warmup` untimed runs. With `--gemm N` it instead times an N×N `gemm_nt` with each available simd table (one thread) and with `gpu::prims` (all threads).
 
-On a CUDA or HIP device it also prints driver calls for the prefill and per decode token: kernels launched directly, kernels captured into a CUDA graph (`FORGE_GRAPHS=1`), graph launches, graph instantiations, kernel-node updates, replayed runs, DtoH/HtoD/DtoD copies and stream syncs. `tools/bench_llm.sh` wraps it for a side-by-side run against llama.cpp.
+On a CUDA or HIP device it also prints driver calls for the prefill and per decode token: kernels launched directly, kernels captured into a CUDA graph (on by default; `FORGE_GRAPHS=0` turns graphs off), graph launches, graph instantiations, kernel-node updates, replayed runs, DtoH/HtoD/DtoD copies and stream syncs. `tools/bench_llm.sh` wraps it for a side-by-side run against llama.cpp.
 
 ### `forge dump <model.fpk> <tensor> <out.f32>`
 Decodes one tensor to raw little-endian f32.

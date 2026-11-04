@@ -27,15 +27,20 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_GPU_WEIGHT_BUDGET` | resident backends | f32 bytes of decoded quantised weights mirrored on the device, e.g. `4G`, `512M` (suffix `k`, `m`, `g`; default 8 GiB). The rest stay encoded and run on the CPU. Codecs with a device quantised matmul stay encoded on the device instead |
 | `FORGE_GPU_ARENA_MB` | CUDA, HIP | Largest activation arena held at fixed device addresses as one buffer, in MiB (default 1024; 0 disables) |
 | `FORGE_GPU_POOL_MB` | CUDA, HIP | MiB of freed device buffers kept for reuse (default 4096) |
-| `FORGE_GPU_REPLAY` | CUDA | If set, enables experimental whole-run decode replay (relaunches recorded device work without the executor). Needs `FORGE_GRAPHS=1` and the fixed arena |
+| `FORGE_GPU_REPLAY` | CUDA | If set, enables experimental whole-run decode replay (relaunches recorded device work without the executor). Needs decode graphs (on unless `FORGE_GRAPHS=0`) and the fixed arena |
 | `FORGE_REPLAY_VERIFY` | CUDA | With `FORGE_GPU_REPLAY`: do one real run every N runs (default 32) |
-| `FORGE_GRAPHS=1` | CUDA | Capture decode kernel launches into CUDA graphs and replay them |
-| `FORGE_GRAPH_REPLAY=0` | CUDA | With `FORGE_GRAPHS=1`: always re-capture instead of patching kernel parameters in place |
-| `FORGE_GRAPH_SEG` | CUDA | With `FORGE_GRAPHS=1`: kernels per captured segment (default 64; 0 = no splitting) |
+| `FORGE_GRAPHS=0` | CUDA | Do not capture decode kernel launches into CUDA graphs (capture and replay are on by default) |
+| `FORGE_GRAPH_REPLAY=0` | CUDA | With decode graphs on: always re-capture instead of patching kernel parameters in place |
+| `FORGE_GRAPH_SEG` | CUDA | With decode graphs on: kernels per captured segment (default 64; 0 = no splitting) |
+| `FORGE_CUDA_IMAGE` | CUDA | Load only this embedded PTX image: `ptx` (sm_70) or `ptx sm_80`. By default `sm_80` is tried first, then `sm_70` |
+| `FORGE_MMA=0` | CUDA | Disable the int8 tensor-core prefill matmul (`sm_80` image) and the q6_k/q8_0 weight repacking; prefill uses MMQ |
+| `FORGE_MMA_BT` | CUDA | `64` or `128`: tokens per tensor-core matmul block (default: 64 for q4_k, 128 for q6_k/q8_0 when rows ≥ 128) |
+| `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
+| `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
 | `FORGE_MMVQ=0` | CUDA, HIP | Disable the q8_1/dp4a decode matmul kernels |
-| `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMQ kernel (default 16; 0 disables MMQ) |
+| `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMA / MMQ kernels (default 16; 0 disables both) |
 | `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
-| `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernel |
+| `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernels (including the tiled `sm_80` one) |
 | `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` |
 | `FORGE_PLAN_TRACE` | all devices | If set, print at exit the ops (with shapes and counts) that ran on the host during device runs |
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |

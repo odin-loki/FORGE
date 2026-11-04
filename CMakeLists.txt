@@ -315,6 +315,12 @@ if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_NVPTX)
             -S -o ${FORGE_GPU_DIR}/kernels.ptx ${FORGE_GPU_DIR}/kernels.cu
     DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "PTX (sm_70)")
   list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.ptx)
+  # sm_80+ image: the same kernels plus the int8 tensor-core prefill matmul; the runtime tries it first.
+  add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.sm80.ptx
+    COMMAND ${FORGE_GPU_CLANG} -x cuda --cuda-device-only -nocudainc -nocudalib -Wno-unknown-cuda-version --cuda-gpu-arch=sm_80 -O3 -Werror
+            -S -o ${FORGE_GPU_DIR}/kernels.sm80.ptx ${FORGE_GPU_DIR}/kernels.cu
+    DEPENDS ${FORGE_GPU_DIR}/kernels.cu COMMENT "PTX (sm_80)")
+  list(APPEND FORGE_GPU_IMAGES ${FORGE_GPU_DIR}/kernels.sm80.ptx)
 endif()
 if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_AMDGPU)
   set(_ld)
