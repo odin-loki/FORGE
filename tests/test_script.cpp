@@ -885,7 +885,7 @@ TEST(emit_text_golden) {
             try { got = script::emit(src, g, sh); } catch (const script::emit_error& e) { CHECK_MSG(false, "%s/%s: %s", g, sh, e.what()); continue; }
             auto path = "tests/data/emit/expected/" + std::string(g) + "." + sh;
             if (update) { std::ofstream(path, std::ios::binary) << got; continue; }
-            auto want = slurp_file(path);
+            auto want = slurp_file(path); std::erase(want, '\r');   // CRLF checkout (core.autocrlf on Windows)
             CHECK_MSG(got == want, "%s differs from the emitted text (FORGE_UPDATE_EMIT_GOLDEN=1 to refresh):\n%s", path.c_str(), got.c_str());
         }
     }

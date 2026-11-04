@@ -4,6 +4,7 @@
 #include <forge/script/script.hpp>
 #include "check.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -13,7 +14,9 @@ namespace fs = std::filesystem;
 static std::string slurp(const fs::path& p) { std::ifstream f(p, std::ios::binary); std::stringstream s; s << f.rdbuf(); return s.str(); }
 static std::string run_path(const std::string& src, const std::string& name, bool vm) {
     std::string out; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 20000;
-    o.out = [&](std::string_view s) { out += s; };
+    // Echo progress to stderr as it happens, so a run that hangs shows which script and line it reached.
+    std::fprintf(stderr, "== %s (%s)\n", name.c_str(), vm ? "vm" : "tree"); std::fflush(stderr);
+    o.out = [&](std::string_view s) { out += s; std::fwrite(s.data(), 1, s.size(), stderr); std::fflush(stderr); };
     script::engine e(o); auto r = e.run(src, name);
     if (!r.ok) out += "!" + r.error_type + "\n";
     return out;
