@@ -177,7 +177,9 @@ elseif(APPLE)
     target_link_libraries(forge_mobile PUBLIC "-framework UIKit" "-framework CoreMotion" "-framework CoreLocation" "-framework AVFoundation"
       "-framework AudioToolbox" "-framework UserNotifications" "-framework LocalAuthentication" "-framework Foundation")
   else()
-    target_link_libraries(forge_mobile PUBLIC "-framework Foundation" "-framework AppKit" "-framework IOKit" "-framework UserNotifications")
+    # macOS: AVFoundation (camera enumeration/permission), CoreLocation (location), LocalAuthentication (Touch ID)
+    target_link_libraries(forge_mobile PUBLIC "-framework Foundation" "-framework AppKit" "-framework IOKit" "-framework UserNotifications"
+      "-framework AVFoundation" "-framework CoreLocation" "-framework LocalAuthentication")
   endif()
 endif()
 
