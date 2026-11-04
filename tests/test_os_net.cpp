@@ -129,9 +129,36 @@ TEST(service_units) {
 }
 TEST(registry_portable) {
 #if defined(FORGE_OS_WINDOWS)
-    CHECK(os::registry::set("HKCU\\Software\\ForgeTest", "n", std::int64_t(42)));
-    auto v = os::registry::get("HKCU\\Software\\ForgeTest", "n"); CHECK(v); CHECK(std::get<std::int64_t>(v.value) == 42);
-    CHECK(os::registry::remove_key("HKCU\\Software\\ForgeTest"));
+    namespace R = os::registry; using T = R::type;
+    const std::string k = "HKCU\\Software\\FORGE-test\\" + std::to_string(os::pid()), sub = k + "\\child";
+    CHECK(R::set(k, "n", std::int64_t(42))); CHECK(R::value_type(k, "n").value == T::qword);
+    auto v = R::get(k, "n"); CHECK(v); CHECK(std::get<std::int64_t>(v.value) == 42);
+    // DWORD stays DWORD while the number fits; a larger one becomes QWORD
+    CHECK(R::set_as(k, "d", std::int64_t(7), T::dword)); CHECK(R::set(k, "d", std::int64_t(0xFFFFFFFF))); CHECK(R::value_type(k, "d").value == T::dword);
+    CHECK(std::get<std::int64_t>(R::get(k, "d").value) == 0xFFFFFFFF);
+    CHECK(R::set(k, "d", std::int64_t(1) << 40)); CHECK(R::value_type(k, "d").value == T::qword); CHECK(!R::set_as(k, "x", std::int64_t(1) << 40, T::dword));
+    // REG_EXPAND_SZ stays expandable and is read unexpanded; non-ASCII round-trips
+    CHECK(R::set_as(k, "e", std::string("%USERPROFILE%\\x"), T::expand_sz)); CHECK(R::set(k, "e", std::string("%TEMP%\\caf\xc3\xa9")));
+    CHECK(R::value_type(k, "e").value == T::expand_sz); CHECK(std::get<std::string>(R::get(k, "e").value) == "%TEMP%\\caf\xc3\xa9");
+    CHECK(R::set(k, "s", std::string("plain"))); CHECK(R::value_type(k, "s").value == T::sz); CHECK(std::get<std::string>(R::get(k, "s").value) == "plain");
+    CHECK(R::set(k, "empty", std::string())); CHECK(std::get<std::string>(R::get(k, "empty").value).empty());
+    // MULTI_SZ and BINARY
+    std::vector<std::string> ms = {"one", "tw\xc3\xb6", "three"}; CHECK(R::set(k, "m", ms)); CHECK(R::value_type(k, "m").value == T::multi_sz);
+    CHECK(std::get<std::vector<std::string>>(R::get(k, "m").value) == ms); CHECK(!R::set(k, "m2", std::vector<std::string>{"a", ""}));
+    CHECK(R::set(k, "m0", std::vector<std::string>{})); CHECK(std::get<std::vector<std::string>>(R::get(k, "m0").value).empty());
+    std::vector<std::uint8_t> bin = {0, 1, 2, 0xFF, 0}; CHECK(R::set(k, "b", bin)); CHECK(R::value_type(k, "b").value == T::binary);
+    CHECK(std::get<std::vector<std::uint8_t>>(R::get(k, "b").value) == bin);
+    CHECK(!R::set_as(k, "bad", std::string("x"), T::dword));
+    // list / remove_value / missing values
+    CHECK(R::set(sub, "c", std::int64_t(1)));
+    auto l = R::list(k); CHECK(l); if (l) { CHECK(l->subkeys.size() == 1 && l->subkeys[0] == "child"); CHECK(l->values.size() == 8); }
+    CHECK(R::remove_value(k, "s")); CHECK(!R::get(k, "s")); CHECK(R::value_type(k, "s").value == T::none); CHECK(!R::remove_value(k, "s"));
+    CHECK(R::list(k)->values.size() == 7);
+    // explicit 64-bit view (the native one for a 64-bit process; HKCU\Software is shared anyway)
+    CHECK(R::set(k, "v64", std::int64_t(5), R::view::wow64_64)); CHECK(std::get<std::int64_t>(R::get(k, "v64", R::view::wow64_64).value) == 5);
+    CHECK(R::remove_key(k)); CHECK(!R::get(k, "n")); CHECK(R::remove_key(k));
+    if (auto p = R::list("HKCU\\Software\\FORGE-test"); p && p->subkeys.empty() && p->values.empty()) CHECK(R::remove_key("HKCU\\Software\\FORGE-test"));
+    CHECK(!R::get("HKXX\\Software", "x")); CHECK(!R::remove_key("HKCU"));
 #else
     CHECK(os::is_unsupported(os::registry::get("HKCU\\Software", "x").err));
 #endif
