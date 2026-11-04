@@ -6,11 +6,13 @@
 #include <utility>
 #include <string>
 #include <atomic>
+#include <chrono>
 #if !defined(_WIN32)
 #include <unistd.h>
 #include <csignal>
 #endif
 using namespace forge;
+TEST_PROCESS_WORKER(script::run_process_worker_if_requested);
 
 TEST(classify_errno_basic) {
 #if !defined(_WIN32)
@@ -125,7 +127,7 @@ TEST(engine_cancel_signals_option) {
     auto r = e.run("1 + 1;"); CHECK(r.ok);
 }
 
-#if !defined(_WIN32) && !defined(FORGE_OS_IOS)
+#if !defined(FORGE_OS_IOS)
 TEST(script_process_pool) {
     script::engine e;
     auto r = e.eval("auto pp = ProcessPool(2); auto f = pp.submit(\"auto task(auto x) { return x * x; }\", 7); auto v = f.get(); pp.shutdown(); v");
@@ -135,5 +137,14 @@ TEST(script_process_pool) {
     // error type crosses the process boundary; worker has no fs by default
     auto r3 = e.eval("auto p3 = ProcessPool(1); auto t = \"\"; try { p3.submit(\"auto task(auto x) { return fs.read(\\\"/etc/hostname\\\"); }\", 0).get(); } catch (const PermissionError& err) { t = \"perm\"; } p3.shutdown(); t");
     CHECK_MSG(r3.ok && r3.value.find("perm") != std::string::npos, "%s %s", r3.value.c_str(), r3.error.c_str());
+}
+// the script's time limit also bounds closing the pool: a worker still busy then is killed, not awaited
+TEST(script_process_pool_time_limit_kills_workers) {
+    script::options o; o.timeout_ms = 1500; o.out = [](std::string_view) {}; script::engine e(o);
+    auto t0 = std::chrono::steady_clock::now();
+    auto r = e.run("auto pp = ProcessPool(1); pp.submit(\"auto task(auto x) { while (true) {} return x; }\", 0).get();", "<pool-timeout>");
+    auto secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    CHECK_MSG(!r.ok, "spinning pool task returned");
+    CHECK_MSG(secs < 20, "run took %.1f s", secs);
 }
 #endif

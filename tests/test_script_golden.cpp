@@ -10,6 +10,7 @@
 #include <sstream>
 using namespace forge;
 namespace fs = std::filesystem;
+TEST_PROCESS_WORKER(script::run_process_worker_if_requested);   // sandbox_escape.fs starts a ProcessPool
 
 static std::string slurp(const fs::path& p) { std::ifstream f(p, std::ios::binary); std::stringstream s; s << f.rdbuf(); return s.str(); }
 static std::string run_path(const std::string& src, const std::string& name, bool vm) {

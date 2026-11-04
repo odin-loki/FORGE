@@ -8,6 +8,7 @@ using namespace forge;
 FORGE_PROCESS_TASK(square, [](std::string in) { long v = std::stol(in); return std::to_string(v * v); });
 FORGE_PROCESS_TASK(echo, [](std::string in) { return in; });
 FORGE_PROCESS_TASK(fail, [](std::string) -> std::string { throw os::os_exception(os::os_errc::not_found, 2, "nope"); });
+FORGE_PROCESS_TASK(hang, [](std::string) { std::this_thread::sleep_for(std::chrono::seconds(120)); return std::string(); });
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 FORGE_PROCESS_TASK(segv, [](std::string) -> std::string { ::raise(SIGSEGV); return {}; });
 FORGE_PROCESS_TASK(pid, [](std::string) { return std::to_string(::getpid()); });
@@ -104,5 +105,21 @@ TEST(pp_windows_spawn) {
 TEST(pp_windows_fork_rejected) {
     try { process_pool pp({.workers = 1, .mode = process_pool::spawn_mode::fork}); CHECK(false); }
     catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::not_supported); }
+}
+#endif
+
+#if !defined(FORGE_OS_IOS)
+TEST(pp_terminate_kills_busy_workers) {
+    process_pool pp({.workers = 2});
+    std::vector<std::future<std::string>> fs;
+    for (int i = 0; i < 3; ++i) fs.push_back(pp.submit("hang", ""));   // two running, one queued
+    CHECK(!pp.wait_all_for(300));
+    auto t0 = std::chrono::steady_clock::now();
+    pp.terminate(); pp.terminate();
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(30));
+    for (auto& f : fs) {
+        try { (void)f.get(); CHECK(false); } catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::cancelled); }
+    }
+    CHECK_THROWS(pp.submit("square", "1").get());
 }
 #endif

@@ -8,8 +8,8 @@ handles: 5 sequential opens with limit 1
 handles: nested open-handle limit of 1 reached opening a file handle
 procs: one
 procs: two
-procs: child-process limit of 2 reached (not starting sh)
+procs: child-process limit of 2 reached
 procs: task
-procs: task child-process limit of 1 reached (not starting sh)
+procs: task child-process limit of 1 reached
 procs: unlimited again: four
 ValueError: limit: handles must not be negative

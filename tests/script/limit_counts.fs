@@ -40,22 +40,29 @@ limit {.handles = 1} {
 forge::fs::remove(path);
 
 // ---- procs: child processes started inside the block -> LimitExceededError
+// Windows need not have a POSIX sh: forge::shell is the host shell (pwsh / powershell / cmd there, whose output
+// ends in CRLF, hence trim()), argv commands go through cmd, and the refusal's "(not starting <exe>)" is cut off.
+std::vector<std::string> echo_argv(const std::string& w) {
+    if (forge::os::platform == "windows") return std::vector<std::string>{"cmd", "/c", "echo " + w};
+    return std::vector<std::string>{"sh", "-c", "echo " + w};
+}
+std::string refusal(const std::string& what) { return what.substr(0, what.find(" (not starting")); }
 limit {.procs = 2} {
-    std::print("procs: {}", forge::sh("echo one").out);
-    std::print("procs: {}", forge::run(std::vector<std::string>{"sh", "-c", "echo two"}).out);
-    try { forge::sh("echo three"); std::println("third process started (wrong)"); }
-    catch (const LimitExceededError& e) { std::println("procs: {}", e.what()); }
+    std::println("procs: {}", forge::shell("echo one").out.trim());
+    std::println("procs: {}", forge::run(echo_argv("two")).out.trim());
+    try { forge::shell("echo three"); std::println("third process started (wrong)"); }
+    catch (const LimitExceededError& e) { std::println("procs: {}", refusal(e.what())); }
 }
 // tasks started in the block share its quota
 try {
     limit {.procs = 1} {
-        auto t = std::async([] { return forge::sh("echo task").out; });
-        std::print("procs: {}", t.get());
-        auto u = std::async([] { return forge::sh("echo again").out; });
+        auto t = std::async([] { return forge::shell("echo task").out.trim(); });
+        std::println("procs: {}", t.get());
+        auto u = std::async([] { return forge::shell("echo again").out; });
         u.get();
     }
-} catch (const LimitExceededError& e) { std::println("procs: task {}", e.what()); }
-std::print("procs: unlimited again: {}", forge::sh("echo four").out);
+} catch (const LimitExceededError& e) { std::println("procs: task {}", refusal(e.what())); }
+std::println("procs: unlimited again: {}", forge::shell("echo four").out.trim());
 
 // ---- bad counts
 try { limit {.handles = -1} {} } catch (const ValueError& e) { std::println("ValueError: {}", e.what()); }

@@ -303,6 +303,15 @@ std::string script_process_task(std::string payload) {
 }
 void register_script_process_task() { static bool once = os::register_process_task("forge.script", script_process_task); (void)once; }
 struct PoolBox { std::unique_ptr<os::process_pool> pool; bool fs = false, net = false, proc = false, env = false; std::uint64_t timeout_ms = 0; };
+// Graceful shutdown, but never past `deadline_ns` (the script's or limit block's): workers still busy then are killed.
+static void close_pool(PoolBox& b, std::uint64_t deadline_ns) {
+    if (!b.pool) return;
+    if (deadline_ns) {
+        auto now = os::monotonic_ns();
+        if (now >= deadline_ns || !b.pool->wait_all_for((deadline_ns - now) / 1000000 + 1)) { b.pool->terminate(); b.pool.reset(); return; }
+    }
+    b.pool->shutdown(); b.pool.reset();
+}
 struct FutureBox { std::future<std::string> f; std::optional<std::string> got; std::exception_ptr err; };
 
 void install_builtins(Shared& sh) {
@@ -906,7 +915,7 @@ void install_builtins(Shared& sh) {
             try { for (std::size_t i = 0; i < box->pool->size(); ++i) in.charge_process("ProcessPool worker"); }
             catch (...) { box->pool->shutdown(); throw; }
         }
-        Value h = make_handle(in, "processpool", box, [box]() { if (box->pool) box->pool->shutdown(); });
+        Value h = make_handle(in, "processpool", box, [box, dl = in.deadline_ns]() { close_pool(*box, dl); });
         as<Handle>(h)->props["workers"] = std::int64_t(box->pool->size());
         return h;
     });
@@ -958,7 +967,7 @@ void install_builtins(Shared& sh) {
     M["handle:processpool"]["resize"] = native("ProcessPool.resize", 2, 2, [](Interp& in, Args& a) -> Value {
         auto& b = *h_of(in, a[0], "processpool").payload_as<PoolBox>(); if (b.pool) b.pool->set_workers(unsigned(std::max<std::int64_t>(1, i_of(in, a[1], "workers")))); return Nil{}; });
     M["handle:processpool"]["shutdown"] = native("ProcessPool.shutdown", 1, 1, [](Interp& in, Args& a) -> Value {
-        auto& b = *h_of(in, a[0], "processpool").payload_as<PoolBox>(); if (b.pool) { b.pool->shutdown(); b.pool.reset(); } return Nil{}; });
+        close_pool(*h_of(in, a[0], "processpool").payload_as<PoolBox>(), in.deadline_ns); return Nil{}; });
     M["handle:processfuture"]["get"] = native("ProcessFuture.get", 1, 2, [pp_get](Interp& in, Args& a) -> Value {
         return pp_get(in, *h_of(in, a[0], "processfuture").payload_as<FutureBox>(), a.size() > 1 ? std::uint64_t(i_of(in, a[1], "timeout")) : 0); });
     M["handle:processfuture"]["done"] = native("ProcessFuture.done", 1, 1, [](Interp& in, Args& a) -> Value {
