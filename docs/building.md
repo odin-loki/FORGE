@@ -34,6 +34,7 @@ Other host presets: `release` (`build/release`) and `asan` (`build/asan`, Debug 
 | `FORGE_LIBFUZZER` | OFF | Link fuzz targets with libFuzzer instead of the built-in driver |
 | `FORGE_FUZZ_ITERS` | 4000 | Mutated inputs per fuzz target under ctest |
 | `FORGE_HIP_ARCHS` | `gfx90a gfx942 gfx1100` | AMDGPU targets embedded for HIP |
+| `FORGE_LOG_MIN_LEVEL` | `none` | Compile-time log strip: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `off` or `none`. Adds `FORGE_LOG_MIN_LEVEL=<0..6>` to every target linking `forge_core`, so log calls below that level compile to nothing (see [support.md](support.md)). Any other value is a configure error. With it set, `test_log` reports skipped |
 
 ## Targets
 Most layers are header-only INTERFACE libraries: `forge_core`, `forge_os`, `forge_ops`, `forge_simd`, `forge_verify`, `forge_gpu`, `forge_graph`, `forge_modelfile`, `forge_inference`, `forge_loadbalancer`. Compiled targets:
