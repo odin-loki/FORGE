@@ -199,7 +199,7 @@ struct http_response {
 // timeout_ms bounds the connect and each read/write; deadline_ms the whole exchange including redirects (<= 0: none).
 // Method, header names and values with CR/LF/NUL or other non-token bytes are rejected (EINVAL). Credentials
 // (Authorization, Proxy-Authorization, Cookie) are not forwarded when a redirect leaves the origin.
-struct http_request { std::string method = "GET", url, body; std::map<std::string, std::string> headers; int timeout_ms = 10000, deadline_ms = 120000; std::size_t max_body = 64u << 20; int max_redirects = 5; };
+struct http_request { std::string method = "GET", url, body; std::map<std::string, std::string> headers; int timeout_ms = 10000, deadline_ms = 300000; std::size_t max_body = 64u << 20; int max_redirects = 5; };
 namespace detail_net {
 // Decode a chunked body: 1 complete, 0 needs more bytes, -1 malformed, -2 larger than max.
 inline int dechunk(const std::string& in, std::size_t i, std::string& out, std::size_t max) {
