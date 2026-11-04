@@ -178,10 +178,14 @@ TEST(foreign_formats_elf) {
     auto tls = find(v, "forge_fixture_tls"); CHECK(tls && tls->type == kind::tls);
     CHECK(!find(v, "forge_fixture_add_v1"));
 }
-#if defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__)
+#if ((defined(__linux__) && defined(__GLIBC__)) || defined(__FreeBSD__)) && defined(__x86_64__)
 TEST(elf_versions_ifunc_tls_loaded) {   // elf_ver.so has no libc dependency, so the host loader takes it as is
     auto p = os::join(xdir, "elf_ver.so"); if (!os::exists(p)) return;
-    auto l = os::dynlib::open(p); CHECK_MSG(l, "%s", l.err.what.c_str()); if (!l) return;
+    auto l = os::dynlib::open(p);
+#if defined(__FreeBSD__)
+    if (!l) { std::printf("  skip: rtld refused the fixture: %s\n", l.err.what.c_str()); return; }
+#endif
+    CHECK_MSG(l, "%s", l.err.what.c_str()); if (!l) return;
     auto s = l->symbols(); CHECK(s); if (!s) return;
     auto tw = find(*s, "forge_fixture_twice"); CHECK(tw && tw->address == l->symbol("forge_fixture_twice"));
     if (tw && tw->address) CHECK(reinterpret_cast<int (*)(int)>(tw->address)(21) == 42);
