@@ -1,6 +1,6 @@
 # .fpk file format (version 1)
 
-The authoritative description is the header comment of `pack/include/forge/pack/fpk.hpp`; this page restates it. All integers are little-endian.
+The authoritative description is the header comment of `modelfile/include/forge/modelfile/fpk.hpp`; this page restates it. All integers are little-endian.
 
 ```
 [header 64 B] [sections, each aligned to 64 B] [section table]
@@ -14,7 +14,7 @@ table  : n_sections x { char name[32]; u64 offset; u64 size; u8 blake3[32]; u8 p
 | Name | Required | Contents |
 |------|----------|----------|
 | `manifest` | yes | JSON. Imported language models carry `format`, `forge_format_version`, `architecture`, `template`, `codec`, `session`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`. ONNX imports add `onnx_inputs` |
-| `blueprint` | yes | Graph text (`pack/blueprint.hpp`): name, opset, session kind (e.g. `generative_sequence`), params, states and ops |
+| `blueprint` | yes | Graph text (`modelfile/blueprint.hpp`): name, opset, session kind (e.g. `generative_sequence`), params, states and ops |
 | `tokenizer` | for text models | Hugging Face style BPE JSON |
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
 | `data` | yes | Tensor bytes, each tensor aligned to 64 B |

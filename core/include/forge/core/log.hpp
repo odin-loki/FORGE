@@ -2,9 +2,9 @@
 // Leveled, thread-safe logging with module tags and pluggable sinks.
 //
 //   forge::log::info("loaded {} tensors", n);              // module "forge"
-//   forge::log::logger L{"mind"}; L.debug("kv {}", b);     // module "mind"
+//   forge::log::logger L{"inference"}; L.debug("kv {}", b);     // module "inference"
 //
-// Threshold: FORGE_LOG="warn" or "info,mind=debug,flow=trace" (first letter of each level counts:
+// Threshold: FORGE_LOG="warn" or "info,inference=debug,graph=trace" (first letter of each level counts:
 // t[race] d[ebug] i[nfo] w[arn] e[rror] o[ff]; default warn). set_level()/set_module_level() override it.
 // Compile-time strip: define FORGE_LOG_MIN (or FORGE_LOG_MIN_LEVEL) to 0..6 (trace..fatal, off) and calls
 // below it compile to nothing. The FORGE_LOG_TRACE(...)..FORGE_LOG_FATAL(...) macros also skip evaluating
@@ -212,7 +212,7 @@ FORGE_LOG_FN_(error, level::error)
 FORGE_LOG_FN_(fatal, level::fatal)
 #undef FORGE_LOG_FN_
 
-// A module-tagged logger: logger L{"mind"}; L.info("..."). Cheap to copy; holds only the tag.
+// A module-tagged logger: logger L{"inference"}; L.info("..."). Cheap to copy; holds only the tag.
 struct logger {
     std::string_view module = "forge";
 #define FORGE_LOG_M_(name, L)                                                                            \
@@ -231,7 +231,7 @@ struct logger {
 } // namespace forge::log
 
 // Macros that skip argument evaluation when the level is stripped or disabled:
-//   FORGE_LOG_DEBUG("mind", "kv {}", expensive());
+//   FORGE_LOG_DEBUG("inference", "kv {}", expensive());
 #define FORGE_LOG_AT_(L, mod, ...)                                                                        \
     do { if constexpr (int(L) >= FORGE_LOG_MIN) { if (::forge::log::enabled(L, mod)) ::forge::log::write_module(L, mod, __VA_ARGS__); } } while (0)
 #define FORGE_LOG_TRACE(mod, ...) FORGE_LOG_AT_(::forge::log::level::trace, mod, __VA_ARGS__)

@@ -1,5 +1,5 @@
-// FUSE engine (Part F.2): task/mem/prof as runtime services, lane for GUI CPU paths, mind through the C ABI.
-#include <forge/lane/dispatch.hpp>
+// FUSE engine (Part F.2): task/mem/prof as runtime services, lane for GUI CPU paths, inference through the C ABI.
+#include <forge/simd/dispatch.hpp>
 #include <forge/task/pool.hpp>
 #include <cstdio>
 #include <vector>
@@ -8,7 +8,7 @@ using namespace forge;
 
 int main() {
     task::pool workers;                                             // one scheduler for frames + inference
-    auto& k = lane::active();
+    auto& k = simd::active();
     const std::size_t W = 640, H = 360;
     std::vector<float> dst(W * H, 0.25f), src(W * H, 1.f);
     for (int frame = 0; frame < 3; ++frame) {

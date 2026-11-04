@@ -1,5 +1,5 @@
 #include "check.hpp"
-#include <forge/grid/prims.hpp>
+#include <forge/gpu/prims.hpp>
 #include <forge/linalg/linalg.hpp>
 #include <forge/mem/arena.hpp>
 #include <forge/prof/prof.hpp>
@@ -82,11 +82,11 @@ TEST(prof_chrome_trace) {
 }
 TEST(prims_segmented_bitonic_hash) {
     std::vector<int> x = {1, 2, 3, 4, 5, 6}, o(6); std::vector<std::uint8_t> st = {1, 0, 0, 1, 0, 1};
-    grid::prims::segmented_scan<int>(x, st, o); CHECK((o == std::vector<int>{1, 3, 6, 4, 9, 6}));
-    std::vector<std::uint32_t> off = {0, 3, 5, 6}; std::vector<int> r(3); grid::prims::segmented_reduce<int>(x, off, r); CHECK((r == std::vector<int>{6, 9, 6}));
+    gpu::prims::segmented_scan<int>(x, st, o); CHECK((o == std::vector<int>{1, 3, 6, 4, 9, 6}));
+    std::vector<std::uint32_t> off = {0, 3, 5, 6}; std::vector<int> r(3); gpu::prims::segmented_reduce<int>(x, off, r); CHECK((r == std::vector<int>{6, 9, 6}));
     std::mt19937 g(9); std::uniform_real_distribution<float> u(-5, 5);
-    for (std::size_t n : {0, 1, 7, 64, 100}) { std::vector<float> v(n); for (auto& e : v) e = u(g); auto w = v; std::sort(w.begin(), w.end()); grid::prims::bitonic_sort(v); CHECK(v == w); }
-    grid::prims::hash_map h; std::map<std::uint64_t, std::uint32_t> ref;
+    for (std::size_t n : {0, 1, 7, 64, 100}) { std::vector<float> v(n); for (auto& e : v) e = u(g); auto w = v; std::sort(w.begin(), w.end()); gpu::prims::bitonic_sort(v); CHECK(v == w); }
+    gpu::prims::hash_map h; std::map<std::uint64_t, std::uint32_t> ref;
     for (int i = 0; i < 5000; ++i) { std::uint64_t k = g() % 3000; h.insert(k, std::uint32_t(i)); ref[k] = std::uint32_t(i); }
     CHECK(h.size() == ref.size()); for (auto& [k, v] : ref) { auto* p = h.find(k); CHECK(p && *p == v); } CHECK(!h.find(99999));
 }

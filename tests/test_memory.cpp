@@ -1,7 +1,7 @@
 #include "check.hpp"
 #include "tiny_model.hpp"
 #include <forge/core/memory.hpp>
-#include <forge/mind/mind.hpp>
+#include <forge/inference/inference.hpp>
 #include <cstring>
 #include <filesystem>
 #include <thread>
@@ -10,7 +10,7 @@
 #endif
 
 using namespace forge;
-static std::vector<int> greedy(mind::session& s, std::vector<int> p, int n) { mind::sampler g; s.reset(); return s.generate(p, n, g); }
+static std::vector<int> greedy(inference::session& s, std::vector<int> p, int n) { inference::sampler g; s.reset(); return s.generate(p, n, g); }
 
 TEST(parse_and_format_sizes) {
     CHECK(mem::parse_size("512") == 512u);
@@ -112,12 +112,12 @@ TEST(scheduler_reports_kv_and_defers_under_budget) {
     auto path = (std::filesystem::temp_directory_path() / ("forge_test_mem_" + std::to_string(::getpid()) + ".fpk")).string();
     forge_test::make_tiny_model(path);
     {   // scope: the model's mapping must be gone before the file is deleted (Windows)
-    auto m = mind::model::open(path);
+    auto m = inference::model::open(path);
     mem::budget b("kvtest", 0);
     std::vector<std::vector<int>> outs(4), want(4);
-    for (int i = 0; i < 4; ++i) { mind::session s(m); want[std::size_t(i)] = greedy(s, {256, i + 1, 2}, 6); }
+    for (int i = 0; i < 4; ++i) { inference::session s(m); want[std::size_t(i)] = greedy(s, {256, i + 1, 2}, 6); }
     {   // unlimited: behaves exactly like before but reports KV usage
-        mind::batch_scheduler s(m, {.max_active = 4, .prefix_cache = 2, .budget = &b});
+        inference::batch_scheduler s(m, {.max_active = 4, .prefix_cache = 2, .budget = &b});
         for (int i = 0; i < 4; ++i) s.submit({.prompt = {256, i + 1, 2}, .max_new = 6, .on_done = [&, i](const std::vector<int>& o, const std::string&) { outs[std::size_t(i)] = o; }});
         s.run_until_idle();
         CHECK(s.stats().peak_active == 4); CHECK(s.stats().deferred == 0);
@@ -127,7 +127,7 @@ TEST(scheduler_reports_kv_and_defers_under_budget) {
     CHECK(b.used() == 0); CHECK(b.cache_bytes() == 0);
     b.set_limit(1);   // absurdly tight: requests must run one at a time but still all finish, same output
     std::fill(outs.begin(), outs.end(), std::vector<int>{});
-    mind::batch_scheduler s(m, {.max_active = 4, .prefix_cache = 2, .budget = &b});
+    inference::batch_scheduler s(m, {.max_active = 4, .prefix_cache = 2, .budget = &b});
     for (int i = 0; i < 4; ++i) s.submit({.prompt = {256, i + 1, 2}, .max_new = 6, .on_done = [&, i](const std::vector<int>& o, const std::string&) { outs[std::size_t(i)] = o; }});
     s.run_until_idle();
     CHECK(s.stats().peak_active == 1); CHECK(s.stats().deferred > 0); CHECK(s.stats().completed == 4);

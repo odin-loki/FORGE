@@ -648,14 +648,14 @@ try { forge::ask("x"); } catch (const AIError& e) { std::println("AIError"); }
     CHECK_MSG(e == "AIError\n", "got:\n%s", e.c_str());
 }
 
-#include <forge/flow/rpc.hpp>
+#include <forge/graph/rpc.hpp>
 TEST(remote_scripts) {
-    flow::rpc::server_security sec; sec.tokens = {"tok"}; sec.allow_scripts = true;
-    flow::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
+    graph::rpc::server_security sec; sec.tokens = {"tok"}; sec.allow_scripts = true;
+    graph::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
     srv.script_handler = [](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t) {
         script::options o; std::string out; o.argv = argv; o.out = [&](std::string_view s) { out += s; };
         script::engine e(o); auto r = e.run(src, name);
-        return flow::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
+        return graph::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
     };
     srv.start();
     std::string addr = "127.0.0.1:" + std::to_string(srv.port());

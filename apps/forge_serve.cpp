@@ -10,10 +10,10 @@
 //   POST /v1/chat/completions    {"messages": [{"role","content"}], ...same sampling fields}
 //   GET  /metrics                -> scheduler counters
 #include <forge/import/gguf.hpp>
-#include <forge/mind/json_schema.hpp>
-#include <forge/mind/mind.hpp>
+#include <forge/inference/json_schema.hpp>
+#include <forge/inference/inference.hpp>
 #include <forge/core/net.hpp>
-#include <forge/balance/proxy.hpp>
+#include <forge/loadbalancer/proxy.hpp>
 #include <forge/os/cpu_topology.hpp>
 #include <forge/os/file_watch.hpp>
 #include <forge/os/memory_pressure.hpp>
@@ -113,7 +113,7 @@ struct channel {
 
 class server {
 public:
-    server(std::shared_ptr<mind::model> m, mind::batch_options bo, std::string name, std::size_t max_queue = 0)
+    server(std::shared_ptr<inference::model> m, inference::batch_options bo, std::string name, std::size_t max_queue = 0)
         : m_(std::move(m)), sched_(m_, bo), name_(std::move(name)), max_queue_(max_queue) { sched_.start(); }
     ~server() { sched_.stop(); }
     void evict_kv(std::size_t keep) { sched_.request_kv_eviction(keep); }
@@ -170,7 +170,7 @@ private:
             }
         }
         if (prompt.empty()) raise(errc::invalid_argument, "empty prompt");
-        mind::request q;
+        inference::request q;
         q.prompt = prompt;
         q.max_new = int(j.num_or("max_tokens", 16));
         q.sampling.temperature = float(j.num_or("temperature", 0));
@@ -184,10 +184,10 @@ private:
         q.sampling.frequency_penalty = float(j.num_or("frequency_penalty", 0));
         q.sampling.repetition_penalty = float(j.num_or("repetition_penalty", 1));
         q.sampling.seed = std::uint64_t(j.num_or("seed", 0));
-        if (auto* g = j.find("grammar"); g && g->is_str()) q.grammar = std::make_shared<mind::grammar>(g->str());
+        if (auto* g = j.find("grammar"); g && g->is_str()) q.grammar = std::make_shared<inference::grammar>(g->str());
         // OpenAI-style structured output: {"response_format": {"type": "json_schema", "json_schema": {"schema": {...}}}}
         if (auto* rf = j.find("response_format"); rf && rf->str_or("type", "") == "json_schema")
-            if (auto* js = rf->find("json_schema"); js && js->find("schema")) q.grammar = std::make_shared<mind::grammar>(mind::json_schema_to_gbnf((*js)["schema"]));
+            if (auto* js = rf->find("json_schema"); js && js->find("schema")) q.grammar = std::make_shared<inference::grammar>(inference::json_schema_to_gbnf((*js)["schema"]));
         std::vector<std::string> stops;
         if (auto* s = j.find("stop")) { if (s->is_str()) stops.push_back(s->str()); else if (s->is_arr()) for (auto& x : s->arr()) stops.push_back(x.str()); }
         bool stream = false; if (auto* s = j.find("stream"); s && s->is_bool()) stream = s->b();
@@ -249,8 +249,8 @@ private:
         c.send(response(200, json::dump(json::value(json::object{{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
                                                                   {"model", name_}, {"choices", json::value(json::array{json::value(choice)})}, {"usage", json::value(usage)}}))));
     }
-    std::shared_ptr<mind::model> m_;
-    mind::batch_scheduler sched_;
+    std::shared_ptr<inference::model> m_;
+    inference::batch_scheduler sched_;
     std::string name_;
     std::atomic<std::uint64_t> counter_{0}, rejected_{0};
     std::size_t max_queue_ = 0;
@@ -268,7 +268,7 @@ std::string arg(int argc, char** argv, const std::string& k, const std::string& 
 // forge-serve proxy --backend host:port [--backend ...] [--mode l4|l7] [--strategy p2c] [--host] [--port]
 //   [--health-ms 2000] [--retries 3] [--route /prefix=host:port,host:port]
 int run_proxy(int argc, char** argv) {
-    using namespace forge::balance;
+    using namespace forge::loadbalancer;
     config c; auto st = parse_strategy(arg(argc, argv, "strategy", "p2c"));
     if (!st) { std::fprintf(stderr, "forge-serve proxy: unknown --strategy\n"); return 2; }
     c.strat = *st;
@@ -339,9 +339,9 @@ int main(int argc, char** argv) {
             else raise(errc::invalid_argument, "bad --mem-limit '{}' (use e.g. 6G, 512M or 75%)", ml);
         }
         mem::governor::instance().watch_pressure();
-        auto m = mind::model::open(path);
+        auto m = inference::model::open(path);
         if (m->blueprint().session != "generative_sequence") raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session);
-        mind::batch_options bo;
+        inference::batch_options bo;
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
         if (host.limit()) bo.budget = &host;

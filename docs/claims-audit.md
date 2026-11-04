@@ -1,9 +1,9 @@
 # FORGE docs claims audit (branch docs-verified, base 5940593)
 
-Scope note: pass 1 checked scripting.md, security-relevant claims in rpc.md/pack.md/os.md, index.md,
+Scope note: pass 1 checked scripting.md, security-relevant claims in rpc.md/modelfile.md/os.md, index.md,
 TODO.md, STATUS.md headline claims, every backticked file path in README/docs/FORGE_PLAN/TODO (automated
-existence check), and the `forge script` CLI options. Per-claim checks of the remaining docs (lane, grid,
-mind, balance, format, mobile, text-locale, FORGE_PLAN roadmap prose) were not done line by line: UNVERIFIED.
+existence check), and the `forge script` CLI options. Per-claim checks of the remaining docs (simd, gpu,
+inference, loadbalancer, format, mobile, text-locale, FORGE_PLAN roadmap prose) were not done line by line: UNVERIFIED.
 
 ## Pass 1
 | # | Claim | Doc | Result | Evidence |
@@ -23,13 +23,13 @@ mind, balance, format, mobile, text-locale, FORGE_PLAN roadmap prose) were not d
 | 13 | Allocation-count/open-handle/child-count limits | scripting.md:208 | FALSE | Limits struct interp.hpp:11-17 |
 | 14 | `tests/script/*.fs` golden tests | scripting.md:493 | FALSE | directory absent |
 | 15 | Parser fuzz target / fuzzing of lexer/parser/compiler/verifier | scripting.md:226,494 | FALSE | fuzz/ has blueprint,fpk,gguf,grammar,json,onnx,safetensors,tokenizer |
-| 16 | Remote execution disabled until auth | scripting.md:489 | VERIFIED (reworded to present tense) | flow/rpc.hpp:175, rpc_secure.hpp:74 |
+| 16 | Remote execution disabled until auth | scripting.md:489 | VERIFIED (reworded to present tense) | graph/rpc.hpp:175, rpc_secure.hpp:74 |
 | 17 | AI code never runs without confirmation | scripting.md:488 | VERIFIED | ai.cpp:85-89 returns false with no callback |
 | 18 | Plugins refused in sandboxed runs | - | VERIFIED | builtins.cpp:823 |
 | 19 | OS sandbox per platform (seccomp/Capsicum/pledge/sandbox_init/restricted token) | os.md:28 | VERIFIED (code); only Linux run-tested | sandbox.hpp:3-12,117-151; test_os_ext.cpp:29 |
 | 20 | `dynlib.hpp` module | os-wrapper.md:41 | FALSE | no such header; `library` in os.hpp:582 |
 | 21 | scripting "design, not yet built" | index.md:13 | FALSE (built) | script/src, 63 tests |
-| 22 | .fpk Ed25519 signing, verify_signature | pack.md:10,28 | VERIFIED | pack/sign.hpp:138 |
+| 22 | .fpk Ed25519 signing, verify_signature | modelfile.md:10,28 | VERIFIED | modelfile/sign.hpp:138 |
 | 23 | Logger features (TODO.md done list) | TODO.md | VERIFIED | core/log.hpp:1-30,130-178 |
 | 24 | rpc-serve --allow-scripts options | cli | VERIFIED | apps/forge.cpp:313,335-347 |
 | 25 | Docs for #6-#9 (wait_any, spawn_leased, pool submit, cache, settings) | - | MISSING -> added docs/support.md | process.hpp:426,443; memory.hpp:393; pool.hpp:73; cache.hpp:46-73; settings.hpp:1-30; time.hpp:131,144 |
@@ -52,7 +52,7 @@ False claims found: 11 (#1,4,9,10,12,13,14,15,20,21 and #8 partly). All fixed in
 | OS sandbox table | sandbox.hpp:3-12,23,117-151 | VERIFIED |
 | AI confirmation default false | ai.cpp:85-89; ai_run via shells() ai.cpp:108-110 | VERIFIED |
 | RPC: scripts need auth, one at a time, 60000 ms default, no-auth warning | rpc.hpp:175,262; forge.cpp:337-347 | VERIFIED |
-| Signing / verify_signature | pack/sign.hpp:138 | VERIFIED |
+| Signing / verify_signature | modelfile/sign.hpp:138 | VERIFIED |
 | support.md logger API | log.hpp:1-30,43,130-178 | VERIFIED |
 | wait_any/wait_all, spawn_leased | process.hpp:426,443; memory.hpp:380-393 | VERIFIED |
 | pool submit/cancelled/pending/wait_idle | pool.hpp:1-12,24-25,73-98 | VERIFIED |
@@ -73,7 +73,7 @@ Pass 3 corrections: 1.
 | #11 forge::limit untested | now tested | tests/script/limits.fs (cpu_s key there is ignored by builtins.cpp:343-350) |
 | .fsc cache | still absent | no "fsc" in script/src |
 Pass 3 corrections total: 5 (example literal, lazy compile, goldens, fuzz, limit test).
-Unverified: ASan/UBSan/TSan "CI jobs" (no workflow in repo; CI branch pending Odin); non-Linux sandbox behaviour; line-by-line claims in lane/grid/mind/balance/format/mobile/text-locale docs and FORGE_PLAN prose.
+Unverified: ASan/UBSan/TSan "CI jobs" (no workflow in repo; CI branch pending Odin); non-Linux sandbox behaviour; line-by-line claims in simd/gpu/inference/loadbalancer/format/mobile/text-locale docs and FORGE_PLAN prose.
 
 ## Pass 3 addendum 2 (after merging main 9a0b4e2, PR #10)
 - `cpu_s` now implemented (builtins.cpp:348, os::thread_cpu_time_ns); docs list it. Earlier "cpu_s ignored" note superseded.

@@ -3,9 +3,9 @@
 Added in PRs #5-#9. Header-only unless noted.
 
 ## Logger: `core/include/forge/core/log.hpp` (tests: `tests/test_log.cpp`, `tests/test_log_strip.cpp`)
-- Levels trace, debug, info, warn, error, fatal, off; default warn. `FORGE_LOG="info,mind=debug"` sets the
+- Levels trace, debug, info, warn, error, fatal, off; default warn. `FORGE_LOG="info,inference=debug"` sets the
   global and per-module thresholds; `set_level`, `set_module_level`, `configure(spec)` at run time.
-- `forge::log::info(...)` (module "forge") or `forge::log::logger L{"mind"}`; `std::format` style.
+- `forge::log::info(...)` (module "forge") or `forge::log::logger L{"inference"}`; `std::format` style.
 - Sinks: stderr (default, `set_stderr`), `add_file_sink(path, max_bytes, keep)` with size rotation, syslog,
   any callback (`add_sink`/`remove_sink`). Text or JSON lines (`set_format`, `FORGE_LOG_FORMAT=json`).
   One locked write per line.

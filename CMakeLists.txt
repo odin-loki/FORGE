@@ -93,25 +93,25 @@ endif()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
 # ---- spec codegen: .fspec -> op table header + docs + oracle test list ----
-file(GLOB FORGE_FSPECS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/spec/ops/*.fspec)
+file(GLOB FORGE_FSPECS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/ops/defs/*.fspec)
 set(FORGE_GEN_DIR ${PROJECT_BINARY_DIR}/generated)
 add_custom_command(
-  OUTPUT ${FORGE_GEN_DIR}/forge/spec/ops.gen.hpp ${FORGE_GEN_DIR}/ops.md
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/fspec_gen.py
+  OUTPUT ${FORGE_GEN_DIR}/forge/ops/ops.gen.hpp ${FORGE_GEN_DIR}/ops.md
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/fspec_gen.py
           --out ${FORGE_GEN_DIR} ${FORGE_FSPECS}
-  DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/spec/gen/fspec_gen.py
-  COMMENT "Generating op registry from spec/ops/*.fspec")
-add_custom_target(forge_spec_gen DEPENDS ${FORGE_GEN_DIR}/forge/spec/ops.gen.hpp)
+  DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/ops/gen/fspec_gen.py
+  COMMENT "Generating op registry from ops/defs/*.fspec")
+add_custom_target(forge_ops_gen DEPENDS ${FORGE_GEN_DIR}/forge/ops/ops.gen.hpp)
 
-# ---- Tier R: raw intrinsic wrappers generated from spec/intrinsics ----
+# ---- Tier R: raw intrinsic wrappers generated from ops/intrinsics ----
 add_custom_command(
-  OUTPUT ${FORGE_GEN_DIR}/forge/lane/raw/x86.gen.hpp
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/intrin_gen.py
-          --db ${PROJECT_SOURCE_DIR}/spec/intrinsics/x86.json
-          --out ${FORGE_GEN_DIR}/forge/lane/raw/x86.gen.hpp
-  DEPENDS ${PROJECT_SOURCE_DIR}/spec/intrinsics/x86.json ${PROJECT_SOURCE_DIR}/spec/gen/intrin_gen.py
-  COMMENT "Generating lane Tier R (x86)")
-add_custom_target(forge_raw_gen DEPENDS ${FORGE_GEN_DIR}/forge/lane/raw/x86.gen.hpp)
+  OUTPUT ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/intrin_gen.py
+          --db ${PROJECT_SOURCE_DIR}/ops/intrinsics/x86.json
+          --out ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp
+  DEPENDS ${PROJECT_SOURCE_DIR}/ops/intrinsics/x86.json ${PROJECT_SOURCE_DIR}/ops/gen/intrin_gen.py
+  COMMENT "Generating simd Tier R (x86)")
+add_custom_target(forge_raw_gen DEPENDS ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp)
 
 add_library(forge_core INTERFACE)
 target_include_directories(forge_core INTERFACE core/include)
@@ -130,12 +130,12 @@ elseif(UNIX AND NOT APPLE)
 endif()
 target_link_libraries(forge_core INTERFACE forge_os)
 
-add_library(forge_balance INTERFACE)   # load balancer + L4/L7 proxy
-target_include_directories(forge_balance INTERFACE balance/include)
-target_link_libraries(forge_balance INTERFACE forge_os)
+add_library(forge_loadbalancer INTERFACE)   # load balancer + L4/L7 proxy
+target_include_directories(forge_loadbalancer INTERFACE loadbalancer/include)
+target_link_libraries(forge_loadbalancer INTERFACE forge_os)
 find_package(Threads)
 if(Threads_FOUND)
-  target_link_libraries(forge_balance INTERFACE Threads::Threads)
+  target_link_libraries(forge_loadbalancer INTERFACE Threads::Threads)
 endif()
 
 # forge::os::mobile — sensors, touch, haptics, display, cameras, permissions (docs/mobile.md).
@@ -185,26 +185,26 @@ if(FORGE_FETCH_UCD)
   include(cmake/fetch_ucd.cmake)
 endif()
 
-add_library(forge_spec INTERFACE)
-target_include_directories(forge_spec INTERFACE spec/include ${FORGE_GEN_DIR})
-target_link_libraries(forge_spec INTERFACE forge_core)
-add_dependencies(forge_spec forge_spec_gen)
+add_library(forge_ops INTERFACE)
+target_include_directories(forge_ops INTERFACE ops/include ${FORGE_GEN_DIR})
+target_link_libraries(forge_ops INTERFACE forge_core)
+add_dependencies(forge_ops forge_ops_gen)
 
-add_library(forge_lane INTERFACE)
-target_include_directories(forge_lane INTERFACE lane/include ${FORGE_GEN_DIR})
-target_link_libraries(forge_lane INTERFACE forge_core)
-add_dependencies(forge_lane forge_raw_gen)
+add_library(forge_simd INTERFACE)
+target_include_directories(forge_simd INTERFACE simd/include ${FORGE_GEN_DIR})
+target_link_libraries(forge_simd INTERFACE forge_core)
+add_dependencies(forge_simd forge_raw_gen)
 
 add_library(forge_verify INTERFACE)
 target_include_directories(forge_verify INTERFACE verify/include)
-target_link_libraries(forge_verify INTERFACE forge_spec)
+target_link_libraries(forge_verify INTERFACE forge_ops)
 
 
 # ---- GPU kernels generated from spec/ops (FORGE_PLAN B.4): GLSL -> SPIR-V (embedded), CUDA/HIP compile checks ----
 set(FORGE_GPU_DIR ${FORGE_GEN_DIR}/gpu)
-execute_process(COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR} --list
+execute_process(COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR} --list
                 OUTPUT_VARIABLE FORGE_GPU_KERNELS OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE _gpu_rc)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py)
 find_program(FORGE_GLSLANG glslangValidator)
 find_program(FORGE_SPIRV_VAL spirv-val)
 find_path(FORGE_VULKAN_INCLUDE vulkan/vulkan.h)
@@ -213,8 +213,8 @@ foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
 add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels.metal
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
-  DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+  DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
   set(FORGE_SPV)
   foreach(k ${FORGE_GPU_KERNELS})
@@ -227,11 +227,11 @@ if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
       DEPENDS ${FORGE_GPU_DIR}/${k}.comp COMMENT "SPIR-V ${k}")
     list(APPEND FORGE_SPV ${FORGE_GPU_DIR}/${k}.spv)
   endforeach()
-  add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp
-    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
-            --embed ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp
-    DEPENDS ${FORGE_SPV} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding SPIR-V kernels")
-  add_custom_target(forge_gpu_gen ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/spirv.gen.hpp)
+  add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/gpu/spirv.gen.hpp
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+            --embed ${FORGE_GEN_DIR}/forge/gpu/spirv.gen.hpp
+    DEPENDS ${FORGE_SPV} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py COMMENT "Embedding SPIR-V kernels")
+  add_custom_target(forge_gpu_gen ALL DEPENDS ${FORGE_GEN_DIR}/forge/gpu/spirv.gen.hpp)
   # Copy only the Vulkan headers so the system include dir is not put ahead of the C++ standard library.
   file(COPY ${FORGE_VULKAN_INCLUDE}/vulkan DESTINATION ${FORGE_GEN_DIR}/vkinc)
   if(EXISTS ${FORGE_VULKAN_INCLUDE}/vk_video)
@@ -244,7 +244,7 @@ else()
   message(STATUS "FORGE: Vulkan backend disabled (need glslangValidator + vulkan/vulkan.h)")
 endif()
 # CUDA / HIP kernel images, built from the generated kernels.cu with clang (no SDK) and embedded for the
-# dlopen-based host runtime (grid/cuda.hpp). HIP code objects need lld; zig's bundled ld.lld works too.
+# dlopen-based host runtime (gpu/cuda.hpp). HIP code objects need lld; zig's bundled ld.lld works too.
 # When the host compiler is clang, the GPU images use that same toolchain (one LLVM for host and device);
 # otherwise the first clang on PATH. Override with -DFORGE_GPU_CLANG=... / -DFORGE_LLD=...
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_COMPILER_ID MATCHES "AppleClang")
@@ -325,36 +325,36 @@ if(FORGE_GPU_CLANG_IMAGES AND FORGE_GPU_HAS_AMDGPU)
     endforeach()
   endif()
 endif()
-add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
-          --embed-images ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp ${FORGE_GPU_IMAGES}
-  DEPENDS ${FORGE_GPU_IMAGES} ${PROJECT_SOURCE_DIR}/spec/gen/gpu_gen.py COMMENT "Embedding CUDA/HIP kernel images")
-add_custom_target(forge_gpu_images ALL DEPENDS ${FORGE_GEN_DIR}/forge/grid/gpu_images.gen.hpp)
+add_custom_command(OUTPUT ${FORGE_GEN_DIR}/forge/gpu/gpu_images.gen.hpp
+  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
+          --embed-images ${FORGE_GEN_DIR}/forge/gpu/gpu_images.gen.hpp ${FORGE_GPU_IMAGES}
+  DEPENDS ${FORGE_GPU_IMAGES} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py COMMENT "Embedding CUDA/HIP kernel images")
+add_custom_target(forge_gpu_images ALL DEPENDS ${FORGE_GEN_DIR}/forge/gpu/gpu_images.gen.hpp)
 add_dependencies(forge_gpu_images forge_gpu_gen)
 message(STATUS "FORGE: CUDA/HIP images: ${FORGE_GPU_IMAGES}")
-add_library(forge_grid INTERFACE)
-target_include_directories(forge_grid INTERFACE grid/include support/include third_party)
-target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR})
+add_library(forge_gpu INTERFACE)
+target_include_directories(forge_gpu INTERFACE gpu/include support/include third_party)
+target_include_directories(forge_gpu INTERFACE ${FORGE_GEN_DIR})
 if(FORGE_HAVE_VULKAN)
-  target_include_directories(forge_grid INTERFACE ${FORGE_GEN_DIR}/vkinc)
+  target_include_directories(forge_gpu INTERFACE ${FORGE_GEN_DIR}/vkinc)
 endif()
-add_dependencies(forge_grid forge_gpu_gen forge_gpu_images)
+add_dependencies(forge_gpu forge_gpu_gen forge_gpu_images)
 if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
   enable_language(OBJCXX)
-  add_library(forge_metal STATIC grid/src/metal.mm)
+  add_library(forge_metal STATIC gpu/src/metal.mm)
   target_compile_options(forge_metal PRIVATE -fobjc-arc)
-  target_compile_definitions(forge_metal PUBLIC FORGE_GRID_METAL=1)
-  target_include_directories(forge_metal PUBLIC grid/include support/include third_party ${FORGE_GEN_DIR} core/include spec/include lane/include)
+  target_compile_definitions(forge_metal PUBLIC FORGE_GPU_METAL=1)
+  target_include_directories(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include ops/include simd/include)
   add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
   target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
-  target_link_libraries(forge_grid INTERFACE forge_metal)
+  target_link_libraries(forge_gpu INTERFACE forge_metal)
 endif()
-target_link_libraries(forge_grid INTERFACE forge_lane)
+target_link_libraries(forge_gpu INTERFACE forge_simd)
 
-add_library(forge_flow INTERFACE)
-target_include_directories(forge_flow INTERFACE flow/include)
-target_link_libraries(forge_flow INTERFACE forge_spec forge_lane forge_grid forge_trust)
-# TLS for rpc-serve (flow/rpc.hpp). OpenSSL is optional; without it rpc stays plain TCP (auth still works).
+add_library(forge_graph INTERFACE)
+target_include_directories(forge_graph INTERFACE graph/include)
+target_link_libraries(forge_graph INTERFACE forge_ops forge_simd forge_gpu forge_trust)
+# TLS for rpc-serve (graph/rpc.hpp). OpenSSL is optional; without it rpc stays plain TCP (auth still works).
 option(FORGE_TLS "TLS for forge rpc-serve via OpenSSL when available" ON)
 if(FORGE_TLS)
   # Pass -DOPENSSL_ROOT_DIR=<prefix> when OpenSSL lives outside the toolchain's sysroot.
@@ -376,14 +376,14 @@ add_library(forge_trust STATIC third_party/monocypher/monocypher.c third_party/m
 target_include_directories(forge_trust PUBLIC third_party/monocypher)
 set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
 
-add_library(forge_pack INTERFACE)
-target_include_directories(forge_pack INTERFACE pack/include)
-target_link_libraries(forge_pack INTERFACE forge_flow forge_trust)
+add_library(forge_modelfile INTERFACE)
+target_include_directories(forge_modelfile INTERFACE modelfile/include)
+target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust)
 
-add_library(forge_mind INTERFACE)
-target_include_directories(forge_mind INTERFACE mind/include)
-target_link_libraries(forge_mind INTERFACE forge_pack)
-target_include_directories(forge_mind INTERFACE mind/include)
+add_library(forge_inference INTERFACE)
+target_include_directories(forge_inference INTERFACE inference/include)
+target_link_libraries(forge_inference INTERFACE forge_modelfile)
+target_include_directories(forge_inference INTERFACE inference/include)
 # forge::script managed scripting runtime (docs/scripting.md). Safe C++23; libc++ hardening when available.
 # Shell backends: one file each in script/src/shells/ defining forge_shell_register_<stem>(); the registry TU is generated.
 file(GLOB FORGE_SHELL_SRCS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/script/src/shells/*.cpp)
@@ -399,7 +399,7 @@ file(CONFIGURE OUTPUT ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp CONTEN
 add_library(forge_script STATIC ${FORGE_SHELL_SRCS} ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp script/src/heap.cpp script/src/parser.cpp script/src/runtime.cpp script/src/tree.cpp
   script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/ai.cpp script/src/remote.cpp script/src/mobile.cpp script/src/text.cpp script/src/reflect.cpp script/src/emit.cpp script/src/debug.cpp script/src/engine.cpp script/src/fsc.cpp script/src/check.cpp)
 target_include_directories(forge_script PUBLIC script/include PRIVATE script/src)
-target_link_libraries(forge_script PUBLIC forge_pack forge_mobile forge_text PRIVATE forge_verify forge_trust)
+target_link_libraries(forge_script PUBLIC forge_modelfile forge_mobile forge_text PRIVATE forge_verify forge_trust)
 if(TARGET forge_rpc_tls)
   target_link_libraries(forge_script PUBLIC forge_rpc_tls)
 endif()
@@ -413,8 +413,8 @@ set_target_properties(forge_script PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_library(forge_script_example_plugin MODULE examples/script_plugin/hello_plugin.c)
 target_include_directories(forge_script_example_plugin PRIVATE script/include)
 set_target_properties(forge_script_example_plugin PROPERTIES OUTPUT_NAME hello_plugin C_VISIBILITY_PRESET hidden)
-add_library(forge_c SHARED mind/capi/forge_c.cpp)
-target_link_libraries(forge_c PRIVATE forge_mind forge_verify forge_lane_mv)
+add_library(forge_c SHARED inference/capi/forge_c.cpp)
+target_link_libraries(forge_c PRIVATE forge_inference forge_verify forge_simd_mv)
 target_compile_definitions(forge_c PRIVATE FORGE_C_BUILD)
 if(MSVC)   # forge.exe and forge.dll would both link to forge.pdb
   set_target_properties(forge_c PROPERTIES PDB_NAME forge_c)
@@ -423,7 +423,7 @@ set_target_properties(forge_c PROPERTIES OUTPUT_NAME forge VERSION ${PROJECT_VER
 if(FORGE_JNI)
   find_package(JNI QUIET)
   add_library(forge_jni SHARED bindings/android/jni/forge_jni.c)
-  target_include_directories(forge_jni PRIVATE mind/include)
+  target_include_directories(forge_jni PRIVATE inference/include)
   if(NOT ANDROID AND JNI_FOUND)
     target_include_directories(forge_jni PRIVATE ${JNI_INCLUDE_DIRS})
   endif()
@@ -432,9 +432,9 @@ if(FORGE_JNI)
     target_link_libraries(forge_jni PRIVATE log)
   endif()
 endif()
-target_compile_definitions(forge_mind INTERFACE FORGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+target_compile_definitions(forge_inference INTERFACE FORGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
-# Multiversioned lane kernels: one TU per target, own flags, own namespace.
+# Multiversioned simd kernels: one TU per target, own flags, own namespace.
 include(CheckCXXSourceCompiles)
 # First flag set that compiles a fixed-length (256-bit) scalable-vector probe: GCC/Clang spelling, then zig's.
 function(forge_probe_flags out header type attr)
@@ -456,68 +456,68 @@ endfunction()
 set(FORGE_SCALABLE_BITS 128 256 512 1024)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64" OR (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
   set(FORGE_ARCH aarch64)
-  add_library(forge_lane_mv STATIC lane/src/kernels_scalar.cpp lane/src/kernels_neon.cpp lane/src/dispatch.cpp)
+  add_library(forge_simd_mv STATIC simd/src/kernels_scalar.cpp simd/src/kernels_neon.cpp simd/src/dispatch.cpp)
   set(_defs)
   foreach(b ${FORGE_SCALABLE_BITS})
     set(FORGE_PROBE_BITS ${b})
     forge_probe_flags(FORGE_SVE${b}_FLAGS arm_sve.h svfloat32_t "arm_sve_vector_bits(${b})"
       "-march=armv8.2-a+sve|-msve-vector-bits=${b}" "-mcpu=generic+sve|-msve-vector-bits=${b}")
     if(FORGE_SVE${b}_FLAGS)
-      add_library(forge_lane_sve${b} OBJECT lane/src/kernels_sve.cpp)
-      target_compile_options(forge_lane_sve${b} PRIVATE ${FORGE_SVE${b}_FLAGS})
-      set_target_properties(forge_lane_sve${b} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
-      target_link_libraries(forge_lane_sve${b} PRIVATE forge_lane)
-      target_sources(forge_lane_mv PRIVATE $<TARGET_OBJECTS:forge_lane_sve${b}>)
-      list(APPEND _defs FORGE_LANE_SVE${b}=1)
+      add_library(forge_simd_sve${b} OBJECT simd/src/kernels_sve.cpp)
+      target_compile_options(forge_simd_sve${b} PRIVATE ${FORGE_SVE${b}_FLAGS})
+      set_target_properties(forge_simd_sve${b} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
+      target_link_libraries(forge_simd_sve${b} PRIVATE forge_simd)
+      target_sources(forge_simd_mv PRIVATE $<TARGET_OBJECTS:forge_simd_sve${b}>)
+      list(APPEND _defs FORGE_SIMD_SVE${b}=1)
     endif()
   endforeach()
-  set_source_files_properties(lane/src/dispatch.cpp PROPERTIES COMPILE_DEFINITIONS "${_defs}")
+  set_source_files_properties(simd/src/dispatch.cpp PROPERTIES COMPILE_DEFINITIONS "${_defs}")
   message(STATUS "FORGE: SVE kernel tables: ${_defs}")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
   set(FORGE_ARCH riscv64)
-  add_library(forge_lane_mv STATIC lane/src/kernels_scalar.cpp lane/src/dispatch.cpp)
+  add_library(forge_simd_mv STATIC simd/src/kernels_scalar.cpp simd/src/dispatch.cpp)
   set(_defs)
   foreach(b ${FORGE_SCALABLE_BITS})
     set(FORGE_PROBE_BITS ${b})
     forge_probe_flags(FORGE_RVV${b}_FLAGS riscv_vector.h vfloat32m1_t "riscv_rvv_vector_bits(${b})"
       "-march=rv64gcv_zvl${b}b|-mrvv-vector-bits=${b}" "-mcpu=baseline_rv64+v+zvl${b}b|-mrvv-vector-bits=${b}")
     if(FORGE_RVV${b}_FLAGS)
-      add_library(forge_lane_rvv${b} OBJECT lane/src/kernels_rvv.cpp)
-      target_compile_options(forge_lane_rvv${b} PRIVATE ${FORGE_RVV${b}_FLAGS})
-      set_target_properties(forge_lane_rvv${b} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
-      target_link_libraries(forge_lane_rvv${b} PRIVATE forge_lane)
-      target_sources(forge_lane_mv PRIVATE $<TARGET_OBJECTS:forge_lane_rvv${b}>)
-      list(APPEND _defs FORGE_LANE_RVV${b}=1)
+      add_library(forge_simd_rvv${b} OBJECT simd/src/kernels_rvv.cpp)
+      target_compile_options(forge_simd_rvv${b} PRIVATE ${FORGE_RVV${b}_FLAGS})
+      set_target_properties(forge_simd_rvv${b} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
+      target_link_libraries(forge_simd_rvv${b} PRIVATE forge_simd)
+      target_sources(forge_simd_mv PRIVATE $<TARGET_OBJECTS:forge_simd_rvv${b}>)
+      list(APPEND _defs FORGE_SIMD_RVV${b}=1)
     endif()
   endforeach()
-  set_source_files_properties(lane/src/dispatch.cpp PROPERTIES COMPILE_DEFINITIONS "${_defs}")
+  set_source_files_properties(simd/src/dispatch.cpp PROPERTIES COMPILE_DEFINITIONS "${_defs}")
   message(STATUS "FORGE: RVV kernel tables: ${_defs}")
 else()
   set(FORGE_ARCH x86_64)
-  add_library(forge_lane_mv STATIC
-    lane/src/kernels_scalar.cpp
-    lane/src/kernels_avx2.cpp
-    lane/src/kernels_avx512.cpp
-    lane/src/dispatch.cpp)
+  add_library(forge_simd_mv STATIC
+    simd/src/kernels_scalar.cpp
+    simd/src/kernels_avx2.cpp
+    simd/src/kernels_avx512.cpp
+    simd/src/dispatch.cpp)
   if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    set_source_files_properties(lane/src/kernels_avx2.cpp   PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-    set_source_files_properties(lane/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+    set_source_files_properties(simd/src/kernels_avx2.cpp   PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(simd/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   else()
-    set_source_files_properties(lane/src/kernels_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
-    set_source_files_properties(lane/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
+    set_source_files_properties(simd/src/kernels_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(simd/src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
   endif()
 endif()
-target_link_libraries(forge_lane_mv PUBLIC forge_lane)
-set_target_properties(forge_lane_mv PROPERTIES POSITION_INDEPENDENT_CODE ON)
-# Matrix tile units (lane/tile.hpp): AMX on x86_64, SME on aarch64. Each file stubs out when its unit can't be compiled.
+target_link_libraries(forge_simd_mv PUBLIC forge_simd)
+set_target_properties(forge_simd_mv PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Matrix tile units (simd/tile.hpp): AMX on x86_64, SME on aarch64. Each file stubs out when its unit can't be compiled.
 include(CheckCXXSourceCompiles)
-target_sources(forge_lane_mv PRIVATE lane/src/tile_amx.cpp lane/src/tile_sme.cpp)
+target_sources(forge_simd_mv PRIVATE simd/src/tile_amx.cpp simd/src/tile_sme.cpp)
 if(FORGE_ARCH STREQUAL "x86_64")
   set(CMAKE_REQUIRED_FLAGS "-mamx-tile -mamx-bf16 -mamx-int8")
   check_cxx_source_compiles("#include <immintrin.h>\nint main(){_tile_zero(0);_tile_release();return 0;}" FORGE_CAN_AMX)
   unset(CMAKE_REQUIRED_FLAGS)
   if(FORGE_CAN_AMX)
-    set_source_files_properties(lane/src/tile_amx.cpp PROPERTIES COMPILE_OPTIONS "-mamx-tile;-mamx-bf16;-mamx-int8" COMPILE_DEFINITIONS FORGE_HAVE_AMX=1)
+    set_source_files_properties(simd/src/tile_amx.cpp PROPERTIES COMPILE_OPTIONS "-mamx-tile;-mamx-bf16;-mamx-int8" COMPILE_DEFINITIONS FORGE_HAVE_AMX=1)
   endif()
 elseif(FORGE_ARCH STREQUAL "aarch64")
   foreach(_f "-march=armv9-a+sme" "-mcpu=generic+sme")
@@ -530,7 +530,7 @@ elseif(FORGE_ARCH STREQUAL "aarch64")
     unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
     unset(CMAKE_REQUIRED_FLAGS)
     if(FORGE_CAN_SME)
-      set_source_files_properties(lane/src/tile_sme.cpp PROPERTIES COMPILE_OPTIONS "${_f}" COMPILE_DEFINITIONS FORGE_HAVE_SME=1)
+      set_source_files_properties(simd/src/tile_sme.cpp PROPERTIES COMPILE_OPTIONS "${_f}" COMPILE_DEFINITIONS FORGE_HAVE_SME=1)
       break()
     endif()
   endforeach()
@@ -539,7 +539,7 @@ message(STATUS "FORGE: tile units AMX=${FORGE_CAN_AMX} SME=${FORGE_CAN_SME}")
 
 # Hardware video decode (vision/video.hpp): NVDEC when nvcuvid.h is available, VideoToolbox on Apple, MediaCodec on Android.
 add_library(forge_video STATIC support/src/video.cpp)
-target_link_libraries(forge_video PUBLIC forge_mind)
+target_link_libraries(forge_video PUBLIC forge_inference)
 set(FORGE_NVCUVID_INCLUDE "" CACHE PATH "Directory with nvcuvid.h/cuviddec.h (NVIDIA Video Codec SDK) and cuda.h")
 find_path(FORGE_NVCUVID_H nvcuvid.h HINTS ${FORGE_NVCUVID_INCLUDE} /usr/local/cuda/include)
 if(FORGE_NVCUVID_H)
@@ -558,9 +558,9 @@ endif()
 
 if(FORGE_BUILD_APPS)
   add_executable(forge apps/forge.cpp)
-  target_link_libraries(forge PRIVATE forge_mind forge_verify forge_lane_mv forge_script)
+  target_link_libraries(forge PRIVATE forge_inference forge_verify forge_simd_mv forge_script)
   add_executable(forge-serve apps/forge_serve.cpp)
-  target_link_libraries(forge-serve PRIVATE forge_mind forge_verify forge_lane_mv forge_balance)
+  target_link_libraries(forge-serve PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
 endif()
 
 if(FORGE_BUILD_TESTS)
@@ -574,7 +574,7 @@ if(FORGE_BUILD_TESTS)
   set(FORGE_TEST_SHELL_PATH "${_shells_default}" CACHE STRING "Extra PATH entries for shell backend tests")
   foreach(t ${FORGE_TESTS})
     get_filename_component(n ${t} NAME_WE)
-    if(n STREQUAL "test_lane_raw" AND NOT FORGE_ARCH STREQUAL "x86_64")
+    if(n STREQUAL "test_simd_raw" AND NOT FORGE_ARCH STREQUAL "x86_64")
       continue()
     endif()
     if(n MATCHES "^test_(text|locale)")   # only needs forge_text
@@ -591,7 +591,7 @@ if(FORGE_BUILD_TESTS)
       continue()
     endif()
     add_executable(${n} ${t})
-    target_link_libraries(${n} PRIVATE forge_mind forge_verify forge_lane_mv forge_balance)
+    target_link_libraries(${n} PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
     if(n STREQUAL "test_video")
       target_link_libraries(${n} PRIVATE forge_video)
     endif()
@@ -606,7 +606,7 @@ if(FORGE_BUILD_TESTS)
       endif()
     endif()
     target_include_directories(${n} PRIVATE tests)
-    if(n STREQUAL "test_lane_raw")
+    if(n STREQUAL "test_simd_raw")
       if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         target_compile_options(${n} PRIVATE /arch:AVX2)
       else()
@@ -639,7 +639,7 @@ if(FORGE_BUILD_TESTS)
       string(REPLACE "|" ";" v "${v}")
       list(GET v 0 b)
       list(GET v 1 cpu)
-      add_test(NAME lane_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_lane> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      add_test(NAME lane_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(lane_${_lane}_vl${b} PROPERTIES PASS_REGULAR_EXPRESSION "active: ${_lane}" FAIL_REGULAR_EXPRESSION "FAIL")
     endforeach()
     if(_emu MATCHES "qemu-aarch64" AND FORGE_CAN_SME)   # SME outer-product tiles at several streaming VLs
@@ -649,17 +649,17 @@ if(FORGE_BUILD_TESTS)
       endforeach()
     endif()
   endif()
-  # forge::os / forge::balance cross-OS compile+link checks (zig ships FreeBSD, macOS and MinGW libcs).
+  # forge::os / forge::loadbalancer cross-OS compile+link checks (zig ships FreeBSD, macOS and MinGW libcs).
   find_program(FORGE_ZIG NAMES zig HINTS $ENV{ZIG_PATH})
   if(FORGE_ZIG)
     foreach(tg x86_64-freebsd aarch64-macos x86_64-macos x86_64-windows-gnu aarch64-linux-musl)
-      foreach(src test_os test_balance test_os_ext test_os_process test_os_sys test_os_net test_os_dev)
+      foreach(src test_os test_loadbalancer test_os_ext test_os_process test_os_sys test_os_net test_os_dev)
         set(_lib)
         if(tg MATCHES windows)
           set(_lib -lws2_32 -lbcrypt)
         endif()
         add_test(NAME xos_${src}_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++20 -O1 -I${PROJECT_SOURCE_DIR}/os/include
-                 -I${PROJECT_SOURCE_DIR}/balance/include -I${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tests/${src}.cpp ${_lib}
+                 -I${PROJECT_SOURCE_DIR}/loadbalancer/include -I${PROJECT_SOURCE_DIR}/tests ${PROJECT_SOURCE_DIR}/tests/${src}.cpp ${_lib}
                  -o ${PROJECT_BINARY_DIR}/xos/${src}.${tg})
         set_tests_properties(xos_${src}_${tg} PROPERTIES LABELS "cross;slow")
       endforeach()
@@ -703,16 +703,16 @@ if(FORGE_BUILD_TESTS)
   set_tests_properties(test_vulkan PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   add_test(NAME test_vulkan_align256 COMMAND test_vulkan WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
   set_tests_properties(test_vulkan_align256 PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu ENVIRONMENT FORGE_VK_SSBO_ALIGN=256)
-  set_tests_properties(test_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
-  add_test(NAME test_gpu_cuda COMMAND test_gpu cuda)
-  add_test(NAME test_gpu_hip COMMAND test_gpu hip)
-  add_test(NAME test_gpu_features_cuda COMMAND test_gpu features cuda)
-  add_test(NAME test_gpu_features_hip COMMAND test_gpu features hip)
-  add_test(NAME test_gpu_metal COMMAND test_gpu metal)
+  set_tests_properties(test_cuda_hip PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
+  add_test(NAME test_gpu_cuda COMMAND test_cuda_hip cuda)
+  add_test(NAME test_gpu_hip COMMAND test_cuda_hip hip)
+  add_test(NAME test_gpu_features_cuda COMMAND test_cuda_hip features cuda)
+  add_test(NAME test_gpu_features_hip COMMAND test_cuda_hip features hip)
+  add_test(NAME test_gpu_metal COMMAND test_cuda_hip metal)
   set_tests_properties(test_gpu_metal PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   foreach(m opencl ze)   # real runtimes: skip (77) without a driver/device
-    add_test(NAME test_gpu_${m} COMMAND test_gpu ${m})
-    add_test(NAME test_gpu_features_${m} COMMAND test_gpu features ${m})
+    add_test(NAME test_gpu_${m} COMMAND test_cuda_hip ${m})
+    add_test(NAME test_gpu_features_${m} COMMAND test_cuda_hip features ${m})
     set_tests_properties(test_gpu_${m} test_gpu_features_${m} PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
   endforeach()
   set_tests_properties(test_gpu_features_cuda test_gpu_features_hip PROPERTIES SKIP_RETURN_CODE 77 LABELS gpu)
@@ -722,14 +722,14 @@ if(FORGE_BUILD_TESTS)
     add_library(mock_cuda SHARED tests/mock_cuda.c)
     set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockcuda)
     target_link_libraries(mock_cuda PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
-    add_test(NAME test_gpu_cuda_mock COMMAND test_gpu cuda)
+    add_test(NAME test_gpu_cuda_mock COMMAND test_cuda_hip cuda)
     set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda" LABELS gpu SKIP_RETURN_CODE 77)
-    add_dependencies(test_gpu mock_cuda)
+    add_dependencies(test_cuda_hip mock_cuda)
     add_library(mock_hip SHARED tests/mock_cuda.c)
     target_compile_definitions(mock_hip PRIVATE MOCK_HIP)
     set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockhip)
     target_link_libraries(mock_hip PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
-    add_dependencies(test_gpu mock_hip)
+    add_dependencies(test_cuda_hip mock_hip)
     foreach(m opencl ze)
       if(m STREQUAL "opencl")
         add_library(mock_${m} SHARED tests/mock_opencl.c)
@@ -742,17 +742,17 @@ if(FORGE_BUILD_TESTS)
       target_include_directories(mock_${m} PRIVATE ${FORGE_GPU_DIR} ${PROJECT_SOURCE_DIR}/third_party)
       target_link_libraries(mock_${m} PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
       add_dependencies(mock_${m} forge_gpu_gen)
-      add_dependencies(test_gpu mock_${m})
-      add_test(NAME test_gpu_${m}_mock COMMAND test_gpu ${m})
-      add_test(NAME test_gpu_features_${m}_mock COMMAND test_gpu features ${m})
+      add_dependencies(test_cuda_hip mock_${m})
+      add_test(NAME test_gpu_${m}_mock COMMAND test_cuda_hip ${m})
+      add_test(NAME test_gpu_features_${m}_mock COMMAND test_cuda_hip features ${m})
       set_tests_properties(test_gpu_${m}_mock test_gpu_features_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
         ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};MOCK_DEVICES=2;FORGE_ZE_TEST_IMAGE=opencl-c")
     endforeach()
-    add_test(NAME test_gpu_hip_mock COMMAND test_gpu hip)
+    add_test(NAME test_gpu_hip_mock COMMAND test_cuda_hip hip)
     set_tests_properties(test_gpu_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip" LABELS gpu SKIP_RETURN_CODE 77)
-    add_test(NAME test_gpu_features_cuda_mock COMMAND test_gpu features cuda)
+    add_test(NAME test_gpu_features_cuda_mock COMMAND test_cuda_hip features cuda)
     set_tests_properties(test_gpu_features_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
-    add_test(NAME test_gpu_features_hip_mock COMMAND test_gpu features hip)
+    add_test(NAME test_gpu_features_hip_mock COMMAND test_cuda_hip features hip)
     set_tests_properties(test_gpu_features_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
     if(FORGE_BUILD_APPS)
       add_test(NAME golden_tiny_llama_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
@@ -826,10 +826,10 @@ if(FORGE_BUILD_TESTS)
       endforeach()
       if(MSVC)   # cl / clang-cl spelling of the same check
         add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} /nologo /c /Fo${PROJECT_BINARY_DIR}/jni_syntax.obj /WX /W3 ${_jni_inc}
-          -I${PROJECT_SOURCE_DIR}/mind/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+          -I${PROJECT_SOURCE_DIR}/inference/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
       else()
         add_test(NAME jni_syntax COMMAND ${CMAKE_C_COMPILER} -c -o ${PROJECT_BINARY_DIR}/jni_syntax.o -Werror -Wall -Wno-unused-command-line-argument ${_jni_inc}
-          -I${PROJECT_SOURCE_DIR}/mind/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
+          -I${PROJECT_SOURCE_DIR}/inference/include ${PROJECT_SOURCE_DIR}/bindings/android/jni/forge_jni.c)
       endif()
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
@@ -844,10 +844,10 @@ if(FORGE_BUILD_TESTS)
   # Cross builds (e.g. aarch64 under qemu) are typically static: skip the shared-library smoke test there.
   if(NOT CMAKE_CROSSCOMPILING)
     add_executable(capi_smoke tests/capi_smoke.c)
-    target_include_directories(capi_smoke PRIVATE mind/include)
+    target_include_directories(capi_smoke PRIVATE inference/include)
     target_link_libraries(capi_smoke PRIVATE forge_c)
     add_executable(doc_example_capi_generate docs/examples/capi_generate.c)
-    target_include_directories(doc_example_capi_generate PRIVATE mind/include)
+    target_include_directories(doc_example_capi_generate PRIVATE inference/include)
     target_link_libraries(doc_example_capi_generate PRIVATE forge_c)
     # libforge.so needs libstdc++; link the C consumers with the C++ driver so toolchains with a private
     # sysroot (conda clang) can resolve it.
@@ -858,34 +858,34 @@ if(FORGE_BUILD_TESTS)
     endif()
   endif()
   # Documentation examples (docs/examples): compiled and run so the guides cannot drift from the API.
-  add_executable(doc_example_lane_dispatch docs/examples/lane_dispatch.cpp)
-  target_link_libraries(doc_example_lane_dispatch PRIVATE forge_lane_mv)
-  add_test(NAME doc_example_lane_dispatch COMMAND doc_example_lane_dispatch)
-  add_executable(doc_example_grid_graph docs/examples/grid_graph.cpp)
-  target_link_libraries(doc_example_grid_graph PRIVATE forge_grid forge_lane_mv)
-  add_test(NAME doc_example_grid_graph COMMAND doc_example_grid_graph)
-  add_executable(doc_example_pack_roundtrip docs/examples/pack_roundtrip.cpp)
-  target_link_libraries(doc_example_pack_roundtrip PRIVATE forge_pack forge_lane_mv)
-  add_test(NAME doc_example_pack_roundtrip COMMAND doc_example_pack_roundtrip)
-  add_executable(doc_example_flow_graph docs/examples/flow_graph.cpp)
-  target_link_libraries(doc_example_flow_graph PRIVATE forge_flow forge_verify forge_lane_mv)
-  add_test(NAME doc_example_flow_graph COMMAND doc_example_flow_graph)
+  add_executable(doc_example_simd_dispatch docs/examples/simd_dispatch.cpp)
+  target_link_libraries(doc_example_simd_dispatch PRIVATE forge_simd_mv)
+  add_test(NAME doc_example_simd_dispatch COMMAND doc_example_simd_dispatch)
+  add_executable(doc_example_gpu_graph docs/examples/gpu_graph.cpp)
+  target_link_libraries(doc_example_gpu_graph PRIVATE forge_gpu forge_simd_mv)
+  add_test(NAME doc_example_gpu_graph COMMAND doc_example_gpu_graph)
+  add_executable(doc_example_modelfile_roundtrip docs/examples/modelfile_roundtrip.cpp)
+  target_link_libraries(doc_example_modelfile_roundtrip PRIVATE forge_modelfile forge_simd_mv)
+  add_test(NAME doc_example_modelfile_roundtrip COMMAND doc_example_modelfile_roundtrip)
+  add_executable(doc_example_graph_build docs/examples/graph_build.cpp)
+  target_link_libraries(doc_example_graph_build PRIVATE forge_graph forge_verify forge_simd_mv)
+  add_test(NAME doc_example_graph_build COMMAND doc_example_graph_build)
   add_executable(doc_example_os_features docs/examples/os_features.cpp)
   target_link_libraries(doc_example_os_features PRIVATE forge_os)
   add_test(NAME doc_example_os_features COMMAND doc_example_os_features)
-  add_executable(doc_example_balance_pool docs/examples/balance_pool.cpp)
-  target_link_libraries(doc_example_balance_pool PRIVATE forge_balance)
-  add_test(NAME doc_example_balance_pool COMMAND doc_example_balance_pool)
-  add_executable(doc_example_mind_generate docs/examples/mind_generate.cpp)
-  target_link_libraries(doc_example_mind_generate PRIVATE forge_mind forge_verify forge_lane_mv)
+  add_executable(doc_example_loadbalancer_pool docs/examples/loadbalancer_pool.cpp)
+  target_link_libraries(doc_example_loadbalancer_pool PRIVATE forge_loadbalancer)
+  add_test(NAME doc_example_loadbalancer_pool COMMAND doc_example_loadbalancer_pool)
+  add_executable(doc_example_inference_generate docs/examples/inference_generate.cpp)
+  target_link_libraries(doc_example_inference_generate PRIVATE forge_inference forge_verify forge_simd_mv)
   if(FORGE_BUILD_APPS)
-    add_test(NAME doc_example_mind_generate COMMAND doc_example_mind_generate ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk "Hi")
-    set_tests_properties(doc_example_mind_generate PROPERTIES DEPENDS golden_tiny_llama)
+    add_test(NAME doc_example_inference_generate COMMAND doc_example_inference_generate ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk "Hi")
+    set_tests_properties(doc_example_inference_generate PROPERTIES DEPENDS golden_tiny_llama)
   endif()
   if(FORGE_BUILD_APPS)
-    add_test(NAME pack_signing COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/sign_test.py
+    add_test(NAME modelfile_signing COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/sign_test.py
              $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
-    set_tests_properties(pack_signing PROPERTIES DEPENDS golden_tiny_llama)
+    set_tests_properties(modelfile_signing PROPERTIES DEPENDS golden_tiny_llama)
     add_test(NAME onnx_import COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/onnx_test.py $<TARGET_FILE:forge>)
     add_test(NAME golden_moe_mla
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
@@ -916,7 +916,7 @@ if(FORGE_BUILD_TESTS)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
-      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla pack_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla modelfile_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
       add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
@@ -944,9 +944,9 @@ if(FORGE_BUILD_TESTS)
     endfunction()
     forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
-      golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_mind_generate doc_example_capi_generate
-      capi_smoke python_bindings serve_http pack_signing)
-    forge_py_needs("cryptography" pack_signing)
+      golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_inference_generate doc_example_capi_generate
+      capi_smoke python_bindings serve_http modelfile_signing)
+    forge_py_needs("cryptography" modelfile_signing)
     forge_py_needs("numpy;onnx" onnx_import)
     if(Python3_EXECUTABLE)
       add_test(NAME docs_up_to_date COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/gen_docs.py --check)
@@ -965,7 +965,7 @@ if(FORGE_BUILD_TESTS)
     else()
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp fuzz/driver.cpp)
     endif()
-    target_link_libraries(fuzz_${ft} PRIVATE forge_mind forge_verify forge_lane_mv)
+    target_link_libraries(fuzz_${ft} PRIVATE forge_inference forge_verify forge_simd_mv)
     if(NOT FORGE_LIBFUZZER)
       add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${FORGE_FUZZ_ITERS} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
                WORKING_DIRECTORY ${PROJECT_BINARY_DIR})
@@ -995,7 +995,7 @@ if(FORGE_BUILD_EXAMPLES)
   foreach(e ${FORGE_EXAMPLES})
     get_filename_component(n ${e} NAME_WE)
     add_executable(example_${n} ${e})
-    target_link_libraries(example_${n} PRIVATE forge_mind forge_verify forge_lane_mv)
+    target_link_libraries(example_${n} PRIVATE forge_inference forge_verify forge_simd_mv)
     if(FORGE_BUILD_TESTS)
       add_test(NAME example_${n} COMMAND example_${n})
       set_tests_properties(example_${n} PROPERTIES LABELS integration)
@@ -1005,11 +1005,11 @@ endif()
 
 # ---- Install + packaging (v1.0 release tooling; tools/release.py drives this) -------------------------
 include(GNUInstallDirs)
-install(DIRECTORY core/include/ lane/include/ spec/include/ grid/include/ flow/include/ pack/include/ mind/include/ support/include/ verify/include/
+install(DIRECTORY core/include/ simd/include/ ops/include/ gpu/include/ graph/include/ modelfile/include/ inference/include/ support/include/ verify/include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
 install(TARGETS forge_c LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime)
-install(TARGETS forge_lane_mv forge_trust ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev)
+install(TARGETS forge_simd_mv forge_trust ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev)
 foreach(t forge forge-serve)
   if(TARGET ${t})
     install(TARGETS ${t} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime)

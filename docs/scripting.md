@@ -31,7 +31,7 @@ destructor calls. Everything else that a typical tool script needs is supported:
 - Declarations: `int`/`long long`/`double`/`bool`/`char`/`std::string`/`auto`, `const`/`constexpr`,
   several declarators, brace/paren initialisation, structured bindings `auto [k, v] = ...`.
   Narrowing (`int x = 3.5;`) and assigning to a `const` are compile-time errors.
-- Control flow: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (incl. bindings), `switch`
+- Control graph: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (incl. bindings), `switch`
   with fall-through, `break`/`continue`, `try`/`catch`/`throw`/`throw;`, `catch (...)`.
 - Functions with defaults, by-value (copied) and by-reference parameters, recursion, templates
   (type-erased), lambdas with `[=]`, `[&]`, `[x]`, `[&x]` captures and `mutable`.
@@ -358,8 +358,8 @@ release, uptime, loadavg, memory, is_tty, term_size, devices, clipboard), `proc.
 
 ## FORGE built-ins
 
-- `model.load(path)`, `model.generate(prompt, opts)` (inference via `mind`).
-- `gpu.devices()`, grid dispatch helpers.
+- `model.load(path)`, `model.generate(prompt, opts)` (inference via `inference`).
+- `gpu.devices()`, gpu dispatch helpers.
 - `mem.budget()`, `mem.usage()`, `mem.limit(size)` from `forge::mem`.
 - `serve.start(opts)` / `serve.stop()`.
 
@@ -577,7 +577,7 @@ in both execution modes.
 - Scripts run with the user's privileges. Capability flags (`forge::sandbox`, `--no-*`) are checked by
   the interpreter only; there is no OS-level sandbox for scripts yet. See [security.md](security.md).
 - AI-generated code is never run without confirmation.
-- Remote execution is refused unless rpc-serve has authentication (`flow/include/forge/flow/rpc.hpp`).
+- Remote execution is refused unless rpc-serve has authentication (`graph/include/forge/graph/rpc.hpp`).
 
 ## Testing
 

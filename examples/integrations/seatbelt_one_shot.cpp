@@ -1,7 +1,7 @@
 // Seatbelt / phone detection (Part F.2): `one_shot` session with a fixed latency budget; vision pre/post.
 // Usage: seatbelt_one_shot [detector.fpk] [budget_ms]. Without a model the detector is a synthetic stub so
 // the pre/post-processing and the budget accounting still run.
-#include <forge/mind/mind.hpp>
+#include <forge/inference/inference.hpp>
 #include <forge/vision/vision.hpp>
 #include <chrono>
 #include <cstdio>
@@ -12,8 +12,8 @@ int main(int argc, char** argv) {
     double budget_ms = argc > 2 ? std::atof(argv[2]) : 20.0;
     vision::image cam{240, 320, 3, std::vector<float>(240 * 320 * 3, 0.5f)};
     for (std::size_t y = 80; y < 160; ++y) for (std::size_t x = 100; x < 140; ++x) cam.at(y, x, 0) = 1.f;   // "belt" stripe
-    std::shared_ptr<mind::session> s;
-    if (argc > 1) s = std::make_shared<mind::session>(argv[1]);
+    std::shared_ptr<inference::session> s;
+    if (argc > 1) s = std::make_shared<inference::session>(argv[1]);
     int over = 0, frames = 10;
     for (int f = 0; f < frames; ++f) {
         auto t0 = std::chrono::steady_clock::now();

@@ -133,7 +133,7 @@ struct Checker {
     std::map<std::string, int> ids; std::map<std::string, std::vector<int>> field_ids;
     int gid(const std::string& k) { auto it = ids.find(k); if (it != ids.end()) return it->second; int id = -int(ids.size()) - 1; ids[k] = id; auto dot = k.find('.'); if (dot != std::string::npos) field_ids[k.substr(0, dot)].push_back(id); return id; }
     bool at_top() const { return !fns.empty() && fns.back().decl && fns.back().decl->is_top; }
-    // flow key of an lvalue: own local "l<slot>", script global "g<name>" (top level only), plus ".field" chains
+    // graph key of an lvalue: own local "l<slot>", script global "g<name>" (top level only), plus ".field" chains
     std::string lkey(const Node& n) {
         if (n.k == NK::Var) {
             if (!n.var.global()) return n.var.depth == 0 ? "l" + std::to_string(n.var.slot) : std::string();

@@ -1,5 +1,5 @@
 #pragma once
-// Minimal owning/non-owning dense tensor used across flow/mind (row-major, f32 compute type).
+// Minimal owning/non-owning dense tensor used across graph/inference (row-major, f32 compute type).
 #include <forge/core/dtypes.hpp>
 #include <forge/core/error.hpp>
 #include <cstddef>
@@ -25,7 +25,7 @@ struct tensor_view {
     shape_t shape;
     // Quantised weight payload (data == nullptr): encoded rows read in place by quantised kernels.
     const std::uint8_t* qdata = nullptr;
-    const void* qcodec = nullptr;   // const flow::codec*
+    const void* qcodec = nullptr;   // const graph::codec*
     std::size_t size() const { return std::size_t(numel(shape)); }
     std::span<float> span() const { return {data, size()}; }
 };

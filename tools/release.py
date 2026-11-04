@@ -33,7 +33,7 @@ def bump(v):
     if not SEMVER.match(v): sys.exit(f"release: '{v}' is not semver")
     edits = [(ROOT / "CMakeLists.txt", r"(project\(FORGE VERSION )\S+", rf"\g<1>{core}"),
              (ROOT / "bindings/android/gradle.properties", r"(?m)^(VERSION_NAME=).*$", rf"\g<1>{v}"),
-             (ROOT / "mind/include/forge.h", r"(#define FORGE_VERSION_STRING \")[^\"]*", rf"\g<1>{v}")]
+             (ROOT / "inference/include/forge.h", r"(#define FORGE_VERSION_STRING \")[^\"]*", rf"\g<1>{v}")]
     for path, pat, rep in edits:
         if not path.exists(): continue
         s = path.read_text(); n = re.sub(pat, rep, s)

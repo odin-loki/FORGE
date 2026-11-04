@@ -1,11 +1,11 @@
 #pragma once
 // Hardware video decode hooks (Part F.1 `vision`): one interface over NVDEC, VA-API, VideoToolbox and MediaCodec.
-// Frames come back as NV12 in host memory (device-resident output is a later step; see grid interop).
+// Frames come back as NV12 in host memory (device-resident output is a later step; see gpu interop).
 //
 // Status (see docs/STATUS.md): HARDWARE-UNTESTED.
 //   nvdec        full H.264/HEVC/AV1/VP9 decode via cuvid's own parser; compiled only when nvcuvid.h is found
 //                (NVIDIA Video Codec SDK headers, -DFORGE_NVCUVID_INCLUDE=...); libcuda/libnvcuvid are dlopened.
-//   videotoolbox full H.264/HEVC decode (grid/src/video_vt.mm, Apple only).
+//   videotoolbox full H.264/HEVC decode (gpu/src/video_vt.mm, Apple only).
 //   mediacodec   full decode through the NDK AMediaCodec API (Android only, links mediandk).
 //   vaapi        device + profile probe through a dlopened libva; bitstream decode needs a slice-header parser
 //                and is NOT implemented (decode() reports unsupported).

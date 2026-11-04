@@ -50,7 +50,7 @@ job_windows_mingw() { # windows-mingw job: llvm-mingw cross build, ctest via win
     -DCMAKE_CROSSCOMPILING_EMULATOR="$WINE" &&
   cmake --build "$b" -j"$J" &&
   # python-driven tests launch forge.exe directly from Linux python (no wine in between): run natively by linux-*.
-  xvfb-run -a ctest --test-dir "$b" -LE "slow|emu" -E "^(golden_|pack_signing|onnx_import|docs_up_to_date|sbom_spdx|doc_example_mind_generate)" \
+  xvfb-run -a ctest --test-dir "$b" -LE "slow|emu" -E "^(golden_|modelfile_signing|onnx_import|docs_up_to_date|sbom_spdx|doc_example_inference_generate)" \
     -j2 --timeout 1200 &&
   FORGE_TEST_ONLY=emit xvfb-run -a "$WINE" "$b/test_script.exe"; }   # from the source dir (tests/data/emit)
 job_freebsd() { # needs FBSD_VM_SH: a script that boots the VM, syncs $src, and runs the workflow's cmake/ctest steps inside.

@@ -1,16 +1,16 @@
 // Graphics interop: export a Vulkan buffer as an OS handle, import it back (same device) and check the bytes are shared.
 // Plays the role of an application renderer creating its own VkDevice. CUDA import runs only with a CUDA driver.
 #include "check.hpp"
-#include <forge/grid/interop.hpp>
+#include <forge/gpu/interop.hpp>
 #include <cstdio>
 #include <cstring>
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
 #include <vector>
-using namespace forge::grid::interop;
+using namespace forge::gpu::interop;
 
-#if defined(FORGE_GRID_VULKAN)
+#if defined(FORGE_GPU_VULKAN)
 TEST(vk_export_import_roundtrip) {
     void* lib = dlopen(FORGE_DLNAME("libvulkan.so.1", "vulkan-1.dll"), RTLD_NOW | RTLD_LOCAL);
     if (!lib) { std::puts("  skip: no Vulkan loader"); return; }

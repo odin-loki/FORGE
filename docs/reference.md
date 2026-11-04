@@ -69,7 +69,7 @@ Every op has a float64 scalar reference that each lowering is tested against.
 | `cumsum` | reduction | 1 | same | rel:1e-5 | no | axis |  | inclusive prefix sum over axis |
 | `moe_gate` | reduction | 1 | same | abs:1e-6 | no | k,norm |  | MoE router: softmax over last axis, keep top-k (ties -> lower index), renormalise if norm |
 
-## C ABI (version 3, `mind/include/forge.h`)
+## C ABI (version 3, `inference/include/forge.h`)
 
 | function | signature | notes |
 |---|---|---|

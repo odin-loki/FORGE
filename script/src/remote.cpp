@@ -4,7 +4,7 @@
 //   opts: {"args", list} {"timeout_ms", n} {"token", s} {"key", secret-key-file} {"tls", bool} {"ca", file}
 //         {"fingerprint", sha256-hex} {"server_name", s} {"name", script-name}
 #include "interp.hpp"
-#include <forge/flow/rpc.hpp>
+#include <forge/graph/rpc.hpp>
 
 namespace forge::script {
 namespace {
@@ -26,10 +26,10 @@ void install_remote(Shared& sh) {
         auto colon = addr.rfind(':'); if (colon == std::string::npos) in.raise("ValueError", "forge::remote: want host:port");
         auto host = addr.substr(0, colon), port = addr.substr(colon + 1);
         if (host.size() > 1 && host.front() == '[') host = host.substr(1, host.size() - 2);
-        flow::rpc::client_security sec;
-        try { sec = flow::rpc::client::env_security(); } catch (const std::exception& e) { in.raise("ValueError", std::string("forge::remote: ") + e.what()); }
+        graph::rpc::client_security sec;
+        try { sec = graph::rpc::client::env_security(); } catch (const std::exception& e) { in.raise("ValueError", std::string("forge::remote: ") + e.what()); }
         if (auto* v = kv(a, 2, "token")) sec.token = in.str(*v);
-        try { if (auto* v = kv(a, 2, "key")) sec.key = std::make_shared<flow::rpc::identity>(flow::rpc::identity_from_seed_hex(flow::rpc::read_key_file(in.str(*v)))); }
+        try { if (auto* v = kv(a, 2, "key")) sec.key = std::make_shared<graph::rpc::identity>(graph::rpc::identity_from_seed_hex(graph::rpc::read_key_file(in.str(*v)))); }
         catch (const std::exception& e) { in.raise("ValueError", std::string("forge::remote: ") + e.what()); }
         if (auto* v = kv(a, 2, "ca")) { sec.tls.ca_file = in.str(*v); sec.tls.enabled = true; }
         if (auto* v = kv(a, 2, "fingerprint")) { sec.tls.fingerprint_sha256 = in.str(*v); sec.tls.enabled = true; }
@@ -39,9 +39,9 @@ void install_remote(Shared& sh) {
         std::uint32_t tmo = 0; if (auto* v = kv(a, 2, "timeout_ms")) if (auto* i = std::get_if<std::int64_t>(v)) tmo = std::uint32_t(std::max<std::int64_t>(0, *i));
         std::string name = "<remote>"; if (auto* v = kv(a, 2, "name")) name = in.str(*v);
         std::string why;
-        auto c = flow::rpc::client::connect(host, port, &why, sec);
+        auto c = graph::rpc::client::connect(host, port, &why, sec);
         if (!c) in.raise(why.find("auth") != std::string::npos ? "PermissionError" : "IOError", why);
-        flow::rpc::client::script_reply r;
+        graph::rpc::client::script_reply r;
         try { r = c->run_script(src, name, argv, tmo); }
         catch (const std::exception& e) { std::string m = e.what(); in.raise(m.find("disabled") != std::string::npos ? "PermissionError" : "IOError", m); }
         auto m = make<Map>(); m->set_str("ok", r.ok); m->set_str("output", strv(r.output)); m->set_str("error_type", strv(r.error_type)); m->set_str("error", strv(r.error));

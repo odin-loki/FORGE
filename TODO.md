@@ -4,7 +4,7 @@
 Grow today's minimal `core/include/forge/core/log.hpp` (stderr only, `FORGE_LOG` threshold) into a proper
 logger module, so PRISM can use it instead of its own logger.
 - **Levels:** trace, debug, info, warn, error, fatal; global threshold plus per-component/category overrides
-  (`FORGE_LOG=warn,flow=debug`), settable at run time.
+  (`FORGE_LOG=warn,graph=debug`), settable at run time.
 - **Sinks:** stderr (default), file with rotation, syslog/journald and Windows event log via the OS wrapper,
   a callback sink for embedders (PRISM, bindings), and an optional JSON-lines structured format.
   Thread-safe, with an async/buffered option that never blocks hot paths.

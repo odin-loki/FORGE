@@ -13,13 +13,13 @@ One monorepo, five core layers, one design pattern running through all of them.
 
 | Layer | Reference it replaces | What it does |
 |---|---|---|
-| **lane** | xsimd (+ std::simd) | SIMD on every CPU ISA; 100% raw intrinsic coverage plus a portable layer and algorithms |
-| **grid** | CUDA / HIP / SYCL | One GPU programming model over NVIDIA, AMD and Intel, plus Vulkan, Metal and a CPU backend |
-| **flow** | ggml | Tensor graph compiler and executor: verify → optimise → partition → plan → replay |
-| **pack** | GGUF / safetensors / ONNX | Model container holding the *graph*, weights, tokenizer, state schema, provenance and signature |
-| **mind** | llama.cpp | Generic inference engine with **zero per-architecture code** — import a model file and run it |
+| **simd** | xsimd (+ std::simd) | SIMD on every CPU ISA; 100% raw intrinsic coverage plus a portable layer and algorithms |
+| **gpu** | CUDA / HIP / SYCL | One GPU programming model over NVIDIA, AMD and Intel, plus Vulkan, Metal and a CPU backend |
+| **graph** | ggml | Tensor graph compiler and executor: verify → optimise → partition → plan → replay |
+| **modelfile** | GGUF / safetensors / ONNX | Model container holding the *graph*, weights, tokenizer, state schema, provenance and signature |
+| **inference** | llama.cpp | Generic inference engine with **zero per-architecture code** — import a model file and run it |
 
-Support modules: `core`, `spec`, `mem`, `task`, `io`, `prof`, `rand`, `linalg`, `vision`, `audio`, `reflect`, `serve`, `verify`.
+Support modules: `core`, `ops`, `mem`, `task`, `io`, `prof`, `rand`, `linalg`, `vision`, `audio`, `reflect`, `serve`, `verify`.
 
 The defining property: **code and model are fully decoupled.** llama.cpp needs new C++ for every new architecture; FORGE needs a new *file*. The engine is a compiler for model blueprints, not a collection of hand-written model builders.
 
@@ -37,7 +37,7 @@ All three references solve the same problem: a matrix of **operations × targets
 
 FORGE applies five rules at every layer:
 
-1. **Spec once.** Every operation is declared once in `spec/`: signature, shape rules, dtype rules, semantics (as a scalar reference implementation), accuracy tolerance, algebraic class (elementwise / reduction / contraction / data-movement / stateful), fusion properties and cost hints. The spec drives code generation, op registries, documentation and tests.
+1. **Spec once.** Every operation is declared once in `ops/`: signature, shape rules, dtype rules, semantics (as a scalar reference implementation), accuracy tolerance, algebraic class (elementwise / reduction / contraction / data-movement / stateful), fusion properties and cost hints. The spec drives code generation, op registries, documentation and tests.
 2. **Capabilities, not hierarchies.** Targets advertise *feature sets*. Implementations declare what they *require*. The most specific valid implementation wins — at compile time on CPU (C++20 concept subsumption), at plan time on graphs (cost-model planner).
 3. **Plan once, replay forever.** Every layer separates *deciding* from *doing*. SIMD dispatch resolves once into a function table; GPU work is recorded as command graphs; tensor graphs compile into flat plans; inference sessions compile per shape bucket. Hot paths never ask "which backend am I on?".
 4. **Data, not code.** Model architectures are blueprints inside the file. Quantisation formats are codecs. Importers are templates. Tokenizers are specs. Nothing about a specific model is compiled into the engine.
@@ -46,16 +46,16 @@ FORGE applies five rules at every layer:
 ### 1.1 How the parts converge
 
 ```
-                    spec/ (op definitions + scalar reference)
+                    ops/ (op definitions + scalar reference)
                  ┌──────────┼───────────┬─────────────┐
                  ▼          ▼           ▼             ▼
-            lane codegen  grid codegen  flow registry  verify oracle
+            simd codegen  gpu codegen  graph registry  verify oracle
             (CPU kernels) (GPU kernels) (op table)     (diff tests)
                  └──────────┴─────┬─────┘             │
                                   ▼                   │
-                       flow plan = choose lowering ◄──┘ (only verified lowerings are eligible)
+                       graph plan = choose lowering ◄──┘ (only verified lowerings are eligible)
                                   ▼
-                pack blueprint ──► mind session ──► your apps
+                modelfile blueprint ──► inference session ──► your apps
 ```
 
 Each Part below is built so it is useful on its own, then plugs into the next. The convergence milestones in Part I are the points where the parts lock together.
@@ -68,21 +68,21 @@ Each Part below is built so it is useful on its own, then plugs into the next. T
  APPS     forge (CLI) · forge-serve · forge-import · forge-bench · forge-inspect
  EMBEDS   FUSE · Rallytek · Cypha / CyphaLLM · CameraDetector · NeuralVFX · PRISM
  ─────────────────────────────────────────────────────────────────────────────
- mind     sessions · state (paged KV / SSM) · samplers · batching · adapters
- pack     manifest · blueprint IR · tokenizer spec · tensor store · signing
- flow     IR · shape inference · fusion · partitioning · memory plan · plans
- lane     CPU SIMD (raw · portable · algorithms · tiles)
- grid     GPU (CUDA · HIP · Level Zero/SYCL · Vulkan · Metal · CPU)
+ inference     sessions · state (paged KV / SSM) · samplers · batching · adapters
+ modelfile     manifest · blueprint IR · tokenizer spec · tensor store · signing
+ graph     IR · shape inference · fusion · partitioning · memory plan · plans
+ simd     CPU SIMD (raw · portable · algorithms · tiles)
+ gpu     GPU (CUDA · HIP · Level Zero/SYCL · Vulkan · Metal · CPU)
  support  mem · task · io · prof · rand · linalg · vision · audio · reflect · serve
- base     core (types, errors, mdspan, logging)  +  spec (ops, codegen)
+ base     core (types, errors, mdspan, logging)  +  ops (op declarations, codegen)
  gate     verify (oracle, differential tests, fuzzing, PRISM bridge)
 ```
 
 **Dependency rule — strictly downward:**
-- `lane` and `grid` know nothing about graphs.
-- `flow` knows nothing about models.
-- `mind` knows nothing about any specific architecture.
-- Embeds (FUSE, Cypha) can take just the layers they need — `core` + `lane` is header-only and costs nothing to pull in.
+- `simd` and `gpu` know nothing about graphs.
+- `graph` knows nothing about models.
+- `inference` knows nothing about any specific architecture.
+- Embeds (FUSE, Cypha) can take just the layers they need — `core` + `simd` is header-only and costs nothing to pull in.
 
 ---
 
@@ -92,38 +92,38 @@ Each Part below is built so it is useful on its own, then plugs into the next. T
 forge/
 ├── CMakeLists.txt · CMakePresets.json · LICENSE · NOTICE · SECURITY.md
 ├── cmake/                      toolchains, target presets, sanitizers, SBOM
-├── spec/
+├── ops/
 │   ├── ops/*.fspec             declarative op definitions (one file per op family)
 │   ├── reference/              scalar C++ reference implementations (the oracle)
 │   ├── intrinsics/             vendored machine-readable intrinsic databases
 │   └── gen/                    code generators (spec → C++/kernels/docs/tests)
 ├── core/                       config, error, expected, dtypes (f16/bf16/fp8/int4), mdspan utils, log
-├── lane/
+├── simd/
 │   ├── raw/{x86,arm,riscv,ppc,wasm,loongarch}/   GENERATED — 100% intrinsic coverage
 │   ├── portable/               vec, svec, mask, ops, conversions
 │   ├── math/                   vectorised libm with accuracy policies
 │   ├── algo/                   transform, reduce, scan, sort, search, transpose, dot, gemm-ukernels
 │   ├── tile/                   AMX / SME matrix units
 │   └── dispatch/               CPU feature detection, multiversioning, dispatch tables
-├── grid/
+├── gpu/
 │   ├── api/                    device, queue, buffer, view, kernel, graph, event
 │   ├── kernel/                 single-source kernel dialect (item, group, subgroup, mma, stage)
 │   ├── backends/{cuda,hip,level_zero,sycl,vulkan,metal,cpu}/
 │   ├── prims/                  reduce, scan, sort, gemm, fft, rng, top-k, softmax, norm
 │   └── loader/                 dynamic runtime loading, backend scoring, kernel cache
-├── flow/
+├── graph/
 │   ├── ir/                     graph IR, symbolic shapes, dtype system
 │   ├── passes/                 verify, canonicalise, fuse, layout, quant-propagate
 │   ├── partition/              capability + cost planner across devices
 │   ├── memplan/                liveness, arena offsets, in-place reuse
 │   ├── codecs/                 quantisation codecs (pluggable)
 │   └── exec/                   plan bytecode, executors, plan cache
-├── pack/
+├── modelfile/
 │   ├── format/                 container reader/writer, sections, sharding
 │   ├── blueprint/              blueprint language: text form, binary form, opsets
 │   ├── tokenizer/              BPE, Unigram, WordPiece, byte-level — as data
 │   └── trust/                  hashing, signing, encryption hooks
-├── mind/
+├── inference/
 │   ├── session/                session kinds: sequence, one-shot, diffusion, streaming
 │   ├── state/                  paged KV cache, prefix cache, SSM state
 │   ├── sample/                 sampler chains, grammars, speculative decoding
@@ -143,7 +143,7 @@ forge/
 
 ---
 
-# Part A — `lane`: SIMD on every CPU
+# Part A — `simd`: SIMD on every CPU
 
 ## A.1 Four tiers
 
@@ -154,14 +154,14 @@ forge/
 | **A — algorithms** | transform, reduce, scan, find, compare, sorting networks, transpose, histogram, byte/string search, UTF-8 validation, dot products, GEMM micro-kernels, quantised dot kernels | Hand-written on Tier P; hot ones specialised on Tier R |
 | **T — tiles** | Matrix engines: Intel AMX, Arm SME/SME2 | Separate API — tiles are not vectors |
 
-Tier R gives "covering all intrinsics" without writing them by hand: the generator reads the database, emits `lane::raw::x86::avx512bw::mm512_maskz_add_epi8(...)`-style wrappers with strong types, `[[gnu::always_inline]]`, and a `requires` clause naming the feature. Using an intrinsic your target doesn't have becomes a **compile error with the feature name**, not a crash on a customer's machine.
+Tier R gives "covering all intrinsics" without writing them by hand: the generator reads the database, emits `simd::raw::x86::avx512bw::mm512_maskz_add_epi8(...)`-style wrappers with strong types, `[[gnu::always_inline]]`, and a `requires` clause naming the feature. Using an intrinsic your target doesn't have becomes a **compile error with the feature name**, not a crash on a customer's machine.
 
 ## A.2 Capabilities instead of an inheritance chain
 
 xsimd models `sse2 → sse3 → … → avx512` as a chain. Real hardware is a set: a CPU can have AVX-512 VNNI but not FP16, AVX10 without the full legacy AVX-512 naming, NEON dot-product but not i8mm. FORGE models targets as **feature sets** and picks implementations by **concept subsumption** — the most constrained valid overload wins automatically.
 
 ```cpp
-namespace forge::lane {
+namespace forge::simd {
 
 // A target is a set of features (generated presets + user-defined)
 struct x86_64_v3 : caps<sse2, sse4_2, popcnt, avx, avx2, fma, f16c, bmi2> {};
@@ -188,18 +188,18 @@ Presets ship for the x86-64 micro-architecture levels (v2/v3/v4), named CPUs (Ze
 
 - `vec<T, Target>` — fixed width (SSE/AVX/AVX-512/NEON/VSX/WASM). Storable in structs.
 - `svec<T>` — length-agnostic (SVE/SVE2, RVV 1.0). Register-only; width known at run time.
-- `lane::strip` — strip-mining loop that hides width and tail handling. Algorithms written against the `Lane` concept work for both.
+- `simd::strip` — strip-mining loop that hides width and tail handling. Algorithms written against the `Lane` concept work for both.
 
 ```cpp
-template <lane::Target T>
+template <simd::Target T>
 void saxpy(float a, std::span<const float> x, std::span<float> y) {
-    lane::strip<T, float>(x.size(), [&](std::size_t i, auto m) {   // m = tail mask
-        auto vx = lane::load(x.data() + i, m);
-        auto vy = lane::load(y.data() + i, m);
-        lane::store(y.data() + i, lane::fma(lane::splat<T>(a), vx, vy), m);
+    simd::strip<T, float>(x.size(), [&](std::size_t i, auto m) {   // m = tail mask
+        auto vx = simd::load(x.data() + i, m);
+        auto vy = simd::load(y.data() + i, m);
+        simd::store(y.data() + i, simd::fma(simd::splat<T>(a), vx, vy), m);
     });
 }
-FORGE_LANE_EXPORT(saxpy, targets(sapphire, x86_64_v3, neoverse2, apple_m, rvv1, scalar));
+FORGE_SIMD_EXPORT(saxpy, targets(sapphire, x86_64_v3, neoverse2, apple_m, rvv1, scalar));
 ```
 
 On AVX-512 and SVE the tail mask becomes a native predicate (no scalar epilogue). On SSE/NEON it lowers to a blend or a short masked epilogue.
@@ -237,7 +237,7 @@ Detection covers what the OS actually enables, not just what CPUID reports: XGET
 ## A.8 Interop
 
 - Zero-cost `.native()` to get the raw intrinsic type, and construction from it.
-- Bidirectional conversion with C++26 `std::simd`. GCC 16 ships an experimental implementation that is x86-only for now, so `lane` treats it as an interop target, not a foundation.
+- Bidirectional conversion with C++26 `std::simd`. GCC 16 ships an experimental implementation that is x86-only for now, so `simd` treats it as an interop target, not a foundation.
 - `std::span` / `std::mdspan` everywhere for memory.
 
 ## A.9 ISA coverage matrix
@@ -259,7 +259,7 @@ Phase numbers refer to the roadmap in Part I.
 | WebAssembly | SIMD128, relaxed SIMD | post-v1 |
 | LoongArch | LSX, LASX | post-v1 |
 
-## A.10 Testing `lane`
+## A.10 Testing `simd`
 
 - **Exhaustive** testing for every 8- and 16-bit type op (all inputs, all lanes).
 - Edge-case corpora for 32/64-bit: ±0, ±inf, NaN payloads, denormals, boundaries, overflow points.
@@ -268,7 +268,7 @@ Phase numbers refer to the roadmap in Part I.
 
 ---
 
-# Part B — `grid`: one GPU programming model
+# Part B — `gpu`: one GPU programming model
 
 ## B.1 The model (not a CUDA clone)
 
@@ -287,18 +287,18 @@ CUDA's model is stream-first: you launch things into streams and optionally capt
 ```cpp
 struct Scale {
     float a;
-    FORGE_KERNEL void operator()(grid::item<1> it, grid::span<float> y) const {
+    FORGE_KERNEL void operator()(gpu::item<1> it, gpu::span<float> y) const {
         if (auto i = it.global(0); i < y.size()) y[i] *= a;
     }
 };
 
-auto dev = grid::select(grid::prefer::discrete);   // NVIDIA, AMD, Intel, Apple… or CPU
+auto dev = gpu::select(gpu::prefer::discrete);   // NVIDIA, AMD, Intel, Apple… or CPU
 auto q   = dev.queue();
 auto buf = dev.alloc<float>(n);
 
-grid::graph g;
+gpu::graph g;
 auto up = g.copy(host_span, buf);
-auto k  = g.launch(Scale{2.0f}, grid::extent{n}, buf).after(up);
+auto k  = g.launch(Scale{2.0f}, gpu::extent{n}, buf).after(up);
 g.copy(buf, host_span).after(k);
 
 auto exe = g.compile(q);   // → CUDA graph / HIP graph / SYCL graph / Vulkan cmdbuf / Metal ICB
@@ -313,7 +313,7 @@ exe.run();
 | warp / wavefront / sub-group | `subgroup` | Width 32 / 32 or 64 / 8–32 — a compile-time property of the kernel target |
 | shared memory / LDS / SLM | `group_memory` | Static and dynamic sizes |
 | SM / CU / Xe-core | `compute_unit` | |
-| Tensor Core / MFMA·WMMA / XMX | `matrix_unit` | Exposed via `grid::mma` |
+| Tensor Core / MFMA·WMMA / XMX | `matrix_unit` | Exposed via `gpu::mma` |
 | CUDA graph / HIP graph / SYCL graph | `graph` | Conditional nodes used where available |
 | TMA / async LDS copies / 2D block loads | `stage` | Async copy pipeline abstraction |
 
@@ -323,22 +323,22 @@ exe.run();
 - `group_memory<T, N>` and dynamic group memory; `group_barrier()`.
 - Atomics with **explicit scopes**: subgroup, group, device, system (`std::atomic_ref` semantics).
 - Subgroup ops: shuffle, broadcast, ballot, reduce, inclusive/exclusive scan, vote.
-- `grid::mma<M, N, K, A, B, Acc>` — maps to NVIDIA tensor-core instructions, AMD MFMA/WMMA, Intel joint-matrix/DPAS; falls back to subgroup FMA loops.
-- `grid::stage<Depth>` — multi-buffered async global→group-memory pipelines.
+- `gpu::mma<M, N, K, A, B, Acc>` — maps to NVIDIA tensor-core instructions, AMD MFMA/WMMA, Intel joint-matrix/DPAS; falls back to subgroup FMA loops.
+- `gpu::stage<Depth>` — multi-buffered async global→group-memory pipelines.
 - Restrictions enforced at compile time: no exceptions, no RTTI, no virtuals, no host-only std calls.
 
 ## B.4 Backends and how kernels reach them
 
 | Backend | Toolchain | Kernel path | Host runtime | Phase |
 |---|---|---|---|---|
-| **CPU** | host compiler | loop nest over `lane` + `task` | in-process | 2 |
+| **CPU** | host compiler | loop nest over `simd` + `task` | in-process | 2 |
 | **NVIDIA** | clang-CUDA or nvcc (CUDA 13.x, Turing → Blackwell) | `__global__` trampoline → PTX + cubin fatbin | CUDA Driver API, dynamically loaded | 2 |
 | **AMD** | clang/hipcc (ROCm 7.x) | `__global__` trampoline → AMDGPU code objects per gfx target | HIP runtime, dynamically loaded | 2 |
 | **Intel** | icpx / intel-llvm SYCL | `parallel_for` wrapper → SPIR-V or AOT binaries | Level Zero directly (SYCL runtime optional) | 5 |
 | **Vulkan** | generated SPIR-V (or Slang source) | compute shaders | Vulkan 1.3 compute | 6 |
 | **Metal** | generated MSL (or Slang source) | compute kernels | Metal | 6 |
 
-**Honest constraint:** C++ functors compile directly for CPU, CUDA, HIP and SYCL. They do **not** compile to Vulkan or Metal. For those two, kernels come from the `spec` code generator (or from Slang, a multi-target shading language). This is tractable because the kernel set an inference engine and game engine actually need is finite — on the order of a couple of hundred kernels — and they are exactly the ones `spec` already describes.
+**Honest constraint:** C++ functors compile directly for CPU, CUDA, HIP and SYCL. They do **not** compile to Vulkan or Metal. For those two, kernels come from the `ops` code generator (or from Slang, a multi-target shading language). This is tractable because the kernel set an inference engine and game engine actually need is finite — on the order of a couple of hundred kernels — and they are exactly the ones `ops` already describes.
 
 CUDA and HIP share ~90% of their backend code because their models are near-identical. That's why both land in the same phase.
 
@@ -349,7 +349,7 @@ CUDA and HIP share ~90% of their backend code because their models are near-iden
 - Pinned staging rings for uploads; zero-copy paths on unified-memory parts (Apple, APUs, Grace-class systems, Jetson).
 - Graphics interop: share buffers between FUSE's renderer (Vulkan/Metal) and compute (CUDA/HIP) via external memory/semaphores — needed for in-game inference without copies.
 
-## B.6 `grid::prims` — portable primitives
+## B.6 `gpu::prims` — portable primitives
 
 Reduce, scan, stream compaction, radix sort (keys and pairs), segmented ops, histogram, GPU hash map, GEMM / batched GEMM / GEMV (with epilogue fusion), convolution, FFT, Philox RNG, top-k, softmax, layer/RMS norm, flash-style attention.
 
@@ -368,9 +368,9 @@ Reduce, scan, stream compaction, radix sort (keys and pairs), segmented ops, his
 
 ---
 
-# Part C — `flow`: tensor graph compiler and executor
+# Part C — `graph`: tensor graph compiler and executor
 
-ggml builds a graph of tensor structs and walks it each time. `flow` treats the graph as a **program to compile once** and an execution plan to **replay**.
+ggml builds a graph of tensor structs and walks it each time. `graph` treats the graph as a **program to compile once** and an execution plan to **replay**.
 
 ## C.1 Pipeline
 
@@ -389,7 +389,7 @@ build ─► verify ─► canonicalise ─► optimise ─► partition ─► 
 | **partition** | Assigns subgraphs to devices using capability reports and a cost model (FLOPs, bytes moved, transfer cost); supports weight offload and layer splitting across GPUs |
 | **memory-plan** | Liveness analysis → static arena offsets; in-place reuse; peak-memory minimisation; reports exact memory need **before** running |
 | **lower** | Picks the most specific *verified* kernel for each op on its device |
-| **plan** | Emits a flat command list (bytecode for CPU; `grid::graph` for GPU) |
+| **plan** | Emits a flat command list (bytecode for CPU; `gpu::graph` for GPU) |
 | **replay** | Executes the plan; only pointers and scalar parameters change between runs |
 
 ## C.2 Symbolic shapes and plan caching
@@ -409,7 +409,7 @@ Planned codecs:
 
 New codecs drop in without touching the engine. Mixed precision per layer is a plan decision, not a file format limitation.
 
-## C.4 Extras in `flow`
+## C.4 Extras in `graph`
 
 - **Determinism mode**: fixed reduction orders and deterministic atomics → bit-identical results across runs on the same device. Needed for game replays, audit trails and debugging.
 - **Reverse-mode autodiff** (later phase): enables LoRA fine-tuning and on-device adaptation with the same IR.
@@ -417,7 +417,7 @@ New codecs drop in without touching the engine. Mixed precision per layer is a p
 
 ---
 
-# Part D — `pack`: the model container (`.fpk`)
+# Part D — `modelfile`: the model container (`.fpk`)
 
 This is what makes "import model data and run it" possible. The file is self-describing: it contains **what to compute**, not just numbers.
 
@@ -466,13 +466,13 @@ This is what makes "import model data and run it" possible. The file is self-des
 
 ---
 
-# Part E — `mind`: the generic inference engine
+# Part E — `inference`: the generic inference engine
 
 ## E.1 What "decoupled" means concretely
 
 ```
 llama.cpp:   model.gguf ──► "arch = llama" ──► llm_build_llama()  (C++ per architecture)
-FORGE:       model.fpk  ──► blueprint      ──► flow compiler      (no model-specific code)
+FORGE:       model.fpk  ──► blueprint      ──► graph compiler      (no model-specific code)
 ```
 
 Adding a new architecture = writing (or importing) a blueprint. No engine rebuild, no new release.
@@ -579,8 +579,8 @@ Initial templates: Llama-family decoders, Qwen, Mistral/Mixtral (MoE), Gemma, Ph
 ## E.6 APIs
 
 ```cpp
-auto model = forge::mind::open("model.fpk");                 // verify signature, map tensors
-auto sess  = model.session({ .devices = forge::grid::all(),
+auto model = forge::inference::open("model.fpk");                 // verify signature, map tensors
+auto sess  = model.session({ .devices = forge::gpu::all(),
                              .context = 32'768,
                              .determinism = false });
 for (auto t : sess.generate("Describe the scene.", { .temperature = 0.7f }))
@@ -605,7 +605,7 @@ for (auto t : sess.generate("Describe the scene.", { .temperature = 0.7f }))
 | `io` | mmap, async file I/O (io_uring / IOCP / dispatch_io), asset streaming, later direct-to-GPU storage | Model loading and FUSE asset streaming share one path |
 | `prof` | Scoped zones, counters, GPU timestamps, Perfetto / Chrome-trace export, optional Tracy | One timeline for CPU, GPU and inference |
 | `rand` | Counter-based RNG (Philox, Threefry) with **identical streams on CPU and every GPU** | Reproducible diffusion, deterministic game replays |
-| `linalg` | GEMM on `lane` micro-kernels + tile units; LU/QR/Cholesky/SVD/eig for small and medium sizes; sparse CSR/BSR SpMV/SpMM; CG/GMRES | Physics, vision geometry, PRISM numerics, analytics |
+| `linalg` | GEMM on `simd` micro-kernels + tile units; LU/QR/Cholesky/SVD/eig for small and medium sizes; sparse CSR/BSR SpMV/SpMM; CG/GMRES | Physics, vision geometry, PRISM numerics, analytics |
 | `vision` | Image decode (via vetted libs), resize, colour conversion, normalisation, NMS, ROI-align, video-decode hooks (NVDEC, VA-API, VideoToolbox, MediaCodec), camera capture | CameraDetector, seatbelt/phone detection, Rallytek street imagery |
 | `audio` | FFT, STFT, mel filterbanks, resampling, filters, ring buffers | NeuralVFX, FUSE audio, speech models |
 | `reflect` | Serialisation with C++26 reflection behind a feature macro where the compiler supports it, macro fallback otherwise | Save games, config, network messages, editor property panels |
@@ -614,21 +614,21 @@ for (auto t : sess.generate("Describe the scene.", { .temperature = 0.7f }))
 
 **FUSE (engine + GUI framework)**
 - `task`, `mem`, `io`, `prof` become FUSE's runtime services — one implementation, not two.
-- `grid` Vulkan/Metal backends are FUSE's compute layer: GPU particles, culling, skinning, physics broad-phase, all written once and running on Android, iOS, Linux, macOS and Windows.
-- `lane` accelerates the GUI framework's CPU paths: blending, colour conversion, glyph rasterisation, layout math.
-- `mind` embeds through the C ABI for in-engine AI tools (editor assistants, asset tagging) and in-game models.
+- `gpu` Vulkan/Metal backends are FUSE's compute layer: GPU particles, culling, skinning, physics broad-phase, all written once and running on Android, iOS, Linux, macOS and Windows.
+- `simd` accelerates the GUI framework's CPU paths: blending, colour conversion, glyph rasterisation, layout math.
+- `inference` embeds through the C ABI for in-engine AI tools (editor assistants, asset tagging) and in-game models.
 
 **Rallytek**
-- Cypha racing AI runs per frame on CPU via `lane` + `task`, inside the frame budget, with determinism mode so replays and ghost cars are bit-identical.
+- Cypha racing AI runs per frame on CPU via `simd` + `task`, inside the frame budget, with determinism mode so replays and ghost cars are bit-identical.
 - The real-world track builder runs as a `diffusion_loop` / vision pipeline over street-level imagery in the editor or offline via `forge-serve`, outputting into FUSE's asset pipeline.
 
 **Cypha / CyphaLLM**
-- Cypha takes **only `core` + `lane`** (header-only): no extra weight, no new code debt, and the single-core classifier gets explicit SIMD on every target.
+- Cypha takes **only `core` + `simd`** (header-only): no extra weight, no new code debt, and the single-core classifier gets explicit SIMD on every target.
 - Cypha's data packs (dictionary, thesaurus, text statistics) can ship as `.fpk` sections — signed, versioned, mmap'd — so code and data stay decoupled for Cypha too.
-- Optional: a `custom` session plugin lets apps call Cypha through the same `mind` API as neural models, without Cypha itself depending on `mind`.
+- Optional: a `custom` session plugin lets apps call Cypha through the same `inference` API as neural models, without Cypha itself depending on `inference`.
 
 **CameraDetector**
-- Macro and micro stages become two sub-graphs in one blueprint under `diffusion_loop`; `vision` handles pre/post-processing; `grid` runs it on whatever GPU the customer has.
+- Macro and micro stages become two sub-graphs in one blueprint under `diffusion_loop`; `vision` handles pre/post-processing; `gpu` runs it on whatever GPU the customer has.
 
 **Seatbelt / phone detection**
 - `one_shot` session with a fixed latency budget; same `.fpk` deploys to x86 boxes, Jetson-class boards (CUDA on Arm) and Android devices (Vulkan).
@@ -637,7 +637,7 @@ for (auto t : sess.generate("Describe the scene.", { .temperature = 0.7f }))
 - `streaming` session + `audio` module for low-latency processing; Philox RNG for reproducible generation.
 
 **PRISM**
-- `grid::prims` (radix sort, scan, compaction, GPU hash tables, segmented reductions) are exactly the building blocks of GPU-side solver work such as clause preprocessing and parallel local search — the CUDA solver goal gets AMD and Intel support for free.
+- `gpu::prims` (radix sort, scan, compaction, GPU hash tables, segmented reductions) are exactly the building blocks of GPU-side solver work such as clause preprocessing and parallel local search — the CUDA solver goal gets AMD and Intel support for free.
 - PRISM is FORGE's verification gate (Part G) and FORGE is a large real-world C++23 codebase for PRISM to prove itself on.
 
 ## F.3 Defence-grade properties (selling points)
@@ -670,7 +670,7 @@ for (auto t : sess.generate("Describe the scene.", { .temperature = 0.7f }))
 
 **Language**: C++23 baseline (matches PRISM). C++26 features — `std::simd` interop, reflection — behind feature macros.
 
-**Build**: CMake with presets; each module its own target; `core` and `lane` are header-only interface targets. Device-facing code stays in headers because GPU compilers' support for C++20 modules is limited; host-only libraries can adopt modules later.
+**Build**: CMake with presets; each module its own target; `core` and `simd` are header-only interface targets. Device-facing code stays in headers because GPU compilers' support for C++20 modules is limited; host-only libraries can adopt modules later.
 
 **Compilers**: GCC 15/16, Clang 20+, MSVC (Visual Studio 2026), Apple Clang, nvcc / clang-CUDA (CUDA 13.x), ROCm clang/hipcc (7.x), Intel icpx / intel-llvm (2026.x).
 
@@ -698,11 +698,11 @@ Sizes are relative (S < M < L < XL). The **critical path** is Phases 0 → 1 (x8
 
 | Phase | Size | Deliverables | Exit criteria |
 |---|---|---|---|
-| **0 — Foundations** | M | `core`, spec format and generator skeleton, ~60 reference ops, `verify` harness, CMake, emulated CI | One op written in `spec` automatically yields its reference implementation, tests and docs |
-| **1 — lane core** | L | Tier R generator (x86, Arm); Tier P on SSE→AVX-512, NEON, scalar; math lib (`fast`, `ml`); dispatch; core algorithms; f32/bf16/int8 GEMM micro-kernels | All Tier P ops pass the oracle on x86, NEON and scalar; GEMM hits a stated percentage of a vendor BLAS on a reference machine |
-| **2 — grid core** | L | API, graph-first execution, CPU + CUDA + HIP backends, core prims, loader, kernel cache | Same kernel source runs on CPU, NVIDIA and AMD; prims pass the oracle on all three |
-| **3 — flow** | L | IR, verify, passes, partitioner, memory planner, plans; first codecs (f16, bf16, int8, 4-bit k-quant) | Graph compiled once and replayed; predicted peak memory equals measured |
-| **4 — pack + mind MVP** | XL | `.fpk` reader/writer, blueprint text + binary, BPE tokenizer, safetensors/HF and GGUF importers, `generative_sequence`, KV cache, sampler chain, CLI | **Convergence 1 — "One file, three targets":** a Llama-class model imported from HF runs from one `.fpk` on CPU, NVIDIA and AMD with zero model-specific code, matching the golden reference |
+| **0 — Foundations** | M | `core`, spec format and generator skeleton, ~60 reference ops, `verify` harness, CMake, emulated CI | One op written in `ops` automatically yields its reference implementation, tests and docs |
+| **1 — simd core** | L | Tier R generator (x86, Arm); Tier P on SSE→AVX-512, NEON, scalar; math lib (`fast`, `ml`); dispatch; core algorithms; f32/bf16/int8 GEMM micro-kernels | All Tier P ops pass the oracle on x86, NEON and scalar; GEMM hits a stated percentage of a vendor BLAS on a reference machine |
+| **2 — gpu core** | L | API, graph-first execution, CPU + CUDA + HIP backends, core prims, loader, kernel cache | Same kernel source runs on CPU, NVIDIA and AMD; prims pass the oracle on all three |
+| **3 — graph** | L | IR, verify, passes, partitioner, memory planner, plans; first codecs (f16, bf16, int8, 4-bit k-quant) | Graph compiled once and replayed; predicted peak memory equals measured |
+| **4 — modelfile + inference MVP** | XL | `.fpk` reader/writer, blueprint text + binary, BPE tokenizer, safetensors/HF and GGUF importers, `generative_sequence`, KV cache, sampler chain, CLI | **Convergence 1 — "One file, three targets":** a Llama-class model imported from HF runs from one `.fpk` on CPU, NVIDIA and AMD with zero model-specific code, matching the golden reference |
 | **5 — Breadth** | XL | Intel (Level Zero / SYCL); SVE/SVE2/RVV; paged KV + prefix cache; continuous batching; speculative decoding; grammars; MoE + MLA; FP8 and MX codecs; multi-GPU; `forge-serve`; C ABI + Python | **Convergence 2 — "Every desktop GPU":** same file on NVIDIA, AMD and Intel; server handles concurrent requests |
 | **6 — Mobile + engine** | L | Vulkan + Metal backends from spec codegen; Android/iOS builds; graphics interop; FUSE runtime services moved onto `task`/`mem`/`io`/`prof` | **Convergence 3 — "In the game":** FUSE runs Cypha AI and a small model on Android and iOS through the same stack |
 | **7 — Modalities + your apps** | L | `diffusion_loop`, `streaming`, `vision`, `audio`; CameraDetector and seatbelt detection on edge; PRISM GPU solver prims; AMX/SME tiles; LoRA hot-swap; optional autodiff | **Convergence 4 — "Whole portfolio, one stack"** |
@@ -716,9 +716,9 @@ Parallelism: Phase 2's CPU backend can start alongside Phase 1, and the `.fpk` r
 
 - **Scale.** xsimd, HIP/SYCL, ggml and llama.cpp each represent years of work by large contributor bases. Solo, the only way through is ruthless sequencing: reach Convergence 1 before any breadth. AI coding agents are well suited to the generated and repetitive parts (Tier R wrappers, backend boilerplate, importer templates) — and the oracle is what makes that safe, because nothing ships that hasn't matched the reference.
 - **Peak performance.** Matching tuned vendor libraries on GEMM and attention is hard. The vendor escape hatch (B.6) means FORGE is never slower than the vendor where the vendor library exists, while staying portable where it doesn't.
-- **Vendor churn.** New GPU generations arrive yearly and support lists change. Keep backends thin; put intelligence in `flow` and `spec`.
+- **Vendor churn.** New GPU generations arrive yearly and support lists change. Keep backends thin; put intelligence in `graph` and `ops`.
 - **Blueprint expressiveness.** Some new architectures will need ops the engine lacks. Mitigation: **composite ops** — a file can define a new op as a composition of existing primitives, so new models run (slower) on older engines, and a fused kernel can be registered later without changing the file.
-- **Licensing and provenance.** xsimd (BSD-3) and llama.cpp (MIT) permit reuse with notices retained, but a clean-room implementation of a new pattern gives clean provenance for government customers; record anything derived in `NOTICE`. CUDA's headers and libraries are under NVIDIA's licence — mirror concepts, never code. Model weights carry their own licences; `pack` records them and the importer never strips them.
+- **Licensing and provenance.** xsimd (BSD-3) and llama.cpp (MIT) permit reuse with notices retained, but a clean-room implementation of a new pattern gives clean provenance for government customers; record anything derived in `NOTICE`. CUDA's headers and libraries are under NVIDIA's licence — mirror concepts, never code. Model weights carry their own licences; `modelfile` records them and the importer never strips them.
 - **Project licence.** FORGE is dual licensed: AGPL-3.0-or-later plus a commercial licence (see `LICENSE` and `COMMERCIAL-LICENCE.md`). Dual licensing only works while all copyright is held by the author, so any outside contributions need a contributor licence agreement before they are merged.
 - **Export obligations.** Shipping encryption and high-performance AI software to overseas government customers can bring the cryptography and dual-use categories of the Defence and Strategic Goods List into play. Check obligations with Defence Export Controls before exporting builds with the encryption hook enabled.
 
@@ -731,7 +731,7 @@ Parallelism: Phase 2's CPU backend can start alongside Phase 1, and the `.fpk` r
 3. Define the `.fspec` format (YAML-like or a small custom grammar) and write the generator skeleton.
 4. Write specs + scalar references for the first 20 ops: add, mul, fma, select, convert, reduce-sum/max, exp, log, tanh, sigmoid, silu, softmax, rms_norm, matmul, transpose, gather, rope, attention (naive).
 5. Build the `verify` oracle runner and tolerance policies; wire it into CI.
-6. Vendor the intrinsic databases into `spec/intrinsics/` and generate Tier R for x86.
+6. Vendor the intrinsic databases into `ops/intrinsics/` and generate Tier R for x86.
 7. Implement `caps`, target presets and concept-subsumption selection; test with a two-overload example.
 8. Implement `vec`, `mask`, load/store (incl. masked) on AVX2 and AVX-512.
 9. Implement `strip` and port `saxpy`, reductions and `softmax` row kernel.
@@ -739,10 +739,10 @@ Parallelism: Phase 2's CPU backend can start alongside Phase 1, and the `.fpk` r
 11. Add NEON to Tier R and Tier P; run under QEMU in CI.
 12. Write the vectorised `exp/log/tanh/sigmoid/silu` with `fast` and `ml` policies and the ULP harness.
 13. Build an f32 GEMM micro-kernel on AVX-512 and NEON; benchmark against a vendor BLAS.
-14. Define `grid` API headers (device, queue, buffer, view, graph) and the CPU backend.
+14. Define `gpu` API headers (device, queue, buffer, view, graph) and the CPU backend.
 15. Implement the CUDA backend: dynamic driver loading, fatbin loading, graph compile/replay.
 16. Port the backend to HIP; run the same kernels on an AMD card.
-17. Implement `grid::prims` reduce, scan and GEMM; pass the oracle on CPU, NVIDIA, AMD.
-18. Start `flow` IR with shape inference and the memory planner.
+17. Implement `gpu::prims` reduce, scan and GEMM; pass the oracle on CPU, NVIDIA, AMD.
+18. Start `graph` IR with shape inference and the memory planner.
 19. Write the `.fpk` writer/reader and the blueprint text parser; round-trip test.
 20. Write the Llama-family import template and run a small model end-to-end on CPU — the first step of Convergence 1.

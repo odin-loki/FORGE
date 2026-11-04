@@ -58,7 +58,7 @@ Device pools take their limit from `FORGE_MEM_DEVICE_LIMIT`. With no limit set, 
 FORGE already has allocators, and the memory manager works alongside them rather than replacing them:
 - **`mem::arena`** (`support/include/forge/mem/arena.hpp`): bump-pointer blocks with scope marks, for short-lived scratch memory. Alignment is any power of two.
 - **`mem::tlsf`** (`support/include/forge/mem/tlsf.hpp`): an O(1) general-purpose allocator over a fixed region, for device heaps and suballocation.
-- **`flow::memplan`**: works out tensor lifetimes at plan time and places all intermediates in one slab, so a graph's peak memory is known before it runs.
+- **`graph::memplan`**: works out tensor lifetimes at plan time and places all intermediates in one slab, so a graph's peak memory is known before it runs.
 - **Paged KV** (`session_options.page_rows`): the KV cache grows a page at a time instead of reserving the full context up front.
 
 The new piece is **`mem::budget_resource`**, a `std::pmr::memory_resource` that charges a budget for every allocation and throws `errc::out_of_memory` past the limit. Any `std::pmr` container, or an arena's upstream, can be accounted this way without changes to its code.
@@ -75,7 +75,7 @@ Alignment is passed straight through to the upstream resource, which by default 
 | Admission control | **done** | Before starting a queued request, the scheduler projects its cost from the largest KV size seen per request so far. If that would cross the soft watermark, it first drops prefix-cache entries, then leaves the request queued. At least one request always runs, so the queue keeps draining. Output is identical, only less parallel. Counted in `deferred` |
 | Backpressure in `forge-serve` | **done** | `--max-queue N` rejects new requests with **503 + `Retry-After: 1`** when N are already waiting. An `out_of_memory` error or `std::bad_alloc` while handling a request returns 503 instead of crashing the server |
 | Spill to disk | **core done** | `mem::spill_store` writes evicted blobs to numbered files in `FORGE_MEM_SPILL_DIR` (default `<tmp>/forge-spill-<pid>`), capped at `FORGE_MEM_SPILL_MAX`, and deletes them on destruction. Nothing spills to it automatically yet (see the phased plan) |
-| GPU memory | **accounting only** | Device pools exist and work, but the grid backends do not yet charge them |
+| GPU memory | **accounting only** | Device pools exist and work, but the gpu backends do not yet charge them |
 
 ## Observability
 - `forge info` prints physical RAM, available RAM, any cgroup limit and current cgroup usage, any `RLIMIT_AS`, the `host` budget and its soft watermark, and where the limit came from.
@@ -113,6 +113,6 @@ Example: to run in a 4 GiB container, the defaults are enough because the cgroup
 
 ## Phased plan
 1. **Done:** budgets, leases, caches, the governor, cgroup and rlimit detection, a pmr resource, the spill store, pressure hookup, KV accounting, admission control and prefix-cache eviction in the scheduler, plus `forge-serve --mem-limit`, `--max-queue`, 503 handling, `/metrics` and `forge info`.
-2. **Next:** charge device pools from the grid backends' buffer allocators, and evict device-resident tensors (`FORGE_GPU_NO_RESIDENCY` behaviour on demand) before a device allocation fails.
+2. **Next:** charge device pools from the gpu backends' buffer allocators, and evict device-resident tensors (`FORGE_GPU_NO_RESIDENCY` behaviour on demand) before a device allocation fails.
 3. **Next:** spill cached prefix KV to the `spill_store` instead of dropping it, and reload it when a prefix hits.
 4. **Later:** a per-request KV reservation sized from `(prompt + max_tokens) × kv bytes per token`, so a request that can never fit is rejected at submission. Budget-aware `forge run` and C ABI entry points. `os_proc_available_memory` on iOS and Job Object limits on Windows.

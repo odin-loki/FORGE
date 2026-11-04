@@ -1,9 +1,9 @@
 # serve: the forge-serve HTTP server
 
 ## Concepts
-`forge-serve` serves one model over HTTP with an OpenAI-compatible API. Requests share a continuous-batching scheduler (`mind/batch.hpp`), which also reuses KV-cache entries for prompts with a shared prefix.
+`forge-serve` serves one model over HTTP with an OpenAI-compatible API. Requests share a continuous-batching scheduler (`inference/batch.hpp`), which also reuses KV-cache entries for prompts with a shared prefix.
 
-The same binary also runs as a load-balancing proxy in front of several servers (`forge-serve proxy`, see [balance.md](balance.md)).
+The same binary also runs as a load-balancing proxy in front of several servers (`forge-serve proxy`, see [loadbalancer.md](loadbalancer.md)).
 
 If you pass a Hugging Face directory or a `.gguf` file, it is imported into a temporary `.fpk` first. `--codec` picks the weight codec for that import.
 
@@ -15,7 +15,7 @@ Defaults are taken from `apps/forge_serve.cpp`:
 ```
 forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx 0] [--codec f32]
             [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0]
-forge-serve proxy ...                      # see balance.md
+forge-serve proxy ...                      # see loadbalancer.md
 ```
 
 `--ctx 0` means use the model's maximum context.

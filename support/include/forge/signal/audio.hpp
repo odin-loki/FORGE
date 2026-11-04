@@ -1,5 +1,5 @@
 #pragma once
-// audio: windowed-sinc rational resampler and RBJ biquad filters (ring buffers live in mind/streaming.hpp).
+// audio: windowed-sinc rational resampler and RBJ biquad filters (ring buffers live in inference/streaming.hpp).
 #include <cmath>
 #include <complex>
 #include <cstddef>

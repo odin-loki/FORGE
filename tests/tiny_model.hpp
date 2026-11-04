@@ -1,7 +1,7 @@
 #pragma once
 // Builds a random tiny Llama .fpk in-process (byte-level tokenizer, vocab 260) for engine tests.
 #include <forge/import/hf.hpp>
-#include <forge/pack/fpk.hpp>
+#include <forge/modelfile/fpk.hpp>
 #include <random>
 
 namespace forge_test {
@@ -40,7 +40,7 @@ inline std::string make_tiny_model(const std::string& path, tiny_cfg c = {}) {
                      {"vocab_size", double(c.vocab)}, {"rms_norm_eps", 1e-5}, {"rope_theta", 10000.0}, {"rope_neox", 1.0}};
     auto bp = import::instantiate(import::read_file(import::template_dir() / "llama.fbp"), json::value(cfg));
     std::mt19937 rng(c.seed); std::normal_distribution<float> N(0, 1);
-    pack::writer w;
+    modelfile::writer w;
     auto put = [&](const std::string& n, shape_t s, float sd, float mean = 0) {
         std::vector<float> d(std::size_t(numel(s))); for (auto& x : d) x = mean + sd * N(rng);
         w.add_tensor(n, s, d, n.find("norm") != std::string::npos || n == "tok_emb" ? std::string("f32") : c.codec);

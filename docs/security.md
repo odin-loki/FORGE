@@ -35,14 +35,14 @@ the engine's `confirm`) returns true; with neither, `confirmed()` returns false 
 capability flags and child limits still apply.
 
 ## RPC
-Token and Ed25519 key auth, optional TLS (`flow/include/forge/flow/rpc_secure.hpp`, docs/rpc.md).
+Token and Ed25519 key auth, optional TLS (`graph/include/forge/graph/rpc_secure.hpp`, docs/rpc.md).
 Remote scripts (`rpc-serve --allow-scripts`) are refused at server construction without auth
-(`flow/include/forge/flow/rpc.hpp`). Remote scripts run one at a time with a timeout (`--script-timeout`,
+(`graph/include/forge/graph/rpc.hpp`). Remote scripts run one at a time with a timeout (`--script-timeout`,
 default 60000 ms) and optional `--script-no-proc/-fs/-net` (`apps/forge.cpp`). Without auth on a non-loopback
 bind the server prints a warning but still serves non-script RPC.
 
 ## Signing
-`.fpk` model packages: Ed25519 signatures over the section-table digest (`pack/include/forge/pack/sign.hpp`,
+`.fpk` model packages: Ed25519 signatures over the section-table digest (`modelfile/include/forge/modelfile/sign.hpp`,
 `verify_signature`); with no trusted keys any valid signature passes (integrity only). Encryption uses
 XChaCha20-Poly1305 (vendored Monocypher). Release artifacts: `tools/release.py` (docs/RELEASING.md).
 Secrets at rest: `os/include/forge/os/keystore.hpp`.
@@ -66,8 +66,8 @@ Everything above describes `main`. The following work is on feature branches and
 |---|---|---|---|
 | ForgeScript OS sandbox on by default | `forge-script-os-sandbox` | When any of fs/net/proc is disallowed, the engine also applies `os::apply_sandbox` (deny network, deny starting processes, deny file writes); mode `off`/default/`require`, where `require` fails the run if the sandbox cannot be applied; exceptions: Python-style `OSError` hierarchy (`PermissionError`, `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError` and the file/connection errors are all `OSError` subclasses) and `SandboxViolationError` (a `PermissionError`); `ProcessPool` workers run in sandboxed processes; test `tests/test_script_os_sandbox.cpp` | Compiles on Linux; non-Linux paths untested |
 | Typed OS exceptions | `forge-script-os-sandbox` | `os/include/forge/os/oserror.hpp`: errno / Win32 / Capsicum errors, sandbox violations and fault signals become typed, catchable ForgeScript exceptions; test `tests/test_script_oserror.cpp` | Compiles on Linux; non-Linux paths untested |
-| Generic Ed25519 bundle signing | `forge-bundle-sign` | `pack/include/forge/pack/bundle.hpp`: detached `sign_bytes`/`verify_bytes` and signed bundles (`FORGE-SIGNATURE.json`); test `tests/test_bundle_sign.cpp` | Compile-checked only, tests not run |
-| Qwen 3.5 models | `qwen35` (PR #13) | Gated DeltaNet + gated full attention (`flow/state_ops.hpp`, `import/templates/qwen3_5.fbp`) | Open PR |
+| Generic Ed25519 bundle signing | `forge-bundle-sign` | `modelfile/include/forge/modelfile/bundle.hpp`: detached `sign_bytes`/`verify_bytes` and signed bundles (`FORGE-SIGNATURE.json`); test `tests/test_bundle_sign.cpp` | Compile-checked only, tests not run |
+| Qwen 3.5 models | `qwen35` (PR #13) | Gated DeltaNet + gated full attention (`graph/state_ops.hpp`, `import/templates/qwen3_5.fbp`) | Open PR |
 | Building FORGE as a subproject | local fix, not pushed | Lets FORGE build inside another project's CMake build | Not on remote |
 
 Known gaps still open on those branches: nested `sandbox{}` blocks are interpreter-checked only; on Windows only process creation is blocked.

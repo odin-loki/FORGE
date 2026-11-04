@@ -3,7 +3,7 @@
 set -eu
 cd "$(dirname "$0")/.."
 out=bindings/apple/FORGE.xcframework; rm -rf "$out" build/xcf; mkdir -p build/xcf/include
-cp mind/include/forge.h build/xcf/include/
+cp inference/include/forge.h build/xcf/include/
 build() { # name, extra cmake args
   cmake -S . -B "build/xcf/$1" -G Xcode -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_APPS=OFF "$@" >/dev/null
   cmake --build "build/xcf/$1" --config Release --target forge_c

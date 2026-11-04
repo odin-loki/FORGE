@@ -1,9 +1,9 @@
 // Cypha integration (Part F.2): core + lane only for the classifier hot loop, data packs as .fpk sections,
-// and an optional `custom` session plugin so apps reach Cypha through the mind API.
-// Usage: cypha_classifier [pack.fpk]   (writes a demo pack to the temp dir when omitted)
-#include <forge/lane/dispatch.hpp>
-#include <forge/mind/plugin.hpp>
-#include <forge/pack/fpk.hpp>
+// and an optional `custom` session plugin so apps reach Cypha through the inference API.
+// Usage: cypha_classifier [modelfile.fpk]   (writes a demo modelfile to the temp dir when omitted)
+#include <forge/simd/dispatch.hpp>
+#include <forge/inference/plugin.hpp>
+#include <forge/modelfile/fpk.hpp>
 #include <cstdio>
 #include <filesystem>
 #include <sstream>
@@ -19,44 +19,44 @@ struct cypha_classifier {
         return c;
     }
     std::vector<float> scores(const float* x) const {                // explicit SIMD dot on every target
-        auto& k = lane::active(); std::vector<float> s(labels.size());
+        auto& k = simd::active(); std::vector<float> s(labels.size());
         for (std::size_t i = 0; i < labels.size(); ++i) s[i] = k.dot(x, centroids.data() + i * dim, dim);
         return s;
     }
 };
 
 // --- App side: register as a `custom` session plugin -----------------------------------------------
-struct cypha_service : mind::plugin::service {
+struct cypha_service : inference::plugin::service {
     cypha_classifier c;
     explicit cypha_service(const std::string& pack) {
-        pack::reader r(pack);
+        modelfile::reader r(pack);
         c = cypha_classifier::from_text(r.section_text("cypha.text_stats"));
     }
     std::string name() const override { return "cypha"; }
-    mind::plugin::tensors run(const mind::plugin::tensors& in) override {
+    inference::plugin::tensors run(const inference::plugin::tensors& in) override {
         auto it = in.find("features");
         if (it == in.end() || it->second.size() != c.dim) raise(errc::invalid_argument, "cypha: need 'features' of {} floats", c.dim);
         return {{"scores", c.scores(it->second.data())}};
     }
 };
-static mind::plugin::registrar reg{"cypha", [](const std::string& cfg) { return std::make_unique<cypha_service>(cfg); }};
+static inference::plugin::registrar reg{"cypha", [](const std::string& cfg) { return std::make_unique<cypha_service>(cfg); }};
 
 int main(int argc, char** argv) {
     std::string path;
     if (argc > 1) path = argv[1];
     else {
         path = (std::filesystem::temp_directory_path() / "cypha_demo.fpk").string();
-        pack::writer w;
+        modelfile::writer w;
         w.set_manifest(json::object{{"name", "cypha-demo"}, {"version", "1"}});
         w.set_section("cypha.text_stats", "4\nnews 1 0 0 0\nsport 0 1 0 0\ncode 0 0 1 1\n");
         w.set_section("cypha.dictionary", "a\nan\nthe\n");
         w.write(path);
     }
-    mind::plugin::session s("cypha", path);
+    inference::plugin::session s("cypha", path);
     auto out = s.infer({{"features", {0.1f, 0.2f, 0.9f, 0.8f}}});
     auto& sc = out["scores"];
     std::size_t best = 0; for (std::size_t i = 1; i < sc.size(); ++i) if (sc[i] > sc[best]) best = i;
     auto& svc = static_cast<cypha_service&>(s.get());
-    std::printf("cypha (%s lane): %s (%.2f)\n", lane::active().target, svc.c.labels[best].c_str(), sc[best]);
+    std::printf("cypha (%s lane): %s (%.2f)\n", simd::active().target, svc.c.labels[best].c_str(), sc[best]);
     return svc.c.labels[best] == "code" || argc > 1 ? 0 : 1;
 }

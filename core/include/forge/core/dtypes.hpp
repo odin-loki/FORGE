@@ -213,7 +213,7 @@ template <class T> inline T stochastic_round(float f, u32 r) {
 using c32 = std::complex<float>;
 using c64 = std::complex<double>;
 
-// Runtime dtype tag used by flow/pack. New tags are appended before `invalid` so stored values stay stable.
+// Runtime dtype tag used by graph/modelfile. New tags are appended before `invalid` so stored values stay stable.
 enum class dtype : u8 { f32, f16, bf16, f64, i8, u8, i16, i32, i64, fp8_e4m3, fp8_e5m2, q8_0, q4_k,
                         q4_g32, q8_g32, mxfp8, mxfp6, mxfp4, mxint8, nvfp4, tq2, q6_k, q5_k, invalid };
 
@@ -236,7 +236,7 @@ constexpr dtype dtype_from_name(std::string_view s) {
         if (name(dtype(i)) == s) return dtype(i);
     return dtype::invalid;
 }
-// Bytes per element for plain dtypes (block codecs report 0; see flow/codecs).
+// Bytes per element for plain dtypes (block codecs report 0; see graph/codecs).
 constexpr std::size_t size_of(dtype d) {
     switch (d) {
         case dtype::f32: case dtype::i32: return 4; case dtype::f64: case dtype::i64: return 8;

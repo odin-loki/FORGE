@@ -1,7 +1,7 @@
 # forge rpc-serve: authentication, TLS and remote scripts
 
 `forge rpc-serve` lends a machine's devices (and, optionally, its script runtime) to other FORGE
-processes. Code: `flow/include/forge/flow/rpc.hpp`, `flow/include/forge/flow/rpc_secure.hpp`.
+processes. Code: `graph/include/forge/graph/rpc.hpp`, `graph/include/forge/graph/rpc_secure.hpp`.
 
 ## Authentication
 
