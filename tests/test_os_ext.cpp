@@ -3,6 +3,7 @@
 // FORGE_OS_EXT_CHILD=<mode> and are dispatched from a static initializer before the test runner starts.
 #include "check.hpp"
 #include <forge/os/all.hpp>
+#include <forge/os/oserror.hpp>
 #include <atomic>
 using namespace forge;
 
@@ -135,6 +136,12 @@ static void aio_roundtrip(os::async_file_io& io, const std::string& path) {
 TEST(async_file_io) {
     auto d = scratch("aio");
     { os::async_file_io io; std::printf("  backend %s\n", io.backend_name()); aio_roundtrip(io, os::join(d, "a.bin")); }
+    {   // a failing request completes with its own user value and a negative result; nothing stays in flight
+        os::async_file_io io; auto f = os::file::open(os::join(d, "a.bin"), os::wr); CHECK(f); char b[16];
+        auto st = io.read(f.value, b, sizeof b, 0, 4242);
+        if (st) { auto c = io.wait(1, 5000); CHECK(c.size() == 1); if (!c.empty()) { CHECK(c[0].user == 4242); CHECK(c[0].result < 0); } }
+        CHECK(io.in_flight() == 0); io.forget(f.value);
+    }
     os::setenv("FORGE_AIO", "threads");
     { os::async_file_io io; CHECK(io.backend() == os::aio_backend::threads); aio_roundtrip(io, os::join(d, "b.bin")); }
     os::unsetenv("FORGE_AIO"); os::remove_all(d);
@@ -210,7 +217,17 @@ TEST(shared_memory) {
     int rc = run_child("shm:" + name); CHECK(rc == 0);
     CHECK(std::string(reinterpret_cast<char*>(a->data() + 64)) == "child-was-here");
 #endif
+    CHECK(!os::shared_memory::create(name, 1 << 16));   // taken: never silently reopened / truncated
     a->close(); CHECK(!os::shared_memory::open("osx-missing-" + std::to_string(os::pid())));
+    CHECK(!os::shared_memory::create("osx-zero-" + std::to_string(os::pid()), 0));
+    // Long names that share a prefix stay distinct (Apple truncated them to 26 chars before).
+    std::string base = "osx-long-name-shared-prefix-" + std::to_string(os::pid()) + "-abcdefghijklmnop-";
+    auto x = os::shared_memory::create(base + "one", 4096), y = os::shared_memory::create(base + "two", 4096);
+    CHECK_MSG(x && y, "%s %s", x.err.what.c_str(), y.err.what.c_str());
+    if (x && y) { x->data()[0] = 1; y->data()[0] = 2; CHECK(x->data()[0] == 1); }
+#if defined(__APPLE__)
+    CHECK(os::shared_memory::os_name(base + "one").size() <= 31); CHECK(os::shared_memory::os_name(base + "one") != os::shared_memory::os_name(base + "two"));
+#endif
 }
 // ---------------------------------------------------------------- 8 GPU discovery
 TEST(gpu_discovery) {
@@ -240,11 +257,44 @@ TEST(local_ipc) {
         CHECK(c->write_all("ping", 4)); char b[5] = {}; CHECK(c->read_exact(b, 4)); CHECK(std::string(b) == "pong");
     });
     auto s = l->accept(5000); CHECK_MSG(s, "%s", s.err.what.c_str());
-    if (s) { char b[5] = {}; CHECK(s->read_exact(b, 4)); CHECK(std::string(b) == "ping"); CHECK(s->write_all("pong", 4)); }
+    if (s) {
+        char b[5] = {}; CHECK(s->read_exact(b, 4)); CHECK(std::string(b) == "ping"); CHECK(s->write_all("pong", 4));
+        auto pc = s->peer(); CHECK_MSG(pc, "%s", pc.err.what.c_str());
+        if (pc) {
+            std::printf("  peer pid=%lld uid=%lld sid=%s\n", (long long)pc->pid, (long long)pc->uid, pc->sid.c_str());
+#if defined(_WIN32)
+            CHECK(pc->pid == std::int64_t(os::pid())); CHECK(pc->sid.rfind("S-1-", 0) == 0);
+#else
+            CHECK(pc->uid == std::int64_t(::getuid()));
+#if defined(__linux__) || defined(__APPLE__)
+            CHECK(pc->pid == std::int64_t(os::pid()));
+#endif
+#endif
+        }
+    }
     cl.join();
-    auto t = l->accept(50); CHECK(!t);   // timeout
+    // Repeated timeouts (Windows: each cancels an overlapped ConnectNamedPipe whose OVERLAPPED is on the stack),
+    // then a real client still gets through.
+    for (int i = 0; i < 5; ++i) { auto t = l->accept(20); CHECK(!t); if (!t) CHECK(os::classify(t.err) == os::os_errc::timed_out); }
+    std::thread cl2([&] { auto c = os::local_stream::connect(ep); CHECK(c); if (c) CHECK(c->write_all("x", 1)); });
+    { auto s2 = l->accept(5000); CHECK_MSG(s2, "%s", s2.err.what.c_str()); char b = 0; if (s2) { CHECK(s2->read_exact(&b, 1)); CHECK(b == 'x'); } }
+    cl2.join();
 #if defined(__linux__)
     auto ab = os::local_listener::listen("@forge-osx-" + std::to_string(os::pid())); CHECK(ab);
+#endif
+#if defined(FORGE_OS_POSIX)
+    {   // listen() on a path holding a regular file fails and leaves the file alone
+        auto d = scratch("ipc"); auto f = os::join(d, "not-a-socket"); CHECK(os::write_file(f, "keep me"));
+        auto bad = os::local_listener::listen(f); CHECK(!bad);
+        CHECK(os::read_file(f).value == "keep me");
+        // a stale socket from a dead listener is replaced
+        auto sp = os::join(d, "s.sock");
+        { sockaddr_un a{}; socklen_t len = 0; CHECK(!os::local_stream::addr_(sp, a, len)); int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+          CHECK(fd >= 0 && ::bind(fd, reinterpret_cast<sockaddr*>(&a), len) == 0); ::close(fd); }   // left behind, as by a crash
+        auto l2 = os::local_listener::listen(sp); CHECK_MSG(l2, "%s", l2.err.what.c_str());
+        if (l2) { l2->close(); CHECK(!os::exists(sp)); }
+        os::remove_all(d);
+    }
 #endif
 }
 // ---------------------------------------------------------------- 10 crash handling

@@ -4,7 +4,10 @@
 #include <forge/os/time.hpp>
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/console.hpp>
+#include <forge/os/oserror.hpp>
+#include <forge/os/pipe.hpp>
 #include <atomic>
+#include <thread>
 #include <vector>
 #include "check.hpp"
 using namespace forge;
@@ -155,6 +158,71 @@ TEST(sysinfo_ext) {
         double busy1 = 0, all1 = 0; for (auto& t : *b) { busy1 += t.total() - t.idle; all1 += t.total(); }
         CHECK(all1 > all0); CHECK(busy1 > busy0);
     }
+}
+// ---------------------------------------------------------------- audit W1-B regressions
+TEST(fs_non_ascii_paths) {
+    auto d = fs::make_temp_dir("forge-\xC3\xA9-\xE6\x97\xA5-"); CHECK(d); if (!d) return;   // "é", "日"
+    CHECK(os::stat(*d).is_dir);
+    auto p = *d + "/\xE6\x97\xA5\xE6\x9C\xAC-caf\xC3\xA9.txt";
+    CHECK(fs::write_file_atomic(p, "one")); CHECK(fs::write_file_atomic(p, "two")); CHECK(os::read_file(p).value == "two");
+    auto l = os::list_dir(*d); CHECK(l && l->size() == 1 && (*l)[0].name == "\xE6\x97\xA5\xE6\x9C\xAC-caf\xC3\xA9.txt");   // no stray temp file
+    { auto k = fs::file_lock::acquire(*d + "/l\xC3\xA9.lock"); CHECK(k); }
+    CHECK(fs::exists(*d + "/l\xC3\xA9.lock"));   // created under its real (UTF-8) name, not a byte-widened one
+    auto t = fs::make_temp_file("t\xC3\xA9-", ".tmp"); CHECK(t); if (t) { CHECK(os::stat(*t).is_file); CHECK(t->find("t\xC3\xA9-") != std::string::npos); fs::remove_all(*t); }
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0444)); CHECK(!os::file::open(*d + "/ro.txt", os::wr));
+    SetFileAttributesW(os::widen(*d + "/ro.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
+#else
+    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0600)); CHECK((*fs::mode(*d + "/ro.txt") & 0077) == 0);
+#endif
+    CHECK(fs::remove_all(*d)); CHECK(!fs::exists(*d));
+}
+TEST(mount_unescape_is_safe) {
+    CHECK(fs::mount_unescape("/mnt/with\\040space") == "/mnt/with space");
+    CHECK(fs::mount_unescape("a\\134b") == "a\\b");
+    CHECK(fs::mount_unescape("bad\\9zz") == "bad\\9zz"); CHECK(fs::mount_unescape("end\\04") == "end\\04"); CHECK(fs::mount_unescape("\\") == "\\");
+}
+TEST(classify_by_domain) {
+    CHECK(os::classify(os::errno_error(ENOENT, "x")) == os::os_errc::not_found);
+    CHECK(os::classify(os::errno_error(EEXIST, "x")) == os::os_errc::already_exists);   // 17 = ERROR_NOT_SAME_DEVICE as Win32
+    CHECK(os::classify(os::errno_error(EINVAL, "x")) == os::os_errc::invalid_argument);
+#if defined(EAI_NONAME)
+    CHECK(os::classify(os::error{EAI_NONAME, "x", os::err_domain::gai}) == os::os_errc::not_found);
+    CHECK(os::classify_gai(EAI_AGAIN) == os::os_errc::would_block);
+#endif
+    auto missing = fs::file_size("definitely/not/here-forge"); CHECK(!missing); CHECK(os::classify(missing.err) == os::os_errc::not_found);
+    auto parse = os::parse_iso8601("nope"); CHECK(os::classify(parse.err) == os::os_errc::invalid_argument);
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(os::classify(os::error{int(ERROR_FILE_NOT_FOUND), "x"}) == os::os_errc::not_found);
+    CHECK(os::classify(os::error{int(ERROR_FILE_NOT_FOUND), "x", os::err_domain::win32}) == os::os_errc::not_found);
+    struct { unsigned long code; os::os_errc k; } t[] = {
+        {ERROR_HANDLE_EOF, os::os_errc::io}, {11001, os::os_errc::not_found}, {11002, os::os_errc::would_block}, {ERROR_SEM_TIMEOUT, os::os_errc::timed_out},
+        {ERROR_PIPE_BUSY, os::os_errc::busy}, {ERROR_NOT_FOUND, os::os_errc::not_found}, {10052, os::os_errc::connection_reset},
+        {ERROR_NETWORK_UNREACHABLE, os::os_errc::network_unreachable}, {ERROR_CANT_RESOLVE_FILENAME, os::os_errc::too_many_links},
+        {10047, os::os_errc::not_supported}, {ERROR_COMMITMENT_LIMIT, os::os_errc::out_of_memory}, {ERROR_ALREADY_EXISTS, os::os_errc::already_exists}};
+    for (auto& e : t) CHECK_MSG(os::classify_win32(e.code) == e.k, "%lu -> %s", e.code, os::name(os::classify_win32(e.code)));
+#else
+    CHECK(os::classify(os::error{ENOENT, "x"}) == os::os_errc::not_found);
+    CHECK(os::classify(os::error{2, "x", os::err_domain::win32}) == os::os_errc::other);
+#endif
+}
+TEST(timezone_and_offsets) {
+    auto tz = os::timezone_name(); std::printf("  timezone_name: '%s'\n", tz.c_str());
+#if defined(FORGE_OS_WINDOWS) || defined(__APPLE__) || defined(FORGE_OS_ANDROID) || defined(FORGE_OS_FREEBSD)
+    CHECK(!tz.empty());
+#endif
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(std::string(os::windows_zone_to_iana("W. Europe Standard Time")) == "Europe/Berlin"); CHECK(!os::windows_zone_to_iana("No Such Zone"));
+#endif
+    int o = os::utc_offset_seconds(-86400LL * 365 * 300); CHECK(o >= -16 * 3600 && o <= 16 * 3600);   // year 1670: 0 or a sane offset, no garbage
+}
+TEST(pipe_read_timeout) {
+    auto p = os::make_pipe(); CHECK(p); if (!p) return;
+    auto t0 = os::monotonic_ns(); CHECK(p->read.read_some(100, 50).empty()); CHECK(os::monotonic_ns() - t0 >= 40'000'000ull);
+    CHECK(p->write.write_all("hello")); CHECK(p->read.read_some(100, 2000) == "hello");
+    std::thread w([&] { os::sleep_ns(30'000'000); p->write.write_all(" world"); p->write.close(); });
+    std::string all; for (std::string c; !(c = p->read.read_some(100, 5000)).empty();) all += c;
+    w.join(); CHECK(all == " world");
 }
 TEST(console_bits) {
     CHECK(os::console::paint("x", os::console::color::red, false) == "x");

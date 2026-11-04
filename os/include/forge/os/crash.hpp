@@ -41,7 +41,7 @@ struct dbghelp {
     DWORD(WINAPI* SymSetOptions)(DWORD) = nullptr;
     BOOL(WINAPI* MiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, void*, void*, void*) = nullptr;
     static dbghelp& get() {
-        static dbghelp d = [] { dbghelp x; x.h = LoadLibraryW(L"dbghelp.dll"); if (!x.h) return x;
+        static dbghelp d = [] { dbghelp x; x.h = LoadLibraryExW(L"dbghelp.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); if (!x.h) return x;
             x.SymInitialize = reinterpret_cast<decltype(x.SymInitialize)>(reinterpret_cast<void*>(GetProcAddress(x.h, "SymInitialize")));
             x.SymFromAddr = reinterpret_cast<decltype(x.SymFromAddr)>(reinterpret_cast<void*>(GetProcAddress(x.h, "SymFromAddr")));
             x.SymSetOptions = reinterpret_cast<decltype(x.SymSetOptions)>(reinterpret_cast<void*>(GetProcAddress(x.h, "SymSetOptions")));

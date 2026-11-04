@@ -161,8 +161,8 @@ namespace {
 // (OneDrive, group policy) are honoured, which %USERPROFILE%\Documents is not.
 std::string known_folder(const GUID& id) {
     using get_t = HRESULT(WINAPI*)(const GUID&, DWORD, HANDLE, PWSTR*); using free_t = void(WINAPI*)(void*);
-    static auto get = reinterpret_cast<get_t>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"shell32.dll"), "SHGetKnownFolderPath")));
-    static auto release = reinterpret_cast<free_t>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryW(L"ole32.dll"), "CoTaskMemFree")));
+    static auto get = reinterpret_cast<get_t>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryExW(L"shell32.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/), "SHGetKnownFolderPath")));
+    static auto release = reinterpret_cast<free_t>(reinterpret_cast<void*>(GetProcAddress(LoadLibraryExW(L"ole32.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/), "CoTaskMemFree")));
     if (!get) return {};
     PWSTR p = nullptr; std::string r;
     if (SUCCEEDED(get(id, 0 /*KF_FLAG_DEFAULT*/, nullptr, &p)) && p) {

@@ -1,6 +1,7 @@
 // forge::os: the unified OS layer, exercised on whatever OS this runs on.
 #include "check.hpp"
 #include <forge/os/os.hpp>
+#include <forge/os/oserror.hpp>
 #include <atomic>
 using namespace forge;
 
@@ -140,5 +141,95 @@ TEST(completion_port) {
     CHECK(cp.write_async(*f, "XY", 2, 0, 7)); CHECK(cp.wait(c, 2000)); CHECK(c.key == 7 && c.bytes == 2);
     CHECK(cp.post(99)); CHECK(cp.wait(c, 2000)); CHECK(c.key == 99);
     CHECK(!cp.wait(c, 20));
-    f->close(); CHECK(os::read_file(p).value == "XY23456789"); os::remove_all(d);
+    cp.forget(*f); f->close(); CHECK(os::read_file(p).value == "XY23456789"); os::remove_all(d);
+}
+// ---------------------------------------------------------------- audit W1-B regressions
+TEST(non_ascii_paths) {
+    // "é" and CJK "日本": UTF-8 in, UTF-16 to the Windows APIs, UTF-8 back out.
+    auto d = os::join(scratch(), "d\xC3\xA9j\xC3\xA0-\xE6\x97\xA5\xE6\x9C\xAC"); CHECK(os::mkdirs(d));
+    auto p = os::join(d, "f\xC3\xA9.txt");
+    CHECK(os::write_file(p, "caf\xC3\xA9")); CHECK(os::read_file(p).value == "caf\xC3\xA9");
+    auto st = os::stat(p); CHECK(st.exists && st.is_file && !st.is_link && st.size == 5);
+    auto l = os::list_dir(d); CHECK(l && l->size() == 1 && (*l)[0].name == "f\xC3\xA9.txt");
+    CHECK(os::rename(p, os::join(d, "\xE6\x97\xA5.txt"))); CHECK(os::exists(os::join(d, "\xE6\x97\xA5.txt")));
+    { auto m = os::mapping::map_file(os::join(d, "\xE6\x97\xA5.txt")); CHECK(m && m->size() == 5); }
+    CHECK(os::remove_all(os::dirname(d))); CHECK(!os::exists(d));
+}
+TEST(stat_reparse_points_are_not_links) {
+    // This repository may live under OneDrive, whose files are cloud reparse points: they are plain files.
+    auto st = os::stat("CMakeLists.txt");
+    if (st.exists) { CHECK(st.is_file && !st.is_link && !st.is_dir && st.size > 0); }
+    auto d = os::stat("os"); if (d.exists) { CHECK(d.is_dir && !d.is_link); }
+}
+TEST(file_append_is_atomic_per_write) {
+    auto d = scratch(); auto p = os::join(d, "a.log");
+    auto a = os::file::open(p, os::wr | os::create | os::append), b = os::file::open(p, os::wr | os::append); CHECK(a && b);
+    CHECK(a->write_all("a", 1)); CHECK(b->write_all("b", 1)); CHECK(a->write_all("c", 1));   // a must not overwrite b
+    a->close(); b->close(); CHECK(os::read_file(p).value == "abc");
+    { auto r = os::file::open(p, os::rd | os::append); CHECK(r); char x[3]; CHECK(r->read(x, 3).value == 3); CHECK(r->write_all("d", 1)); }
+    CHECK(os::read_file(p).value == "abcd"); os::remove_all(d);
+}
+TEST(map_file_range_checks) {
+    auto d = scratch(); auto p = os::join(d, "m.bin"); std::size_t g = os::allocation_granularity(); CHECK(g >= 4096);
+    std::string s(g * 2 + 100, 'a'); s[g] = 'B'; CHECK(os::write_file(p, s));
+    { auto m = os::mapping::map_file(p, os::prot_read, g); CHECK(m); if (m) { CHECK(m->size() == g + 100); CHECK(m->data()[0] == 'B'); } }
+    CHECK(!os::mapping::map_file(p, os::prot_read, 1));                 // unaligned offset
+    CHECK(!os::mapping::map_file(p, os::prot_read, g * 4));             // offset past the end
+    CHECK(!os::mapping::map_file(p, os::prot_read, 0, s.size() + 1));   // range past the end
+    { auto r = os::mapping::anonymous(1 << 16, os::prot_read); CHECK(r); }
+    os::remove_all(d);
+}
+TEST(memory_and_cpu_sanity) {
+    auto t = os::total_memory(), a = os::available_memory();
+    std::printf("  total=%llu MiB available=%llu MiB\n", (unsigned long long)(t >> 20), (unsigned long long)(a >> 20));
+    CHECK(t > 0); CHECK(a > 0); CHECK(a <= t);
+#if defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__)
+    os::thread th([] { CHECK(os::pin_thread(0)); CHECK(!os::pin_thread(100000)); }); th.join();
+#endif
+    os::thread th2([] { CHECK(os::set_thread_priority(os::thread_priority::low)); }); th2.join();
+}
+TEST(thread_move_assign_joins) {
+    std::atomic<int> done{0};
+    os::thread a([&] { os::sleep_ns(20'000'000); done = 1; });
+    a = os::thread([] {});   // the running thread is joined, not leaked
+    CHECK(done == 1); a.join(); CHECK(!a.joinable());
+}
+TEST(sleep_is_fine_grained) {
+    auto t0 = os::monotonic_ns(); for (int i = 0; i < 20; ++i) os::sleep_ns(100'000); auto dt = os::monotonic_ns() - t0;
+    std::printf("  20 x sleep_ns(100us) = %.2f ms\n", double(dt) / 1e6);
+    CHECK(dt >= 2'000'000); CHECK(dt < 200'000'000);   // a 1 ms / 15.6 ms floor would take 20-312 ms
+    os::mutex m; os::condvar c; { os::lock_guard g(m); CHECK(!c.wait_for(m, 1'000'000)); }
+}
+TEST(socket_errors_carry_codes) {
+    auto l = os::socket::listen("127.0.0.1", 0); CHECK(l); int port = l->local_port(); l->close();
+    auto c = os::socket::connect("127.0.0.1", port, 2000); CHECK(!c);
+    if (!c) {
+        auto k = os::classify(c.err); std::printf("  connect: %s -> %s\n", c.err.what.c_str(), os::name(k));
+        CHECK(c.err.code != -1); CHECK(k == os::os_errc::connection_refused || k == os::os_errc::timed_out);
+    }
+    auto r = os::socket::resolve("no-such-host.invalid", 80, false); CHECK(!r);
+    if (!r) {
+        auto k = os::classify(r.err); std::printf("  resolve: %s -> %s\n", r.err.what.c_str(), os::name(k));
+        CHECK(k == os::os_errc::not_found || k == os::os_errc::would_block || k == os::os_errc::network_unreachable);
+    }
+    os::poller p; os::error e; CHECK(p.wait(0, e).empty()); CHECK(!e);
+}
+TEST(completion_port_errors_and_reuse) {
+    auto d = scratch(); os::completion_port cp; os::completion c;
+    // post: any key, user pointer returned untouched (~0 used to collide with the internal I/O key)
+    int token = 7; CHECK(cp.post(~0ull, &token, 3)); CHECK(cp.wait(c, 2000)); CHECK(c.key == ~0ull && c.user == &token && c.bytes == 3 && !c.error);
+    auto pa = os::join(d, "a.bin"), pb = os::join(d, "b.bin"); CHECK(os::write_file(pa, "AAAA")); CHECK(os::write_file(pb, "BBBB"));
+    // read at end of file: 0 bytes, no error
+    { auto f = os::file::open(pa, os::rd); char b[4]; CHECK(cp.read_async(*f, b, 4, 100, 1)); CHECK(cp.wait(c, 2000)); CHECK(c.key == 1 && c.bytes == 0 && c.error == 0); cp.forget(*f); }
+    // an error at submission is this key's completion, not a stray one
+    { auto f = os::file::open(pa, os::wr); char b[4]; bool ok = cp.read_async(*f, b, 4, 0, 2);
+      if (ok) { CHECK(cp.wait(c, 2000)); CHECK(c.key == 2 && c.error != 0); } CHECK(!cp.wait(c, 20)); cp.forget(*f); }
+    // handle reuse: a new file that gets the old handle value must not be served from the old file (no forget())
+    for (int i = 0; i < 6; ++i) {
+        auto& path = (i & 1) ? pb : pa; char b[5] = {};
+        auto f = os::file::open(path, os::rd); CHECK(f);
+        CHECK(cp.read_async(*f, b, 4, 0, 10 + std::uint64_t(i))); CHECK(cp.wait(c, 2000)); CHECK(c.key == 10 + std::uint64_t(i) && c.bytes == 4);
+        CHECK(std::string(b) == ((i & 1) ? "BBBB" : "AAAA"));
+    }
+    os::remove_all(d);
 }

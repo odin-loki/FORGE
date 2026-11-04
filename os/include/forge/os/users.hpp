@@ -54,7 +54,7 @@ inline std::vector<BYTE> token_sid_(TOKEN_INFORMATION_CLASS c) {
 // Full name, primary group and local groups from netapi32 (loaded at run time, no link library). Filled for
 // local accounts; left empty for domain accounts, whose database lives on a domain controller.
 inline void user_netinfo_(user_info& u) {
-    static HMODULE h = LoadLibraryW(L"netapi32.dll"); if (!h) return;
+    static HMODULE h = LoadLibraryExW(L"netapi32.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); if (!h) return;
     auto get = reinterpret_cast<decltype(&NetUserGetInfo)>(reinterpret_cast<void*>(GetProcAddress(h, "NetUserGetInfo")));
     auto grp = reinterpret_cast<decltype(&NetUserGetLocalGroups)>(reinterpret_cast<void*>(GetProcAddress(h, "NetUserGetLocalGroups")));
     auto fre = reinterpret_cast<decltype(&NetApiBufferFree)>(reinterpret_cast<void*>(GetProcAddress(h, "NetApiBufferFree")));

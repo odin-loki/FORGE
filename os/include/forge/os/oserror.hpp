@@ -299,13 +299,34 @@ inline os_errc classify_win32(unsigned long e) {
     case ERROR_CANCELLED: return os_errc::cancelled;
     case ERROR_POSSIBLE_DEADLOCK: return os_errc::deadlock;
     case ERROR_FILE_TOO_LARGE: return os_errc::file_too_large;
-    case ERROR_PIPE_BUSY: case ERROR_PIPE_NOT_CONNECTED: return os_errc::broken_pipe;
+    case ERROR_PIPE_BUSY: return os_errc::busy;   // every instance of the pipe is taken
+    case ERROR_PIPE_NOT_CONNECTED: return os_errc::broken_pipe;
     case ERROR_IO_PENDING: return os_errc::would_block;
     case ERROR_NETNAME_DELETED: return os_errc::connection_reset;
     case ERROR_BAD_NETPATH: case ERROR_BAD_NET_NAME: return os_errc::not_found;
     case ERROR_INVALID_FUNCTION: return os_errc::not_supported;
     case ERROR_CRC: case ERROR_READ_FAULT: case ERROR_WRITE_FAULT: case ERROR_GEN_FAILURE: return os_errc::io;
     case ERROR_ELEVATION_REQUIRED: return os_errc::permission_denied;
+    case ERROR_HANDLE_EOF: case ERROR_SEEK: case ERROR_NOT_READY: return os_errc::io;
+    case ERROR_SEM_TIMEOUT: return os_errc::timed_out;
+    case ERROR_PROC_NOT_FOUND: case ERROR_NOT_FOUND: case ERROR_DEV_NOT_EXIST: case 11001 /*WSAHOST_NOT_FOUND*/: case 11004 /*WSANO_DATA*/:
+        return os_errc::not_found;
+    case 11002 /*WSATRY_AGAIN*/: return os_errc::would_block;
+    case 11003 /*WSANO_RECOVERY*/: case ERROR_NETWORK_UNREACHABLE: case ERROR_HOST_UNREACHABLE: case 10064 /*WSAEHOSTDOWN*/:
+        return os_errc::network_unreachable;
+    case ERROR_CONNECTION_ABORTED: case 10052 /*WSAENETRESET*/: return os_errc::connection_reset;
+    case ERROR_PORT_UNREACHABLE: return os_errc::connection_refused;
+    case ERROR_ADDRESS_ALREADY_ASSOCIATED: return os_errc::address_in_use;
+    case 10058 /*WSAESHUTDOWN*/: case ERROR_BAD_PIPE: return os_errc::broken_pipe;
+    case 10063 /*WSAENAMETOOLONG*/: return os_errc::name_too_long;
+    case 10047 /*WSAEAFNOSUPPORT*/: case 10043 /*WSAEPROTONOSUPPORT*/: case 10045 /*WSAEOPNOTSUPP*/: case ERROR_BAD_EXE_FORMAT: return os_errc::not_supported;
+    case 10038 /*WSAENOTSOCK*/: case 10040 /*WSAEMSGSIZE*/: case 10009 /*WSAEBADF*/: case ERROR_INVALID_DATA: case ERROR_NEGATIVE_SEEK:
+    case ERROR_BAD_PATHNAME: case ERROR_NOT_A_REPARSE_POINT: case ERROR_INSUFFICIENT_BUFFER: case ERROR_ARITHMETIC_OVERFLOW: return os_errc::invalid_argument;
+    case 10014 /*WSAEFAULT*/: case ERROR_INVALID_ADDRESS: return os_errc::bad_address;
+    case 10103 /*WSAECANCELLED*/: return os_errc::cancelled;
+    case ERROR_PATH_BUSY: case ERROR_DRIVE_LOCKED: case ERROR_USER_MAPPED_FILE: return os_errc::busy;
+    case ERROR_TOO_MANY_LINKS: case ERROR_CANT_RESOLVE_FILENAME: return os_errc::too_many_links;
+    case ERROR_NO_SYSTEM_RESOURCES: case ERROR_COMMITMENT_LIMIT: case ERROR_WORKING_SET_QUOTA: return os_errc::out_of_memory;
     default: return os_errc::other;
     }
 }
@@ -378,16 +399,57 @@ inline int mach_exception_signal(int exc_type) {
 #endif
 }
 
-// os::error codes are errno on POSIX and GetLastError()/WSAGetLastError() on Windows; unsupported_code
-// maps to not_supported.
+// getaddrinfo EAI_* codes (os::socket::resolve reports them with err_domain::gai). If-chain, not a switch: some
+// libcs alias EAI_NODATA to EAI_NONAME.
+inline os_errc classify_gai(int e) {
+    if (e == 0) return os_errc::ok;
+#if defined(EAI_NONAME)
+    if (e == EAI_NONAME) return os_errc::not_found;
+#endif
+#if defined(EAI_NODATA)
+    if (e == EAI_NODATA) return os_errc::not_found;
+#endif
+#if defined(EAI_AGAIN)
+    if (e == EAI_AGAIN) return os_errc::would_block;
+#endif
+#if defined(EAI_FAIL)
+    if (e == EAI_FAIL) return os_errc::network_unreachable;
+#endif
+#if defined(EAI_MEMORY)
+    if (e == EAI_MEMORY) return os_errc::out_of_memory;
+#endif
+#if defined(EAI_FAMILY)
+    if (e == EAI_FAMILY) return os_errc::not_supported;
+#endif
+#if defined(EAI_SOCKTYPE)
+    if (e == EAI_SOCKTYPE) return os_errc::not_supported;
+#endif
+#if defined(EAI_SERVICE)
+    if (e == EAI_SERVICE) return os_errc::invalid_argument;
+#endif
+#if defined(EAI_BADFLAGS)
+    if (e == EAI_BADFLAGS) return os_errc::invalid_argument;
+#endif
+    return os_errc::other;
+}
+
+// os::error carries the number space of its code (err_domain): native codes are errno on POSIX and
+// GetLastError()/WSAGetLastError() on Windows; posix codes are errno everywhere (also the Windows C runtime and
+// libstdc++'s std::filesystem); gai codes are EAI_*. unsupported_code maps to not_supported.
 inline os_errc classify(const error& e) {
     if (!e) return os_errc::ok;
     if (is_unsupported(e)) return os_errc::not_supported;
+    switch (e.domain) {
+    case err_domain::posix: return classify_errno(e.code);
+    case err_domain::gai: return classify_gai(e.code);
 #if defined(_WIN32)
-    return classify_win32(static_cast<unsigned long>(e.code));
+    case err_domain::win32: case err_domain::native: return classify_win32(static_cast<unsigned long>(e.code));
 #else
-    return classify_errno(e.code);
+    case err_domain::win32: return os_errc::other;
+    case err_domain::native: return classify_errno(e.code);
 #endif
+    }
+    return os_errc::other;
 }
 
 struct os_exception : std::runtime_error {

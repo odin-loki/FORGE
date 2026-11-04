@@ -27,24 +27,24 @@ The work is split by file ownership so changes can proceed in parallel without c
 | A13 | D | Tests: `run_sandboxed` everywhere, pool sandbox, large stdin, grandchild, concurrent `child::start` | fixed: run_sandboxed (Linux, FreeBSD, Windows incl. argv quoting and AppContainer), Windows pool sandbox failure and task stdio, 1 MB stdin with timeout and early exit, background grandchild, concurrent `child::start` / `spawn_wait` to EOF, invalid `send_signal` pids, batch `"&echo pwned&"` and `%PATH%`, case-insensitive PATH, crash chaining / abort / private dir |
 
 ### W1-B: core, files, IPC, console, time (`os.hpp`, `oserror.hpp`, `async_file.hpp`, `local_ipc.hpp`, `shared_memory.hpp`, `fs.hpp`, `console.hpp`, `time.hpp`, `detail.hpp`)
-| ID | Cat | Item |
-|---|---|---|
-| B1 | C | Windows `local_listener::accept` timeout: `CancelIo` without waiting, kernel can complete into a dead stack `OVERLAPPED` |
-| B2 | C | `local_ipc`: client lacks `SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION`; `listen` unlinks any file at the path; no peer-credential check |
-| B3 | C | Windows IOCP: `post_error_` drops the error; handle-value cache misroutes I/O after handle reuse; reserved key collides with user keys |
-| B4 | C | Close-on-exec races: `run()` pipe, `socket::make`, `socket::accept`, local_ipc sockets; Windows sockets inheritable; `SO_REUSEADDR` port hijack on Windows |
-| B5 | C | Windows `fs`: byte-wise widening of paths (`file_lock`, `write_file_atomic`, `make_temp_file`); `write_file_atomic` not durable, ignores mode; `make_temp_file` not exclusive |
-| B6 | C | Windows `stat`: every reparse point (OneDrive placeholders, dedup) reported as a link; target size/mtime not followed |
-| B7 | C | io_uring: no opcode probe (kernels 5.1–5.5), tail not rolled back on failure, length truncation |
-| B8 | C | `shared_memory`: Apple name truncation collisions, `O_TRUNC` on existing regions, name leaks on error, Windows existing mapping not detected, Android default dir |
-| B9 | B | `classify` on Windows treats errno/`EAI_*` codes as Win32; missing Win32 mappings |
-| B10 | B | Smaller `os.hpp` items: append emulation, DWORD truncation, `pread` moves the pointer, `map_file` offset checks, `prot` ignored, `temp_dir` overflow, thread priority, `pin_thread` shift UB and FreeBSD support, `thread` move-assign leak, `socket::connect` error, `sleep_ns` granularity |
-| B11 | B | macOS `available_memory` is total/4 (use `host_statistics64`); FreeBSD free-only count |
-| B12 | B | Console on Windows: `_isatty`, size fallback, VT input, `read_password` Unicode; OSC 8 links emitted without colour and unsanitised |
-| B13 | A | `timezone_name` on Windows, Android, FreeBSD; `on_signal(hangup)` on Windows |
-| B14 | A | `pipe.hpp` on Windows |
-| B15 | B | Linux `mounts` unescape can throw; `localtime_s` unchecked; `read_some` EINTR as EOF |
-| B16 | D | Tests: non-ASCII paths, classify tables, IOCP errors, handle reuse, shm collisions, timezone, console |
+| ID | Cat | Item | Status |
+|---|---|---|---|
+| B1 | C | Windows `local_listener::accept` timeout: `CancelIo` without waiting, kernel can complete into a dead stack `OVERLAPPED` | fixed (b00d79e): CancelIoEx + blocking GetOverlappedResult, wait failure reported |
+| B2 | C | `local_ipc`: client lacks `SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION`; `listen` unlinks any file at the path; no peer-credential check | fixed (b00d79e): SQOS identification, S_ISSOCK-only unlink, `local_stream::peer()` |
+| B3 | C | Windows IOCP: `post_error_` drops the error; handle-value cache misroutes I/O after handle reuse; reserved key collides with user keys | fixed (fdd96be): errors as the key's completion, file-identity cache with exact access, internal keys, `forget()` |
+| B4 | C | Close-on-exec races: `run()` pipe, `socket::make`, `socket::accept`, local_ipc sockets; Windows sockets inheritable; `SO_REUSEADDR` port hijack on Windows | fixed (fdd96be, b00d79e): SOCK_CLOEXEC/pipe2/accept4, Apple under `fork_mutex` (accept window documented), NO_HANDLE_INHERIT, SO_EXCLUSIVEADDRUSE |
+| B5 | C | Windows `fs`: byte-wise widening of paths (`file_lock`, `write_file_atomic`, `make_temp_file`); `write_file_atomic` not durable, ignores mode; `make_temp_file` not exclusive | fixed (30de8e8) |
+| B6 | C | Windows `stat`: every reparse point (OneDrive placeholders, dedup) reported as a link; target size/mtime not followed | fixed (fdd96be): only SYMLINK/MOUNT_POINT tags, followed via handle |
+| B7 | C | io_uring: no opcode probe (kernels 5.1–5.5), tail not rolled back on failure, length truncation | fixed (fdd96be) |
+| B8 | C | `shared_memory`: Apple name truncation collisions, `O_TRUNC` on existing regions, name leaks on error, Windows existing mapping not detected, Android default dir | fixed (b00d79e); Windows `open(n=0)` page-rounded size documented |
+| B9 | B | `classify` on Windows treats errno/`EAI_*` codes as Win32; missing Win32 mappings | fixed (fdd96be): `err_domain` on `error`, `classify_gai` |
+| B10 | B | Smaller `os.hpp` items: append emulation, DWORD truncation, `pread` moves the pointer, `map_file` offset checks, `prot` ignored, `temp_dir` overflow, thread priority, `pin_thread` shift UB and FreeBSD support, `thread` move-assign leak, `socket::connect` error, `sleep_ns` granularity | fixed (fdd96be); Windows `pread` file position documented |
+| B11 | B | macOS `available_memory` is total/4 (use `host_statistics64`); FreeBSD free-only count | fixed (fdd96be) |
+| B12 | B | Console on Windows: `_isatty`, size fallback, VT input, `read_password` Unicode; OSC 8 links emitted without colour and unsanitised | fixed (30de8e8); OSC 8 lives in `os/src/text/console.cpp` (W1-E) |
+| B13 | A | `timezone_name` on Windows, Android, FreeBSD; `on_signal(hangup)` on Windows | fixed (fdd96be, 30de8e8) |
+| B14 | A | `pipe.hpp` on Windows | fixed (30de8e8) |
+| B15 | B | Linux `mounts` unescape can throw; `localtime_s` unchecked; `read_some` EINTR as EOF | fixed (30de8e8) |
+| B16 | D | Tests: non-ASCII paths, classify tables, IOCP errors, handle reuse, shm collisions, timezone, console | fixed (335fb56); Linux, Windows (MinGW, native), FreeBSD; macOS/MSVC CI only |
 
 ### W1-C: system, hardware, network, watching (`net.hpp`, `sysinfo.hpp`, `cpu_topology.hpp`, `numa.hpp`, `hugepages.hpp`, `memory_pressure.hpp`, `power.hpp`, `perf.hpp`, `gpu_devices.hpp`, `devices.hpp`, `clipboard.hpp`, `dynlib.hpp`, `file_watch.hpp`, `file_watch_tree.hpp`)
 | ID | Cat | Item | Status |
@@ -54,7 +54,7 @@ The work is split by file ownership so changes can proceed in parallel without c
 | C3 | C | `CPU_SET` without bounds (`pin_thread_to`, `bind_thread_to_node`) on Linux and FreeBSD | fixed 2bbe188: bounds-checked (dynamic sets for large ids) |
 | C4 | C | `memory_pressure`: dead monitor after stop/subscribe; Windows event leak; Apple dispatch source never cancelled | fixed 3f4a547: pipe drained, event reused, dispatch source cancelled; `monitoring()` |
 | C5 | C | Windows clipboard reads unterminated foreign data; no retry on contention | fixed 3b6241b: bounded by `GlobalSize`, `OpenClipboard` retried |
-| C6 | C | System DLLs loaded through the default search order (use `LoadLibraryExW` + `LOAD_LIBRARY_SEARCH_SYSTEM32`) | fixed 2702fd4, 3b6241b (os.hpp copy fixed by W1-B) |
+| C6 | C | System DLLs loaded through the default search order (use `LoadLibraryExW` + `LOAD_LIBRARY_SEARCH_SYSTEM32`) | fixed 2702fd4, 3b6241b; crash, users and mobile services in the merge (`os.hpp` `dynlib::open` keeps the default order for caller-named libraries) |
 | C7 | C | FreeBSD partition prefix match; `gpu_devices` PCI batch; Windows `current_cpu` group-relative; hugepages privilege race; perf timer handle leak | fixed 3b6241b, 2bbe188 |
 | C8 | C | `file_watch`: >64 Windows directories silently dead; overflow dropped; case-sensitive names on Windows; kqueue fd exhaustion; tree watcher symlink loops | fixed 63b7840: one IOCP, `overflow` + rescan, case-insensitive, kqueue cap → polling, loop detection by file id |
 | C9 | B | MSVC: no rdtsc/cpuid (`cycle_counter` in ns, empty CPU brand) | fixed 2bbe188 (`__rdtsc`/`__cpuid`; MSVC ARM64 still ns) |

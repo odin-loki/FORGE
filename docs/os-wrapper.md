@@ -73,9 +73,9 @@ How it works per platform:
 `mem::spawn_leased` ([memory.md](memory.md)) starts a `child` whose memory cap is a lease on a memory budget.
 
 ## Pipes and signals
-- `pipe.hpp` is POSIX only. Pipes are close-on-exec. `read_some` with a timeout returns an empty string on timeout or EOF.
+- `pipe.hpp` works on POSIX and Windows. Pipes are close-on-exec (non-inheritable on Windows, where the read end is an overlapped named pipe so it can time out). `read_some` with a timeout returns an empty string on timeout or EOF; a signal does not cut the wait short.
 - `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported (a console control event cannot be aimed at one process).
-- Handler installation is `os::on_signal` in `os.hpp`; on Windows it maps Ctrl-C to `interrupt` and close / Ctrl-Break / shutdown to `terminate`.
+- Handler installation is `os::on_signal` in `os.hpp`; on Windows it maps Ctrl-C to `interrupt`, Ctrl-Break / shutdown to `terminate`, and console close / logoff to `hangup` (to `terminate` when no hangup handler is installed).
 
 ## Files (`fs.hpp`)
 | Function | Notes |
@@ -88,13 +88,15 @@ How it works per platform:
 | `walk(root, walk_opts)` | `max_depth`, `follow_symlinks`, `include_dirs`, `include_hidden` |
 | `file_lock` | RAII advisory lock: `flock` / `LockFileEx`, shared or exclusive, wait or try |
 | `disk_usage(path)` | total, free, available |
-| `mounts()` | `/proc/self/mounts` (Linux, Android), volume enumeration (Windows), `getfsstat` (macOS, FreeBSD) |
-| `make_temp_file`, `make_temp_dir` | |
-| `write_file_atomic(path, data, mode)` | temp file, fsync, rename, then fsync of the directory (POSIX) |
+| `mounts()` | `/proc/self/mounts` (Linux, Android; `mount_unescape` decodes its `\ooo` escapes), volume enumeration (Windows), `getfsstat` (macOS, FreeBSD) |
+| `make_temp_file`, `make_temp_dir` | created exclusively (`O_EXCL` / `CREATE_NEW`) |
+| `write_file_atomic(path, data, mode)` | temp file (exclusive), fsync / `FlushFileBuffers`, rename, then fsync of the directory (POSIX). Windows honours `mode` only as read-only when it has no write bit |
+
+Paths are UTF-8 everywhere; on Windows every call converts them to UTF-16, so non-ASCII names work.
 
 ## Users, time, system, console
 - **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) everywhere but iOS. Windows has no numeric ids: `uid` is the last sub-authority (RID) of the account SID and `gid` that of its primary group; `user_info::sid` holds the SID string, the home directory comes from the profile list and full name / groups from netapi32 (loaded at run time). `current_user()` reports the process token's primary group, which can differ from the account's. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows the XDG base directories on Linux and FreeBSD (documents / downloads / desktop from `user-dirs.dirs`, then `XDG_*_DIR`), `~/Library` on Apple, and Known Folders through `SHGetKnownFolderPath` on Windows, so OneDrive and Group Policy redirection are followed. On Windows `current_user()` also fills `groups` from the token and `full_name` from netapi32 or the display name.
-- **`time.hpp`.** `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name`, `format_iso8601` / `format_local_iso8601` / `parse_iso8601` (RFC 3339 with offsets and fractions to ns). `timer_queue` runs `after(ms, fn)` and `every(ms, fn)` callbacks on one worker thread; `cancel(id)`. `stopwatch` and `deadline` are described in [support.md](support.md).
+- **`time.hpp`.** `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name` (`$TZ`, else `/etc/localtime`'s target, FreeBSD `/var/db/zoneinfo`, `/etc/timezone`, `UTC` when there is no `/etc/localtime`; Android `persist.sys.timezone`; Windows the zone key mapped to IANA through a CLDR table, or the key itself), `format_iso8601` / `format_local_iso8601` / `parse_iso8601` (RFC 3339 with offsets and fractions to ns). `timer_queue` runs `after(ms, fn)` and `every(ms, fn)` callbacks on one worker thread; `cancel(id)`. `stopwatch` and `deadline` are described in [support.md](support.md).
 - **`sysinfo.hpp`.**
 
   | Call | Linux | Android | Windows | macOS / iOS | FreeBSD |
@@ -106,7 +108,7 @@ How it works per platform:
   | `per_cpu_times`, `cpu_usage` | `/proc/stat` | yes | `NtQuerySystemInformationEx` per processor group | `host_processor_info` | `kern.cp_times` |
   | `self_usage`, `current_rss` | yes | yes | peak working set, page faults (soft and hard, in `minor_faults`) | yes | yes |
 
-- **`console.hpp`.** `is_tty`, `size`, `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo), `read_password`, `confirm`.
+- **`console.hpp`.** `is_tty` (on Windows a real console, which `NUL` is not, or a mintty / MSYS2 / Cygwin pty pipe), `size` (falls back to `COLUMNS` / `LINES`), `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo; raw also enables VT input on Windows, so keys arrive as escape sequences), `read_password` (UTF-16 console input on Windows, returned as UTF-8), `confirm`.
 
 ## Networking (`net.hpp`)
 | Call | Notes |
@@ -191,7 +193,7 @@ int main(int argc, char** argv) {
 ## Platform notes
 - **iOS.** No spawning: `spawn_wait`, `child` and `os::run` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
 - **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control.
-- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM through `sc.exe`, registry, event-log service log. `pipe.hpp`, `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error. CPU ids past what the OS mask holds are `EINVAL` everywhere (Linux allocates a larger set with `CPU_ALLOC` beyond `CPU_SETSIZE`). System DLLs loaded at run time (`iphlpapi`, `setupapi`, `powrprof`, `dxgi`, `dxcore`) come from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`).
+- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM through `sc.exe`, registry, event-log service log. `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error. CPU ids past what the OS mask holds are `EINVAL` everywhere (Linux allocates a larger set with `CPU_ALLOC` beyond `CPU_SETSIZE`). System DLLs loaded at run time (`iphlpapi`, `setupapi`, `powrprof`, `dxgi`, `dxcore`) come from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`).
 - **macOS.** `RLIMIT_AS` is ignored by the kernel, so `memory_bytes` uses a resident-size watchdog. kqueue for file watching.
 - **Linux.** fork/exec, inotify, `/proc` and `/sys`.
 
@@ -199,7 +201,6 @@ int main(int argc, char** argv) {
 | Item | Today |
 |---|---|
 | `os::caps()` for the whole OS layer | Only `process_caps()`; ForgeScript `os.caps()` wraps it |
-| `pipe.hpp` on Windows | POSIX only (`child` and `local_ipc.hpp` cover the uses) |
 | Named pipes / FIFOs in `pipe.hpp`, signal-to-fd for event loops | Not present (`local_ipc.hpp` covers named pipes) |
 | cgroup v2 limits for spawned processes | rlimits, Job Objects and watchdogs instead |
 | HTTPS in `net::http` | unsupported; use the RPC client or a TLS library |
