@@ -631,11 +631,12 @@ public:
             unsigned block = 64, grid = (threads + block - 1) / block;
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
                 fn = function("forge_attention_fa"); block = 128; grid = rows * cols; }
+            std::uint32_t ns = 16, nrow = rows * cols; std::uint64_t pa = 0;   // outlive the block: the comb launch below reads them via args
             if (s == sig::attention && rows * cols <= 256 && (u7 & 0x7Eu) == 0 && k % 32 == 0 && k <= 256 && u6 % 32 == 0 && u6 <= 256 &&
                 ptrs.size() == 4 && attn_dec() && has_fn_locked("forge_attention_dec") && has_fn_locked("forge_attention_comb")) {
-                std::uint32_t ns = 16, nrow = rows * cols; std::size_t need = std::size_t(nrow) * ns * (u6 + 2) * 4;
+                std::size_t need = std::size_t(nrow) * ns * (u6 + 2) * 4;
                 if (att_cap_ < need) { if (att_) free_s(att_); att_ = 0; att_cap_ = 0; att_ = dmalloc(need, "scratch"); att_cap_ = need; }
-                std::uint64_t pa = att_;
+                pa = att_;
                 void* a1[] = {&ptrs[0], &ptrs[1], &ptrs[2], &pa, &rows, &cols, &k, &u4, &u5, &u6, &u7, &f0, &ns};
                 writes(pa, need);
                 ck(launch_s(function("forge_attention_dec"), nrow * ns, 1, 1, 128, 1, 1, 0, stream_, a1, nullptr), "launch");
