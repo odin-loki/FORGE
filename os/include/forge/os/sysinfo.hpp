@@ -142,7 +142,11 @@ inline memory_info memory() {
     }
 #elif defined(FORGE_OS_WINDOWS)
     MEMORYSTATUSEX s{}; s.dwLength = sizeof s;
-    if (GlobalMemoryStatusEx(&s)) { m.available = m.free = s.ullAvailPhys; m.swap_total = s.ullTotalPageFile - s.ullTotalPhys; m.swap_free = s.ullAvailPageFile > s.ullAvailPhys ? s.ullAvailPageFile - s.ullAvailPhys : 0; }
+    if (GlobalMemoryStatusEx(&s)) {   // the commit limit minus RAM approximates the page file; keep free <= total
+        m.available = m.free = s.ullAvailPhys;
+        m.swap_total = s.ullTotalPageFile > s.ullTotalPhys ? s.ullTotalPageFile - s.ullTotalPhys : 0;
+        m.swap_free = std::min(m.swap_total, s.ullAvailPageFile > s.ullAvailPhys ? s.ullAvailPageFile - s.ullAvailPhys : 0);
+    }
     // Free = zeroed + free page lists (SystemMemoryListInformation; may need SeProfileSingleProcessPrivilege),
     // else available minus the standby/system cache (K32GetPerformanceInfo).
     struct mem_lists { ULONG_PTR zero, free, modified, modified_nowrite, bad, standby[8], repurposed[8], modified_pagefile; } ml{};
@@ -242,6 +246,7 @@ inline double cpu_usage(const cpu_times& a, const cpu_times& b) {
 }
 
 struct process_usage { double user_s = 0, system_s = 0; std::uint64_t max_rss = 0; long major_faults = 0, minor_faults = 0, voluntary_switches = 0, involuntary_switches = 0; };
+inline std::uint64_t current_rss();
 inline result<process_usage> self_usage() {
 #if defined(FORGE_OS_POSIX)
     rusage r{}; if (::getrusage(RUSAGE_SELF, &r)) return {{}, last_error("getrusage")};
@@ -251,6 +256,7 @@ inline result<process_usage> self_usage() {
 #else
     u.max_rss = std::uint64_t(r.ru_maxrss) * 1024;
 #endif
+    if (!u.max_rss) u.max_rss = current_rss();   // FreeBSD samples ru_maxrss on clock ticks: 0 for a young process
     u.major_faults = r.ru_majflt; u.minor_faults = r.ru_minflt; u.voluntary_switches = r.ru_nvcsw; u.involuntary_switches = r.ru_nivcsw;
     return {u, {}};
 #else

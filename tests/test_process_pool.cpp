@@ -10,14 +10,18 @@ FORGE_PROCESS_TASK(echo, [](std::string in) { return in; });
 FORGE_PROCESS_TASK(fail, [](std::string) -> std::string { throw os::os_exception(os::os_errc::not_found, 2, "nope"); });
 FORGE_PROCESS_TASK(hang, [](std::string) { std::this_thread::sleep_for(std::chrono::seconds(120)); return std::string(); });
 // A task that writes to stdout and tries to read stdin: neither may touch the IPC stream.
+// (The #if lives outside the macro: MSVC rejects directives inside macro arguments.)
+static std::size_t chatty_stdin_bytes() {
+#if defined(_WIN32)   // the worker's stdin was the IPC pipe: it must now read as NUL (EOF at once)
+    char b[16]; return std::fread(b, 1, sizeof b, stdin);
+#else
+    return 0;
+#endif
+}
 FORGE_PROCESS_TASK(chatty, [](std::string in) {
     std::printf("noise from printf\n"); std::fflush(stdout);
     std::fputs("more noise\n", stdout); std::fflush(stdout);
-    std::size_t n = 0;
-#if defined(_WIN32)   // the worker's stdin was the IPC pipe: it must now read as NUL (EOF at once)
-    char b[16]; n = std::fread(b, 1, sizeof b, stdin);
-#endif
-    return in + ":" + std::to_string(n);
+    return in + ":" + std::to_string(chatty_stdin_bytes());
 });
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 FORGE_PROCESS_TASK(segv, [](std::string) -> std::string { ::raise(SIGSEGV); return {}; });

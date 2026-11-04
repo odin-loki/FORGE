@@ -209,7 +209,8 @@ private:
                 auto k = unwrap_key_(r.value); crypto_wipe(r.value.data(), r.value.size()); if (k) return k;
                 last = k.err; std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue;   // maybe still being written
             }
-            if (exists(p)) return {{}, last_error("keystore: read " + p)};
+            // Exists but unreadable: on Windows a scanner or a concurrent rename can hold it briefly; retry.
+            if (exists(p)) { last = last_error("keystore: read " + p); std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
             std::string k(32, '\0'); if (!entropy(k.data(), k.size())) return {{}, {EIO, "keystore: no entropy"}};
             auto w = wrap_key_(k); crypto_wipe(k.data(), k.size()); if (!w) return {{}, w.err};
             auto tmp = tmp_name_(d, ".master");

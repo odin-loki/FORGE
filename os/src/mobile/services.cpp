@@ -20,7 +20,7 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
-#elif defined(__APPLE__) || defined(__FreeBSD__)
+#elif (defined(__APPLE__) && !defined(FORGE_OS_IOS)) || defined(__FreeBSD__)   // no <net/if_media.h> in the iOS SDK
 #  include <net/if.h>
 #  include <net/if_media.h>
 #  include <sys/ioctl.h>
@@ -109,7 +109,7 @@ std::string transport_of(const std::string& n) {
         if (starts(n, "rmnet") || starts(n, "ccmni") || starts(n, "wwan")) return "cellular";
         return "ethernet";
     }
-#elif defined(__APPLE__) || defined(__FreeBSD__)
+#elif (defined(__APPLE__) && !defined(FORGE_OS_IOS)) || defined(__FreeBSD__)   // no <net/if_media.h> in the iOS SDK
     // The interface's media type: IFM_IEEE80211 for Wi-Fi (macOS en0 on laptops), IFM_ETHER for wired.
     int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
     if (fd >= 0) {
