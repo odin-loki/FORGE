@@ -9,6 +9,9 @@
 #include <sstream>
 #include <cstdio>
 #include "check.hpp"
+#include <cctype>
+#include <cstdlib>
+#include <string>
 using namespace forge;
 
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
@@ -188,12 +191,6 @@ TEST(signals) {
     CHECK(os::send_signal(c->pid(), os::signal_id::terminate));
     CHECK(c->wait() == 128 + SIGTERM);
 }
-#if defined(FORGE_OS_LINUX)
-TEST(process_list) {
-    auto l = os::list_processes(); CHECK(l); CHECK(!l->empty());
-    auto me = os::process_info(os::pid()); CHECK(me); CHECK(me->rss_bytes > 0);
-}
-#endif
 #endif
 TEST(find_exe) { CHECK(os::find_executable("no-such-command-forge-xyz").empty()); CHECK(!os::process_caps().empty() || true); }
 
@@ -226,6 +223,108 @@ TEST(wait_any_picks_first_and_wait_all) {
     CHECK(os::wait_all(all, 5000)); CHECK(a.exit_code() == 1);
     CHECK(!os::wait_any(all));                             // nothing left to wait for
     os::child d = mk("5", 0); os::child* one[] = {&d};
+    auto t0 = os::monotonic_ns(); CHECK(!os::wait_all(one, 50)); CHECK(os::monotonic_ns() - t0 < 2000000000ull);
+    d.kill(); CHECK(d.wait() == 128 + 9);
+}
+#endif
+
+#if !defined(FORGE_OS_IOS)
+// list_processes / process_info on every desktop platform: our own entry carries every field, and a child we
+// started lists us as its parent with its argv in cmdline.
+TEST(process_list_self_and_child) {
+    auto l = os::list_processes(); CHECK(l); CHECK(l && l->size() > 1);
+    auto me = os::process_info(os::pid()); CHECK(me);
+    if (me) {
+        CHECK(me->pid == os::pid()); CHECK(me->ppid > 0); CHECK(me->rss_bytes > 0);
+        CHECK(me->name.find("test_os_pro") != std::string::npos);
+        CHECK(me->cmdline.find("test_os_process") != std::string::npos);
+        if (me->name.find("test_os_pro") == std::string::npos || me->cmdline.find("test_os_process") == std::string::npos)
+            std::printf("  self: name [%s] cmdline [%s]\n", me->name.c_str(), me->cmdline.c_str());
+    }
+#if defined(FORGE_OS_WINDOWS)
+    auto c = os::child::start({"ping", "-n", "30", "127.0.0.1"});
+#else
+    auto c = os::child::start({"sleep", "29.5"});
+#endif
+    CHECK(c);
+    if (c) {
+        // POSIX start(argv) returns right after fork: until exec the child still shows our argv, so retry briefly
+        auto has_argv = [](const os::process_entry& e) { return e.cmdline.find("29.5") != std::string::npos || e.cmdline.find("127.0.0.1") != std::string::npos; };
+        auto k = os::process_info(c->pid());
+        for (int i = 0; i < 200 && k && !has_argv(k.value); ++i) { std::this_thread::sleep_for(std::chrono::milliseconds(10)); k = os::process_info(c->pid()); }
+        CHECK(k);
+        if (k) { CHECK(k->ppid == os::pid()); CHECK(has_argv(k.value)); }
+        CHECK(c->kill()); CHECK(c->wait() == 128 + 9);
+    }
+    CHECK(!os::process_info(~0ull - 7));
+}
+#endif
+
+#if defined(FORGE_OS_WINDOWS)
+// child on Windows: CreateProcess + Job Object. ping -n N sleeps about N-1 seconds; sort reads stdin.
+namespace {
+std::string drain(os::child& c) { std::string out, part; while (!(part = c.read()).empty()) out += part; return out; }
+std::string sysroot() { std::string r = os::getenv("SystemRoot"); return r.empty() ? std::string("C:\\Windows") : r; }
+}
+TEST(win_child_stream_and_kill_tree) {
+    auto c = os::child::start({"cmd", "/d", "/c", "echo hi& ping -n 30 127.0.0.1 >nul"});
+    CHECK(c); if (!c) return;
+    CHECK(c->running()); CHECK(c->pid() != 0);
+    CHECK(c->read(100, 5000) == "hi\r\n");
+    CHECK(c->read(100, 50).empty());                       // nothing more yet: times out
+    CHECK(c->try_wait() == -1); CHECK(c->wait(50) == -1); CHECK(!c->exited());
+    CHECK(c->kill(0));                                     // still running
+    CHECK(c->kill(9)); CHECK(c->wait() == 128 + 9); CHECK(c->exit_code() == 137); CHECK(!c->running());
+    CHECK(!c->kill(9));                                    // already reaped
+    // ping (the grandchild, holding the pipe too) died with the job, so the stream ends now, not in 30 s
+    auto t0 = os::monotonic_ns(); CHECK(c->read().empty()); CHECK(os::monotonic_ns() - t0 < 5'000'000'000ull);
+}
+TEST(win_child_merge_exit_code_and_errors) {
+    auto m = os::child::start({"cmd", "/d", "/c", "echo a& echo b>&2& exit 3"}, true);
+    CHECK(m); if (m) { CHECK(drain(*m) == "a\r\nb\r\n"); CHECK(m->wait() == 3); CHECK(m->try_wait() == 3); }
+    CHECK(!os::child::start({"C:\\nonexistent\\forge-no-such-binary.exe"}));
+    CHECK(!os::child::start({"cmd", "/d", "/c", "exit 0"}, false, "C:\\nonexistent-forge-dir\\x"));
+    os::child moved;
+    { auto t = os::child::start({"cmd", "/d", "/c", "exit 5"}); CHECK(t); if (t) moved = std::move(t.value); }
+    CHECK(moved.wait(10000) == 5);
+}
+TEST(win_child_spec_env_cwd_stdin_stderr) {
+    os::spawn_spec s; s.argv = {"cmd", "/d", "/c", "echo %FORGE_X%& cd"}; s.env_set["FORGE_X"] = "hi"; s.cwd = sysroot();
+    auto c = os::child::start(s); CHECK(c);
+    // %SystemRoot% is often "C:\WINDOWS" while cd prints the on-disk "C:\Windows": compare case-insensitively
+    auto lower = [](std::string x) { for (auto& ch : x) ch = char(std::tolower(static_cast<unsigned char>(ch))); return x; };
+    if (c) { auto out = drain(*c); CHECK(c->wait() == 0); CHECK(lower(out) == lower("hi\r\n" + sysroot() + "\r\n")); }
+    std::string d = os::temp_dir() + "\\forge_wchild_" + std::to_string(os::pid());
+    CHECK(os::write_file(d + ".in", "b\r\na\r\n"));
+    os::spawn_spec so; so.argv = {sysroot() + "\\System32\\sort.exe"}; so.stdin_file = d + ".in";
+    auto st = os::child::start(so); CHECK(st);
+    if (st) { CHECK(drain(*st) == "a\r\nb\r\n"); CHECK(st->wait() == 0); }
+    os::spawn_spec se; se.argv = {"cmd", "/d", "/c", "echo e>&2"}; se.stderr_file = d + ".err";
+    auto e = os::child::start(se); CHECK(e);
+    if (e) { CHECK(drain(*e).empty()); CHECK(e->wait() == 0); }
+    auto ef = os::read_file(d + ".err"); CHECK(ef); CHECK(ef && ef.value == "e\r\n");
+    os::spawn_spec nul; nul.argv = {sysroot() + "\\System32\\sort.exe"};   // no stdin_file: NUL, so sort ends at once
+    auto n = os::child::start(nul); CHECK(n); if (n) { CHECK(drain(*n).empty()); CHECK(n->wait(10000) == 0); }
+    std::remove((d + ".in").c_str()); std::remove((d + ".err").c_str());
+    se.stdin_file = d + ".missing"; CHECK(!os::child::start(se));
+}
+TEST(win_child_memory_limit) {
+    os::spawn_spec s; s.argv = {"cmd", "/d", "/c", "exit 0"}; s.limits.memory_bytes = 256ull << 10;   // cmd cannot even start in 256 KiB
+    auto c = os::child::start(s); if (c) CHECK(c->wait(10000) != 0);
+    s.limits.memory_bytes = 512ull << 20;
+    auto d = os::child::start(s); CHECK(d); if (d) CHECK(d->wait(10000) == 0);
+}
+TEST(win_wait_any_and_wait_all) {
+    auto mk = [](int secs, int code) { return std::move(os::child::start({"cmd", "/d", "/c", "ping -n " + std::to_string(secs + 1) + " 127.0.0.1 >nul& exit " + std::to_string(code)}).value); };
+    os::child a = mk(3, 1), b = mk(0, 2), c = mk(1, 3);
+    os::child* all[] = {&a, &b, &c, nullptr};
+    auto i = os::wait_any(all); CHECK(i && *i == 1); CHECK(b.exit_code() == 2);
+    i = os::wait_any(all); CHECK(i && *i == 2); CHECK(c.exit_code() == 3);
+    CHECK(!os::wait_any(all, 20));
+    CHECK(a.try_wait() == -1);
+    CHECK(os::wait_all(all, 10000)); CHECK(a.exit_code() == 1);
+    CHECK(!os::wait_any(all));
+    os::child d = mk(5, 0); os::child* one[] = {&d};
     auto t0 = os::monotonic_ns(); CHECK(!os::wait_all(one, 50)); CHECK(os::monotonic_ns() - t0 < 2000000000ull);
     d.kill(); CHECK(d.wait() == 128 + 9);
 }

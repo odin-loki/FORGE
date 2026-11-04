@@ -24,6 +24,7 @@
 #endif
 #if defined(FORGE_OS_WINDOWS)
 #include <psapi.h>
+#include <tlhelp32.h>
 #if defined(_MSC_VER)
 #pragma comment(lib, "psapi.lib")
 #endif
@@ -344,6 +345,54 @@ inline std::string find_executable(const std::string& name) {
     return {};
 }
 
+#if defined(FORGE_OS_WINDOWS)
+namespace detail_proc {
+// argv -> CreateProcess command line (MSVCRT quoting). exe is argv[0] resolved by find_executable; a .cmd/.bat
+// runs as `cmd.exe /d /c script args` (exe is switched to cmd.exe).
+inline std::wstring win_cmdline(std::vector<std::string> av, std::string& exe) {
+    std::wstring cmd;
+    bool is_batch = exe.size() > 4 && (exe.ends_with(".cmd") || exe.ends_with(".bat") || exe.ends_with(".CMD") || exe.ends_with(".BAT"));
+    av[0] = exe;
+    if (is_batch) { av.insert(av.begin(), {"cmd.exe", "/d", "/c"}); exe = find_executable("cmd.exe"); }
+    for (auto& a : av) {
+        if (!cmd.empty()) cmd += L' ';
+        std::wstring w = widen(a);
+        if (!w.empty() && w.find_first_of(L" \t\"") == std::wstring::npos) { cmd += w; continue; }
+        cmd += L'"'; std::size_t bs = 0;
+        for (wchar_t c : w) { if (c == L'\\') { ++bs; continue; } if (c == L'"') cmd.append(bs * 2 + 1, L'\\'); else cmd.append(bs, L'\\'); bs = 0; cmd += c; }
+        cmd.append(bs * 2, L'\\'); cmd += L'"';
+    }
+    return cmd;
+}
+// CREATE_UNICODE_ENVIRONMENT block from the parent's environment (unless clear_env) plus env_unset/env_set.
+inline std::wstring win_env_block(const spawn_spec& sp) {
+    std::map<std::wstring, std::wstring> envm;
+    if (!sp.clear_env) {
+        if (LPWCH blk = GetEnvironmentStringsW()) {
+            for (LPWCH p = blk; *p; p += wcslen(p) + 1) { std::wstring e(p); auto eq = e.find(L'=', 1); if (eq != std::wstring::npos) envm[e.substr(0, eq)] = e.substr(eq + 1); }
+            FreeEnvironmentStringsW(blk);
+        }
+    }
+    for (auto& u : sp.env_unset) envm.erase(widen(u));
+    for (auto& [k, v] : sp.env_set) envm[widen(k)] = widen(v);
+    std::wstring envb; for (auto& [k, v] : envm) { envb += k; envb += L'='; envb += v; envb += L'\0'; } envb += L'\0';
+    return envb;
+}
+// Job Object carrying the memory / CPU limits; kill_on_close also kills whatever is left when it is closed.
+inline HANDLE win_job(const proc_limits& lim, bool kill_on_close) {
+    HANDLE job = CreateJobObjectW(nullptr, nullptr);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+        if (kill_on_close) li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (lim.memory_bytes) { li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY; li.ProcessMemoryLimit = SIZE_T(lim.memory_bytes); }
+        if (lim.cpu_seconds) { li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME; li.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = LONGLONG(lim.cpu_seconds) * 10000000LL; }
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
+    }
+    return job;
+}
+}
+#endif
+
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 namespace detail_proc {
 inline void set_nonblock(int fd) { int fl = ::fcntl(fd, F_GETFL); ::fcntl(fd, F_SETFL, fl | O_NONBLOCK); }
@@ -362,29 +411,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
 #elif defined(FORGE_OS_WINDOWS)
     std::string exe = find_executable(sp.argv[0]);
     if (exe.empty()) return {{}, {ERROR_FILE_NOT_FOUND, "spawn " + sp.argv[0] + ": not found"}};
-    std::wstring cmd;
-    bool is_batch = exe.size() > 4 && (exe.ends_with(".cmd") || exe.ends_with(".bat") || exe.ends_with(".CMD") || exe.ends_with(".BAT"));
-    std::vector<std::string> av = sp.argv; av[0] = exe;
-    if (is_batch) { av.insert(av.begin(), {"cmd.exe", "/d", "/c"}); exe = find_executable("cmd.exe"); }
-    for (auto& a : av) {
-        if (!cmd.empty()) cmd += L' ';
-        std::wstring w = widen(a);
-        if (!w.empty() && w.find_first_of(L" \t\"") == std::wstring::npos) { cmd += w; continue; }
-        cmd += L'"'; std::size_t bs = 0;
-        for (wchar_t c : w) { if (c == L'\\') { ++bs; continue; } if (c == L'"') cmd.append(bs * 2 + 1, L'\\'); else cmd.append(bs, L'\\'); bs = 0; cmd += c; }
-        cmd.append(bs * 2, L'\\'); cmd += L'"';
-    }
-    // environment block
-    std::map<std::wstring, std::wstring> envm;
-    if (!sp.clear_env) {
-        if (LPWCH blk = GetEnvironmentStringsW()) {
-            for (LPWCH p = blk; *p; p += wcslen(p) + 1) { std::wstring e(p); auto eq = e.find(L'=', 1); if (eq != std::wstring::npos) envm[e.substr(0, eq)] = e.substr(eq + 1); }
-            FreeEnvironmentStringsW(blk);
-        }
-    }
-    for (auto& u : sp.env_unset) envm.erase(widen(u));
-    for (auto& [k, v] : sp.env_set) envm[widen(k)] = widen(v);
-    std::wstring envb; for (auto& [k, v] : envm) { envb += k; envb += L'='; envb += v; envb += L'\0'; } envb += L'\0';
+    std::wstring cmd = detail_proc::win_cmdline(sp.argv, exe), envb = detail_proc::win_env_block(sp);
     SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
     HANDLE in_r = nullptr, in_w = nullptr, out_r = nullptr, out_w = nullptr, err_r = nullptr, err_w = nullptr;
     auto closeh = [](HANDLE& h) { if (h) { CloseHandle(h); h = nullptr; } };
@@ -407,14 +434,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     HANDLE o1 = fout ? fout : out_w;
     si.hStdOutput = o1 ? o1 : GetStdHandle(STD_OUTPUT_HANDLE);
     si.hStdError = sp.merge_stderr ? si.hStdOutput : (ferr ? ferr : (err_w ? err_w : GetStdHandle(STD_ERROR_HANDLE)));
-    HANDLE job = CreateJobObjectW(nullptr, nullptr);
-    if (job) {
-        JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
-        li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        if (sp.limits.memory_bytes) { li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY; li.ProcessMemoryLimit = SIZE_T(sp.limits.memory_bytes); }
-        if (sp.limits.cpu_seconds) { li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME; li.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = LONGLONG(sp.limits.cpu_seconds) * 10000000LL; }
-        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li);
-    }
+    HANDLE job = detail_proc::win_job(sp.limits, true);
     PROCESS_INFORMATION pi{};
     std::wstring wcwd = widen(sp.cwd);
     BOOL ok = create_process_std_only(widen(exe).c_str(), cmd.data(), CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
@@ -612,6 +632,9 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
 
 // Live process for streaming use: spawn without waiting; read/wait/kill later. RAII: the destructor kills
 // and reaps a child that is still running, so a forgotten handle never leaves a zombie.
+// Windows: the child runs in a Job Object (which carries limits.memory_bytes / cpu_seconds); kill() and the
+// destructor terminate the whole job, i.e. the child and everything it started. There are no signals: any
+// kill(sig) with sig != 0 terminates with exit code 128+sig, so wait() reports what POSIX would.
 class child {
 public:
     child() = default;
@@ -638,9 +661,14 @@ public:
         ::setpgid(p, p); ::close(po[1]);
         c.pid_ = p; c.out_ = po[0];
         return {std::move(c), {}};
+#elif defined(FORGE_OS_WINDOWS)
+        (void)c;
+        if (argv.empty()) return {{}, {ERROR_FILE_NOT_FOUND, "spawn: command not found"}};
+        spawn_spec sp; sp.argv = argv; sp.merge_stderr = merge_stderr; sp.cwd = cwd;
+        return start_win(sp, true);
 #else
-        (void)argv; (void)merge_stderr; (void)cwd;
-        return {{}, {unsupported_code, "child::start: not available on this platform yet (use spawn_wait)"}};
+        (void)c; (void)argv; (void)merge_stderr; (void)cwd;
+        return {{}, {unsupported_code, "child::start: process spawning is not available on iOS"}};
 #endif
     }
     // Start from a full spawn_spec: argv, cwd, env_set/env_unset/clear_env, limits (memory/cpu/files) and
@@ -697,9 +725,13 @@ public:
         if (child_errno) { int st; while (::waitpid(p, &st, 0) < 0 && errno == EINTR) {} ::close(po[0]); errno = child_errno; return {{}, last_error("exec " + sp.argv[0])}; }
         c.pid_ = p; c.out_ = po[0];
         return {std::move(c), {}};
+#elif defined(FORGE_OS_WINDOWS)
+        (void)c;
+        if (sp.argv.empty()) return {{}, {ERROR_INVALID_PARAMETER, "spawn: empty argv"}};
+        return start_win(sp, false);
 #else
-        (void)sp;
-        return {{}, {unsupported_code, "child::start: not available on this platform yet (use spawn_wait)"}};
+        (void)c; (void)sp;
+        return {{}, {unsupported_code, "child::start: process spawning is not available on iOS"}};
 #endif
     }
     // Non-blocking: the exit code (128+signal) if the child has exited, else -1.
@@ -712,6 +744,10 @@ public:
         if (w != pid_) return -1;
         done_ = true; code_ = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
         return code_;
+#elif defined(FORGE_OS_WINDOWS)
+        if (done_) return code_;
+        if (!proc_ || WaitForSingleObject(proc_, 0) != WAIT_OBJECT_0) return -1;
+        return reap();
 #else
         return -1;
 #endif
@@ -727,14 +763,33 @@ public:
         auto n = ::read(out_, s.data(), max);
         if (n <= 0) { ::close(out_); out_ = -1; return {}; }
         s.resize(std::size_t(n)); return s;
+#elif defined(FORGE_OS_WINDOWS)
+        if (!hout_) return {};
+        if (timeout_ms) {   // anonymous pipes cannot be waited on: peek with a short back-off (1 ms rising to 5 ms)
+            const std::uint64_t end = monotonic_ns() + timeout_ms * 1000000ull; std::uint64_t nap = 1000000ull;
+            for (;;) {
+                DWORD avail = 0;
+                if (!PeekNamedPipe(hout_, nullptr, 0, nullptr, &avail, nullptr) || avail) break;   // data, or EOF: ReadFile tells
+                if (monotonic_ns() >= end) return {};
+                sleep_ns(nap); nap = std::min<std::uint64_t>(nap * 2, 5000000ull);
+            }
+        }
+        std::string s(max, '\0'); DWORD n = 0;
+        if (!ReadFile(hout_, s.data(), DWORD(std::min<std::size_t>(max, 1u << 30)), &n, nullptr) || !n) { CloseHandle(hout_); hout_ = nullptr; return {}; }
+        s.resize(n); return s;
 #else
         (void)max; (void)timeout_ms; return {};
 #endif
     }
-    // Signal the whole process group.
+    // Signal the whole process group (Windows: terminate the Job Object with exit code 128+sig; sig 0 only
+    // reports whether the child is still running).
     bool kill(int sig = 9) {
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
         return pid_ > 0 && !done_ && ::kill(-pid_, sig) == 0;
+#elif defined(FORGE_OS_WINDOWS)
+        if (pid_ <= 0 || done_ || !proc_) return false;
+        if (sig == 0) return WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT;
+        return job_ ? TerminateJobObject(job_, UINT(128 + sig)) != 0 : TerminateProcess(proc_, UINT(128 + sig)) != 0;
 #else
         (void)sig; return false;
 #endif
@@ -754,19 +809,85 @@ public:
         }
         done_ = true; code_ = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
         return code_;
+#elif defined(FORGE_OS_WINDOWS)
+        if (done_) return code_;
+        if (!proc_) return -1;
+        const std::uint64_t end = timeout_ms ? monotonic_ns() + timeout_ms * 1000000ull : 0;
+        for (;;) {
+            DWORD slice = INFINITE;
+            if (end) { std::uint64_t now = monotonic_ns(); if (now >= end) return -1; slice = DWORD(std::min<std::uint64_t>((end - now + 999999) / 1000000, 0x7fffffffu)); }
+            DWORD w = WaitForSingleObject(proc_, slice);
+            if (w == WAIT_OBJECT_0) return reap();
+            if (w != WAIT_TIMEOUT) return -1;
+        }
 #else
         (void)timeout_ms; return -1;
 #endif
     }
 private:
-    void swap(child& o) noexcept { std::swap(pid_, o.pid_); std::swap(out_, o.out_); std::swap(done_, o.done_); std::swap(code_, o.code_); }
+    void swap(child& o) noexcept {
+        std::swap(pid_, o.pid_); std::swap(out_, o.out_); std::swap(done_, o.done_); std::swap(code_, o.code_);
+#if defined(FORGE_OS_WINDOWS)
+        std::swap(proc_, o.proc_); std::swap(job_, o.job_); std::swap(hout_, o.hout_);
+#endif
+    }
     void reset() {
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
         if (out_ >= 0) { ::close(out_); out_ = -1; }
         if (pid_ > 0 && !done_) { ::kill(-pid_, SIGKILL); int st; while (::waitpid(pid_, &st, 0) < 0 && errno == EINTR) {} }
+#elif defined(FORGE_OS_WINDOWS)
+        if (hout_) { CloseHandle(hout_); hout_ = nullptr; }
+        if (proc_) {
+            if (!done_) { if (!job_ || !TerminateJobObject(job_, 128 + 9)) TerminateProcess(proc_, 128 + 9); WaitForSingleObject(proc_, INFINITE); }
+            CloseHandle(proc_); proc_ = nullptr;
+        }
+        if (job_) { CloseHandle(job_); job_ = nullptr; }
 #endif
         pid_ = -1; done_ = false; code_ = -1;
     }
+#if defined(FORGE_OS_WINDOWS)
+    int reap() { DWORD code = 0; GetExitCodeProcess(proc_, &code); done_ = true; code_ = int(code); return code_; }
+    // stdout (plus stderr when merged) is a pipe read through read(); stdin is the parent's (inherit_stdin, the
+    // argv overload) or stdin_file / NUL; an unmerged stderr goes to stderr_file or is inherited. The process
+    // starts suspended, joins its Job Object (no kill-on-close: like POSIX, what outlives the child is not
+    // swept), then resumes. CreateProcess failure (not found, bad cwd) is reported here.
+    static result<child> start_win(const spawn_spec& sp, bool inherit_stdin) {
+        child c;
+        std::string exe = find_executable(sp.argv[0]);
+        if (exe.empty()) return {{}, {ERROR_FILE_NOT_FOUND, "spawn " + sp.argv[0] + ": not found"}};
+        std::wstring cmd = detail_proc::win_cmdline(sp.argv, exe), envb = detail_proc::win_env_block(sp);
+        auto closeh = [](HANDLE& h) { if (h) { CloseHandle(h); h = nullptr; } };
+        HANDLE fin = nullptr, ferr = nullptr, out_r = nullptr, out_w = nullptr;
+        if (!inherit_stdin) {
+            const std::string f = sp.stdin_file.empty() ? std::string("NUL") : sp.stdin_file;
+            fin = CreateFileW(widen(f).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (fin == INVALID_HANDLE_VALUE) return {{}, last_error("open " + f)};
+        }
+        if (!sp.stderr_file.empty() && !sp.merge_stderr) {
+            ferr = CreateFileW(widen(sp.stderr_file).c_str(), sp.append_output ? FILE_APPEND_DATA : GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, sp.append_output ? OPEN_ALWAYS : CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (ferr == INVALID_HANDLE_VALUE) { auto e = last_error("open " + sp.stderr_file); closeh(fin); return {{}, e}; }
+        }
+        // not inheritable: create_process_std_only hands the child inheritable duplicates of exactly these
+        if (!CreatePipe(&out_r, &out_w, nullptr, 0)) { auto e = last_error("CreatePipe"); closeh(fin); closeh(ferr); return {{}, e}; }
+        STARTUPINFOW si{}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
+        si.hStdInput = inherit_stdin ? GetStdHandle(STD_INPUT_HANDLE) : fin;
+        si.hStdOutput = out_w;
+        si.hStdError = sp.merge_stderr ? out_w : ferr ? ferr : GetStdHandle(STD_ERROR_HANDLE);
+        HANDLE job = detail_proc::win_job(sp.limits, false);
+        PROCESS_INFORMATION pi{};
+        std::wstring wcwd = widen(sp.cwd);
+        BOOL ok = create_process_std_only(widen(exe).c_str(), cmd.data(), CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
+                                          envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi);
+        closeh(out_w); closeh(fin); closeh(ferr);
+        if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); closeh(out_r); closeh(job); return {{}, e}; }
+        if (job && !AssignProcessToJobObject(job, pi.hProcess)) closeh(job);   // e.g. a parent job forbids nesting: plain TerminateProcess then
+        ResumeThread(pi.hThread); CloseHandle(pi.hThread);
+        c.pid_ = static_cast<long long>(pi.dwProcessId); c.proc_ = pi.hProcess; c.job_ = job; c.hout_ = out_r;
+        return {std::move(c), {}};
+    }
+    HANDLE proc_ = nullptr, job_ = nullptr, hout_ = nullptr;
+#endif
 #if defined(FORGE_OS_POSIX)
     pid_t pid_ = -1;
 #else
@@ -806,8 +927,32 @@ inline bool wait_all(std::span<child* const> cs, std::uint64_t timeout_ms = 0) {
     return true;
 }
 
-// One running process as seen by list_processes()/process_info().
+// One running process as seen by list_processes()/process_info(). name is the short command name (Linux,
+// Android, macOS, FreeBSD: the kernel's comm, at most 15-19 chars; Windows: the image file name, "foo.exe");
+// cmdline is argv joined by spaces (Windows: the raw command line). rss_bytes is the resident set (Windows: the
+// working set). Fields the caller may not read stay empty / 0: another user's argv or RSS on macOS, protected
+// and other users' processes on Windows (rss and cmdline), kernel threads everywhere (cmdline).
 struct process_entry { std::uint64_t pid = 0, ppid = 0, rss_bytes = 0; std::string name, cmdline; };
+
+#if defined(FORGE_OS_MACOS) || defined(FORGE_OS_FREEBSD)
+namespace detail_proc {
+// NUL-separated strings in [q, e) -> at most `count` of them joined by spaces.
+inline std::string join_args(const char* q, const char* e, std::size_t count = ~std::size_t(0)) {
+    std::string s;
+    for (std::size_t i = 0; i < count && q < e; ++i) {
+        std::size_t l = ::strnlen(q, std::size_t(e - q));
+        if (i) s += ' ';
+        s.append(q, l); q += l + 1;
+    }
+    while (!s.empty() && s.back() == ' ') s.pop_back();
+    return s;
+}
+inline std::size_t arg_max() {
+    int mib[2] = {CTL_KERN, KERN_ARGMAX}, v = 0; std::size_t sz = sizeof v;
+    return ::sysctl(mib, 2, &v, &sz, nullptr, 0) == 0 && v > 0 ? std::size_t(v) : std::size_t(1) << 20;
+}
+}
+#endif
 
 inline result<std::vector<process_entry>> list_processes() {
     std::vector<process_entry> v;
@@ -830,8 +975,78 @@ inline result<std::vector<process_entry>> list_processes() {
         v.push_back(std::move(p));
     }
     return {std::move(v), {}};
+#elif defined(FORGE_OS_WINDOWS)
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return {{}, last_error("CreateToolhelp32Snapshot")};
+    // Another process's command line: NtQueryInformationProcess(ProcessCommandLineInformation = 60), Windows 8.1+,
+    // needs only PROCESS_QUERY_LIMITED_INFORMATION. ntdll is always loaded; resolved at run time (no import lib).
+    using nqip_t = LONG (WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    auto nqip = ntdll ? reinterpret_cast<nqip_t>(reinterpret_cast<void*>(GetProcAddress(ntdll, "NtQueryInformationProcess"))) : nullptr;
+    struct ustr { USHORT len, max; PWSTR buf; };   // UNICODE_STRING
+    std::vector<unsigned char> buf(8192);
+    PROCESSENTRY32W pe{}; pe.dwSize = sizeof pe;
+    for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
+        process_entry p; p.pid = pe.th32ProcessID; p.ppid = pe.th32ParentProcessID; p.name = narrow(pe.szExeFile);
+        if (HANDLE h = pe.th32ProcessID ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID) : nullptr) {
+            PROCESS_MEMORY_COUNTERS pmc{};
+            if (GetProcessMemoryInfo(h, &pmc, sizeof pmc)) p.rss_bytes = std::uint64_t(pmc.WorkingSetSize);
+            if (nqip) {
+                ULONG need = 0;
+                LONG st = nqip(h, 60, buf.data(), ULONG(buf.size()), &need);
+                if (st < 0 && need > buf.size()) { buf.resize(need); st = nqip(h, 60, buf.data(), ULONG(buf.size()), &need); }
+                if (st >= 0) {
+                    ustr u{}; std::memcpy(&u, buf.data(), sizeof u);
+                    if (u.buf && u.len) p.cmdline = narrow(std::wstring_view(u.buf, u.len / sizeof(wchar_t)));
+                    while (!p.cmdline.empty() && p.cmdline.back() == ' ') p.cmdline.pop_back();
+                }
+            }
+            CloseHandle(h);
+        }
+        v.push_back(std::move(p));
+    }
+    CloseHandle(snap);
+    return {std::move(v), {}};
+#elif defined(FORGE_OS_MACOS)
+    auto pids = detail_proc::list_pids(PROC_ALL_PIDS, 0);
+    if (pids.empty()) return {{}, last_error("proc_listpids")};
+    std::vector<char> args(detail_proc::arg_max());
+    for (pid_t pid : pids) {
+        // PROC_PIDT_SHORTBSDINFO needs no privilege; the resident size and argv are readable for own processes
+        // (all of them as root).
+        proc_bsdshortinfo bi{};
+        if (::proc_pidinfo(pid, PROC_PIDT_SHORTBSDINFO, 0, &bi, int(sizeof bi)) != int(sizeof bi)) continue;   // exited meanwhile
+        process_entry p; p.pid = std::uint64_t(pid); p.ppid = std::uint64_t(bi.pbsi_ppid);
+        p.name.assign(bi.pbsi_comm, ::strnlen(bi.pbsi_comm, sizeof bi.pbsi_comm));
+        rusage_info_v2 ri{};
+        if (::proc_pid_rusage(pid, RUSAGE_INFO_V2, reinterpret_cast<rusage_info_t*>(&ri)) == 0) p.rss_bytes = ri.ri_resident_size;
+        // KERN_PROCARGS2: int argc, the exec path, NUL padding, then argv[0..argc) (then the environment)
+        int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid}; std::size_t sz = args.size();
+        if (::sysctl(mib, 3, args.data(), &sz, nullptr, 0) == 0 && sz > sizeof(int)) {
+            int argc = 0; std::memcpy(&argc, args.data(), sizeof argc);
+            const char* q = args.data() + sizeof(int); const char* e = args.data() + sz;
+            while (q < e && *q) ++q;
+            while (q < e && !*q) ++q;
+            if (argc > 0) p.cmdline = detail_proc::join_args(q, e, std::size_t(argc));
+        }
+        v.push_back(std::move(p));
+    }
+    return {std::move(v), {}};
+#elif defined(FORGE_OS_FREEBSD)
+    auto ks = detail_proc::procs(KERN_PROC_PROC, 0);
+    if (ks.empty()) return {{}, last_error("sysctl kern.proc.proc")};
+    const std::uint64_t pg = std::uint64_t(::getpagesize());
+    std::vector<char> args(detail_proc::arg_max());
+    for (auto& k : ks) {
+        process_entry p; p.pid = std::uint64_t(k.ki_pid); p.ppid = std::uint64_t(k.ki_ppid);
+        p.rss_bytes = std::uint64_t(k.ki_rssize) * pg; p.name = k.ki_comm;
+        int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ARGS, k.ki_pid}; std::size_t sz = args.size();
+        if (::sysctl(mib, 4, args.data(), &sz, nullptr, 0) == 0 && sz) p.cmdline = detail_proc::join_args(args.data(), args.data() + sz);
+        v.push_back(std::move(p));
+    }
+    return {std::move(v), {}};
 #else
-    return {{}, {unsupported_code, "list_processes: not implemented on this platform yet"}};
+    return {{}, {unsupported_code, "list_processes: other processes are not visible on this platform"}};
 #endif
 }
 
