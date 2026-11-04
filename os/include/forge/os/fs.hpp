@@ -368,14 +368,14 @@ inline std::string random_suffix(std::size_t n = 10) {
 }
 inline result<std::string> make_temp_dir(const std::string& prefix = "forge-") {
     for (int i = 0; i < 16; ++i) {
-        auto p = u8path(temp_dir()) / (prefix + random_suffix());
+        auto p = u8path(temp_dir()) / u8path(prefix + random_suffix());
         std::error_code ec; if (stdfs::create_directory(p, ec) && !ec) return {u8str(p), {}};
     }
     return {{}, error{-1, "make_temp_dir: could not create a unique directory"}};
 }
 inline result<std::string> make_temp_file(const std::string& prefix = "forge-", const std::string& suffix = "") {
     for (int i = 0; i < 16; ++i) {
-        auto p = u8str(u8path(temp_dir()) / (prefix + random_suffix() + suffix));
+        auto p = u8str(u8path(temp_dir()) / u8path(prefix + random_suffix() + suffix));
 #if defined(FORGE_OS_POSIX)
         int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (fd >= 0) { ::close(fd); return {p, {}}; }
