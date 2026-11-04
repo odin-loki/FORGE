@@ -32,6 +32,8 @@
 #endif
 #include <forge/task/pool.hpp>
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <cmath>
 #include <format>
 #include <regex>
@@ -136,8 +138,15 @@ void pretty(std::string& o, const json::value& v, int ind) {
 // ---- sorting with script comparisons
 bool less(Interp& in, const Value& a, const Value& b) { return Interp::truthy(in.binary(Op::Lt, a, b)); }
 
-Value make_handle(std::string kind, std::shared_ptr<void> payload, std::function<void()> closer) {
-    auto h = make<Handle>(std::move(kind)); h->payload = std::move(payload); h->closer = std::move(closer); return obj(h);
+// An OS-resource handle. Inside limit({handles: N}) it counts against the quota until disposed; over the
+// quota the resource is closed again and TooManyFilesError (the EMFILE error) is raised.
+Value make_handle(Interp& in, std::string kind, std::shared_ptr<void> payload, std::function<void()> closer) {
+    if (const Quota* full = in.handle_quota ? Quota::acquire(in.handle_quota) : nullptr) {
+        if (closer) { try { closer(); } catch (...) {} }
+        payload.reset();
+        in.raise("TooManyFilesError", "open-handle limit of " + std::to_string(full->max) + " reached opening a " + kind + " handle");
+    }
+    auto h = make<Handle>(std::move(kind)); h->payload = std::move(payload); h->closer = std::move(closer); h->quota = in.handle_quota; return obj(h);
 }
 Handle& h_of(Interp& in, const Value& v, const std::string& kind) {
     auto* h = as<Handle>(v);
@@ -156,6 +165,7 @@ Value run_process(Interp& in, Args& a) {
         if (!cur.empty()) sp.argv.push_back(cur);
     }
     if (sp.argv.empty()) in.raise("ValueError", "proc.run: empty command");
+    in.charge_process(sp.argv[0]);
     sp.max_output = in.sh->limits.max_output;
     sp.limits.memory_bytes = in.child_mem; sp.limits.cpu_seconds = in.child_cpu_s; sp.timeout_ms = in.child_timeout_ms;
     if (auto* v = opt_key(a, 1, "cwd")) sp.cwd = in.str(*v);
@@ -177,10 +187,65 @@ Value run_process(Interp& in, Args& a) {
 
 // run fn(args) with narrowed limits, restoring them afterwards (RAII)
 struct Scope {
-    Interp& in; Caps caps; std::uint64_t mem, cpu, to, dl, cdl, cap;
-    explicit Scope(Interp& i) : in(i), caps(i.caps), mem(i.child_mem), cpu(i.child_cpu_s), to(i.child_timeout_ms), dl(i.deadline_ns), cdl(i.cpu_deadline_ns), cap(Heap::instance().soft_cap()) {}
-    ~Scope() { in.caps = caps; in.child_mem = mem; in.child_cpu_s = cpu; in.child_timeout_ms = to; in.deadline_ns = dl; in.cpu_deadline_ns = cdl; Heap::instance().set_soft_cap(cap); }
+    Interp& in; Caps caps; std::uint64_t mem, cpu, to, dl, cdl, cap, acap; std::shared_ptr<Quota> hq, pq;
+    explicit Scope(Interp& i) : in(i), caps(i.caps), mem(i.child_mem), cpu(i.child_cpu_s), to(i.child_timeout_ms), dl(i.deadline_ns), cdl(i.cpu_deadline_ns), cap(Heap::instance().soft_cap()),
+                                acap(AllocQuota::cap), hq(i.handle_quota), pq(i.proc_quota) {}
+    ~Scope() {
+        in.caps = caps; in.child_mem = mem; in.child_cpu_s = cpu; in.child_timeout_ms = to; in.deadline_ns = dl; in.cpu_deadline_ns = cdl; Heap::instance().set_soft_cap(cap);
+        AllocQuota::cap = acap; in.handle_quota = std::move(hq); in.proc_quota = std::move(pq);
+    }
 };
+
+// ---- limit option values. Sizes: a number of bytes or a string "64K", "512M", "2G", "1T" (powers of 1024; "KB",
+// "KiB", "MB", ... and a trailing "B" are accepted). Durations: a number (ms for timeout, seconds for cpu_s /
+// proc_cpu) or a string with a unit "250us", "200ms", "5s", "2m", "1h".
+std::pair<double, std::string> num_unit(Interp& in, const std::string& s, const char* key) {
+    std::size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
+    std::size_t b = i; while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '.')) ++i;
+    double v = 0; std::string num = s.substr(b, i - b);
+    auto r = std::from_chars(num.data(), num.data() + num.size(), v);
+    if (num.empty() || r.ec != std::errc{} || r.ptr != num.data() + num.size()) in.raise("ValueError", std::string("limit: bad ") + key + " value \"" + s + "\"");
+    while (i < s.size() && s[i] == ' ') ++i;
+    std::string u; for (; i < s.size(); ++i) if (s[i] != ' ') u += char(std::tolower(static_cast<unsigned char>(s[i])));
+    return {v, u};
+}
+std::uint64_t size_opt(Interp& in, const Value& v, const char* key) {
+    if (auto* s = as<String>(v)) {
+        auto [n, u] = num_unit(in, s->s, key);
+        if (u.size() > 1 && u.back() == 'b') u.pop_back();             // KB, MiB -> k, mi
+        if (u.size() == 2 && u.back() == 'i') u.pop_back();
+        static const std::pair<const char*, double> units[] = {{"", 1}, {"k", 1024.0}, {"m", 1048576.0}, {"g", 1073741824.0}, {"t", 1099511627776.0}};
+        for (auto& [name, mul] : units) if (u == name || (u == "b" && !*name)) {
+            double bytes = n * mul;
+            if (bytes >= 1.8e19) in.raise("ValueError", std::string("limit: ") + key + " \"" + s->s + "\" is too large");
+            return std::uint64_t(bytes);
+        }
+        in.raise("ValueError", std::string("limit: unknown size unit in ") + key + " \"" + s->s + "\" (use K, M, G or T)");
+    }
+    double d = f_of(in, v, key);
+    if (d < 0) in.raise("ValueError", std::string("limit: ") + key + " must not be negative");
+    return std::uint64_t(d);
+}
+// duration in units of `unit_s` seconds (1e-3 for ms); bare numbers are already in that unit
+double duration_opt(Interp& in, const Value& v, const char* key, double unit_s) {
+    double out;
+    if (auto* s = as<String>(v)) {
+        auto [n, u] = num_unit(in, s->s, key);
+        double secs;
+        if (u.empty()) return n;
+        if (u == "ns") secs = n * 1e-9; else if (u == "us") secs = n * 1e-6; else if (u == "ms") secs = n * 1e-3;
+        else if (u == "s") secs = n; else if (u == "m" || u == "min") secs = n * 60; else if (u == "h") secs = n * 3600;
+        else in.raise("ValueError", std::string("limit: unknown time unit in ") + key + " \"" + s->s + "\" (use ms, s, m or h)");
+        out = secs / unit_s;
+    } else out = f_of(in, v, key);
+    if (out < 0) in.raise("ValueError", std::string("limit: ") + key + " must not be negative");
+    return out;
+}
+std::int64_t count_opt(Interp& in, const Value& v, const char* key) {
+    std::int64_t n = i_of(in, v, key);
+    if (n < 0) in.raise("ValueError", std::string("limit: ") + key + " must not be negative");
+    return n;
+}
 
 } // namespace
 
@@ -399,6 +464,8 @@ void install_builtins(Shared& sh) {
             Value g, f;
             { std::lock_guard lk(copy_m); std::unordered_map<const Obj*, Value> mm; g = deep_copy(in, g0, mm); f = deep_copy(in, f0, mm); }
             Interp child(shared, as_ref<Globals>(g)); child.caps = caps; child.deadline_ns = dl; child.file = in.file;
+            child.child_mem = in.child_mem; child.child_cpu_s = in.child_cpu_s; child.child_timeout_ms = in.child_timeout_ms;
+            child.handle_quota = in.handle_quota; child.proc_quota = in.proc_quota;
             for (std::size_t i = b; i < e; ++i) {
                 try { Args x{in_items[i], std::int64_t(i)}; auto* fnp = as<Function>(f); if (fnp && fnp->decl->params.size() < 2) x.pop_back(); out[i] = child.call(f, x); }
                 catch (...) { auto se = child.from_cpp(std::current_exception()); auto* inst = as<Instance>(se.v); etypes[i] = inst ? inst->cls->name : "Error"; errs[i] = se.msg; }
@@ -411,12 +478,35 @@ void install_builtins(Shared& sh) {
     // limit(opts) { ... } and sandbox(opts) { ... }: run the trailing block with narrower limits / capabilities
     B["limit"] = native("limit", 2, 2, [](Interp& in, Args& a) -> Value {
         Scope s(in);
-        auto& o = m_of(in, a[0], "limit");
-        if (auto* v = o.find_str("timeout")) { auto d = os::monotonic_ns() + std::uint64_t(f_of(in, *v, "timeout") * 1e6); in.deadline_ns = in.deadline_ns ? std::min(in.deadline_ns, d) : d; in.child_timeout_ms = std::uint64_t(f_of(in, *v, "timeout")); }
-        if (auto* v = o.find_str("mem")) { auto cap = Heap::instance().live_bytes() + std::uint64_t(i_of(in, *v, "mem")); auto old = Heap::instance().soft_cap(); Heap::instance().set_soft_cap(old ? std::min(old, cap) : cap); }
-        if (auto* v = o.find_str("cpu_s")) { auto d = os::thread_cpu_time_ns() + std::uint64_t(f_of(in, *v, "cpu_s") * 1e9); in.cpu_deadline_ns = in.cpu_deadline_ns ? std::min(in.cpu_deadline_ns, d) : d; }
-        if (auto* v = o.find_str("proc_mem")) in.child_mem = std::uint64_t(i_of(in, *v, "proc_mem"));
-        if (auto* v = o.find_str("proc_cpu")) in.child_cpu_s = std::uint64_t(i_of(in, *v, "proc_cpu"));
+        if (!as<Map>(a[0]) && !as<List>(a[0])) in.raise("TypeError", "limit expects a map of options, got " + Interp::type_of(a[0]));
+        if (auto* l = as<List>(a[0])) for (auto& e : l->items) { auto* p = as<List>(e); if (!p || p->items.size() != 2 || !as<String>(p->items[0])) in.raise("TypeError", "limit options must be {\"key\", value} pairs"); }
+        static const char* known[] = {"timeout", "cpu_s", "mem", "proc_mem", "proc_cpu", "allocs", "handles", "procs"};
+        auto check_keys = [&](const Value& k) {
+            std::string ks = in.str(k);
+            if (std::find_if(std::begin(known), std::end(known), [&](const char* n) { return ks == n; }) == std::end(known))
+                in.raise("ValueError", "limit: unknown option '" + ks + "' (timeout, cpu_s, mem, proc_mem, proc_cpu, allocs, handles, procs)");
+        };
+        if (auto* m = as<Map>(a[0])) for (auto& [k, x] : m->entries) check_keys(k);
+        else for (auto& e : as<List>(a[0])->items) check_keys(as<List>(e)->items[0]);
+        auto get = [&](const char* k) { return opt_key(a, 0, k); };
+        // Read every option before applying any, so a bad value leaves the limits unchanged.
+        const Value *to = get("timeout"), *mem = get("mem"), *cpu = get("cpu_s"), *pm = get("proc_mem"), *pc = get("proc_cpu"), *al = get("allocs"), *hd = get("handles"), *pr = get("procs");
+        double to_ms = to ? duration_opt(in, *to, "timeout", 1e-3) : 0, cpu_s = cpu ? duration_opt(in, *cpu, "cpu_s", 1.0) : 0, pc_s = pc ? duration_opt(in, *pc, "proc_cpu", 1.0) : 0;
+        std::uint64_t mem_b = mem ? size_opt(in, *mem, "mem") : 0, pm_b = pm ? size_opt(in, *pm, "proc_mem") : 0;
+        std::int64_t n_al = al ? count_opt(in, *al, "allocs") : 0, n_hd = hd ? count_opt(in, *hd, "handles") : 0, n_pr = pr ? count_opt(in, *pr, "procs") : 0;
+        if (to) { auto d = os::monotonic_ns() + std::uint64_t(to_ms * 1e6); in.deadline_ns = in.deadline_ns ? std::min(in.deadline_ns, d) : d; in.child_timeout_ms = std::uint64_t(std::ceil(to_ms)); }
+        if (mem) { auto cap = Heap::instance().live_bytes() + mem_b; auto old = Heap::instance().soft_cap(); Heap::instance().set_soft_cap(old ? std::min(old, cap) : cap); }
+        if (cpu) { auto d = os::thread_cpu_time_ns() + std::uint64_t(cpu_s * 1e9); in.cpu_deadline_ns = in.cpu_deadline_ns ? std::min(in.cpu_deadline_ns, d) : d; }
+        if (pm) in.child_mem = in.child_mem ? std::min(in.child_mem, pm_b) : pm_b;
+        if (pc) { auto c = std::uint64_t(std::ceil(pc_s)); in.child_cpu_s = in.child_cpu_s ? std::min(in.child_cpu_s, c) : c; }
+        if (al) {   // allocations on this thread from now on (AllocQuota in value.hpp)
+            if (!AllocQuota::cap) AllocQuota::count = 0;
+            auto c = AllocQuota::count + std::uint64_t(n_al);
+            AllocQuota::cap = AllocQuota::cap ? std::min(AllocQuota::cap, c) : c;
+            if (!AllocQuota::cap) { AllocQuota::count = 1; AllocQuota::cap = 1; }   // allocs: 0 (cap 0 means "none")
+        }
+        if (hd) in.handle_quota = std::make_shared<Quota>(n_hd, in.handle_quota);
+        if (pr) in.proc_quota = std::make_shared<Quota>(n_pr, in.proc_quota);
         Args none; return in.call(a[1], none);
     });
     B["sandbox"] = native("sandbox", 2, 2, [](Interp& in, Args& a) -> Value {
@@ -517,7 +607,7 @@ void install_builtins(Shared& sh) {
             unsigned fl = mode == "r" ? os::rd : mode == "w" ? (os::wr | os::create | os::truncate) : mode == "a" ? (os::wr | os::create | os::append) : mode == "rw" ? (os::rdwr | os::create) : 0u;
             if (!fl) in.raise("ValueError", "fs.open mode must be r, w, a or rw");
             auto f = std::make_shared<os::file>(ok(in, os::file::open(s_of(in, a[0], "fs.open"), fl)));
-            Value h = make_handle("file", f, [f]() { *f = os::file(); });
+            Value h = make_handle(in, "file", f, [f]() { *f = os::file(); });
             as<Handle>(h)->props["path"] = a[0];
             return h;
         })
@@ -555,7 +645,7 @@ void install_builtins(Shared& sh) {
             auto r = os::fs::file_lock::acquire(s_of(in, a[0], "fs.lock"), true, wait);
             if (!r) { if (!wait) return Nil{}; in.raise("IOError", r.err.what); }
             auto l = std::make_shared<os::fs::file_lock>(std::move(r.value));
-            return make_handle("lock", l, [l]() { l->unlock(); });
+            return make_handle(in, "lock", l, [l]() { l->unlock(); });
         })
         .def("watch_tree", 1, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access");
@@ -566,15 +656,16 @@ void install_builtins(Shared& sh) {
             if (auto* v = opt_key(a, 1, "ignore")) if (auto* l = as<List>(*v)) for (auto& x : l->items) o.ignore.push_back(in.str(x));
             auto w = ok(in, os::tree_watcher::open(s_of(in, a[0], "fs.watch_tree"), o));
             std::shared_ptr<os::tree_watcher> sp(std::move(w));
-            return make_handle("treewatcher", sp, {});
+            return make_handle(in, "treewatcher", sp, {});
         })
         .def("watch", 1, 1, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access");
             auto w = std::make_shared<os::file_watcher>();
             if (auto* l = as<List>(a[0])) { for (auto& x : l->items) ok(in, w->add(in.str(x))); } else ok(in, w->add(s_of(in, a[0], "fs.watch")));
-            return make_handle("watcher", w, {});
+            return make_handle(in, "watcher", w, {});
         }).done();
     M["handle:file"]["read"] = native("file.read", 1, 2, [](Interp& in, Args& a) -> Value {
+        need(in, in.caps.fs, "file access");   // a handle opened before a sandbox({fs: false}) block is not usable inside it
         auto f = h_of(in, a[0], "file").payload_as<os::file>();
         std::size_t lim = a.size() > 1 ? std::size_t(i_of(in, a[1], "read")) : SIZE_MAX;
         std::string s; char buf[65536];
@@ -582,6 +673,7 @@ void install_builtins(Shared& sh) {
         return strv(std::move(s));
     });
     M["handle:file"]["write"] = native("file.write", 2, 2, [](Interp& in, Args& a) -> Value {
+        need(in, in.caps.fs, "file access");
         auto f = h_of(in, a[0], "file").payload_as<os::file>(); auto d = in.str(a[1]); ok(in, f->write_all(d.data(), d.size())); return std::int64_t(d.size());
     });
     M["handle:file"]["close"] = native("file.close", 1, 1, [](Interp& in, Args& a) -> Value { in.dispose(a[0]); return Nil{}; });
@@ -764,14 +856,15 @@ void install_builtins(Shared& sh) {
         .def("start", 1, 1, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.proc, "running processes");
             std::vector<std::string> argv; for (auto& x : l_of(in, a[0], "proc.start").items) argv.push_back(in.str(x));
+            in.charge_process(argv.empty() ? std::string("proc.start") : argv[0]);
             auto c = std::make_shared<os::child>(ok(in, os::child::start(argv, true), "OSError"));
-            Value h = make_handle("process", c, [c]() { if (c->running()) { c->kill(); c->wait(1000); } });
+            Value h = make_handle(in, "process", c, [c]() { if (c->running()) { c->kill(); c->wait(1000); } });
             as<Handle>(h)->props["pid"] = std::int64_t(c->pid());
             return h;
         }).done();
     M["handle:process"]["read"] = native("process.read", 1, 2, [](Interp& in, Args& a) -> Value { auto c = h_of(in, a[0], "process").payload_as<os::child>(); return strv(c->read(65536, a.size() > 1 ? std::uint64_t(i_of(in, a[1], "timeout")) : 0)); });
     M["handle:process"]["wait"] = native("process.wait", 1, 2, [](Interp& in, Args& a) -> Value { auto c = h_of(in, a[0], "process").payload_as<os::child>(); return std::int64_t(c->wait(a.size() > 1 ? std::uint64_t(i_of(in, a[1], "timeout")) : 0)); });
-    M["handle:process"]["kill"] = native("process.kill", 1, 1, [](Interp& in, Args& a) -> Value { return h_of(in, a[0], "process").payload_as<os::child>()->kill(); });
+    M["handle:process"]["kill"] = native("process.kill", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.proc, "process control"); return h_of(in, a[0], "process").payload_as<os::child>()->kill(); });
     M["handle:process"]["get_running"] = native("process.running", 1, 1, [](Interp& in, Args& a) -> Value { return h_of(in, a[0], "process").payload_as<os::child>()->running(); });
 
     // ------------------------------------------------ ProcessPool
@@ -791,7 +884,11 @@ void install_builtins(Shared& sh) {
         po.sandbox = sp;
         try { box->pool = std::make_unique<os::process_pool>(std::move(po)); }
         catch (const os::os_exception& e) { in.raise(e.script_type(), e.what()); }
-        Value h = make_handle("processpool", box, [box]() { if (box->pool) box->pool->shutdown(); });
+        if (in.proc_quota) {   // each worker is a child process (limit {procs})
+            try { for (std::size_t i = 0; i < box->pool->size(); ++i) in.charge_process("ProcessPool worker"); }
+            catch (...) { box->pool->shutdown(); throw; }
+        }
+        Value h = make_handle(in, "processpool", box, [box]() { if (box->pool) box->pool->shutdown(); });
         as<Handle>(h)->props["workers"] = std::int64_t(box->pool->size());
         return h;
     });
@@ -803,7 +900,7 @@ void install_builtins(Shared& sh) {
         if (box.timeout_ms) p.emplace_back("timeout_ms", double(box.timeout_ms));
         auto fb = std::make_shared<FutureBox>();
         fb->f = box.pool->submit("forge.script", json::dump(json::value(std::move(p))));
-        return make_handle("processfuture", fb, [] {});
+        return make_handle(in, "processfuture", fb, [] {});
     };
     auto pp_get = [](Interp& in, FutureBox& fb, std::uint64_t timeout_ms) -> Value {
         if (!fb.got && !fb.err) {

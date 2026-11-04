@@ -1,6 +1,7 @@
 // forge::script: language, runtime, ARC/cycles, limits, OS bindings. Every program runs through both the
 // tree-walker and the bytecode VM and must produce identical output.
 #include <forge/script/script.hpp>
+#include <forge/script/check.hpp>
 #include "check.hpp"
 #include <cstdio>
 #include <algorithm>
@@ -960,4 +961,44 @@ TEST(limit_block_timeout_mem_cpu) {
     // mem (bytes): the heap may grow by at most this much inside the block
     EXPECT("forge::limit(std::map<std::string, int>{{\"mem\", 65536}}, [] { std::vector<std::string> v; for (int i = 0; i < 100000; ++i) v.push_back(std::string(64, 'x')); });", "!OutOfMemoryError");
     EXPECT("forge::limit(std::map<std::string, int>{{\"mem\", 1048576}}, [] { std::vector<int> v; v.push_back(1); std::println(\"ok\"); });", "ok\n");
+}
+
+// limit {...} { } syntax errors and the static checker's limit-option diagnostics (golden: tests/script/limit_*.fs)
+TEST(limit_block_syntax_and_check) {
+    EXPECT("limit {.timeout = 5} { return; }", "!SyntaxError");                          // return would only leave the block
+    EXPECT("int f() { limit {.timeout = 5} { return 1; } return 0; }", "!SyntaxError");
+    EXPECT("auto r = limit {.timeout = 5000} { return 7; }; std::println(\"{}\", r);", "7\n");   // expression form may return
+    EXPECT("for (int i = 0; i < 3; ++i) { limit {.timeout = 5} { break; } }", "!SyntaxError");
+    EXPECT("while (true) { limit {.timeout = 5} { continue; } }", "!SyntaxError");
+    EXPECT("limit {.timeuot = 5} { }", "!SyntaxError");                                    // unknown key
+    EXPECT("limit {.timeout = 5, .timeout = 6} { }", "!SyntaxError");                      // repeated key
+    EXPECT("limit {{\"mem\", \"2G\"}} { std::println(\"ok\"); }", "ok\n");
+    EXPECT("int limit = 3; std::println(\"{}\", limit);", "3\n");                          // still a plain name
+    EXPECT("auto limit(int x) { return x + 1; } std::println(\"{}\", limit(1));", "2\n");
+    // literal option values are checked before the script runs
+    auto ids = [](const std::string& src) { std::string s; for (auto& d : script::check(src, "<t>")) if (d.id == "limit-option") s += d.message + "\n"; return s; };
+    CHECK(ids("limit {.mem = \"2G\", .timeout = \"200ms\", .proc_cpu = \"1.5s\", .allocs = 10} { }").empty());
+    CHECK(!ids("limit {.mem = \"2X\"} { }").empty());
+    CHECK(!ids("limit {.timeout = \"5 fortnights\"} { }").empty());
+    CHECK(!ids("limit {.handles = \"5\"} { }").empty());
+    EXPECT("limit {.mem = \"lots\"} { std::println(\"ran\"); }", "!StaticCheckError");
+    // with --no-check the runtime raises the same problem as ValueError
+    script::options nc; nc.static_check = false;
+    auto got = run("limit {.mem = \"lots\"} { std::println(\"ran\"); }", nc);
+    CHECK_MSG(got == "!ValueError", "got %s", got.c_str());
+}
+
+// Capability escapes with the run's own capabilities off (the golden sandbox_escape.fs narrows them with forge::sandbox).
+TEST(capability_escape_engine_level) {
+    script::options o; o.allow_fs = false; o.allow_proc = false; o.os_sandbox = script::options::os_sandbox_mode::off;
+    auto expect_denied = [&](const std::string& src) {
+        auto got = run(src, o);
+        CHECK_MSG(got == "!PermissionError" || got == "!SandboxViolationError" || got == "!StaticCheckError", "%s -> %s", src.c_str(), got.c_str());
+    };
+    expect_denied("auto f = forge::fs::read; std::vector<std::string> v{\"/etc/hostname\"}; for (auto& p : v) f(p);");
+    expect_denied("eval(\"forge::fs::read(\\\"/etc/hostname\\\");\");");
+    expect_denied("std::string name = \"forge::sh\"; forge::reflect::call(name, \"echo hi\");");
+    expect_denied("std::async([] { return forge::fs::read(\"/etc/hostname\"); }).get();");
+    expect_denied("limit {.timeout = \"5s\"} { auto s = forge::bash; s(\"echo hi\"); }");
+    expect_denied("forge::sandbox(std::map<std::string, bool>{{\"fs\", true}}, [] { auto r = forge::fs::read; r(\"/etc/hostname\"); });");
 }

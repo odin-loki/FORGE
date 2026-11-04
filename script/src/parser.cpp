@@ -238,6 +238,7 @@ struct FnScope {
     std::string cls;            // enclosing class for member functions
     bool is_static = false;     // static member function: no `this`
     std::shared_ptr<TI> ret;    // declared return type (brace-init returns)
+    bool limit_stmt = false;    // body of a `limit {...} { }` statement: `return` would only leave the block
 };
 
 struct ClassInfo {
@@ -557,6 +558,7 @@ private:
                 while (!is_op(">") && !is_op(">>") && !is_op(">=") && !is_op(">>=")) {
                     if (at(T::Int)) { take(); args.push_back(TI{TK::Int}); }   // std::array<int, 3>
                     else args.push_back(parse_type());
+                    if (is_op("(")) skip_balanced("(", ")");   // function type std::function<R(Args...)>: erased
                     if (!accept_op(",")) break;
                 }
                 close_angle();
@@ -814,6 +816,7 @@ private:
                 fail_at(line, "'" + k + "' is not supported in FORGE scripts");
             if (k == "new" || k == "delete") fail_at(line, "new/delete are not allowed; use std::make_unique / std::make_shared");
         }
+        if (limit_block_ahead()) { auto e = limit_block(line, true); accept_op(";"); return expr_stmt_of(std::move(e), line); }
         if (at(T::Ident) && ahead_op(1, "(")) {   // Cls::Cls(...) defined out of line
             const std::string& q = cur().s; auto p = q.rfind("::");
             if (p != std::string::npos && classes_.count(q.substr(0, p)) && short_name(q.substr(0, p)) == q.substr(p + 2)) { std::string qn = take().s; return out_of_line(TI{TK::Void}, qn, line); }
@@ -1015,6 +1018,7 @@ private:
     }
     NodeP return_stmt() {
         int line = take().line; auto n = mk(NK::Return, line);
+        if (fns_.back().limit_stmt) fail_at(line, "'return' inside a limit block statement would only leave the block; write `auto r = limit {...} { return x; };` to get a value out");
         if (accept_op(";")) return n;
         std::shared_ptr<TI> fret = fns_.back().ret;   // copy: parsing a lambda below may grow fns_
         if (is_op("{")) {
@@ -1733,6 +1737,7 @@ private:
         }
         // local variables shadow everything else
         if (is_local(w)) return var_node(w, line);
+        if (limit_word(w) && limit_block_after(i_)) return limit_block(line, false, true);
         // members of the enclosing class (fields, methods, statics), including inherited ones
         if (const FnScope* ms = method_scope(); ms && w.find("::") == std::string::npos) {
             if (class_has_static(ms->cls, w)) { auto f = mk(NK::Field, line); f->s = w; f->kids.push_back(var_node(short_name(ms->cls), line)); return f; }
@@ -1819,6 +1824,61 @@ private:
         if (ti.k == TK::Any && !ti.name.empty()) return builtin_call(ti.name, args, line);
         return construct(ti, std::move(args), false, line);
     }
+    // ---- limit blocks: `limit {opts} { body }` / `limit (opts_expr) { body }` (docs/scripting.md "Resource limits").
+    // Sugar for forge::limit(opts, [&] { body }). opts entries are `{"key", value}` pairs or `.key = value`.
+    bool limit_word(const std::string& w) const { return (w == "limit" || w == "forge::limit") && !is_local(w) && !types_.count(w); }
+    // Is the token at index k a `{...}` or `(...)` group directly followed by `{`?
+    bool limit_block_after(std::size_t k) const {
+        if (k >= t_.size() || t_[k].t != T::Op || (t_[k].s != "{" && t_[k].s != "(")) return false;
+        const std::string open = t_[k].s, close = open == "{" ? "}" : ")";
+        int depth = 0;
+        for (std::size_t j = k; j < t_.size() && t_[j].t != T::End; ++j) {
+            if (t_[j].t != T::Op) continue;
+            if (t_[j].s == open) ++depth;
+            else if (t_[j].s == close && --depth == 0) return j + 1 < t_.size() && t_[j + 1].t == T::Op && t_[j + 1].s == "{";
+        }
+        return false;
+    }
+    bool limit_block_ahead() const { return at(T::Ident) && limit_word(canon_fn_name(cur().s)) && limit_block_after(i_ + 1); }
+    // stmt: statement form (value discarded, `return` refused). taken: the `limit` word was already consumed.
+    NodeP limit_block(int line, bool stmt, bool taken = false) {
+        if (!taken) take();
+        NodeP opts;
+        if (accept_op("(")) { opts = expr(); expect_op(")"); }
+        else {
+            auto m = mk(NK::Map, line);
+            std::set<std::string> keys;
+            expect_op("{");
+            while (!is_op("}")) {
+                std::string k; NodeP v;
+                if (accept_op(".")) { k = ident(); expect_op("="); v = copy_of(assign_expr()); }
+                else {
+                    expect_op("{");
+                    if (!at(T::Str)) fail("a limit option name must be a string literal, e.g. {\"timeout\", 500}");
+                    k = take().s; expect_op(","); v = copy_of(assign_expr()); expect_op("}");
+                }
+                static const std::set<std::string> known = {"timeout", "cpu_s", "mem", "proc_mem", "proc_cpu", "allocs", "handles", "procs"};
+                if (!known.count(k)) fail_at(line, "unknown limit option '" + k + "' (timeout, cpu_s, mem, proc_mem, proc_cpu, allocs, handles, procs)");
+                if (!keys.insert(k).second) fail_at(line, "limit option '" + k + "' given twice");
+                m->kids.push_back(str_node(k, line)); m->kids.push_back(std::move(v));
+                if (!accept_op(",")) break;
+            }
+            expect_op("}");
+            opts = m;
+        }
+        auto fd = std::make_shared<FnDecl>(); fd->name = "<limit>"; fd->line = line; fd->file = file_;
+        auto saved_brk = std::exchange(brk_, {});   // break / continue cannot leave the block
+        push_fn("", false);
+        fns_.back().cls.clear(); fns_.back().limit_stmt = stmt;
+        TI r; r.k = TK::Auto; fns_.back().ret = std::make_shared<TI>(r);
+        try { fd->body = block_body(line, false); } catch (...) { brk_ = std::move(saved_brk); throw; }
+        brk_ = std::move(saved_brk);
+        fd->nslots = fns_.back().nslots;
+        pop_fn();
+        auto lam = mk(NK::Lambda, line); lam->fn = fd;
+        return builtin_call("forge::limit", {opts, lam}, line);
+    }
+
     NodeP lambda() {
         int line = cur().line;
         expect_op("[");
