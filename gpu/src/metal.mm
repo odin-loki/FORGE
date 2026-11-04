@@ -2,6 +2,7 @@
 // HARDWARE-UNTESTED.
 #define FORGE_GPU_METAL 1
 #include <forge/gpu/metal.hpp>
+#include <forge/core/memory.hpp>
 #import <Metal/Metal.h>
 #include <mutex>
 #include <unistd.h>
@@ -49,6 +50,14 @@ bool runtime::run_op(const std::string& op, const std::vector<tensor_view>& in, 
     if (!cuda_hip::supports(op, ss, a)) return false;
     auto L = cuda_hip::kernel_args(op, in, a, out);
     std::lock_guard lk(p_->mu);
+    // Device memory accounting (docs/memory.md): the op's buffers are charged to the pool "metal:N" while it runs.
+    // Unified memory and no residency, so there is nothing to evict: an op that does not fit fails.
+    std::size_t total = std::max<std::size_t>(4, out.size() * 4) + (L.s == cuda_hip::sig::rope ? std::max<std::size_t>(4, L.rope_inv.size() * 4) : 0);
+    for (auto& v : in) total += std::max<std::size_t>(4, v.size() * 4);
+    auto& pool = mem::governor::instance().pool("metal:" + std::to_string(ordinal_));
+    mem::lease charge = pool.try_reserve(total, "scratch");
+    if (!charge) raise(errc::out_of_memory, "{}: cannot allocate {} for {} ({} of {} in use; raise FORGE_MEM_DEVICE_LIMIT)",
+                       pool.name(), mem::format_size(total), op, mem::format_size(pool.used()), mem::format_size(pool.limit()));
     @autoreleasepool {
         ++dispatches_[op];
         auto& pso = p_->pso["forge_" + op];

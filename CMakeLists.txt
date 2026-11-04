@@ -758,6 +758,12 @@ if(FORGE_BUILD_TESTS)
     set_tests_properties(test_gpu_features_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
     add_test(NAME test_gpu_features_hip_mock COMMAND test_cuda_hip features hip)
     set_tests_properties(test_gpu_features_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
+    # Device memory pools: allocation accounting, LRU eviction under a small budget, driver out-of-memory retry.
+    foreach(m cuda hip opencl ze)
+      add_test(NAME test_gpu_memory_${m}_mock COMMAND test_cuda_hip memory ${m})
+      set_tests_properties(test_gpu_memory_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+        ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};FORGE_ZE_TEST_IMAGE=opencl-c")
+    endforeach()
     if(FORGE_BUILD_APPS)
       add_test(NAME golden_tiny_llama_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_cumock)

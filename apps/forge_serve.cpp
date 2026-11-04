@@ -1,6 +1,6 @@
 // forge-serve — OpenAI-compatible HTTP server over the continuous-batching scheduler.
 //
-//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N]   (see docs/serve.md)
+//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill]   (see docs/serve.md)
 //
 //   GET  /health                 -> {"status":"ok"}
 //   GET  /v1/models              -> model list
@@ -140,9 +140,11 @@ private:
         if (path == "/metrics") {
             auto& s = sched_.stats();
             c.send(response(200, std::format("forge_steps {}\nforge_completed {}\nforge_prefix_hits {}\nforge_prefix_tokens_reused {}\nforge_peak_active {}\nforge_peak_kv_bytes {}\n"
-                                             "forge_queue_waiting {}\nforge_queue_active {}\nforge_admission_deferred_total {}\nforge_rejected_total {}\nforge_kv_evictions_total {}\n",
+                                             "forge_queue_waiting {}\nforge_queue_active {}\nforge_admission_deferred_total {}\nforge_rejected_total {}\nforge_kv_evictions_total {}\n"
+                                             "forge_kv_spills_total {}\nforge_kv_reloads_total {}\nforge_kv_spilled {}\n",
                                              s.steps, s.completed, s.prefix_hits, s.prefix_tokens_reused, s.peak_active, s.peak_kv_bytes,
-                                             sched_.waiting(), sched_.active_count(), s.deferred, rejected_.load(), sched_.evictions()) + mem::governor::instance().prometheus(), "text/plain")); return;
+                                             sched_.waiting(), sched_.active_count(), s.deferred, rejected_.load(), sched_.evictions(),
+                                             s.prefix_spills, s.prefix_reloads, sched_.spilled()) + mem::governor::instance().prometheus(), "text/plain")); return;
         }
         bool chat = path == "/v1/chat/completions";
         if (path != "/v1/completions" && !chat) { c.send(response(404, error_json("no route " + path))); return; }
@@ -310,7 +312,7 @@ int run_proxy(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)
@@ -345,6 +347,10 @@ int main(int argc, char** argv) {
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
         if (host.limit()) bo.budget = &host;
+        // --kv-spill: prefix KV evicted from memory goes to disk (FORGE_MEM_SPILL_DIR, capped by FORGE_MEM_SPILL_MAX)
+        // and is read back when a prompt hits it, instead of being recomputed (docs/memory.md)
+        std::unique_ptr<mem::spill_store> spill;
+        if (has_flag(argc, argv, "kv-spill")) { spill = std::make_unique<mem::spill_store>(); bo.spill = spill.get(); }
         namespace fos = forge::os;
         // P-core pinning: on hybrid CPUs keep the main thread (and the scheduler/request threads it spawns, which
         // inherit the mask) on performance cores. --no-pin disables.

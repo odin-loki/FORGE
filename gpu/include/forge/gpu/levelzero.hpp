@@ -32,6 +32,7 @@ public:
         return r;
     }
     ~runtime() {
+        dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(ctx_, e.d); res_.clear(); } catch (...) {}
         for (auto p : keep_) f_.free_(ctx_, p);
         for (auto& [n, k] : kern_) f_.kernel_destroy(k);
@@ -51,6 +52,8 @@ public:
     mem_info memory() { mem_info m; m.total = total_; m.free = total_ > stats_.resident_bytes ? total_ - stats_.resident_bytes : 0; return m; }
     using residency_stats = cuda_hip::runtime::residency_stats;
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
+    mem::budget* memory_pool() { return dm_.pool(); }   // "level_zero:N" (gpu/device_memory.hpp)
+    std::uint64_t charged_bytes() { std::lock_guard lk(mu_); return dm_.charged(); }
 
     void begin_run() { std::lock_guard lk(mu_); in_run_ = true; }
     void end_run() {
@@ -83,6 +86,7 @@ public:
     }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); if (!n) return;
+        begin_op();
         acquire(dst_base, dst_count, false);
         void* s = acquire(src, n, false).ptr;
         auto d = acquire(dst_base, dst_count, false);
@@ -94,8 +98,8 @@ public:
     std::size_t capture_end() { std::lock_guard lk(mu_); capturing_ = false; graphs_.push_back(std::move(cur_)); cur_.clear(); return graphs_.size() - 1; }
     void graph_launch(std::size_t id) { std::lock_guard lk(mu_); for (auto& l : graphs_.at(id)) enqueue(l); sync(); }
 
-    std::uint64_t device_alloc(std::size_t bytes) { std::lock_guard lk(mu_); return reinterpret_cast<std::uintptr_t>(alloc(bytes)); }
-    void device_free(std::uint64_t p) { std::lock_guard lk(mu_); f_.free_(ctx_, reinterpret_cast<void*>(p)); }
+    std::uint64_t device_alloc(std::size_t bytes) { std::lock_guard lk(mu_); begin_op(); return reinterpret_cast<std::uintptr_t>(alloc(bytes, "raw")); }
+    void device_free(std::uint64_t p) { std::lock_guard lk(mu_); dfree(reinterpret_cast<void*>(p)); }
     void upload(std::uint64_t d, const void* h, std::size_t bytes) { std::lock_guard lk(mu_); copy(reinterpret_cast<void*>(d), h, bytes); sync(); }
     void download(void* h, std::uint64_t d, std::size_t bytes) { std::lock_guard lk(mu_); copy(h, reinterpret_cast<void*>(d), bytes); sync(); }
     void copy_to_peer(runtime& dst, std::uint64_t dst_ptr, std::uint64_t src_ptr, std::size_t bytes) {
@@ -106,22 +110,22 @@ public:
         std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
         if (!cuda_hip::supports(op, ss, a)) return false;
         auto L = cuda_hip::kernel_args(op, in, a, out);
-        std::lock_guard lk(mu_);
+        std::lock_guard lk(mu_); begin_op();
         ++dispatches_[op];
         launch l; l.kernel = kernel("forge_" + op); l.global = L.threads;
         std::vector<void*> temps;
-        auto free_temps = [&] { for (auto p : temps) f_.free_(ctx_, p); };
+        auto free_temps = [&] { for (auto p : temps) dfree(p); };
         try {
             auto buf = [&](const float* h, std::size_t cnt, bool is_out) {
                 void* d;
                 if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, is_out); if (is_out) b.e->host_valid = false; d = b.ptr; }
-                else { d = alloc(cnt * 4); temps.push_back(d); if (!is_out) copy(d, h, cnt * 4); }
+                else { d = alloc(cnt * 4, "scratch"); temps.push_back(d); if (!is_out) copy(d, h, cnt * 4); }
                 l.args.push_back({d, 0, false}); return d;
             };
             for (std::size_t i = 0; i < in.size(); ++i) {
                 buf(in[i].data, in[i].size(), false);
                 if (L.s == sig::rope && i == 1) {
-                    void* d = alloc(L.rope_inv.size() * 4); (capturing_ ? keep_ : temps).push_back(d);
+                    void* d = alloc(L.rope_inv.size() * 4, "scratch"); (capturing_ ? keep_ : temps).push_back(d);
                     copy(d, L.rope_inv.data(), L.rope_inv.size() * 4); l.args.push_back({d, 0, false});
                 }
             }
@@ -139,7 +143,7 @@ private:
     runtime() = default;
     struct arg { void* ptr; std::uint32_t v; bool scalar; };
     struct launch { ze_kernel_handle_t kernel = nullptr; std::uint32_t global = 0; std::vector<arg> args; };
-    struct entry { float* host; std::size_t count; void* d; bool host_valid = true, pinned = false; };
+    struct entry { float* host; std::size_t count; void* d; bool host_valid = true, pinned = false; std::uint64_t last = 0; };
     struct bound { entry* e; void* ptr; };
     struct fns {
         decltype(&::zeInit) init = nullptr;
@@ -173,9 +177,35 @@ private:
         ck(f_.memcpy_(list_, dst, src, n, nullptr, 0, nullptr), "zeCommandListAppendMemoryCopy");
         ck(f_.barrier(list_, nullptr, 0, nullptr), "zeCommandListAppendBarrier");
     }
-    void* alloc(std::size_t bytes) {
-        ze_device_mem_alloc_desc_t d{}; d.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
-        void* p = nullptr; ck(f_.alloc(ctx_, &d, std::max<std::size_t>(4, bytes), 64, dev_, &p), "zeMemAllocDevice"); return p;
+    // ---- device memory accounting (gpu/device_memory.hpp): pool "level_zero:N" ----
+    device_memory dm_;
+    std::uint64_t clock_ = 0, op_mark_ = 0;   // buffers touched after begin_op() belong to the op in progress
+    void begin_op() { op_mark_ = clock_; }
+    void* alloc(std::size_t bytes, const char* tag) {
+        bytes = std::max<std::size_t>(4, bytes);
+        return dm_.allocate(bytes, tag, [&]() -> std::optional<void*> {
+            ze_device_mem_alloc_desc_t d{}; d.stype = ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC;
+            void* p = nullptr; auto r = f_.alloc(ctx_, &d, bytes, 64, dev_, &p);
+            if (r == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY || r == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY) return std::nullopt;
+            ck(r, "zeMemAllocDevice"); return p; });
+    }
+    void dfree(void* p) { dm_.release(p); f_.free_(ctx_, p); }
+    // device_memory's evict callback (mu_ held): resident buffers least recently used first, synced to the host
+    // first; never one the op in progress has bound, and nothing while a graph is being recorded.
+    std::uint64_t evict_device(std::uint64_t want, bool external) {
+        if (capturing_) return 0;
+        if (external) op_mark_ = clock_;
+        std::vector<std::pair<std::uint64_t, std::uintptr_t>> vs;
+        for (auto& [k, e] : res_) if (e.last <= op_mark_) vs.push_back({e.last, k});
+        std::sort(vs.begin(), vs.end());
+        std::size_t n = 0; std::uint64_t got = 0;
+        while (n < vs.size() && (!want || got < want)) got += std::max<std::size_t>(4, res_[vs[n++].second].count * 4);
+        if (!n) return 0;
+        for (std::size_t i = 0; i < n; ++i) { auto& e = res_[vs[i].second]; if (!e.host_valid) download(e); }
+        sync();
+        for (std::size_t i = 0; i < n; ++i) { drop(res_[vs[i].second]); res_.erase(vs[i].second); }
+        stats_.evictions += n; stats_.evicted_bytes += got;
+        return got;
     }
     void enqueue(const launch& l) {
         for (std::uint32_t i = 0; i < l.args.size(); ++i) {
@@ -199,20 +229,20 @@ private:
         for (auto& [k, e] : res_) { auto el = k, eh = k + e.count * 4; if (el < hi && lo < eh) f(e); }
     }
     void download(entry& e) { copy(e.host, e.d, e.count * 4); e.host_valid = true; ++stats_.downloads; }
-    void drop(entry& e) { f_.free_(ctx_, e.d); stats_.resident_bytes -= e.count * 4; }
+    void drop(entry& e) { dfree(e.d); stats_.resident_bytes -= e.count * 4; }
     bound acquire(float* h, std::size_t count, bool is_out) {
         auto key = reinterpret_cast<std::uintptr_t>(h);
-        if (auto it = res_.find(key); it != res_.end() && it->second.count == count) return {&it->second, it->second.d};
+        if (auto it = res_.find(key); it != res_.end() && it->second.count == count) { it->second.last = ++clock_; return {&it->second, it->second.d}; }
         auto it = res_.upper_bound(key);
         if (it != res_.begin()) {
             auto& c = std::prev(it)->second; auto cl = std::prev(it)->first;
-            if (cl + c.count * 4 >= key + count * 4 && count) return {&c, static_cast<char*>(c.d) + (key - cl)};
+            if (cl + c.count * 4 >= key + count * 4 && count) { c.last = ++clock_; return {&c, static_cast<char*>(c.d) + (key - cl)}; }
         }
         std::vector<std::uintptr_t> ks;
         each_overlap(h, count, [&](entry& e) { if (!e.host_valid) download(e); ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         if (!ks.empty()) sync();
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
-        entry e{h, count, alloc(count * 4)};
+        entry e{h, count, alloc(count * 4, "resident")}; e.last = ++clock_;
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
         if (!is_out) { copy(e.d, h, count * 4); ++stats_.uploads; }
         stats_.resident_bytes += count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
@@ -276,6 +306,7 @@ private:
             mod_ = nullptr; return "zeModuleCreate failed: " + s;
         }
         if (log) f_.log_destroy(log);
+        dm_.attach("level_zero:" + std::to_string(ordinal_), mu_, [this](std::uint64_t w, bool ext) { return evict_device(w, ext); });
         return {};
     }
     int ordinal_ = 0;

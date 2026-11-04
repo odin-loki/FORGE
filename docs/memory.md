@@ -21,7 +21,7 @@ The code is `core/include/forge/core/memory.hpp` (namespace `forge::mem`), and t
 ## Budget model
 A **budget** is a named pool with a byte limit:
 - `host` is the process heap and anonymous memory.
-- Device pools such as `cuda:0` and `vulkan:0` are created on demand with `governor::pool(name)`.
+- Device pools such as `cuda:0` and `vulkan:0` are created on demand with `governor::pool(name)`. The GPU backends charge them for every device allocation (see [GPU memory](#gpu-memory)).
 
 Each budget has a **hard limit** and a **soft watermark**. The soft watermark is `FORGE_MEM_SOFT × limit`, 0.9 by default.
 
@@ -70,12 +70,23 @@ Alignment is passed straight through to the upstream resource, which by default 
 |-----------|--------|-------|
 | OS pressure signals | **done** | `governor::watch_pressure()` subscribes to `os::memory_pressure` (Linux PSI, Android `onTrimMemory`, the Apple dispatch source, the Windows resource notification, or a 1 s poll). At *moderate* it trims every pool to its soft watermark. At *critical* it drops every cache. `FORGE_MEM_PRESSURE=0` turns this off |
 | Model weights | **done (existing)** | `.fpk` tensors are memory-mapped (`core/mapped.hpp`). The kernel pages them in on demand and can drop clean pages under pressure, so weights are **not** charged to the budget. `FORGE_HUGEPAGES=1` is still available for large mappings |
-| Prefix KV cache eviction | **done** | The batch scheduler registers its prefix cache with the budget (priority 10, LRU). The pressure response and admission control both evict from it |
+| Prefix KV cache eviction | **done** | The batch scheduler registers its prefix cache with the budget (priority 10, LRU: a hit moves an entry to the front). The pressure response and admission control both evict from it. With a spill store, evicted prefixes go to disk instead of being dropped (next row) |
 | KV of running requests | **done** | The live KV size is reported each step with `set_usage("kv", …)` |
 | Admission control | **done** | Before starting a queued request, the scheduler projects its cost from the largest KV size seen per request so far. If that would cross the soft watermark, it first drops prefix-cache entries, then leaves the request queued. At least one request always runs, so the queue keeps draining. Output is identical, only less parallel. Counted in `deferred` |
 | Backpressure in `forge-serve` | **done** | `--max-queue N` rejects new requests with **503 + `Retry-After: 1`** when N are already waiting. An `out_of_memory` error or `std::bad_alloc` while handling a request returns 503 instead of crashing the server |
-| Spill to disk | **core done** | `mem::spill_store` writes evicted blobs to numbered files in `FORGE_MEM_SPILL_DIR` (default `<tmp>/forge-spill-<pid>`), capped at `FORGE_MEM_SPILL_MAX`, and deletes them on destruction. Nothing spills to it automatically yet (see the phased plan) |
-| GPU memory | **accounting only** | Device pools exist and work, but the gpu backends do not yet charge them |
+| Spill to disk | **done** | `mem::spill_store` writes evicted blobs to numbered files in `FORGE_MEM_SPILL_DIR` (default `<tmp>/forge-spill-<pid>`), capped at `FORGE_MEM_SPILL_MAX`, and deletes them on destruction. With `batch_options::spill` set (`forge-serve --kv-spill`), a prefix the scheduler evicts from memory is saved there (`session::save_prefix`, up to `spill_entries` prefixes, default 64) instead of dropped. A prompt that shares a spilled prefix reads it back (`session::load_prefix`), moves it into the in-memory cache and copies its rows like any other hit, so the output is identical to recomputing it. If the store is full the prefix is dropped as before |
+| GPU memory | **done** | Every device allocation of the CUDA, HIP, OpenCL, Level Zero, Vulkan and Metal backends is charged to the device pool, and resident tensors are evicted least recently used first before an allocation would exceed the pool's limit or fail (see [GPU memory](#gpu-memory)) |
+
+## GPU memory
+The GPU backends (`gpu/device_memory.hpp`) charge the pool `<backend>:<ordinal>` (`cuda:0`, `hip:0`, `opencl:0`, `level_zero:0`, `vulkan:0`, `metal:0`) for each device allocation, with tags `resident` (tensors kept on the device by the residency protocol, and freed buffers the CUDA/HIP runtime pools for reuse), `weights` (encoded weights for the device quantised kernels), `scratch` (per-op temporaries and staging buffers) and `raw` (`device_alloc`). Freeing an allocation releases its charge. `FORGE_MEM_DEVICE_LIMIT` (or `budget::set_limit` on the pool) sets the limit. With no limit the pool only keeps accounts, which `/metrics` shows like any other pool.
+
+Each runtime registers its resident buffers with its pool as a cache. Before an allocation would cross the limit, and when the driver itself reports out of memory, the runtime makes room in this order:
+1. It frees its pooled free buffers (CUDA/HIP).
+2. It evicts resident tensors and encoded weights, least recently used first. A tensor whose newest data is only on the device is copied back to the host first. The next op that needs it uploads it again, which is what `FORGE_GPU_NO_RESIDENCY` does for every buffer, applied on demand to just enough of them.
+
+Buffers bound by the op in progress are never evicted. If nothing more can be evicted the allocation fails with `errc::out_of_memory`, naming the pool, the size and the setting to change. The runtime stays usable: a later op with room runs normally. `budget::evict` and the pressure response reach the same callback from other threads. A runtime that is busy is skipped rather than waited for, so two runtimes sharing a pool cannot deadlock. Metal has unified memory and no residency: each op charges its buffers while it runs, and nothing can be evicted.
+
+Eviction moves device addresses, so the CUDA runtime turns off whole-run replay until runs are confirmed again. Nothing is evicted while a stream capture (CUDA/HIP) or a recorded graph (OpenCL, Level Zero) is being built. `residency()` counts `evictions` and `evicted_bytes` per runtime, and `memory_pool()` / `charged_bytes()` return the pool and the bytes the runtime holds in it.
 
 ## Observability
 - `forge info` prints physical RAM, available RAM, any cgroup limit and current cgroup usage, any `RLIMIT_AS`, the `host` budget and its soft watermark, and where the limit came from.
@@ -85,7 +96,7 @@ Alignment is passed straight through to the upstream resource, which by default 
   - the counters `forge_mem_reservations_total`, `forge_mem_denials_total`, `forge_mem_waits_total`, `forge_mem_evictions_total` and `forge_mem_evicted_bytes_total`;
   - `forge_mem_used_bytes_by_tag{pool,tag}`.
 
-  It also adds `forge_mem_pressure_events_total`, plus the scheduler gauges and counters `forge_queue_waiting`, `forge_queue_active`, `forge_admission_deferred_total`, `forge_rejected_total` and `forge_kv_evictions_total`.
+  It also adds `forge_mem_pressure_events_total`, plus the scheduler gauges and counters `forge_queue_waiting`, `forge_queue_active`, `forge_admission_deferred_total`, `forge_rejected_total`, `forge_kv_evictions_total`, `forge_kv_spills_total`, `forge_kv_reloads_total` and `forge_kv_spilled` (prefixes currently on disk).
 
 ## Configuration summary
 | Setting | Default | Effect |
@@ -93,12 +104,13 @@ Alignment is passed straight through to the upstream resource, which by default 
 | `FORGE_MEM_LIMIT` | unset | Host budget: a size, a percentage of the detected limit, or `off` |
 | `FORGE_MEM_FRACTION` | `0.85` | Share of the detected limit used when `FORGE_MEM_LIMIT` is unset |
 | `FORGE_MEM_SOFT` | `0.9` | Soft watermark as a share of the limit |
-| `FORGE_MEM_DEVICE_LIMIT` | unset | Limit for every device pool |
+| `FORGE_MEM_DEVICE_LIMIT` | unset | Limit for every device pool. Resident GPU tensors are evicted to stay under it |
 | `FORGE_MEM_PRESSURE` | on | Set to `0` to ignore OS pressure signals |
 | `FORGE_MEM_SPILL_DIR` | `<tmp>/forge-spill-<pid>` | Spill directory |
 | `FORGE_MEM_SPILL_MAX` | unlimited | Maximum bytes on disk in the spill store |
 | `forge-serve --mem-limit` | env | Same values as `FORGE_MEM_LIMIT`, and takes priority over it |
 | `forge-serve --max-queue N` | `0` (no cap) | Reject with 503 once N requests are waiting |
+| `forge-serve --kv-spill` | off | Spill evicted prefix KV to the spill directory and reload it on a hit |
 
 Example: to run in a 4 GiB container, the defaults are enough because the cgroup limit is detected. To set the limit and queue cap explicitly:
 
@@ -113,6 +125,6 @@ Example: to run in a 4 GiB container, the defaults are enough because the cgroup
 
 ## Phased plan
 1. **Done:** budgets, leases, caches, the governor, cgroup and rlimit detection, a pmr resource, the spill store, pressure hookup, KV accounting, admission control and prefix-cache eviction in the scheduler, plus `forge-serve --mem-limit`, `--max-queue`, 503 handling, `/metrics` and `forge info`.
-2. **Next:** charge device pools from the gpu backends' buffer allocators, and evict device-resident tensors (`FORGE_GPU_NO_RESIDENCY` behaviour on demand) before a device allocation fails.
-3. **Next:** spill cached prefix KV to the `spill_store` instead of dropping it, and reload it when a prefix hits.
+2. **Done:** the GPU backends charge their device pools for every allocation and evict device-resident tensors, least recently used first (`FORGE_GPU_NO_RESIDENCY` behaviour on demand), before a device allocation would exceed the budget or fail. Tests: `test_gpu_memory_{cuda,hip,opencl,ze}_mock`.
+3. **Done:** the scheduler spills cached prefix KV to the `spill_store` instead of dropping it, and reloads it when a prefix hits (`forge-serve --kv-spill`). Tests: `kv_prefix_blob_roundtrip_identical_logits` and `scheduler_spills_and_reloads_prefix_kv` in `tests/test_memory.cpp`.
 4. **Later:** a per-request KV reservation sized from `(prompt + max_tokens) × kv bytes per token`, so a request that can never fit is rejected at submission. Budget-aware `forge run` and C ABI entry points. `os_proc_available_memory` on iOS and Job Object limits on Windows.

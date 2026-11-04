@@ -9,11 +9,13 @@
 #include <forge/gpu/spirv.gen.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/core/dl.hpp>
+#include <forge/gpu/device_memory.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <cstring>
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <mutex>
@@ -42,6 +44,7 @@ public:
         return r;
     }
     ~runtime() {
+        dm_.detach();
         if (dev_) {
             vkDeviceWaitIdle(dev_);
             if (cb_) vkFreeCommandBuffers(dev_, pool_, 1, &cb_);
@@ -77,7 +80,7 @@ public:
 
     // Run kernel `name` over the given host buffers (bound 0..N-1 in order; the last is written back).
     void run(const std::string& name, const std::vector<hbuf>& bufs, const push& pc, std::uint32_t invocations) {
-        std::lock_guard lk(mu_);
+        std::lock_guard lk(mu_); begin_op();
         ++dispatches_[name];
         auto& p = pipeline(name, std::uint32_t(bufs.size()));
         struct dbuf { VkBuffer b; VkDeviceMemory m; VkDeviceSize sz; };
@@ -87,8 +90,8 @@ public:
             VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
             VkBuffer b; ck(vkCreateBuffer(dev_, &bi, nullptr, &b), "vkCreateBuffer");
             VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev_, b, &mr);
-            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = memtype(mr.memoryTypeBits);
-            VkDeviceMemory m; ck(vkAllocateMemory(dev_, &ai, nullptr, &m), "vkAllocateMemory");
+            VkDeviceMemory m;
+            try { m = vk_alloc(mr.size, memtype(mr.memoryTypeBits), "scratch"); } catch (...) { vkDestroyBuffer(dev_, b, nullptr); for (auto& x : d) { vkDestroyBuffer(dev_, x.b, nullptr); vk_free(x.m); } throw; }
             ck(vkBindBufferMemory(dev_, b, m, 0), "vkBindBufferMemory");
             void* ptr; ck(vkMapMemory(dev_, m, 0, sz, 0, &ptr), "vkMapMemory");
             std::memcpy(ptr, h.data, h.count * 4); vkUnmapMemory(dev_, m);
@@ -123,7 +126,7 @@ public:
         auto& out = d.back(); void* ptr; ck(vkMapMemory(dev_, out.m, 0, out.sz, 0, &ptr), "vkMapMemory");
         std::memcpy(bufs.back().data, ptr, bufs.back().count * 4); vkUnmapMemory(dev_, out.m);
         vkDestroyFence(dev_, f, nullptr); vkFreeCommandBuffers(dev_, pool_, 1, &cb); vkDestroyDescriptorPool(dev_, dp, nullptr);
-        for (auto& x : d) { vkDestroyBuffer(dev_, x.b, nullptr); vkFreeMemory(dev_, x.m, nullptr); }
+        for (auto& x : d) { vkDestroyBuffer(dev_, x.b, nullptr); vk_free(x.m); }
     }
 
     // ---- Resident mode -------------------------------------------------------------------------------
@@ -178,8 +181,12 @@ public:
             ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         for (auto k : ks) { free_entry(res_[k]); res_.erase(k); }
     }
-    struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0; };
+    // evictions / evicted_bytes: resident buffers dropped to fit the device budget (gpu/device_memory.hpp)
+    struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0,
+                             evictions = 0, evicted_bytes = 0; };
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
+    mem::budget* memory_pool() { return dm_.pool(); }   // "vulkan:0"
+    std::uint64_t charged_bytes() { std::lock_guard lk(mu_); return dm_.charged(); }
 
     // Record kernel `name` over resident buffers (bound 0..N-1; the last is the output).
     void run_resident(const std::string& name, const std::vector<hbuf>& bufs, const push& pc, std::uint32_t invocations) {
@@ -197,7 +204,7 @@ public:
                 return;
             }
         }
-        std::unique_lock lk(mu_);
+        std::unique_lock lk(mu_); begin_op();
         std::vector<bound> es;
         for (std::size_t i = 0; i < bufs.size(); ++i) es.push_back(acquire(bufs[i], i + 1 == bufs.size()));
         // a later acquisition may have dropped an earlier binding (partially overlapping views): re-check
@@ -239,7 +246,7 @@ public:
     // Device-side copy of n floats from src into dst_base[off..] (dst_base spans dst_count floats, e.g. a
     // state slot). Both stay resident; nothing touches the host.
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
-        std::lock_guard lk(mu_);
+        std::lock_guard lk(mu_); begin_op();
         if (!n) return;
         auto d = acquire({dst_base, dst_count}, false);
         auto sb = acquire({src, n}, false);
@@ -329,6 +336,7 @@ private:
         VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cp.queueFamilyIndex = fam; cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         if (vkCreateCommandPool(dev_, &cp, nullptr, &pool_) != VK_SUCCESS) return "vkCreateCommandPool failed";
         init_pipeline_cache();
+        dm_.attach("vulkan:0", mu_, [this](std::uint64_t w, bool ext) { return evict_device(w, ext); });
         return {};
     }
     void init_pipeline_cache() {
@@ -401,14 +409,48 @@ private:
         return pipes_.emplace(name, p).first->second;
     }
 
-    struct entry { float* host; std::size_t count; VkBuffer b{}; VkDeviceMemory m{}; void* map = nullptr; bool host_valid = true, pinned = false; };
+    struct entry { float* host; std::size_t count; VkBuffer b{}; VkDeviceMemory m{}; void* map = nullptr; bool host_valid = true, pinned = false; std::uint64_t last = 0; };
     std::map<std::uintptr_t, entry> res_;   // keyed by host start address; entries never overlap
     std::vector<std::pair<const float*, std::size_t>> pinned_;
     std::vector<VkDescriptorPool> pending_pools_;
     VkCommandBuffer cb_ = nullptr; std::size_t recorded_ = 0;
     bool in_run_ = false;
     residency_stats stats_;
-    void free_entry(entry& e) { stats_.resident_bytes -= e.count * 4; vkUnmapMemory(dev_, e.m); vkDestroyBuffer(dev_, e.b, nullptr); vkFreeMemory(dev_, e.m, nullptr); }
+    void free_entry(entry& e) { stats_.resident_bytes -= e.count * 4; vkUnmapMemory(dev_, e.m); vkDestroyBuffer(dev_, e.b, nullptr); vk_free(e.m); }
+    // ---- device memory accounting (gpu/device_memory.hpp): pool "vulkan:0" ----
+    device_memory dm_;
+    std::uint64_t clock_ = 0, op_mark_ = 0;   // buffers touched after begin_op() belong to the op in progress
+    std::size_t op_scratch_ = 0;              // scratch_ entries that predate the op in progress
+    void begin_op() { op_mark_ = clock_; op_scratch_ = scratch_.size(); }
+    VkDeviceMemory vk_alloc(VkDeviceSize size, std::uint32_t type, const char* tag) {
+        return dm_.allocate(size, tag, [&]() -> std::optional<VkDeviceMemory> {
+            VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = size; ai.memoryTypeIndex = type;
+            VkDeviceMemory m{}; auto r = vkAllocateMemory(dev_, &ai, nullptr, &m);
+            if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY || r == VK_ERROR_OUT_OF_HOST_MEMORY) return std::nullopt;
+            ck(r, "vkAllocateMemory"); return m; });
+    }
+    void vk_free(VkDeviceMemory m) { dm_.release(m); vkFreeMemory(dev_, m, nullptr); }
+    // device_memory's evict callback (mu_ held): resident buffers least recently used first. Recorded work is
+    // submitted first (it may read them), device-only data is copied back to the host, then the buffer goes.
+    // Not while the op in progress holds staged scratch buffers (a submit frees those).
+    std::uint64_t evict_device(std::uint64_t want, bool external) {
+        if (external) begin_op();
+        else if (scratch_.size() > op_scratch_) return 0;
+        std::vector<std::pair<std::uint64_t, std::uintptr_t>> vs;
+        for (auto& [k, e] : res_) if (e.last <= op_mark_) vs.push_back({e.last, k});
+        std::sort(vs.begin(), vs.end());
+        std::size_t n = 0; std::uint64_t got = 0;
+        while (n < vs.size() && (!want || got < want)) got += std::max<std::size_t>(4, res_[vs[n++].second].count * 4);
+        if (!n) return 0;
+        submit_locked();
+        for (std::size_t i = 0; i < n; ++i) {
+            auto& e = res_[vs[i].second];
+            if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); ++stats_.downloads; }
+            free_entry(e); res_.erase(vs[i].second);
+        }
+        stats_.evictions += n; stats_.evicted_bytes += got;
+        return got;
+    }
     bool overlaps_any(const float* p, std::size_t n) {
         auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
         auto it = res_.lower_bound(hi);
@@ -431,7 +473,7 @@ private:
         vkDestroyFence(dev_, f, nullptr); vkFreeCommandBuffers(dev_, pool_, 1, &cb_); cb_ = nullptr;
         for (auto dp : pending_pools_) vkDestroyDescriptorPool(dev_, dp, nullptr);
         pending_pools_.clear(); ++stats_.submits; recorded_ = 0;
-        for (auto& e : scratch_) free_entry(e); scratch_.clear();
+        for (auto& e : scratch_) free_entry(e); scratch_.clear(); op_scratch_ = 0;
     }
     // Find or create the resident buffer for exactly [h.data, h.data+h.count). An overlapping entry of a
     // different extent (arena slot reuse, a view into a bigger buffer) is synced to the host and dropped first.
@@ -441,13 +483,14 @@ private:
         auto key = reinterpret_cast<std::uintptr_t>(h.data);
         VkDeviceSize range = std::max<VkDeviceSize>(4, h.count * 4);
         auto it = res_.find(key);
-        if (it != res_.end() && it->second.count == h.count) return {&it->second, 0, range};
+        if (it != res_.end() && it->second.count == h.count) { it->second.last = ++clock_; return {&it->second, 0, range}; }
         // a sub-range of a bigger resident buffer (e.g. the live prefix of a KV-cache slot): bind at an offset
         it = res_.upper_bound(key);
         if (it != res_.begin()) {
             auto& c = std::prev(it)->second;
             auto cl = reinterpret_cast<std::uintptr_t>(c.host);
             if (cl + c.count * 4 >= key + h.count * 4 && h.count) {
+                c.last = ++clock_;
                 if ((key - cl) % align_ == 0) return {&c, key - cl, range};
                 // Misaligned view (e.g. 256-byte SwiftShader limit): stage it through a scratch buffer with
                 // device-side copies instead of dropping the parent, which would force a submit + host sync.
@@ -474,10 +517,10 @@ private:
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         ck(vkCreateBuffer(dev_, &bi, nullptr, &e.b), "vkCreateBuffer");
         VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev_, e.b, &mr);
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = memtype(mr.memoryTypeBits, true);
-        ck(vkAllocateMemory(dev_, &ai, nullptr, &e.m), "vkAllocateMemory");
+        try { e.m = vk_alloc(mr.size, memtype(mr.memoryTypeBits, true), "resident"); } catch (...) { vkDestroyBuffer(dev_, e.b, nullptr); throw; }
         ck(vkBindBufferMemory(dev_, e.b, e.m, 0), "vkBindBufferMemory");
         ck(vkMapMemory(dev_, e.m, 0, sz, 0, &e.map), "vkMapMemory");
+        e.last = ++clock_;
         for (auto [pp, pn] : pinned_) if (h.data >= pp && h.data + h.count <= pp + pn) e.pinned = true;
         (void)is_out; { std::memcpy(e.map, h.data, h.count * 4); ++stats_.uploads; stats_.upload_bytes += h.count * 4; }
         stats_.resident_bytes += h.count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);
@@ -489,8 +532,7 @@ private:
         VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; bi.size = sz; bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         ck(vkCreateBuffer(dev_, &bi, nullptr, &e.b), "vkCreateBuffer");
         VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev_, e.b, &mr);
-        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO}; ai.allocationSize = mr.size; ai.memoryTypeIndex = memtype(mr.memoryTypeBits, true);
-        ck(vkAllocateMemory(dev_, &ai, nullptr, &e.m), "vkAllocateMemory");
+        try { e.m = vk_alloc(mr.size, memtype(mr.memoryTypeBits, true), "scratch"); } catch (...) { vkDestroyBuffer(dev_, e.b, nullptr); throw; }
         ck(vkBindBufferMemory(dev_, e.b, e.m, 0), "vkBindBufferMemory");
         ck(vkMapMemory(dev_, e.m, 0, sz, 0, &e.map), "vkMapMemory");
         stats_.resident_bytes += count * 4;

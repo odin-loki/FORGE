@@ -3,7 +3,7 @@
    kernel by running a C version of it over the argument array exactly as cuLaunchKernel would pass it. This
    exercises the dlopen path, symbol set, argument packing, grid sizing, streams, residency copies, graph
    capture/replay and multi-device without a GPU. It does not execute the PTX / code object.
-   MOCK_DEVICES (env) sets the device count (default 1). */
+   MOCK_DEVICES (env) sets the device count (default 1); MOCK_MEM_LIMIT caps the bytes allocated at once. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,7 +39,10 @@ int N_(cuModuleLoadData, hipModuleLoadData)(void** m, const void* img) {
 int N_(cuModuleUnload, hipModuleUnload)(void* m) { (void)m; return 0; }
 int N_(cuModuleGetFunction, hipModuleGetFunction)(void** f, void* m, const char* name) { (void)m; *f = strdup(name); return 0; }
 static size_t g_live = 0;
-int N_(cuMemAlloc_v2, hipMalloc)(dptr* p, size_t n) { size_t* b = malloc(n + 16); if (!b) return 2; b[0] = n; g_live += n; *p = (dptr)(uintptr_t)(b + 2); return 0; }
+/* MOCK_MEM_LIMIT (bytes): allocations past it fail with CUDA_ERROR_OUT_OF_MEMORY / hipErrorOutOfMemory (2). */
+int N_(cuMemAlloc_v2, hipMalloc)(dptr* p, size_t n) {
+    const char* lim = getenv("MOCK_MEM_LIMIT"); if (lim && g_live + n > (size_t)strtoull(lim, NULL, 10)) return 2;
+    size_t* b = malloc(n + 16); if (!b) return 2; b[0] = n; g_live += n; *p = (dptr)(uintptr_t)(b + 2); return 0; }
 int N_(cuMemFree_v2, hipFree)(dptr p) { if (!p) return 0; size_t* b = (size_t*)(uintptr_t)p - 2; g_live -= b[0]; free(b); return 0; }
 int N_(cuMemcpyHtoD_v2, hipMemcpyHtoD)(dptr d, const void* s, size_t n) { memcpy(P(d), s, n); return 0; }
 int N_(cuMemcpyDtoH_v2, hipMemcpyDtoH)(void* d, dptr s, size_t n) { memcpy(d, P(s), n); return 0; }

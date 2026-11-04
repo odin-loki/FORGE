@@ -9,6 +9,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <format>
 #include <string>
 
 using namespace forge;
@@ -199,6 +200,104 @@ template<class Open, class Count> static int features_t(Open open, Count device_
     return fails ? 1 : 0;
 }
 
+static void set_env(const char* k, const std::string& v) {
+#ifdef _WIN32
+    _putenv_s(k, v.c_str());
+#else
+    if (v.empty()) unsetenv(k); else setenv(k, v.c_str(), 1);
+#endif
+}
+
+// Device memory accounting (gpu/device_memory.hpp, docs/memory.md): every allocation is charged to the pool
+// "<backend>:0"; resident buffers are evicted least recently used first (synced to the host) when an allocation
+// would cross the pool's limit or the driver runs out; an op that cannot fit even then fails with out_of_memory.
+template<class Open> static int memory_t(Open open) {
+    std::string why; auto rt = open(&why, 0);
+    if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    int fails = 0;
+    auto chk = [&](bool c, const std::string& what) { std::printf("%s %s\n", c ? "ok  " : "FAIL", what.c_str()); fails += !c; };
+    auto* pool = rt->memory_pool();
+    chk(pool && pool->name() == std::string(rt->backend()) + ":0", std::string("runtime charges the pool ") + (pool ? pool->name() : "?"));
+    if (!pool) return 1;
+    pool->set_limit(0);
+    const std::size_t N = 1000, B = N * 4;
+    shape_t sh{i64(N)};
+    std::vector<float> w0(N), w1(N), w2(N), y(N), z(N);
+    for (std::size_t i = 0; i < N; ++i) { w0[i] = float(i % 13) * 0.5f - 3; w1[i] = float(i % 7) + 1; w2[i] = float(i % 5) - 2; }
+    for (auto* w : {&w0, &w1, &w2}) rt->pin(w->data(), N);   // weights: resident across runs
+    auto same = [&](const std::vector<float>& v, auto f) { for (std::size_t i = 0; i < N; ++i) if (std::abs(v[i] - f(i)) > 1e-5f) return false; return true; };
+    auto pooled = [&] { if constexpr (requires { rt->residency().pooled_bytes; }) return std::uint64_t(rt->residency().pooled_bytes); else return std::uint64_t(0); };
+    auto base = pool->used();
+
+    // 1. accounting: a resident op charges its buffers; after the run the pinned weights (and pooled buffers) stay charged
+    rt->begin_run();
+    rt->run_op("add", {{w0.data(), sh}, {w1.data(), sh}}, {}, {y.data(), sh});
+    chk(pool->used() - base == 3 * B && rt->charged_bytes() == 3 * B, std::format("add(w0, w1) charges 3 x {} bytes (used {})", B, pool->used() - base));
+    chk(pool->stats().by_tag["resident"] >= 3 * B, "charged under the tag \"resident\"");
+    rt->end_run();
+    chk(same(y, [&](std::size_t i) { return w0[i] + w1[i]; }), "add result");
+    chk(pool->used() - base == 2 * B + pooled(), std::format("after end_run: 2 pinned weights + {} pooled bytes stay charged (used {})", pooled(), pool->used() - base));
+
+    // 2. a limit of 3 buffers: the next op needs 4, so the least recently used weight not bound by the op goes
+    pool->set_limit(base + 3 * B);
+    auto ev0 = rt->residency().evictions, up0 = rt->residency().uploads;
+    rt->begin_run();
+    rt->run_op("mul", {{w2.data(), sh}, {w0.data(), sh}}, {}, {z.data(), sh});
+    rt->end_run();
+    chk(same(z, [&](std::size_t i) { return w2[i] * w0[i]; }), "mul result under a 3-buffer budget");
+    chk(rt->residency().evictions > ev0 && pool->stats().evictions > 0, std::format("an allocation over the budget evicted ({} evictions)", rt->residency().evictions - ev0));
+    chk(pool->stats().peak <= base + 3 * B && pool->used() <= base + 3 * B, std::format("usage never crossed the limit (peak {})", pool->stats().peak - base));
+    // w1 was evicted (LRU, not bound by mul): using it again uploads it; w0 stayed resident
+    up0 = rt->residency().uploads;
+    rt->begin_run(); rt->run_op("scale", {{w0.data(), sh}}, {{"alpha", 2.0}}, {y.data(), sh}); rt->end_run();
+    chk(rt->residency().uploads == up0 && same(y, [&](std::size_t i) { return 2 * w0[i]; }), "w0 (used most recently) stayed resident");
+    rt->begin_run(); rt->run_op("scale", {{w1.data(), sh}}, {{"alpha", 2.0}}, {y.data(), sh}); rt->end_run();
+    chk(rt->residency().uploads == up0 + 1 && same(y, [&](std::size_t i) { return 2 * w1[i]; }), "w1 (least recently used) was evicted and is uploaded again");
+
+    // 3. eviction requested from outside (pressure response): least recently used first
+    ev0 = rt->residency().evictions;
+    pool->evict(pooled() + 1);   // the pool's free buffers, then one resident weight: w0 (used before w1)
+    up0 = rt->residency().uploads;
+    rt->begin_run(); rt->run_op("scale", {{w1.data(), sh}}, {{"alpha", 3.0}}, {y.data(), sh}); rt->end_run();
+    chk(rt->residency().evictions > ev0 && rt->residency().uploads == up0, "budget::evict drops the LRU weight and keeps the recent one");
+
+    // 4. an op that cannot fit even after evicting everything fails with out_of_memory, and leaves the runtime usable
+    pool->set_limit(base + 2 * B);
+    auto den = pool->stats().denials; bool oom = false;
+    rt->begin_run();
+    try { rt->run_op("add", {{w0.data(), sh}, {w1.data(), sh}}, {}, {y.data(), sh}); }
+    catch (const forge_exception& e) { oom = e.code == errc::out_of_memory; std::printf("     %s\n", e.what()); }
+    rt->end_run();
+    chk(oom && pool->stats().denials > den, "an op larger than the budget fails with errc::out_of_memory");
+    pool->set_limit(0);
+    rt->begin_run(); rt->run_op("add", {{w0.data(), sh}, {w1.data(), sh}}, {}, {y.data(), sh}); rt->end_run();
+    chk(same(y, [&](std::size_t i) { return w0[i] + w1[i]; }), "the runtime recovers once the limit is lifted");
+
+#if !defined(_WIN32)   // the mock reads MOCK_MEM_LIMIT through its own C runtime
+    // 5. (mock driver) the driver runs out with no budget set: evict resident buffers, including an unsynced output, and retry
+    if (rt->device_name().find("forge mock") != std::string::npos && (std::string(rt->backend()) == "cuda" || std::string(rt->backend()) == "hip")) {
+        pool->evict(0);
+        const std::size_t M = 1500;   // a size the pool has no buffer for
+        shape_t sm{i64(M)};
+        std::vector<float> a(M), b(M), c(M), d(M);
+        for (std::size_t i = 0; i < M; ++i) { a[i] = float(i % 11) * 0.1f; c[i] = float(i % 3) * 0.2f; }
+        auto m = rt->memory(); std::size_t live = m.total - m.free;
+        set_env("MOCK_MEM_LIMIT", std::to_string(live + 2 * M * 4));
+        ev0 = rt->residency().evictions;
+        rt->begin_run();
+        rt->run_op("exp", {{a.data(), sm}}, {}, {b.data(), sm});   // a, b: the driver is now full
+        rt->run_op("exp", {{c.data(), sm}}, {}, {d.data(), sm});   // c evicts a, d evicts b (downloaded first)
+        rt->end_run();
+        set_env("MOCK_MEM_LIMIT", "");
+        bool ok = true; for (std::size_t i = 0; i < M; ++i) ok &= std::abs(b[i] - std::exp(a[i])) < 1e-5f && std::abs(d[i] - std::exp(c[i])) < 1e-5f;
+        chk(ok && rt->residency().evictions >= ev0 + 2, std::format("driver out of memory: {} evictions, results intact", rt->residency().evictions - ev0));
+    }
+#endif
+    rt.reset();
+    chk(pool->used() == base, std::format("destroying the runtime returns every byte (used {})", pool->used() - base));
+    return fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
@@ -216,6 +315,12 @@ int main(int argc, char** argv) {
         if (w == "ze") return features_t(ze, [] { return forge::gpu::ze::runtime::device_count(); });
         auto a = w == "hip" ? cuda_hip::api::hip : cuda_hip::api::cuda;
         return features_t(cu(a), [a] { return cuda_hip::runtime::device_count(a); });
+    }
+    if (mode == "memory") {
+        std::string w = argc > 2 ? argv[2] : "cuda";
+        if (w == "opencl") return memory_t(cl);
+        if (w == "ze") return memory_t(ze);
+        return memory_t(cu(w == "hip" ? cuda_hip::api::hip : cuda_hip::api::cuda));
     }
     std::fprintf(stderr, "usage: test_cuda_hip [images|cuda|hip|opencl|ze|features <api>]\n"); return 2;
 }

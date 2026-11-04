@@ -136,6 +136,79 @@ TEST(scheduler_reports_kv_and_defers_under_budget) {
     std::filesystem::remove(path);
 }
 
+// session::save_prefix / load_prefix: a prefix restored from a blob continues with bit-identical logits.
+TEST(kv_prefix_blob_roundtrip_identical_logits) {
+    auto path = (std::filesystem::temp_directory_path() / ("forge_test_kvblob_" + std::to_string(::getpid()) + ".fpk")).string();
+    forge_test::make_tiny_model(path);
+    {
+    auto m = inference::model::open(path);
+    const std::vector<int> p{256, 5, 9, 3, 7, 1};
+    const int t = 11;
+    inference::session a(m), b(m), fresh(m);
+    a.forward(p);
+    auto blob = a.save_prefix();
+    CHECK(!blob.empty());
+    b.load_prefix(blob);
+    CHECK(b.position() == a.position());
+    auto la = a.forward(std::span<const int>(&t, 1)), lb = b.forward(std::span<const int>(&t, 1));
+    fresh.forward(p); auto lf = fresh.forward(std::span<const int>(&t, 1));
+    CHECK(la == lb); CHECK(lb == lf);   // bitwise
+    // a shorter prefix behaves exactly like copy_prefix
+    inference::session c(m), d(m);
+    c.copy_prefix(a, 3); d.load_prefix(a.save_prefix(3));
+    CHECK(d.position() == 3);
+    auto lc = c.forward(std::span<const int>(&t, 1)), ld = d.forward(std::span<const int>(&t, 1));
+    CHECK(lc == ld);
+    std::vector<std::byte> junk(blob.begin(), blob.begin() + 20);
+    CHECK_THROWS(d.load_prefix(junk));
+    }
+    std::filesystem::remove(path);
+}
+
+// The batch scheduler spills evicted prefix KV to a spill_store and reloads it when a prompt hits it.
+TEST(scheduler_spills_and_reloads_prefix_kv) {
+    auto path = (std::filesystem::temp_directory_path() / ("forge_test_spill_" + std::to_string(::getpid()) + ".fpk")).string();
+    auto dir = std::filesystem::temp_directory_path() / ("forge_spill_sched_" + std::to_string(::getpid()));
+    forge_test::make_tiny_model(path);
+    {
+    auto m = inference::model::open(path);
+    const std::vector<int> p1{256, 10, 11, 12, 13, 14}, p2{256, 20, 21, 22}, p3{256, 10, 11, 12, 13, 14, 15, 16};
+    std::vector<int> want1, want2, want3;
+    { inference::session s(m); want1 = greedy(s, p1, 5); want2 = greedy(s, p2, 5); want3 = greedy(s, p3, 5); }
+    auto run = [&](inference::batch_scheduler& s, const std::vector<int>& p) {
+        std::vector<int> out; s.submit({.prompt = p, .max_new = 5, .on_done = [&](const std::vector<int>& o, const std::string&) { out = o; }});
+        s.run_until_idle(); return out;
+    };
+    mem::spill_store sp(dir);
+    {
+        inference::batch_scheduler s(m, {.max_active = 1, .prefix_cache = 1, .spill = &sp});
+        CHECK(run(s, p1) == want1);
+        CHECK(run(s, p2) == want2);   // p1's prefix leaves memory (capacity 1): spilled, not dropped
+        CHECK(s.stats().prefix_spills == 1); CHECK(s.spilled() == 1); CHECK(sp.bytes() > 0);
+        auto reused = s.stats().prefix_tokens_reused;
+        CHECK(run(s, p3) == want3);   // shares p1's 6 tokens: read back from disk, rows copied, same tokens out
+        CHECK(s.stats().prefix_reloads == 1);
+        CHECK(s.stats().prefix_tokens_reused - reused >= p1.size());
+        CHECK(s.stats().prefix_spills == 3);   // the reload pushed p2's prefix out, retiring p3 pushed p1's out
+        CHECK(s.spilled() == 2);
+        // memory pressure: every cached prefix goes to disk, nothing stays in memory, and a hit still works
+        s.request_kv_eviction(0); s.step();
+        CHECK(s.spilled() == 3);
+        CHECK(run(s, p3) == want3);
+        CHECK(s.stats().prefix_reloads == 2);
+    }
+    CHECK(sp.bytes() == 0);   // the scheduler drops its spilled prefixes when it goes away
+    {   // without a spill store the evicted prefix is recomputed: same output, no hit
+        inference::batch_scheduler s(m, {.max_active = 1, .prefix_cache = 1});
+        run(s, p1); run(s, p2);
+        auto hits = s.stats().prefix_tokens_reused;
+        CHECK(run(s, p3) == want3);
+        CHECK(s.stats().prefix_tokens_reused - hits < p1.size());
+    }
+    }
+    std::filesystem::remove(path);
+}
+
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 TEST(spawn_leased_charges_and_returns_cap) {
     forge::mem::budget b("children", 1ull << 30);
