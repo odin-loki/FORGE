@@ -204,8 +204,38 @@ public:
         if (a != adapter_) { adapter_ = a; execs_.clear(); reset(); }
     }
     const std::string& adapter() const { return adapter_; }
-    // roll back to `pos` tokens (speculative rejection, prefix reuse)
+    // roll back to `pos` tokens (speculative rejection, prefix reuse). Recurrent state (e.g. Qwen3.5 DeltaNet,
+    // conv windows) cannot be cut: this raises for such models unless pos is 0; use checkpoint() + rewind(pos, ck, tokens).
     void rewind(i64 pos) { if (pos < pos_) { st_.truncate(pos); pos_ = pos; } }
+    // True when the state holds recurrent slots, which only make sense at their full length.
+    bool has_recurrent_state() const { for (auto& [k, s] : st_.slots) if (s.fixed) return true; return false; }
+    // Whether the first `n` tokens of this session can be shared (copy_prefix / save_prefix) or rewound to.
+    bool can_share_prefix(i64 n) const {
+        if (n > pos_) return false;
+        for (auto& [k, s] : st_.slots) if (s.fixed && n != s.len) return false;
+        return true;
+    }
+    // A snapshot of the recurrent slots at the current position (empty for pure KV-cache models), so a later
+    // rewind can restore them and replay the tokens since, instead of cutting a state that cannot be cut.
+    struct checkpoint { i64 pos = 0; std::map<std::string, graph::state_store::slot> fixed; };
+    checkpoint make_checkpoint() const {
+        checkpoint c; c.pos = pos_;
+        if (!has_recurrent_state()) return c;
+        st_.flush();   // device-resident rows back to the host copy
+        for (auto& [k, s] : st_.slots) if (s.fixed) c.fixed.emplace(k, s);
+        return c;
+    }
+    // Roll back to `pos` (ck.pos <= pos <= position()), where `since` holds the tokens fed after the checkpoint.
+    // KV-only models just truncate; recurrent slots are restored from `ck` and since[0 .. pos - ck.pos) replayed.
+    void rewind(i64 pos, const checkpoint& ck, std::span<const int> since) {
+        if (pos >= pos_) return;
+        if (ck.fixed.empty()) { rewind(pos); return; }
+        if (pos < ck.pos || pos - ck.pos > i64(since.size())) raise(errc::invalid_argument, "rewind: position {} is outside the checkpoint range", pos);
+        st_.forget();   // device copies are stale after the restore
+        for (auto& [k, s] : ck.fixed) st_.slots[k] = s;
+        st_.truncate(ck.pos); pos_ = ck.pos;
+        if (pos > ck.pos) forward(since.subspan(0, std::size_t(pos - ck.pos)));
+    }
     // copy the first `n` tokens of another session's state (prefix sharing across sequences)
     void copy_prefix(const session& o, i64 n) {
         if (o.m_ != m_) raise(errc::invalid_argument, "copy_prefix: sessions use different models");

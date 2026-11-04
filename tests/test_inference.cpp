@@ -213,6 +213,69 @@ TEST(batch_scheduler_threaded) {
     b.stop();
 }
 
+// Qwen3.5-style hybrid: its DeltaNet and conv-window state is recurrent and cannot be cut to a shorter prefix.
+static const std::string& model_h() { static std::string p = forge_test::make_tiny_qwen35_model(tmp("h.fpk")); return p; }
+static const std::string& model_h2() { static std::string p = forge_test::make_tiny_qwen35_model(tmp("h2.fpk"), 77); return p; }
+
+TEST(recurrent_rewind_via_checkpoint) {
+    auto m = model::open(model_h());
+    inference::session a(m), b(m);
+    std::vector<int> p = {256, 10, 20, 30, 40};
+    a.forward(p);
+    CHECK(a.has_recurrent_state());
+    CHECK(!a.can_share_prefix(3) && a.can_share_prefix(5));
+    auto ck = a.make_checkpoint();
+    std::vector<int> more = {60, 61, 62};
+    a.forward_all(more);
+    CHECK_THROWS(a.rewind(6));                       // the recurrent state cannot simply be cut
+    a.rewind(6, ck, more);                           // restore the checkpoint and replay 60
+    CHECK(a.position() == 6);
+    auto la = a.forward(std::vector<int>{9});
+    b.forward(p); b.forward(std::vector<int>{60}); auto lb = b.forward(std::vector<int>{9});
+    CHECK_MSG(maxdiff(la, lb) < 1e-5f, "diff %g", maxdiff(la, lb));
+    a.rewind(5, ck, more);                           // back to the checkpoint itself
+    CHECK(a.position() == 5);
+}
+
+TEST(recurrent_speculative_and_lookup_equal_greedy) {
+    auto tm = model::open(model_h());
+    std::vector<int> p = {256, 72, 101, 108, 108, 111, 32, 72, 101, 108, 108, 111};
+    inference::session ref(tm); auto want = greedy(ref, p, 30);
+    for (auto* dpath : {&model_h(), &model_h2()})
+        for (int k : {1, 4}) {
+            inference::session t(tm), d(model::open(*dpath)); sampler g; speculative_stats st;
+            auto got = speculative_generate(t, d, p, 30, g, k, {}, &st);
+            CHECK_MSG(got == want, "draft %s k=%d", dpath->c_str(), k);
+        }
+    for (int k : {1, 4}) {
+        inference::session t(tm); sampler g; speculative_stats st;
+        auto got = lookup_generate(t, p, 30, g, k, 3, {}, &st);
+        CHECK_MSG(got == want, "lookup k=%d", k);
+    }
+}
+
+TEST(batch_scheduler_recurrent_prefix_cache) {
+    auto m = model::open(model_h());
+    // A finishes first; B shares only part of A's sequence (this used to fail every active request);
+    // C continues A's whole sequence (a multi-turn chat), the one hit a recurrent state allows.
+    std::vector<int> A = {256, 1, 2, 3, 4};
+    inference::session r(m); auto outA = greedy(r, A, 6);
+    CHECK(outA.size() == 6);
+    std::vector<int> B = {256, 1, 2, 99}, C = A;
+    C.insert(C.end(), outA.begin(), outA.end() - 1);    // the cached tokens: A plus every output token but the last
+    C.push_back(50); C.push_back(51);
+    std::vector<std::vector<int>> prompts = {A, B, C}, want;
+    for (auto& q : prompts) { inference::session s(m); want.push_back(greedy(s, q, 6)); }
+    batch_scheduler b(m, {.max_active = 1, .prefill_chunk = 3, .prefix_cache = 4});
+    std::vector<std::vector<int>> got(prompts.size()); std::vector<std::string> why(prompts.size());
+    for (std::size_t i = 0; i < prompts.size(); ++i)
+        b.submit({.prompt = prompts[i], .max_new = 6, .on_done = [&, i](const std::vector<int>& o, const std::string& w) { got[i] = o; why[i] = w; }});
+    b.run_until_idle();
+    for (std::size_t i = 0; i < prompts.size(); ++i) CHECK_MSG(got[i] == want[i] && why[i] == "length", "request %zu (%s)", i, why[i].c_str());
+    CHECK(b.stats().prefix_hits == 1);
+    CHECK(b.stats().prefix_tokens_reused == A.size() + outA.size() - 1);
+}
+
 #include <forge/inference/json_schema.hpp>
 TEST(sampler_typical_and_mirostat) {
     // typical: entropy of {0.5,0.25,0.125,0.125} is 1.75 bits; the 0.25 token (2 bits) is most typical.
