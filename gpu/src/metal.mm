@@ -34,7 +34,7 @@ std::unique_ptr<runtime> runtime::open(std::string* why, int ordinal) {
         std::unique_ptr<runtime> r(new runtime); r->ordinal_ = ordinal; r->p_ = new impl;
         r->p_->dev = ds[NSUInteger(ordinal)]; r->name_ = r->p_->dev.name.UTF8String;
         r->p_->q = [r->p_->dev newCommandQueue];
-        NSString* src = [[NSString alloc] initWithBytes:gpu::images::metal_src length:gpu::images::metal_src_size encoding:NSUTF8StringEncoding];
+        NSString* src = [[NSString alloc] initWithBytes:cuda_hip::images::metal_src length:cuda_hip::images::metal_src_size encoding:NSUTF8StringEncoding];
         MTLCompileOptions* o = [MTLCompileOptions new]; o.fastMathEnabled = NO;
         NSError* err = nil;
         r->p_->lib = [r->p_->dev newLibraryWithSource:src options:o error:&err];
