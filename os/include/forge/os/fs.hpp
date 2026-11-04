@@ -24,7 +24,11 @@
 namespace forge::os::fs {
 namespace stdfs = std::filesystem;
 
-inline error from_ec(const std::error_code& ec, std::string_view what) { return {ec.value() ? ec.value() : -1, std::string(what) + ": " + ec.message()}; }
+// std::filesystem reports errno values (generic_category: libstdc++, including mingw) or native codes
+// (system_category: Win32 on MSVC); the error records which, so os::classify reads it right.
+inline error from_ec(const std::error_code& ec, std::string_view what) {
+    return {ec.value() ? ec.value() : -1, std::string(what) + ": " + ec.message(), ec.category() == std::generic_category() ? err_domain::posix : err_domain::native};
+}
 inline stdfs::path u8path(const std::string& s) { return stdfs::path(std::u8string(s.begin(), s.end())); }
 inline std::string u8str(const stdfs::path& p) { auto u = p.u8string(); return std::string(u.begin(), u.end()); }
 
@@ -274,8 +278,7 @@ public:
         while (::flock(fd, op) != 0) { if (errno == EINTR) continue; auto e = last_error("lock " + path); ::close(fd); return {{}, e}; }
         l.h_ = fd;
 #else
-        std::wstring w(path.begin(), path.end());
-        HANDLE h = CreateFileW(w.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, 0, nullptr);
+        HANDLE h = CreateFileW(widen(path).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, 0, nullptr);
         if (h == INVALID_HANDLE_VALUE) return {{}, last_error("lock " + path)};
         OVERLAPPED ov{};
         DWORD fl = (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0) | (wait ? 0 : LOCKFILE_FAIL_IMMEDIATELY);
@@ -310,15 +313,26 @@ inline result<disk_usage_t> disk_usage(const std::string& p) {
     if (ec) return {{}, from_ec(ec, "disk usage " + p)};
     return {{std::uint64_t(s.capacity), std::uint64_t(s.free), std::uint64_t(s.available)}, {}};
 }
+// /proc/self/mounts escapes space, tab, newline and backslash as \ooo; anything that is not three octal digits
+// stays literal (never throws).
+inline std::string mount_unescape(const std::string& s) {
+    auto oct = [](char c) { return c >= '0' && c <= '7'; };
+    std::string o;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 3 < s.size() && oct(s[i + 1]) && oct(s[i + 2]) && oct(s[i + 3])) {
+            o += char(((s[i + 1] - '0') << 6) | ((s[i + 2] - '0') << 3) | (s[i + 3] - '0')); i += 3;
+        } else o += s[i];
+    }
+    return o;
+}
 struct mount_info { std::string device, path, type, options; };
 inline result<std::vector<mount_info>> mounts() {
     std::vector<mount_info> out;
 #if defined(__linux__)
     std::ifstream f("/proc/self/mounts");
     if (!f) return {{}, last_error("/proc/self/mounts")};
-    auto unesc = [](std::string s) { std::string o; for (std::size_t i = 0; i < s.size(); ++i) { if (s[i] == '\\' && i + 3 < s.size()) { o += char(std::stoi(s.substr(i + 1, 3), nullptr, 8)); i += 3; } else o += s[i]; } return o; };
     std::string dev, path, type, opts, a, b;
-    while (f >> dev >> path >> type >> opts >> a >> b) out.push_back({unesc(dev), unesc(path), type, opts});
+    while (f >> dev >> path >> type >> opts >> a >> b) out.push_back({mount_unescape(dev), mount_unescape(path), type, opts});
     return {std::move(out), {}};
 #elif defined(FORGE_OS_WINDOWS)
     char buf[512]; DWORD n = GetLogicalDriveStringsA(sizeof buf, buf);
@@ -366,18 +380,21 @@ inline result<std::string> make_temp_file(const std::string& prefix = "forge-", 
         int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
         if (fd >= 0) { ::close(fd); return {p, {}}; }
         if (errno != EEXIST) return {{}, last_error("make_temp_file")};
-#else
-        if (!exists(p)) { std::ofstream f(u8path(p), std::ios::binary); if (f) return {p, {}}; }
+#else   // CREATE_NEW: exclusive like O_EXCL, so a name that appears between choosing and creating is never reused
+        HANDLE h = CreateFileW(widen(p).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return {p, {}}; }
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return {{}, last_error("make_temp_file")};
 #endif
     }
     return {{}, error{-1, "make_temp_file: could not create a unique file"}};
 }
 // Write to a sibling temp file, flush it to disk and rename over `path`: readers see the old or the new
-// content, never a torn file.
+// content, never a torn file. mode: POSIX permission bits (less the umask); on Windows a mode without any write
+// bit makes the file read-only, the rest has no NTFS equivalent.
 inline status write_file_atomic(const std::string& path, std::string_view data, unsigned mode = 0644) {
     std::string tmp = path + ".tmp-" + random_suffix(8);
 #if defined(FORGE_OS_POSIX)
-    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, mode);
+    int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode);
     if (fd < 0) return {{}, last_error("write " + tmp)};
     std::size_t off = 0;
     while (off < data.size()) { auto n = ::write(fd, data.data() + off, data.size() - off); if (n < 0) { if (errno == EINTR) continue; auto e = last_error("write " + tmp); ::close(fd); ::unlink(tmp.c_str()); return {{}, e}; } off += std::size_t(n); }
@@ -391,10 +408,22 @@ inline status write_file_atomic(const std::string& path, std::string_view data, 
     if (dfd >= 0) { (void)::fsync(dfd); ::close(dfd); }
     return {};
 #else
-    (void)mode;
-    { std::ofstream f(u8path(tmp), std::ios::binary | std::ios::trunc); if (!f) return {{}, last_error("write " + tmp)}; f.write(data.data(), std::streamsize(data.size())); f.flush(); if (!f) return {{}, last_error("write " + tmp)}; }
-    std::wstring a(tmp.begin(), tmp.end()), b(path.begin(), path.end());
-    if (!MoveFileExW(a.c_str(), b.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { auto e = last_error("rename " + path); std::error_code ec; stdfs::remove(u8path(tmp), ec); return {{}, e}; }
+    auto a = widen(tmp), b = widen(path);
+    HANDLE h = CreateFileW(a.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, (mode & 0222) ? FILE_ATTRIBUTE_NORMAL : FILE_ATTRIBUTE_READONLY, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {{}, last_error("write " + tmp)};
+    auto fail = [&](const char* what) {
+        auto e = last_error(std::string(what) + " " + tmp); CloseHandle(h);
+        SetFileAttributesW(a.c_str(), FILE_ATTRIBUTE_NORMAL); DeleteFileW(a.c_str()); return status{{}, e};
+    };
+    for (std::size_t off = 0; off < data.size();) {
+        DWORD put = 0; if (!WriteFile(h, data.data() + off, file::chunk(data.size() - off), &put, nullptr)) return fail("write");
+        off += put;
+    }
+    if (!FlushFileBuffers(h)) return fail("flush");   // the data is on disk before the rename can expose it
+    CloseHandle(h);
+    if (!MoveFileExW(a.c_str(), b.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        auto e = last_error("rename " + path); SetFileAttributesW(a.c_str(), FILE_ATTRIBUTE_NORMAL); DeleteFileW(a.c_str()); return {{}, e};
+    }
     return {};
 #endif
 }
