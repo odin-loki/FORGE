@@ -595,7 +595,12 @@ std::string shell_exe(const shell_backend& b) {
     }
     return {};
 #else
-    for (auto& e : b.exes) if (!os::find_executable(e).empty()) return e;
+    for (auto& e : b.exes) {
+        auto p = os::find_executable(e);
+        if (p.empty()) continue;
+        if (p.size() > 4 && p.compare(p.size() - 4, 4, ".exe") == 0) continue;   // WSL interop (cmd.exe): no Linux cwd
+        return e;
+    }
     return {};
 #endif
 }
