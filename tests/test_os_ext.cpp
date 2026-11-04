@@ -355,7 +355,19 @@ TEST(timers_and_perf) {
 TEST(background_execution) {
     auto t = os::background::begin("forge-test");
     if (!t) { skip("background", t.err.what); CHECK(os::is_unsupported(t.err)); }
-    else { std::printf("  kind %s\n", os::background::kind(t.value).c_str()); CHECK(os::background::active() == 1); CHECK(os::background::end(t.value)); CHECK(os::background::active() == 0); CHECK(!os::background::end(t.value)); }
+    else {
+        auto k = os::background::kind(t.value); std::printf("  kind %s\n", k.c_str());
+#if defined(_WIN32)
+        CHECK(k == "power-request");
+#elif defined(FORGE_OS_LINUX)
+        CHECK(k == "logind-inhibit" || k == "not_required");
+#endif
+        CHECK(os::background::active() == 1);
+        auto t2 = os::background::begin("forge-test-2"); CHECK(t2); CHECK(os::background::active() == 2);
+        std::thread other([&] { CHECK(os::background::end(t.value)); });   // tokens are per process, not per thread
+        other.join(); CHECK(os::background::active() == 1); CHECK(!os::background::end(t.value));
+        if (t2) CHECK(os::background::end(t2.value)); CHECK(os::background::active() == 0);
+    }
     bool began = false, ended = false;
     os::background::set_hooks({[&](auto&, auto&, auto&) { began = true; return true; }, [&](auto&) { ended = true; }});
 #if defined(__ANDROID__)
