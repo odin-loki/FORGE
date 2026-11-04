@@ -187,7 +187,7 @@ int main(int argc, char** argv) {
 - **Modes.** `fork` (default on Linux, macOS, FreeBSD, Android) forks workers that run the registered tasks. `spawn` re-launches the program with `--forge-process-worker=...`: fork + exec on POSIX, `CreateProcessW` with the worker's stdin/stdout as the IPC pipes on Windows, where it is the only mode (`fork` throws `os_exception{not_supported}`). Spawn mode needs `run_worker_if_requested(argc, argv)` first in `main()`; a test harness must do the same, or a worker re-runs the test suite. On iOS the constructor throws `os_exception{not_supported}`.
 - **IPC.** One pipe pair per worker; frames are length-prefixed (type, id, task name, payload).
 - **Errors.** A task that throws fails its future with `os_exception` (kind carried over from the worker). A worker that dies mid-task fails that future with `os_errc::signal` and the signal number (Windows access violation / illegal instruction / divide by zero map to 1 / 2 / 3), or `os_errc::io` for a non-zero exit. The worker is respawned; other tasks keep running.
-- **Sandbox.** `options.sandbox` applies `os::apply_sandbox` in every worker before its first task.
+- **Sandbox.** `options.sandbox` applies `os::apply_sandbox` in every worker before its first task (Linux: seccomp, plus Landlock where the kernel has it). On Windows, workers whose policy denies network or file writes start in an AppContainer (no network capability; writes only to the container folder), and the pool grants the container read + execute on the worker image. A worker that cannot apply its policy exits with 70 and the task fails (`os_errc::io`, "sandbox could not be applied"). See security.md.
 - ForgeScript exposes it as `ProcessPool(n, {...})`.
 
 ## Platform notes
