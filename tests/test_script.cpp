@@ -3,6 +3,7 @@
 #include <forge/script/script.hpp>
 #include "check.hpp"
 #include <cstdio>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -648,6 +649,53 @@ try { forge::ask("x"); } catch (const AIError& e) { std::println("AIError"); }
     CHECK_MSG(e == "AIError\n", "got:\n%s", e.c_str());
 }
 
+// In-process inference for forge::ask / ask_json: a tiny random Llama (tests/tiny_model.hpp) through the inference
+// module, registered the way the forge CLI does it (forge/script/local_ai.hpp).
+#include <forge/script/local_ai.hpp>
+#include "tiny_model.hpp"
+TEST(ask_local_model) {
+    namespace stdfs = std::filesystem;
+    auto path = (stdfs::temp_directory_path() / ("forge_ask_" + std::to_string(::getpid()) + ".fpk")).string();
+    forge_test::make_tiny_model(path);
+    script::options o; o.ask_model = path; o.ask_max_tokens = 8;
+    // without a registered generator (forge_script alone) a configured model is an AIError, not a silent fallback
+    script::set_local_ai(nullptr);
+    auto miss = run("try { forge::ask(\"hi\"); } catch (const AIError& e) { std::println(\"{}\", e.what()); }", o);
+    CHECK_MSG(miss.find("no in-process inference") != std::string::npos, "got: %s", miss.c_str());
+    script::install_local_ai();
+    CHECK(script::has_local_ai());
+    // the generator is greedy decoding of forge-serve's chat layout, straight through the inference module
+    {
+        forge::inference::session_options so; so.context = 64;
+        forge::inference::session s(path, so);
+        auto* tok = s.tokenizer();
+        auto ids = tok->encode("user: hi\nassistant:"); ids.insert(ids.begin(), tok->bos());
+        forge::inference::sampler smp;
+        auto out = s.generate(ids, 8, smp);
+        if (!out.empty() && out.back() == tok->eos()) out.pop_back();
+        CHECK(script::local_ai_generate({path, "", "hi", false, 8}) == tok->decode(out));
+    }
+    // forge::ask returns exactly what the model generates for its system prompt + the question
+    auto want = script::local_ai_generate({path, "You are a concise assistant inside a FORGE script.", "hi", false, 8});
+    auto got = run("std::print(\"{}\", forge::ask(\"hi\"));", o);
+    CHECK_MSG(got == want, "got [%s] want [%s]", got.c_str(), want.c_str());
+    // $FORGE_ASK_MODEL selects the same model when the option is empty
+    ::setenv("FORGE_ASK_MODEL", path.c_str(), 1);
+    script::options envo; envo.ask_max_tokens = 8;
+    CHECK(run("std::print(\"{}\", forge::ask(\"hi\"));", envo) == want);
+    ::unsetenv("FORGE_ASK_MODEL");
+    // ask_json is grammar-constrained: a random model yields some JSON value, or a clear error when the token cap
+    // cuts the value off; never prose
+    auto j = run("try { auto v = forge::ask_json(\"give json\"); std::println(\"json {}\", json.dump(v).size() > 0); } catch (const AIError& e) { std::println(\"{}\", e.what()); }", o);
+    CHECK_MSG(j == "json true\n" || j.find("cut off at 8 tokens") != std::string::npos, "got: %s", j.c_str());
+    script::options big = o; big.ask_max_tokens = 64;
+    auto j2 = run("try { auto v = forge::ask_json(\"give json\"); std::println(\"json {}\", json.dump(v).size() > 0); } catch (const AIError& e) { std::println(\"{}\", e.what()); }", big);
+    CHECK_MSG(j2 == "json true\n" || j2.find("cut off at 64 tokens") != std::string::npos, "got: %s", j2.c_str());
+    std::printf("ask_json on the tiny model: [%s] [%s]\n", j.c_str(), j2.c_str());
+    script::set_local_ai(nullptr);
+    stdfs::remove(path);
+}
+
 #include <forge/graph/rpc.hpp>
 TEST(remote_scripts) {
     graph::rpc::server_security sec; sec.tokens = {"tok"}; sec.allow_scripts = true;
@@ -665,6 +713,59 @@ TEST(remote_scripts) {
                    "std::println(\"{}\", b[\"ok\"]);\n"
                    "try { forge::remote(\"" + addr + "\", \"1;\", {{\"token\", \"nope\"}}); } catch (const PermissionError& e) { std::println(\"denied\"); }\n");
     CHECK_MSG(got == "true hi 1\n\nfalse\ndenied\n", "got:\n%s", got.c_str());
+    srv.stop();
+}
+
+// forge::remote_call ships a function's source plus its captured plain values; the node runs it like a remote
+// script (here: an engine with fs denied, standing in for `rpc-serve --script-no-fs`) and the result comes back typed.
+TEST(remote_call_functions) {
+    graph::rpc::server_security sec; sec.tokens = {"tok"}; sec.allow_scripts = true;
+    graph::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
+    std::string first_src;
+    srv.script_handler = [&](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t) {
+        if (first_src.empty()) first_src = src;
+        script::options o; std::string out; o.argv = argv; o.allow_fs = false; o.os_sandbox = script::options::os_sandbox_mode::off;
+        o.out = [&](std::string_view s) { out += s; };
+        script::engine e(o); auto r = e.run(src, name);
+        return graph::rpc::server::script_result{r.ok && r.exit_code == 0, r.error_type, r.error, out};
+    };
+    srv.start();
+    std::string node = "\"127.0.0.1:" + std::to_string(srv.port()) + "\"", tok = "{{\"token\", \"tok\"}}";
+    auto got = run(
+        "int fact(int n) { return n < 2 ? 1 : n * fact(n - 1); }\n"
+        "auto scale = 2.5;\n"
+        "std::map<std::string, int> counts = {{\"a\", 1}};\n"
+        "auto fib = [](int n) { return n < 2 ? n : fib(n - 1) + fib(n - 2); };\n"
+        "int main() {\n"
+        "    int k = 10; std::vector<int> xs = {1, 2, 3};\n"
+        "    auto twice = [](int v) { return v * 2; };\n"
+        "    auto f = [k, xs, &twice](int a, double b) { std::println(\"on node {}\", a); int s = 0; for (auto x : xs) s += x;\n"
+        "        return std::vector<std::any>{a + k + s, b * scale, fact(5), counts[\"a\"], counts[\"zz\"], twice(a), \"q\\\"\\n\"}; };\n"
+        "    auto r = forge::remote_call(" + node + ", f, {1, 2.0}, " + tok + ");\n"
+        "    std::println(\"{} {} {}\", r, r[1] == 5.0, r[0] == 17);\n"
+        "    std::println(\"{} {}\", forge::remote_call(" + node + ", fact, {6}, " + tok + "), forge::remote_call(" + node + ", fib, {10}, " + tok + "));\n"
+        "    std::println(\"{}\", forge::remote_call(" + node + ", [](auto m) { m[\"n\"] = m.size(); return m; }, {std::map<std::string, int>{{\"b\", 2}}}, " + tok + "));\n"
+        "    try { forge::remote_call(" + node + ", []() { throw std::invalid_argument(\"boom\"); }, {}, " + tok + "); } catch (const ValueError& e) { std::println(\"ValueError {}\", e.what()); }\n"
+        "    try { forge::remote_call(" + node + ", []() { fs.write(\"forge_rc_x\", \"y\"); }, {}, " + tok + "); } catch (const PermissionError& e) { std::println(\"PermissionError\"); }\n"
+        "    auto h = fs.open(\"tests/test_script.cpp\");\n"
+        "    try { forge::remote_call(" + node + ", [&]() { return h; }, {}, " + tok + "); } catch (const TypeError& e) { std::println(\"{}\", e.what()); }\n"
+        "    try { forge::remote_call(" + node + ", [](auto x) { return x; }, {h}, " + tok + "); } catch (const TypeError& e) { std::println(\"{}\", e.what()); }\n"
+        "    try { forge::remote_call(" + node + ", [](auto x) { return x; }, {1}, {{\"token\", \"nope\"}}); } catch (const PermissionError& e) { std::println(\"denied\"); }\n"
+        "    return 0;\n"
+        "}\n");
+    CHECK_MSG(got == "on node 1\n[17, 5, 120, 1, 0, 2, \"q\\\"\\n\"] true true\n720 55\n{b: 2, n: 1}\nValueError remote: boom\nPermissionError\n"
+                     "forge::remote_call: captured 'h' is a handle; only nil, bool, numbers, strings, lists and maps (and script functions over them) can be sent to a remote node\n"
+                     "forge::remote_call: argument 1 is a handle; only nil, bool, numbers, strings, lists and maps (and script functions over them) can be sent to a remote node\n"
+                     "denied\n", "got:\n%s", got.c_str());
+    // captured k, xs, twice and the globals scale, counts, fact travel with f; built-ins (std::println) do not
+    for (const char* want : {"auto k = forge::__unmarshal(", "auto xs = forge::__unmarshal(", "auto scale = forge::__unmarshal(", "auto counts = forge::__unmarshal(",
+                             "auto twice = [&](int v)", "int fact(int n)", "auto __forge_remote_fn = [&](int a, double b)"})
+        CHECK_MSG(first_src.find(want) != std::string::npos, "missing %s in shipped:\n%s", want, first_src.c_str());
+    // the typed encoding keeps ints and doubles apart and survives a round trip
+    EXPECT("auto v = std::vector<std::any>{1, 2.0, -0.5, \"x\", true, nullptr, std::vector<int>{3}};\n"
+           "auto w = forge::__unmarshal(forge::__marshal(v)); std::println(\"{} {} {}\", w, w == v, w[1] == 2.0);",
+           "[1, 2, -0.5, \"x\", true, nil, [3]] true true\n");
+    EXPECT("forge::__unmarshal(\"zz\");", "!ValueError");
     srv.stop();
 }
 
@@ -767,6 +868,26 @@ TEST(emit_golden_all_shells) {
     }
     stdfs::remove_all(dir);
     std::printf("emit tested:%s\nemit refused (outside the target's subset):%s\n", tested.c_str(), refused.c_str());
+}
+
+// Emitted text for the shells that are rarely installed (ysh, rc, es) is compared with checked-in goldens in
+// tests/data/emit/expected/, so emitter changes show up even where emit_golden_all_shells skips them.
+// FORGE_UPDATE_EMIT_GOLDEN=1 rewrites the files (then run the outputs with the real shells before committing).
+TEST(emit_text_golden) {
+    bool update = std::getenv("FORGE_UPDATE_EMIT_GOLDEN") != nullptr;
+    for (const char* sh : {"ysh", "rc", "es"}) {
+        auto targets = script::emit_targets();
+        CHECK_MSG(std::find(targets.begin(), targets.end(), sh) != targets.end(), "%s has no emitter", sh);
+        for (const char* g : {"functions", "flat", "batch"}) {
+            std::string src = slurp_file("tests/data/emit/" + std::string(g) + ".cpp");
+            std::string got;
+            try { got = script::emit(src, g, sh); } catch (const script::emit_error& e) { CHECK_MSG(false, "%s/%s: %s", g, sh, e.what()); continue; }
+            auto path = "tests/data/emit/expected/" + std::string(g) + "." + sh;
+            if (update) { std::ofstream(path, std::ios::binary) << got; continue; }
+            auto want = slurp_file(path);
+            CHECK_MSG(got == want, "%s differs from the emitted text (FORGE_UPDATE_EMIT_GOLDEN=1 to refresh):\n%s", path.c_str(), got.c_str());
+        }
+    }
 }
 
 TEST(emit_errors_and_host_shell) {

@@ -100,6 +100,10 @@ Wrong credentials and refused permissions raise `PermissionError`; network failu
 Options: `args`, `timeout_ms`, `token`, `key`, `tls`, `ca`, `fingerprint`, `server_name`, `tls_cert`,
 `tls_key`, `name`.
 
+`forge::remote_call(node, fn, {args...}, opts)` sends a function instead of a whole script: its source and the
+plain values it captures travel as a generated script over the same path (same child, sandbox and limits), and the
+call returns `fn(args...)`'s value. See docs/scripting.md, "Remote execution".
+
 ```sh
 forge keygen -o me                                     # me.key / me.pub
 forge rpc-serve --bind 0.0.0.0 --authorized-keys keys.txt --tls-cert c.pem --tls-key k.pem \

@@ -2,8 +2,8 @@
 
 Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
 cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
-Automation (pipelines, file-watch triggers, schedules) and modules/native plugins implemented.
-Still to come: AI commands, remote execution. See *Phasing* at the end.
+Automation (pipelines, file-watch triggers, schedules), modules/native plugins, AI commands and remote
+execution implemented. See *Phasing* at the end.
 
 ## Purpose
 
@@ -328,7 +328,7 @@ be expressed in bash`. Unsupported constructs include classes, lambdas, containe
 | tcsh, csh | `.csh` | functions (only `int main()` is inlined), `fs.read`, `forge::sh` results (csh drops newlines) |
 | cmd (golden-tested under wine) | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |
 | rc (Byron rc), es | `.rc`, `.es` | string ordering. Integers go through `expr(1)`, and locals use dynamic-scope blocks |
-| ysh | | no emitter (osh covers Oils) |
+| ysh | `.ysh` | string ordering. J8 `b'...'` literals, typed procs, `/` and `%` through `_div`/`_mod` funcs (YSH's `//` refuses negative divisors) |
 
 **Tests.** `emit_golden_all_shells` in `tests/test_script.cpp` emits `tests/data/emit/functions.cpp` and `flat.cpp` for every
 installed backend. It runs each output with the real shell and requires exactly the interpreter's stdout and exit code. Shells that
@@ -336,6 +336,11 @@ are missing are skipped. ctest sets `FORGE_TEST_SHELL_PATH` from the `FORGE_TEST
 `../opt/shells/bin` when that directory exists. **Golden-tested on Linux**: sh, bash, zsh, dash, ash (busybox), yash, fish, tcsh,
 pwsh, xonsh, elvish, nu, ksh, mksh, oksh, osh, hush, rc and es, plus csh and powershell through tcsh and pwsh, and cmd under wine
 (`batch.cpp`). **Untested**: posh, real csh, Windows PowerShell 5.1, and mksh as Android's /system/bin/sh.
+
+`emit_text_golden` also compares the emitted *text* for ysh, rc and es with `tests/data/emit/expected/*.{ysh,rc,es}`, so
+emitter changes are caught on machines without those shells (`FORGE_UPDATE_EMIT_GOLDEN=1` rewrites the files). The ysh,
+rc and es outputs of all three goldens were run against real shells built from source (Oils 0.29.0 `ysh`, rakitzis/rc
+HEAD, wryun/es-shell HEAD) and matched the interpreter's output and exit code.
 
 **OS targets.**
 
@@ -398,7 +403,8 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 6. **AI-assisted commands** — `ai "find the 5 largest files here"` asks a local model to draft a
    script, shows it, and runs only on confirmation; `ai.explain(r.err)` for failed commands.
 7. **Remote execution** — `forge::remote("host:7000", source, opts)` runs on `forge rpc-serve
-   --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS. Implemented; see docs/rpc.md.
+   --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS; `forge::remote_call(node, fn,
+   args, opts)` ships one function and returns its result. Implemented; see *Remote execution* below and docs/rpc.md.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
 9. **Sandboxed runs** — run untrusted scripts with fs/net/proc capabilities off. ForgeScript enforces
    the flags twice: the interpreter raises `PermissionError`, and the engine applies the OS sandbox from
@@ -450,6 +456,45 @@ in the task is `ValueError` in the caller); a worker that crashes raises `Signal
 `print` output is replayed in the caller when the result is collected. Programs embedding the engine that use spawn
 mode must call `forge::script::run_process_worker_if_requested(argc, argv)` first in `main()` (the `forge` CLI does).
 
+## Remote execution (implemented)
+
+`script/src/remote.cpp`. Both calls go to a `forge rpc-serve --allow-scripts` node (docs/rpc.md) and take the same
+options: `{{"token", s}}`, `{{"key", file}}`, `{{"tls", bool}}`, `{{"ca", file}}`, `{{"fingerprint", hex}}`,
+`{{"server_name", s}}`, `{{"timeout_ms", n}}`, `{{"name", s}}` (credentials default to the `FORGE_RPC_*` environment).
+
+```cpp
+auto r = forge::remote("box2:7000", "std::println(\"{}\", os.hostname());", {{"token", tok}});   // {ok, output, error_type, error}
+
+int k = 10;
+std::map<std::string, int> weights = {{"a", 2}};
+auto score = [k, &weights](std::string key, int x) { return weights[key] * x + k; };
+int v = forge::remote_call("box2:7000", score, {"a", 5}, {{"token", tok}});                 // 20, computed on box2
+auto n = forge::remote_call("box2:7000", [](auto xs) { return xs.size(); }, {std::vector<int>{1, 2, 3}});
+```
+
+`forge::remote_call(node, fn[, args-list[, opts]])` ships a lambda or free function:
+
+- **What travels**: the function's source text (kept by the parser for every function and lambda, and in `.fsc`
+  caches), plus every variable it uses from outside its own body: captured locals (by value or by reference),
+  globals, and other script functions it calls (shipped the same way, recursively). Built-ins are not shipped; the
+  node has its own. On the node the generated script defines each captured name at top level, so captures are
+  **copies**: assignments the function makes to them are not seen by the caller.
+- **Only plain data**: captured values and arguments must be nil, bool, int, double, string, list or map (std::map /
+  unordered_map / set, including their default value), nested to any depth. Ints and doubles stay distinct (a typed
+  encoding, `forge::__marshal` / `forge::__unmarshal`, not JSON). Anything else — file and process handles, objects
+  and `this`, classes, tasks, channels, natives, bound methods — is refused before connecting, with a `TypeError`
+  naming the variable: `forge::remote_call: captured 'h' is a handle; only nil, bool, numbers, strings, lists and maps
+  (and script functions over them) can be sent to a remote node`. Two different values captured under one name (shadowing)
+  and namespaced names are refused as well.
+- **Sandbox**: the function runs exactly like a `forge::remote` script: in its own `forge script --rpc-child` process
+  with the node's `--script-timeout`, `--script-mem-mb` and `--script-no-*` capabilities (OS sandbox `require`).
+  The script's static checks run there too, so e.g. `fs.write` on a `--script-no-fs` node fails with `PermissionError`.
+- **Result**: the return value (same plain-data rule) comes back typed. An exception keeps its type (`ValueError` on the
+  node is `ValueError` here, message prefixed `remote: `); the node's `print` output is replayed locally first. Wrong
+  credentials raise `PermissionError`, connection failures `IOError`.
+- Tested over loopback in `tests/test_script.cpp` (`remote_call_functions`; the node is an in-process engine with fs
+  denied) and by hand against `forge rpc-serve --allow-scripts --script-no-fs`.
+
 ## AI-assisted commands (implemented)
 
 `script/src/ai.cpp`. Drafted code never runs without confirmation.
@@ -463,9 +508,22 @@ auto j = forge::ask_json("give {name, version} for this package", fs.read("packa
 std::println("{}", forge::explain(forge::sh("make").err));
 ```
 
-- Backend: the host's `options::ai` callback, else `FORGE_AI_ENDPOINT` — any OpenAI-compatible
-  `/v1/chat/completions` server, normally FORGE's own `forge-serve` (`FORGE_AI_MODEL`, `FORGE_AI_KEY`
-  optional). Endpoint calls need the `net` capability; plain `http://` only.
+- Backend, first match wins:
+  1. the host's `options::ai` callback;
+  2. **in-process inference**: `options::ask_model`, `forge script --ask-model M.fpk` or `$FORGE_ASK_MODEL` names a
+     `.fpk`, and the host registered a generator. `forge_script` itself does not link the inference module; a host
+     that does calls `forge::script::install_local_ai()` from `<forge/script/local_ai.hpp>` (the `forge` CLI does,
+     so `forge script` and rpc-serve's script children have it). The model is loaded once per path and shared; each
+     call is a fresh session, greedy (same question, same answer), formatted like forge-serve's chat endpoint
+     (`system: …\nuser: …\nassistant:`), and capped at `options::ask_max_tokens` / `--ask-max-tokens` /
+     `$FORGE_ASK_MAX_TOKENS` (default 256). `ask_json` constrains decoding to a JSON value with the grammar sampler,
+     so a small model cannot answer in prose; a value cut off by the token cap raises `AIError`. No `net` capability
+     is needed. If a model is configured but the host has no generator, the endpoint below is used when set, else
+     `AIError`;
+  3. `FORGE_AI_ENDPOINT` — any OpenAI-compatible `/v1/chat/completions` server, normally FORGE's own `forge-serve`
+     (`FORGE_AI_MODEL`, `FORGE_AI_KEY` optional). Endpoint calls need the `net` capability; plain `http://` only.
+- Tested: `ask_local_model` in `tests/test_script.cpp` runs `ask` / `ask_json` on a tiny random Llama built in-process
+  (`tests/tiny_model.hpp`) and checks `ask` against direct greedy decoding through `forge::inference::session`.
 - Confirmation: `{{"confirm", fn}}` per call, else `options::confirm`. `forge script` prompts
   `Run it? [y/N]` on the terminal. With no confirmer, `ran` is `false` and nothing executes.
 - `ai_run` takes `{{"shell", "sh"|"bash"|"pwsh"|"cmd"}}`; it runs through `forge::<shell>` so sandbox
