@@ -908,11 +908,6 @@ void install_builtins(Shared& sh) {
         os::process_pool::options po;
         po.workers = a.empty() || is_nil(a[0]) ? 0u : unsigned(std::max<std::int64_t>(1, i_of(in, a[0], "workers")));
         os::sandbox_policy sp; sp.deny_network = !box->net; sp.deny_exec = !box->proc; sp.deny_fs_write = !box->fs;
-#if defined(_WIN32)
-        // Windows workers cannot deny network or file writes in-process, and the pool now refuses a policy it
-        // cannot apply; the worker's interpreter still enforces fs/net from the payload (docs/security.md).
-        sp.deny_network = sp.deny_fs_write = false;
-#endif
         po.sandbox = sp;
         try { box->pool = std::make_unique<os::process_pool>(std::move(po)); }
         catch (const os::os_exception& e) { in.raise(e.script_type(), e.what()); }

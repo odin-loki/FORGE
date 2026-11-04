@@ -45,19 +45,32 @@ API: `sandbox_policy { deny_network, deny_exec, deny_fs_write }`, `apply_sandbox
 
 | Platform | `apply_sandbox` (current process) | `run_sandboxed` (child) |
 |---|---|---|
-| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls (io_uring, x32 and i386 `socketcall` closed; the `*at` file-write calls and `*setxattr` denied); `unsupported` on architectures with no audit arch | fork, apply, exec (see note) |
+| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls (io_uring, x32 and i386 `socketcall` closed; the `*at` file-write calls and `*setxattr` denied); `unsupported` on architectures with no audit arch. Landlock stacked on top when the kernel has it (5.13+, ABI 1-6 detected; raw syscalls): `deny_fs_write` handles every write right of the ABI (refer from 2, truncate from 3) with no rule allowing it, `deny_exec` handles EXECUTE, `deny_network` handles TCP bind/connect from ABI 4. Without Landlock, seccomp alone | fork, Landlock + seccomp, exec; with Landlock `deny_exec` applies to the target (see note) |
 | FreeBSD | Capsicum `cap_enter()` (all-or-nothing, coarser than asked) | fork, open the binary, `cap_enter`, then `fexecve` (static) or `ld-elf.so.1 -f` with `LD_LIBRARY_PATH_FDS` (dynamic; libraries from the system dirs and `/usr/local/lib` only); scripts refused |
 | OpenBSD | `pledge()` | fork, apply, exec |
 | macOS | `sandbox_init` named profiles, found with `dlsym` | fork, apply, exec |
 | iOS | no-op; the app sandbox already applies | unsupported |
-| Windows | exec denial only (job object, one active process); net/fs denial returns `unsupported` | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job; arguments quoted like `spawn_wait` |
+| Windows | exec denial (job object, one active process); net/fs denial returns `unsupported` unless the process already runs in an AppContainer without network capabilities (`process_pool` workers) | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job; arguments quoted like `spawn_wait` |
 
-On POSIX, `run_sandboxed` applies the network and file-write parts in the child before `execvp`, and drops
-`deny_exec` so the target can start; the target itself may still exec.
+On POSIX, `run_sandboxed` applies the network and file-write parts in the child before `execvp`. `deny_exec`
+cannot go into the seccomp filter (it would stop the target too). On Linux with Landlock it is applied to the
+target: EXECUTE is allowed only on the target binary, its `#!` interpreter and its ELF interpreter (`ld.so`);
+Landlock rules survive `execve`, so the target runs but cannot start another program. Without Landlock, and on
+macOS, the target itself may still exec. `sandbox_status()` reports `mechanism` (`seccomp-bpf+landlock` when this
+process applied Landlock), `landlock_abi` (0: unavailable) and `landlock`. `FORGE_LANDLOCK=0` turns Landlock off.
+Android: the first probe runs in a throwaway child, since an app's seccomp policy may kill on unknown syscalls.
+
+`process_pool` on Windows starts workers whose policy denies network or file writes inside an AppContainer
+(profiles `forge.sandbox.nonet`, `.nofs`, `.nonet.nofs`, shared with `run_sandboxed`). The worker inherits only
+its two pipe ends and stderr (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). The pool adds an ACE granting the profile
+read + execute on the worker image, because AppContainers cannot read files in user directories by default. The
+worker checks its token (AppContainer, no `internetClient` / `internetClientServer` /
+`privateNetworkClientServer` capability when the network is denied) before recording the policy. Loopback is
+blocked too. Writes are allowed only in the container folder (`%LOCALAPPDATA%\Packages\<profile>\AC`).
 
 Tests: the `sandboxing` case of `tests/test_os_ext.cpp` runs in CI on Linux, macOS, Windows and FreeBSD
 (sub-cases that report `unsupported` skip; FreeBSD skips when Capsicum refuses a partial policy).
-`run_sandboxed` is tested on Linux, FreeBSD and Windows (AppContainer included) in `tests/test_os_process.cpp`. `process_pool` workers that cannot apply a requested sandbox (Windows net/fs) fail instead of running unsandboxed.
+`run_sandboxed` is tested on Linux (Landlock target exec denial, `#!` and dynamic targets), FreeBSD and Windows (AppContainer included) in the `run_sandboxed_child` case of `tests/test_os_ext.cpp`; the `sandboxing` case also applies Landlock alone (EACCES for writes and exec). `tests/test_process_pool.cpp` checks Linux workers report `seccomp-bpf+landlock`, and Windows AppContainer workers run tasks, cannot connect to a loopback listener and cannot write to the temp directory. `process_pool` workers that cannot apply a requested sandbox fail instead of running unsandboxed.
 
 ## Native plugins
 
@@ -158,8 +171,12 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 
 - RPC: tokens always have full access. Client-certificate identities are not mapped to permissions.
 - Windows: no in-process network or file-write denial; scripts there get only the job object plus the
-  interpreter checks.
-- POSIX `run_sandboxed` does not apply `deny_exec` to the target (Linux Landlock is planned, `docs/os-audit.md` W2-3).
+  interpreter checks (script `ProcessPool` workers do get an AppContainer).
+- `run_sandboxed` does not apply `deny_exec` to the target on macOS, or on Linux without Landlock. With Landlock
+  the target can still run another program by invoking the dynamic loader explicitly (`ld.so prog`), since
+  Landlock does not govern `mmap(PROT_EXEC)`.
+- Windows AppContainer pool workers: the ACE added to the worker image stays (it names only the FORGE profile);
+  the profiles persist per user like any package profile. Some CI images refuse AppContainer profiles.
 - `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
 - Nested non-isolated `sandbox` blocks are interpreter-checked only.
 - Static capability checks miss indirect calls.

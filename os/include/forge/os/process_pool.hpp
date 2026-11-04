@@ -41,11 +41,16 @@
 // A task that throws in the worker fails its future with os_exception (kind from the worker's os_exception if
 // any, else other) whose message is the worker's what().
 //
-// Sandbox: options.sandbox applies os::apply_sandbox in each worker right after it starts (before any task). A
-// policy the worker cannot apply (Windows: network / file-write denial needs an AppContainer, not available in
-// process) makes it exit with code 70 instead of running unconfined, and the task fails with kind=io,
-// "sandbox could not be applied". The policy recorded for error mapping (note_sandbox_policy) is always one
-// that is in force.
+// Sandbox: options.sandbox applies os::apply_sandbox in each worker right after it starts (before any task); on
+// Linux that is seccomp plus Landlock where the kernel has it. On Windows, network / file-write denial cannot be
+// applied in process, so such workers are started inside an AppContainer (os/sandbox.hpp profiles
+// forge.sandbox.nonet / .nofs / .nonet.nofs: no network capability when the network is denied; writes only to the
+// container's own folder; reads of user files only where their ACL admits ALL APPLICATION PACKAGES or the
+// profile). The pool grants the profile read + execute on the worker image (an ACE added to that file, kept), and
+// the worker's apply_sandbox accepts the parts its token enforces; deny_exec adds the job object as before.
+// A policy the worker cannot apply makes it exit with code 70 instead of running unconfined, and the task fails
+// with kind=io, "sandbox could not be applied". The policy recorded for error mapping (note_sandbox_policy) is
+// always one that is in force.
 #include <forge/os/os.hpp>
 #include <forge/os/oserror.hpp>
 #include <forge/os/pipe.hpp>
@@ -367,9 +372,20 @@ private:
         STARTUPINFOW si{}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = c_in_r; si.hStdOutput = c_out_w; si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
         PROCESS_INFORMATION pi{};
-        BOOL ok = create_process_std_only(nullptr, wc.data(), CREATE_NO_WINDOW, nullptr, nullptr, si, pi);
+        BOOL ok = FALSE;
+        if (opt_.sandbox && (opt_.sandbox->deny_network || opt_.sandbox->deny_fs_write)) {
+            // Network / file-write denial: the worker starts in the policy's AppContainer (it inherits only the
+            // two pipe ends and stderr, which stay usable since inherited handles are not access-checked). The
+            // container is granted read + execute on the worker image, which in a user directory it could not
+            // otherwise open. The worker's apply_sandbox then checks its token and records the policy.
+            auto e = detail::wsbx::create_in_appcontainer(*opt_.sandbox, nullptr, wc.data(), CREATE_NO_WINDOW, si, pi, widen(opt_.exe));
+            ok = !e; if (e) { err = "CreateProcess (AppContainer) " + opt_.exe + ": " + e.what; SetLastError(DWORD(e.code)); }
+        } else {
+            ok = create_process_std_only(nullptr, wc.data(), CREATE_NO_WINDOW, nullptr, nullptr, si, pi);
+            if (!ok) err = last_error("CreateProcess " + opt_.exe).what;
+        }
         CloseHandle(c_in_r); CloseHandle(c_out_w);
-        if (!ok) { err = last_error("CreateProcess " + opt_.exe).what; CloseHandle(c_in_w); CloseHandle(c_out_r); return std::nullopt; }
+        if (!ok) { CloseHandle(c_in_w); CloseHandle(c_out_r); return std::nullopt; }
         CloseHandle(pi.hThread);
         w.to = c_in_w; w.from = c_out_r; w.proc = pi.hProcess;
         return w;

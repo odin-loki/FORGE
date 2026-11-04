@@ -4,6 +4,14 @@
 //   other than AF_UNIX and i386 socketcall, execve/execveat, file writes via open flags / creat / unlink / rename /
 //   mkdir / truncate / link / symlink / mknod / chmod / chown / utimes / xattrs; io_uring whenever network or
 //   writes are denied). Another architecture's syscalls kill the process, and so do x86_64 x32 calls.
+//   Landlock (Linux 5.13+, raw syscalls, ABI 1-6 detected) is stacked on top when the kernel has it: deny_fs_write
+//   handles every write right of the ABI (write, remove, make-*, refer from 2, truncate from 3) with no rule
+//   allowing it, so the whole tree is read-only; deny_exec handles EXECUTE; deny_network handles TCP bind and
+//   connect from ABI 4. Without Landlock (older kernel, LSM disabled, Android's app seccomp policy refusing the
+//   calls) the seccomp filter alone applies; sandbox_status() says which mechanisms are active.
+//   run_sandboxed() uses Landlock to apply deny_exec to the target itself: EXECUTE is allowed only on the target
+//   binary, its #! interpreter and its ELF interpreter (ld.so), and Landlock rules survive execve, so the target
+//   starts but cannot start anything else (except by running a program through ld.so explicitly).
 //   FreeBSD: Capsicum cap_enter() (capability mode: no global namespaces at all; coarser than requested).
 //   run_sandboxed() there opens the binary, the run-time linker and the library directories first and starts
 //   the target with fexecve of ld-elf.so.1 -f <fd> (LD_LIBRARY_PATH_FDS), since capability mode allows no
@@ -14,20 +22,27 @@
 //   filesystem denial cannot be added to a running process, so run_sandboxed() starts children in an
 //   AppContainer (no network capability unless allowed; writes only to the container folder) inside a
 //   kill-on-close job with UI limits, or, for an exec-only policy, with a restricted token in the job).
+//   process_pool starts its workers in the same AppContainer profiles (detail::create_in_appcontainer), and
+//   apply_sandbox() inside such a process accepts net/fs denial the token already enforces.
 #include <forge/os/detail.hpp>
 #include <forge/os/process.hpp>   // find_executable, detail_proc::win_cmdline
 #if defined(_WIN32)
 #include <userenv.h>   // CreateAppContainerProfile (link userenv)
+#include <aclapi.h>    // SetEntriesInAcl (advapi32): grant the container read+execute on a worker image
 #if defined(_MSC_VER)
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 #endif
 #if defined(__linux__)
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
+#include <elf.h>
 #include <stddef.h>
+#include <atomic>
 #elif defined(FORGE_OS_FREEBSD)
 #include <sys/capsicum.h>
 #include <elf.h>
@@ -35,13 +50,232 @@
 
 namespace forge::os {
 struct sandbox_policy { bool deny_network = false, deny_exec = false, deny_fs_write = false; };
-struct sandbox_info { bool sandboxed = false; std::string mechanism; };
+// mechanism: what confines this process ("seccomp-bpf", "seccomp-bpf+landlock", "capsicum", "appcontainer+job-object", ...).
+// landlock_abi: the Landlock ABI the kernel offers (0: none / not usable), whether or not it is applied; landlock:
+// this process applied a Landlock ruleset (through apply_sandbox; one inherited across exec is not visible).
+struct sandbox_info { bool sandboxed = false; std::string mechanism; int landlock_abi = 0; bool landlock = false; };
+
+#if defined(__linux__)
+// Landlock through raw syscalls (numbers shared by every architecture; no libc wrapper needed).
+namespace detail::ll {
+constexpr long nr_create = 444, nr_add_rule = 445, nr_restrict = 446;
+constexpr std::uint32_t create_version = 1u << 0;
+constexpr int rule_path_beneath = 1;
+enum : std::uint64_t {
+    fs_execute = 1ull << 0, fs_write_file = 1ull << 1, fs_read_file = 1ull << 2, fs_read_dir = 1ull << 3,
+    fs_remove_dir = 1ull << 4, fs_remove_file = 1ull << 5, fs_make_char = 1ull << 6, fs_make_dir = 1ull << 7,
+    fs_make_reg = 1ull << 8, fs_make_sock = 1ull << 9, fs_make_fifo = 1ull << 10, fs_make_block = 1ull << 11,
+    fs_make_sym = 1ull << 12, fs_refer = 1ull << 13 /*ABI 2*/, fs_truncate = 1ull << 14 /*ABI 3*/, fs_ioctl_dev = 1ull << 15 /*ABI 5*/,
+    net_bind_tcp = 1ull << 0, net_connect_tcp = 1ull << 1 /*ABI 4*/,
+};
+struct ruleset_attr { std::uint64_t handled_fs = 0, handled_net = 0, scoped = 0; };   // scoped: ABI 6
+struct __attribute__((packed)) path_beneath_attr { std::uint64_t allowed = 0; std::int32_t parent_fd = -1; };
+inline std::atomic<bool>& applied() { static std::atomic<bool> a{false}; return a; }
+inline int probe() noexcept {
+    long v = ::syscall(nr_create, nullptr, 0, create_version);
+    return v > 0 ? int(v) : 0;
+}
+// The kernel's Landlock ABI (0 when unavailable). Android: an app's seccomp policy may kill a process that makes
+// an unlisted syscall, so the first probe there runs in a throwaway child. FORGE_LANDLOCK=0 turns it off (seccomp
+// only), e.g. to test the fallback.
+inline int abi() {
+    static const int v = [] {
+        if (const char* e = std::getenv("FORGE_LANDLOCK"); e && e[0] == '0') return 0;
+#if defined(__ANDROID__)
+        pid_t c = forge::os::serialized_fork();
+        if (c < 0) return 0;
+        if (c == 0) ::_exit(probe() & 0x7f);
+        int st = 0; while (::waitpid(c, &st, 0) < 0 && errno == EINTR) {}
+        if (!WIFEXITED(st) || WEXITSTATUS(st) == 0) return 0;
+#endif
+        return probe();
+    }();
+    return v;
+}
+// Every right that changes the file system, for this ABI.
+inline std::uint64_t write_rights(int abi) {
+    std::uint64_t r = fs_write_file | fs_remove_dir | fs_remove_file | fs_make_char | fs_make_dir | fs_make_reg | fs_make_sock |
+                      fs_make_fifo | fs_make_block | fs_make_sym;
+    if (abi >= 2) r |= fs_refer;
+    if (abi >= 3) r |= fs_truncate;
+    return r;
+}
+// Build a ruleset for `p` (returns -1 when Landlock is unavailable or the policy needs nothing from it). EXECUTE is
+// allowed only on `exec_ok` (files) when exec is denied. Errors adding a rule are returned in *err.
+inline int ruleset(const sandbox_policy& p, const std::vector<std::string>& exec_ok, error* err) {
+    const int a = abi(); if (!a) return -1;
+    ruleset_attr at;
+    if (p.deny_fs_write) at.handled_fs |= write_rights(a);
+    if (p.deny_exec) at.handled_fs |= fs_execute;
+    if (p.deny_network && a >= 4) at.handled_net = net_bind_tcp | net_connect_tcp;
+    if (!at.handled_fs && !at.handled_net) return -1;
+    const std::size_t sz = a >= 6 ? sizeof at : a >= 4 ? 16 : 8;
+    int fd = int(::syscall(nr_create, &at, sz, 0u));
+    if (fd < 0) { if (err) *err = last_error("landlock_create_ruleset"); return -1; }
+    if (p.deny_exec)
+        for (auto& path : exec_ok) {
+            path_beneath_attr pb; pb.allowed = fs_execute;
+            pb.parent_fd = ::open(path.c_str(), O_PATH | O_CLOEXEC);
+            if (pb.parent_fd < 0 || ::syscall(nr_add_rule, fd, rule_path_beneath, &pb, 0u) != 0) {
+                if (err) *err = last_error("landlock_add_rule " + path);
+                if (pb.parent_fd >= 0) ::close(pb.parent_fd);
+                ::close(fd); return -1;
+            }
+            ::close(pb.parent_fd);
+        }
+    return fd;
+}
+// Enforce a ruleset on the calling thread (and what it execs). Async-signal-safe: used in a forked child.
+inline bool restrict_self(int fd) noexcept {
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return false;
+    return ::syscall(nr_restrict, fd, 0u) == 0;
+}
+// What a target needs EXECUTE on to start: the file itself, a #! interpreter (recursively), and the ELF program
+// interpreter (PT_INTERP, the dynamic linker), which the kernel opens for execution too.
+inline void exec_chain(const std::string& path, std::vector<std::string>& out, int depth = 0) {
+    if (depth > 4 || path.empty()) return;
+    out.push_back(path);
+    int f = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); if (f < 0) return;
+    char head[256] = {}; ssize_t n = ::pread(f, head, sizeof head - 1, 0);
+    if (n > 2 && head[0] == '#' && head[1] == '!') {
+        std::string s(head + 2, std::size_t(n - 2)); s = s.substr(0, s.find('\n'));
+        auto b = s.find_first_not_of(" \t"); if (b != std::string::npos) s = s.substr(b);
+        s = s.substr(0, s.find_first_of(" \t"));
+        ::close(f); exec_chain(s, out, depth + 1); return;
+    }
+    if (n >= EI_NIDENT && std::memcmp(head, ELFMAG, SELFMAG) == 0) {
+        const bool e64 = head[EI_CLASS] == ELFCLASS64;
+        std::uint64_t phoff = 0; unsigned phnum = 0, phent = 0;
+        if (e64 && n >= ssize_t(sizeof(Elf64_Ehdr))) { Elf64_Ehdr eh; std::memcpy(&eh, head, sizeof eh); phoff = eh.e_phoff; phnum = eh.e_phnum; phent = eh.e_phentsize; }
+        else if (!e64 && n >= ssize_t(sizeof(Elf32_Ehdr))) { Elf32_Ehdr eh; std::memcpy(&eh, head, sizeof eh); phoff = eh.e_phoff; phnum = eh.e_phnum; phent = eh.e_phentsize; }
+        for (unsigned i = 0; i < phnum && i < 256; ++i) {
+            std::uint32_t type = 0; std::uint64_t off = 0, size = 0;
+            if (e64) { Elf64_Phdr ph; if (::pread(f, &ph, sizeof ph, off_t(phoff + std::uint64_t(i) * phent)) != ssize_t(sizeof ph)) break; type = ph.p_type; off = ph.p_offset; size = ph.p_filesz; }
+            else { Elf32_Phdr ph; if (::pread(f, &ph, sizeof ph, off_t(phoff + std::uint64_t(i) * phent)) != ssize_t(sizeof ph)) break; type = ph.p_type; off = ph.p_offset; size = ph.p_filesz; }
+            if (type != PT_INTERP || size < 2 || size > 4096) continue;
+            std::string ip(std::size_t(size), '\0');
+            if (::pread(f, ip.data(), ip.size(), off_t(off)) == ssize_t(ip.size())) { ip.resize(::strnlen(ip.c_str(), ip.size())); ::close(f); exec_chain(ip, out, depth + 1); return; }
+            break;
+        }
+    }
+    ::close(f);
+}
+}
+#elif defined(FORGE_OS_WINDOWS)
+namespace detail::wsbx {
+// True when this process runs in an AppContainer; *net: it holds a network capability (internetClient,
+// internetClientServer or privateNetworkClientServer).
+inline bool in_appcontainer(bool* net) {
+    if (net) *net = false;
+    HANDLE t = nullptr; if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return false;
+    DWORD ac = 0, len = 0; bool in = GetTokenInformation(t, TokenIsAppContainer, &ac, sizeof ac, &len) && ac;
+    if (in && net) {
+        GetTokenInformation(t, TokenCapabilities, nullptr, 0, &len);
+        std::vector<unsigned char> b(len ? len : 1);
+        if (len && GetTokenInformation(t, TokenCapabilities, b.data(), len, &len)) {
+            auto* g = reinterpret_cast<TOKEN_GROUPS*>(b.data());
+            for (DWORD i = 0; i < g->GroupCount; ++i) {
+                PSID s = g->Groups[i].Sid; auto* ia = GetSidIdentifierAuthority(s);
+                const SID_IDENTIFIER_AUTHORITY app = SECURITY_APP_PACKAGE_AUTHORITY;
+                if (std::memcmp(ia, &app, sizeof app) != 0 || *GetSidSubAuthorityCount(s) != SECURITY_BUILTIN_CAPABILITY_RID_COUNT) continue;
+                DWORD rid = *GetSidSubAuthority(s, 1);
+                if (*GetSidSubAuthority(s, 0) == SECURITY_CAPABILITY_BASE_RID &&
+                    (rid == SECURITY_CAPABILITY_INTERNET_CLIENT || rid == SECURITY_CAPABILITY_INTERNET_CLIENT_SERVER || rid == SECURITY_CAPABILITY_PRIVATE_NETWORK_CLIENT_SERVER)) *net = true;
+            }
+        }
+    }
+    CloseHandle(t); return in;
+}
+// The AppContainer profile for a net/fs policy (created on first use, then reused; it persists per user like any
+// package profile). *sid is freed with FreeSid.
+inline const wchar_t* profile_name(const sandbox_policy& p) {
+    return p.deny_network && p.deny_fs_write ? L"forge.sandbox.nonet.nofs" : p.deny_network ? L"forge.sandbox.nonet" : L"forge.sandbox.nofs";
+}
+inline error profile_sid(const sandbox_policy& p, PSID* sid) {
+    const wchar_t* name = profile_name(p); *sid = nullptr;
+    HRESULT hr = CreateAppContainerProfile(name, name, L"FORGE sandboxed child", nullptr, 0, sid);
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) hr = DeriveAppContainerSidFromAppContainerName(name, sid);
+    if (FAILED(hr) || !*sid) return {FAILED(hr) ? int(hr) : int(E_FAIL), "AppContainer profile failed"};
+    return {};
+}
+// Give the container read + execute on a file outside the places it may read by default (the user's own
+// directories are not readable by AppContainers; system directories are). An existing grant is left alone.
+inline error grant_read_execute(const std::wstring& path, PSID sid) {
+    PACL dacl = nullptr; PSECURITY_DESCRIPTOR sd = nullptr;
+    if (DWORD e = GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &sd))
+        return {int(e), "GetNamedSecurityInfo " + narrow(path)};
+    const DWORD want = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    bool have = false;
+    for (DWORD i = 0; dacl && i < dacl->AceCount && !have; ++i) {
+        void* a = nullptr; if (!GetAce(dacl, i, &a)) continue;
+        auto* h = static_cast<ACE_HEADER*>(a);
+        if (h->AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
+        auto* aa = static_cast<ACCESS_ALLOWED_ACE*>(a);
+        if (EqualSid(reinterpret_cast<PSID>(&aa->SidStart), sid) && (aa->Mask & want) == want) have = true;
+    }
+    error r{};
+    if (!have) {
+        EXPLICIT_ACCESS_W ea{}; ea.grfAccessPermissions = want; ea.grfAccessMode = GRANT_ACCESS; ea.grfInheritance = NO_INHERITANCE;
+        ea.Trustee.TrusteeForm = TRUSTEE_IS_SID; ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP; ea.Trustee.ptstrName = static_cast<LPWSTR>(sid);
+        PACL nd = nullptr;
+        if (DWORD e = SetEntriesInAclW(1, &ea, dacl, &nd)) r = {int(e), "SetEntriesInAcl " + narrow(path)};
+        else if (DWORD e2 = SetNamedSecurityInfoW(const_cast<wchar_t*>(path.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nd, nullptr))
+            r = {int(e2), "SetNamedSecurityInfo " + narrow(path) + " (grant the AppContainer read+execute on the worker image)"};
+        if (nd) LocalFree(nd);
+    }
+    LocalFree(sd); return r;
+}
+// CreateProcessW inside the policy's AppContainer (no network capability when deny_network, else internetClient).
+// With STARTF_USESTDHANDLES the child inherits exactly si's std handles (inheritable duplicates through
+// PROC_THREAD_ATTRIBUTE_HANDLE_LIST, like create_process_std_only), otherwise no handles. `image`, when given, is
+// granted read + execute for the container first.
+inline error create_in_appcontainer(const sandbox_policy& p, const wchar_t* app, wchar_t* cmd, DWORD flags, const STARTUPINFOW& si,
+                                    PROCESS_INFORMATION& pi, const std::wstring& image = {}) {
+    PSID ac = nullptr;
+    if (auto e = profile_sid(p, &ac)) return e;
+    if (!image.empty()) if (auto e = grant_read_execute(image, ac)) { FreeSid(ac); return e; }
+    SID_AND_ATTRIBUTES caps[1]{}; DWORD ncaps = 0; PSID net = nullptr;
+    if (!p.deny_network) {   // fs denied only: keep outbound network
+        SID_IDENTIFIER_AUTHORITY auth = SECURITY_APP_PACKAGE_AUTHORITY;
+        if (AllocateAndInitializeSid(&auth, SECURITY_BUILTIN_CAPABILITY_RID_COUNT, SECURITY_CAPABILITY_BASE_RID, SECURITY_CAPABILITY_INTERNET_CLIENT, 0, 0, 0, 0, 0, 0, &net)) { caps[0].Sid = net; caps[0].Attributes = SE_GROUP_ENABLED; ncaps = 1; }
+    }
+    SECURITY_CAPABILITIES sc{}; sc.AppContainerSid = ac; sc.Capabilities = ncaps ? caps : nullptr; sc.CapabilityCount = ncaps;
+    HANDLE self = GetCurrentProcess();
+    STARTUPINFOEXW sx{}; sx.StartupInfo = si; sx.StartupInfo.cb = sizeof sx;
+    HANDLE* std3[3] = {&sx.StartupInfo.hStdInput, &sx.StartupInfo.hStdOutput, &sx.StartupInfo.hStdError};
+    HANDLE orig[3] = {}, dups[3] = {}; DWORD n = 0;
+    if (si.dwFlags & STARTF_USESTDHANDLES)
+        for (HANDLE* h : std3) {
+            if (!*h || *h == INVALID_HANDLE_VALUE) continue;
+            DWORD k = 0; while (k < n && orig[k] != *h) ++k;
+            if (k == n) { if (!DuplicateHandle(self, *h, self, &dups[n], 0, TRUE, DUPLICATE_SAME_ACCESS)) { *h = nullptr; continue; } orig[n++] = *h; }
+            *h = dups[k];
+        }
+    const DWORD nattr = n ? 2 : 1;
+    SIZE_T sz = 0; InitializeProcThreadAttributeList(nullptr, nattr, 0, &sz);
+    std::vector<unsigned char> buf(sz ? sz : 1); auto* al = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buf.data());
+    bool init = InitializeProcThreadAttributeList(al, nattr, 0, &sz);
+    bool ok = init && UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &sc, sizeof sc, nullptr, nullptr) &&
+              (!n || UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, dups, n * sizeof(HANDLE), nullptr, nullptr));
+    sx.lpAttributeList = al;
+    if (ok) ok = CreateProcessW(app, cmd, nullptr, nullptr, n ? TRUE : FALSE, flags | EXTENDED_STARTUPINFO_PRESENT, nullptr, nullptr, &sx.StartupInfo, &pi);
+    error e{}; if (!ok) e = last_error("CreateProcess (AppContainer)");
+    if (init) DeleteProcThreadAttributeList(al);
+    for (DWORD i = 0; i < n; ++i) CloseHandle(dups[i]);
+    if (net) FreeSid(net);
+    FreeSid(ac);
+    return e;
+}
+}
+#endif
 
 inline sandbox_info sandbox_status() {
     sandbox_info i;
 #if defined(__linux__)
     auto s = detail::slurp("/proc/self/status"); auto p = s.find("Seccomp:");
     if (p != std::string::npos && std::atoi(s.c_str() + p + 8) > 0) { i.sandboxed = true; i.mechanism = std::atoi(s.c_str() + p + 8) == 2 ? "seccomp-bpf" : "seccomp-strict"; }
+    i.landlock_abi = detail::ll::abi(); i.landlock = detail::ll::applied().load();
+    if (i.landlock) { i.sandboxed = true; i.mechanism += i.mechanism.empty() ? "landlock" : "+landlock"; }
 #elif defined(FORGE_OS_FREEBSD)
     unsigned m = 0; if (::cap_getmode(&m) == 0 && m) { i.sandboxed = true; i.mechanism = "capsicum"; }
 #elif defined(FORGE_OS_IOS)
@@ -49,7 +283,8 @@ inline sandbox_info sandbox_status() {
 #elif defined(FORGE_OS_MACOS)
     if (!getenv("APP_SANDBOX_CONTAINER_ID").empty()) { i.sandboxed = true; i.mechanism = "app-sandbox"; }
 #elif defined(FORGE_OS_WINDOWS)
-    BOOL in = FALSE; if (IsProcessInJob(GetCurrentProcess(), nullptr, &in) && in) { i.sandboxed = true; i.mechanism = "job-object"; }
+    if (detail::wsbx::in_appcontainer(nullptr)) { i.sandboxed = true; i.mechanism = "appcontainer"; }
+    BOOL in = FALSE; if (IsProcessInJob(GetCurrentProcess(), nullptr, &in) && in) { i.sandboxed = true; i.mechanism += i.mechanism.empty() ? "job-object" : "+job-object"; }
 #endif
     return i;
 }
@@ -178,6 +413,11 @@ inline status apply_sandbox(const sandbox_policy& p) {
     if (!p.deny_network && !p.deny_exec && !p.deny_fs_write) return {};
 #if defined(__linux__)
     if (!detail::audit_arch) return {{}, unsupported("seccomp on this architecture")};
+    // Landlock first (best effort: the seccomp filter below is the baseline everywhere), then seccomp.
+    if (int ll = detail::ll::ruleset(p, {}, nullptr); ll >= 0) {
+        if (detail::ll::restrict_self(ll)) detail::ll::applied() = true;
+        ::close(ll);
+    }
     return detail::apply_seccomp(p);
 #elif defined(FORGE_OS_FREEBSD)
     if (::cap_enter()) return {{}, last_error("cap_enter")}; return {};
@@ -193,7 +433,15 @@ inline status apply_sandbox(const sandbox_policy& p) {
 #elif defined(FORGE_OS_IOS)
     return {};   // already confined by the iOS app sandbox (no exec, container-only fs); nothing further to apply
 #elif defined(FORGE_OS_WINDOWS)
-    if (p.deny_network || p.deny_fs_write) return {{}, unsupported("in-process network/fs denial on Windows (use run_sandboxed)")};
+    if (p.deny_network || p.deny_fs_write) {
+        // Cannot be added to a running process; accepted only when this process already runs in an
+        // AppContainer that enforces it (process_pool workers, run_sandboxed children): no network capability
+        // when the network is denied.
+        bool net = false;
+        if (!detail::wsbx::in_appcontainer(&net) || (p.deny_network && net))
+            return {{}, unsupported("in-process network/fs denial on Windows (use run_sandboxed or an AppContainer process_pool)")};
+        if (!p.deny_exec) return {};
+    }
     HANDLE j = CreateJobObjectW(nullptr, nullptr); if (!j) return {{}, last_error("CreateJobObject")};
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{}; li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS; li.BasicLimitInformation.ActiveProcessLimit = 1;
     if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li) || !AssignProcessToJobObject(j, GetCurrentProcess())) { auto e = last_error("job object"); CloseHandle(j); return {{}, e}; }
@@ -205,9 +453,10 @@ inline status apply_sandbox(const sandbox_policy& p) {
 
 // Run a child under the policy; returns its exit code (POSIX: 126 = the policy could not be applied, 127 = the
 // target could not be started, 128+n = killed by signal n). argv[0] is resolved like spawn_wait (PATH).
-// deny_exec: Windows (ActiveProcessLimit = 1) and FreeBSD (capability mode) keep the target itself from
-// starting programs; Linux and macOS cannot deny exec yet allow the one that starts the target, so there the
-// target runs under the policy's other parts only (Landlock is planned).
+// deny_exec: Windows (ActiveProcessLimit = 1), FreeBSD (capability mode) and Linux with Landlock (EXECUTE only on
+// the target's binary, #! interpreter and ld.so) keep the target itself from starting programs. Linux without
+// Landlock and macOS cannot deny exec yet allow the one that starts the target, so there the target runs under the
+// policy's other parts only (sandbox_status().landlock_abi says whether Landlock is there).
 inline result<int> run_sandboxed(const std::vector<std::string>& argv, const sandbox_policy& p) {
     if (argv.empty()) return {-1, {22, "run_sandboxed: empty argv"}};
 #if defined(FORGE_OS_WINDOWS)
@@ -231,27 +480,8 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
         // (internetClient / privateNetworkClientServer are not granted) and can write only to its own
         // container folder (%LOCALAPPDATA%\Packages\<name>\AC); reads of user files are denied unless their ACL
         // grants ALL APPLICATION PACKAGES (system directories do, so programs still load).
-        const wchar_t* name = p.deny_network && p.deny_fs_write ? L"forge.sandbox.nonet.nofs" : p.deny_network ? L"forge.sandbox.nonet" : L"forge.sandbox.nofs";
-        PSID ac = nullptr;
-        HRESULT hr = CreateAppContainerProfile(name, name, L"FORGE sandboxed child", nullptr, 0, &ac);
-        if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) hr = DeriveAppContainerSidFromAppContainerName(name, &ac);
-        if (FAILED(hr) || !ac) { CloseHandle(j); return {-1, {int(hr), "AppContainer profile failed"}}; }
-        SID_AND_ATTRIBUTES caps[1]{}; DWORD ncaps = 0; PSID net = nullptr;
-        if (!p.deny_network) {   // fs denied only: keep outbound network
-            SID_IDENTIFIER_AUTHORITY app = SECURITY_APP_PACKAGE_AUTHORITY;
-            if (AllocateAndInitializeSid(&app, SECURITY_BUILTIN_CAPABILITY_RID_COUNT, SECURITY_CAPABILITY_BASE_RID, SECURITY_CAPABILITY_INTERNET_CLIENT, 0, 0, 0, 0, 0, 0, &net)) { caps[0].Sid = net; caps[0].Attributes = SE_GROUP_ENABLED; ncaps = 1; }
-        }
-        SECURITY_CAPABILITIES sc{}; sc.AppContainerSid = ac; sc.Capabilities = ncaps ? caps : nullptr; sc.CapabilityCount = ncaps;
-        SIZE_T sz = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &sz);
-        std::vector<unsigned char> al(sz); auto* attrs = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(al.data());
-        bool ok = InitializeProcThreadAttributeList(attrs, 1, 0, &sz) && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &sc, sizeof sc, nullptr, nullptr);
-        STARTUPINFOEXW si{}; si.StartupInfo.cb = sizeof si; si.lpAttributeList = attrs;
-        if (ok) ok = CreateProcessW(wexe.c_str(), cmd.data(), nullptr, nullptr, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED, nullptr, nullptr, &si.StartupInfo, &pi);
-        error e{}; if (!ok) e = last_error("CreateProcess (AppContainer)");
-        if (attrs) DeleteProcThreadAttributeList(attrs);
-        if (net) FreeSid(net);
-        FreeSid(ac);
-        if (!ok) { CloseHandle(j); return {-1, e}; }
+        STARTUPINFOW si{}; si.cb = sizeof si;
+        if (auto e = detail::wsbx::create_in_appcontainer(p, wexe.c_str(), cmd.data(), CREATE_SUSPENDED, si, pi)) { CloseHandle(j); return {-1, e}; }
     } else {
         // exec-only policy: restricted token (max privileges dropped) inside the job.
         HANDLE tok = nullptr, rt = nullptr;
@@ -278,10 +508,15 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
     std::vector<char*> a; for (auto& s : argv) a.push_back(const_cast<char*>(s.c_str())); a.push_back(nullptr);
     const bool confine = p.deny_network || p.deny_exec || p.deny_fs_write;
 #if defined(__linux__)
-    // deny_exec is left out: the filter would refuse the execve that starts the target.
+    // deny_exec is left out of the seccomp filter (it would refuse the execve that starts the target); Landlock
+    // carries it instead, with EXECUTE allowed on the target's own exec chain only.
     sandbox_policy q = p; q.deny_exec = false;
     if (confine && !detail::audit_arch) return {-1, unsupported("seccomp on this architecture")};
     const std::vector<sock_filter> filter = q.deny_network || q.deny_fs_write ? detail::seccomp_filter(q) : std::vector<sock_filter>{};
+    std::vector<std::string> chain; if (p.deny_exec) detail::ll::exec_chain(exe, chain);
+    error ll_err{};
+    const int ll = confine ? detail::ll::ruleset(p, chain, &ll_err) : -1;
+    if (ll_err) return {-1, ll_err};
 #elif defined(FORGE_OS_FREEBSD)
     // Capability mode refuses every lookup by path, execve included, so the child opens nothing itself: the
     // binary (and for a dynamic one the run-time linker named by PT_INTERP plus the default library
@@ -331,11 +566,14 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
         auto e = last_error("fork");
 #if defined(FORGE_OS_FREEBSD)
         close_all();
+#elif defined(__linux__)
+        if (ll >= 0) ::close(ll);
 #endif
         return {-1, e};
     }
     if (c == 0) {
 #if defined(__linux__)
+        if (ll >= 0 && !detail::ll::restrict_self(ll)) ::_exit(126);
         if (!filter.empty() && !detail::install_seccomp(filter)) ::_exit(126);
 #elif defined(FORGE_OS_FREEBSD)
         if (confine) {
@@ -352,6 +590,8 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
     }
 #if defined(FORGE_OS_FREEBSD)
     close_all();
+#elif defined(__linux__)
+    if (ll >= 0) ::close(ll);
 #endif
     int st = 0; while (::waitpid(c, &st, 0) < 0 && errno == EINTR) {}
     return {WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st), {}};
