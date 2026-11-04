@@ -129,6 +129,20 @@ elseif(UNIX AND NOT APPLE)
   target_link_libraries(forge_os INTERFACE ${CMAKE_DL_LIBS})
 endif()
 target_link_libraries(forge_core INTERFACE forge_os)
+if(WIN32)
+  target_link_libraries(forge_core INTERFACE advapi32)   # log.hpp: RegisterEventSourceW / ReportEventW
+endif()
+# Compile-time log strip (core/log.hpp): calls below this level compile to nothing in every target linking forge_core.
+set(FORGE_LOG_MIN_LEVEL "none" CACHE STRING "Strip log calls below this level at compile time: trace debug info warn error fatal off, or none")
+set_property(CACHE FORGE_LOG_MIN_LEVEL PROPERTY STRINGS none trace debug info warn error fatal off)
+include(cmake/forge_log_level.cmake)
+forge_log_level_value("${FORGE_LOG_MIN_LEVEL}" _forge_log_min)
+if(_forge_log_min STREQUAL "INVALID")
+  message(FATAL_ERROR "FORGE_LOG_MIN_LEVEL='${FORGE_LOG_MIN_LEVEL}': use none, trace, debug, info, warn, error, fatal or off")
+elseif(NOT _forge_log_min STREQUAL "")
+  target_compile_definitions(forge_core INTERFACE FORGE_LOG_MIN_LEVEL=${_forge_log_min})
+  message(STATUS "FORGE: log calls below '${FORGE_LOG_MIN_LEVEL}' are stripped (FORGE_LOG_MIN_LEVEL=${_forge_log_min})")
+endif()
 
 add_library(forge_balance INTERFACE)   # load balancer + L4/L7 proxy
 target_include_directories(forge_balance INTERFACE balance/include)
@@ -618,6 +632,8 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(${n} PROPERTIES ENVIRONMENT "FORGE_TEST_SHELL_PATH=${FORGE_TEST_SHELL_PATH}")
     endif()
   endforeach()
+  set_tests_properties(test_log PROPERTIES SKIP_RETURN_CODE 77)   # skips when built with FORGE_LOG_MIN_LEVEL
+  add_test(NAME log_min_level_cmake COMMAND ${CMAKE_COMMAND} -P ${PROJECT_SOURCE_DIR}/tests/log_min_level.cmake)
   # Scalable vectors at many lengths under qemu: the sve/rvv lane must be active at every VL, including the
   # ones without a power-of-two table (lowered at load time) and ones above 1024 bits.
   if(CMAKE_CROSSCOMPILING AND CMAKE_CROSSCOMPILING_EMULATOR)

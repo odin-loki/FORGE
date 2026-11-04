@@ -3,9 +3,17 @@
 #include <forge/os/os.hpp>
 #include <filesystem>
 #include <fstream>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <set>
 #include <thread>
 namespace L = forge::log;
+
+#if FORGE_LOG_MIN > 0
+// Built with -DFORGE_LOG_MIN_LEVEL=...: these tests need every level (test_log_strip covers stripping).
+TEST(skip_when_stripped) { std::printf("skip: built with FORGE_LOG_MIN=%d\n", FORGE_LOG_MIN); std::exit(77); }
+#endif
 
 struct capture {
     std::vector<std::string> lines; std::vector<std::string> mods; int id;
@@ -100,3 +108,124 @@ TEST(file_sink_rotation) {
       CHECK(last.find("line 29") != std::string::npos); }
     for (auto s : {"", ".1", ".2"}) std::filesystem::remove(p + s);
 }
+
+// ---- async sink -----------------------------------------------------------------------------------
+static std::string tmp_log(const char* tag) {
+    return (std::filesystem::temp_directory_path() / (std::string(tag) + std::to_string(forge::os::pid()) + ".log")).string();
+}
+
+TEST(async_file_sink_threads_and_flush) {
+    L::set_stderr(false); L::configure("info");
+    auto p = tmp_log("forge_async_"); std::filesystem::remove(p);
+    int id = L::add_async_sink(L::make_file_sink(p), 4096); CHECK(id > 0);
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t) ts.emplace_back([t] { L::logger g{"th"}; for (int i = 0; i < 200; ++i) g.info("t{}-i{}-{}", t, i, std::string(40, char('a' + t))); });
+    for (auto& t : ts) t.join();
+    L::flush();
+    auto st = L::async_sink_stats(id);
+    CHECK(st.written == 800); CHECK(st.dropped == 0); CHECK(st.pending == 0);
+    {
+        std::ifstream in(p); std::string s; int n = 0; std::set<std::string> seen;
+        while (std::getline(in, s)) {
+            ++n; CHECK_MSG(s.rfind("[forge:th I] t", 0) == 0, "bad line %s", s.c_str());
+            auto tail = s.substr(s.size() - 40); CHECK(tail == std::string(40, tail[0]));
+            seen.insert(s);
+        }
+        CHECK(n == 800); CHECK(seen.size() == 800);
+    }
+    L::remove_sink(id);
+    CHECK(L::async_sink_stats(id).written == 0);   // unknown id after removal
+    std::filesystem::remove(p);
+}
+
+TEST(async_full_queue_drops_and_reports_without_blocking) {
+    L::set_stderr(false); L::configure("info");
+    std::atomic<bool> gate{false}, entered{false};
+    std::vector<std::string> lines, mods; std::vector<L::level> lvls;   // touched only by the drain thread until flush
+    int id = L::add_async_sink([&](const L::record& r, std::string_view s) {
+        entered = true;
+        while (!gate.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lines.emplace_back(s); mods.emplace_back(r.module); lvls.push_back(r.lvl);
+    }, 4);
+    L::info("first");
+    while (!entered.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));   // drain thread is now stuck in the sink
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < 100; ++i) L::info("burst {}", i);   // 4 fit in the queue, 96 are dropped; none of these waits
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    CHECK_MSG(ms < 2000, "logging blocked for %lld ms", (long long)ms);
+    auto st = L::async_sink_stats(id);
+    CHECK(st.dropped == 96); CHECK(st.pending == 5); CHECK(st.written == 0);
+    gate = true;
+    L::flush();
+    st = L::async_sink_stats(id);
+    CHECK(st.written == 5); CHECK(st.dropped == 96); CHECK(st.pending == 0);
+    CHECK(lines.size() == 6);
+    if (lines.size() == 6) {
+        CHECK(lines[0] == "[forge I] first");
+        CHECK(lines[1] == "[forge I] burst 0"); CHECK(lines[4] == "[forge I] burst 3");
+        CHECK_MSG(lines[5] == "[forge:log W] dropped 96 log line(s): async queue full (capacity 4)", "got %s", lines[5].c_str());
+        CHECK(mods[5] == "log"); CHECK(lvls[5] == L::level::warn);
+    }
+    L::remove_sink(id);
+}
+
+TEST(async_remove_sink_drains_queue) {
+    L::set_stderr(false); L::configure("info");
+    std::atomic<int> got{0};
+    int id = L::add_async_sink([&](const L::record&, std::string_view) { std::this_thread::sleep_for(std::chrono::microseconds(200)); ++got; });
+    for (int i = 0; i < 50; ++i) L::warn("w {}", i);
+    L::remove_sink(id);   // writes the remaining lines and joins the thread
+    CHECK(got.load() == 50);
+    L::warn("after");     // no longer delivered
+    CHECK(got.load() == 50);
+}
+
+TEST(async_sink_factories) {
+    CHECK(!L::make_file_sink("/nonexistent-dir/x/y.log"));
+    CHECK(L::add_async_sink(L::sink{}) == 0);
+    auto st = L::async_sink_stats(987654);
+    CHECK(st.written == 0 && st.dropped == 0 && st.pending == 0);
+    L::flush();   // nothing registered: returns at once
+    CHECK(L::make_stderr_sink());
+}
+
+// Child half of async_drains_at_exit: does something only when the parent sets FORGE_TEST_LOG_EXIT_FILE.
+TEST(async_exit_child) {
+    const char* p = std::getenv("FORGE_TEST_LOG_EXIT_FILE");
+    if (!p || !*p) return;
+    L::set_stderr(false); L::configure("info");
+    auto file = L::make_file_sink(p);
+    L::add_async_sink([file](const L::record& r, std::string_view s) { std::this_thread::sleep_for(std::chrono::microseconds(300)); file(r, s); });
+    for (int i = 0; i < 100; ++i) L::info("exit line {}", i);
+    std::exit(0);   // static destruction must drain the queue
+}
+
+TEST(async_drains_at_exit) {
+    auto p = tmp_log("forge_async_exit_"); std::filesystem::remove(p);
+    auto exe = forge::os::exe_path(); CHECK(!exe.empty());
+    forge_test::set_env("FORGE_TEST_LOG_EXIT_FILE", p.c_str());
+    forge_test::set_env("FORGE_TEST_ONLY", "async_exit_child");
+#if defined(_WIN32)
+    int rc = std::system(("\"\"" + exe + "\"\"").c_str());
+#else
+    int rc = std::system(("'" + exe + "'").c_str());
+#endif
+    forge_test::set_env("FORGE_TEST_LOG_EXIT_FILE", nullptr);
+    forge_test::set_env("FORGE_TEST_ONLY", nullptr);
+    CHECK(rc == 0);
+    int n = 0;
+    { std::ifstream in(p); std::string s, last; while (std::getline(in, s)) { ++n; last = s; }   // closed before remove (Windows)
+      CHECK(last == "[forge I] exit line 99"); }
+    CHECK_MSG(n == 100, "child wrote %d of 100 lines before exit", n);
+    std::filesystem::remove(p);
+}
+
+#ifdef _WIN32
+TEST(eventlog_sink) {
+    L::set_stderr(false); L::configure("info");
+    CHECK(L::make_eventlog_sink("forge-test"));
+    int id = L::add_eventlog_sink("forge-test"); CHECK(id > 0);
+    L::warn("forge test_log eventlog_sink {}", 1); L::error("e"); L::info("i");
+    L::remove_sink(id);
+}
+#endif
