@@ -1,0 +1,112 @@
+# forge::os audit (2026-11-05)
+
+A read-only audit of every `forge::os` header and the compiled `os/src` backends (mobile, text, locale), branch by
+branch on Linux, Android, Windows (MSVC, MinGW), macOS, iOS and FreeBSD. Categories: **C** bug or security risk,
+**B** partial or degraded behaviour, **A** unsupported where the OS could support it, **D** untested path,
+**E** inherent limit (documented, not fixed). Status: open, fixed (commit), or won't fix (reason).
+
+The work is split by file ownership so changes can proceed in parallel without conflicts.
+
+## Wave 1: bugs, security, degraded behaviour
+
+### W1-A: processes, sandbox, signals, pipes, crash (`process.hpp`, `process_pool.hpp`, `sandbox.hpp`, `signal.hpp`, `pipe.hpp`, `crash.hpp`)
+| ID | Cat | Item |
+|---|---|---|
+| A1 | C | `send_signal`: pid 0 signals our own group; pid ≤ 1 with `group` becomes `kill(-1)`; pid truncation |
+| A2 | C | Pipes from `pipe()` without atomic close-on-exec (spawn, child, process_pool, pipe.hpp): concurrent forks inherit them, readers never see EOF |
+| A3 | C | Windows `spawn_wait`: stdin written synchronously (deadlock, timeout ignored); readers wait forever on a grandchild holding the pipe |
+| A4 | C | Windows `.bat`/`.cmd` arguments through `cmd /c` with MSVCRT quoting (BatBadBut injection) |
+| A5 | B | Windows environment block is case-sensitive (`Path` vs `PATH` duplicates) |
+| A6 | B | Windows job: `no_core` ignored; failed `AssignProcessToJobObject` silently drops limits and tree kill |
+| A7 | C | Windows process_pool: CRT fd 1 not redirected (task `printf` corrupts IPC); `reap` orphans on timeout; few NTSTATUS codes mapped |
+| A8 | C | process_pool sandbox on Windows: unsupported policy swallowed and recorded as applied |
+| A9 | C | seccomp: io_uring, x32 and i386 `socketcall` bypasses; `linkat`/`symlinkat`/`mknodat`/`fchmodat`/`fchownat`/`utimensat`/`*setxattr` not denied |
+| A10 | C | FreeBSD `run_sandboxed`: `cap_enter` before `execvp` makes every child exit 127 |
+| A11 | C | Windows `run_sandboxed`: arguments quoted without escaping |
+| A12 | C | Crash handler: non-async-signal-safe calls, predictable `/tmp` report path without `O_EXCL`/`O_NOFOLLOW`, ANSI paths on Windows, altstack only on the installing thread, no chaining, CRT abort paths bypass it |
+| A13 | D | Tests: `run_sandboxed` everywhere, pool sandbox, large stdin, grandchild, concurrent `child::start` |
+
+### W1-B: core, files, IPC, console, time (`os.hpp`, `oserror.hpp`, `async_file.hpp`, `local_ipc.hpp`, `shared_memory.hpp`, `fs.hpp`, `console.hpp`, `time.hpp`, `detail.hpp`)
+| ID | Cat | Item |
+|---|---|---|
+| B1 | C | Windows `local_listener::accept` timeout: `CancelIo` without waiting, kernel can complete into a dead stack `OVERLAPPED` |
+| B2 | C | `local_ipc`: client lacks `SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION`; `listen` unlinks any file at the path; no peer-credential check |
+| B3 | C | Windows IOCP: `post_error_` drops the error; handle-value cache misroutes I/O after handle reuse; reserved key collides with user keys |
+| B4 | C | Close-on-exec races: `run()` pipe, `socket::make`, `socket::accept`, local_ipc sockets; Windows sockets inheritable; `SO_REUSEADDR` port hijack on Windows |
+| B5 | C | Windows `fs`: byte-wise widening of paths (`file_lock`, `write_file_atomic`, `make_temp_file`); `write_file_atomic` not durable, ignores mode; `make_temp_file` not exclusive |
+| B6 | C | Windows `stat`: every reparse point (OneDrive placeholders, dedup) reported as a link; target size/mtime not followed |
+| B7 | C | io_uring: no opcode probe (kernels 5.1–5.5), tail not rolled back on failure, length truncation |
+| B8 | C | `shared_memory`: Apple name truncation collisions, `O_TRUNC` on existing regions, name leaks on error, Windows existing mapping not detected, Android default dir |
+| B9 | B | `classify` on Windows treats errno/`EAI_*` codes as Win32; missing Win32 mappings |
+| B10 | B | Smaller `os.hpp` items: append emulation, DWORD truncation, `pread` moves the pointer, `map_file` offset checks, `prot` ignored, `temp_dir` overflow, thread priority, `pin_thread` shift UB and FreeBSD support, `thread` move-assign leak, `socket::connect` error, `sleep_ns` granularity |
+| B11 | B | macOS `available_memory` is total/4 (use `host_statistics64`); FreeBSD free-only count |
+| B12 | B | Console on Windows: `_isatty`, size fallback, VT input, `read_password` Unicode; OSC 8 links emitted without colour and unsanitised |
+| B13 | A | `timezone_name` on Windows, Android, FreeBSD; `on_signal(hangup)` on Windows |
+| B14 | A | `pipe.hpp` on Windows |
+| B15 | B | Linux `mounts` unescape can throw; `localtime_s` unchecked; `read_some` EINTR as EOF |
+| B16 | D | Tests: non-ASCII paths, classify tables, IOCP errors, handle reuse, shm collisions, timezone, console |
+
+### W1-C: system, hardware, network, watching (`net.hpp`, `sysinfo.hpp`, `cpu_topology.hpp`, `numa.hpp`, `hugepages.hpp`, `memory_pressure.hpp`, `power.hpp`, `perf.hpp`, `gpu_devices.hpp`, `devices.hpp`, `clipboard.hpp`, `dynlib.hpp`, `file_watch.hpp`, `file_watch_tree.hpp`)
+| ID | Cat | Item |
+|---|---|---|
+| C1 | C | `net::http`: CR/LF/NUL injection in method, path, headers; credentials copied across redirect origins; IPv6 `Host`; relative redirects |
+| C2 | C | `net::http`: truncated bodies returned as success; no overall deadline; repeated `Set-Cookie` merged |
+| C3 | C | `CPU_SET` without bounds (`pin_thread_to`, `bind_thread_to_node`) on Linux and FreeBSD |
+| C4 | C | `memory_pressure`: dead monitor after stop/subscribe; Windows event leak; Apple dispatch source never cancelled |
+| C5 | C | Windows clipboard reads unterminated foreign data; no retry on contention |
+| C6 | C | System DLLs loaded through the default search order (use `LoadLibraryExW` + `LOAD_LIBRARY_SEARCH_SYSTEM32`) |
+| C7 | C | FreeBSD partition prefix match; `gpu_devices` PCI batch; Windows `current_cpu` group-relative; hugepages privilege race; perf timer handle leak |
+| C8 | C | `file_watch`: >64 Windows directories silently dead; overflow dropped; case-sensitive names on Windows; kqueue fd exhaustion; tree watcher symlink loops |
+| C9 | B | MSVC: no rdtsc/cpuid (`cycle_counter` in ns, empty CPU brand) |
+| C10 | B | `sysinfo::memory`: swap 0 on macOS/FreeBSD, Windows free = available, Linux root cgroup only; Windows `self_usage` peak RSS/faults; Windows 11 version |
+| C11 | B | `gpu_devices` integrated/VRAM heuristics; `power` thermal/throttle/charging/multi-battery heuristics; perf hybrid PMUs and multiplexing |
+| C12 | B | Clipboard: macOS UTF-8, X11 empty selection; `dlvsym` on FreeBSD/bionic; Linux PSI in containers |
+| C13 | A | perf: macOS `proc_pid_rusage` cycles/instructions, FreeBSD libpmc; numa on Windows/FreeBSD; hugepages Windows 1G and FreeBSD largepage shm |
+| C14 | D | Tests for each of the above |
+
+### W1-D: services, keystore, users, settings, registry, background (`keystore.hpp`, `service.hpp`, `service_control.hpp`, `background.hpp`, `users.hpp`, `registry.hpp`, `settings.hpp`)
+| ID | Cat | Item |
+|---|---|---|
+| D1 | C | Keystore file fallback is XOR obfuscation with no integrity; pad races; permissions set after writing; chmod of any dir; replace with XChaCha20-Poly1305 (monocypher, already in `third_party/`) and a wrapped key |
+| D2 | B | Keystore: libsecret failures silently fall back to the file while reporting "libsecret"; FreeBSD never tries libsecret; Android default dir unusable; Apple put deletes before add |
+| D3 | C | `service::log`: `openlog` keeps a pointer into a string that is reassigned on every call |
+| D4 | C | systemd unit rendering: newline injection, `$` doubling, unquoted `;` |
+| D5 | B | macOS service `query` reports loaded-but-stopped as running; deprecated `load`/`unload` |
+| D6 | B | `background`: Windows per-thread `SetThreadExecutionState`; iOS nil expiration handler; Linux/FreeBSD no inhibitor |
+| D7 | B | `user_directory` ignores Known Folders (OneDrive redirection) and `user-dirs.dirs`; Windows `current_user` groups/full name |
+| D8 | B | Registry: no WOW64 view, type changes on write, no MULTI_SZ/BINARY |
+| D9 | B | `settings`: ANSI `getenv` on Windows; `strtoll` base 0 parses "010" as octal |
+| D10 | D | Tests: backends that silently pass when `put` fails, services, registry, user_directory, settings |
+
+### W1-E: mobile, text, locale (`os/src/mobile`, `os/src/text`, `mobile.hpp`, `text.hpp`, `locale.hpp`)
+| ID | Cat | Item |
+|---|---|---|
+| E1 | C | `zone_at` opens caller-supplied absolute paths with no type or size check; unbounded cache |
+| E2 | C | `open_url` accepts any string containing `://` (local executables, option injection) |
+| E3 | C | gettext plural expression `!` recursion unbounded |
+| E4 | C | Windows pointer timestamps in QPC ticks; iOS shared `CMMotionManager` across streams |
+| E5 | B | Sensors with no native source cannot use the bridge feed |
+| E6 | B | Linux/FreeBSD touch picks touchpads, raw units, REALTIME clock |
+| E7 | B | Windows keep_awake per thread, device info; Android rotation vector `w`, unchecked `registerSensor` |
+| E8 | B | Linux cameras/torch/brightness/biometrics/form factor/bluetooth/nmcli parsing; services paths on Android/Windows/Linux; audio hooks; network type |
+| E9 | B | Locale categories (`LC_TIME`/`LC_NUMERIC`), OS user overrides, console code page, `TERM`, mintty |
+| E10 | A | Android tzdata bundle; MinGW local zone; ISO-8859-9 |
+| E11 | D | CI: iOS builds only `forge_c` (apple.mm UIKit never compiled); Android runs no `test_mobile`/`test_locale` |
+
+## Wave 2: new backends (after wave 1)
+| ID | Item |
+|---|---|
+| W2-1 | HTTPS in `net::http` (reuse FORGE's TLS when built; Schannel / Network.framework otherwise) |
+| W2-2 | Windows services through the SCM API (env, working dir, status), per-user services through Task Scheduler; FreeBSD rc.d |
+| W2-3 | Windows process_pool sandbox through AppContainer; Linux Landlock for `deny_exec` and file policy |
+| W2-4 | Keystore key wrapping through TPM / Argon2id passphrase |
+| W2-5 | Windows mobile backends (Sensor API, Media Foundation cameras, brightness, Bluetooth, audio, notifications) |
+| W2-6 | Linux mobile backends (GeoClue, V4L2 capture, more IIO channels, logind brightness and inhibit); FreeBSD keep_awake/backlight |
+| W2-7 | Apple mobile backends (deviceMotion, pedometer, proximity, pasteboard, macOS notifications/cameras/location/biometrics) |
+| W2-8 | FSEvents on macOS; `load_average` emulation on Windows |
+
+## Inherent limits (not fixed)
+Windows: `chown`, POSIX signals beyond kill/terminate, user-mode PMCs, THP, per-process open-file/file-size limits,
+in-process network/file denial. macOS: hard CPU affinity, temperature without SMC. iOS: spawning, process listing,
+services, light sensor. Android: JNI-only features (vibrate, notify, display, clipboard, services, keystore dir).
+Linux: abstract sockets only. DPAPI and Keychain do not isolate secrets between processes of one user.
