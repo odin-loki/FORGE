@@ -130,15 +130,16 @@ struct apple_backend final : backend {
             hub->add(k, q, hz); sub->hub = hub; sub->hq = q.get();
             break;
         }
-        case sensor_kind::pressure:
+        case sensor_kind::pressure: {   // braced: a block literal in an unbraced case makes later labels jump into its scope
             if (![CMAltimeter isRelativeAltitudeAvailable]) return {{}, unsupported("barometer")};
             sub->alt = [CMAltimeter new];
             [sub->alt startRelativeAltitudeUpdatesToQueue:sub->oq withHandler:^(CMAltitudeData* d, NSError*) { if (d) q->push({false, {k, std::uint64_t(d.timestamp * 1e9), {d.pressure.doubleValue * 10.0 /* kPa -> hPa */}, 1}, {}}); }];
             break;
+        }
         case sensor_kind::location: {
             if (![CLLocationManager locationServicesEnabled]) return {{}, unsupported("location services disabled")};
             auto* del = [FORGELocationDelegate new]; del.q = q; sub->del = del;
-            __block CLLocationManager* lm = nil;
+            CLLocationManager* lm = nil;   // captured by reference in a C++ lambda (__block cannot be)
             on_main([&] { lm = [CLLocationManager new]; lm.delegate = del; [lm requestWhenInUseAuthorization]; [lm startUpdatingLocation]; });
             sub->lm = lm; break;
         }
