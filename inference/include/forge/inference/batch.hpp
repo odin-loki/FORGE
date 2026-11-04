@@ -162,12 +162,17 @@ private:
         if (a->r.prompt.empty()) raise(errc::invalid_argument, "request with empty prompt");
         a->hist = a->r.prompt;
         // prefix cache: reuse the longest shared prefix (always leave >= 1 prompt token to compute logits); an
-        // in-memory entry wins a tie with a spilled one
+        // in-memory entry wins a tie with a spilled one. An entry with recurrent state (e.g. Qwen3.5) only matches
+        // at its full length: that state cannot be cut back to a shorter prefix.
         std::size_t best = 0; session* src = nullptr;
-        auto shared = [&](const std::vector<int>& t) { std::size_t n = 0, lim = std::min(t.size(), a->r.prompt.size() - 1); while (n < lim && t[n] == a->r.prompt[n]) ++n; return n; };
+        auto shared = [&](const cached& c) {
+            std::size_t n = 0, lim = std::min(c.tokens.size(), a->r.prompt.size() - 1);
+            while (n < lim && c.tokens[n] == a->r.prompt[n]) ++n;
+            return c.full_only && n != c.tokens.size() ? std::size_t(0) : n;
+        };
         auto mem_hit = cache_.end(), sp_hit = spilled_.end();
-        for (auto it = cache_.begin(); it != cache_.end(); ++it) if (auto n = shared(it->tokens); n > best) { best = n; mem_hit = it; }
-        for (auto it = spilled_.begin(); it != spilled_.end(); ++it) if (auto n = shared(it->tokens); n > best) { best = n; sp_hit = it; mem_hit = cache_.end(); }
+        for (auto it = cache_.begin(); it != cache_.end(); ++it) if (auto n = shared(*it); n > best) { best = n; mem_hit = it; }
+        for (auto it = spilled_.begin(); it != spilled_.end(); ++it) if (auto n = shared(*it); n > best) { best = n; sp_hit = it; mem_hit = cache_.end(); }
         if (sp_hit != spilled_.end()) {   // reload from disk; it becomes the most recently used in-memory entry
             auto c = std::move(*sp_hit); spilled_.erase(sp_hit);
             if (auto blob = o_.spill->take(c.spill_key)) {
@@ -207,7 +212,8 @@ private:
     void retire(std::unique_ptr<active> a) {
         if (o_.prefix_cache == 0) return;
         std::vector<int> toks(a->hist.begin(), a->hist.begin() + std::min<std::size_t>(a->hist.size(), std::size_t(a->s->position())));
-        cache_.push_front({std::move(toks), std::move(a->s)});
+        bool full_only = a->s->has_recurrent_state();
+        cache_.push_front({std::move(toks), std::move(a->s), 0, full_only});
         while (cache_.size() > o_.prefix_cache) evict_lru_();
         update_cache_bytes_();
     }
@@ -216,7 +222,7 @@ private:
         for (auto& a : active_) if (a->r.on_done) a->r.on_done(a->out, "error: " + msg);
         active_.clear();
     }
-    struct cached { std::vector<int> tokens; std::unique_ptr<session> s; std::uint64_t spill_key = 0; };
+    struct cached { std::vector<int> tokens; std::unique_ptr<session> s; std::uint64_t spill_key = 0; bool full_only = false; };
     // Evict the least recently used in-memory prefix: with a spill store its KV goes to disk (a later hit reloads
     // it), otherwise, or when the store is full or the state cannot be saved, it is dropped.
     void evict_lru_() {

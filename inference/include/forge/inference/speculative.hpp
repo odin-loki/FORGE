@@ -42,7 +42,8 @@ inline std::vector<int> speculative_generate(session& target, session& draft, st
             if (target.position() + 1 > target.context()) break;
             continue;
         }
-        // 1. draft proposes kk tokens
+        // 1. draft proposes kk tokens. Checkpoints let a rejection roll back models with recurrent state too.
+        auto dck = draft.make_checkpoint(), tck = target.make_checkpoint();
         std::vector<int> d; std::vector<std::vector<double>> q;
         std::vector<int> dh = hist;
         int feed = cur;
@@ -73,7 +74,7 @@ inline std::vector<int> speculative_generate(session& target, session& draft, st
         }
         st.accepted += std::size_t(acc);
         if (done) {   // stopped inside the accepted run: keep state consistent with what was emitted
-            target.rewind(P + 1 + acc); draft.rewind(P + std::min(acc + 1, kk));
+            target.rewind(P + 1 + acc, tck, batch); draft.rewind(P + std::min(acc + 1, kk), dck, batch);
             break;
         }
         if (next < 0) {   // all accepted: bonus token from the target's last row
@@ -81,8 +82,8 @@ inline std::vector<int> speculative_generate(session& target, session& draft, st
             next = s.draw(p);
             draft.forward(std::span<const int>(&d.back(), 1));   // draft never saw its own last proposal
         } else {
-            target.rewind(P + 1 + acc);
-            draft.rewind(P + 1 + acc);
+            target.rewind(P + 1 + acc, tck, batch);
+            draft.rewind(P + 1 + acc, dck, batch);
         }
         emit(next); cur = next;
     }
@@ -131,6 +132,7 @@ inline std::vector<int> lookup_generate(session& target, std::span<const int> pr
             int t = s.sample(l, hist); emit(t); cur = t; continue;
         }
         std::vector<int> batch{cur}; batch.insert(batch.end(), d.begin(), d.end());
+        auto ck = target.make_checkpoint();   // rolls back recurrent state on a rejection
         auto L = target.forward_all(batch);
         ++st.rounds; st.drafted += d.size();
         int acc = 0, next = -1; std::vector<int> th = hist;
@@ -141,9 +143,9 @@ inline std::vector<int> lookup_generate(session& target, std::span<const int> pr
             p[std::size_t(d[i])] = 0; next = s.draw(p); break;
         }
         st.accepted += std::size_t(acc);
-        if (done) { target.rewind(P + 1 + acc); break; }
+        if (done) { target.rewind(P + 1 + acc, ck, batch); break; }
         if (next < 0) next = s.draw(s.probs(std::span<const float>(L.data() + d.size() * V, V), th));
-        else target.rewind(P + 1 + acc);
+        else target.rewind(P + 1 + acc, ck, batch);
         emit(next); cur = next;
     }
     st.new_tokens = out.size();
