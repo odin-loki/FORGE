@@ -5,6 +5,24 @@
 namespace forge::os {
 
 #if defined(FORGE_OS_POSIX)
+namespace detail {
+// pipe() with both ends close-on-exec from the start, so a fork+exec on another thread never inherits them (a
+// leaked write end keeps the reader from ever seeing EOF). pipe2(O_CLOEXEC) is atomic on Linux, Android and
+// FreeBSD. Apple has no pipe2: pipe + FD_CLOEXEC run under fork_mutex(), which every FORGE fork
+// (serialized_fork) takes, so no FORGE-spawned child can inherit the ends in between; a fork the embedding
+// program makes without serialized_fork can still race there. A child that needs an end as 0/1/2 gets it with
+// dup2, which clears the flag on the copy (see detail_proc::dup_to for the from == to case).
+inline int pipe_cloexec(int fd[2]) noexcept {
+#if defined(__APPLE__)
+    std::lock_guard<std::mutex> lk(fork_mutex());
+    if (::pipe(fd)) return -1;
+    ::fcntl(fd[0], F_SETFD, FD_CLOEXEC); ::fcntl(fd[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+#else
+    return ::pipe2(fd, O_CLOEXEC);
+#endif
+}
+}
 class pipe_end {
 public:
     pipe_end() = default;
@@ -35,8 +53,7 @@ private:
 };
 struct pipe_pair { pipe_end read, write; };
 inline result<pipe_pair> make_pipe() {
-    int f[2]; if (::pipe(f)) return {{}, last_error("pipe")};
-    ::fcntl(f[0], F_SETFD, FD_CLOEXEC); ::fcntl(f[1], F_SETFD, FD_CLOEXEC);
+    int f[2]; if (detail::pipe_cloexec(f)) return {{}, last_error("pipe")};
     pipe_pair p{pipe_end(f[0]), pipe_end(f[1])};
     return {std::move(p), {}};
 }
