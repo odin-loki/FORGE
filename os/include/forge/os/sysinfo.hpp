@@ -15,7 +15,9 @@
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <mach/processor_info.h>
 #elif defined(__FreeBSD__)
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
 #endif
@@ -84,7 +86,7 @@ inline result<load_avg> load_average() {
 #elif defined(FORGE_OS_ANDROID)
     std::ifstream f("/proc/loadavg"); load_avg a; if (f >> a.one >> a.five >> a.fifteen) return {a, {}};
     return {{}, last_error("/proc/loadavg")};
-#else
+#else   // Windows keeps no run-queue average; sampling one would need a background thread. Use per_cpu_times.
     return {{}, unsupported("load_average")};
 #endif
 }
@@ -111,7 +113,8 @@ inline memory_info memory() {
     return m;
 }
 
-// Cumulative busy/idle time per logical CPU (seconds since boot). usage(a, b) gives the busy fraction between samples.
+// Cumulative busy/idle time per logical CPU (seconds since boot): /proc/stat, host_processor_info (Apple),
+// kern.cp_times (FreeBSD), NtQuerySystemInformationEx (Windows). usage(a, b) gives the busy fraction between samples.
 struct cpu_times { double user = 0, system = 0, idle = 0, other = 0; double total() const { return user + system + idle + other; } };
 inline result<std::vector<cpu_times>> per_cpu_times() {
     std::vector<cpu_times> out;
@@ -124,6 +127,46 @@ inline result<std::vector<cpu_times>> per_cpu_times() {
         out.push_back(t);
     }
     if (out.empty()) return {{}, last_error("/proc/stat")};
+    return {std::move(out), {}};
+#elif defined(__APPLE__)
+    natural_t n = 0; processor_info_array_t info = nullptr; mach_msg_type_number_t cnt = 0;
+    if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &n, &info, &cnt) != KERN_SUCCESS) return {{}, error{-1, "host_processor_info failed"}};
+    double hz = double(::sysconf(_SC_CLK_TCK)); if (hz <= 0) hz = 100;
+    auto* l = reinterpret_cast<processor_cpu_load_info_t>(info);
+    for (natural_t i = 0; i < n; ++i) {
+        cpu_times t; t.user = (double(l[i].cpu_ticks[CPU_STATE_USER]) + double(l[i].cpu_ticks[CPU_STATE_NICE])) / hz;
+        t.system = double(l[i].cpu_ticks[CPU_STATE_SYSTEM]) / hz; t.idle = double(l[i].cpu_ticks[CPU_STATE_IDLE]) / hz; out.push_back(t);
+    }
+    vm_deallocate(mach_task_self(), vm_address_t(info), vm_size_t(cnt) * sizeof(integer_t));
+    return {std::move(out), {}};
+#elif defined(__FreeBSD__)
+    std::size_t sz = 0; if (::sysctlbyname("kern.cp_times", nullptr, &sz, nullptr, 0)) return {{}, last_error("kern.cp_times")};
+    std::vector<long> v(sz / sizeof(long)); if (::sysctlbyname("kern.cp_times", v.data(), &sz, nullptr, 0)) return {{}, last_error("kern.cp_times")};
+    clockinfo ci{}; std::size_t cn = sizeof ci; double hz = ::sysctlbyname("kern.clockrate", &ci, &cn, nullptr, 0) == 0 && ci.stathz > 0 ? double(ci.stathz) : 128;
+    for (std::size_t i = 0; i + CPUSTATES <= sz / sizeof(long); i += CPUSTATES) {   // ticks at stathz
+        cpu_times t; t.user = double(v[i + CP_USER] + v[i + CP_NICE]) / hz; t.system = double(v[i + CP_SYS]) / hz;
+        t.idle = double(v[i + CP_IDLE]) / hz; t.other = double(v[i + CP_INTR]) / hz; out.push_back(t);
+    }
+    if (out.empty()) return {{}, error{-1, "kern.cp_times: empty"}};
+    return {std::move(out), {}};
+#elif defined(FORGE_OS_WINDOWS)
+    // NtQuerySystemInformationEx(SystemProcessorPerformanceInformation = 8) per processor group (100 ns units;
+    // kernel time includes idle). ntdll is always loaded.
+    struct sppi { LARGE_INTEGER idle, kernel, user, dpc, interrupt; ULONG interrupts; };
+    using fn = LONG(WINAPI*)(int, void*, ULONG, void*, ULONG, ULONG*);
+    auto q = reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformationEx")));
+    if (!q) return {{}, unsupported("per_cpu_times (NtQuerySystemInformationEx)")};
+    WORD groups = GetActiveProcessorGroupCount(); if (!groups) groups = 1;
+    for (WORD g = 0; g < groups; ++g) {
+        USHORT grp = g; DWORD c = GetActiveProcessorCount(g); std::vector<sppi> b(c ? c : 1); ULONG got = 0;
+        LONG st = q(8, &grp, sizeof grp, b.data(), ULONG(b.size() * sizeof(sppi)), &got);
+        if (st < 0) return {{}, error{int(st), "NtQuerySystemInformationEx(SystemProcessorPerformanceInformation) failed"}};
+        for (std::size_t i = 0; i < got / sizeof(sppi) && i < b.size(); ++i) {
+            cpu_times t; t.idle = double(b[i].idle.QuadPart) / 1e7; t.user = double(b[i].user.QuadPart) / 1e7;
+            t.system = double(b[i].kernel.QuadPart - b[i].idle.QuadPart) / 1e7; out.push_back(t);
+        }
+    }
+    if (out.empty()) return {{}, error{-1, "per_cpu_times: no processors reported"}};
     return {std::move(out), {}};
 #else
     return {{}, unsupported("per_cpu_times")};
