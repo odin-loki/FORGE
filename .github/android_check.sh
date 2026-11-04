@@ -13,6 +13,7 @@ done
 libcxx=$(find -L "$ANDROID_NDK_LATEST_HOME/" -path "*x86_64-linux-android/libc++_shared.so" | head -1)
 adb push "$libcxx" build/android-x86_64/test_script build/android-x86_64/libhello_plugin.so $d/ >/dev/null
 adb push tests $d/ >/dev/null
-adb shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_TEST_PLUGIN_PATH=$d/libhello_plugin.so ./test_script; echo RC=\$?" | tr -d '\r' | tee out.txt
+adb shell "mkdir -p $d/templates" && adb push import/templates/. $d/templates/ >/dev/null   # model templates (tiny model in ask_local_model)
+adb shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_TEMPLATES=$d/templates FORGE_TEST_PLUGIN_PATH=$d/libhello_plugin.so ./test_script; echo RC=\$?" | tr -d '\r' | tee out.txt
 grep -q '^RC=0$' out.txt || fail=1
 exit $fail
