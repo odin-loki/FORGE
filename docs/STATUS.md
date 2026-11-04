@@ -1,10 +1,22 @@
 # FORGE implementation status
 
-## Known gaps / not yet implemented (verified 2026-10-31, see docs/security.md)
-- Script sandboxing is interpreter capability checks only; `script/` does not call `os/sandbox.hpp`.
-- No on-disk `.fsc` bytecode cache (dropped) and no `limit {}` block syntax (only `forge::limit(opts, fn)`).
-- No `os/dynlib.hpp` (dynamic libraries are `os::library` in `os.hpp`).
-- Logger: no async sink, Windows event log sink or CMake strip option.
+## Known gaps / not yet implemented (updated 2026-11-04, see docs/security.md)
+- No on-disk `.fsc` bytecode cache (dropped).
+- Logger: the Windows event log sink has not been compiled or run on Windows yet (no mingw toolchain on the build box).
+- `os/dynlib.hpp`: the Windows and Apple code that reads loaded images has not been compiled or run; PE and Mach-O file parsing is tested on Linux.
+- RPC: tokens always have full access; client-certificate identities are not mapped to permissions.
+- GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open, and graphs recorded before an eviction must not be replayed after it.
+
+## Finished 2026-11-04
+- **Modules renamed** to plain names: lane→simd, grid→gpu, flow→graph, pack→modelfile, mind→inference, balance→loadbalancer, spec→ops (`FORGE_LANE_TARGET` still works as an alias of `FORGE_SIMD_TARGET`).
+- **Logger**: `add_async_sink` (bounded queue, drops counted, never blocks), `add_eventlog_sink` (Windows), `FORGE_LOG_MIN_LEVEL` CMake option. Tests: `test_log`, `log_min_level_cmake`.
+- **Script limits**: `limit {...} { body }` blocks, size/duration strings (`"2G"`, `"200ms"`), and `allocs`, `handles`, `procs` limits. Escape tests for the capability checks (`tests/script/sandbox_escape.fs`, `capability_escape_engine_level`); they found and closed three gaps (`std::getenv` ignored `env`; pre-opened files and processes were usable inside a narrower sandbox).
+- **RPC security**: mTLS (`--tls-client-ca`), token/key auth bound to the TLS connection (RFC 9266 tls-exporter; unbound methods refused over TLS), per-key `allow=device,scripts` permissions in authorized_keys. Tests: `test_rpc`, `test_rpc_tls`. Clients built before this change cannot authenticate to a TLS server.
+- **Remote functions and local AI**: `forge::remote_call(node, fn, args)` ships a function plus its captured plain values; `forge::ask`/`ask_json` run in-process with `--ask-model`/`FORGE_ASK_MODEL` (`ask_json` grammar-constrained), HTTP otherwise.
+- **Shell emitters**: ysh, rc and es all have emitters; golden text tests run everywhere, and real Oils 0.29.0, rc and es built from source passed all three emit goldens.
+- **GPU memory**: CUDA, HIP, OpenCL, Level Zero and Vulkan allocations are charged to per-device pools with LRU eviction of resident tensors before the budget or the driver runs out (mock-driver tests `test_gpu_memory_*_mock`, Vulkan on lavapipe).
+- **Prefix KV spill**: evicted prefix-cache KV goes to the spill store and is reloaded on a hit (`batch_options::spill`, `forge-serve --kv-spill`), bit-identical logits.
+- **`os/dynlib.hpp`**: search paths, typed `get<>`, `path()`, ELF/PE/Mach-O symbol listing with bounds-checked parsers.
 
 ## forge::os::mobile (2026-10-31)
 - **ForgeScript (written, compile-checked, not yet tested):** `.fsc` cache (BLAKE3 key, optional Ed25519 signature, `--cache-dir`); `rpc-serve` runs remote scripts in sandboxed child processes; `sandbox({..., isolate: true})` runs a block in a forked child under a narrower OS sandbox; Windows `run_sandboxed` uses AppContainer + job object (llvm-mingw cross-compile only); Android builds add `-fexperimental-library`.
@@ -21,7 +33,7 @@
 - **Cross (`ctest -L cross`)**: 39/39 pass after a fix. zig 0.17 `-fsyntax-only` fails with "failed to rename tmp/...o", so `xos_emit_*` now compiles each file with `-c` (`cmake/xos_compile_each.cmake`, ee0100c). macOS (aarch64/x86_64) is cross-compiled and linked only. iOS (`mobile_ios`) is skipped because there is no Xcode SDK.
 - **Emitters**: `emit_golden_all_shells` now also runs **ksh, osh, hush** and cmd (wine) on the box. They pass, along with the 14 shells below.
 - **rc/es emitters added**: `script/src/shells/rc.cpp`. There are no arithmetic builtins, so integers go through `expr`. Function locals are wrapped in a dynamic-scope block (rc `a=() {..}`, es `local (a=) {..}`), which keeps recursion safe. es has no `continue`, so it is emulated with `catch`. Both pass all three emit goldens and `shell_backends_golden`.
-- **Shells built from source** into `/workspace/opt/shells/bin` (user-local; GNU make 4.4.1 was bootstrapped into `~/local/tools`): rc (rakitzis/rc HEAD), es 0.10.0, mksh R59 (2025/12/23) and oksh (ibara HEAD). mksh and oksh pass the emit goldens with the existing POSIX emitter. Still untested: posh (not built) and ysh (not an emit target).
+- **Shells built from source** into `/workspace/opt/shells/bin` (user-local; GNU make 4.4.1 was bootstrapped into `~/local/tools`): rc (rakitzis/rc HEAD), es 0.10.0, mksh R59 (2025/12/23) and oksh (ibara HEAD). mksh and oksh pass the emit goldens with the existing POSIX emitter. Still untested: posh (not built). ysh now has an emitter (2026-11-04).
 - **Android**: not re-run this round. A second TCG AVD needs about 2 GB RAM and 2 GB disk. The box had about 3.4 GB RAM and 3 GB disk free, with another agent's emulator (fuse34) running, so the earlier emulator pass below still stands.
 
 ## Latest check (2026-10-30, scripting milestones 6-7 + shell backends)
@@ -33,12 +45,8 @@ Built with conda clang 18 (`/workspace/opt/llvm18`) and a user-local OpenSSL (`/
 - **Translator (`forge script --emit`)**: one C++-subset script becomes a standalone script for 21 backends. The `emit_golden_all_shells` test matches the interpreter's output and exit code on sh, bash, zsh, dash, ash, yash, fish, tcsh, pwsh, xonsh, elvish and nu, and on csh and powershell through tcsh and pwsh. **Untested emitters**: ksh, mksh/android, oksh, posh, hush, osh, cmd and PowerShell 5.1. iOS is interpreter-only. Added `forge::shell` and `forge::host_shell`. ctest now sets `FORGE_TEST_SHELL_PATH` automatically. The emitter has zig cross syntax checks (`ctest -L cross`), but they were not run because zig is absent.
 
 ### Deferred
-- Emitters for ysh, rc and es; cmd emit golden runs (wine segfaults on this box)
-- TLS channel binding and client certificates (mTLS)
-- Per-key permissions in authorized_keys
-- Shipping lambdas to remote nodes
-- In-process inference for `forge::ask` (it currently goes through HTTP)
-- Golden tests for the untested shells (needs ksh/mksh/oils builds, Windows or wine)
+- cmd emit golden runs (wine segfaults on this box)
+- Golden tests for posh (not built), Windows PowerShell 5.1 and real Windows cmd
 
 ## Latest check (2026-10-30, documentation rewrite)
 x86_64 Linux box, no GPU, built with zig 0.17 (`zig cc`/`zig c++`) as the compiler: `ctest -LE "slow|emu"` gave 71/73 after installing `numpy safetensors cryptography onnx` in the Python environment. The 2 failures were `test_gpu_cuda_mock` and `test_gpu_features_cuda_mock`, which need `clang` to embed the PTX image; without it they exit 77 but are not marked as skip tests. All `doc_example_*` tests passed. Vulkan was compiled out (no glslang on that machine). Cross builds and qemu runs below were not repeated; treat them as historical.

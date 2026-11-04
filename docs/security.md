@@ -9,9 +9,12 @@ What FORGE enforces today, where, and what is only planned. Every statement belo
 - Built-ins that touch files, network, processes, devices or reflection check the flag first and raise
   `PermissionError` (helpers `need()` in `builtins.cpp`, `need_dev()` in `mobile.cpp`, `need_reflect()` in
   `reflect.cpp`; also `runtime.cpp` for processes and `import`, `ai.cpp`, `remote.cpp`, `text.cpp`,
-  `automation.cpp`). About 59 such checks in `script/src`.
-- **Limit:** these are checks inside the interpreter. They are not an OS boundary: a bug in the
-  interpreter or in a native built-in could bypass them. Nothing in `script/` calls `os/sandbox.hpp`.
+  `automation.cpp`). About 63 such checks in `script/src`, including `std::getenv` (gated by `env`) and
+  reads, writes and kills on files and processes that were opened before a narrower sandbox started.
+- These are checks inside the interpreter; a bug in the interpreter or a native built-in could bypass
+  them. When fs, net or proc is turned off, the engine also applies the OS sandbox below
+  (`script/src/engine.cpp`, `builtins.cpp`). Escape tests: `tests/script/sandbox_escape.fs` (39 indirect
+  routes) and `capability_escape_engine_level` in `tests/test_script.cpp`.
 
 ## OS sandbox (`os/include/forge/os/sandbox.hpp`)
 `sandbox_policy { deny_network, deny_exec, deny_fs_write }`, `apply_sandbox`, `run_sandboxed`, `sandbox_status`.
@@ -25,7 +28,7 @@ What FORGE enforces today, where, and what is only planned. Every statement belo
 Tested on Linux in `tests/test_os_ext.cpp`; other platforms are compile-checked only.
 
 ## Plugins
-Native plugins (`os::library`) are refused unless fs, net, proc and env are all enabled
+Native plugins (`os::library` / `os::dynlib`) are refused unless fs, net, proc and env are all enabled
 (`builtins.cpp`, "native plugins are refused in sandboxed runs").
 
 ## AI-drafted code
@@ -36,6 +39,11 @@ capability flags and child limits still apply.
 
 ## RPC
 Token and Ed25519 key auth, optional TLS (`graph/include/forge/graph/rpc_secure.hpp`, docs/rpc.md).
+Optional mTLS (`--tls-client-ca`). Over TLS, token and key auth are bound to the connection (RFC 9266
+tls-exporter) and the unbound methods are refused, so a relayed auth exchange fails. authorized_keys lines
+can carry `allow=device,scripts` permissions, enforced per request in `rpc.hpp`; lines without options keep
+full access. `forge::remote_call` produces an ordinary remote script, so the same auth, child process,
+sandbox and limits apply; the caller refuses to send anything but plain data.
 Remote scripts (`rpc-serve --allow-scripts`) are refused at server construction without auth
 (`graph/include/forge/graph/rpc.hpp`). Remote scripts run one at a time with a timeout (`--script-timeout`,
 default 60000 ms) and optional `--script-no-proc/-fs/-net` (`apps/forge.cpp`). Without auth on a non-loopback
@@ -52,25 +60,12 @@ See docs/scripting.md (Errors): `Interp::from_cpp` maps C++ exceptions to script
 catches all of them, so an embedder never sees a C++ exception from `run`/`eval`.
 
 ## Known gaps / not yet implemented
-- On `main`, scripts are not OS-sandboxed. On `forge-script-os-sandbox` the engine applies the OS sandbox (row
-  below); OS denials map to `SandboxViolationError` only when the active policy denies that kind of operation.
-- `limit {}` block syntax (only `forge::limit(opts, fn)` exists), no allocation/handle/child-count limits.
-- No escape tests for the capability checks (the parser is fuzzed by `fuzz/fuzz_script.cpp`).
-- RPC: no mTLS or per-key permissions (docs/STATUS.md, Deferred).
-
-## Pending features (not on `main` yet)
-
-Everything above describes `main`. The following work is on feature branches and is **not merged**; do not rely on it from `main`.
-
-| Feature | Branch | What it adds | State |
-|---|---|---|---|
-| ForgeScript OS sandbox on by default | `forge-script-os-sandbox` | When any of fs/net/proc is disallowed, the engine also applies `os::apply_sandbox` (deny network, deny starting processes, deny file writes); mode `off`/default/`require`, where `require` fails the run if the sandbox cannot be applied; exceptions: Python-style `OSError` hierarchy (`PermissionError`, `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError` and the file/connection errors are all `OSError` subclasses) and `SandboxViolationError` (a `PermissionError`); `ProcessPool` workers run in sandboxed processes; test `tests/test_script_os_sandbox.cpp` | Compiles on Linux; non-Linux paths untested |
-| Typed OS exceptions | `forge-script-os-sandbox` | `os/include/forge/os/oserror.hpp`: errno / Win32 / Capsicum errors, sandbox violations and fault signals become typed, catchable ForgeScript exceptions; test `tests/test_script_oserror.cpp` | Compiles on Linux; non-Linux paths untested |
-| Generic Ed25519 bundle signing | `forge-bundle-sign` | `modelfile/include/forge/modelfile/bundle.hpp`: detached `sign_bytes`/`verify_bytes` and signed bundles (`FORGE-SIGNATURE.json`); test `tests/test_bundle_sign.cpp` | Compile-checked only, tests not run |
-| Qwen 3.5 models | `qwen35` (PR #13) | Gated DeltaNet + gated full attention (`graph/state_ops.hpp`, `import/templates/qwen3_5.fbp`) | Open PR |
-| Building FORGE as a subproject | local fix, not pushed | Lets FORGE build inside another project's CMake build | Not on remote |
-
-Known gaps still open on those branches: nested `sandbox{}` blocks are interpreter-checked only; on Windows only process creation is blocked.
+- RPC: tokens always have full access; client-certificate identities are not mapped to permissions.
+- Nested `sandbox{}` blocks are interpreter-checked only; on Windows the OS sandbox only blocks process creation.
+- `--kv-spill` writes KV-cache contents (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
+  (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
+  destroyed). Put it on a private directory if prompts are sensitive.
+- Static capability checks don't see indirect calls (runtime checks and the escape tests cover them).
 
 ## Static capability checks
 
