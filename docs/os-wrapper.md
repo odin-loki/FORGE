@@ -22,8 +22,8 @@ The scripting layer uses these headers for `run`, `proc`, `fs`, `os`, `time`, `n
 | `console.hpp` | `forge::os::console` | `is_tty`, `size`, `enable_vt`, `color_enabled`, `paint`, `mode_guard` (raw or no-echo), `read_password`, `confirm` |
 | `net.hpp` | `forge::os::net` | `resolve`, `interfaces`, `port_open`, `parse_url`, `http(request)`, `http_get` |
 | `file_watch_tree.hpp` | `forge::os` | `tree_watcher::open(root, tree_watch_opts)`, `poll(ms)` |
-| `service_control.hpp` | `forge::os::service` | `service_spec`, `render_systemd_unit`, `render_launchd_plist`, `install`, `start`, `stop`, `query`, `uninstall` |
-| `registry.hpp` | `forge::os::registry` | `get`, `set` (string or 64-bit integer), `remove_value`, `remove_key`, `list` |
+| `service_control.hpp` | `forge::os::service` | `service_spec`, `validate`, `render_systemd_unit`, `render_launchd_plist`, `parse_launchctl_print`, `install`, `start`, `stop`, `query`, `uninstall` |
+| `registry.hpp` | `forge::os::registry` | `get`, `set`, `set_as`, `value_type` (string, integer, string list, bytes; optional WOW64 `view`), `remove_value`, `remove_key`, `list` |
 | `devices.hpp` | `forge::os::devices` | `block()`, `pci()`, `usb()` |
 | `clipboard.hpp` | `forge::os::clipboard` | `available`, `get`, `set` |
 | `dynlib.hpp` | `forge::os` | `dynlib::open`, `get<F>`, `require<F>`, `path()`, `symbols()`, `file_symbols(path)`, `file_format(path)` |
@@ -93,7 +93,7 @@ How it works per platform:
 | `write_file_atomic(path, data, mode)` | temp file, fsync, rename, then fsync of the directory (POSIX) |
 
 ## Users, time, system, console
-- **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) everywhere but iOS. Windows has no numeric ids: `uid` is the last sub-authority (RID) of the account SID and `gid` that of its primary group; `user_info::sid` holds the SID string, the home directory comes from the profile list and full name / groups from netapi32 (loaded at run time). `current_user()` reports the process token's primary group, which can differ from the account's. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows XDG on Linux and FreeBSD, `~/Library` on Apple, Known Folders on Windows.
+- **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) everywhere but iOS. Windows has no numeric ids: `uid` is the last sub-authority (RID) of the account SID and `gid` that of its primary group; `user_info::sid` holds the SID string, the home directory comes from the profile list and full name / groups from netapi32 (loaded at run time). `current_user()` reports the process token's primary group, which can differ from the account's. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows the XDG base directories on Linux and FreeBSD (documents / downloads / desktop from `user-dirs.dirs`, then `XDG_*_DIR`), `~/Library` on Apple, and Known Folders through `SHGetKnownFolderPath` on Windows, so OneDrive and Group Policy redirection are followed. On Windows `current_user()` also fills `groups` from the token and `full_name` from netapi32 or the display name.
 - **`time.hpp`.** `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name`, `format_iso8601` / `format_local_iso8601` / `parse_iso8601` (RFC 3339 with offsets and fractions to ns). `timer_queue` runs `after(ms, fn)` and `every(ms, fn)` callbacks on one worker thread; `cancel(id)`. `stopwatch` and `deadline` are described in [support.md](support.md).
 - **`sysinfo.hpp`.**
 
@@ -126,14 +126,14 @@ A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_
 | Platform | Backend |
 |---|---|
 | Linux, FreeBSD with systemd | user unit in `$XDG_CONFIG_HOME/systemd/user`, driven by `systemctl --user` |
-| macOS | LaunchAgent plist in `~/Library/LaunchAgents`, driven by `launchctl` |
+| macOS | LaunchAgent plist in `~/Library/LaunchAgents`, driven by `launchctl bootstrap` / `kickstart` / `bootout` in `gui/<uid>`; `query` parses `launchctl print` |
 | Windows | Service Control Manager service through `sc.exe` (needs an elevated process) |
 | Android, iOS | unsupported |
 
-`render_systemd_unit` and `render_launchd_plist` return the file text without touching the system. `query` returns `not_installed`, `stopped`, `running`, `failed` or `unknown`. Setting `spec.dir` writes the unit elsewhere without registering it (the tests use this).
+`render_systemd_unit` and `render_launchd_plist` return the file text without touching the system. `install` calls `validate`, which rejects control characters (a newline would inject unit directives), `=` in environment names and a systemd prefix character on `argv[0]`. Unit text is escaped per systemd.syntax: `ExecStart=` doubles `%` and `$`, C-escapes quotes and backslashes and writes a lone `;` as `\;`; `Environment=` doubles `%` only; `Description=` and `WorkingDirectory=` are verbatim. `query` returns `not_installed`, `stopped`, `running`, `failed` or `unknown`; on macOS a loaded but not running agent is `stopped` and one whose last exit was non-zero is `failed`. Setting `spec.dir` writes the unit elsewhere without registering it (the tests use this).
 
 ## Registry, devices, clipboard
-- **`registry.hpp`.** Windows only: `get` / `set` string and 64-bit integer values (`REG_SZ`, `REG_DWORD`, `REG_QWORD`), `remove_value`, `remove_key`, `list`. Every call is unsupported elsewhere.
+- **`registry.hpp`.** Windows only. `value` is a string (`REG_SZ`, `REG_EXPAND_SZ` read unexpanded), a 64-bit integer (`REG_DWORD`, `REG_QWORD`), a string list (`REG_MULTI_SZ`) or bytes (`REG_BINARY` and other raw types). `set` keeps the existing type where it can (expandable strings stay `REG_EXPAND_SZ`, a `REG_DWORD` stays one while the number fits); `set_as` writes an explicit `type`, `value_type` reports it. Every call takes an optional `view` (`native`, `wow64_64`, `wow64_32`) for the WOW64 registry views. `remove_value`, `remove_key`, `list`. Every call is unsupported elsewhere.
 - **`devices.hpp`.** Read-only enumeration: `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver), `usb()` (vendor/product ids, strings, bus/devnum). Linux and Android read sysfs. Windows lists `PhysicalDriveN` disks with drive letters as partitions (storage IOCTLs, no admin needed) and PCI/USB through SetupAPI loaded at run time; USB `bus` / `devnum` are the hub number and hub port (Windows has no USB address). FreeBSD uses the GEOM sysctls, `/dev/pci` (`PCIOCGETCONF`) and the newbus device tree. macOS uses IOKit loaded at run time. Unsupported on iOS.
 - **`clipboard.hpp`.** Text get/set: Win32 clipboard on Windows, `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux and FreeBSD. Unsupported without a display or helper, and on mobile.
 

@@ -103,9 +103,20 @@ on Linux, macOS and FreeBSD CI; it skips on Windows CI because its `openssl` CLI
 
 ## Secrets at rest (`os/include/forge/os/keystore.hpp`)
 
-Keychain on Apple, DPAPI on Windows, libsecret on Linux when a session keyring exists, an app-installed backend on
-Android. The fallback is one 0600 file per secret in a 0700 directory, **not encrypted** beyond a per-store XOR
-pad; it only protects against other users. `keystore::backend()` reports which one is in use.
+Keychain on Apple (items `AfterFirstUnlockThisDeviceOnly`, updated in place), DPAPI on Windows, libsecret on Linux
+and FreeBSD when the session bus has a Secret Service provider, an app-installed backend on Android. libsecret
+failures (locked keyring, refused prompt) are returned as errors; the file backend is used only when there is no
+bus or provider, or with `FORGE_KEYSTORE=file`, and `keystore::backend()` reports which one is in use. Android has
+no default directory: the JNI glue sets `FORGE_KEYSTORE_DIR` or installs a backend.
+
+The file backend seals each secret with XChaCha20-Poly1305 (Monocypher) under a random 32-byte store key, with a
+random nonce and the (service, account) pair as associated data, so a modified, truncated or swapped file fails
+`get()` instead of returning garbage. Files are created 0600 from the start (`O_EXCL`, no symlink following) and
+replaced atomically; the store key file `.master` is created exclusively, so concurrent processes agree on one key,
+and is DPAPI-wrapped on Windows. A directory FORGE creates is 0700; an existing `FORGE_KEYSTORE_DIR` keeps its mode.
+The key sits beside the secrets, so this protects against other users and against copies of single files, not
+against code running as the same user. TPM or passphrase key wrapping is planned (os-audit W2-4). Old XOR-pad
+files are re-encrypted on first read and the pad is deleted once none remain.
 
 ## Exceptions
 
@@ -121,7 +132,7 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 - `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
 - Nested non-isolated `sandbox` blocks are interpreter-checked only.
 - Static capability checks miss indirect calls.
-- Keystore file fallback is not encrypted.
+- Keystore file backend: the store key is not wrapped (TPM / passphrase planned), so same-user code can read it.
 - `.fsc` script cache has no tests.
 - `forge-serve --kv-spill` writes KV-cache data (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
   (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
