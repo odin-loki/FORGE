@@ -890,12 +890,13 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_moe_mla
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_moe)
+    # Python with torch/transformers/gguf (verify/golden/requirements.txt) for the golden tests below.
+    set(FORGE_GOLDEN_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python with torch/transformers/gguf for golden tests")
     add_test(NAME golden_quant_inplace
-      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/quant_inplace.py
+      COMMAND ${FORGE_GOLDEN_PYTHON} ${PROJECT_SOURCE_DIR}/verify/golden/quant_inplace.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_quant_inplace)
     # Qwen3.5 (Gated DeltaNet) against transformers; skips without torch + transformers >= 5. Set
     # FORGE_GOLDEN_PYTHON to an interpreter that has them (e.g. a venv) to run it.
-    set(FORGE_GOLDEN_PYTHON "${Python3_EXECUTABLE}" CACHE FILEPATH "Python with torch/transformers for golden_tiny_qwen3_5")
     add_test(NAME golden_tiny_qwen3_5
       COMMAND ${FORGE_GOLDEN_PYTHON} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_qwen3_5.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_tiny_qwen3_5)
