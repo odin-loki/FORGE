@@ -149,7 +149,7 @@ static int mock_qmma(const signed char* xq, const float* xds, const unsigned cha
     for (i = 0; i < rows * k; ++i) a[i] = xds[2u * (i / 32u)] * (float)xq[i];
     mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
-    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma_", 12)) return 9;
+    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 9;
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
@@ -250,8 +250,9 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         mock_q81(y, (unsigned char*)(uintptr_t)ARG(4, dptr), n / 32u); return 0; }
     if (!strcmp(op, "quant_q8r")) { unsigned nb = ARG(3, unsigned); if (gx * 8u < nb) return 1;
         mock_q8r(P(ARG(0, dptr)), (signed char*)(uintptr_t)ARG(1, dptr), P(ARG(2, dptr)), nb); return 0; }
-    if (!strncmp(op, "qmatmul_mma_", 12)) {   /* qmatmul_mma_q8_0 / _q4_k / _q6_k */ unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned);
-        if (gx < ((cols + 127) / 128) * ((rows + 63) / 64) || bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u || fmt == 6u)) return 1;   /* 64x64 tiles, 128 threads */
+    if (!strncmp(op, "qmatmul_mma", 11)) {   /* qmatmul_mma_* (64 tokens per block) / qmatmul_mma128_* (128) */
+        unsigned bt = op[11] == '1' ? 128u : 64u; unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned);
+        if (gx < ((cols + 127) / 128) * ((rows + bt - 1) / bt) || bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u || fmt == 6u)) return 1;   /* 64x64 tiles, 128 threads */
         return mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), P(ARG(3, dptr)), rows, cols, k, fmt, rb); }
     if (!strcmp(op, "quant_q81")) { mock_q81(P(ARG(0, dptr)), (unsigned char*)(uintptr_t)ARG(1, dptr), ARG(2, unsigned)); return 0; }
     if (!strcmp(op, "qmatmul_q81")) { const unsigned char* xq = (const unsigned char*)(uintptr_t)ARG(0, dptr); float* y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);

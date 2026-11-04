@@ -212,7 +212,16 @@ public:
     plan() = default;
     plan(const plan&) = delete;
     plan& operator=(const plan&) = delete;
-    ~plan() { if (arena_resident && hooks_ref && hooks_ref->forget) try { hooks_ref->forget(arena.data(), arena.size()); } catch (...) {} }
+    ~plan() {
+        if (!hooks_ref || !hooks_ref->forget) return;
+        try {
+            if (arena_resident) hooks_ref->forget(arena.data(), arena.size());
+            // constants pinned by run() live in this plan's graph: drop their device copies (and pin records) before
+            // the host memory goes, or a later buffer at the same address would find a stale resident entry
+            if (pinned) for (std::size_t i = 0; i < g.size() && i < views.size(); ++i)
+                if (g.nodes()[i].kind == node_kind::constant && views[i].data) hooks_ref->forget(views[i].data, views[i].size());
+        } catch (...) {}
+    }
     bool pinned = false;
     bool deterministic = true;        // CPU kernels use fixed reduction orders
     std::string describe() const {

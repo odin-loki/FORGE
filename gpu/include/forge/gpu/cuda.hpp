@@ -281,6 +281,7 @@ public:
         std::vector<std::uintptr_t> ks;
         each_overlap(p, n, [&](entry& e) { ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        std::erase_if(pinned_, [&](const auto& r) { return r.first >= p && r.first + r.second <= p + n; });   // the range is going away
     }
     bool resident() { std::lock_guard lk(mu_); return in_run_; }
     void pin(const float* p, std::size_t n) { std::lock_guard lk(mu_); pinned_.push_back({p, n}); }
@@ -446,7 +447,10 @@ public:
     static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on; }
     std::uint64_t att_ = 0; std::size_t att_cap_ = 0;
     std::set<void*> mma_attr_;   // kernels (qmatmul_mma_*, attention_fa2_*) whose dynamic shared memory limit was raised
-    static const char* mma_fn(std::uint32_t fmt) { return fmt == 1 ? "forge_qmatmul_mma_q8_0" : fmt == 6 ? "forge_qmatmul_mma_q8_0g" : fmt == 2 ? "forge_qmatmul_mma_q4_k" : "forge_qmatmul_mma_q6_k"; }
+    static std::string mma_fn(std::uint32_t fmt, unsigned bt = 64) {
+        return std::string(bt == 128 ? "forge_qmatmul_mma128_" : "forge_qmatmul_mma_") + (fmt == 1 ? "q8_0" : fmt == 6 ? "q8_0g" : fmt == 2 ? "q4_k" : "q6_k"); }
+    static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
+        static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
     std::uint64_t q8r_ = 0; std::size_t q8r_cap_ = 0;   // int8 activation rows + per-group (d, d*sum) for the mma path
     void q8r_reserve(std::size_t need) {
         if (q8r_cap_ >= need) return;
@@ -531,11 +535,15 @@ public:
                 void* qa[] = {&xd, &xq, &xds, &nb};
                 ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                 void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-                // 128 weight rows x 64 tokens per 256-thread block; dynamic shared memory sized per format
-                const unsigned smem = fmt == 2 ? 48128u : fmt == 5 ? 60416u : 64512u;   // q8_0 (1, 6): 64512
-                void* mf = function(mma_fn(fmt));
-                if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, 64512), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
-                unsigned grid = ((rows + 63) / 64) * ((cols + 127) / 128);
+                // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
+                // q4_k keeps 64 tokens (47 KB of shared memory: two blocks per SM); q6_k / q8_0 use one block per SM anyway,
+                // so 128 tokens give each warp twice the work per weight fragment ($FORGE_MMA_BT=64|128 forces one)
+                const unsigned want = mma_bt() ? mma_bt() : fmt == 2 ? 64u : 128u;
+                const unsigned bt = rows >= 128 && want == 128 && has_fn_locked(mma_fn(fmt, 128)) ? 128u : 64u;
+                const unsigned smem = bt * 336 + 8192 + (fmt == 2 ? 144u : fmt == 5 ? 240u : 272u) * 128;
+                void* mf = function(mma_fn(fmt, bt));
+                if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
+                unsigned grid = ((rows + bt - 1) / bt) * ((cols + 127) / 128);
                 if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
             } else if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
                 ++dispatches_["qmatmul_mmq"];

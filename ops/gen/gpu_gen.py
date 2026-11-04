@@ -595,27 +595,28 @@ FORGE_DEV unsigned smem_addr(const void* p) { unsigned long long a; asm("cvta.to
 FORGE_DEV void cpa16(void* d, const void* s, unsigned n) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(smem_addr(d)), "l"(s), "r"(n) : "memory"); }
 FORGE_DEV void cpa8(void* d, const void* s, unsigned n) { asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(smem_addr(d)), "l"(s), "r"(n) : "memory"); }
 FORGE_DEV void cpa_wait() { asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;" ::: "memory"); }
+// BT tokens per block (64 or 128; warp tile 16 weight rows x BT). Shared: Xq BT x 272 | Xs 8 x BT x 2 floats | Wm 8 KB | Wr.
 static __attribute__((device, always_inline)) inline void mma_body(const signed char* xq, const float* xds, const unsigned char* w, float* y,
-                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb) {
-  unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + 17408u); float* Wm = (float*)(forge_dsm + 21504u);
-  unsigned char* Wr = forge_dsm + 29696u;
+                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT) {
+  unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + BT * 272u); float* Wm = (float*)(forge_dsm + BT * 336u);
+  unsigned char* Wr = forge_dsm + BT * 336u + 8192u;
   unsigned t = tid_(), wp = t >> 5, l = t & 31u, gid = l >> 2, tig = l & 3u;
-  unsigned ntb = (rows + 63u) / 64u, bi = bid_(), t0 = (bi % ntb) * 64u, c0 = (bi / ntb) * 128u, nbk = k / 32u;
+  unsigned ntb = (rows + BT - 1u) / BT, bi = bid_(), t0 = (bi % ntb) * BT, c0 = (bi / ntb) * 128u, nbk = k / 32u;
   unsigned wsb = mma_wstride(fmt), bsz = fmt == 2u ? 144u : fmt == 5u ? 224u : 272u, nch = bsz / 16u;
-  float acc[8][4];
+  float acc[16][4];
 #pragma unroll
-  for (unsigned n = 0; n < 8u; ++n)
+  for (unsigned n = 0; n < BT / 8u; ++n)
 #pragma unroll
     for (unsigned e = 0; e < 4u; ++e) acc[n][e] = 0.0f;
   for (unsigned kb = 0; kb < k; kb += 256u) {
     // stage chunk kb: activations, their scales and the raw weight blocks go global -> shared with cp.async (two
     // resident blocks per SM overlap one block's loads with the other's mmas)
 #pragma unroll
-    for (unsigned j = 0; j < 4u; ++j) { unsigned i = t + 256u * j, r = i >> 4, ch = i & 15u; bool ok = t0 + r < rows;
+    for (unsigned j = 0; j < BT / 16u; ++j) { unsigned i = t + 256u * j, r = i >> 4, ch = i & 15u; bool ok = t0 + r < rows;
       cpa16(Xq + r * 68u + ch * 4u, ok ? (const void*)(xq + (unsigned long long)(t0 + r) * k + kb + ch * 16u) : (const void*)xq, ok ? 16u : 0u); }
 #pragma unroll
-    for (unsigned j = 0; j < 2u; ++j) { unsigned i = t + 256u * j, r = i >> 3, g = i & 7u; bool ok = t0 + r < rows;
-      cpa8(Xs + (g * 64u + r) * 2u, ok ? (const void*)(xds + 2ull * ((unsigned long long)(t0 + r) * nbk + (kb >> 5) + g)) : (const void*)xds, ok ? 8u : 0u); }
+    for (unsigned j = 0; j < BT / 32u; ++j) { unsigned i = t + 256u * j, r = i >> 3, g = i & 7u; bool ok = t0 + r < rows;
+      cpa8(Xs + (g * BT + r) * 2u, ok ? (const void*)(xds + 2ull * ((unsigned long long)(t0 + r) * nbk + (kb >> 5) + g)) : (const void*)xds, ok ? 8u : 0u); }
     unsigned c = t >> 1, h = t & 1u, gc = c0 + c;
     if (fmt != 1u) {
 #pragma unroll
@@ -662,10 +663,10 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
         sa0 = Wm[ra * 16u + g]; sb0 = Wm[rb8 * 16u + g]; sa1 = 0.0f; sb1 = 0.0f;
       }
 #pragma unroll
-      for (unsigned n = 0; n < 8u; ++n) {
+      for (unsigned n = 0; n < BT / 8u; ++n) {
         const unsigned* xr = Xq + (n * 8u + gid) * 68u + g * 8u + tig;
         unsigned b0 = xr[0], b1 = xr[4];
-        const float* xs = Xs + (g * 64u + n * 8u + tig * 2u) * 2u;   // (d, d*sum) of tokens 2tig, 2tig+1 of this tile
+        const float* xs = Xs + (g * BT + n * 8u + tig * 2u) * 2u;   // (d, d*sum) of tokens 2tig, 2tig+1 of this tile
         float xd0 = xs[0], xm0 = xs[1], xd1 = xs[2], xm1 = xs[3];
         if (fmt == 5u) {
           int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
@@ -683,17 +684,22 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
     bar_(); }
   const unsigned ra = wp * 16u + gid;
 #pragma unroll
-  for (unsigned n = 0; n < 8u; ++n)
+  for (unsigned n = 0; n < BT / 8u; ++n)
 #pragma unroll
     for (unsigned e = 0; e < 4u; ++e) {
       unsigned col = c0 + ra + 8u * (e >> 1), tok = t0 + n * 8u + tig * 2u + (e & 1u);
       if (tok < rows && col < cols) y[(unsigned long long)tok * cols + col] = acc[n][e]; } }
 // One kernel per format, so the format checks fold away at compile time.
-#define FORGE_MMA_KERNEL(name, f) FORGE_GLOBAL __attribute__((launch_bounds(256, 2))) void name(const signed char* xq, const float* xds, const unsigned char* w, float* y,     unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb); }
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u)
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0g, 6u)
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u)
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q6_k, 5u)
+#define FORGE_MMA_KERNEL(name, f, bt, nb) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
+    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt); }
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u, 64u, 2)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0g, 6u, 64u, 2)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u, 64u, 2)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q6_k, 5u, 64u, 2)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q8_0, 1u, 128u, 1)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q8_0g, 6u, 128u, 1)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q4_k, 2u, 128u, 1)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q6_k, 5u, 128u, 1)
 #undef FORGE_MMA_KERNEL
 // Prefill attention, tiled (flash-attention style, fp32 SIMT): same contract as forge_attention for plain f32 K/V.
 // A 256-thread block takes BQ query rows of one head; key/value tiles of BK rows go through shared memory and are
