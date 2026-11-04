@@ -113,6 +113,35 @@ static int pipeline_cache() {
     return 0;
 }
 
+// Device memory pool "vulkan:0" (gpu/device_memory.hpp): allocations are charged, and a resident weight not used by
+// the op in progress is evicted (least recently used first) when the next allocation would cross the limit.
+static int device_memory() {
+    auto rt = gpu::vk::runtime::open(); if (!rt) return 1;
+    auto* pool = rt->memory_pool();
+    if (!pool || pool->name() != "vulkan:0") { std::puts("FAIL vulkan runtime charges no pool vulkan:0"); return 1; }
+    pool->set_limit(0);
+    pool->evict(0);   // runtimes from the earlier checks share the pool: empty their resident buffers first
+    const std::size_t N = 1000; auto base = pool->used();
+    std::vector<float> w0(N), w1(N), w2(N), y(N), z(N);
+    for (std::size_t i = 0; i < N; ++i) { w0[i] = float(i % 13) - 6; w1[i] = float(i % 7); w2[i] = float(i % 5) - 2; }
+    for (auto* w : {&w0, &w1, &w2}) rt->pin(w->data(), N);
+    rt->begin_run(); rt->run_resident("add", {{w0.data(), N}, {w1.data(), N}, {y.data(), N}}, {.n = std::uint32_t(N)}, std::uint32_t(N)); rt->end_run();
+    auto two = pool->used() - base, one = two / 2;   // the two pinned weights stay charged
+    bool ok = two >= 2 * N * 4 && rt->charged_bytes() == two;
+    for (std::size_t i = 0; i < N; ++i) ok &= y[i] == w0[i] + w1[i];
+    pool->set_limit(base + 3 * one);   // mul(w2, w0) needs a 4th buffer: w1 must go
+    rt->begin_run(); rt->run_resident("mul", {{w2.data(), N}, {w0.data(), N}, {z.data(), N}}, {.n = std::uint32_t(N)}, std::uint32_t(N)); rt->end_run();
+    for (std::size_t i = 0; i < N; ++i) ok &= z[i] == w2[i] * w0[i];
+    std::size_t ev = rt->residency().evictions;
+    if (!ok) std::puts("FAIL vulkan: wrong results or charges before the eviction step");
+    ok &= ev >= 1 && pool->used() <= base + 3 * one;
+    pool->set_limit(0); rt.reset();
+    ok &= pool->used() == base;
+    std::printf("%s vulkan device memory: %llu bytes per weight, eviction under a 3-buffer budget (%zu evictions, %llu bytes left charged)\n", ok ? "ok  " : "FAIL",
+                static_cast<unsigned long long>(one), ev, static_cast<unsigned long long>(pool->used() - base));
+    return ok ? 0 : 1;
+}
+
 int main() {
     std::string why;
     auto tmp = std::filesystem::temp_directory_path() / ("forge-vkcache-" + std::to_string(::getpid()));
@@ -129,6 +158,7 @@ int main() {
     f += end_to_end();
     rt.reset();
     f += pipeline_cache();
+    f += device_memory();
     std::error_code ec; std::filesystem::remove_all(tmp, ec);
     return f ? 1 : 0;
 }

@@ -13,12 +13,15 @@
 //     on the device keyed by host address, pinned ranges (weights) survive across runs;
 //   * stream capture into a graph and replay (`capture_begin/capture_end/graph_launch`) where the driver
 //     exports the graph API;
-//   * multiple devices (`open(api, ordinal)`, `device_count`) and peer copies between runtimes.
+//   * multiple devices (`open(api, ordinal)`, `device_count`) and peer copies between runtimes;
+//   * device memory accounting (gpu/device_memory.hpp): every allocation is charged to the pool "cuda:N" / "hip:N",
+//     and resident buffers are evicted least recently used first when an allocation would not fit.
 #include <cstdlib>
 #include <forge/gpu/gpu_images.gen.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/ops/ops.gen.hpp>
 #include <forge/core/dl.hpp>
+#include <forge/gpu/device_memory.hpp>
 #include <algorithm>
 #include <atomic>
 #include <set>
@@ -164,7 +167,8 @@ public:
         return r;
     }
     ~runtime() {
-        try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, d] : qres_) if (d) f_.free_(d); qres_.clear();
+        dm_.detach();
+        try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
             for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (att_) f_.free_(att_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
@@ -183,8 +187,13 @@ public:
     std::map<std::string, std::size_t> dispatches() { std::lock_guard lk(mu_); return dispatches_; }
     struct mem_info { std::size_t free = 0, total = 0; };
     mem_info memory() { mem_info m; if (f_.mem_info) { bind(); f_.mem_info(&m.free, &m.total); } return m; }
-    struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0, qweight_bytes = 0; };
-    residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
+    // pooled_bytes: freed buffers kept for reuse; evictions / evicted_bytes: buffers dropped to fit the device budget
+    struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0, qweight_bytes = 0,
+                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0; };
+    residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); s.pooled_bytes = pool_bytes_; return s; }
+    // The device memory pool this runtime charges ("cuda:0", ...) and the bytes it has charged to it.
+    mem::budget* memory_pool() { return dm_.pool(); }
+    std::uint64_t charged_bytes() { std::lock_guard lk(mu_); return dm_.charged(); }
 
     // ---- residency protocol (see graph::device_hooks) ----
     void begin_run() { std::lock_guard lk(mu_); q81_drop(); in_run_ = true; seg_ = 0; dirty_ = false; }
@@ -256,9 +265,9 @@ public:
     // a plan arena held as one device buffer across runs (graph::device_hooks::arena): intermediates are sub-ranges
     // of it, so they keep their device addresses run after run
     void arena(float* h, std::size_t n) {
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         auto key = reinterpret_cast<std::uintptr_t>(h);
-        if (auto it = res_.find(key); it != res_.end() && it->second.count == n && it->second.arena) return;
+        if (auto it = res_.find(key); it != res_.end() && it->second.count == n && it->second.arena) { it->second.last = ++clock_; return; }
         auto b = acquire(h, n, false); b.e->kept = true; b.e->arena = true;
     }
     void forget(const float* p, std::size_t n) {   // drop device copies without fetching them
@@ -302,7 +311,7 @@ public:
     bool run_bcast(int op, const std::vector<tensor_view>& in, tensor_view out) {
         std::uint32_t n = std::uint32_t(out.size()), ma = std::uint32_t(in[0].size()), mb = std::uint32_t(in[1].size()), o = std::uint32_t(op);
         if (!ma || !mb || n % ma || n % mb) return false;
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         if (!has_fn_locked("forge_bcast")) return false;
         if (!in_run_) {   // outside a run the views are host memory
             for (std::uint32_t i = 0; i < n; ++i) { float x = in[0].data[i % ma], z = in[1].data[i % mb];
@@ -321,7 +330,7 @@ public:
     }
     // dst_base[off + r * ds + c] = src[r * w + c] on the device (concat)
     bool copy2d_resident(float* src, std::size_t sn, float* dst_base, std::size_t dst_count, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off) {
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         if (!has_fn_locked("forge_copy2d")) return false;
         if (!rows || !w) return true;
         ++dispatches_["copy2d"];
@@ -336,7 +345,7 @@ public:
         return true;
     }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         if (!n) return;
         auto d = acquire(dst_base, dst_count, false);
         auto s = acquire(src, n, false);
@@ -366,8 +375,8 @@ public:
         { std::lock_guard lk(mu_); bind(); ck(dtoh_s(tmp.data(), src_ptr, bytes, stream_), "memcpy DtoH"); sync(); }
         std::lock_guard lk(dst.mu_); dst.bind(); dst.ck(dst.htod_s(dst_ptr, tmp.data(), bytes, dst.stream_), "memcpy HtoD"); dst.sync();
     }
-    std::uint64_t device_alloc(std::size_t bytes) { std::lock_guard lk(mu_); bind(); std::uint64_t p = 0; ck(f_.malloc_(&p, std::max<std::size_t>(4, bytes)), "malloc"); return p; }
-    void device_free(std::uint64_t p) { std::lock_guard lk(mu_); bind(); f_.free_(p); }
+    std::uint64_t device_alloc(std::size_t bytes) { std::lock_guard lk(mu_); bind(); begin_op(); return dmalloc(bytes, "raw"); }
+    void device_free(std::uint64_t p) { std::lock_guard lk(mu_); bind(); dfree(p); }
     void upload(std::uint64_t d, const void* h, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(htod_s(d, h, bytes, stream_), "memcpy HtoD"); sync(); }
     void download(void* h, std::uint64_t d, std::size_t bytes) { std::lock_guard lk(mu_); bind(); ck(dtoh_s(h, d, bytes, stream_), "memcpy DtoH"); sync(); }
 
@@ -393,17 +402,18 @@ public:
     // Embedding gather over an encoded table (forge_qgather); the table is uploaded once, like run_qmatmul's weights.
     bool run_qgather(const tensor_view& idx, const std::uint8_t* q, std::size_t rb, std::uint32_t nrows, std::uint32_t d, std::uint32_t fmt, tensor_view out) {
         if (!q || fmt < 1 || fmt > 4 || !d || d % 32 || out.size() != idx.size() * d) return false;
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         if (!has_fn_locked("forge_qgather")) return false;
         ++dispatches_["qgather"];
         std::size_t qbytes = rb * nrows;
-        auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
-        if (!qd) {
-            std::uint64_t dp = 0; ck(f_.malloc_(&dp, std::max<std::size_t>(4, qbytes)), "malloc");
-            qd = dp; ck(htod_s(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}]; qe.last = ++clock_;
+        if (!qe.d) {
+            std::uint64_t dp = dmalloc(qbytes, "weights");
+            qe.d = dp; ck(htod_s(qe.d, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
         }
+        const std::uint64_t qd = qe.d;
         std::vector<std::uint64_t> temps;
-        auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
+        auto free_temps = [&] { for (auto p : temps) dfree(p); };
         std::uint32_t n = std::uint32_t(idx.size());
         try {
             std::uint64_t xd = 0, yd = 0;
@@ -411,9 +421,9 @@ public:
                 xd = acquire(idx.data, idx.size(), false).ptr;
                 auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
             } else {
-                ck(f_.malloc_(&xd, std::max<std::size_t>(4, idx.size() * 4)), "malloc"); temps.push_back(xd);
+                xd = dmalloc(idx.size() * 4, "scratch"); temps.push_back(xd);
                 ck(htod_s(xd, idx.data, idx.size() * 4, stream_), "memcpy HtoD");
-                ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
+                yd = dmalloc(out.size() * 4, "scratch"); temps.push_back(yd);
             }
             std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
             void* args[] = {&xd, &wd, &yd, &n, &d, &fmt, &rb32, &nrows};
@@ -440,8 +450,8 @@ public:
     void writes(std::uint64_t p, std::size_t bytes) { if (nwr_ < 3) { wr_[nwr_][0] = p; wr_[nwr_][1] = p + bytes; } ++nwr_; }
     void q81_reserve(std::size_t need) {
         if (q81_cap_ >= need) return;
-        q81_drop(); if (q81_) free_s(q81_); q81_ = 0;
-        ck(f_.malloc_(&q81_, std::max<std::size_t>(need, 1 << 20)), "malloc"); q81_cap_ = std::max<std::size_t>(need, 1 << 20);
+        q81_drop(); if (q81_) free_s(q81_); q81_ = 0; q81_cap_ = 0;
+        q81_ = dmalloc(std::max<std::size_t>(need, 1 << 20), "scratch"); q81_cap_ = std::max<std::size_t>(need, 1 << 20);
     }
     // Decode rms_norm / silu_mul also emit the q8_1 form of their output for the next matmul ($FORGE_FUSE_Q81=0 off).
     static bool fuse_q81() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q81"); return !(e && std::string(e) == "0"); }(); return on; }
@@ -449,26 +459,27 @@ public:
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
         std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
         if (!k || k % 32 || out.size() != std::size_t(rows) * cols) return false;
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         ++dispatches_["qmatmul_t"];
         void* fn = function("forge_qmatmul_t");
         std::size_t qbytes = rb * cols;
-        auto& qd = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}];
-        if (!qd) {
-            std::uint64_t d = 0; ck(f_.malloc_(&d, std::max<std::size_t>(4, qbytes)), "malloc");
-            qd = d; ck(htod_s(qd, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(q), qbytes}]; qe.last = ++clock_;
+        if (!qe.d) {
+            std::uint64_t d = dmalloc(qbytes, "weights");
+            qe.d = d; ck(htod_s(qe.d, q, qbytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += qbytes;
         }
+        const std::uint64_t qd = qe.d;
         std::vector<std::uint64_t> temps;
-        auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
+        auto free_temps = [&] { for (auto p : temps) dfree(p); };
         try {
             std::uint64_t xd = 0, yd = 0;
             if (in_run_) {
                 xd = acquire(x.data, x.size(), false).ptr;
                 auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
             } else {
-                ck(f_.malloc_(&xd, std::max<std::size_t>(4, x.size() * 4)), "malloc"); temps.push_back(xd);
+                xd = dmalloc(x.size() * 4, "scratch"); temps.push_back(xd);
                 ck(htod_s(xd, x.data, x.size() * 4, stream_), "memcpy HtoD");
-                ck(f_.malloc_(&yd, std::max<std::size_t>(4, out.size() * 4)), "malloc"); temps.push_back(yd);
+                yd = dmalloc(out.size() * 4, "scratch"); temps.push_back(yd);
             }
             std::uint64_t wd = qd; std::uint32_t rb32 = std::uint32_t(rb);
             void* args[] = {&xd, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
@@ -505,7 +516,7 @@ public:
     // Gated DeltaNet state ops (graph/state_ops.hpp) on the device. The state slot S is pinned, so it stays resident
     // across runs (tokens) like the weights; inputs/output follow the residency protocol. Only inside a run.
     bool run_state(const std::string& fn, const std::vector<tensor_view>& in, float* S, std::size_t sn, tensor_view out, const ops::attrs& a) {
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         if (!in_run_ || !has_fn_locked("forge_" + fn)) return false;
         std::uint32_t u[6] = {}; std::uint32_t grid = 0; float sc = 0;
         if (fn == "delta_rule" && in.size() == 5) {
@@ -581,15 +592,15 @@ public:
             u7 = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7);
             f0 = float(a.num("scale", 1.0 / std::sqrt(double(k)))); threads = rows * cols; break; }
         }
-        std::lock_guard lk(mu_); bind();
+        std::lock_guard lk(mu_); bind(); begin_op();
         ++dispatches_[op];
         void* fn = function("forge_" + op);
         std::vector<std::uint64_t> ptrs, temps;
-        auto free_temps = [&] { for (auto p : temps) f_.free_(p); };
+        auto free_temps = [&] { for (auto p : temps) dfree(p); };
         try {
             auto buf = [&](const float* h, std::size_t cnt, bool is_out) {
                 if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, is_out); if (is_out) b.e->host_valid = false; return b.ptr; }
-                std::uint64_t d = 0; ck(f_.malloc_(&d, std::max<std::size_t>(4, cnt * 4)), "malloc"); temps.push_back(d);
+                std::uint64_t d = dmalloc(cnt * 4, "scratch"); temps.push_back(d);
                 if (!is_out) ck(htod_s(d, h, cnt * 4, stream_), "memcpy HtoD");
                 return d;
             };
@@ -597,7 +608,7 @@ public:
                 ptrs.push_back(buf(in[i].data, in[i].size(), false));
                 if (s == sig::rope && i == 1) {   // the inverse-frequency table goes after pos
                     auto& d = rope_[extra];   // the table depends only on (base, dim): upload once
-                    if (!d) { ck(f_.malloc_(&d, std::max<std::size_t>(4, extra.size() * 4)), "malloc");
+                    if (!d) { d = dmalloc(extra.size() * 4, "scratch");
                               ck(htod_s(d, extra.data(), extra.size() * 4, stream_), "memcpy HtoD"); }
                     ptrs.push_back(d);
                 }
@@ -623,7 +634,7 @@ public:
             if (s == sig::attention && rows * cols <= 256 && (u7 & 0x7Eu) == 0 && k % 32 == 0 && k <= 256 && u6 % 32 == 0 && u6 <= 256 &&
                 ptrs.size() == 4 && attn_dec() && has_fn_locked("forge_attention_dec") && has_fn_locked("forge_attention_comb")) {
                 std::uint32_t ns = 16, nrow = rows * cols; std::size_t need = std::size_t(nrow) * ns * (u6 + 2) * 4;
-                if (att_cap_ < need) { if (att_) free_s(att_); att_ = 0; ck(f_.malloc_(&att_, need), "malloc"); att_cap_ = need; }
+                if (att_cap_ < need) { if (att_) free_s(att_); att_ = 0; att_cap_ = 0; att_ = dmalloc(need, "scratch"); att_cap_ = need; }
                 std::uint64_t pa = att_;
                 void* a1[] = {&ptrs[0], &ptrs[1], &ptrs[2], &pa, &rows, &cols, &k, &u4, &u5, &u6, &u7, &f0, &ns};
                 writes(pa, need);
@@ -697,7 +708,8 @@ private:
             std::vector<char> t(n); int r = dtoh(t.data(), s, n); return r ? r : htod(d, t.data(), n);
         }
     };
-    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false, arena = false; };
+    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false, arena = false; std::uint64_t last = 0; };
+    struct qbuf { std::uint64_t d = 0, last = 0; };   // an encoded weight kept on the device (run_qmatmul / run_qgather)
     struct bound { entry* e; std::uint64_t ptr; };
 
     template<class F> bool sym(F& f, const char* n) { f = reinterpret_cast<F>(dlsym(lib_, n)); return f != nullptr; }
@@ -805,7 +817,48 @@ private:
     }
     int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; cuda_hip::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
-    int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return f_.free_(p); }
+    int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return dfree(p); }
+    // ---- device memory accounting (gpu/device_memory.hpp) ----
+    // Every driver allocation goes through dmalloc/dfree, so the pool "cuda:N" / "hip:N" sees it. A buffer
+    // touched (acquired) after begin_op() belongs to the op in progress and is never evicted by it.
+    device_memory dm_;
+    std::uint64_t clock_ = 0, op_mark_ = 0;
+    void begin_op() { op_mark_ = clock_; }
+    std::uint64_t dmalloc(std::size_t bytes, const char* tag) {
+        bytes = std::max<std::size_t>(4, bytes);
+        return dm_.allocate(bytes, tag, [&]() -> std::optional<std::uint64_t> { std::uint64_t p = 0; if (f_.malloc_(&p, bytes) != 0 || !p) return std::nullopt; return p; });
+    }
+    int dfree(std::uint64_t p) { dm_.release(p); return f_.free_(p); }
+    // Make room on the device (device_memory's evict callback; mu_ held): give back the pooled free buffers,
+    // then evict resident buffers and encoded weights least recently used first, syncing device-only data to
+    // the host first. The next op that needs one uploads it again (FORGE_GPU_NO_RESIDENCY behaviour on demand).
+    std::uint64_t evict_device(std::uint64_t want, bool external) {
+        if (user_cap_) return 0;   // a user stream capture is open: nothing may be freed or synced
+        if (external) op_mark_ = clock_;   // no op in progress: every buffer may go
+        bind(); flush();
+        std::uint64_t freed = 0;
+        for (auto& [b, p] : pool_) { free_s(p); freed += b; ++stats_.evictions; stats_.evicted_bytes += b; }
+        pool_.clear(); pool_bytes_ = 0;
+        if (want && freed >= want) return freed;
+        struct victim { std::uint64_t last; bool q; std::uintptr_t key; std::pair<std::uintptr_t, std::size_t> qkey; std::size_t bytes; };
+        std::vector<victim> vs;
+        for (auto& [k, e] : res_) if (e.last <= op_mark_) vs.push_back({e.last, false, k, {}, std::max<std::size_t>(4, e.count * 4)});
+        for (auto& [k, qb] : qres_) if (qb.d && qb.last <= op_mark_) vs.push_back({qb.last, true, 0, k, std::max<std::size_t>(4, k.second)});
+        std::sort(vs.begin(), vs.end(), [](const victim& a, const victim& b) { return a.last < b.last; });
+        std::size_t n = 0; std::uint64_t got = freed;
+        while (n < vs.size() && (!want || got < want)) got += vs[n++].bytes;
+        if (!n) return freed;
+        for (std::size_t i = 0; i < n; ++i) if (!vs[i].q) { auto& e = res_[vs[i].key]; if (!e.host_valid) download(e); }
+        sync();   // downloads done, and no queued kernel still reads a buffer about to be freed
+        for (std::size_t i = 0; i < n; ++i) {
+            auto& v = vs[i];
+            if (v.q) { free_s(qres_[v.qkey].d); qres_.erase(v.qkey); }
+            else { auto& e = res_[v.key]; stats_.resident_bytes -= e.count * 4; free_s(e.d); res_.erase(v.key); }
+            freed += v.bytes; ++stats_.evictions; stats_.evicted_bytes += v.bytes;
+        }
+        q81_drop(); streak_ = 0;   // device addresses moved: no whole-run replay until runs are re-confirmed
+        return freed;
+    }
     // device-to-device copy on the stream; inside a graph-mode run it is a kernel (forge_copy_words), so segments hold
     // kernel nodes only and replay can patch them
     int dtod_s(std::uint64_t d, std::uint64_t s, std::size_t n) {
@@ -912,10 +965,7 @@ private:
     void dev_alloc(std::uint64_t* d, std::size_t bytes) {
         bytes = std::max<std::size_t>(4, bytes);
         if (auto it = pool_.find(bytes); it != pool_.end()) { *d = it->second; pool_.erase(it); pool_bytes_ -= bytes; return; }
-        if (f_.malloc_(d, bytes) != 0) {   // out of memory: give the pool back and retry
-            for (auto& [k, p] : pool_) free_s(p); pool_.clear(); pool_bytes_ = 0;
-            ck(f_.malloc_(d, bytes), "malloc");
-        }
+        *d = dmalloc(bytes, "resident");   // out of memory: device_memory evicts (the pool first, then LRU) and retries
     }
     static std::size_t pool_cap() {
         static const std::size_t v = [] { const char* e = std::getenv("FORGE_GPU_POOL_MB"); return (e ? std::strtoull(e, nullptr, 10) : 4096ull) << 20; }();
@@ -923,11 +973,11 @@ private:
     }
     bound acquire(float* h, std::size_t count, bool is_out) {
         auto key = reinterpret_cast<std::uintptr_t>(h);
-        if (auto it = res_.find(key); it != res_.end() && it->second.count == count) return {&it->second, it->second.d};
+        if (auto it = res_.find(key); it != res_.end() && it->second.count == count) { it->second.last = ++clock_; return {&it->second, it->second.d}; }
         auto it = res_.upper_bound(key);
         if (it != res_.begin()) {   // a sub-range of a resident buffer (e.g. the live prefix of a KV slot)
             auto& c = std::prev(it)->second; auto cl = std::prev(it)->first;
-            if (cl + c.count * 4 >= key + count * 4 && count) return {&c, c.d + (key - cl)};
+            if (cl + c.count * 4 >= key + count * 4 && count) { c.last = ++clock_; return {&c, c.d + (key - cl)}; }
         }
         // Resident entries overlapping [h, h+count) (decode re-views the same host arenas with new extents every
         // token): the overlapping part moves device-to-device into the new buffer and any part sticking out stays
@@ -936,13 +986,14 @@ private:
         std::vector<std::uintptr_t> olds, fetched; bool dl = false;
         const auto lo = key, hi = key + std::max<std::size_t>(count, 1) * 4;
         each_overlap(h, count, [&](entry& o) {
+            o.last = ++clock_;   // consumed below: not evictable while the new buffer is allocated
             auto ol = reinterpret_cast<std::uintptr_t>(o.host), oh = ol + o.count * 4;
             if ((o.pinned || o.kept) && !(ol >= lo && oh <= hi)) { if (!o.host_valid) { download(o); dl = true; } fetched.push_back(ol); }
             else olds.push_back(ol); });
         if (dl) sync();
         for (auto k : fetched) { drop(res_[k]); res_.erase(k); }
         entry e{h, count, 0};
-        dev_alloc(&e.d, count * 4);
+        dev_alloc(&e.d, count * 4); e.last = ++clock_;
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
         std::sort(olds.begin(), olds.end());
         if (!is_out) {   // upload only the gaps the resident pieces do not cover
@@ -1020,7 +1071,11 @@ private:
         if (f_.stream_create && f_.stream_create(&stream_, 1 /* non-blocking */) != 0) stream_ = nullptr;
         for (auto& [arch, img] : imgs) {
             std::string image(img);
-            if (f_.load(&mod_, image.data()) == 0) { arch_ = arch; return {}; }
+            if (f_.load(&mod_, image.data()) == 0) {
+                arch_ = arch;
+                dm_.attach(std::string(api_name(api_)) + ":" + std::to_string(ordinal_), mu_, [this](std::uint64_t w, bool ext) { return evict_device(w, ext); });
+                return {};
+            }
             mod_ = nullptr;
         }
         return "module load failed (no embedded PTX/code object is accepted by this device)";
@@ -1033,7 +1088,7 @@ private:
     std::mutex mu_;
     bool in_run_ = false;
     std::map<std::uintptr_t, entry> res_;
-    std::map<std::pair<std::uintptr_t, std::size_t>, std::uint64_t> qres_;
+    std::map<std::pair<std::uintptr_t, std::size_t>, qbuf> qres_;
     std::multimap<std::size_t, std::uint64_t> pool_; std::size_t pool_bytes_ = 0;
     std::map<std::vector<float>, std::uint64_t> rope_;   // encoded weights (run_qmatmul)
     std::vector<std::pair<const float*, std::size_t>> pinned_;

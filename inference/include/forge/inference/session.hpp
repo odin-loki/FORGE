@@ -11,10 +11,13 @@
 #include <forge/modelfile/sign.hpp>
 #include <forge/modelfile/tokenizer.hpp>
 #include <chrono>
+#include <cstddef>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 
 namespace forge::inference {
 
@@ -166,6 +169,9 @@ private:
     i64 vocab_ = 0;
 };
 
+// Header of session::save_prefix blobs (KV state of a token prefix).
+inline constexpr char kv_blob_magic[9] = "FORGEKV1";
+
 class session {
 public:
     explicit session(const std::string& fpk_path, session_options o = {}) : session(model::open(fpk_path, o.verify), o) {}
@@ -219,6 +225,49 @@ public:
             i64 rw = numel(s.buf.shape) / std::max<i64>(s.capacity, 1);
             std::copy_n(s.buf.data.data(), std::size_t(rw * n), d.buf.data.data());
             d.len = n;
+        }
+        pos_ = n;
+    }
+    // Serialise the KV state of the first `n` tokens (all, by default) to a blob, e.g. for mem::spill_store.
+    // load_prefix() restores it into a session of the same model and KV codec: afterwards the session continues
+    // exactly as copy_prefix() from the original would (identical logits).
+    std::vector<std::byte> save_prefix(i64 n = -1) const {
+        n = n < 0 ? pos_ : std::min(n, pos_);
+        st_.flush();   // device-resident rows back to the host copy
+        std::vector<std::byte> b;
+        auto put = [&](const void* p, std::size_t k) { auto* c = static_cast<const std::byte*>(p); b.insert(b.end(), c, c + k); };
+        auto u64 = [&](std::uint64_t v) { put(&v, 8); };
+        put(kv_blob_magic, 8); u64(std::uint64_t(n)); u64(std::uint64_t(st_.codec)); u64(st_.slots.size());
+        for (auto& [k, s] : st_.slots) {
+            if (s.fixed && n != s.len) raise(errc::unsupported, "save_prefix: recurrent slot '{}' holds {} tokens, cannot save {}", k, s.len, n);
+            u64(k.size()); put(k.data(), k.size());
+            u64(s.fixed); u64(std::uint64_t(s.codec)); u64(std::uint64_t(s.len)); u64(std::uint64_t(s.capacity)); u64(s.buf.shape.size());
+            for (auto d : s.buf.shape) u64(std::uint64_t(d));
+            std::size_t nf = s.fixed ? s.buf.data.size() : std::size_t(numel(s.buf.shape) / std::max<i64>(s.capacity, 1) * n);
+            u64(nf); put(s.buf.data.data(), nf * sizeof(float));
+        }
+        return b;
+    }
+    void load_prefix(std::span<const std::byte> b) {
+        std::size_t at = 0;
+        auto get = [&](void* p, std::size_t k) { if (at + k > b.size()) raise(errc::parse_error, "load_prefix: truncated KV blob"); std::memcpy(p, b.data() + at, k); at += k; };
+        auto u64 = [&] { std::uint64_t v; get(&v, 8); return v; };
+        char magic[8]; get(magic, 8);
+        if (std::memcmp(magic, kv_blob_magic, 8)) raise(errc::parse_error, "load_prefix: not a KV blob");
+        i64 n = i64(u64());
+        if (graph::kv_codec(u64()) != st_.codec) raise(errc::invalid_argument, "load_prefix: the blob uses a different KV codec");
+        if (n > st_.capacity) raise(errc::out_of_memory, "load_prefix: {} tokens exceed the context {}", n, st_.capacity);
+        st_.forget(); st_.reset();
+        for (std::uint64_t i = 0, ns = u64(); i < ns; ++i) {
+            std::string k(u64(), '\0'); get(k.data(), k.size());
+            bool fixed = u64() != 0; auto codec = graph::kv_codec(u64()); i64 len = i64(u64()), cap = i64(u64());
+            shape_t sh(u64()); for (auto& d : sh) d = i64(u64());
+            std::size_t nf = u64();
+            auto& d = st_.slots[k];
+            if (fixed) { d = {}; d.buf = tensor(sh); d.len = len; d.capacity = cap; d.codec = codec; d.fixed = true; }
+            else { if (!d.capacity) d.codec = codec; st_.ensure(d, sh, std::max<i64>(n, 1)); d.len = n; }
+            if (nf > d.buf.data.size()) raise(errc::parse_error, "load_prefix: slot '{}' does not fit its shape", k);
+            get(d.buf.data.data(), nf * sizeof(float));
         }
         pos_ = n;
     }

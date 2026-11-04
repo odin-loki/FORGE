@@ -3,7 +3,8 @@
 // `max_active`, prefills newcomers in chunks and advances every active sequence by one token, so short
 // requests finish and free their KV pages while long ones keep decoding (iteration-level scheduling).
 // Finished sequences are kept in a small prefix cache: a new prompt that shares a prefix with a cached
-// sequence copies those KV rows instead of recomputing them.
+// sequence copies those KV rows instead of recomputing them. With a spill store, prefixes evicted from memory
+// (capacity, memory pressure, admission control) are written to disk and read back when a prompt hits them.
 #include <forge/inference/grammar.hpp>
 #include <forge/inference/session.hpp>
 #include <forge/core/memory.hpp>
@@ -29,9 +30,15 @@ struct request {
 // budget: when set, live KV bytes are reported to it (tag "kv"), the prefix cache registers as an evictable
 // cache, and new requests wait in the queue while the budget is over its soft watermark (at least one request
 // always runs, so the queue drains). See docs/memory.md.
-struct batch_options { int max_active = 8; i64 prefill_chunk = 256; std::size_t prefix_cache = 4; session_options session; mem::budget* budget = nullptr; };
+// spill: when set, a prefix evicted from the in-memory cache is written there (session::save_prefix) instead of
+// being dropped, up to `spill_entries` prefixes (and the store's FORGE_MEM_SPILL_MAX); a prompt that hits a
+// spilled prefix reads it back, moves it into the in-memory cache, and copies its rows as for any other hit.
+struct batch_options { int max_active = 8; i64 prefill_chunk = 256; std::size_t prefix_cache = 4; session_options session; mem::budget* budget = nullptr;
+                       mem::spill_store* spill = nullptr; std::size_t spill_entries = 64; };
 
-struct batch_stats { std::size_t steps = 0, completed = 0, prefix_hits = 0, prefix_tokens_reused = 0, peak_active = 0, peak_kv_bytes = 0, deferred = 0; };
+// prefix_spills: evicted prefixes written to the spill store; prefix_reloads: spilled prefixes read back on a hit
+struct batch_stats { std::size_t steps = 0, completed = 0, prefix_hits = 0, prefix_tokens_reused = 0, peak_active = 0, peak_kv_bytes = 0, deferred = 0,
+                     prefix_spills = 0, prefix_reloads = 0; };
 
 class batch_scheduler {
 public:
@@ -39,7 +46,11 @@ public:
         if (o_.budget) cache_id_ = o_.budget->add_cache("prefix_kv", [this] { return cache_bytes_.load(); },
                                                         [this](std::uint64_t) { auto b = cache_bytes_.load(); request_kv_eviction(0); return b; }, 10);
     }
-    ~batch_scheduler() { stop(); if (o_.budget) { o_.budget->remove_cache(cache_id_); o_.budget->set_usage("kv", 0); } }
+    ~batch_scheduler() {
+        stop(); if (o_.budget) { o_.budget->remove_cache(cache_id_); o_.budget->set_usage("kv", 0); }
+        if (o_.spill) for (auto& c : spilled_) o_.spill->drop(c.spill_key);
+    }
+    std::size_t spilled() { std::lock_guard lk(mu_); return spilled_.size(); }   // prefixes held in the spill store
     std::size_t waiting() { std::lock_guard lk(mu_); return waiting_.size(); }
     std::size_t active_count() { std::lock_guard lk(mu_); return active_.size(); }
 
@@ -71,14 +82,14 @@ public:
     bool step() {
         {
             std::lock_guard lk(mu_);
-            if (evict_.exchange(false)) { auto k = evict_keep_.load(); while (cache_.size() > k) { cache_.pop_back(); ++evictions_; } update_cache_bytes_(); }
+            if (evict_.exchange(false)) { auto k = evict_keep_.load(); while (cache_.size() > k) evict_lru_(); update_cache_bytes_(); }
             std::uint64_t admitted = 0;
             while (!waiting_.empty() && int(active_.size()) < o_.max_active) {
                 // Admission control: project this request at the KV size observed per running request (unknown
                 // counts as 1 byte), drop cached prefixes first, then leave it queued while anything else runs.
                 std::uint64_t est = std::max<std::uint64_t>(kv_per_req_, 1) * (admitted + 1);
                 if (o_.budget && o_.budget->under_pressure(est)) {
-                    while (!cache_.empty() && o_.budget->under_pressure(est)) { cache_.pop_back(); ++evictions_; update_cache_bytes_(); }
+                    while (!cache_.empty() && o_.budget->under_pressure(est)) evict_lru_();
                     if (!active_.empty() && o_.budget->under_pressure(est)) { ++stats_.deferred; break; }
                 }
                 ++admitted;
@@ -150,17 +161,26 @@ private:
         }
         if (a->r.prompt.empty()) raise(errc::invalid_argument, "request with empty prompt");
         a->hist = a->r.prompt;
-        // prefix cache: reuse the longest shared prefix (always leave >= 1 prompt token to compute logits)
+        // prefix cache: reuse the longest shared prefix (always leave >= 1 prompt token to compute logits); an
+        // in-memory entry wins a tie with a spilled one
         std::size_t best = 0; session* src = nullptr;
-        for (auto& c : cache_) {
-            std::size_t n = 0, lim = std::min(c.tokens.size(), a->r.prompt.size() - 1);
-            while (n < lim && c.tokens[n] == a->r.prompt[n]) ++n;
-            if (n > best) { best = n; src = c.s.get(); }
-        }
+        auto shared = [&](const std::vector<int>& t) { std::size_t n = 0, lim = std::min(t.size(), a->r.prompt.size() - 1); while (n < lim && t[n] == a->r.prompt[n]) ++n; return n; };
+        auto mem_hit = cache_.end(), sp_hit = spilled_.end();
+        for (auto it = cache_.begin(); it != cache_.end(); ++it) if (auto n = shared(it->tokens); n > best) { best = n; mem_hit = it; }
+        for (auto it = spilled_.begin(); it != spilled_.end(); ++it) if (auto n = shared(it->tokens); n > best) { best = n; sp_hit = it; mem_hit = cache_.end(); }
+        if (sp_hit != spilled_.end()) {   // reload from disk; it becomes the most recently used in-memory entry
+            auto c = std::move(*sp_hit); spilled_.erase(sp_hit);
+            if (auto blob = o_.spill->take(c.spill_key)) {
+                c.s = std::make_unique<session>(m_, o_.session); c.s->load_prefix(*blob); c.spill_key = 0;
+                cache_.push_front(std::move(c)); mem_hit = cache_.begin(); ++stats_.prefix_reloads;
+            } else best = 0;
+        } else if (mem_hit != cache_.end()) cache_.splice(cache_.begin(), cache_, mem_hit);   // LRU: a hit moves to the front
+        if (mem_hit != cache_.end()) src = cache_.front().s.get();
         if (src && best > 0) {
             a->s->copy_prefix(*src, i64(best)); a->fed = best;
             ++stats_.prefix_hits; stats_.prefix_tokens_reused += best;
         }
+        while (cache_.size() > std::max<std::size_t>(o_.prefix_cache, 1)) evict_lru_();   // a reload may overfill it
         return a;
     }
     // returns true when finished
@@ -188,7 +208,7 @@ private:
         if (o_.prefix_cache == 0) return;
         std::vector<int> toks(a->hist.begin(), a->hist.begin() + std::min<std::size_t>(a->hist.size(), std::size_t(a->s->position())));
         cache_.push_front({std::move(toks), std::move(a->s)});
-        while (cache_.size() > o_.prefix_cache) cache_.pop_back();
+        while (cache_.size() > o_.prefix_cache) evict_lru_();
         update_cache_bytes_();
     }
     void fail_all(const std::string& msg) {
@@ -196,14 +216,30 @@ private:
         for (auto& a : active_) if (a->r.on_done) a->r.on_done(a->out, "error: " + msg);
         active_.clear();
     }
-    struct cached { std::vector<int> tokens; std::unique_ptr<session> s; };
+    struct cached { std::vector<int> tokens; std::unique_ptr<session> s; std::uint64_t spill_key = 0; };
+    // Evict the least recently used in-memory prefix: with a spill store its KV goes to disk (a later hit reloads
+    // it), otherwise, or when the store is full or the state cannot be saved, it is dropped.
+    void evict_lru_() {
+        if (cache_.empty()) return;
+        auto c = std::move(cache_.back()); cache_.pop_back(); ++evictions_;
+        if (o_.spill && o_.spill_entries && c.s && c.s->position() > 0) {
+            try {
+                auto blob = c.s->save_prefix();
+                if (auto k = o_.spill->put(blob.data(), blob.size())) {
+                    c.s.reset(); c.spill_key = k; spilled_.push_front(std::move(c)); ++stats_.prefix_spills;
+                    while (spilled_.size() > o_.spill_entries) { o_.spill->drop(spilled_.back().spill_key); spilled_.pop_back(); }
+                }
+            } catch (const std::exception&) {}   // e.g. a recurrent slot that cannot be cut: drop the entry
+        }
+        update_cache_bytes_();
+    }
     std::shared_ptr<model> m_;
     batch_options o_;
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<pending> waiting_;
     std::list<std::unique_ptr<active>> active_;
-    std::list<cached> cache_;
+    std::list<cached> cache_, spilled_;   // most recently used first
     std::atomic<std::uint64_t> cache_bytes_{0}; std::uint64_t kv_per_req_ = 0; int cache_id_ = 0;
     void update_cache_bytes_() { std::uint64_t b = 0; for (auto& c : cache_) if (c.s) b += c.s->state().bytes(); cache_bytes_.store(b); }
     std::uint64_t next_id_ = 0;
