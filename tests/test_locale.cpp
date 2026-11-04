@@ -287,6 +287,28 @@ static void zone_safety() {
 #endif
     std::filesystem::remove_all(tmp);
 }
+static void categories() {
+    auto h = L::current(L::category::time);   // whatever the OS says, it is a usable tag
+    CHECK(!h.empty() && !L::current(L::category::numeric).empty());
+    std::printf("  locale: messages %s, time %s, numeric %s\n", L::current().c_str(), h.c_str(), L::current(L::category::numeric).c_str());
+#if !defined(_WIN32)
+    const char* names[] = {"LC_ALL", "LC_MESSAGES", "LC_TIME", "LC_NUMERIC", "LANG"};
+    std::vector<std::pair<bool, std::string>> saved;
+    for (auto n : names) { const char* v = std::getenv(n); saved.push_back({v != nullptr, v ? v : ""}); }
+    set_env("LC_ALL", nullptr); set_env("LC_MESSAGES", nullptr);
+    set_env("LANG", "en_US.UTF-8"); set_env("LC_TIME", "de_DE.UTF-8"); set_env("LC_NUMERIC", "fr_FR.UTF-8");
+    EQ(L::system_locale(), "en-US"); EQ(L::current(), "en-US");
+    EQ(L::current(L::category::time), "de-DE"); EQ(L::current(L::category::numeric), "fr-FR");
+    EQ(L::format_number(1234.5), "1" + NNBSP + "234,5");                             // LC_NUMERIC
+    L::datetime d; d.year = 2026; d.month = 3; d.day = 9;
+    EQ(L::format_date(d, "", L::date_style::long_), L::format_date(d, "de-DE", L::date_style::long_));   // LC_TIME
+    CHECK(L::first_day_of_week() == L::weekday::mon);
+    set_env("LC_ALL", "ja_JP.UTF-8");                                                 // LC_ALL wins everywhere
+    EQ(L::current(L::category::time), "ja-JP"); EQ(L::current(L::category::numeric), "ja-JP");
+    L::set_current("pt-BR"); EQ(L::current(L::category::time), "pt-BR"); L::set_current("");
+    for (std::size_t i = 0; i < saved.size(); ++i) set_env(names[i], saved[i].first ? saved[i].second.c_str() : nullptr);
+#endif
+}
 static void messages() {
     auto m = L::format_message("{n, plural, =0 {no files} one {# file} other {# files}} in {dir}", {{"n", 1234}, {"dir", "/tmp"}}, "en");
     CHECK(m); EQ(m.value, "1,234 files in /tmp");
@@ -307,6 +329,9 @@ static void gettext() {
     CHECK(e && e.value == 1);
     CHECK(!L::eval_plural_expr("n +", 1));
     CHECK(!L::eval_plural_expr("n / 0", 1));
+    CHECK(!L::eval_plural_expr(std::string(200000, '!') + "n", 1));    // deep '!' chains fail instead of overflowing the stack
+    CHECK(!L::eval_plural_expr(std::string(200000, '(') + "n", 1));
+    auto nn = L::eval_plural_expr("!!n", 5); CHECK(nn && nn.value == 1);
     const char* po =
         "# comment\nmsgid \"\"\nmsgstr \"\"\n\"Language: ru\\n\"\n\"Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 && (n%100<10 || n%100>=20) ? 1 : 2);\\n\"\n\n"
         "msgid \"Hello\"\nmsgstr \"\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82\"\n\n"
@@ -354,7 +379,7 @@ static void gettext() {
     std::filesystem::remove_all(dir);
 }
 int main() {
-    tags(); region(); plurals_numbers(); lists_units(); calendars(); dates(); zones(); zone_safety(); messages(); gettext();
+    tags(); region(); plurals_numbers(); lists_units(); calendars(); dates(); zones(); zone_safety(); categories(); messages(); gettext();
     std::printf("test_locale: %d/%d checks passed\n", checks - fails, checks);
     return fails ? 1 : 0;
 }
