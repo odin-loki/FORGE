@@ -28,14 +28,27 @@
 //
 // Crash detection: if a worker's pipe hits EOF mid-task the parent reaps it and fails that task's future with
 // os_exception: kind=signal + signo for a POSIX signal death (SIGSEGV, SIGSYS from a sandbox, SIGKILL ...) or a
-// Windows NTSTATUS crash code (access violation=1, illegal instruction=2, int divide by zero=3, matching
-// os::signal_name); kind=io for a plain non-zero exit. The worker is respawned; other tasks keep running.
+// Windows NTSTATUS crash code (signo as in os::signal_name: access violation=1, illegal instruction=2, int
+// divide by zero=3, in-page error=4, misalignment=5, float=6, privileged instruction=7, int overflow=8, stack
+// overflow=9, array bounds=10; fast fail / stack buffer overrun, heap corruption and invalid CRT parameter are
+// kind=signal with signo 0 and the status named in the message); kind=io for a plain non-zero exit. A Windows
+// worker that does not exit within 5 s of losing its pipes is terminated (kind=timed_out). The worker is
+// respawned; other tasks keep running.
+//
+// Worker stdio: the IPC pipes belong to the protocol. On Windows (where they are the worker's stdin/stdout) CRT
+// fd 1 (printf, std::cout) is re-pointed at stderr and fd 0 at NUL, so a task cannot corrupt the stream; POSIX
+// workers use separate descriptors and keep the parent's stdio.
 // A task that throws in the worker fails its future with os_exception (kind from the worker's os_exception if
 // any, else other) whose message is the worker's what().
 //
-// Sandbox: options.sandbox applies os::apply_sandbox in each worker right after it starts (before any task).
+// Sandbox: options.sandbox applies os::apply_sandbox in each worker right after it starts (before any task). A
+// policy the worker cannot apply (Windows: network / file-write denial needs an AppContainer, not available in
+// process) makes it exit with code 70 instead of running unconfined, and the task fails with kind=io,
+// "sandbox could not be applied". The policy recorded for error mapping (note_sandbox_policy) is always one
+// that is in force.
 #include <forge/os/os.hpp>
 #include <forge/os/oserror.hpp>
+#include <forge/os/pipe.hpp>
 #include <forge/os/sandbox.hpp>
 #include <atomic>
 #include <condition_variable>
@@ -53,6 +66,8 @@
 #include <vector>
 #if defined(FORGE_OS_WINDOWS)
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #else
 #include <fcntl.h>
 #include <signal.h>
@@ -126,7 +141,10 @@ inline std::optional<msg> read_msg(fd_t f) {
 
 // The worker side: serve tasks until quit/EOF.
 inline int serve(fd_t in, fd_t out, const sandbox_policy* sb) {
-    if (sb) { if (auto st = apply_sandbox(*sb); st.err && !is_unsupported(st.err)) return 70; note_sandbox_policy(sb->deny_network, sb->deny_exec, sb->deny_fs_write); }
+    if (sb) {   // never run unconfined, and never record a policy that is not in force
+        if (auto st = apply_sandbox(*sb); st.err) { std::fprintf(stderr, "process_pool worker: %s\n", st.err.what.c_str()); return 70; }
+        note_sandbox_policy(sb->deny_network, sb->deny_exec, sb->deny_fs_write);
+    }
     for (;;) {
         auto m = read_msg(in);
         if (!m || m->type == msg_quit) return 0;
@@ -189,9 +207,20 @@ public:
             sandbox_policy parsed;
 #if defined(FORGE_OS_WINDOWS)
             (void)spec;
-            HANDLE in = GetStdHandle(STD_INPUT_HANDLE), out = GetStdHandle(STD_OUTPUT_HANDLE);
-            // Keep task stdout from corrupting the IPC stream: point the CRT stdout at stderr.
-            SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
+            // Keep tasks off the IPC stream: private duplicates of the pipe handles serve the protocol, then CRT
+            // fd 1 (printf, std::cout) is pointed at stderr (NUL without one) and fd 0 at NUL. _dup2 closes the
+            // original pipe handles; SetStdHandle makes GetStdHandle agree.
+            HANDLE in = nullptr, out = nullptr, self = GetCurrentProcess();
+            if (!DuplicateHandle(self, GetStdHandle(STD_INPUT_HANDLE), self, &in, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
+                !DuplicateHandle(self, GetStdHandle(STD_OUTPUT_HANDLE), self, &out, 0, FALSE, DUPLICATE_SAME_ACCESS)) std::exit(64);
+            std::fflush(stdout);
+            const int nul_in = _open("NUL", _O_RDONLY | _O_BINARY), err_fd = _fileno(stderr);
+            const bool has_err = err_fd >= 0 && _get_osfhandle(err_fd) != -1 && _get_osfhandle(err_fd) != -2;
+            const int sink = has_err ? err_fd : _open("NUL", _O_WRONLY | _O_BINARY);
+            if (nul_in >= 0) { _dup2(nul_in, 0); _close(nul_in); }
+            if (sink >= 0) { _dup2(sink, 1); if (sink != err_fd) _close(sink); }
+            SetStdHandle(STD_INPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(0)));
+            SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(1)));
             if (const char* s = std::strchr(argv[i], ':')) { parsed = parse_sb(s + 1); if (!p) p = &parsed; }
             std::exit(detail::pp::serve(in, out, p));
 #else
@@ -345,10 +374,9 @@ private:
         w.to = c_in_w; w.from = c_out_r; w.proc = pi.hProcess;
         return w;
 #else
-        int a[2], b[2];   // a: parent->child, b: child->parent
-        if (::pipe(a)) { err = last_error("pipe").what; return std::nullopt; }
-        if (::pipe(b)) { err = last_error("pipe").what; ::close(a[0]); ::close(a[1]); return std::nullopt; }
-        for (int f : {a[0], a[1], b[0], b[1]}) ::fcntl(f, F_SETFD, FD_CLOEXEC);
+        int a[2], b[2];   // a: parent->child, b: child->parent; close-on-exec from the start (detail::pipe_cloexec)
+        if (detail::pipe_cloexec(a)) { err = last_error("pipe").what; return std::nullopt; }
+        if (detail::pipe_cloexec(b)) { err = last_error("pipe").what; ::close(a[0]); ::close(a[1]); return std::nullopt; }
         std::string exe = opt_.exe, spec = std::string(detail::pp::worker_flag) + std::to_string(a[0]) + "," + std::to_string(b[1]) + sb_spec();
         pid_t pid = serialized_fork();   // one fork at a time (atfork handlers, e.g. Z3, livelock otherwise)
         if (pid < 0) { err = last_error("fork").what; for (int f : {a[0], a[1], b[0], b[1]}) ::close(f); return std::nullopt; }
@@ -373,11 +401,27 @@ private:
     static os_exception reap(worker& w) {
         detail::pp::close_fd(w.to); detail::pp::close_fd(w.from);
 #if defined(FORGE_OS_WINDOWS)
-        WaitForSingleObject(w.proc, 5000);
+        // Its pipes are closed, so a live worker reads EOF and quits; one that does not (stuck in a task) is
+        // terminated rather than left running unowned.
+        const bool stuck = WaitForSingleObject(w.proc, 5000) == WAIT_TIMEOUT;
+        if (stuck) { TerminateProcess(w.proc, 1); WaitForSingleObject(w.proc, 5000); }
         DWORD code = 0; GetExitCodeProcess(w.proc, &code); CloseHandle(w.proc); w.proc = nullptr;
-        int sig = code == 0xC0000005u ? 1 : code == 0xC000001Du ? 2 : code == 0xC0000094u ? 3 : 0;
-        if (sig) return os_exception(os_errc::signal, int(code), std::string("process_pool: worker crashed: ") + signal_name(sig), sig);
-        if (code) return os_exception(os_errc::io, int(code), "process_pool: worker exited with code " + std::to_string(code));
+        if (stuck) return os_exception(os_errc::timed_out, int(code), "process_pool: worker did not exit; terminated");
+        int sig = 0; const char* name = nullptr;
+        switch (code) {   // NTSTATUS crash codes; signo as in os::signal_name
+        case 0xC0000005u: sig = 1; break; case 0xC000001Du: sig = 2; break; case 0xC0000094u: sig = 3; break;
+        case 0xC0000006u: sig = 4; break; case 0x80000002u: sig = 5; break; case 0xC0000096u: sig = 7; break;
+        case 0xC0000095u: sig = 8; break; case 0xC00000FDu: sig = 9; break; case 0xC000008Cu: sig = 10; break;
+        case 0xC000008Du: case 0xC000008Eu: case 0xC000008Fu: case 0xC0000090u: case 0xC0000091u: case 0xC0000092u:
+        case 0xC0000093u: case 0xC00002B4u: case 0xC00002B5u: sig = 6; break;
+        case 0xC0000409u: name = "STATUS_STACK_BUFFER_OVERRUN (fast fail)"; break;
+        case 0xC0000374u: name = "STATUS_HEAP_CORRUPTION"; break;
+        case 0xC0000417u: name = "STATUS_INVALID_CRUNTIME_PARAMETER"; break;
+        default: break;
+        }
+        char hex[16]; std::snprintf(hex, sizeof hex, "0x%08lX", static_cast<unsigned long>(code));
+        if (sig || name) return os_exception(os_errc::signal, int(code), std::string("process_pool: worker crashed: ") + (name ? name : signal_name(sig)) + " (" + hex + ")", sig);
+        if (code) return os_exception(os_errc::io, int(code), "process_pool: worker exited with code " + std::to_string(code) + (code == 70 ? " (sandbox could not be applied)" : ""));
         return os_exception(os_errc::ok, 0, "");
 #else
         int st = 0; while (::waitpid(w.pid, &st, 0) < 0 && errno == EINTR) {}

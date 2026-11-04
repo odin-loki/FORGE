@@ -9,6 +9,16 @@ FORGE_PROCESS_TASK(square, [](std::string in) { long v = std::stol(in); return s
 FORGE_PROCESS_TASK(echo, [](std::string in) { return in; });
 FORGE_PROCESS_TASK(fail, [](std::string) -> std::string { throw os::os_exception(os::os_errc::not_found, 2, "nope"); });
 FORGE_PROCESS_TASK(hang, [](std::string) { std::this_thread::sleep_for(std::chrono::seconds(120)); return std::string(); });
+// A task that writes to stdout and tries to read stdin: neither may touch the IPC stream.
+FORGE_PROCESS_TASK(chatty, [](std::string in) {
+    std::printf("noise from printf\n"); std::fflush(stdout);
+    std::fputs("more noise\n", stdout); std::fflush(stdout);
+    std::size_t n = 0;
+#if defined(_WIN32)   // the worker's stdin was the IPC pipe: it must now read as NUL (EOF at once)
+    char b[16]; n = std::fread(b, 1, sizeof b, stdin);
+#endif
+    return in + ":" + std::to_string(n);
+});
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 FORGE_PROCESS_TASK(segv, [](std::string) -> std::string { ::raise(SIGSEGV); return {}; });
 FORGE_PROCESS_TASK(pid, [](std::string) { return std::to_string(::getpid()); });
@@ -84,6 +94,10 @@ TEST(pp_spawn_bad_exe_fails_cleanly) {
     process_pool pp({.workers = 1, .mode = process_pool::spawn_mode::spawn, .exe = "/nonexistent/forge-worker"});
     try { pp.submit("square", "1").get(); CHECK(false); } catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::io || e.kind == os::os_errc::broken_pipe); }
 }
+TEST(pp_spawn_mode_task_stdio) {
+    process_pool pp({.workers = 1, .mode = process_pool::spawn_mode::spawn});
+    CHECK(pp.submit("chatty", "s").get().rfind("s:", 0) == 0);
+}
 TEST(pp_sandboxed_worker_denies_write) {
     os::sandbox_policy p; p.deny_fs_write = true;
     process_pool pp({.workers = 1, .sandbox = p});
@@ -101,6 +115,23 @@ TEST(pp_windows_spawn) {
     for (int i = 0; i < 10; ++i) fs.push_back(pp.submit("square", std::to_string(i)));
     for (int i = 0; i < 10; ++i) CHECK(fs[std::size_t(i)].get() == std::to_string(i * i));
     try { (void)pp.submit("fail", "").get(); CHECK(false); } catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::not_found); }
+}
+TEST(pp_windows_task_stdio_does_not_corrupt_ipc) {
+    process_pool pp({.workers = 1});
+    for (int i = 0; i < 5; ++i) CHECK(pp.submit("chatty", "p" + std::to_string(i)).get() == "p" + std::to_string(i) + ":0");
+    CHECK(pp.submit("square", "11").get() == "121");
+}
+TEST(pp_windows_sandbox_unsupported_fails_task) {
+    // Network / file-write denial cannot be applied to a running Windows process: the worker must refuse to
+    // run (exit 70) rather than serve tasks unconfined under a policy recorded as applied.
+    os::sandbox_policy p; p.deny_network = true;
+    process_pool pp({.workers = 1, .sandbox = p});
+    try { (void)pp.submit("square", "3").get(); CHECK(false); }
+    catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::io); CHECK(std::string(e.what()).find("sandbox") != std::string::npos); }
+    // exec denial alone is applied in process (job object): tasks run
+    os::sandbox_policy x; x.deny_exec = true;
+    process_pool px({.workers = 1, .sandbox = x});
+    CHECK(px.submit("square", "4").get() == "16");
 }
 TEST(pp_windows_fork_rejected) {
     try { process_pool pp({.workers = 1, .mode = process_pool::spawn_mode::fork}); CHECK(false); }
