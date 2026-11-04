@@ -347,7 +347,7 @@ std::optional<tzif> etc_gmt(std::string_view n) {
     int h = 0; for (char c : n.substr(8)) { if (!std::isdigit((unsigned char)c)) return std::nullopt; h = h * 10 + (c - '0'); }
     if (h > 14) return std::nullopt;
     tzif z; z.has_footer = true; z.footer.ok = true; z.footer.std_off = (n[7] == '+' ? -h : h) * 3600;
-    char b[8]; std::snprintf(b, sizeof b, "%c%02d", n[7] == '+' ? '-' : '+', h); z.footer.std_name = b;
+    char b[16]; std::snprintf(b, sizeof b, "%c%02d", n[7] == '+' ? '-' : '+', h); z.footer.std_name = b;
     return z;
 }
 
