@@ -76,6 +76,7 @@ struct Fn {
     const FnDecl* decl = nullptr;
     std::map<int, Binding*> slot;                      // current binding per slot
     std::vector<std::unique_ptr<Binding>> all;
+    std::vector<Binding*> order;                       // every binding declared here, locals and globals, in order
     std::vector<std::set<std::string>> scopes;         // names per block, for shadowing
     // Move-only: MSVC's vector<Fn> reallocation otherwise picks the (ill-formed) copy,
     // because std::map's move constructor is not noexcept there.
@@ -129,6 +130,7 @@ struct Checker {
     }
     Fn& cur() { return fns.back(); }
     std::map<std::string, Binding*> gbind;             // globals declared by this script's top level
+    std::vector<std::unique_ptr<Binding>> gall;         // owns global bindings: a global can be declared inside a nested function
     std::set<std::string> gread, fn_assigned;          // globals read anywhere / assigned inside some function
     std::map<std::string, int> ids; std::map<std::string, std::vector<int>> field_ids;
     int gid(const std::string& k) { auto it = ids.find(k); if (it != ids.end()) return it->second; int id = -int(ids.size()) - 1; ids[k] = id; auto dot = k.find('.'); if (dot != std::string::npos) field_ids[k.substr(0, dot)].push_back(id); return id; }
@@ -160,11 +162,13 @@ struct Checker {
             f.scopes.back().insert(name);
         }
         auto b = std::make_unique<Binding>(); b->name = name; b->line = line; b->report = report && !internal_name(name); b->cnst = cnst;
-        if (v.global()) { if (gread.count(name)) b->report = false; gbind[name] = b.get(); } else f.slot[v.slot] = b.get();
+        f.order.push_back(b.get());
+        if (v.global()) { if (gread.count(name)) b->report = false; gbind[name] = b.get(); gall.push_back(std::move(b)); return; }
+        f.slot[v.slot] = b.get();
         f.all.push_back(std::move(b));
     }
     void end_fn() {
-        for (auto& b : cur().all) if (b->report && !b->used) diag(L::warning, "unused-variable", b->line, "variable '" + b->name + "' is never read", b->name);
+        for (auto* b : cur().order) if (b->report && !b->used) diag(L::warning, "unused-variable", b->line, "variable '" + b->name + "' is never read", b->name);
         fns.pop_back();
     }
 
