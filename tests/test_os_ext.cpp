@@ -12,6 +12,27 @@ static void skip(const char* what, const std::string& why) { std::printf("  skip
 // ---------------------------------------------------------------- child modes
 static int child_main(const std::string& mode) {
     auto arg = mode.substr(mode.find(':') == std::string::npos ? mode.size() : mode.find(':') + 1);
+    if (mode.rfind("crash_chain", 0) == 0) {   // a handler installed first must still run (exit 42) after the report
+#if defined(_WIN32)
+        SetUnhandledExceptionFilter([](EXCEPTION_POINTERS*) -> LONG { ExitProcess(42); });
+#else
+        struct sigaction sa{}; sa.sa_handler = [](int) { ::_exit(42); }; sigemptyset(&sa.sa_mask); ::sigaction(SIGSEGV, &sa, nullptr);
+#endif
+        os::crash_handler::config c; c.dir = arg; c.app = "osx"; if (!os::crash_handler::install(c)) return 2;
+        volatile int* p = nullptr; *p = 42; return 3;
+    }
+    if (mode.rfind("crash_default", 0) == 0) {   // no dir: the private per-user directory
+        os::crash_handler::config c; c.app = arg; if (!os::crash_handler::install(c)) return 2;
+        volatile int* p = nullptr; *p = 42; return 3;
+    }
+    if (mode.rfind("abort", 0) == 0) {
+        os::crash_handler::config c; c.dir = arg; c.app = "osx"; if (!os::crash_handler::install(c)) return 2;
+        std::abort();
+    }
+#if defined(_WIN32)
+    if (mode == "argv")   // run_sandboxed quoting: exactly these arguments
+        return __argc == 4 && std::string(__argv[1]) == "a \"b\" c\\" && std::string(__argv[2]).empty() && std::string(__argv[3]) == "x\\\"y" ? 0 : 5;
+#endif
     if (mode.rfind("crash", 0) == 0) {
         os::crash_handler::config c; c.dir = arg; c.app = "osx"; if (!os::crash_handler::install(c)) return 2;
         volatile int* p = nullptr; *p = 42; return 3;
@@ -230,6 +251,70 @@ TEST(sandboxing) {
         CHECK_MSG(rc == 0, "%s rc=%d", m.c_str(), rc);
     }
     os::remove_all(d);
+#endif
+}
+// run_sandboxed on every desktop platform: exit codes pass through (FreeBSD: capability mode + fexecve of the
+// run-time linker, which used to exit 127), writes are refused under deny_fs_write, arguments arrive intact.
+TEST(run_sandboxed_child) {
+#if defined(_WIN32)
+    os::sandbox_policy x; x.deny_exec = true;
+    auto r = os::run_sandboxed({"cmd", "/d", "/c", "exit 3"}, x); CHECK_MSG(r, "%s", r.err.what.c_str()); if (r) CHECK(r.value == 3);
+    // exec denied: the nested cmd cannot start (ActiveProcessLimit 1)
+    auto n = os::run_sandboxed({"cmd", "/d", "/c", "cmd /d /c exit 0 || exit 9"}, x); CHECK(n); if (n) CHECK(n.value == 9);
+    // quoting goes through the spawn_wait command-line builder: quotes, spaces, trailing backslash, empty
+    os::setenv("FORGE_OS_EXT_CHILD", "argv");
+    auto a = os::run_sandboxed({os::exe_path(), "a \"b\" c\\", "", "x\\\"y"}, x);
+    os::unsetenv("FORGE_OS_EXT_CHILD");
+    CHECK_MSG(a, "%s", a.err.what.c_str()); if (a) CHECK_MSG(a.value == 0, "argv child rc=%d", a.value);
+    os::sandbox_policy net; net.deny_network = true;   // AppContainer: may be unavailable (e.g. some CI images)
+    auto c = os::run_sandboxed({"cmd", "/d", "/c", "exit 4"}, net);
+    if (!c) skip("AppContainer run_sandboxed", c.err.what); else CHECK(c.value == 4);
+    CHECK(!os::run_sandboxed({"no-such-forge-cmd-xyz"}, x));
+#elif !defined(__APPLE__) || !TARGET_OS_IPHONE
+    os::sandbox_policy none, net, w, x; net.deny_network = true; w.deny_fs_write = true; x.deny_exec = true;
+    auto r0 = os::run_sandboxed({"sh", "-c", "exit 5"}, none); CHECK(r0); if (r0) CHECK(r0.value == 5);
+    auto r = os::run_sandboxed({"sh", "-c", "exit 3"}, net); CHECK_MSG(r, "%s", r.err.what.c_str()); if (r) CHECK_MSG(r.value == 3, "rc=%d", r.value);
+    auto d = scratch("rsb"); std::string f = os::join(d, "w.txt");
+    auto rw = os::run_sandboxed({"sh", "-c", "echo x > " + f}, w); CHECK(rw); if (rw) CHECK(rw.value != 0);
+    CHECK(!os::read_file(f));
+    auto ok = os::run_sandboxed({"sh", "-c", "echo x > " + f}, none); CHECK(ok); if (ok) CHECK(ok.value == 0);
+    CHECK(os::read_file(f));
+    auto rx = os::run_sandboxed({"sh", "-c", "exit 7"}, x); CHECK(rx); if (rx) CHECK(rx.value == 7);
+#if defined(__FreeBSD__)
+    auto ex = os::run_sandboxed({"sh", "-c", "/bin/echo hi"}, x); CHECK(ex); if (ex) CHECK(ex.value != 0);   // capability mode: no exec by path
+#endif
+    CHECK(!os::run_sandboxed({"no-such-forge-cmd-xyz"}, net));
+    os::remove_all(d);
+#endif
+}
+// The crash handler chains to a handler installed before it (after writing its report), reports abort(), and
+// by default writes into a private per-user directory.
+TEST(crash_handler_chain_abort_private_dir) {
+#if !defined(__APPLE__) || !TARGET_OS_IPHONE
+    auto find_report = [](const std::string& dir, const std::string& prefix, const char* needle) {
+        auto l = os::list_dir(dir); bool found = false;
+        if (l) for (auto& e : l.value)
+            if (e.name.rfind(prefix, 0) == 0 && e.name.size() > 6 && e.name.substr(e.name.size() - 6) == ".crash") {
+                auto t = os::read_file(os::join(dir, e.name));
+                if (t && t->find(needle) != std::string::npos && t->find("backtrace") != std::string::npos) found = true;
+            }
+        return found;
+    };
+    auto d = scratch("crashc");
+    int rc = run_child("crash_chain:" + d); CHECK_MSG(rc == 42, "rc=%d", rc);
+    CHECK(find_report(d, "osx-", "pid "));
+    auto d2 = scratch("crasha");
+    rc = run_child("abort:" + d2); CHECK(rc != 0);
+    CHECK(find_report(d2, "osx-", "abort") || find_report(d2, "osx-", "SIGABRT"));
+    os::remove_all(d); os::remove_all(d2);
+#if !defined(_WIN32)
+    const std::string app = "osxd" + std::to_string(os::pid());
+    rc = run_child("crash_default:" + app); CHECK(rc != 0);
+    const std::string pd = os::join(os::temp_dir(), "forge-crash-" + std::to_string(::geteuid()));
+    struct stat sb{}; CHECK(::lstat(pd.c_str(), &sb) == 0); CHECK(S_ISDIR(sb.st_mode)); CHECK((sb.st_mode & 077) == 0);
+    CHECK(find_report(pd, app + "-", "SIGSEGV"));
+    if (auto l = os::list_dir(pd)) for (auto& e : l.value) if (e.name.rfind(app, 0) == 0) std::remove(os::join(pd, e.name).c_str());
+#endif
 #endif
 }
 // ---------------------------------------------------------------- 12 secure key storage

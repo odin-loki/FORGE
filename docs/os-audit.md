@@ -10,21 +10,21 @@ The work is split by file ownership so changes can proceed in parallel without c
 ## Wave 1: bugs, security, degraded behaviour
 
 ### W1-A: processes, sandbox, signals, pipes, crash (`process.hpp`, `process_pool.hpp`, `sandbox.hpp`, `signal.hpp`, `pipe.hpp`, `crash.hpp`)
-| ID | Cat | Item |
-|---|---|---|
-| A1 | C | `send_signal`: pid 0 signals our own group; pid ≤ 1 with `group` becomes `kill(-1)`; pid truncation |
-| A2 | C | Pipes from `pipe()` without atomic close-on-exec (spawn, child, process_pool, pipe.hpp): concurrent forks inherit them, readers never see EOF |
-| A3 | C | Windows `spawn_wait`: stdin written synchronously (deadlock, timeout ignored); readers wait forever on a grandchild holding the pipe |
-| A4 | C | Windows `.bat`/`.cmd` arguments through `cmd /c` with MSVCRT quoting (BatBadBut injection) |
-| A5 | B | Windows environment block is case-sensitive (`Path` vs `PATH` duplicates) |
-| A6 | B | Windows job: `no_core` ignored; failed `AssignProcessToJobObject` silently drops limits and tree kill |
-| A7 | C | Windows process_pool: CRT fd 1 not redirected (task `printf` corrupts IPC); `reap` orphans on timeout; few NTSTATUS codes mapped |
-| A8 | C | process_pool sandbox on Windows: unsupported policy swallowed and recorded as applied |
-| A9 | C | seccomp: io_uring, x32 and i386 `socketcall` bypasses; `linkat`/`symlinkat`/`mknodat`/`fchmodat`/`fchownat`/`utimensat`/`*setxattr` not denied |
-| A10 | C | FreeBSD `run_sandboxed`: `cap_enter` before `execvp` makes every child exit 127 |
-| A11 | C | Windows `run_sandboxed`: arguments quoted without escaping |
-| A12 | C | Crash handler: non-async-signal-safe calls, predictable `/tmp` report path without `O_EXCL`/`O_NOFOLLOW`, ANSI paths on Windows, altstack only on the installing thread, no chaining, CRT abort paths bypass it |
-| A13 | D | Tests: `run_sandboxed` everywhere, pool sandbox, large stdin, grandchild, concurrent `child::start` |
+| ID | Cat | Item | Status |
+|---|---|---|---|
+| A1 | C | `send_signal`: pid 0 signals our own group; pid ≤ 1 with `group` becomes `kill(-1)`; pid truncation | fixed: pid 0, pid above pid_t / DWORD and `group` with pid ≤ 1 rejected (EINVAL); `kill_group` range-checked too |
+| A2 | C | Pipes from `pipe()` without atomic close-on-exec (spawn, child, process_pool, pipe.hpp): concurrent forks inherit them, readers never see EOF | fixed: `detail::pipe_cloexec` (pipe2 `O_CLOEXEC` on Linux/Android/FreeBSD; Apple: pipe + `FD_CLOEXEC` under `fork_mutex`) everywhere; children move ends onto 0/1/2 with `dup_to` |
+| A3 | C | Windows `spawn_wait`: stdin written synchronously (deadlock, timeout ignored); readers wait forever on a grandchild holding the pipe | fixed: stdin writer thread; after the direct child exits, 200 ms grace, then threads drain only buffered data and `CancelSynchronousIo` ends blocked I/O; handles created non-inheritable |
+| A4 | C | Windows `.bat`/`.cmd` arguments through `cmd /c` with MSVCRT quoting (BatBadBut injection) | fixed: Rust std's scheme (`cmd.exe /e:ON /v:OFF /d /c ""script" args"`, quote unsafe ASCII, double `"`, `%` → `%%cd:~,%`), cmd.exe from the system directory; CR/LF/NUL arguments and quoted script names refused |
+| A5 | B | Windows environment block is case-sensitive (`Path` vs `PATH` duplicates) | fixed: names compared with `CompareStringOrdinal(…, TRUE)`, existing casing kept |
+| A6 | B | Windows job: `no_core` ignored; failed `AssignProcessToJobObject` silently drops limits and tree kill | fixed: `no_core` → `JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION` (not `SEM_NOGPFAULTERRORBOX`: another process's error mode can only be set by racing our process-wide one); job create / limit / assign failure terminates the child and returns an error; `open_files` / `file_size_bytes` documented POSIX-only |
+| A7 | C | Windows process_pool: CRT fd 1 not redirected (task `printf` corrupts IPC); `reap` orphans on timeout; few NTSTATUS codes mapped | fixed: worker duplicates the IPC handles, CRT fd 1 → stderr (NUL without one), fd 0 → NUL; a worker not gone 5 s after losing its pipes is terminated (kind timed_out); NTSTATUS map adds in-page, misalignment, float, privileged, overflow, stack overflow, bounds, fast fail, heap corruption, invalid CRT parameter |
+| A8 | C | process_pool sandbox on Windows: unsupported policy swallowed and recorded as applied | fixed: any `apply_sandbox` error (unsupported included) exits the worker with 70 and fails the task (kind io, "sandbox could not be applied"); `note_sandbox_policy` only after success. AppContainer workers: W2-3 |
+| A9 | C | seccomp: io_uring, x32 and i386 `socketcall` bypasses; `linkat`/`symlinkat`/`mknodat`/`fchmodat`/`fchownat`/`utimensat`/`*setxattr` not denied | fixed: io_uring setup/enter/register denied with network or write denial; x32 (nr ≥ 0x40000000) kills; `socketcall` denied; link/symlink/mknod/chmod/fchmodat2/chown/utimes/xattr calls (non-at, 32-bit uid, time64, truncate64 variants too) denied; `run_sandboxed` builds the filter before fork |
+| A10 | C | FreeBSD `run_sandboxed`: `cap_enter` before `execvp` makes every child exit 127 | fixed: binary, PT_INTERP linker and library dirs opened before fork; child `cap_enter()` then `fexecve` (static) or `ld-elf.so.1 -f <fd>` with `LD_LIBRARY_PATH_FDS` (dynamic); scripts refused (ENOEXEC). Verified on FreeBSD 14.5 |
+| A11 | C | Windows `run_sandboxed`: arguments quoted without escaping | fixed: `detail_proc::win_cmdline` (batch handling included), resolved exe as application name |
+| A12 | C | Crash handler: non-async-signal-safe calls, predictable `/tmp` report path without `O_EXCL`/`O_NOFOLLOW`, ANSI paths on Windows, altstack only on the installing thread, no chaining, CRT abort paths bypass it | fixed: handler formats with `detail::sig_text` (no stdio/malloc); unwinder and dladdr warmed at install (not formally AS-safe: a crash inside the loader can still hang); default dir `<temp>/forge-crash-<euid>` 0700, owner/symlink checked; `O_CREAT\|O_EXCL\|O_NOFOLLOW` with -1..-9 suffixes, pid taken at crash time; `after` is a plain function pointer; previous sigaction chained; `install_thread_stack()` for other threads; Windows wide paths, previous SEH filter chained, SIGABRT / invalid-parameter / purecall handlers |
+| A13 | D | Tests: `run_sandboxed` everywhere, pool sandbox, large stdin, grandchild, concurrent `child::start` | fixed: run_sandboxed (Linux, FreeBSD, Windows incl. argv quoting and AppContainer), Windows pool sandbox failure and task stdio, 1 MB stdin with timeout and early exit, background grandchild, concurrent `child::start` / `spawn_wait` to EOF, invalid `send_signal` pids, batch `"&echo pwned&"` and `%PATH%`, case-insensitive PATH, crash chaining / abort / private dir |
 
 ### W1-B: core, files, IPC, console, time (`os.hpp`, `oserror.hpp`, `async_file.hpp`, `local_ipc.hpp`, `shared_memory.hpp`, `fs.hpp`, `console.hpp`, `time.hpp`, `detail.hpp`)
 | ID | Cat | Item |
