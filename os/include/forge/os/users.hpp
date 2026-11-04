@@ -6,10 +6,17 @@
 #if defined(FORGE_OS_POSIX)
 #include <grp.h>
 #include <pwd.h>
+#else
+#include <lm.h>     // types only: netapi32 is loaded at run time
+#include <sddl.h>
 #endif
 
 namespace forge::os {
-struct user_info { std::string name, home, shell, full_name; long uid = -1, gid = -1; std::vector<std::string> groups; };
+// Windows has no numeric ids: uid is the RID (last sub-authority) of the account SID, gid the RID of its primary
+// group (the account's, usually 513 "None" / "Domain Users", from lookups; the process token's from current_user,
+// like getgid), and sid the full SID string ("" on POSIX). lookup_uid(rid) resolves the RID in the current user's
+// domain, then among this machine's local accounts.
+struct user_info { std::string name, home, shell, full_name; long uid = -1, gid = -1; std::vector<std::string> groups; std::string sid; };
 
 #if defined(FORGE_OS_POSIX)
 inline user_info user_from_passwd_(const passwd& p) {
@@ -31,6 +38,46 @@ inline user_info user_from_passwd_(const passwd& p) {
 #endif
     return u;
 }
+#else
+inline long sid_rid_(PSID s) { UCHAR n = *GetSidSubAuthorityCount(s); return n ? long(*GetSidSubAuthority(s, n - 1u)) : -1; }
+inline std::string sid_string_(PSID s) { wchar_t* w = nullptr; if (!ConvertSidToStringSidW(s, &w)) return {}; std::string r = narrow(w); LocalFree(w); return r; }
+// The token's user or primary-group SID (cheap: no account-database lookup).
+inline std::vector<BYTE> token_sid_(TOKEN_INFORMATION_CLASS c) {
+    HANDLE t = nullptr; std::vector<BYTE> out; if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return out;
+    DWORD n = 0; GetTokenInformation(t, c, nullptr, 0, &n); std::vector<BYTE> b(n ? n : 1);
+    if (n && GetTokenInformation(t, c, b.data(), n, &n)) {
+        PSID s = c == TokenUser ? reinterpret_cast<TOKEN_USER*>(b.data())->User.Sid : reinterpret_cast<TOKEN_PRIMARY_GROUP*>(b.data())->PrimaryGroup;
+        out.assign(static_cast<BYTE*>(s), static_cast<BYTE*>(s) + GetLengthSid(s));
+    }
+    CloseHandle(t); return out;
+}
+// Full name, primary group and local groups from netapi32 (loaded at run time, no link library). Filled for
+// local accounts; left empty for domain accounts, whose database lives on a domain controller.
+inline void user_netinfo_(user_info& u) {
+    static HMODULE h = LoadLibraryW(L"netapi32.dll"); if (!h) return;
+    auto get = reinterpret_cast<decltype(&NetUserGetInfo)>(reinterpret_cast<void*>(GetProcAddress(h, "NetUserGetInfo")));
+    auto grp = reinterpret_cast<decltype(&NetUserGetLocalGroups)>(reinterpret_cast<void*>(GetProcAddress(h, "NetUserGetLocalGroups")));
+    auto fre = reinterpret_cast<decltype(&NetApiBufferFree)>(reinterpret_cast<void*>(GetProcAddress(h, "NetApiBufferFree")));
+    if (!get || !grp || !fre) return;
+    std::wstring w = widen(u.name); LPBYTE b = nullptr;
+    if (get(nullptr, w.c_str(), 3, &b) == NERR_Success && b) { auto* i = reinterpret_cast<USER_INFO_3*>(b); if (i->usri3_full_name) u.full_name = narrow(i->usri3_full_name); u.gid = long(i->usri3_primary_group_id); }
+    if (b) fre(b);
+    b = nullptr; DWORD n = 0, tot = 0;
+    if (grp(nullptr, w.c_str(), 0, 0, &b, MAX_PREFERRED_LENGTH, &n, &tot) == NERR_Success && b) { auto* g = reinterpret_cast<LOCALGROUP_USERS_INFO_0*>(b); for (DWORD i = 0; i < n; ++i) u.groups.push_back(narrow(g[i].lgrui0_name)); }
+    if (b) fre(b);
+}
+// The user account a SID names. home comes from the ProfileList registry key (empty if it never logged on).
+inline result<user_info> user_from_sid_(PSID sid, const std::string& what) {
+    wchar_t nm[256], dom[256]; DWORD nn = 256, dn = 256; SID_NAME_USE use{};
+    if (!LookupAccountSidW(nullptr, sid, nm, &nn, dom, &dn, &use)) return {{}, error{int(GetLastError()), what + ": not found"}};
+    if (use != SidTypeUser) return {{}, error{ERROR_NONE_MAPPED, what + ": not a user account"}};
+    user_info u; u.name = narrow(nm); u.sid = sid_string_(sid); u.uid = sid_rid_(sid); u.shell = getenv("COMSPEC", "cmd.exe");
+    wchar_t home[1024]; DWORD hn = sizeof home;
+    std::wstring key = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\" + widen(u.sid);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"ProfileImagePath", RRF_RT_REG_SZ, nullptr, home, &hn) == ERROR_SUCCESS) u.home = narrow(home);
+    user_netinfo_(u);
+    return {std::move(u), {}};
+}
 #endif
 
 inline result<user_info> lookup_user(const std::string& name) {
@@ -39,8 +86,10 @@ inline result<user_info> lookup_user(const std::string& name) {
     int rc = ::getpwnam_r(name.c_str(), &p, b.data(), b.size(), &r);
     if (rc || !r) return {{}, error{rc ? rc : ENOENT, "user " + name + ": not found"}};
     return {user_from_passwd_(p), {}};
-#else
-    (void)name; return {{}, unsupported("lookup_user")};
+#else   // "name" or "DOMAIN\name"
+    BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD sn = sizeof sid; wchar_t dom[256]; DWORD dn = 256; SID_NAME_USE use{};
+    if (!LookupAccountNameW(nullptr, widen(name).c_str(), sid, &sn, dom, &dn, &use) || use != SidTypeUser) return {{}, error{ERROR_NONE_MAPPED, "user " + name + ": not found"}};
+    return user_from_sid_(sid, "user " + name);
 #endif
 }
 inline result<user_info> lookup_uid(long uid) {
@@ -49,8 +98,23 @@ inline result<user_info> lookup_uid(long uid) {
     int rc = ::getpwuid_r(uid_t(uid), &p, b.data(), b.size(), &r);
     if (rc || !r) return {{}, error{rc ? rc : ENOENT, "uid " + std::to_string(uid) + ": not found"}};
     return {user_from_passwd_(p), {}};
-#else
-    (void)uid; return {{}, unsupported("lookup_uid")};
+#else   // uid = RID, under the current user's domain SID, then this machine's account-domain SID
+    auto none = [&] { return result<user_info>{{}, error{ERROR_NONE_MAPPED, "uid " + std::to_string(uid) + ": not found"}}; };
+    if (uid < 0) return none();
+    std::vector<std::pair<std::vector<BYTE>, UCHAR>> doms;   // (SID, sub-authorities of it to keep)
+    if (auto me = token_sid_(TokenUser); !me.empty()) { UCHAR n = *GetSidSubAuthorityCount(me.data()); if (n > 1) doms.push_back({me, UCHAR(n - 1)}); }
+    wchar_t cn[MAX_COMPUTERNAME_LENGTH + 1]; DWORD cl = MAX_COMPUTERNAME_LENGTH + 1; BYTE d[SECURITY_MAX_SID_SIZE]; DWORD dl = sizeof d; wchar_t dd[256]; DWORD ddl = 256; SID_NAME_USE use{};
+    if (GetComputerNameW(cn, &cl) && LookupAccountNameW(nullptr, cn, d, &dl, dd, &ddl, &use) && use == SidTypeDomain)
+        doms.push_back({std::vector<BYTE>(d, d + GetLengthSid(d)), *GetSidSubAuthorityCount(d)});
+    for (auto& [p, keep] : doms) {
+        if (keep >= SID_MAX_SUB_AUTHORITIES) continue;
+        BYTE s[SECURITY_MAX_SID_SIZE];
+        if (!InitializeSid(s, GetSidIdentifierAuthority(p.data()), BYTE(keep + 1))) continue;
+        for (UCHAR i = 0; i < keep; ++i) *GetSidSubAuthority(s, i) = *GetSidSubAuthority(p.data(), i);
+        *GetSidSubAuthority(s, keep) = DWORD(uid);
+        if (auto r = user_from_sid_(s, "uid " + std::to_string(uid))) return r;
+    }
+    return none();
 #endif
 }
 inline user_info current_user() {
@@ -58,9 +122,11 @@ inline user_info current_user() {
     if (auto r = lookup_uid(long(::getuid()))) return r.value;
     user_info u; u.uid = long(::getuid()); u.gid = long(::getgid()); u.name = getenv("USER"); u.home = home_dir(); return u;
 #else
-    user_info u; char b[256]; DWORD n = sizeof b;
-    if (GetUserNameA(b, &n)) u.name = b; else u.name = getenv("USERNAME");
+    user_info u; wchar_t b[257]; DWORD n = 257;
+    if (GetUserNameW(b, &n)) u.name = narrow(b); else u.name = getenv("USERNAME");
     u.home = home_dir(); u.shell = getenv("COMSPEC");
+    if (auto s = token_sid_(TokenUser); !s.empty()) { u.uid = sid_rid_(s.data()); u.sid = sid_string_(s.data()); }
+    if (auto g = token_sid_(TokenPrimaryGroup); !g.empty()) u.gid = sid_rid_(g.data());
     return u;
 #endif
 }
