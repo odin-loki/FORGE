@@ -1,6 +1,6 @@
 # OS wrapper design (forge::os, full surface)
 
-Status: **implemented** (phases 1–4 below; remaining platform gaps are listed at the end of Phasing). Scripts reach it through `forge::sh/pwsh/cmd`, `fs`, `os`, `time`, `net`, `service`, `proc` and `json`. This extends the existing header-only `forge::os` layer
+Status: **implemented** (phases 1–5 below; remaining platform gaps are listed at the end of Phasing). Scripts reach it through `forge::sh/pwsh/cmd`, `fs`, `os`, `time`, `net`, `service`, `proc` and `json`. This extends the existing header-only `forge::os` layer
 (`os/include/forge/os/`) into a complete, portable wrapper over the operating system. It is the
 foundation for the scripting layer in [scripting.md](scripting.md).
 
@@ -38,7 +38,7 @@ crash handling and GPU device enumeration.
 | `sysinfo.hpp` (extends) | OS name/version/kernel, arch, uptime, load average, per-CPU usage, memory (incl. cgroup limit, shared with `forge::mem`), disks, battery/thermal (via `power.hpp`), GPU list (via `gpu_devices.hpp`) |
 | `devices.hpp` | block devices, USB/PCI enumeration where the OS exposes it (sysfs, SetupAPI, IOKit); read-only |
 | `service.hpp` (extend) | install/start/stop/status for systemd user units, launchd agents, Windows SCM; `unsupported` on mobile |
-| `os.hpp` (`library`) | dynamic libraries via `os::library`; a separate `dynlib.hpp` with symbol enumeration is planned, not implemented |
+| `os.hpp` (`library`), `dynlib.hpp` | `os::library` (open / symbol / close); `os::dynlib` on top of it: search dirs and an env var before the system loader, typed `get<F>` / `require<F>`, `path()` of the loaded file, `symbols()` of a loaded library and `file_symbols(path)` for ELF / PE / Mach-O files on any host |
 | `registry.hpp` | Windows registry read/write/enumerate; `unsupported` elsewhere |
 | `console.hpp` | is-a-tty, terminal size, ANSI/VT enabling on Windows, raw mode for the REPL line editor |
 | `clipboard.hpp` | text get/set on desktop platforms (optional, low priority) |
@@ -95,6 +95,11 @@ can branch on features rather than on platform names.
    - `clipboard.hpp` (`forge::os::clipboard`): `available`, `get`, `set` — Win32 clipboard on Windows, pbcopy/pbpaste on macOS, wl-copy/wl-paste or xclip/xsel on Linux/FreeBSD; unsupported without a display or helper and on mobile.
    - Scripts: `os.devices("block"|"pci"|"usb")`, `os.clipboard()` / `os.clipboard(text)`.
    - Tests: `tests/test_os_dev.cpp` (cross-compiled too).
+
+5. **Done:** `dynlib`.
+   - `dynlib.hpp` (`forge::os::dynlib`, in `all.hpp`): `dynlib::open(name, {search_dirs, env_var, system_search})` tries `name` and `library::decorate(name)` (`m` → `libm.so` / `libm.dylib` / `m.dll`) in each dir, then hands both to the system loader exactly as `os::library::open` does; `""` is the running program; a name with a path separator is opened as is. `dynlib::adopt(library)` wraps an existing `os::library`. `get<int (*)(int)>` / `get<int(int)>` / `get<T*>` return typed pointers (nullptr when missing), `require<F>` returns an error naming the symbol. `path()` is the loaded file (dl_iterate_phdr + `RTLD_NOLOAD` handle match on ELF, `GetModuleFileNameW`, dyld image list).
+   - Symbols: `dynlib_symbol{name, type (function/data/tls/other), weak, indirect, value (offset from load base), address, version, default_version, ordinal, forwarder}`. `file_symbols(path)` / `file_format(path)` parse any format on any host: ELF `.dynsym` with `.gnu.version`/`.gnu.version_d` (both `foo@@V2` and hidden `foo@V1` are listed), or `PT_DYNAMIC` + `DT_HASH`/`DT_GNU_HASH` when section headers are stripped, 32/64-bit, either endianness; PE32/PE32+ export directory (named exports, ordinals, forwarders); Mach-O export trie (`LC_DYLD_INFO[_ONLY]`, `LC_DYLD_EXPORTS_TRIE`) or external `LC_SYMTAB` entries, fat files (host slice), leading `_` stripped. `dynlib::symbols()` adds run-time addresses: ELF reads the file and adds the `dl_iterate_phdr` load base (IFUNCs through `dlsym`, hidden versions through `dlvsym` on glibc); Windows parses the mapped module; Apple parses the image in memory (works for the dyld shared cache). The parsers are bounds-checked and never read past their input.
+   - Tests: `tests/test_os_dynlib.cpp` loads a fixture library built in the test target (`tests/dynlib_fixture.c`) through search dirs and an env var, calls it through `get<>` and through enumerated addresses, enumerates libm (calls `cos`), and, when clang + lld are installed, parses fixtures cross-linked by `cmake/dynlib_fixtures.cmake` (PE32+/PE32 DLLs with a forwarder, arm64/x86_64/exports-trie/fat Mach-O dylibs, ELF32, big-endian ELF, section-stripped ELF with DT_HASH and DT_GNU_HASH, symbol versions + IFUNC + TLS, the last also loaded and called on x86_64 glibc), plus ~14k truncated and mutated inputs. Windows and Apple loaded-image code is compile-checked only (zig `xos_test_os_dynlib_*` where zig is installed).
 
 Remaining platform gaps (tracked, not blocking): Windows/macOS device enumeration (SetupAPI / IOKit), Windows `interfaces()` (GetAdaptersAddresses), per-CPU times off Linux, `mounts()` on macOS/FreeBSD, user lookup by SID on Windows, and HTTPS in `net::http`.
 

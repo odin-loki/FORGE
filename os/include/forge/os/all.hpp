@@ -32,3 +32,4 @@
 #include <forge/os/registry.hpp>
 #include <forge/os/devices.hpp>
 #include <forge/os/clipboard.hpp>
+#include <forge/os/dynlib.hpp>

@@ -598,11 +598,12 @@ inline void advise_willneed(void* p, std::size_t n) {
 }
 
 // ---------------------------------------------------------------- dynamic libraries
+// Plain open / symbol / close. <forge/os/dynlib.hpp> adds search dirs, typed get<>, path() and symbol enumeration.
 class library {
 public:
     library() = default;
-    library(library&& o) noexcept : h_(std::exchange(o.h_, nullptr)) {}
-    library& operator=(library&& o) noexcept { if (this != &o) { close(); h_ = std::exchange(o.h_, nullptr); } return *this; }
+    library(library&& o) noexcept : h_(std::exchange(o.h_, nullptr)), self_(std::exchange(o.self_, false)) {}
+    library& operator=(library&& o) noexcept { if (this != &o) { close(); h_ = std::exchange(o.h_, nullptr); self_ = std::exchange(o.self_, false); } return *this; }
     ~library() { close(); }
     static result<library> open(const std::string& name) {   // empty name = the running program
         library l;
@@ -625,6 +626,7 @@ public:
     }
     template <class F> F get(const char* s) const { return reinterpret_cast<F>(symbol(s)); }
     bool valid() const { return h_ != nullptr; }
+    bool is_self() const { return self_; }   // opened with "" (the running program)
     void* native() const { return h_; }
     void close() {
         if (!h_) return;
