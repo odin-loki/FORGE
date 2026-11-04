@@ -431,7 +431,7 @@ FORGE_GLOBAL void forge_attention_comb(const float* part, float* y, unsigned nro
     for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu != -__builtin_inff()) a = fma_(pp[u * (dv + 2u) + 2u + e], fexp(mu - M), a); }
     y[(unsigned long long)id * dv + e] = a * inv; } }
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
-// y[rows, cols] = xq . W^T for q8_0 (fmt 1), q4_k (fmt 2) and q6_k (fmt 3). A warp per output column (4 per 128-thread
+// y[rows, cols] = xq . W^T for q8_0 (fmt 1), q4_k (fmt 2) and q6_k (fmt 3, or 5 = padded to 224-byte blocks). A warp per output column (4 per 128-thread
 // block, no shared memory or barriers: the warp reduces with shuffles), up to 4 activation rows per block, as in
 // llama.cpp's mul_mat_vec_q. q4_k lanes take 16 weight bytes in one 128-bit load (8 lanes per super-block, 4
 // super-blocks per warp step); q6_k (210-byte blocks, 2-aligned) a whole super-block per warp step; q8_0 (34-byte
@@ -462,10 +462,10 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
           sa = dp4a_us(q[i] & 0x0F0F0F0Fu, ia, sa); ua = dp4a_us(0x01010101u, ia, ua);
           sbb = dp4a_us((q[i] >> 4) & 0x0F0F0F0Fu, ib, sbb); ub = dp4a_us(0x01010101u, ib, ub); }
         acc[rr] += *(const float*)xa * (d0 * (float)sa - n0 * (float)ua) + *(const float*)xb * (d1 * (float)sbb - n1 * (float)ub); } }
-  } else if (fmt == 3u) {
-    unsigned h = l >> 4, p = (l & 15u) * 4u, tb = p >= 32u ? 1u : 0u, lo0 = p & 31u;
+  } else if (fmt == 3u || fmt == 5u) {   // 5: q6_k blocks padded to 224 bytes on upload
+    unsigned h = l >> 4, p = (l & 15u) * 4u, tb = p >= 32u ? 1u : 0u, lo0 = p & 31u, bs = fmt == 5u ? 224u : 210u;
     for (unsigned sb = 0; sb < k / 256u; ++sb) {
-      const unsigned char* b = row + sb * 210u;
+      const unsigned char* b = row + sb * bs;
       unsigned ql = ld16(b + 64u * h + p) | (ld16(b + 64u * h + p + 2u) << 16), qh = ld16(b + 128u + 32u * h + lo0) | (ld16(b + 130u + 32u * h + lo0) << 16);
       const signed char* sc = (const signed char*)(b + 192u + 8u * h);
       float d = h2f(ld16(b + 208u)), dA = d * (float)sc[(lo0 >> 4) + 2u * tb], dB = d * (float)sc[(lo0 >> 4) + 2u * (tb + 2u)];
@@ -492,6 +492,251 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
   }
 #pragma unroll
   for (unsigned rr = 0; rr < 4u; ++rr) { if (rr >= nr) continue; float v = wsum_(acc[rr]); if (l == 0u) y[(unsigned long long)(r0 + rr) * cols + c] = v; } }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+// Batched (prefill) quantised matmul on int8 tensor cores (mma.sync s8, sm_80+; the sm_80 PTX image only), after
+// llama.cpp's MMQ (ggml-cuda/mmq.cuh, MIT, the ggml authors). Activations are quantised per 32 values
+// (forge_quant_q8r: int8 rows, plus (d, d * sum) per group); each 32-value group's integer dot comes from the
+// tensor cores and is scaled in f32: q4_k xd * (d*sc * dot) - xd*sum * dmin*m, q6_k xd * (d*sc_lo * dot_lo +
+// d*sc_hi * dot_hi) (16-value scales, so two k16 mmas), q8_0 xd * d * dot.
+FORGE_GLOBAL void forge_quant_q8r(const float* x, signed char* xq, float* xds, unsigned nb) {   // a warp per 32-value block
+  unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i >= nb) return;
+  float v = x[(unsigned long long)i * 32u + l], am = wmax_(fabs_(v)), d = am / 127.0f;
+  int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
+  xq[(unsigned long long)i * 32u + l] = (signed char)q;
+  float sm = wsum_((float)q);
+  if (l == 0u) { xds[2ull * i] = d; xds[2ull * i + 1u] = d * sm; } }
+FORGE_DEV void mma_k32(int* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+               : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)); }
+FORGE_DEV void mma_k16(int* c, unsigned a0, unsigned a1, unsigned b0) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};"
+               : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0)); }
+FORGE_DEV unsigned q6frag(const unsigned char* base, unsigned g, unsigned l) {   // 4 values of group g at lane offset l
+  unsigned h = g >> 2, q = g & 3u;
+  unsigned ql = *(const unsigned*)(base + 64u * h + 32u * (q & 1u) + l), qh = *(const unsigned*)(base + 128u + 32u * h + l);
+  unsigned v = ((ql >> (4u * (q >> 1))) & 0x0F0F0F0Fu) | (((qh >> (2u * q)) & 0x03030303u) << 4);
+  return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u; }   // per byte v - 32 (no borrow across bytes)
+// y[rows, cols] = x . W^T (fmt 1 q8_0, 2 q4_k, 5 q6_k padded to 224-byte blocks; k % 256 == 0), structured like
+// llama.cpp's MMQ: the weights are the mma A operand. A 256-thread block (8 warps) computes 128 weight rows (output
+// columns) x 64 tokens; warp w owns weight rows 16w..16w+15 for all 64 tokens (8 n8 tiles), so each 32-value group's
+// weight fragment and scales are unpacked once and reused by 8 mmas. k goes in 256-value chunks; the raw weight
+// blocks (q8_0: unpacked int8) and the int8 activation rows are staged in dynamic shared memory, and the next
+// chunk's global loads are issued into registers before the current chunk is computed.
+// Shared layout (bytes): Xq 64 x 272 | Xs 8 groups x 64 tokens x (d, d*sum) | Wm 128 x 16 floats | Wr 128 x stride.
+// Wm per weight row: q4_k (d*sc, dmin*m) x 8 groups; q6_k d*sc x 16; q8_0 d x 8. Wr stride: q4_k 144, q6_k 240, q8_0 272.
+FORGE_DEV unsigned mma_wstride(unsigned fmt) { return fmt == 2u ? 144u : fmt == 5u ? 240u : 272u; }
+extern __attribute__((shared)) unsigned char forge_dsm[];
+static __attribute__((device, always_inline)) inline void mma_body(const signed char* xq, const float* xds, const unsigned char* w, float* y,
+                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb) {
+  unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + 17408u); float* Wm = (float*)(forge_dsm + 21504u);
+  unsigned char* Wr = forge_dsm + 29696u;
+  unsigned t = tid_(), wp = t >> 5, l = t & 31u, gid = l >> 2, tig = l & 3u;
+  unsigned ntb = (rows + 63u) / 64u, bi = bid_(), t0 = (bi % ntb) * 64u, c0 = (bi / ntb) * 128u, nbk = k / 32u;
+  unsigned wsb = mma_wstride(fmt), bsz = fmt == 2u ? 144u : 224u, nch = bsz / 16u;
+  float acc[8][4];
+#pragma unroll
+  for (unsigned n = 0; n < 8u; ++n)
+#pragma unroll
+    for (unsigned e = 0; e < 4u; ++e) acc[n][e] = 0.0f;
+  u32x4 px[4], pw[7]; float pd[4];
+#define FORGE_MMA_LOAD(kb) { \
+    _Pragma("unroll") for (unsigned j = 0; j < 4u; ++j) { unsigned i = t + 256u * j, r = i >> 4, ch = i & 15u; \
+      px[j] = t0 + r < rows ? *(const u32x4*)(xq + (unsigned long long)(t0 + r) * k + (kb) + ch * 16u) : (u32x4){0u, 0u, 0u, 0u}; } \
+    _Pragma("unroll") for (unsigned j = 0; j < 2u; ++j) { unsigned i = t + 256u * j, r = i >> 3, g = i & 7u; \
+      const float* p = xds + 2ull * ((unsigned long long)(t0 + r) * nbk + ((kb) >> 5) + g); \
+      pd[2u * j] = t0 + r < rows ? p[0] : 0.0f; pd[2u * j + 1u] = t0 + r < rows ? p[1] : 0.0f; } \
+    if (fmt != 1u) { _Pragma("unroll") for (unsigned j = 0; j < 7u; ++j) { unsigned i = t + 256u * j, c = i / nch, ch = i % nch; \
+      pw[j] = (c < 128u && c0 + c < cols) ? *(const u32x4*)(w + (unsigned long long)(c0 + c) * rb + ((kb) >> 8) * bsz + ch * 16u) : (u32x4){0u, 0u, 0u, 0u}; } } }
+  FORGE_MMA_LOAD(0u)
+  for (unsigned kb = 0; kb < k; kb += 256u) {
+#pragma unroll
+    for (unsigned j = 0; j < 4u; ++j) { unsigned i = t + 256u * j, r = i >> 4, ch = i & 15u; *(u32x4*)(Xq + r * 68u + ch * 4u) = px[j]; }
+#pragma unroll
+    for (unsigned j = 0; j < 2u; ++j) { unsigned i = t + 256u * j, r = i >> 3, g = i & 7u;
+      Xs[(g * 64u + r) * 2u] = pd[2u * j]; Xs[(g * 64u + r) * 2u + 1u] = pd[2u * j + 1u]; }
+    unsigned c = t >> 1, h = t & 1u, gc = c0 + c;
+    if (fmt != 1u) {
+#pragma unroll
+      for (unsigned j = 0; j < 7u; ++j) { unsigned i = t + 256u * j, cc = i / nch, ch = i % nch;
+        if (cc < 128u) *(u32x4*)(Wr + cc * wsb + ch * 16u) = pw[j]; }
+    } else {   // q8_0: 34-byte blocks are not 16-byte aligned; copy them byte-wise into int8 rows
+      unsigned char* dst = Wr + c * 272u;
+      for (unsigned g = 4u * h; g < 4u * h + 4u; ++g) {
+        if (gc < cols) { const unsigned char* b = w + (unsigned long long)gc * rb + ((kb >> 5) + g) * 34u;
+          Wm[c * 16u + g] = h2f(ld16(b)); for (unsigned i = 0; i < 32u; ++i) dst[g * 32u + i] = b[2u + i]; }
+        else { Wm[c * 16u + g] = 0.0f; for (unsigned i = 0; i < 32u; ++i) dst[g * 32u + i] = 0u; } }
+    }
+    bar_();
+    if (fmt == 2u) {   // per-group scales from the raw headers: 128 rows x 2 halves of 4 groups
+      const unsigned char* b = Wr + c * 144u; float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u));
+      for (unsigned j = 4u * h; j < 4u * h + 4u; ++j) { unsigned s0, m0; scmin(j, b + 4u, &s0, &m0);
+        Wm[c * 16u + 2u * j] = d * (float)s0; Wm[c * 16u + 2u * j + 1u] = dm * (float)m0; }
+    } else if (fmt == 5u) {
+      const unsigned char* b = Wr + c * 240u; float d = h2f(ld16(b + 208u));
+      for (unsigned j = 8u * h; j < 8u * h + 8u; ++j) Wm[c * 16u + j] = d * (float)((const signed char*)(b + 192u))[j];
+    }
+    if (kb + 256u < k) FORGE_MMA_LOAD(kb + 256u)   // next chunk's loads fly while this one computes
+    bar_();
+    const unsigned ra = wp * 16u + gid, rb8 = ra + 8u;
+#pragma unroll 1
+    for (unsigned g = 0; g < 8u; ++g) {
+      unsigned a0, a1, a2, a3; float sa0, sa1, sb0, sb1;   // A fragment (rows ra, ra+8) and its scales
+      if (fmt == 2u) {
+        const unsigned* q0 = (const unsigned*)(Wr + ra * 144u) + 4u + (g >> 1) * 8u + tig; const unsigned* q1 = q0 + 8u * 36u;
+        unsigned sh = (g & 1u) * 4u;
+        a0 = (q0[0] >> sh) & 0x0F0F0F0Fu; a1 = (q1[0] >> sh) & 0x0F0F0F0Fu; a2 = (q0[4] >> sh) & 0x0F0F0F0Fu; a3 = (q1[4] >> sh) & 0x0F0F0F0Fu;
+        sa0 = Wm[ra * 16u + 2u * g]; sa1 = Wm[ra * 16u + 2u * g + 1u]; sb0 = Wm[rb8 * 16u + 2u * g]; sb1 = Wm[rb8 * 16u + 2u * g + 1u];
+      } else if (fmt == 5u) {
+        a0 = q6frag(Wr + ra * 240u, g, tig * 4u); a1 = q6frag(Wr + rb8 * 240u, g, tig * 4u);
+        a2 = q6frag(Wr + ra * 240u, g, tig * 4u + 16u); a3 = q6frag(Wr + rb8 * 240u, g, tig * 4u + 16u);
+        sa0 = Wm[ra * 16u + 2u * g]; sa1 = Wm[ra * 16u + 2u * g + 1u]; sb0 = Wm[rb8 * 16u + 2u * g]; sb1 = Wm[rb8 * 16u + 2u * g + 1u];
+      } else {
+        const unsigned* q0 = (const unsigned*)(Wr + ra * 272u) + g * 8u + tig; const unsigned* q1 = q0 + 8u * 68u;
+        a0 = q0[0]; a1 = q1[0]; a2 = q0[4]; a3 = q1[4];
+        sa0 = Wm[ra * 16u + g]; sb0 = Wm[rb8 * 16u + g]; sa1 = 0.0f; sb1 = 0.0f;
+      }
+#pragma unroll
+      for (unsigned n = 0; n < 8u; ++n) {
+        const unsigned* xr = Xq + (n * 8u + gid) * 68u + g * 8u + tig;
+        unsigned b0 = xr[0], b1 = xr[4];
+        const float* xs = Xs + (g * 64u + n * 8u + tig * 2u) * 2u;   // (d, d*sum) of tokens 2tig, 2tig+1 of this tile
+        float xd0 = xs[0], xm0 = xs[1], xd1 = xs[2], xm1 = xs[3];
+        if (fmt == 5u) {
+          int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
+          mma_k16(lo, a0, a1, b0); mma_k16(hi, a2, a3, b1);
+          acc[n][0] = fma_(xd0, fma_(sa1, (float)hi[0], sa0 * (float)lo[0]), acc[n][0]); acc[n][1] = fma_(xd1, fma_(sa1, (float)hi[1], sa0 * (float)lo[1]), acc[n][1]);
+          acc[n][2] = fma_(xd0, fma_(sb1, (float)hi[2], sb0 * (float)lo[2]), acc[n][2]); acc[n][3] = fma_(xd1, fma_(sb1, (float)hi[3], sb0 * (float)lo[3]), acc[n][3]);
+        } else {
+          int ci[4] = {0, 0, 0, 0}; mma_k32(ci, a0, a1, a2, a3, b0, b1);
+          acc[n][0] = fma_(sa0 * xd0, (float)ci[0], acc[n][0]); acc[n][1] = fma_(sa0 * xd1, (float)ci[1], acc[n][1]);
+          acc[n][2] = fma_(sb0 * xd0, (float)ci[2], acc[n][2]); acc[n][3] = fma_(sb0 * xd1, (float)ci[3], acc[n][3]);
+          if (fmt == 2u) {   // q4_k min term: - dmin*m * d_x*sum_x
+            acc[n][0] = fma_(-sa1, xm0, acc[n][0]); acc[n][1] = fma_(-sa1, xm1, acc[n][1]);
+            acc[n][2] = fma_(-sb1, xm0, acc[n][2]); acc[n][3] = fma_(-sb1, xm1, acc[n][3]); }
+        } } }
+    bar_(); }
+#undef FORGE_MMA_LOAD
+  const unsigned ra = wp * 16u + gid;
+#pragma unroll
+  for (unsigned n = 0; n < 8u; ++n)
+#pragma unroll
+    for (unsigned e = 0; e < 4u; ++e) {
+      unsigned col = c0 + ra + 8u * (e >> 1), tok = t0 + n * 8u + tig * 2u + (e & 1u);
+      if (tok < rows && col < cols) y[(unsigned long long)tok * cols + col] = acc[n][e]; } }
+// One kernel per format, so the format checks fold away at compile time.
+#define FORGE_MMA_KERNEL(name, f) FORGE_GLOBAL void name(const signed char* xq, const float* xds, const unsigned char* w, float* y,     unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb); }
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q6_k, 5u)
+#undef FORGE_MMA_KERNEL
+// Prefill attention, tiled (flash-attention style, fp32 SIMT): same contract as forge_attention for plain f32 K/V.
+// A 256-thread block takes BQ query rows of one head; key/value tiles of BK rows go through shared memory and are
+// shared by all BQ rows (the per-row kernel reads every key once per query row). Thread (ty = tid / 8, tx = tid % 8)
+// owns rows ty + 32i and, for the scores, keys tx + 8j of the tile; for the output, columns 4tx + 32c (float4s).
+// Online softmax per row: the row's 8 threads are adjacent lanes, so max and sum reduce with 3 shuffles.
+// Shared (floats): Q BQ x (DM + 4) | K BK x (DM + 4) | V BK x DM | P BQ x (BK + 1).
+FORGE_DEV float wmax8_(float v) { for (unsigned o = 4u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v = __builtin_fmaxf(v, w); } return v; }
+FORGE_DEV float wsum8_(float v) { for (unsigned o = 4u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v += w; } return v; }
+typedef float f32x4 __attribute__((ext_vector_type(4)));
+static __attribute__((device, always_inline)) inline void fa2_body(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq,
+    unsigned d, unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale, const unsigned BQ, const unsigned BK, const unsigned DM) {
+  const unsigned RT = BQ / 32u, KT = BK / 8u, CT = DM / 32u, QS = DM + 4u;
+  float* Qs = (float*)forge_dsm; float* Ks = Qs + BQ * QS; float* Vs = Ks + BK * QS; float* Ps = Vs + BK * DM;
+  unsigned tid = tid_(), tx = tid & 7u, ty = tid >> 3, bi = bid_(), h = bi % hq, q0 = (bi / hq) * BQ, kh = h / (hq / hk);
+  unsigned causal = flags & 1u, window = flags >> 7;
+  for (unsigned i = tid; i < BQ * (d / 4u); i += 256u) {   // Q tile (rows past s are zero)
+    unsigned r = i / (d / 4u), e = (i % (d / 4u)) * 4u; f32x4 x = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (q0 + r < s) x = *(const f32x4*)(q + ((unsigned long long)(q0 + r) * hq + h) * d + e);
+    *(f32x4*)(Qs + r * QS + e) = x; }
+  float m[2], lsum[2], o[2][32];
+#pragma unroll
+  for (unsigned i = 0; i < RT; ++i) { m[i] = -__builtin_inff(); lsum[i] = 0.0f;
+#pragma unroll
+    for (unsigned c = 0; c < 4u * CT; ++c) o[i][c] = 0.0f; }
+  int pos[2];
+#pragma unroll
+  for (unsigned i = 0; i < RT; ++i) pos[i] = (int)t - (int)s + (int)(q0 + ty + 32u * i);
+  // key range this tile needs: [jlo, jhi)
+  int last = (int)t - (int)s + (int)(q0 + BQ - 1u), first = (int)t - (int)s + (int)q0;
+  unsigned jhi = t; if (causal) jhi = last + 1 < 0 ? 0u : ((unsigned)(last + 1) < t ? (unsigned)(last + 1) : t);
+  unsigned jlo = 0u; if (window && first - (int)window + 1 > 0) jlo = (unsigned)(first - (int)window + 1);
+  jlo = jlo / BK * BK;
+  for (unsigned j0 = jlo; j0 < jhi; j0 += BK) {
+    bar_();   // previous tile's K/V/P reads are done
+    for (unsigned i = tid; i < BK * (d / 4u); i += 256u) {
+      unsigned r = i / (d / 4u), e = (i % (d / 4u)) * 4u; f32x4 x = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (j0 + r < t) x = *(const f32x4*)(k + ((unsigned long long)(j0 + r) * hk + kh) * d + e);
+      *(f32x4*)(Ks + r * QS + e) = x; }
+    for (unsigned i = tid; i < BK * (dv / 4u); i += 256u) {
+      unsigned r = i / (dv / 4u), e = (i % (dv / 4u)) * 4u; f32x4 x = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (j0 + r < t) x = *(const f32x4*)(v + ((unsigned long long)(j0 + r) * hk + kh) * dv + e);
+      *(f32x4*)(Vs + r * DM + e) = x; }
+    if (dv < DM) for (unsigned i = tid; i < BK * ((DM - dv) / 4u); i += 256u) {
+      unsigned r = i / ((DM - dv) / 4u), e = dv + (i % ((DM - dv) / 4u)) * 4u; *(f32x4*)(Vs + r * DM + e) = (f32x4){0.0f, 0.0f, 0.0f, 0.0f}; }
+    bar_();
+    float sc[2][4];
+#pragma unroll
+    for (unsigned i = 0; i < RT; ++i)
+#pragma unroll
+      for (unsigned j = 0; j < KT; ++j) sc[i][j] = 0.0f;
+    for (unsigned e = 0; e < d; e += 4u) {
+      f32x4 qa[2], ka[4];
+#pragma unroll
+      for (unsigned i = 0; i < RT; ++i) qa[i] = *(const f32x4*)(Qs + (ty + 32u * i) * QS + e);
+#pragma unroll
+      for (unsigned j = 0; j < KT; ++j) ka[j] = *(const f32x4*)(Ks + (tx + 8u * j) * QS + e);
+#pragma unroll
+      for (unsigned i = 0; i < RT; ++i)
+#pragma unroll
+        for (unsigned j = 0; j < KT; ++j) {
+        sc[i][j] = fma_(qa[i].x, ka[j].x, sc[i][j]); sc[i][j] = fma_(qa[i].y, ka[j].y, sc[i][j]);
+        sc[i][j] = fma_(qa[i].z, ka[j].z, sc[i][j]); sc[i][j] = fma_(qa[i].w, ka[j].w, sc[i][j]); } }
+#pragma unroll
+    for (unsigned i = 0; i < RT; ++i) {
+      float mx = -__builtin_inff();
+#pragma unroll
+      for (unsigned j = 0; j < KT; ++j) {
+        int key = (int)(j0 + tx + 8u * j);
+        bool ok = key < (int)t && (!causal || key <= pos[i]) && (!window || pos[i] - key < (int)window);
+        sc[i][j] = ok ? sc[i][j] * scale : -__builtin_inff(); mx = __builtin_fmaxf(mx, sc[i][j]); }
+      mx = wmax8_(mx);
+      float mn = __builtin_fmaxf(m[i], mx), al = m[i] == -__builtin_inff() ? 0.0f : fexp(m[i] - mn), ps = 0.0f;
+#pragma unroll
+      for (unsigned j = 0; j < KT; ++j) { float p = sc[i][j] == -__builtin_inff() ? 0.0f : fexp(sc[i][j] - mn); ps += p;
+        Ps[(ty + 32u * i) * (BK + 1u) + tx + 8u * j] = p; }
+      ps = wsum8_(ps);
+      lsum[i] = lsum[i] * al + ps; m[i] = mn;
+#pragma unroll
+      for (unsigned c = 0; c < 4u * CT; ++c) o[i][c] *= al; }
+    bar_();   // P visible to the row's other threads
+    for (unsigned j = 0; j < BK; ++j) {
+      float p[2];
+#pragma unroll
+      for (unsigned i = 0; i < RT; ++i) p[i] = Ps[(ty + 32u * i) * (BK + 1u) + j];
+#pragma unroll
+      for (unsigned c = 0; c < CT; ++c) {
+        unsigned e = tx * 4u + 32u * c;   // columns past dv read zero-filled V (no break: o stays in registers)
+        f32x4 vv = *(const f32x4*)(Vs + j * DM + e);
+#pragma unroll
+        for (unsigned i = 0; i < RT; ++i) {
+          o[i][4u * c] = fma_(p[i], vv.x, o[i][4u * c]); o[i][4u * c + 1u] = fma_(p[i], vv.y, o[i][4u * c + 1u]);
+          o[i][4u * c + 2u] = fma_(p[i], vv.z, o[i][4u * c + 2u]); o[i][4u * c + 3u] = fma_(p[i], vv.w, o[i][4u * c + 3u]); } } } }
+#pragma unroll
+  for (unsigned i = 0; i < RT; ++i) {
+    unsigned r = q0 + ty + 32u * i; if (r >= s) continue;
+    float inv = lsum[i] > 0.0f ? 1.0f / lsum[i] : 0.0f; float* yp = y + ((unsigned long long)r * hq + h) * dv;
+#pragma unroll
+    for (unsigned c = 0; c < CT; ++c) { unsigned e = tx * 4u + 32u * c; if (e >= dv) continue;
+      f32x4 out = {o[i][4u * c] * inv, o[i][4u * c + 1u] * inv, o[i][4u * c + 2u] * inv, o[i][4u * c + 3u] * inv};
+      *(f32x4*)(yp + e) = out; } } }
+// d, dv <= 128: 64 query rows x 32-key tiles (75.5 KB shared); d, dv <= 256: 32 x 16 (68.5 KB). d, dv % 4 == 0.
+FORGE_GLOBAL void forge_attention_fa2_d128(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq, unsigned d,
+                                           unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
+  fa2_body(q, k, v, y, s, hq, d, t, hk, dv, flags, scale, 64u, 32u, 128u); }
+FORGE_GLOBAL void forge_attention_fa2_d256(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq, unsigned d,
+                                           unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
+  fa2_body(q, k, v, y, s, hq, d, t, hk, dv, flags, scale, 32u, 16u, 256u); }
+#endif
 #endif
 // Embedding lookup from encoded rows: one 256-thread block per index; out-of-range indices give zeros.
 FORGE_GLOBAL void forge_qgather(const float* idx, const unsigned char* w, float* y, unsigned n, unsigned d, unsigned fmt, unsigned rb, unsigned nrows) {
@@ -894,11 +1139,12 @@ def embed_images(files, out):
     """Write a header with the CUDA PTX and HIP code objects (used by grid/cuda.hpp); missing ones are empty."""
     def arr(name, data):
         return f"inline constexpr unsigned char {name}[] = {{" + "".join(str(b) + "," for b in data) + "0};"
-    ptx = b""; hsaco = []; cl = b""; spv = b""; metal = b""
+    ptx = b""; ptx80 = b""; hsaco = []; cl = b""; spv = b""; metal = b""
     for f in files:
         if not os.path.exists(f): continue
         base = os.path.basename(f)
-        if base.endswith(".ptx"): ptx = open(f, "rb").read()
+        if base.endswith(".sm80.ptx"): ptx80 = open(f, "rb").read()   # sm_80+ image (tensor-core kernels)
+        elif base.endswith(".ptx"): ptx = open(f, "rb").read()
         elif base.endswith(".hsaco"): hsaco.append((base.split(".")[1], open(f, "rb").read()))
         elif base.endswith(".cl"): cl = open(f, "rb").read()
         elif base.endswith(".spv"): spv = open(f, "rb").read()
@@ -907,6 +1153,8 @@ def embed_images(files, out):
              "namespace forge::gpu::cuda_hip::images {",
              "inline constexpr char ptx[] = {" + "".join(str(b if b < 128 else b - 256) + "," for b in ptx) + "0};",
              f"inline constexpr std::size_t ptx_size = {len(ptx)};",
+             "inline constexpr char ptx_sm80[] = {" + "".join(str(b if b < 128 else b - 256) + "," for b in ptx80) + "0};",
+             f"inline constexpr std::size_t ptx_sm80_size = {len(ptx80)};",
              "inline constexpr char opencl_c[] = {" + "".join(str(b if b < 128 else b - 256) + "," for b in cl) + "0};",
              f"inline constexpr std::size_t opencl_c_size = {len(cl)};",
              "inline constexpr char metal_src[] = {" + "".join(str(b if b < 128 else b - 256) + "," for b in metal) + "0};",

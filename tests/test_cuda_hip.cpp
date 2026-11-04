@@ -4,12 +4,14 @@
 #include <forge/gpu/cuda.hpp>
 #include <forge/graph/vulkan.hpp>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <functional>
 #include <string>
 
 using namespace forge;
@@ -27,9 +29,11 @@ static int images() {
     auto hip = cuda_hip::module_images(cuda_hip::api::hip);
     if (ptx.empty()) { std::puts("SKIP images: built without a GPU-capable clang"); return 77; }
     for (auto& [arch, img] : ptx) {
-        bool ok = has(img, ".version") && has(img, ".target sm_70");
-        for (auto op : kernel_ops) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL ptx: no entry forge_%s\n", op); ok = false; }
-        std::printf("%s ptx: %zu bytes, %zu kernels\n", ok ? "ok  " : "FAIL", img.size(), std::size(kernel_ops)); fails += !ok;
+        const bool sm80 = arch == "ptx sm_80";   // the sm_80 image adds the int8 tensor-core prefill matmul
+        bool ok = has(img, ".version") && has(img, sm80 ? ".target sm_80" : ".target sm_70");
+        for (auto op : kernel_ops) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
+        if (sm80) for (auto op : {"qmatmul_mma_q8_0", "qmatmul_mma_q4_k", "qmatmul_mma_q6_k", "quant_q8r"}) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
+        std::printf("%s %s: %zu bytes, %zu kernels\n", ok ? "ok  " : "FAIL", arch.c_str(), img.size(), std::size(kernel_ops)); fails += !ok;
     }
     for (auto& [arch, img] : hip) {
         bool elf = img.size() > 64 && std::memcmp(img.data(), "\x7f" "ELF", 4) == 0;
@@ -49,7 +53,8 @@ static int images() {
 }
 
 // Quantised matmul_t kept encoded on the device vs the CPU quantised kernel (graph::qweights::gemm_nt).
-template<class RT> static int qmatmul_check(graph::registry& reg, const std::string& api) {
+// mma_runs: how many prefill matmuls ran on the int8 tensor-core kernel so far (it quantises x like the MMVQ path).
+template<class RT> static int qmatmul_check(graph::registry& reg, const std::string& api, const std::function<std::size_t()>& mma_runs) {
     if (!reg.device_qgemm) { std::printf("note %s: no device quantised matmul\n", api.c_str()); return 0; }
     int fails = 0, n = 0;
     for (std::string cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) for (std::size_t rows : {1, 3, 6, 16, 70, 130}) {   // >= 16 rows: the tiled MMQ kernel
@@ -66,10 +71,12 @@ template<class RT> static int qmatmul_check(graph::registry& reg, const std::str
         tensor_view og; og.data = yg.data(); og.shape = {i64(rows), i64(cols)};
         tensor_view oc; oc.data = yc.data(); oc.shape = og.shape;
         std::vector<tensor_view> ins{xv, wv};
+        const std::size_t mma0 = mma_runs();
         reg.device_qgemm->fn(ins, og, {});
+        const bool mma = mma_runs() != mma0;
         // rows < 16 on q8_0/q4_k/q6_k: the MMVQ path quantises x to q8_1 (32-value blocks, d = amax/127) like llama.cpp,
         // so the reference uses the same rounded activations.
-        const bool mmvq = rows < 16 && (cn == "q8_0" || cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0");
+        const bool mmvq = mma || (rows < 16 && (cn == "q8_0" || cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0"));
         std::vector<float> xr(x);
         if (mmvq) for (std::size_t b = 0; b < xr.size(); b += 32) {
             float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xr[b + i]));
@@ -127,13 +134,15 @@ static int state_ops_check(graph::registry& reg, const std::string& api) {
     return ok ? 0 : 1;
 }
 
-// attention at the shapes the split-K decode kernels (forge_attention_dec + _comb) take: head dims a multiple of 32
-// up to 256 and rows x heads <= 256, with GQA, causal prefill and decode, against the reference.
+// attention against the reference: the split-K decode kernels' shapes (forge_attention_dec + _comb: head dims a
+// multiple of 32 up to 256, rows x heads <= 256) and prefill shapes for the tiled kernel; GQA, causal and not.
 template<class RT> static int attention_dec_check(RT& rt, const std::string& api) {
     int fails = 0, n = 0;
     struct cfg { i64 s, t, hq, hk, d; bool causal; };
     for (auto c : {cfg{1, 1, 4, 2, 32, true}, cfg{1, 37, 4, 2, 32, true}, cfg{6, 6, 4, 2, 32, true}, cfg{5, 12, 8, 2, 64, true},
-                   cfg{1, 300, 16, 4, 128, true}, cfg{3, 9, 4, 4, 32, false}, cfg{16, 16, 8, 8, 32, true}}) {
+                   cfg{1, 300, 16, 4, 128, true}, cfg{3, 9, 4, 4, 32, false}, cfg{16, 16, 8, 8, 32, true},
+                   // prefill shapes (rows x heads > 256: the tiled forge_attention_fa2_* kernels on the sm_80 image)
+                   cfg{100, 100, 8, 2, 128, true}, cfg{70, 90, 4, 4, 256, true}, cfg{40, 40, 8, 4, 64, false}, cfg{130, 130, 4, 1, 96, true}}) {
         auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.613f + ph); return v; };
         tensor q({c.s, c.hq, c.d}), k({c.t, c.hk, c.d}), v({c.t, c.hk, c.d}), y({c.s, c.hq, c.d});
         q.data = rnd(q.data.size(), 1); k.data = rnd(k.data.size(), 2); v.data = rnd(v.data.size(), 3);
@@ -147,7 +156,7 @@ template<class RT> static int attention_dec_check(RT& rt, const std::string& api
         if (!(worst < 1e-4)) { std::printf("FAIL %s.attention s %lld t %lld hq %lld hk %lld d %lld: worst abs error %.3g\n", api.c_str(),
                                                 (long long)c.s, (long long)c.t, (long long)c.hq, (long long)c.hk, (long long)c.d, worst); ++fails; }
     }
-    std::printf("%s %d/%d %s decode-attention shapes match the reference\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    std::printf("%s %d/%d %s attention shapes match the reference\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails;
 }
 
@@ -160,7 +169,9 @@ template<class RT, class Open> static int device_t(Open open) {
     int dec_fails = 0;
     if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); })
         if (api == "cuda" || api == "hip") dec_fails = attention_dec_check(*rt, api);
-    auto reg = graph::gpu_registry(std::shared_ptr<RT>(std::move(rt)));
+    auto shared = std::shared_ptr<RT>(std::move(rt));
+    auto reg = graph::gpu_registry(shared);
+    auto mma_runs = [&]() -> std::size_t { auto d = shared->dispatches(); auto it = d.find("qmatmul_mma"); return it == d.end() ? 0 : it->second; };
     int fails = 0, n = 0;
     for (std::size_t i = 0; i < ops::op_count; ++i) for (auto& l : reg->lowerings(ops::op(i))) {
         if (l.name.rfind(api + ".", 0) != 0) continue;
@@ -169,7 +180,7 @@ template<class RT, class Open> static int device_t(Open open) {
     }
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     fails += dec_fails;
-    fails += qmatmul_check<RT>(*reg, api);
+    fails += qmatmul_check<RT>(*reg, api, mma_runs);
     fails += state_ops_check(*reg, api);
     return fails ? 1 : 0;
 }
@@ -326,9 +337,48 @@ template<class Open> static int memory_t(Open open) {
     return fails ? 1 : 0;
 }
 
+// test_cuda_hip bench <codec> <rows> <cols> <k> [reps]: time one quantised matmul on the device (x and y stay resident
+// inside a run, so only the kernels are timed). Not part of ctest; for kernel work (e.g. q4_k 512 25600 5120).
+static int bench_qmm(int argc, char** argv) {
+    if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip bench <codec> <rows> <cols> <k> [reps]\n"); return 2; }
+    std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
+    if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    const auto* c = graph::codecs::find(argv[2]);
+    if (!c) { std::fprintf(stderr, "unknown codec %s\n", argv[2]); return 2; }
+    const std::size_t rows = std::stoul(argv[3]), cols = std::stoul(argv[4]), k = std::stoul(argv[5]), rb = c->bytes(k);
+    const int reps = argc > 6 ? std::stoi(argv[6]) : 20;
+    std::vector<float> wrow(k), x(rows * k), y(rows * cols);
+    std::vector<std::uint8_t> enc(cols * rb);
+    for (std::size_t j = 0; j < cols; ++j) {
+        for (std::size_t i = 0; i < k; ++i) wrow[i] = std::sin(float(j * k + i) * 0.731f) * 0.05f;
+        c->encode(wrow.data(), k, enc.data() + j * rb);
+    }
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+    std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : c->name == "q5_k" ? 4 : 0;
+    tensor_view xv{x.data(), {i64(rows), i64(k)}}, yv{y.data(), {i64(rows), i64(cols)}};
+    rt->begin_run();
+    rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv);   // upload + warm up
+    rt->wait();
+    // single timed calls, fastest kept: the GPU may be shared, and the minimum best approximates an idle device
+    std::vector<double> ts;
+    for (int i = 0; i < reps; ++i) {
+        auto t0 = std::chrono::steady_clock::now();
+        rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv); rt->wait();
+        ts.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+    }
+    std::sort(ts.begin(), ts.end()); const double us = ts.front(), med = ts[ts.size() / 2];
+    rt->end_run();
+    auto d = rt->dispatches(); std::string path;
+    for (const char* p : {"qmatmul_mma", "qmatmul_mmq", "qmatmul_q81"}) if (d.count(p)) path = p;
+    std::printf("%s rows %zu cols %zu k %zu: min %.1f us (median %.1f), %.1f TOPS, %.0f GB/s weights (%s)\n", argv[2], rows, cols, k, us, med,
+                2.0 * double(rows) * double(cols) * double(k) / us / 1e6, double(enc.size()) / us / 1e3, path.c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
+    if (mode == "bench") return bench_qmm(argc, argv);
     auto cu = [](cuda_hip::api a) { return [a](std::string* w, int o) { return cuda_hip::runtime::open(a, w, o); }; };
     auto cl = [](std::string* w, int o) { return forge::gpu::ocl::runtime::open(w, o); };
     auto ze = [](std::string* w, int o) { return forge::gpu::ze::runtime::open(w, o); };
