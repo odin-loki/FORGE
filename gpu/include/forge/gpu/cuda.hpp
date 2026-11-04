@@ -451,6 +451,7 @@ public:
     std::set<void*> mma_attr_;   // kernels (qmatmul_mma_*, attention_fa2_*) whose dynamic shared memory limit was raised
     static std::string mma_fn(std::uint32_t fmt, unsigned bt = 64) {
         return std::string(bt == 128 ? "forge_qmatmul_mma128_" : "forge_qmatmul_mma_") + (fmt == 1 ? "q8_0" : fmt == 6 ? "q8_0g" : fmt == 2 ? "q4_k" : "q6_k"); }
+    static unsigned mma_ns() { static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_STAGES"); return e && std::string(e) == "2" ? 2u : 1u; }(); return v; }   // $FORGE_MMA_STAGES=2: double-buffered q4_k (opt-in; no gain on an RTX 3090)
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
         static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
     std::uint64_t q8r_ = 0; std::size_t q8r_cap_ = 0;   // int8 activation rows + per-group (d, d*sum) for the mma path
@@ -542,8 +543,10 @@ public:
                 // so 128 tokens give each warp twice the work per weight fragment ($FORGE_MMA_BT=64|128 forces one)
                 const unsigned want = mma_bt() ? mma_bt() : fmt == 2 ? 64u : 128u;
                 const unsigned bt = rows >= 128 && want == 128 && has_fn_locked(mma_fn(fmt, 128)) ? 128u : 64u;
-                const unsigned smem = bt * 336 + 8192 + (fmt == 2 ? 144u : fmt == 5 ? 240u : 272u) * 128;
-                void* mf = function(mma_fn(fmt, bt));
+                // q4_k at 64 tokens: the double-buffered kernel (copies the next k-chunk while computing this one)
+                const bool ns2 = fmt == 2 && bt == 64 && mma_ns() == 2 && has_fn_locked("forge_qmatmul_mma2_q4_k");
+                const unsigned smem = (ns2 ? 2u : 1u) * (bt * 336 + (fmt == 2 ? 144u : fmt == 5 ? 240u : 272u) * 128) + 8192;
+                void* mf = function(ns2 ? std::string("forge_qmatmul_mma2_q4_k") : mma_fn(fmt, bt));
                 if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
                 unsigned grid = ((rows + bt - 1) / bt) * ((cols + 127) / 128);
                 if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");

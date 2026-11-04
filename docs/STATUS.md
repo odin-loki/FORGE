@@ -35,7 +35,7 @@ found and tested. The other shells in the job's install list were not present in
 | Backend | Real hardware | Mock / software | CI |
 |---|---|---|---|
 | CPU | every platform above | — | all jobs |
-| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31) and native Windows 11, CUDA 13.2 driver (2026-11-04) | mock driver (`test_gpu_*cuda_mock`) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
+| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31, 2026-11-05) and native Windows 11, CUDA 13.2 driver (2026-11-04) | mock driver (`test_gpu_*cuda_mock`) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
 | HIP | **never** | mock driver | mocks pass on Linux |
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
@@ -58,6 +58,19 @@ CI log because ctest only prints output on failure.
 
 HIP on that machine: mock only (no ROCm runtime).
 
+### CUDA performance on RTX 3090 (2026-11-05)
+
+Idle RTX 3090, Windows 11 host, WSL2 Ubuntu, clang 23, CUDA 13 driver 610.88. 512-token prefill and 128-token
+decode, tok/s. llama.cpp is `llama-bench` at bc428e4 on the same GGUF file; FORGE imports that GGUF to `.fpk`.
+"Before" is main before the `cuda-mma-prefill` branch.
+
+| Model (Q4_K_M) | Prefill before → after | llama.cpp prefill | Decode before → after | llama.cpp decode |
+|---|---|---|---|---|
+| Qwen3.5 9B | 326 → 2720 | 4740 | 75.6 → 107.5 | 120.5 |
+| Goedel-Prover-V2 32B (Qwen3) | 88 → 839 | 1360 | 26.2 → 35.3 | 38.4 |
+
+Greedy output is identical with CUDA graphs on and off.
+
 ## Known gaps
 
 - iOS: built in CI, never run. The Swift package and XCTest have not been run.
@@ -78,6 +91,19 @@ HIP on that machine: mock only (no ROCm runtime).
 ## Changelog of checks
 
 Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-05 (branch `cuda-mma-prefill`, RTX 3090)
+- CUDA prefill and decode speedups; numbers in [CUDA performance](#cuda-performance-on-rtx-3090-2026-11-05).
+  A second PTX image for `sm_80` (tried first, `sm_70` fallback) carries int8 tensor-core prefill matmul for
+  q8_0/q4_k/q6_k and tiled prefill attention. Gated DeltaNet keeps its state in registers. Decode MMVQ uses a
+  4-warp block per output column, with q6_k padded to 224-byte blocks and q8_0 regrouped on upload. CUDA graph
+  capture is now on by default (`FORGE_GRAPHS=0` turns it off). Less host work per decode token: no device fetch
+  before overwriting an input, no sync after uploads, logits read in place, plain greedy takes the argmax directly.
+- Fixed: a destroyed plan left its pinned constants resident on the device, so a later buffer at the same host
+  address could find a stale entry; `~plan` now forgets them and `forget` drops their pin records.
+- Full Linux ctest passes on that machine, including the CUDA/HIP mock goldens and the tiny Qwen3.5 golden
+  against transformers. `test_cuda_hip` adds prefill attention shapes, three delta_rule shapes, an MMA-aware
+  quantised matmul reference and an `sm_80` image check.
 
 ### 2026-11-04
 - PR #53 merged as ccc0a7d. Its last PR run (41802863931) passed all 11 CI jobs: linux-gcc, linux-clang,

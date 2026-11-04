@@ -614,11 +614,13 @@ FORGE_DEV unsigned smem_addr(const void* p) { unsigned long long a; asm("cvta.to
 FORGE_DEV void cpa16(void* d, const void* s, unsigned n) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(smem_addr(d)), "l"(s), "r"(n) : "memory"); }
 FORGE_DEV void cpa8(void* d, const void* s, unsigned n) { asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(smem_addr(d)), "l"(s), "r"(n) : "memory"); }
 FORGE_DEV void cpa_wait() { asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;" ::: "memory"); }
-// BT tokens per block (64 or 128; warp tile 16 weight rows x BT). Shared: Xq BT x 272 | Xs 8 x BT x 2 floats | Wm 8 KB | Wr.
+// BT tokens per block (64 or 128; warp tile 16 weight rows x BT); NS shared-memory stages (2: chunk kb + 256 is copied
+// with cp.async while chunk kb is computed). Shared: NS x [Xq BT x 272 | Xs 8 x BT x 2 floats | Wr 128 x stride] | Wm 8 KB.
 static __attribute__((device, always_inline)) inline void mma_body(const signed char* xq, const float* xds, const unsigned char* w, float* y,
-                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT) {
-  unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + BT * 272u); float* Wm = (float*)(forge_dsm + BT * 336u);
-  unsigned char* Wr = forge_dsm + BT * 336u + 8192u;
+                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT, const unsigned NS) {
+  const unsigned SB = BT * 336u + 128u * mma_wstride(fmt);   // bytes per stage
+  float* Wm = (float*)(forge_dsm + NS * SB);
+  unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + BT * 272u); unsigned char* Wr = forge_dsm + BT * 336u;
   unsigned t = tid_(), wp = t >> 5, l = t & 31u, gid = l >> 2, tig = l & 3u;
   unsigned ntb = (rows + BT - 1u) / BT, bi = bid_(), t0 = (bi % ntb) * BT, c0 = (bi / ntb) * 128u, nbk = k / 32u;
   unsigned wsb = mma_wstride(fmt), bsz = fmt == 2u ? 144u : fmt == 5u ? 224u : 272u, nch = bsz / 16u;
@@ -627,30 +629,34 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
   for (unsigned n = 0; n < BT / 8u; ++n)
 #pragma unroll
     for (unsigned e = 0; e < 4u; ++e) acc[n][e] = 0.0f;
-  for (unsigned kb = 0; kb < k; kb += 256u) {
-    // stage chunk kb: activations, their scales and the raw weight blocks go global -> shared with cp.async (two
-    // resident blocks per SM overlap one block's loads with the other's mmas)
-#pragma unroll
-    for (unsigned j = 0; j < BT / 16u; ++j) { unsigned i = t + 256u * j, r = i >> 4, ch = i & 15u; bool ok = t0 + r < rows;
-      cpa16(Xq + r * 68u + ch * 4u, ok ? (const void*)(xq + (unsigned long long)(t0 + r) * k + kb + ch * 16u) : (const void*)xq, ok ? 16u : 0u); }
-#pragma unroll
-    for (unsigned j = 0; j < BT / 32u; ++j) { unsigned i = t + 256u * j, r = i >> 3, g = i & 7u; bool ok = t0 + r < rows;
-      cpa8(Xs + (g * BT + r) * 2u, ok ? (const void*)(xds + 2ull * ((unsigned long long)(t0 + r) * nbk + (kb >> 5) + g)) : (const void*)xds, ok ? 8u : 0u); }
+#define FORGE_MMA_STAGE(KB, XQ, XS, WR) { \
+    _Pragma("unroll") for (unsigned j = 0; j < BT / 16u; ++j) { unsigned i = t + 256u * j, r = i >> 4, ch = i & 15u; bool ok = t0 + r < rows; \
+      cpa16((XQ) + r * 68u + ch * 4u, ok ? (const void*)(xq + (unsigned long long)(t0 + r) * k + (KB) + ch * 16u) : (const void*)xq, ok ? 16u : 0u); } \
+    _Pragma("unroll") for (unsigned j = 0; j < BT / 32u; ++j) { unsigned i = t + 256u * j, r = i >> 3, g = i & 7u; bool ok = t0 + r < rows; \
+      cpa8((XS) + (g * BT + r) * 2u, ok ? (const void*)(xds + 2ull * ((unsigned long long)(t0 + r) * nbk + ((KB) >> 5) + g)) : (const void*)xds, ok ? 8u : 0u); } \
+    if (fmt != 1u) { _Pragma("unroll") for (unsigned j = 0; j < 9u; ++j) { unsigned i = t + 256u * j, cc = i / nch, ch = i % nch; \
+      if (cc < 128u) { bool ok = c0 + cc < cols; \
+        cpa16((WR) + cc * wsb + ch * 16u, ok ? (const void*)(w + (unsigned long long)(c0 + cc) * rb + ((KB) >> 8) * bsz + ch * 16u) : (const void*)w, ok ? 16u : 0u); } } } \
+    asm volatile("cp.async.commit_group;" ::: "memory"); }
+  if (NS == 2u) FORGE_MMA_STAGE(0u, Xq, Xs, Wr)
+  for (unsigned kb = 0, st = 0; kb < k; kb += 256u, st ^= NS - 1u) {
+    unsigned* xqs = (unsigned*)(forge_dsm + st * SB); float* xss = (float*)(forge_dsm + st * SB + BT * 272u); unsigned char* wrs = forge_dsm + st * SB + BT * 336u;
+    if (NS == 2u && kb + 256u < k) {   // copy the next chunk into the other stage, then wait for this one only
+      FORGE_MMA_STAGE(kb + 256u, (unsigned*)(forge_dsm + (st ^ 1u) * SB), (float*)(forge_dsm + (st ^ 1u) * SB + BT * 272u), forge_dsm + (st ^ 1u) * SB + BT * 336u)
+      asm volatile("cp.async.wait_group 1;" ::: "memory");
+    } else if (NS == 2u) asm volatile("cp.async.wait_group 0;" ::: "memory");
+    else FORGE_MMA_STAGE(kb, xqs, xss, wrs)
     unsigned c = t >> 1, h = t & 1u, gc = c0 + c;
-    if (fmt != 1u) {
-#pragma unroll
-      for (unsigned j = 0; j < 9u; ++j) { unsigned i = t + 256u * j, cc = i / nch, ch = i % nch;
-        if (cc < 128u) { bool ok = c0 + cc < cols;
-          cpa16(Wr + cc * wsb + ch * 16u, ok ? (const void*)(w + (unsigned long long)(c0 + cc) * rb + (kb >> 8) * bsz + ch * 16u) : (const void*)w, ok ? 16u : 0u); } }
-    } else {   // q8_0: 34-byte blocks are not 16-byte aligned; copy them byte-wise into int8 rows
-      unsigned char* dst = Wr + c * 272u;
+    if (fmt == 1u) {   // q8_0: 34-byte blocks are not 16-byte aligned; copy them byte-wise into int8 rows
+      unsigned char* dst = wrs + c * 272u;
       for (unsigned g = 4u * h; g < 4u * h + 4u; ++g) {
         if (gc < cols) { const unsigned char* b = w + (unsigned long long)gc * rb + ((kb >> 5) + g) * 34u;
           Wm[c * 16u + g] = h2f(ld16(b)); for (unsigned i = 0; i < 32u; ++i) dst[g * 32u + i] = b[2u + i]; }
         else { Wm[c * 16u + g] = 0.0f; for (unsigned i = 0; i < 32u; ++i) dst[g * 32u + i] = 0u; } }
     }
-    cpa_wait();
+    if (NS == 1u) asm volatile("cp.async.wait_group 0;" ::: "memory");
     bar_();
+    Xq = xqs; Xs = xss; Wr = wrs;
     if (fmt == 2u) {   // per-group scales from the raw headers: 128 rows x 2 halves of 4 groups
       const unsigned char* b = Wr + c * 144u; float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u));
       for (unsigned j = 4u * h; j < 4u * h + 4u; ++j) { unsigned s0, m0; scmin(j, b + 4u, &s0, &m0);
@@ -708,17 +714,19 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
     for (unsigned e = 0; e < 4u; ++e) {
       unsigned col = c0 + ra + 8u * (e >> 1), tok = t0 + n * 8u + tig * 2u + (e & 1u);
       if (tok < rows && col < cols) y[(unsigned long long)tok * cols + col] = acc[n][e]; } }
+#undef FORGE_MMA_STAGE
 // One kernel per format, so the format checks fold away at compile time.
-#define FORGE_MMA_KERNEL(name, f, bt, nb) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
-    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt); }
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u, 64u, 2)
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0g, 6u, 64u, 2)
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u, 64u, 2)
-FORGE_MMA_KERNEL(forge_qmatmul_mma_q6_k, 5u, 64u, 2)
-FORGE_MMA_KERNEL(forge_qmatmul_mma128_q8_0, 1u, 128u, 1)
-FORGE_MMA_KERNEL(forge_qmatmul_mma128_q8_0g, 6u, 128u, 1)
-FORGE_MMA_KERNEL(forge_qmatmul_mma128_q4_k, 2u, 128u, 1)
-FORGE_MMA_KERNEL(forge_qmatmul_mma128_q6_k, 5u, 128u, 1)
+#define FORGE_MMA_KERNEL(name, f, bt, nb, ns) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
+    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, ns); }
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u, 64u, 2, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0g, 6u, 64u, 2, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u, 64u, 2, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma_q6_k, 5u, 64u, 2, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q8_0, 1u, 128u, 1, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q8_0g, 6u, 128u, 1, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q4_k, 2u, 128u, 1, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma128_q6_k, 5u, 128u, 1, 1u)
+FORGE_MMA_KERNEL(forge_qmatmul_mma2_q4_k, 2u, 64u, 1, 2u)   // q4_k, 64 tokens, double-buffered (88 KB of shared memory)
 #undef FORGE_MMA_KERNEL
 // Prefill attention, tiled (flash-attention style, fp32 SIMT): same contract as forge_attention for plain f32 K/V.
 // A 256-thread block takes BQ query rows of one head; key/value tiles of BK rows go through shared memory and are

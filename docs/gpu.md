@@ -14,7 +14,7 @@ Nothing links against a vendor SDK. Each runtime `dlopen`s its driver library at
 | Output | Used by | Built with |
 |--------|---------|------------|
 | one GLSL compute shader per kernel (33) | Vulkan | `glslangValidator` → SPIR-V, embedded |
-| `kernels.cu` | CUDA, HIP | clang, no SDK: PTX for `sm_70` (JIT-compiled by the driver); AMDGPU code objects for `FORGE_HIP_ARCHS` (default `gfx90a gfx942 gfx1100`, needs lld) |
+| `kernels.cu` | CUDA, HIP | clang, no SDK: two PTX images, `sm_70` and `sm_80` (JIT-compiled by the driver; the `sm_80` one adds the tensor-core kernels); AMDGPU code objects for `FORGE_HIP_ARCHS` (default `gfx90a gfx942 gfx1100`, needs lld) |
 | `kernels.cl` | OpenCL (built by the driver at open), Level Zero (offline to SPIR-V with clang + `llvm-spirv`) | |
 | `kernels.metal` | Metal (compiled at open with `newLibraryWithSource`) | |
 
@@ -40,31 +40,36 @@ Every driver allocation of Vulkan, CUDA, HIP, OpenCL and Level Zero is charged t
 ## CUDA and HIP
 One runtime class (`gpu::cuda_hip::runtime`) serves both APIs. CUDA loads `libcuda.so.1` / `nvcuda.dll`; HIP loads `libamdhip64.so.6` (or `.5`, or unversioned) / `amdhip64.dll`. Each runtime has one non-blocking stream.
 
+CUDA embeds two PTX images built from the same `kernels.cu`: `ptx sm_80` (`kernels.sm80.ptx`) and `ptx` (`sm_70`). The runtime tries `sm_80` first and falls back to `sm_70` on a device that rejects it. Kernels guarded by `__CUDA_ARCH__ >= 800` (the tensor-core matmul and the tiled prefill attention) exist only in the `sm_80` image; everything else is in both. `FORGE_CUDA_IMAGE=ptx` (or `ptx sm_80`) loads only that image. `image_arch()` reports the one in use.
+
 ### Kernel selection
 `run_op` and the quantised entry points choose kernels by shape:
 
 | Work | Kernel | When | Disable |
 |------|--------|------|---------|
-| Attention, prefill | `forge_attention_fa`: a block per (query row, head), tiled online softmax | default | `FORGE_GPU_NO_FA` (any value) falls back to `forge_attention` |
+| Attention, prefill (tiled) | `forge_attention_fa2_d128` / `_d256` (`sm_80` image): fp32 flash attention, 64 (head dim ≤ 128) or 32 (≤ 256) query rows per block, K/V tiles in shared memory | rows ≥ 16, plain f32 KV, head dims multiples of 4 and ≤ 256, split-K decode path not taken | `FORGE_GPU_NO_FA` (any value) |
+| Attention, prefill | `forge_attention_fa`: a block per (query row, head), tiled online softmax | otherwise | `FORGE_GPU_NO_FA` (any value) falls back to `forge_attention` |
 | Attention, decode | `forge_attention_dec` + `forge_attention_comb`: split-K over 16 key chunks, then a combine pass | rows × heads ≤ 256, f32 KV, head dims multiples of 32 and ≤ 256 | `FORGE_ATTN_DEC=0` |
-| Quantised matmul_t, many rows | `forge_qmatmul_mmq`: 64×64 tiles | rows ≥ `FORGE_MMQ_MIN_ROWS` (default 16) | `FORGE_MMQ_MIN_ROWS=0` |
-| Quantised matmul_t, few rows (decode) | `forge_quant_q81` + `forge_qmatmul_q81`: activations quantised to q8_1, dp4a dot, a warp per output column | q8_0, q4_k, q6_k weights | `FORGE_MMVQ=0` |
+| Quantised matmul_t, many rows (tensor cores) | `forge_quant_q8r` (activations to int8 per 32 values, plus per-group `d` and `d·sum`) + `forge_qmatmul_mma_{q8_0,q8_0g,q4_k,q6_k}` (`sm_80` image): int8 `mma.sync`, 128 weight rows × 64 tokens per block, `cp.async` staging; `forge_qmatmul_mma128_*` use 128-token tiles | rows ≥ `FORGE_MMQ_MIN_ROWS`, q8_0 / q4_k / q6_k, k % 256 = 0. q4_k uses 64-token tiles (two blocks per SM); q6_k and q8_0 use 128 when rows ≥ 128 | `FORGE_MMA=0` (falls back to MMQ); `FORGE_MMA_BT=64\|128` forces the token tile |
+| Quantised matmul_t, many rows | `forge_qmatmul_mmq`: 64×64 tiles | rows ≥ `FORGE_MMQ_MIN_ROWS` (default 16), MMA not used | `FORGE_MMQ_MIN_ROWS=0` |
+| Quantised matmul_t, few rows (decode) | `forge_quant_q81` + `forge_qmatmul_q81`: activations quantised to q8_1, dp4a dot, a 128-thread block per output column whose 4 warps split k (up to 4 activation rows per block) | q8_0, q4_k, q6_k weights | `FORGE_MMVQ=0` |
 | Quantised matmul_t, otherwise | `forge_qmatmul_t` | q5_k at few rows, or MMVQ off | |
 | Embedding gather from encoded rows | `forge_qgather` | q8_0, q4_k, q6_k, q5_k tables | `FORGE_GPU_QGATHER=0` |
 | rms_norm | `forge_rms_norm_b` (block per row) | when present | |
-| q8_1 fusion | `forge_rms_norm_q81`, `forge_silu_mul_q81` also write the q8_1 form of their output for the next matmul | decode rows inside a run, with MMVQ on | `FORGE_FUSE_Q81=0` |
+| q8_1 fusion | `forge_rms_norm_q81`, `forge_silu_mul_q81` also write the q8_1 form of their output for the next matmul. `forge_rms_norm_q81` reduces with warp shuffles and uses one 1024-thread block for a wide row (rows ≤ 4, cols ≥ 2048) | decode rows inside a run, with MMVQ on | `FORGE_FUSE_Q81=0` |
 | Broadcast add/sub/mul/div | `forge_bcast` | the smaller shape is a suffix of the larger | |
-| Gated DeltaNet state ops | `forge_delta_rule` (dk ≤ 256), `forge_causal_conv` (kernel width 1–9) | inside a run; state slot stays resident | `FORGE_GPU_NO_STATE_OPS` (any value) |
+| Gated DeltaNet state ops | `forge_delta_rule_r8` / `_r16` / `_r32`: the recurrent state in registers, a 256-thread block per (value head, 32 state columns) | CUDA (both images), inside a run; dk ∈ {64, 128, 256}, dv % 32 = 0 | `FORGE_DELTA_RULE_OLD` (any value) |
+| | `forge_delta_rule` (dk ≤ 256), `forge_causal_conv` (kernel width 1–9) | inside a run; state slot stays resident | `FORGE_GPU_NO_STATE_OPS` (any value) |
 | Device copies | `forge_copy2d` (concat), `forge_copy_words` (copies inside a captured segment) | | |
 
-Encoded weights (q8_0, q4_k, q6_k, q5_k) are uploaded once and stay on the device. Consecutive decode matmuls that read the same activation reuse its q8_1 form instead of re-quantising.
+Encoded weights (q8_0, q4_k, q6_k, q5_k) are uploaded once and stay on the device. With the `sm_80` image and both MMA and MMVQ on, two codecs are repacked on upload so the kernels can use aligned 16-byte loads (k % 256 = 0 only): q6_k blocks are padded from 210 to 224 bytes (about 6.7% more device memory), and q8_0 is regrouped so each 8 blocks become 8 fp16 scales followed by 256 int8 values (272 bytes, the same size). Decode MMVQ reads both layouts; q4_k reads its 16-byte super-block header in one load. Consecutive decode matmuls that read the same activation reuse its q8_1 form instead of re-quantising.
 
 Attention supports the KV codecs `int8`, `fp8`, `tbq4` and `tbq3` (tbq only up to head dim 256). `tbq4p` and `tbq3p` run on the CPU only. The same holds for Vulkan.
 
 ### Graphs and replay (CUDA)
 - **User capture**: `capture_begin()`, `capture_end()` → id, `graph_launch(id)`. Streams are captured in relaxed mode so `run_op` may allocate while capturing. Needs the driver's graph API (`has_graphs()`); both CUDA and HIP export it.
-- **Decode graphs** (`FORGE_GRAPHS=1`, CUDA only, opt-in). Inside a run, kernel launches are stream-captured in segments. A segment ends at a host copy, a free, a sync, or after `FORGE_GRAPH_SEG` kernels (default 64; 0 = no split). Each segment's exec graph is cached by index. On later tokens, if the sequence of kernels and launch shapes matches, only the kernel nodes whose arguments changed are patched (`cuGraphExecKernelNodeSetParams`) and the graph is relaunched, without capturing. This needs `cuFuncGetParamInfo` (CUDA 12.4+). Without it, or with `FORGE_GRAPH_REPLAY=0`, each segment is re-captured and refreshed with `cuGraphExecUpdate`.
-- **Whole-run replay** (`FORGE_GPU_REPLAY` set, experimental, opt-in; also needs `FORGE_GRAPHS=1` and the fixed arena). When every step of a run was a recorded kernel, the runtime predicts the next run's arguments from the last two (decode moves the KV write row and attention length by one each token) and relaunches all segments without the executor. A run becomes replayable only after a real run confirmed a prediction. The executor does one real run every `FORGE_REPLAY_VERIFY` runs (default 32). A wrong prediction disables replay for that plan and prints a warning.
+- **Decode graphs** (CUDA only, on by default; `FORGE_GRAPHS=0` turns them off). Inside a run, kernel launches are stream-captured in segments. A segment ends at a host copy, a free, a sync, or after `FORGE_GRAPH_SEG` kernels (default 64; 0 = no split). Each segment's exec graph is cached by index. On later tokens, if the sequence of kernels and launch shapes matches, only the kernel nodes whose arguments changed are patched (`cuGraphExecKernelNodeSetParams`) and the graph is relaunched, without capturing. This needs `cuFuncGetParamInfo` (CUDA 12.4+). Without it, or with `FORGE_GRAPH_REPLAY=0`, each segment is re-captured and refreshed with `cuGraphExecUpdate`.
+- **Whole-run replay** (`FORGE_GPU_REPLAY` set, experimental, opt-in; also needs decode graphs on and the fixed arena). When every step of a run was a recorded kernel, the runtime predicts the next run's arguments from the last two (decode moves the KV write row and attention length by one each token) and relaunches all segments without the executor. A run becomes replayable only after a real run confirmed a prediction. The executor does one real run every `FORGE_REPLAY_VERIFY` runs (default 32). A wrong prediction disables replay for that plan and prints a warning.
 - **Fixed arena**: a plan's whole activation arena is held as one device buffer across runs, so every intermediate keeps its device address. Used when the arena is at most `FORGE_GPU_ARENA_MB` (default 1024; 0 = off).
 
 Freed device buffers are kept in a per-runtime pool for reuse, up to `FORGE_GPU_POOL_MB` (default 4096). The pool is the first thing given back under memory pressure.
@@ -127,15 +132,19 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 
 | Variable | Default | Backend | Effect |
 |----------|---------|---------|--------|
-| `FORGE_GPU_NO_FA` | unset | CUDA/HIP | Set: no flash-attention kernel |
+| `FORGE_CUDA_IMAGE` | unset | CUDA | `ptx` (sm_70) or `ptx sm_80`: load only that PTX image |
+| `FORGE_GPU_NO_FA` | unset | CUDA/HIP | Set: no flash-attention kernels (`forge_attention_fa`, `forge_attention_fa2_*`) |
 | `FORGE_ATTN_DEC` | on | CUDA/HIP | `0`: no split-K decode attention |
 | `FORGE_MMVQ` | on | CUDA/HIP | `0`: no q8_1/dp4a decode matmul |
-| `FORGE_MMQ_MIN_ROWS` | 16 | CUDA/HIP | Rows at which the tiled MMQ kernel is used; `0` disables it |
+| `FORGE_MMQ_MIN_ROWS` | 16 | CUDA/HIP | Rows at which the tiled MMA / MMQ kernels are used; `0` disables them |
+| `FORGE_MMA` | on | CUDA | `0`: no int8 tensor-core prefill matmul (and no q6_k/q8_0 repacking); MMQ is used instead |
+| `FORGE_MMA_BT` | per codec | CUDA | `64` or `128`: tokens per MMA block |
+| `FORGE_DELTA_RULE_OLD` | unset | CUDA | Set: use `forge_delta_rule` instead of the register-state kernels |
 | `FORGE_FUSE_Q81` | on | CUDA/HIP | `0`: rms_norm/silu_mul do not emit q8_1 |
 | `FORGE_GPU_QMATMUL` | on | CUDA/HIP | `0`: no device quantised matmul; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` |
 | `FORGE_GPU_QGATHER` | on | CUDA/HIP | `0`: no device quantised gather |
 | `FORGE_GPU_NO_STATE_OPS` | unset | CUDA/HIP | Set: DeltaNet state ops run on the host |
-| `FORGE_GRAPHS` | off | CUDA | `1`: capture decode runs into CUDA graph segments |
+| `FORGE_GRAPHS` | on | CUDA | `0`: do not capture decode runs into CUDA graph segments |
 | `FORGE_GRAPH_SEG` | 64 | CUDA | Kernels per captured segment; `0` = unlimited |
 | `FORGE_GRAPH_REPLAY` | on | CUDA | `0`: re-capture segments instead of patching kernel nodes |
 | `FORGE_GPU_REPLAY` | unset | CUDA | Set: experimental whole-run replay |
@@ -161,7 +170,7 @@ Test hooks, not for normal use: `FORGE_VK_SSBO_ALIGN` (emulate a stricter storag
 - **Level Zero** needs `llvm-spirv` at build time; without it `open()` says so. `opencl` on the same GPU is the alternative.
 - **Metal** builds only on Apple platforms (`FORGE_GPU_METAL`); elsewhere `open()` reports "not an Apple platform build". On Linux only an MSL syntax check runs (`gpu_compile_metal_syntax`). Metal has no graphs. Each op charges its buffers to the `metal:<ordinal>` memory pool while it runs; with unified memory and no residency there is nothing to evict, so an op that does not fit fails (see [memory.md](memory.md)).
 - Tested on hardware:
-  - **CUDA** on an NVIDIA RTX 3090. 2026-10-31 (WSL2, CUDA 13, clang 23.1.4): full ctest 104/104. 2026-11-04 (Windows 11, mingw-w64 build): `test_gpu_cuda` passed 31/31 lowerings against the oracle, 24/24 quantised matmul cases, 7/7 split-K decode-attention shapes, and delta_rule/causal_conv matched the CPU. The same day a bug was fixed where the split-K combine kernel was launched with dangling argument pointers (commit 7fe8a83); the 3090 had passed by luck, the mocks failed.
+  - **CUDA** on an NVIDIA RTX 3090. 2026-10-31 (WSL2, CUDA 13, clang 23.1.4): full ctest 104/104. 2026-11-04 (Windows 11, mingw-w64 build): `test_gpu_cuda` passed 31/31 lowerings against the oracle, 24/24 quantised matmul cases, 7/7 split-K decode-attention shapes, and delta_rule/causal_conv matched the CPU. The same day a bug was fixed where the split-K combine kernel was launched with dangling argument pointers (commit 7fe8a83); the 3090 had passed by luck, the mocks failed. 2026-11-05 (WSL2, CUDA 13 driver 610.88, clang 23): the `sm_80` image (tensor-core prefill matmul, tiled prefill attention), register-state delta_rule and graphs on by default; full Linux ctest passes and greedy output is identical with graphs on and off. Prefill (512 tokens) / decode (128 tokens) tok/s on Q4_K_M GGUF weights, against llama.cpp `llama-bench` (bc428e4) on the same file: Qwen3.5 9B 2720 / 107.5 (llama.cpp 4740 / 120.5); Goedel-Prover-V2 32B (Qwen3) 839 / 35.3 (llama.cpp 1360 / 38.4). See [STATUS.md](STATUS.md).
   - **Vulkan** on Mesa lavapipe and SwiftShader only (software devices).
   - **Metal** on the GitHub `macos-latest` runner's GPU: `test_gpu_metal` passes in CI (oracle check of every `metal.*` lowering). The device model is not logged.
   - **HIP, OpenCL, Level Zero**: never on real hardware. HIP, OpenCL and Level Zero run against mock driver libraries (`tests/mock_cuda.c` serves CUDA and HIP, `mock_opencl.c`, `mock_ze.c`) in `test_gpu_*_mock`, `test_gpu_memory_*_mock` and `golden_tiny_llama_*_mock`. The OpenCL and Level Zero mocks compile the generated OpenCL C as C and run it. The AMD code objects are only compile-checked (`gpu_compile_hip`).
