@@ -934,7 +934,10 @@ void install_builtins(Shared& sh) {
             auto end = timeout_ms ? os::monotonic_ns() + timeout_ms * 1000000 : 0;
             while (fb.f.wait_for(std::chrono::milliseconds(20)) != std::future_status::ready) {
                 in.step();   // CancelledError / limits while waiting
-                if (end && os::monotonic_ns() > end) in.raise("TimeoutError", "ProcessPool future: timed out waiting for the worker");
+                // step() reads the clock only every 256 calls, which is 5 s or more of these waits
+                auto now = os::monotonic_ns();
+                if (in.deadline_ns && now > in.deadline_ns) { in.deadline_ns = 0; in.raise("TimeoutError", "time limit reached"); }
+                if (end && now > end) in.raise("TimeoutError", "ProcessPool future: timed out waiting for the worker");
             }
             try { fb.got = fb.f.get(); } catch (...) { fb.err = std::current_exception(); }
         }
