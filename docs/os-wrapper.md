@@ -22,7 +22,7 @@ The scripting layer uses these headers for `run`, `proc`, `fs`, `os`, `time`, `n
 | `console.hpp` | `forge::os::console` | `is_tty`, `size`, `enable_vt`, `color_enabled`, `paint`, `mode_guard` (raw or no-echo), `read_password`, `confirm` |
 | `net.hpp` | `forge::os::net` | `resolve`, `interfaces`, `port_open`, `parse_url`, `http(request)`, `http_get` |
 | `file_watch_tree.hpp` | `forge::os` | `tree_watcher::open(root, tree_watch_opts)`, `poll(ms)` |
-| `service_control.hpp` | `forge::os::service` | `service_spec`, `validate`, `render_systemd_unit`, `render_launchd_plist`, `parse_launchctl_print`, `install`, `start`, `stop`, `query`, `uninstall` |
+| `service_control.hpp` | `forge::os::service` | `service_spec` (`scope`), `validate`, `render_systemd_unit`, `render_launchd_plist`, `render_task_xml`, `render_rcd_script`, `render_scm`, `parse_launchctl_print`, `install`, `start`, `stop`, `query`, `query_info`, `uninstall` |
 | `registry.hpp` | `forge::os::registry` | `get`, `set`, `set_as`, `value_type` (string, integer, string list, bytes; optional WOW64 `view`), `remove_value`, `remove_key`, `list` |
 | `devices.hpp` | `forge::os::devices` | `block()`, `pci()`, `usb()` |
 | `clipboard.hpp` | `forge::os::clipboard` | `available`, `get`, `set` |
@@ -103,10 +103,12 @@ Paths are UTF-8 everywhere; on Windows every call converts them to UTF-16, so no
   |---|---|---|---|---|---|
   | `release_info` | os-release | yes | `RtlGetVersion` (`version` "10" / "11" by build; NT version in `kernel_version`) | sysctl | sysctl |
   | `uptime_seconds` | `/proc/uptime` | yes | `GetTickCount64` | `kern.boottime` | `kern.boottime` |
-  | `load_average` | `getloadavg` | `/proc/loadavg` | unsupported (no run-queue average) | `getloadavg` | `getloadavg` |
+  | `load_average` | `getloadavg` | `/proc/loadavg` | emulated (below) | `getloadavg` | `getloadavg` |
   | `memory()` | `/proc/meminfo`; cgroup v2/v1 of this process (`/proc/self/cgroup`), tightest `memory.max` up the tree | yes | free = zeroed + free lists (else available − cache); page file as swap | free pages; `vm.swapusage` | `v_free_count`; swap from `vm.swap_info` |
   | `per_cpu_times`, `cpu_usage` | `/proc/stat` | yes | `NtQuerySystemInformationEx` per processor group | `host_processor_info` | `kern.cp_times` |
   | `self_usage`, `current_rss` | yes | yes | peak working set, page faults (soft and hard, in `minor_faults`) | yes | yes |
+
+  Windows keeps no run-queue average, so `load_average` emulates Linux's. The first call starts a background thread that never stops. Every 5 s it samples busy CPUs (from `GetSystemTimes` over the tick, times the active processors) plus threads waiting for a CPU (`\System\Processor Queue Length` through PDH; pdh.dll is loaded at run time, and the term is 0 without it). It folds each sample into 1, 5 and 15-minute averages with decay factors `exp(-5/60)`, `exp(-5/300)` and `exp(-5/900)`. The first call measures for 100 ms and seeds all three averages with that value, so early readings follow the current load instead of climbing from 0. Threads blocked on I/O (Linux's D state) are not counted.
 
 - **`console.hpp`.** `is_tty` (on Windows a real console, which `NUL` is not, or a mintty / MSYS2 / Cygwin pty pipe), `size` (falls back to `COLUMNS` / `LINES`), `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo; raw also enables VT input on Windows, so keys arrive as escape sequences), `read_password` (UTF-16 console input on Windows, returned as UTF-8), `confirm`.
 
@@ -127,16 +129,19 @@ Paths are UTF-8 everywhere; on Windows every call converts them to UTF-16, so no
 Limits and loss. kqueue holds a descriptor per watched path, capped at half the `RLIMIT_NOFILE` soft limit (at most 8192; `max_native_handles` or `file_watcher::set_max_handles` to change it); a directory or file past the cap, or any directory the native backend refuses, is polled every 100 ms instead (`polled_dirs()`, backend "native+polling"). Windows completes all directories through one I/O completion port, so there is no 64-handle limit, and matches names case-insensitively. When the kernel drops events (inotify `IN_Q_OVERFLOW`, a Windows buffer overflow) `file_watcher::poll` returns `watch_kind::overflow` for each affected directory and `tree_watcher` rescans the whole tree. Directories are entered once by identity (device and inode; volume and file id on Windows), so symlink and junction loops are not followed. `file_watcher::remove(path)` drops a watch.
 
 ## Service control (`service_control.hpp`)
-A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_on_failure`, `start_at_login`, optional `dir`) becomes a per-user service:
+A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_on_failure`, `start_at_login`, `scope`, optional `dir`) becomes a per-user service (`scope = service_scope::user`, the default) or a system one (`service_scope::system`, needs root or an elevated process):
 
-| Platform | Backend |
-|---|---|
-| Linux, FreeBSD with systemd | user unit in `$XDG_CONFIG_HOME/systemd/user`, driven by `systemctl --user` |
-| macOS | LaunchAgent plist in `~/Library/LaunchAgents`, driven by `launchctl bootstrap` / `kickstart` / `bootout` in `gui/<uid>`; `query` parses `launchctl print` |
-| Windows | Service Control Manager service through `sc.exe` (needs an elevated process) |
-| Android, iOS | unsupported |
+| Platform | User scope | System scope |
+|---|---|---|
+| Linux (systemd) | unit in `$XDG_CONFIG_HOME/systemd/user`, `systemctl --user` | unit in `/etc/systemd/system`, `systemctl` |
+| macOS | LaunchAgent in `~/Library/LaunchAgents`, `launchctl bootstrap` / `kickstart` / `bootout` in `gui/<uid>`; `query` parses `launchctl print` | LaunchDaemon in `/Library/LaunchDaemons`, domain `system` |
+| Windows | Task Scheduler task with a logon trigger for the current user (`render_task_xml`, registered through the `ITaskService` COM API; ole32/oleaut32 loaded at run time) | Service Control Manager API (`render_scm`): `CreateServiceW`, description and restart failure actions through `ChangeServiceConfig2W`, `StartServiceW`, `ControlService`, `QueryServiceStatusEx`, `DeleteService` |
+| FreeBSD | unsupported (no per-user service manager) | rc.d script (`render_rcd_script`) in `/usr/local/etc/rc.d` running the program under `daemon(8)`; `sysrc <name>_enable`, `service <name> onestart` / `onestop` / `onestatus` |
+| Android, iOS | unsupported | unsupported |
 
-`render_systemd_unit` and `render_launchd_plist` return the file text without touching the system. `install` calls `validate`, which rejects control characters (a newline would inject unit directives), `=` in environment names and a systemd prefix character on `argv[0]`. Unit text is escaped per systemd.syntax: `ExecStart=` doubles `%` and `$`, C-escapes quotes and backslashes and writes a lone `;` as `\;`; `Environment=` doubles `%` only; `Description=` and `WorkingDirectory=` are verbatim. `query` returns `not_installed`, `stopped`, `running`, `failed` or `unknown`; on macOS a loaded but not running agent is `stopped` and one whose last exit was non-zero is `failed`. Setting `spec.dir` writes the unit elsewhere without registering it (the tests use this).
+`query_info` returns the state with the main process id and, for Windows services, tasks and launchd, the last exit code. Windows details: argv[0] is resolved through `PATH` and a `.bat` / `.cmd` program is refused. A service gets `env` as its registry `Environment` value; it has no working directory of its own, so `working_dir` travels as `FORGE_SERVICE_DIR` in that environment and `run_as_service` (`service.hpp`) changes to it (other programs must read it themselves). A task has a native working directory but no environment: with `env` set its action is Windows PowerShell with `-EncodedCommand` (base64 UTF-16, so nothing reaches a command line) that sets the variables and starts argv. `stop` ends the task's whole process tree; Task Scheduler alone stops only the action's process. Tasks run with the user's interactive token, so a console program shows a console window. A task's restart policy (`RestartOnFailure`, up to 999 times a minute apart) covers what Task Scheduler counts as failure, not every non-zero exit; a finished task with a non-zero result reads as `failed`. FreeBSD details: `daemon -P` keeps its own pid in `/var/run/<name>.pid`, so `stop` ends the supervisor and the program; `restart_on_failure` restarts after any exit (`-r -R 5`, daemon(8) has no failure-only mode); output goes to syslog; `working_dir` and `env` are applied by a `start_precmd`; environment names must be shell identifiers and service names map to rc variables with other characters turned into `_` (`rc_name`).
+
+`render_systemd_unit`, `render_launchd_plist`, `render_task_xml`, `render_rcd_script` and `render_scm` return the definition without touching the system. `install` calls `validate`, which rejects control characters (a newline would inject unit directives), `=` in environment names and a systemd prefix character on `argv[0]`. Unit text is escaped per systemd.syntax: `ExecStart=` doubles `%` and `$`, C-escapes quotes and backslashes and writes a lone `;` as `\;`; `Environment=` doubles `%` only; `Description=` and `WorkingDirectory=` are verbatim. Plist and task XML escape `& < > " '`. rc.d values are single-quoted sh words (`'` as `'\''`), and `command_args`, which rc.subr evals, is quoted twice. Windows command lines use MSVCRT quoting (argv[0] quoted when it has a space, so no unquoted-path hijack); PowerShell literals double `'` and its typographic variants. `query` returns `not_installed`, `stopped`, `running`, `failed` or `unknown`; on macOS a loaded but not running agent is `stopped` and one whose last exit was non-zero is `failed`. Setting `spec.dir` writes the definition elsewhere without registering it (the tests use this): the unit, plist or rc.d script, or on Windows the task XML as UTF-16 (`schtasks /XML` reads it); a Windows system service has no file form.
 
 ## Registry, devices, clipboard
 - **`registry.hpp`.** Windows only. `value` is a string (`REG_SZ`, `REG_EXPAND_SZ` read unexpanded), a 64-bit integer (`REG_DWORD`, `REG_QWORD`), a string list (`REG_MULTI_SZ`) or bytes (`REG_BINARY` and other raw types). `set` keeps the existing type where it can (expandable strings stay `REG_EXPAND_SZ`, a `REG_DWORD` stays one while the number fits); `set_as` writes an explicit `type`, `value_type` reports it. Every call takes an optional `view` (`native`, `wow64_64`, `wow64_32`) for the WOW64 registry views. `remove_value`, `remove_key`, `list`. Every call is unsupported elsewhere.
@@ -193,7 +198,7 @@ int main(int argc, char** argv) {
 ## Platform notes
 - **iOS.** No spawning: `spawn_wait`, `child` and `os::run` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
 - **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control.
-- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM through `sc.exe`, registry, event-log service log. `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error. CPU ids past what the OS mask holds are `EINVAL` everywhere (Linux allocates a larger set with `CPU_ALLOC` beyond `CPU_SETSIZE`). System DLLs loaded at run time (`iphlpapi`, `setupapi`, `powrprof`, `dxgi`, `dxcore`) come from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`).
+- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM API for system services and Task Scheduler (COM) for per-user ones, registry, event-log service log. `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error. CPU ids past what the OS mask holds are `EINVAL` everywhere (Linux allocates a larger set with `CPU_ALLOC` beyond `CPU_SETSIZE`). System DLLs loaded at run time (`iphlpapi`, `setupapi`, `powrprof`, `dxgi`, `dxcore`) come from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`).
 - **macOS.** `RLIMIT_AS` is ignored by the kernel, so `memory_bytes` uses a resident-size watchdog. kqueue for file watching.
 - **Linux.** fork/exec, inotify, `/proc` and `/sys`.
 
@@ -206,13 +211,13 @@ int main(int argc, char** argv) {
 | HTTPS in `net::http` | unsupported; use the RPC client or a TLS library |
 | FSEvents on macOS | kqueue is used instead (immediate per-file events) |
 | Fuzz target for glob/path parsing | none |
-| `load_average` on Windows, `chown` on Windows, signals other than kill/terminate on Windows, `advise_huge` on Windows/macOS, hard CPU affinity on macOS | no OS facility (see the sections above) |
+| `chown` on Windows, signals other than kill/terminate on Windows, `advise_huge` on Windows/macOS, hard CPU affinity on macOS | no OS facility (see the sections above) |
 
 ## Tests
 | Test | Covers |
 |---|---|
 | `test_os_process` | spawn, limits, timeouts, tree kill, redirection, cancellation, memory watchdog, `find_executable` |
-| `test_os_sys` | `fs`, users, time, sysinfo, console |
+| `test_os_sys` | `fs`, users, time, sysinfo (Windows load average under load), console; service definitions for Windows (SCM parameters, task XML, PowerShell env wrapper) and rc.d with injection attempts, SCM queries, a real per-user scheduled task on Windows, a real rc.d service on FreeBSD (root, `FORGE_TEST_RCD=1`) |
 | `test_os_net` | net, local HTTP servers (injection, cross-origin redirects, truncated bodies, deadline, `Set-Cookie`), native and polling tree watch (80 directories, overflow, symlink/junction loop, kqueue cap), service units in a temp dir |
 | `test_os_dev` | devices, FreeBSD GEOM partition fixture, clipboard |
 | `test_os_dynlib` | loads `tests/dynlib_fixture.c` through search dirs and an env var, calls it through `get<>` and through enumerated addresses, enumerates libm; when clang + lld are installed, parses fixtures cross-linked by `cmake/dynlib_fixtures.cmake` (PE32/PE32+ with a forwarder, arm64/x86_64/exports-trie/fat Mach-O, ELF32, big-endian ELF, section-stripped ELF, versions + IFUNC + TLS), plus ~14k truncated and mutated inputs |
