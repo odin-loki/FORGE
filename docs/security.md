@@ -1,77 +1,129 @@
 # Security model
 
-What FORGE enforces today, where, and what is only planned. Every statement below points at code.
+What FORGE enforces today and where. Checked against the source on 2026-11-04 (main at ccc0a7d).
+For the target standard (most of it not built yet) see [security-standard.md](security-standard.md).
 
-## Script capabilities (interpreter-level)
-- `struct Caps { fs, net, proc, env, reflect }` in `script/src/interp.hpp`; all default on.
-- Narrowed by `forge::sandbox(opts, fn)` (`script/src/builtins.cpp`, can only turn flags off) and by
-  `forge script --no-fs / --no-net / --no-proc` (`apps/forge.cpp`).
-- Built-ins that touch files, network, processes, devices or reflection check the flag first and raise
-  `PermissionError` (helpers `need()` in `builtins.cpp`, `need_dev()` in `mobile.cpp`, `need_reflect()` in
-  `reflect.cpp`; also `runtime.cpp` for processes and `import`, `ai.cpp`, `remote.cpp`, `text.cpp`,
-  `automation.cpp`). About 63 such checks in `script/src`, including `std::getenv` (gated by `env`) and
-  reads, writes and kills on files and processes that were opened before a narrower sandbox started.
-- These are checks inside the interpreter; a bug in the interpreter or a native built-in could bypass
-  them. When fs, net or proc is turned off, the engine also applies the OS sandbox below
-  (`script/src/engine.cpp`, `builtins.cpp`). Escape tests: `tests/script/sandbox_escape.fs` (39 indirect
-  routes) and `capability_escape_engine_level` in `tests/test_script.cpp`.
+## Script capabilities (interpreter)
+
+| Item | Where |
+|---|---|
+| `struct Caps { fs, net, proc, env, reflect }`, all on by default | `script/src/interp.hpp` |
+| Narrow with `forge::sandbox(opts, fn)`; it can only turn flags off | `script/src/builtins.cpp` |
+| Narrow from the CLI: `forge script --no-fs --no-net --no-proc` | `apps/forge.cpp` |
+| Checks raise `PermissionError` | `need()` in `builtins.cpp`, `need_dev()` in `mobile.cpp`, `need_reflect()` in `reflect.cpp`, plus checks in `runtime.cpp`, `ai.cpp`, `remote.cpp`, `text.cpp`, `automation.cpp` |
+
+- `env` gates `std::getenv` and device access (`forge::mobile`, sensors).
+- `reflect` gates `reflect::set/invoke/call/construct`.
+- Files and processes opened before a narrower `sandbox` block cannot be read, written or killed inside it.
+- These are interpreter checks. A bug in the interpreter or a native built-in can bypass them, so the OS
+  sandbox below backs them up.
+- Escape tests: `tests/script/sandbox_escape.fs` and `capability_escape_engine_level` in `tests/test_script.cpp`.
+
+### OS sandbox for scripts
+
+When `--no-fs`, `--no-net` or `--no-proc` is given, the engine also applies the OS sandbox
+(`script/src/engine.cpp`): `--no-net` → deny network, `--no-proc` → deny exec, `--no-fs` → deny file writes
+(reads stay allowed). `--os-sandbox off|best-effort|require` picks what happens if it cannot be applied;
+`require` aborts the run.
+
+`sandbox({..., isolate: true}, fn)` runs the block in a forked child under the narrower OS sandbox and returns
+its result as JSON (`builtins.cpp`). Without `fork()` (Windows) it raises `PermissionError` and does not run
+the block. Plain nested `sandbox` blocks are interpreter-checked only.
+
+### Static capability checks
+
+Before a run, the static checker (docs/scripting.md "Static checks", `script/src/check.cpp`) reports direct calls
+to `fs`, `net`, `proc`, `service` or environment built-ins, `run()` and shell blocks that the run's capabilities
+or an enclosing literal `sandbox({...}, fn)` deny. They are errors, so the script is refused before it starts.
+Indirect calls (a built-in in a variable, `eval`, imported modules) are not seen; the runtime checks remain the
+enforcement.
 
 ## OS sandbox (`os/include/forge/os/sandbox.hpp`)
-`sandbox_policy { deny_network, deny_exec, deny_fs_write }`, `apply_sandbox`, `run_sandboxed`, `sandbox_status`.
-| Platform | Mechanism |
-|---|---|
-| Linux / Android | `no_new_privs` + seccomp-BPF returning EPERM for denied syscalls (`unsupported` on architectures without an audit arch) |
-| FreeBSD | Capsicum `cap_enter()` (coarser than requested) |
-| OpenBSD | `pledge()` |
-| macOS | `sandbox_init` named profiles, looked up with `dlsym` |
-| Windows | in-process denial unsupported; `run_sandboxed` starts children with `CreateRestrictedToken` + a job object |
-Tested on Linux in `tests/test_os_ext.cpp`; other platforms are compile-checked only.
 
-## Plugins
-Native plugins (`os::library` / `os::dynlib`) are refused unless fs, net, proc and env are all enabled
-(`builtins.cpp`, "native plugins are refused in sandboxed runs").
+API: `sandbox_policy { deny_network, deny_exec, deny_fs_write }`, `apply_sandbox`, `run_sandboxed`,
+`sandbox_status`. Applying is one-way.
+
+| Platform | `apply_sandbox` (current process) | `run_sandboxed` (child) |
+|---|---|---|
+| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls; `unsupported` on architectures with no audit arch | fork, apply, exec (see note) |
+| FreeBSD | Capsicum `cap_enter()` (all-or-nothing, coarser than asked) | fork, apply, exec |
+| OpenBSD | `pledge()` | fork, apply, exec |
+| macOS | `sandbox_init` named profiles, found with `dlsym` | fork, apply, exec |
+| iOS | no-op; the app sandbox already applies | unsupported |
+| Windows | exec denial only (job object, one active process); net/fs denial returns `unsupported` | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job |
+
+On POSIX, `run_sandboxed` applies the network and file-write parts in the child before `execvp`, and drops
+`deny_exec` so the target can start; the target itself may still exec.
+
+Tests: the `sandboxing` case of `tests/test_os_ext.cpp` runs in CI on Linux, macOS, Windows and FreeBSD
+(sub-cases that report `unsupported` skip; FreeBSD skips when Capsicum refuses a partial policy).
+`run_sandboxed` has no test.
+
+## Native plugins
+
+Native plugins are refused unless fs, net, proc and env are all enabled
+(`builtins.cpp`: "native plugins are refused in sandboxed runs").
 
 ## AI-drafted code
-`forge::ai_run` / `forge::ai_eval` run drafted code only if a confirm callback (per call `{"confirm", fn}` or
-the engine's `confirm`) returns true; with neither, `confirmed()` returns false and nothing runs
-(`script/src/ai.cpp`). The CLI prompts `[y/N]`. `ai_run` goes through the normal shell built-ins, so
-capability flags and child limits still apply.
 
-## RPC
-Token and Ed25519 key auth, optional TLS (`graph/include/forge/graph/rpc_secure.hpp`, docs/rpc.md).
-Optional mTLS (`--tls-client-ca`). Over TLS, token and key auth are bound to the connection (RFC 9266
-tls-exporter) and the unbound methods are refused, so a relayed auth exchange fails. authorized_keys lines
-can carry `allow=device,scripts` permissions, enforced per request in `rpc.hpp`; lines without options keep
-full access. `forge::remote_call` produces an ordinary remote script, so the same auth, child process,
-sandbox and limits apply; the caller refuses to send anything but plain data.
-Remote scripts (`rpc-serve --allow-scripts`) are refused at server construction without auth
-(`graph/include/forge/graph/rpc.hpp`). Remote scripts run one at a time with a timeout (`--script-timeout`,
-default 60000 ms) and optional `--script-no-proc/-fs/-net` (`apps/forge.cpp`). Without auth on a non-loopback
-bind the server prints a warning but still serves non-script RPC.
+`forge::ai_run` and `forge::ai_eval` run drafted code only if a confirm callback returns true: per call
+`{"confirm", fn}`, else the engine's `confirm`. With neither, `confirmed()` returns false and nothing runs
+(`script/src/ai.cpp`). The CLI prompts `[y/N]`. `ai_run` goes through the normal shell built-ins, so capability
+flags and child limits still apply.
 
-## Signing
-`.fpk` model packages: Ed25519 signatures over the section-table digest (`modelfile/include/forge/modelfile/sign.hpp`,
-`verify_signature`); with no trusted keys any valid signature passes (integrity only). Encryption uses
-XChaCha20-Poly1305 (vendored Monocypher). Release artifacts: `tools/release.py` (docs/RELEASING.md).
-Secrets at rest: `os/include/forge/os/keystore.hpp`.
+## RPC (`graph/include/forge/graph/rpc_secure.hpp`, `rpc.hpp`, docs/rpc.md)
 
-## Exceptions as a security boundary
-See docs/scripting.md (Errors): `Interp::from_cpp` maps C++ exceptions to script exceptions and `engine`
-catches all of them, so an embedder never sees a C++ exception from `run`/`eval`.
+| Feature | Behaviour |
+|---|---|
+| Auth | Tokens (`--token`, `--token-file`) and Ed25519 keys (`--authorized-keys`, `--pubkey`). Tokens are compared in constant time; nonces come from the OS CSPRNG. |
+| TLS | OpenSSL, when built with it (`--tls-cert`, `--tls-key`). |
+| mTLS | `--tls-client-ca`: every client must present a certificate that chains to the CA. Needs `--tls-cert/--tls-key`. |
+| Channel binding | Over TLS only the bound methods are accepted. The binding is RFC 9266 tls-exporter on TLS 1.3 and on TLS 1.2 with extended master secret, else RFC 5929 tls-unique. A relayed or replayed auth exchange fails; a bound token never crosses the wire. |
+| Per-key permissions | authorized_keys lines may start with `allow=device`, `allow=scripts` or `allow=all`. Checked per request. Unknown options are errors. A line without options has full access. |
+| Remote scripts | `rpc-serve --allow-scripts`. The server refuses to start with it and no auth. Each script runs in its own child (`forge script --rpc-child`) with a timeout (`--script-timeout`, default 60000 ms), a memory cap (`--script-mem-mb`, default 2048) and optional `--script-no-proc/-fs/-net`. On POSIX the child requires the OS sandbox; on Windows it is best-effort. RPC secrets are removed from the child's environment. |
+| No auth | Allowed for non-script RPC. On a non-loopback bind the server prints a warning. |
 
-## Known gaps / not yet implemented
-- RPC: tokens always have full access; client-certificate identities are not mapped to permissions.
-- Nested `sandbox{}` blocks are interpreter-checked only; on Windows the OS sandbox only blocks process creation.
-- `--kv-spill` writes KV-cache contents (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
+`forge::remote_call` ships a function and its captured values as an ordinary remote script, so the same auth,
+child process, sandbox and limits apply. It refuses anything but plain data (nil, bool, numbers, strings,
+lists, maps, script functions) with a `TypeError` (`script/src/remote.cpp`).
+
+Tests: `test_rpc` (auth, `allow=`), `test_rpc_tls` (server verify, mTLS, channel binding). `test_rpc_tls` runs
+on Linux, macOS and FreeBSD CI; it skips on Windows CI because its `openssl` CLI probe uses a POSIX redirect.
+
+## Model files and signing
+
+| Item | Where |
+|---|---|
+| `.fpk` signing: Ed25519 over a BLAKE3 digest of the section table (name, size, hash of each non-signature section). CLI `forge keygen/sign/verify`. | `modelfile/include/forge/modelfile/sign.hpp` |
+| `verify_signature(reader, trusted)`: with no trusted keys, any valid signature passes (integrity only, not provenance). | `sign.hpp` |
+| `.fpk` encryption: the data section sealed with XChaCha20-Poly1305 (vendored Monocypher). `forge encrypt`; key from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Metadata opens without the key. | `modelfile/include/forge/modelfile/fpk.hpp` |
+| Signed bundles: Ed25519 over a `FORGE-SIGNATURE.json` manifest of (path, size, BLAKE3) for a directory. Verification re-hashes and reports modified, missing and unsigned extra files; multiple signers; paths that escape the root are refused. Also `sign_bytes`/`verify_bytes` with a domain-separation context. Library API only, no CLI command. Test: `test_bundle_sign`. | `modelfile/include/forge/modelfile/bundle.hpp` |
+| Script cache `.fsc`: BLAKE3 key, optional Ed25519 signature (`--cache-dir`, `--cache-trust`, `--cache-require-signed`, `--cache-sign-seed`). Signatures are required when the cache directory is not private. No test. | `script/src/fsc.cpp`, `engine.cpp` |
+| Release artefacts | `tools/release.py`, docs/RELEASING.md |
+
+## Secrets at rest (`os/include/forge/os/keystore.hpp`)
+
+Keychain on Apple, DPAPI on Windows, libsecret on Linux when a session keyring exists, an app-installed backend on
+Android. The fallback is one 0600 file per secret in a 0700 directory, **not encrypted** beyond a per-store XOR
+pad; it only protects against other users. `keystore::backend()` reports which one is in use.
+
+## Exceptions
+
+`Interp::from_cpp` maps C++ exceptions to script exceptions and `engine` catches all of them, so an embedder never
+sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
+
+## Known gaps
+
+- RPC: tokens always have full access. Client-certificate identities are not mapped to permissions.
+- Windows: no in-process network or file-write denial; scripts there get only the job object plus the
+  interpreter checks. `run_sandboxed` (AppContainer) is untested.
+- POSIX `run_sandboxed` does not apply `deny_exec` to the target.
+- `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
+- Nested non-isolated `sandbox` blocks are interpreter-checked only.
+- Static capability checks miss indirect calls.
+- Keystore file fallback is not encrypted.
+- `.fsc` script cache has no tests.
+- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
   (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
-  destroyed). Put it on a private directory if prompts are sensitive.
-- Static capability checks don't see indirect calls (runtime checks and the escape tests cover them).
-
-## Static capability checks
-
-Before a script runs, the static checker (docs/scripting.md "Static checks") reports every direct call to an
-`fs`, `net`, `proc`, `service` or environment builtin, `run()` and every shell block that the run's capabilities,
-or an enclosing literal `sandbox({...}, fn)` block, deny. These are errors, so by default the script is refused
-before any of it executes rather than failing part-way with PermissionError. It is a convenience layer: indirect
-calls (a builtin stored in a variable, `eval`, imported modules) are not seen statically, and the interpreter's
-capability checks and the OS sandbox remain the enforcement.
+  destroyed). Use a private directory if prompts are sensitive.
+- No `forge::security` API, policy file or `forge security check` yet; see security-standard.md.

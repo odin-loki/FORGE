@@ -1,285 +1,158 @@
-# FORGE implementation status
+# FORGE test status
 
-## Known gaps / not yet implemented (updated 2026-11-04, see docs/security.md)
-- No on-disk `.fsc` bytecode cache (dropped).
-- Logger: the Windows event log sink has not been compiled or run on Windows yet (no mingw toolchain on the build box).
-- `os/dynlib.hpp`: the Windows and Apple code that reads loaded images has not been compiled or run; PE and Mach-O file parsing is tested on Linux.
-- RPC: tokens always have full access; client-certificate identities are not mapped to permissions.
-- GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open, and graphs recorded before an eviction must not be replayed after it.
+What has been built and tested where. Current as of 2026-11-04, main at ccc0a7d (PR #53).
+CI is `.github/workflows/ci.yml`; it runs on every pull request and every push to main.
+"Skip" means a test exited 77 because its device or tool was missing.
 
-## Finished 2026-11-04
-- **Modules renamed** to plain names: lane→simd, grid→gpu, flow→graph, pack→modelfile, mind→inference, balance→loadbalancer, spec→ops (`FORGE_LANE_TARGET` still works as an alias of `FORGE_SIMD_TARGET`).
-- **Logger**: `add_async_sink` (bounded queue, drops counted, never blocks), `add_eventlog_sink` (Windows), `FORGE_LOG_MIN_LEVEL` CMake option. Tests: `test_log`, `log_min_level_cmake`.
-- **Script limits**: `limit {...} { body }` blocks, size/duration strings (`"2G"`, `"200ms"`), and `allocs`, `handles`, `procs` limits. Escape tests for the capability checks (`tests/script/sandbox_escape.fs`, `capability_escape_engine_level`); they found and closed three gaps (`std::getenv` ignored `env`; pre-opened files and processes were usable inside a narrower sandbox).
-- **RPC security**: mTLS (`--tls-client-ca`), token/key auth bound to the TLS connection (RFC 9266 tls-exporter; unbound methods refused over TLS), per-key `allow=device,scripts` permissions in authorized_keys. Tests: `test_rpc`, `test_rpc_tls`. Clients built before this change cannot authenticate to a TLS server.
-- **Remote functions and local AI**: `forge::remote_call(node, fn, args)` ships a function plus its captured plain values; `forge::ask`/`ask_json` run in-process with `--ask-model`/`FORGE_ASK_MODEL` (`ask_json` grammar-constrained), HTTP otherwise.
-- **Shell emitters**: ysh, rc and es all have emitters; golden text tests run everywhere, and real Oils 0.29.0, rc and es built from source passed all three emit goldens.
-- **GPU memory**: CUDA, HIP, OpenCL, Level Zero and Vulkan allocations are charged to per-device pools with LRU eviction of resident tensors before the budget or the driver runs out (mock-driver tests `test_gpu_memory_*_mock`, Vulkan on lavapipe).
-- **Prefix KV spill**: evicted prefix-cache KV goes to the spill store and is reloaded on a hit (`batch_options::spill`, `forge-serve --kv-spill`), bit-identical logits.
-- **`os/dynlib.hpp`**: search paths, typed `get<>`, `path()`, ELF/PE/Mach-O symbol listing with bounds-checked parsers.
+## Platforms
 
-## forge::os::mobile (2026-10-31)
-- **ForgeScript (written, compile-checked, not yet tested):** `.fsc` cache (BLAKE3 key, optional Ed25519 signature, `--cache-dir`); `rpc-serve` runs remote scripts in sandboxed child processes; `sandbox({..., isolate: true})` runs a block in a forked child under a narrower OS sandbox; Windows `run_sandboxed` uses AppContainer + job object (llvm-mingw cross-compile only); Android builds add `-fexperimental-library`.
-- **Runtime reflection** in the script language ([scripting.md](scripting.md#reflection-implemented)): `forge::reflect::*` covers type info, fields/methods/bases/attributes, get/set/invoke by name, enum values, module symbols, signatures and construct-by-name, in both VM and tree-walker, gated by the `reflect` capability. Tested: `test_script` `reflection`, plus `docs/examples/script/reflection.cpp`.
-- New `forge_mobile` library ([mobile.md](mobile.md)): sensors, touch/gestures, device services and lifecycle on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, null and simulated backends; script built-ins `forge::mobile::device`, `forge::sensors::*`, `forge::touch::open`.
-- **Tested here (x86_64 Linux):** `test_mobile` 13/13 (simulator, gestures, services, lifecycle, geofencing, Linux IIO/evdev against fake sysfs), `test_script` `mobile_sensors_touch`.
-- **Compile-checked only:** Windows, FreeBSD, macOS and musl backends via zig (`xos_mobile_*`); Android (`android.cpp`, `services.cpp`, `linux.cpp`, `mobile.cpp`) with NDK r27c aarch64.
-- **Not compiled here:** `apple.mm` (iOS/iPadOS/macOS Objective-C++) needs an Apple SDK. It needs a macOS CI job.
+| Platform | Built | Tested | How |
+|---|---|---|---|
+| Linux x86_64, GCC 14 | CI `linux-gcc` | ctest `-LE "slow\|emu"`: 111/111 pass (GPU device tests skip) | Ubuntu 24.04, `cmake --preset dev` |
+| Linux x86_64, Clang 18 | CI `linux-clang` | same, 111/111 | Ubuntu 24.04 |
+| Linux, ASan + UBSan | CI `linux-asan` | `test_script` only | Clang 18, `FORGE_SANITIZE=ON` |
+| Linux, TSan | CI `linux-tsan` | `test_script` only | Clang 18, `FORGE_TSAN=ON` |
+| macOS | CI `macos` | ctest 111/111, including `test_gpu_metal` | `macos-latest` runner, Xcode toolchain |
+| iOS | CI `ios` | **nothing run** | `forge_c` static library built with Xcode, signing off; tests, apps and examples off |
+| Windows, MSVC | CI `windows-msvc` | ctest 106/106; script emit goldens | `windows-latest`, Ninja + `cl` |
+| Windows, MinGW | CI `windows-mingw` | ctest: 84 run, all pass | MSYS2 UCRT64 GCC |
+| FreeBSD 14.3 | CI `freebsd` | ctest `-LE "slow\|emu\|gpu"`: 60/60 | `vmactions/freebsd-vm` VM on Ubuntu |
+| Android arm64-v8a | CI `android` | build only | NDK, `tests/mobile_build.sh` |
+| Android x86_64 | CI `android` | `test_script` and `--emit android` goldens on an API 34 emulator | NDK build of `forge`, `test_script`, the example plugin; KVM emulator |
+| Android, physical device | no | never | — |
+| Linux aarch64 (SVE) | locally, zig cross | under qemu-user only (2026-10-31: 50/54, see changelog) | `qemu-aarch64 -cpu max,sveN=on` |
+| Linux riscv64 (RVV) | locally, zig cross | under qemu-user only (same) | `qemu-riscv64 -cpu rv64,v=true,vlen=N` |
+| Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
-## Latest check (2026-10-31, qemu-user aarch64/riscv64, cross, emitters)
-- **aarch64** (zig 0.17 musl, qemu-user 10.0.13 `-cpu max,sve256=on`, `QEMU_LD_PREFIX` = Alpine musl loader): `ctest -E '^(xos_|mobile_)'` gives 50/54 with 6 GPU skips. All simd/SVE VL tests and fuzz targets pass.
-- **riscv64** (`-cpu rv64,v=true,vlen=256`): the same 50/54. All RVV VL 128-1024 tests pass. Fixed a real build break: riscv64 has no `__NR_renameat`, so `sandbox.hpp` now guards it (cff8244).
-- The 4 failures are the same on both architectures and come from the qemu-user environment, not from FORGE. zig musl links statically, so dlopen and plugins are unavailable. Self-exec of a guest binary gets ENOEXEC because there is no binfmt. `/proc/self` rss is 0. The child-spawn memory limit and the sandbox_* children also fail. They affect `test_os`, `test_os_ext`, `test_os_process` and `test_script` (plugin case).
-- **Cross (`ctest -L cross`)**: 39/39 pass after a fix. zig 0.17 `-fsyntax-only` fails with "failed to rename tmp/...o", so `xos_emit_*` now compiles each file with `-c` (`cmake/xos_compile_each.cmake`, ee0100c). macOS (aarch64/x86_64) is cross-compiled and linked only. iOS (`mobile_ios`) is skipped because there is no Xcode SDK.
-- **Emitters**: `emit_golden_all_shells` now also runs **ksh, osh, hush** and cmd (wine) on the box. They pass, along with the 14 shells below.
-- **rc/es emitters added**: `script/src/shells/rc.cpp`. There are no arithmetic builtins, so integers go through `expr`. Function locals are wrapped in a dynamic-scope block (rc `a=() {..}`, es `local (a=) {..}`), which keeps recursion safe. es has no `continue`, so it is emulated with `catch`. Both pass all three emit goldens and `shell_backends_golden`.
-- **Shells built from source** into `/workspace/opt/shells/bin` (user-local; GNU make 4.4.1 was bootstrapped into `~/local/tools`): rc (rakitzis/rc HEAD), es 0.10.0, mksh R59 (2025/12/23) and oksh (ibara HEAD). mksh and oksh pass the emit goldens with the existing POSIX emitter. Still untested: posh (not built). ysh now has an emitter (2026-11-04).
-- **Android**: not re-run this round. A second TCG AVD needs about 2 GB RAM and 2 GB disk. The box had about 3.4 GB RAM and 3 GB disk free, with another agent's emulator (fuse34) running, so the earlier emulator pass below still stands.
+Windows emit goldens (`FORGE_TEST_ONLY=emit test_script`, `windows-msvc`): sh, bash, dash, pwsh and PowerShell 5.1
+for all three goldens; cmd for `batch` (the other two are outside the cmd subset and refused).
 
-## Latest check (2026-10-30, scripting milestones 6-7 + shell backends)
-Built with conda clang 18 (`/workspace/opt/llvm18`) and a user-local OpenSSL (`/workspace/opt/openssl`). `ctest -LE "slow|emu"`: **84/84 pass**; the hardware tests skip. The cuda_mock failures from earlier are gone. ASan and TSan runs of `test_script` and `test_rpc` are clean.
-- **Milestone 6, AI commands**: `forge::ask`, `forge::explain`, `forge::suggest_cmd`, `forge::ask_json`, `forge::ai_run`, `forge::ai_eval`. They call an OpenAI-compatible endpoint (`FORGE_AI_ENDPOINT`, for example forge-serve). Nothing runs without a confirm callback; the CLI prompts `[y/N]`.
-- **Milestone 7, RPC security**: token auth and Ed25519 key auth (reusing forge_trust), optional TLS (`FORGE_TLS`), and remote script execution (`forge::remote`, `rpc-serve --allow-scripts`, which requires auth). See docs/rpc.md.
-- **Shell emit targets**: a pluggable backend registry, one file per shell (docs/shells.md). 14 backends are golden-tested on the box: sh, bash, zsh, dash, ash/busybox, yash, fish, tcsh, csh (via tcsh), nu, xonsh, elvish, pwsh, and powershell (via pwsh). **Untested**: ksh, mksh, oksh, posh, osh/ysh, hush, cmd, rc, es, and real Windows PowerShell 5.1.
+Shell emit goldens (`shells` job, 2026-11-04 run): only sh, bash, dash, ash (busybox), pwsh and powershell were
+found and tested. The other shells in the job's install list were not present in that run.
 
-- **Translator (`forge script --emit`)**: one C++-subset script becomes a standalone script for 21 backends. The `emit_golden_all_shells` test matches the interpreter's output and exit code on sh, bash, zsh, dash, ash, yash, fish, tcsh, pwsh, xonsh, elvish and nu, and on csh and powershell through tcsh and pwsh. **Untested emitters**: ksh, mksh/android, oksh, posh, hush, osh, cmd and PowerShell 5.1. iOS is interpreter-only. Added `forge::shell` and `forge::host_shell`. ctest now sets `FORGE_TEST_SHELL_PATH` automatically. The emitter has zig cross syntax checks (`ctest -L cross`), but they were not run because zig is absent.
+## GPU backends
 
-### Deferred
-- cmd emit golden runs (wine segfaults on this box)
-- Golden tests for posh (not built), Windows PowerShell 5.1 and real Windows cmd
+| Backend | Real hardware | Mock / software | CI |
+|---|---|---|---|
+| CPU | every platform above | — | all jobs |
+| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31) and native Windows 11, CUDA 13.2 driver (2026-11-04) | mock driver (`test_gpu_*cuda_mock`) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
+| HIP | **never** | mock driver | mocks pass on Linux |
+| OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
+| Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
+| Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering) | MSL host syntax check | `macos` |
+| Vulkan | **never** on a GPU | Mesa lavapipe (local, historical); SwiftShader in the Android emulator (local) | compiled out in every CI job (no `glslangValidator`) |
 
-## Latest check (2026-10-30, documentation rewrite)
-x86_64 Linux box, no GPU, built with zig 0.17 (`zig cc`/`zig c++`) as the compiler: `ctest -LE "slow|emu"` gave 71/73 after installing `numpy safetensors cryptography onnx` in the Python environment. The 2 failures were `test_gpu_cuda_mock` and `test_gpu_features_cuda_mock`, which need `clang` to embed the PTX image; without it they exit 77 but are not marked as skip tests. All `doc_example_*` tests passed. Vulkan was compiled out (no glslang on that machine). Cross builds and qemu runs below were not repeated; treat them as historical.
+`test_gpu_metal` passing means the runtime opened a device and all checks passed; the device name is not in the
+CI log because ctest only prints output on failure.
 
-## Historical results
+### CUDA on RTX 3090, Windows 11 (2026-11-04)
 
-Built and tested on an 8-core Xeon (AVX-512, AMX) with no GPU. The Vulkan backend runs on Mesa lavapipe (a software Vulkan device). aarch64 and riscv64 are cross-built with zig and tested under qemu-user.
+`test_cuda_hip` cross-built with mingw-w64 and run natively:
 
-## Test matrix (ctest)
-| Build | Result |
+| Check | Result |
 |---|---|
-| x86_64 dev | 73/73 with `-LE "slow|emu"` (2026-10-30; earlier rounds 59/59 with `-LE slow`) (hardware tests skip with code 77: CUDA/HIP/OpenCL/Level Zero/Metal devices, adb, iOS). With `ANDROID_NDK_HOME` set, `mobile_android_arm64-v8a` and `mobile_android_x86_64` (label `slow`) pass: NDK r27c cross-build plus a check that all 12 JNI exports are present. This includes 8 fuzz targets, the Vulkan kernels on lavapipe, both goldens end-to-end on Vulkan (`FORGE_DEVICE=vulkan`), and the CUDA/HIP compile checks. |
-| aarch64 SVE build (`build/a64sve`), latest run | 31/31 without the fuzz label (3 skip: Vulkan/CUDA/HIP). |
-| riscv64 build (`build/rv64`), latest run | 27/27 without the fuzz label (3 skip). |
-| aarch64, qemu `-cpu max` (VL 512, so the NEON path runs) | 13/13 without the fuzz label. `test_vulkan` skips because the build is static. |
-| aarch64 SVE, qemu `-cpu max,sveN=on`, N = 128/256/512 (1024 requested; qemu caps `max` at 512) | 13/13 at each length without the fuzz label. The `sve` lane is active at each VL. |
-| riscv64 RVV, qemu `-cpu rv64,v=true,vlen=N`, N = 128/256/512/1024 | 13/13 at each length without the fuzz label. The `rvv` lane is active at each VLEN. |
+| CUDA lowerings vs the float64 oracle | 31/31 |
+| Quantised `matmul_t` cases | 24/24 |
+| `delta_rule`, `causal_conv` state ops | match the reference |
+| Split-K decode attention shapes | 7/7 |
 
-## Done
-- **core / ops**: dtypes, shapes, a declarative op spec (`ops/defs/*.fspec`) with codegen, and a float64 oracle for every op.
-- **simd**: target-tag SIMD with native lowerings for scalar, AVX2, AVX-512, NEON, **SVE** and **RVV** at any vector length from 128 to 1024 bits. SVE lengths that are not a power of two, or are above 1024, are lowered with PR_SVE_SET_VL at load time.
-  - SVE and RVV are built once per length (128/256/512/1024) as fixed-length tables. At startup, dispatch reads the hardware VL (`rdvl` / `vlenb`) and picks the matching table.
-  - Math functions are within 3 ulp and agree across lowerings. Also included: runtime dispatch (HWCAP/cpuid), an ULP harness, and GEMM.
-- **gpu**:
-  - CPU backend with graph replay, backend probing, prims, GEMM and Philox RNG.
-  - **GPU kernels are generated from the spec** (`ops/gen/gpu_gen.py`): 33 kernels covering elementwise unary and binary ops, scale, silu_mul, softmax, rms_norm and matmul_t, rope, gather, attention and slice.
-    - GLSL is compiled to SPIR-V with glslangValidator, validated with spirv-val, and embedded in the binary.
-    - The **Vulkan backend** (`gpu/vulkan.hpp`) dlopens libvulkan, so there is no link dependency. Every kernel is checked against the spec reference (`test_vulkan`, max relative error 3e-7).
-    - The same source compiles to **CUDA PTX (sm_80) and HIP AMDGCN (gfx90a)** with clang, without an SDK (`gpu_compile_cuda`, `gpu_compile_hip`).
-- **graph**: IR, verifier, CSE/fold/fuse/DCE passes, memory planner, quant codecs: f16, bf16, fp8 e4m3/e5m2, q8_0, q4_k, groupwise q4_g32/q8_g32 (AWQ/GPTQ style), OCP MX (mxfp8, mxfp6, mxfp4, mxint8), nvfp4 and ternary tq2 (BitNet absmean). All are usable via `forge import --codec`.
-- **core dtypes**: FP4 E2M1 / FP6 E2M3 / E3M2 element formats (checked exhaustively), stochastic rounding (checked for bias), complex c32/c64.
-- **simd extended libm**: exp2, expm1, log2/10/1p, sqrt, rsqrt, cbrt, sin/cos/tan, asin/acos/atan/atan2, sinh/cosh, erf/erfc, gelu_erf, softplus, lgamma, pow, hypot, logsumexp. Written on portable vec ops so every lowering gets them; worst error is 4 ulp (`math_extended_ulp`).
-- **Vulkan residency**: tensors stay on the device across ops; submits are batched (571 dispatches in 63 submits for the e2e golden).
-- **CUDA/HIP host runtime**: dlopens libcuda/libamdhip64 at run time and loads the embedded PTX/HSACO. Tested against a mock driver library; the hardware tests skip when there is no device.
-- **modelfile**:
-  - `.fpk` container (mmap, BLAKE3) and **Ed25519 signing** (`forge keygen/sign/verify`, vendored Monocypher, cross-checked against pyca/cryptography).
-  - **Signed bundles** (`forge/modelfile/bundle.hpp`): Ed25519 over any directory of artefacts via a `FORGE-SIGNATURE.json` manifest of (path, size, BLAKE3). Verification re-hashes the files and reports modified, missing and unsigned-extra files. Supports multiple signers and refuses paths that escape the root. Also domain-separated detached `sign_bytes` / `verify_bytes`.
-  - JSON, BPE tokenizer, blueprint language, GBNF grammars.
-- **import**:
-  - HF safetensors: Llama, Mixtral **MoE**, and DeepSeek-V2 **MLA** (absorbed).
-  - GGUF.
-  - **ONNX**: a protobuf decoder translating to a blueprint. Supports MatMul, Gemm, elementwise ops, Gelu, Softmax, LayerNorm, Transpose, Reshape, Flatten and Reduce*. Run with `forge run model.onnx --input x=x.f32`.
-- **inference**: paged KV, continuous batching with a prefix cache, speculative decoding, grammar-constrained sampling, samplers, and the C ABI v2.
-- **apps**: the `forge` CLI (info/import/inspect/run/bench/dump/keygen/sign/verify), the OpenAI-compatible `forge-serve`, and Python bindings.
-- **Fuzzing** (`fuzz/`): json, blueprint, grammar, gguf, fpk, tokenizer, onnx and more, each with a corpus. Parsers were hardened against every crash the fuzzers found.
-- **support**: arena allocator, linalg (LU/Cholesky/QR/CSR/CG), FFT (radix-2 + Bluestein, rfft, STFT, mel), vision (resize/YUV/NMS), profiler zones with Chrome-trace export, and gpu prims (segmented scan/reduce, bitonic sort, hash map).
-- **inference, newer**: typical-p and Mirostat v2 samplers; JSON-Schema to GBNF (`response_format` in forge-serve); LoRA hot-swap (in memory or from an `.fpk` with `*.lora_a/b`); C ABI 3 (`forge_generate_ex2` + size-prefixed `forge_sampling_ext`), also exposed in the Python bindings.
-- **Session kinds**: `diffusion_loop` (`inference/diffusion.hpp`): DDIM/DDPM/flow-Euler; epsilon/v/x0 prediction; classifier-free guidance; step plans; a latent cache that resumes bit-identically; Philox noise. `streaming` (`inference/streaming.hpp`): SPSC ring buffer, window/hop framing, and a latency budget that drops the oldest frames.
-- **graph**: reverse-mode autodiff (`graph/autodiff.hpp`), checked by finite differences. Blueprint composite ops (`op name(args){...}`).
-- **modelfile security**: `.fpk` encryption with XChaCha20-Poly1305 (`forge encrypt`; key from `FORGE_MODEL_KEY` or `FORGE_MODEL_KEY_FILE`). Without the key, metadata still opens.
-- **Vulkan pipeline cache** on disk, keyed by vendor/device/driver/pipelineCacheUUID and a SPIR-V hash (`FORGE_CACHE_DIR`; `FORGE_VK_PIPELINE_CACHE=0` turns it off).
-- **Supply chain**: SPDX 2.3 SBOM (`tools/sbom.py`, deterministic, tested). Release builds are bit-identical (`FORGE_REPRODUCIBLE`, `ci/repro_check.sh`, which compares two builds in different directories). NOTICE lists Monocypher.
-- **support, more**: Threefry4x32-20 (Random123 known-answer tests); linalg sym_eig/SVD (Jacobi) and GMRES; TLSF + pool allocators with leak reports (`mem/tlsf.hpp`); `FORGE_REFLECT` JSON reflection; audio resample/biquad; vision roi_align.
-- **Async I/O** (`io/aio.hpp`): io_uring through raw syscalls (no liburing), falling back to a pread thread pool; short reads are resubmitted (`test_aio` runs both backends).
-- **inference, serving**: prompt-lookup (n-gram) speculation; presence/frequency penalties (also in forge-serve); batch request priority and `cancel(id)`.
-- **Docs/perf**: generated API reference (`tools/gen_docs.py`, `docs/reference.md`, checked by ctest `docs_up_to_date`); perf baselines (`tools/perf_baseline.py`, `perf/baseline-x86_64.json`).
-- **KV-cache quantisation + host offload** (`graph/kv_codec.hpp`): int8 (symmetric) and fp8 E4M3 per (row, head) with an f32 scale; `state_append` quantises, the CPU and Vulkan attention kernels decode on the fly. Select with `session_options.kv_codec` or `FORGE_KV_CODEC`. Measured on the tiny model: max logit error vs f32 KV is 6.8e-3 (int8) and 3.1e-2 (fp8) relative to max |logit|; Vulkan int8 matches CPU int8 to 4e-7. `kv_offload` / `FORGE_KV_OFFLOAD=1` drops device KV after each attention (peak device bytes 153 KB vs 219 KB). Tested by `test_kvquant`.
-- **GPU runtimes sharing one contract** (`gpu/cuda.hpp`): run_op, residency, graph capture/replay, peer copy, multiple devices (`cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]`, `metal[:N]`), and one kernel-argument packer.
-  - **OpenCL** (`gpu/opencl.hpp`): kernels.cl is generated from the CUDA bodies.
-  - **Level Zero** (`gpu/levelzero.hpp`): vendored MIT `ze_api.h`; SPIR-V is built when llvm-spirv is available.
-  - **Metal** (`gpu/metal.hpp` + `src/metal.mm`): MSL is generated; unified memory.
-  - **Mock-tested only.** For OpenCL and Level Zero, mock drivers run the real generated OpenCL C as C, and all 31 lowerings pass the oracle plus golden_tiny_llama. The MSL passes a host syntax check. **None of these have run on real hardware.**
-- **Android** (*cross-compiled, never run on a device*):
-  - NDK CMake build for arm64-v8a (NEON + Vulkan) and x86_64. The CUDA/HIP image builds are disabled on mobile. Portable entropy (`modelfile/entropy.hpp`, arc4random_buf on Bionic/Apple) because API 26 lacks getentropy.
-  - JNI bridge at `bindings/android/jni/forge_jni.c` (CMake `-DFORGE_JNI=ON` builds `libforge_jni.so`).
-  - Kotlin `dev.forge.ForgeModel`, a Gradle library module `:forge` (externalNativeBuild on the root CMakeLists), and an example app `:example`.
-  - The Kotlin and Gradle files have **not been compiled**: there is no JDK on the build box.
-- **iOS / macOS** (*written without a Mac; never compiled*):
-  - `cmake/toolchains/ios.cmake` (device, or simulator with `-DFORGE_IOS_SIMULATOR=ON`) and `tools/build_xcframework.sh`, which produces FORGE.xcframework.
-  - SwiftPM package `bindings/apple`: a binaryTarget, a `CForge` module map over forge.h, and a `Forge` Swift API (ForgeModel/Sampling, streaming callback).
-  - XCTest (skips without `FORGE_TEST_FPK`) and a SwiftUI example. Metal is the default device.
-- **Goldens**: tiny Llama and MoE/MLA, checked against NumPy float64 references.
+HIP on that machine: mock only (no ROCm runtime).
 
-- **Multi-GPU pipeline split + socket RPC device** (`graph/rpc.hpp`, `FORGE_DEVICE=pipe:a*w,b` / `rpc:host:port`, `forge rpc-serve`): contiguous stage split balanced by cost; loopback RPC tested (test_rpc). Only CPU/lavapipe stages exercised — no real multi-GPU. RPC has no auth; binds 127.0.0.1 by default.
-- **AMX / SME tiles** (`simd/tile.hpp`): AMX bf16/int8 runs natively and under Intel SDE (`tile_amx_sde_{spr,gnr,icl}`); SME f32 outer products pass under qemu at SVL 128–2048 (`tile_sme_svl*`, weak SME ABI routines for runtimes lacking them). **Open bug:** AMX bf16/s8 gives wrong blocks intermittently (~1.5% native, most SDE runs) after interleaved calls; not yet root-caused.
-- **Graphics interop** (`gpu/interop.hpp`): Vulkan external memory export/import round-trip passes on lavapipe (also on the Android emulator); external semaphores optional (lavapipe lacks them); CUDA import code untested (no GPU).
-- **Hardware video decode** (`vision/video.hpp`): Annex-B/SPS parsing tested; NVDEC (built only with nvcuvid.h), MediaCodec, VideoToolbox written but untested; VA-API is probe-only.
-- **Windows**: mingw-w64 cross-build compiles and links all targets (`--preset windows-mingw`; Winsock via `core/net.hpp`, dlopen shim, ReadFile pread). **Not run**: Kron4ek Wine 11.20 crashes/cannot init a prefix on this VM. macOS: osxcross toolchain file only (no SDK on the box) — not built.
-- **App integrations** (`examples/integrations`, `inference/plugin.hpp` custom-session registry): Cypha, seatbelt one_shot, NeuralVFX streaming, FUSE runtime, CameraDetector examples run as ctest `-L integration`.
-- **v1.0 release tooling**: `tools/release.py` (bump/changelog/build/verify/tag), install rules + CPack (TGZ/DEB/ZIP), platform presets and a `release` workflow preset, `docs/RELEASING.md`. The full `build` graph has not been run end to end yet.
-- **Android emulator pass** (`tests/android_emulator.sh`, x86_64 AVD API 34 under TCG — KVM is not usable in this VM): native tests run on device; Kotlin sources compile with kotlinc 2.0.21 + JDK 17.
+## Known gaps
 
-## Remaining
-- Not testable on this machine: real CUDA/HIP GPUs, Level Zero, Metal, native Windows/macOS/iOS (Windows runs under wine, Android under the x86_64 emulator), multi-GPU/NCCL-style collectives, and SDE-validated AMX/SME tiles.
-- Vulkan runs whole sessions (`FORGE_DEVICE=vulkan` or `session::set_device`). The vk.* lowerings have priority over the CPU ones and are each oracle-checked; any op without a GPU kernel falls back to the CPU.
-- CUDA/HIP/OpenCL/Level Zero/Metal have not been run on real hardware; only the mock drivers have run them.
-- Android: native tests run on the x86_64 emulator (see below), not on a physical device; the Kotlin/Gradle files have not been compiled. iOS/Swift: not compiled at all.
-- CI: the workflow file is at `ci/github-actions-ci.yml`. The push token lacks `workflow` scope, so it has to be moved to `.github/workflows/ci.yml` by hand.
+- iOS: built in CI, never run. The Swift package and XCTest have not been run.
+- Android: never run on a physical device. CI runs only `test_script` on the emulator.
+- HIP, OpenCL and Level Zero have never run on real hardware. Vulkan has never run on a real GPU.
+- CUDA: one GPU model (RTX 3090). No multi-GPU or peer-copy test on hardware.
+- Vulkan is not built in CI.
+- `test_rpc_tls` skips on Windows CI: its `openssl` CLI probe redirects to `/dev/null`, which `cmd` does not have.
+- AMX/SME: AMX ran natively and under Intel SDE; SME only under qemu.
+- GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open;
+  graphs recorded before an eviction must not be replayed after it.
+- RPC: tokens have full access; client-certificate identities are not mapped to permissions.
+- `.fsc` script cache has no tests.
+- Not tested anywhere: hybrid P/E cores, multi-node NUMA, batteries and thermal sensors, running under
+  systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox decode, CUDA graphics interop.
+- Security gaps: [security.md](security.md#known-gaps).
 
-## Build
-    cmake -S . -B build -G Ninja && ninja -C build && (cd build && ctest)
-The Vulkan backend needs `glslangValidator` and `vulkan/vulkan.h` at build time. At run time any loader and ICD works; lavapipe is enough for testing. The GPU compile checks need clang ≥18.
+## Changelog of checks
 
-### Cross builds under qemu
-Toolchain files are in `cmake/toolchains/` (`aarch64-sve-qemu.cmake`, `riscv64-rvv-qemu.cmake`). Configure with:
+Newest first. Results are from the date given; later code may differ.
 
-    -DCMAKE_TOOLCHAIN_FILE=... -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_EXE_LINKER_FLAGS=-static -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+### 2026-11-04
+- PR #53 merged as ccc0a7d. Its last PR run (41802863931) passed all 11 CI jobs: linux-gcc, linux-clang,
+  linux-asan, linux-tsan, macos, ios, freebsd, android, windows-msvc, windows-mingw, shells.
+- CI now covers native macOS, iOS (build), Windows MSVC and MinGW, and FreeBSD in a VM. This supersedes
+  older notes that macOS was only cross-linked, iOS never built, and the Windows event log sink and
+  `os/dynlib.hpp` Windows/Apple code never compiled: `test_log` (including `eventlog_sink` on Windows) and
+  `test_os_dynlib` pass on macOS, both Windows jobs and FreeBSD.
+- CUDA on an RTX 3090 under Windows 11 (results above).
+- Fixed: split-K decode attention launched its combine kernel with dangling argument pointers (7fe8a83).
+- Fixed: on Windows, `find_executable` let an extensionless file on PATH shadow `cmd.exe` (1dea828); this was the
+  `windows-mingw` `limit_counts.fs` failure.
+- Fixed: Windows `ProcessPool` workers re-ran the whole test suite, an unbounded chain of test processes
+  (d6377d3).
+- Also: `strtod` fallback where libc++ lacks floating `from_chars` (FreeBSD 14, f6f1d11); CRLF-tolerant emit text
+  goldens (8a90508); Metal build fixes after the module rename (f17c83d, d7d423d).
+- Modules renamed: lane→simd, grid→gpu, flow→graph, pack→modelfile, mind→inference, balance→loadbalancer,
+  spec→ops. `FORGE_LANE_TARGET` still works as an alias of `FORGE_SIMD_TARGET`.
+- Added with tests: async and Windows event log sinks, `FORGE_LOG_MIN_LEVEL` (`test_log`, `log_min_level_cmake`);
+  `limit {}` blocks and `allocs`/`handles`/`procs` limits; capability escape tests, which closed three gaps
+  (`std::getenv` ignored `env`; pre-opened files and processes were usable in a narrower sandbox); RPC mTLS,
+  channel binding and `allow=` permissions (`test_rpc`, `test_rpc_tls`; clients built before this cannot
+  authenticate to a TLS server); `forge::remote_call`; GPU memory pools with LRU eviction
+  (`test_gpu_memory_*_mock`); prefix KV spill (bit-identical logits); `os/dynlib.hpp`.
+- PR #50: merges to main are gated on all CI checks.
 
-To compile with zig instead (`-DFORGE_CROSS_CXX=<wrapper running "zig c++ -target aarch64-linux-musl">`), note that zig rejects `-march`. The CMake probes select the zig-compatible spellings:
-- SVE: `-mcpu=generic+sve -msve-vector-bits=256`
-- RVV: `-mcpu=baseline_rv64+v+zvl<B>b -mrvv-vector-bits=B`
+### 2026-11-01 to 2026-11-03 (CUDA decode work, RTX 3090)
+PRs #33–#48 moved CUDA decode onto the device. Decode speed reported in the PR titles: 1.2 → 4.5 tok/s at
+p=1024 (#33), 4.8 → 17 (#35), 17 → 24 (#36), 24 → 29 with CUDA graphs (#38), split-K decode attention +29% (#48).
+PR #49 (whole-run decode replay) gave no gain; PR #52 made it opt-in.
 
-The emulators are `qemu-aarch64 -cpu max,sve256=on` and `qemu-riscv64 -cpu rv64,v=true,vlen=256`.
+### 2026-10-31
+- PR #18: CUDA on an RTX 3090 under WSL2, clang 23.1.4: ctest 104/104, CUDA tests on the device. Fixes: graph
+  capture uses relaxed mode (global mode fails with error 900 on a real driver).
+- PR #17: first GitHub Actions workflow.
+- qemu-user, zig 0.17 musl static builds:
+  - aarch64 (`-cpu max,sve256=on`) and riscv64 (`-cpu rv64,v=true,vlen=256`): `ctest -E '^(xos_|mobile_)'` 50/54
+    with 6 GPU skips on both. All simd, SVE/RVV VL and fuzz tests pass. The 4 failures come from qemu-user (no
+    dlopen in static builds, no binfmt for self-exec, `/proc/self` RSS 0) in `test_os`, `test_os_ext`,
+    `test_os_process`, `test_script` (plugin).
+  - Fixed: riscv64 has no `__NR_renameat` (cff8244).
+- `ctest -L cross` (zig compile + link for FreeBSD, macOS, MinGW, musl): 39/39 after compiling each file with `-c`
+  (ee0100c).
+- QEMU TCG VMs: FreeBSD 14.5 amd64, all real tests pass after fixes; wine 11.20 (llvm-mingw build) every test
+  passes, GPU tests skip. Bugs fixed then include kqueue missing in-place writes, a safetensors header-length
+  overflow, Winsock `shutdown()` not waking `accept()`, and several cmd emitter errors.
+- Shell emit goldens run on: sh, bash, zsh, dash, ash/busybox, yash, fish, tcsh, csh, nu, xonsh, elvish, pwsh,
+  powershell (via pwsh), ksh, osh, ysh, hush, mksh, oksh, rc, es, and cmd under wine. Not tested: posh.
+- `forge_mobile`: `test_mobile` 13/13 on x86_64 Linux (simulator, fake sysfs). Windows, FreeBSD, macOS, musl and
+  Android backends compile-checked only; `apple.mm` not compiled then (now built in the `macos` job).
 
-### Android (NDK r26+)
-    export ANDROID_NDK_HOME=/path/to/android-ndk-r27c
-    cmake -S . -B build/android-arm64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-      -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DCMAKE_BUILD_TYPE=Release -DFORGE_JNI=ON
-    ninja -C build/android-arm64 forge_jni      # libforge.so + libforge_jni.so; use ANDROID_ABI=x86_64 for the emulator
-    cd bindings/android && gradle :example:assembleDebug     # AAR + APK (Gradle invokes the same CMake per ABI)
-    gradle :forge:connectedAndroidTest                       # on a device; set FORGE_TEST_FPK for the model test
-On the device, `FORGE_DEVICE=vulkan` selects the Vulkan backend; otherwise the NEON CPU lanes run. The ctest entries are `mobile_android_<abi>` and `mobile_android_device`.
+### 2026-10-30
+- Linux dev builds: ctest 73/73 (zig), 76/76 (g++), 84/84 (clang 18, after scripting milestones 6–7). ASan and
+  TSan runs of `test_script` and `test_rpc` clean.
+- Android x86_64 emulator (API 34, TCG): 23 pass, 2 skip, 1 fail (`test_os_ext` socket binds; fix 7b7602c
+  restored after 21c58e0 reverted it). The Android rerun after the fix was not done.
+- wine: 32 pass, `test_vulkan` skips; one `test_os` timing flake fixed.
+- `forge::os` extension, 16 features (`test_os_ext`): all pass on Linux and the Android emulator; under wine all
+  pass except sandbox exec (wine ignores job limits).
+- `test_vulkan` on SwiftShader: fixed a real misaligned-sub-buffer bug; lavapipe and the emulator now batch 571
+  dispatches into 63 submits. `test_vulkan_align256` covers it.
 
-### Android emulator (low-memory settings used on the shared box)
-    emulator -avd forge -no-window -no-audio -no-snapshot -no-boot-anim -gpu swiftshader_indirect \
-      -memory 2048 -cores 2 -no-metrics -accel off -feature -Netsim     # TCG boot: 4–12 min
-    adb push build/android-x64/test_os_ext $NDK/.../x86_64-linux-android/libc++_shared.so /data/local/tmp/forge/
-    adb shell 'cd /data/local/tmp/forge && FORGE_THREADS=2 LD_LIBRARY_PATH=. TMPDIR=. ./test_os_ext'
-Run one test at a time with a timeout; skip test_inference (OOMs the emulator). `tests/android_emulator.sh` automates this.
-
-### Windows under wine64
-    cmake -S . -B build/win64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/mingw-w64.cmake; ninja -C build/win64 -j4
-    WINEPREFIX=~/.wine-forge64 tests/wine_run.sh build/win64     # pure win64 prefix; 77 = skip
-Do not leave `FORGE_OS_EXT_CHILD` exported in the shell — test_os_ext children use it.
-
-### zig cross compile+link (FreeBSD, macOS, MinGW, musl)
-`ctest -L cross` runs `zig c++ -target <x86_64-freebsd|aarch64-macos|x86_64-macos|x86_64-windows-gnu|aarch64-linux-musl>`
-on test_os, test_loadbalancer and test_os_ext. Use `ninja -j4` or lower on shared machines.
-
-### iOS / macOS (Xcode 15+)
-    tools/build_xcframework.sh                 # iOS device + simulator + macOS -> bindings/apple/FORGE.xcframework
-    cd bindings/apple && swift test            # XCTest; set FORGE_TEST_FPK=/path/model.fpk
-Add `bindings/apple` as a local Swift package in Xcode and `import Forge` (see `Example/ForgeExample`). ctest `mobile_ios` runs both steps on macOS and skips elsewhere.
-
-## Test flake (test_vulkan under parallel load)
-
-Concurrent runs shared fixed temp paths in /tmp (`forge_test_vk_e2e.fpk` and others), which caused SIGBUS and bad-magic errors. Temp files are now named per pid in test_vulkan, test_inference and test_modelfile. After the fix, 120 concurrent runs and `ctest -j8 --repeat until-fail:4` under full CPU load all passed.
-
-### AMX intermittent-failure root cause (resolved)
-The intermittent bf16/s8 AMX mismatches are a host problem: this VM loses tile registers across
-context switches. `tools/amx_state_probe.cpp` loads a tile, spins, stores it back, and sees 42-329 of 3000
-round-trips corrupted, with no FORGE code involved. SDE shows the same failures because on an AMX host it
-runs tile instructions natively. Changes: explicit compiler fences around the tile asm (GCC's intrinsics have
-no memory clobber), reused thread_local pack buffers, and test_tile retries before failing. 0/300 native and
-0/10 SDE failures after the change.
-
-## OS wrapper (`forge::os`) + load balancer (`forge::loadbalancer`) — 2026-10-29
-
-- `os/include/forge/os/os.hpp`: one header that wraps files and the filesystem, mmap, processes, threads and sync, time, sockets, polling (epoll, kqueue, or WSAPoll), IOCP `completion_port` (emulated off Windows), dl, env, signals, memory, sysinfo, paths and entropy. It targets Linux, Android, Windows, macOS, iOS (`run` unsupported there) and FreeBSD. `core/mapped`, `core/net` and `modelfile/entropy` now go through it. Not yet converted: dl.hpp, rpc.hpp, aio.hpp, video.cpp, interop.hpp.
-- `loadbalancer/`: strategies are RR, smooth-weighted, least-conn, EWMA, consistent hash (vnodes + bounded load), P2C and prefix/KV affinity with load spill. Also includes health checks, a circuit breaker, retries, and a backpressure queue. `proxy.hpp` provides the L4/L7 proxy behind `forge-serve proxy`.
-- Verification:
-  - Linux native: test_os (12 tests) and test_loadbalancer (13 tests) pass, as does the full dev ctest.
-  - Android x86_64 emulator (TCG): test_os and test_loadbalancer pass; the l7 stickiness check is occasionally flaky under TCG.
-  - zig cross compile+link (`xos_*` ctests): x86_64-freebsd, aarch64/x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl all OK.
-- Android full-suite run: everything passes except test_vulkan. SwiftShader's sin/cos come in at about 1.9e-4 abs error, which the Vulkan spec allows (bound 2^-11). Fix: vk lowerings for sin/cos/rope now carry `lowering::tol = 5e-4`. test_inference and example_seatbelt hit `adb device offline` because the emulator ran out of memory; that is not a test failure.
-- Windows under wine (`tests/wine_run.sh`): the earlier `kernel32.dll c0000135` came from a wow64 prefix. A pure 64-bit prefix (`WINEARCH=win64`, `/usr/lib/wine/wine64 wineboot -i`) works. All 19 win64 tests, 5 examples and 8 fuzzers pass; test_vulkan skips (no ICD). Real Windows bugs this run exposed and fixed:
-  - IOCP: `completion_port` now reopens the file handle with `FILE_FLAG_OVERLAPPED` (`ReOpenFile`); sync handles never completed.
-  - msvcrt/mingw `fmaf` is unfused (2.4M of 10M random inputs wrong), which broke the scalar simd math (asin/erfc 1 ulp over). New `forge::fmaf_exact` (TwoSum + round-to-odd, or the hardware FMA) is used by the simd scalar backend and the spec reference.
-  - `std::rename` does not replace on Windows, so fpk write/sign silently kept the old file. They now use `os::rename` (MoveFileEx REPLACE_EXISTING) and raise on failure.
-  - `modelfile::reader`, `safetensors` and `gguf_file` leaked their mapping when the constructor threw (bad key, corrupt or fuzzed input), which held files open on Windows.
-  - Tests: autodiff data is now portable Box-Muller (std::normal_distribution differs between libstdc++ and libc++). The paged-KV capacity check now allows for EOS.
-- All platform code now goes through forge::os: rpc (os::socket), aio (os::file; CRT fds kept on Windows), video/interop (os::library), and the dl.hpp shim (UTF-8 LoadLibraryW).
-- Not done:
-  - FreeBSD qemu VM: not run (memory limits on the shared box); only cross-linked.
-  - iOS: no SDK (zig lacks iOS libc headers, and there is no osxcross/darling), so iOS paths are unverified beyond review.
-
-### Android emulator re-run (FORGE_THREADS cap, one test at a time) — 2026-10-29
-- 21 pass (aio, loadbalancer, dtypes, graph, gpu, interop, kvquant, simd, lane_raw, os, pack, rpc, sessions, support, support2, tile, video, plus 5 examples); test_cuda_hip skips.
-- test_vulkan: the 33 kernel oracles and vk.rope now pass with the relative 2^-11 bound. Still failing on SwiftShader: "residency: dispatches are not batched" and the e2e tiny llama step, which only fails on that batching flag (logits err 8.8e-4, greedy tokens identical). Not investigated yet.
-- test_inference: exceeds 10–20 min under TCG with 2 threads and has taken the emulator down from memory twice. Treated as too heavy for this box; it passes on Linux and wine.
-- `tests/android_emulator.sh` accepts FORGE_TEST_TIMEOUT and FORGE_THREADS, and retries when adb drops.
-
-## test_vulkan batching on SwiftShader — fixed
-Root cause was a real backend bug. SwiftShader requires a 256-byte minStorageBufferOffsetAlignment. Sub-range views of a resident buffer at misaligned offsets made `acquire` drop the parent buffer, which forced a submit and a host sync (143 submits/571 dispatches). Such views are now staged through scratch buffers with device-side copies, including write-back of outputs. `FORGE_VK_SSBO_ALIGN` emulates stricter drivers, and the `test_vulkan_align256` ctest covers this on lavapipe. Lavapipe (with and without align=256) and the Android emulator now give 63 submits/571 dispatches and test_vulkan passes. Linux dev suite: all pass.
-
-## forge::os extension (16 features) — 2026-10-30
-Code: `os/include/forge/os/*.hpp` (guide: [`docs/os.md`](os.md)); test: `tests/test_os_ext.cpp` (one TEST per feature).
-Wiring: forge-serve `--watch` hot reload, `service::ready`, P-core pinning, `--numa-node`, memory pressure → prefix KV
-eviction (`batch_scheduler::request_kv_eviction`), `FORGE_HUGEPAGES=1` on weight mappings (see [`docs/serve.md`](serve.md)).
-
-| Feature | Linux (native) | Windows (wine64) | Android x86_64 emu | FreeBSD / macOS / musl |
-|---|---|---|---|---|
-| 1 NUMA | pass (1 node) | pass (affinity-mask fallback) | pass | link only |
-| 2 Huge pages | pass (2M via THP; strict 1G ENOMEM) | pass (large pages need privilege → fallback) | pass | link only |
-| 3 Async file I/O | pass (io_uring) | pass (IOCP) | pass | link only |
-| 4 CPU topology P/E | pass (non-hybrid VM) | pass | pass | link only |
-| 5 Power/thermal | pass (no battery) | pass | pass | link only |
-| 6 Memory pressure | pass (PSI) | pass (resource notification) | pass | link only |
-| 7 Shared memory | pass | pass | pass | link only |
-| 8 GPU discovery | pass (no GPU visible) | pass (DXGI via wine) | pass | link only |
-| 9 Unix sockets / pipes | pass | pass (named pipes) | pass | link only |
-| 10 Crash + minidump | pass (.crash) | pass (.dmp) | pass | link only |
-| 11 Sandboxing | pass (seccomp net/exec/write) | exec skipped (wine ignores job limits); net/fs unsupported by design | pass | link only |
-| 12 Key storage | pass (libsecret + file) | pass (DPAPI + file) | pass | link only |
-| 13 File watching | pass (inotify) | pass (ReadDirectoryChangesW) | pass | link only |
-| 14 Timers/perf | pass (TSC fallback; perf_event_paranoid=2) | pass (cycle fallback) | pass | link only |
-| 15 Background hooks | pass (not_required) | pass (execution state) | pass | link only |
-| 16 Service integration | pass (no manager) | pass (not under SCM) | pass | link only |
-
-forge-serve `--watch` verified live on Linux (two reloads, `/health` OK after); `--numa-node 0` verified. Linux dev ctest 73/73.
-Android x86_64 emulator (API 34, TCG, 2 GB, FORGE_THREADS=2): test_os_ext 16/16, test_os and test_loadbalancer pass. Android-specific
-results: background → unsupported without JNI hooks (graceful skip), perf counters unavailable (cycle fallback), GPU = emulator EGL device,
-unix sockets must be abstract (SELinux) — `local_endpoint` now defaults to `@forge-<name>` on Linux/Android.
-Also compiled and passed with g++ (Linux) in addition to the zig/clang dev build.
-Untested: iOS (no SDK),
-FreeBSD/macOS execution, hybrid P/E hardware, multi-node NUMA, batteries/thermal sensors, real GPUs, running under
-systemd/SCM, Windows sandbox exec denial on real Windows, macOS kperf (root).
-
-## Latest runs (2026-10-30)
-- Linux, g++ dev build: ctest 76/76 pass, including the two new `doc_example_*` tests. The Python golden, signing and ONNX tests need `numpy`, `safetensors`, `onnx` and `cryptography` in the configured Python.
-- Windows under wine, mingw build, `tests/wine_run.sh`: 32 pass, `test_vulkan` skipped, `test_os.exe` failed once inside the suite, at `cpu_time_ns() > 0` in `time_and_sleep`. Windows process times tick at about 15.6 ms, so the test's short loop could read 0. The test now busy-spins for 100 ms of wall time first, and passed 5 out of 5 reruns under wine.
-- Android x86_64 emulator, full suite (`tests/android_emulator.sh native build/android-x64`, with `test_inference`): 23 pass, 2 skipped (`test_cuda_hip`, `test_vulkan`), 1 failed. The failure was `test_os_ext` on socket-file binds. Commit 21c58e0 had accidentally reverted the abstract-socket fix; commit 7b7602c restores it. Linux `test_os_ext` passes again. **The Android rerun of `test_os_ext` after the restore is still pending.**
-
-## QEMU / multi-OS test matrix (2026-10-31)
-Host has /dev/kvm but KVM guests hang, so all VMs run under QEMU TCG (QEMU 9.2.2 built user-locally).
-
-| Target | How | Result |
-|---|---|---|
-| FreeBSD 14.5 amd64 | official BASIC-CLOUDINIT image, cross-built with clang 18 + FreeBSD sysroot, ctest in VM | all real tests pass after fixes; host-path tests (zig/python goldens) n/a in VM |
-| Shells on FreeBSD | pkg: sh, bash, zsh, dash, ksh93, mksh, oksh, yash, oils osh/ysh, fish, tcsh/csh, nu, elvish | backend golden + emit golden pass; xonsh pkg broken (ModuleNotFoundError), es segfaults, rc binary corrupt in VM |
-| Shells on Linux host | + oils 0.34 (user-local), busybox hush | ysh, osh, hush pass |
-| Windows x64 (wine 11.20 wow64) | llvm-mingw cross build, run under `xvfb-run` with a fresh prefix (`mscoree`/PATH must be initialised by `wineboot -i`) | every test passes; test_cuda_hip/test_vulkan skip (no GPU) |
-| Shells under wine | wine `cmd.exe`, busybox-w32 as `sh`/`ash` | backend golden (sh, ash) and emit golden (functions/flat/batch on sh+ash, batch on cmd) pass; PowerShell 7.4.6 win-x64 crashes at CLR start under wine (0x80131501), so pwsh/powershell are untested on Windows |
-
-Bugs fixed: GPU images with clangs lacking NVPTX/AMDGPU; strtod fallback for libc++ without FP from_chars; `-pthread` on FreeBSD; dlopen("libc.so") linker script on FreeBSD; kqueue tree watcher missed in-place file writes; safetensors header-length overflow (fuzz crash, trapped by FreeBSD libc++); ysh quoting (`'\''` invalid, now J8 `b'...'`); ksh93 emitter used `local` (now `typeset` + `function f {}`).
-
-Windows fixes (found under wine): close/unmap files before deleting; 8 MiB main-thread stack; `fs::glob` root backslashes; rpc `server::stop()` hung (Winsock `shutdown()` does not wake `accept()`/`recv()`); tree watcher pinned deleted subdirectories via per-directory handles (now one recursive handle); emitted shells did not map busybox-w32 `uname -s` = `Windows_NT`; the cmd emitter used multi-letter FOR variables, `^^!` escapes and `""` quote doubling (all wrong on real cmd too), `(a)+(b)` arithmetic and `/` paths.
-
-Where wine's cmd differs from Windows cmd (seen in this run): `set /a (a)+(b)` is a syntax error or crashes cmd (a group followed by an operator); `^` escapes are not processed during delayed expansion, so `^^!` prints `^`; `mkdir "a/b"` fails ("Path not found") where Windows accepts `/`; `sc query <missing>` exits 36 instead of 1060. The emitter now avoids all four, so its output is the same on both, but it has not been run on real Windows.
-
-## Text & locale (os layer)
-
-Clean-room Unicode/CLDR stack, no ICU: `test_text` 115/115, `test_locale` 223/223, UCD
-conformance 100% on 8 suites, cross-OS compile of `os/src/text` passes for freebsd,
-macos, windows-gnu and linux-musl. Script builtins in `script/src/text.cpp`. Gaps: see
-`docs/text-locale.md`.
+### 2026-10-29 and earlier
+- 8-core Xeon (AVX-512, AMX), no GPU. Vulkan on lavapipe: every kernel within 3e-7 relative of the reference;
+  both goldens end-to-end on Vulkan.
+- SVE at VL 128/256/512 and RVV at VLEN 128–1024 under qemu: simd tests pass at every length.
+- AMX intermittent mismatches traced to the VM losing tile registers across context switches
+  (`tools/amx_state_probe.cpp`); after fences and retries, 0/300 native and 0/10 SDE failures.
+- SME f32 outer products pass under qemu at SVL 128–2048.
+- KV-cache quantisation on the tiny model: max logit error vs f32 KV 6.8e-3 (int8), 3.1e-2 (fp8); Vulkan int8
+  matches CPU int8 to 4e-7.
+- Windows under wine (pure win64 prefix): 19 tests, 5 examples, 8 fuzzers pass. Real Windows bugs fixed then:
+  IOCP on sync handles, unfused mingw `fmaf` (now `forge::fmaf_exact`), `std::rename` not replacing, mappings
+  leaked when constructors threw.
+- Android emulator: `test_os`, `test_loadbalancer`, `test_os_ext` pass; `test_inference` too heavy for TCG.
+  Kotlin sources compiled with kotlinc 2.0.21.
+- Text and locale: `test_text` 115/115, `test_locale` 223/223, UCD conformance 100% on 8 suites.
+- `test_vulkan` parallel-run flake (shared `/tmp` paths) fixed with per-pid temp names.

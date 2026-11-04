@@ -3,42 +3,73 @@
 ## Concepts
 A `.fpk` file holds everything needed to run a model:
 - a JSON **manifest**,
-- a **blueprint** (the computation graph as text, see `modelfile/blueprint.hpp`),
-- a **tokenizer** (Hugging Face style BPE JSON),
-- a **tensor index** and the **tensor data**.
+- a **blueprint** (the computation graph as text, `modelfile/blueprint.hpp`),
+- a **tokenizer** (Hugging Face style `tokenizer.json`),
+- a **tensor index** and the **tensor data**, each tensor in one of the weight codecs of `graph/codecs.hpp`.
 
-Every section and every tensor has a BLAKE3 hash. Files can be **signed** (Ed25519) and their tensor data **encrypted** (XChaCha20-Poly1305), both via vendored Monocypher. Readers memory-map the file. The byte layout is in [format.md](format.md).
+Every section and every tensor has a BLAKE3 hash. Files can be **signed** (Ed25519) and their tensor data **encrypted** (XChaCha20-Poly1305), both with the vendored Monocypher. Readers memory-map the file. The byte layout is in [format.md](format.md).
+
+Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`. Language models get their blueprint from a template in `import/templates/` (`llama`, `qwen3`, `qwen3_5`, `mixtral`, `deepseek_v2`).
 
 ## API
 ### `modelfile::writer` (`fpk.hpp`)
-- `set_manifest(json)`, `set_section(name, bytes)`.
-- `add_tensor(name, shape, span<const float>, codec = "f32")` encodes on write. If a block codec's block size does not divide the element count, the tensor is stored as `f16` instead.
-- `add_raw(name, shape, codec, bytes)` stores already-encoded blocks (e.g. GGUF Q8_0/Q4_K) without re-quantising.
-- `write(path)` (replaces an existing file).
+
+| Member | Notes |
+|--------|-------|
+| `set_manifest(json)`, `set_section(name, bytes)` | |
+| `add_tensor(name, shape, span<const float>, codec = "f32")` | Encodes on write with any codec in `graph::codecs::all()`. If a block codec's block size does not divide the element count, the tensor is stored as `f16` |
+| `add_raw(name, shape, codec, bytes)` | Stores already-encoded blocks (e.g. GGUF Q4_K) without re-quantising; the byte count must match the codec |
+| `write(path)` | Writes to a temporary file and renames it over `path` |
+
+`modelfile::stream_writer(path)` has the same `set_*`/`add_*` calls but writes each tensor to disk as it is added, so peak memory is one tensor. Call `finish()` at the end.
 
 ### `modelfile::reader(path, key = nullopt)` (`fpk.hpp`)
-- Metadata: `manifest()`, `sections()`, `tensors()`, `entry(name)` (`.codec`, `.shape`, `.offset`, …), `has_section(name)`, `section_text(name)`, `file_size()`.
-- Data: `load(name)` returns the tensor decoded to f32.
-- `verify()` returns the names that fail their hash check (empty = intact).
-- Encryption state: `encrypted()`, `locked()` (encrypted and no key supplied).
-- `modelfile::alignment == 64`.
+
+| Member | Notes |
+|--------|-------|
+| `manifest()`, `sections()`, `tensors()`, `entry(name)`, `has_section(name)`, `section_text(name)`, `section_bytes(name)`, `file_size()` | Metadata. `entry` gives `.codec`, `.shape`, `.offset`, `.bytes`, `.blake3` |
+| `load(name)` | The tensor decoded to f32 |
+| `verify()` | Names of sections and tensors whose hash fails (empty = intact). Tensor hashes are skipped while `locked()` |
+| `encrypted()`, `locked()` | `locked()`: encrypted and no key from the constructor, `FORGE_MODEL_KEY` or `FORGE_MODEL_KEY_FILE` |
+
+`modelfile::alignment` is 64; `modelfile::format_version` is 1.
 
 ### Others
-- `modelfile::bpe_tokenizer` (`tokenizer.hpp`): `encode(text)`, `decode(ids)`, `bos()`, `eos()`.
-- `sign.hpp`: signing and `verify_signature(reader, trusted_keys)` over a digest of the section table (scheme `forge-fpk-v1`). With no trusted keys, any valid signature passes (integrity only).
-- `blueprint.hpp`: parser for the blueprint language, including composite ops (`op name(args) { ... }`).
+
+| Header | Contents |
+|--------|----------|
+| `tokenizer.hpp` | `bpe_tokenizer`: `encode(text)`, `decode(ids)`, `decode_one(id)`, `token_id(str)`, `vocab_size()`, `bos()`, `eos()` |
+| `sign.hpp` | `generate_keypair()`, `load_secret_key(path)`, `load_public_key(path)`, `sign_file(in, out, key)`, `verify_signature(reader, trusted_keys)` → `signature_report` (`signed_`, `digest_ok`, `trusted`, `valid_keys`, `message`). With no trusted keys, any valid signature counts (integrity only, not provenance) |
+| `bundle.hpp` | Ed25519 over a directory: `sign_bundle(root, key)` writes `FORGE-SIGNATURE.json` (path, size, BLAKE3 per file); `verify_bundle(root, trusted)` re-hashes and reports modified, missing and extra files. Also detached `sign_bytes` / `verify_bytes` |
+| `blueprint.hpp` | `parse_blueprint(text)`: the blueprint language (params, state slots, `repeat` loops, any spec op by name, composites such as `linear`, `embed`, `heads`, user-defined `op name(args) { ... }`, fixed-size state ops `state[i].conv(...)` / `state[i].delta(...)`) |
+| `entropy.hpp` | OS randomness for keys and nonces |
 
 ## Importers (`modelfile/include/forge/import/`)
 
-| Source | Header | Notes |
-|--------|--------|-------|
-| Hugging Face directory (`config.json` + safetensors) | `hf.hpp`, `safetensors.hpp` | Templates: `llama` (Llama, Mistral, Qwen2), `mixtral` (MoE), `deepseek_v2` (MLA; DeepSeek-V2/V3 architectures) |
-| GGUF v2/v3 | `gguf.hpp` | `llama`, `qwen2`, `qwen3`, `mistral`, `qwen35` (Qwen3.5 dense, onto the `qwen3_5` template; tiled V heads are put back in grouped order, and the Gated DeltaNet out projection is re-encoded as q8_0 when quantised) architectures. Q8_0 / Q4_K blocks are copied verbatim |
-| ONNX | `onnx.hpp` | Static-shape inference graphs (MLPs, classifiers, encoder blocks) from MatMul, Gemm, elementwise ops, Relu/Sigmoid/Tanh/Gelu/Erf/Softplus, Softmax, LayerNormalization, Transpose, Reshape, Flatten, ReduceMean/Sum and a few more (list in the header). One symbolic dimension maps to `seq`; unsupported ops are rejected by name |
+| Source | Function, header | Architectures | Weights |
+|--------|------------------|---------------|---------|
+| Hugging Face directory (`config.json`, `*.safetensors`, `tokenizer.json`) | `import_hf`, `hf.hpp` (+ `safetensors.hpp`) | `llama` template: Llama, Mistral, Qwen2. `qwen3`: Qwen3 (QK-norm). `qwen3_5`: Qwen3.5 dense text models (Gated DeltaNet + gated full attention, partial RoPE). `mixtral`: Mixtral MoE. `deepseek_v2`: DeepSeek-V2/V3 (absorbed MLA) | Encoded with `--codec`; mixed precision with `q4_k_m` / `q5_k_m` |
+| GGUF v2/v3 | `import_gguf`, `gguf.hpp` | `llama`, `mistral`, `qwen2` → `llama`; `qwen3`; `qwen35` → `qwen3_5` | Copied verbatim: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. `--codec` is not applied |
+| ONNX | `import_onnx`, `onnx.hpp` | Static-shape inference graphs (MLPs, classifiers, encoder blocks) | Initializers become weights |
 
-CLI: `forge import <src> -o out.fpk [--codec C] [--template NAME]`. Codecs: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`.
+Importer limits that raise an error:
+- HF `deepseek_v2`: no YaRN rope scaling, greedy top-k routing with softmax scoring only.
+- HF `qwen3_5` and GGUF `qwen35`: no MoE variants, no full-width RoPE, `hidden_act` must be `silu`, and full-attention layers must repeat every `full_attention_interval` layers.
+- GGUF `qwen35`: V heads stored in tiled order (`ssm.v_head_reordered`) are put back in grouped order. Row-wise tensors are permuted as raw blocks. The DeltaNet out projection is decoded, permuted and re-encoded, as q8_0 when the source was quantised.
+- ONNX ops: MatMul Gemm Add Sub Mul Div Pow Max Min Relu Sigmoid Tanh Exp Log Sqrt Neg Abs Erf Gelu Softplus Reciprocal Softmax LayerNormalization Transpose Reshape Flatten Identity Constant ReduceMean ReduceSum. One symbolic dimension maps to `seq`. Any other op is rejected by name.
 
-The importers are tested on small synthetic models generated by the test scripts (`verify/golden/*.py`, `tests/onnx_test.py`), not on full-size published checkpoints.
+Templates are read from `FORGE_TEMPLATES` if set, else from `import/templates/` in the source tree.
+
+### Mixed precision (HF only, `quant_recipe.hpp`)
+`--codec q4_k_m` or `q5_k_m` chooses a type per tensor. `--recipe llama` is a port of llama.cpp's `llama_tensor_get_type()` rules. `--recipe forge` (default) applies the same rules, then puts Gated DeltaNet in/out projections and `attn_output` at q6_k and the head and token embedding at q8_0 (bf16 with `--bf16-head`). Norms, conv weights, A/dt and the a/b gates stay f32. Overrides: `--output-tensor-type`, `--token-embedding-type`, `--tensor-type REGEX=TYPE[,...]` (first match wins), `--pure`.
+
+### CLI
+```sh
+forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME] [--emb-codec C]
+```
+Codecs: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`. With a quantised codec, the token embedding defaults to q8_0 (`--emb-codec` overrides). `forge run` also accepts an HF directory or `.gguf` directly and caches the import in `~/.cache/forge`.
+
+The importers are tested on small random models built by the test scripts (`verify/golden/tiny_llama.py`, `tiny_moe.py`, `tiny_qwen3.py` (HF and GGUF), `tiny_qwen3_5.py`, `quant_inplace.py`, `tests/onnx_test.py`), checked against float64 NumPy or transformers references. They have not been checked against full-size published checkpoints in the test suite.
 
 ## Examples
 `docs/examples/modelfile_roundtrip.cpp` (ctest `doc_example_modelfile_roundtrip`):
@@ -47,24 +78,26 @@ The importers are tested on small synthetic models generated by the test scripts
 modelfile::writer w;
 w.set_manifest(json::object{{"name", "demo"}});
 w.add_tensor("w", {16, 16}, a, "f32");
+w.add_tensor("wq", {256}, a, "q8_0");      // quantised on write
 w.write(path);
 modelfile::reader r(path);
-bool ok = r.verify().empty();
+bool ok = r.verify().empty();              // empty = every hash matches
+auto t = r.load("w");                      // decoded to f32
 ```
 
-Signing and encryption from the CLI (run against the golden model while writing this page):
+Signing and encryption from the CLI:
 
 ```sh
-forge keygen -o dk                              # dk.key (secret), dk.pub
+forge keygen -o dk                              # dk.key (secret seed), dk.pub
 forge sign model.fpk --key dk.key -o signed.fpk
-forge verify signed.fpk --pubkey dk.pub         # prints "signed.fpk: VERIFIED", exit 0
+forge verify signed.fpk --pubkey dk.pub         # prints "signed.fpk: VERIFIED"; exit 1 on failure
 forge encrypt signed.fpk -o sealed.fpk --new-key k.mkey
-FORGE_MODEL_KEY_FILE=k.mkey forge inspect sealed.fpk
+FORGE_MODEL_KEY_FILE=k.mkey forge inspect sealed.fpk --verify
 ```
 
-Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>]`. The key can also be given as `FORGE_MODEL_KEY=<hex>`.
+Strict loading in inference sessions: `FORGE_REQUIRE_SIGNED=1` refuses unsigned files; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` also requires a signature from one of those keys.
 
 ## Platform notes and limits
-- `FORGE_HUGEPAGES=1` asks for huge pages on mappings of 2 MiB or more.
-- In encrypted files, the manifest, blueprint, tokenizer, tensor index and section table stay readable; only `data` is sealed. That is why `inspect` and section-hash checks work without the key.
-- Signing was cross-checked against pyca/cryptography (`modelfile_signing` ctest).
+- `FORGE_HUGEPAGES=1` asks for transparent huge pages on mappings of 2 MiB or more.
+- In encrypted files only `data` is sealed. The manifest, blueprint, tokenizer, tensor index and section table stay readable, which is why `inspect`, section-hash and signature checks work without the key.
+- Signing is cross-checked against pyca/cryptography (`modelfile_signing` ctest).

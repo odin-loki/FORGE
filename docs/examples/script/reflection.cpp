@@ -1,4 +1,4 @@
-// Runtime reflection in FORGE script: run with `forge run docs/examples/script/reflection.cpp`
+// Runtime reflection in FORGE script: run with `forge script docs/examples/script/reflection.cpp`
 struct [[serializable]] Point {
     [[key("x")]] double x = 0;
     double y = 0;

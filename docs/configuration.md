@@ -1,64 +1,145 @@
 # Configuration: environment variables
 
-FORGE has no config file. Programs take command-line flags ([cli.md](cli.md), [serve.md](serve.md)) and read the environment variables below. Each was found by searching the sources for `getenv`.
+FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.md), [serve.md](serve.md), [rpc.md](rpc.md)) and read the environment variables below. The list was built by searching the sources for `getenv`. Most values are read once, the first time they are needed, so set them before the program starts.
 
-## Runtime
+## Devices and kernels
 
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge-serve`, C ABI, bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to CPU |
-| `FORGE_SIMD_TARGET` | simd | Force a kernel table: `scalar`, `avx2`, `avx512` (x86), `neon`, `sve` (aarch64), `rvv` (riscv64). Ignored if not usable on this CPU (old name `FORGE_LANE_TARGET` still works) |
+| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
+| `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx2`, `avx512`, `neon`, `sve`, `rvv`. Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
+| `FORGE_SVE_KEEP_VL=1` | simd (aarch64 Linux) | Do not change the SVE vector length at start-up when there is no kernel table for the hardware length |
 | `FORGE_THREADS` | task pool | Worker thread count (default: hardware concurrency) |
-| `FORGE_LOG` | logging | Threshold by first letter: `trace`, `debug`, `info`, `warn` (default), `error` |
-| `FORGE_HUGEPAGES=1` | memory-mapped files | Request huge pages (`madvise`) for mappings of 2 MiB or more |
-| `FORGE_KV_CODEC` | sessions | KV cache codec when `session_options.kv_codec` is empty: `f32` (default), `int8`, `fp8` |
-| `FORGE_KV_OFFLOAD=1` | sessions | Keep KV on the host and drop device copies after each attention |
-| `FORGE_GPU_NO_RESIDENCY` | Vulkan lowerings | If set, tensors are not kept resident on the device between ops |
-| `FORGE_GPU_REPLAY` | CUDA/HIP lowerings | If set, enables experimental whole-run decode replay (relaunches recorded device work without the executor) |
-| `FORGE_REPLAY_VERIFY` | CUDA/HIP lowerings | With `FORGE_GPU_REPLAY`, run one real (verifying) run every N runs (default 32) |
-| `FORGE_SVE_KEEP_VL=1` | simd (aarch64) | Do not change the SVE vector length at start-up |
+| `FORGE_PROCESSES` | `os::process_pool` | Worker process count when the pool is created with 0 workers (default: hardware concurrency) |
+| `FORGE_QDOT=0` | quantised matmul (CPU) | Use the plain scalar decode + dot path instead of the SIMD one (benchmarking, bisecting) |
 
-## Memory
+## GPU tuning and debugging
+
+These switch individual GPU code paths. Most are for benchmarking and bisecting; the defaults are the tested configuration. [gpu.md](gpu.md) describes each kernel path they control.
+
+| Variable | Applies to | Effect |
+|----------|-----------|--------|
+| `FORGE_GPU_NO_RESIDENCY` | CUDA, HIP, OpenCL, Level Zero, Metal | If set, tensors are not kept on the device between ops; every op uploads and downloads. Vulkan always keeps tensors resident |
+| `FORGE_GPU_EAGER_SYNC` | CUDA, HIP | If set, every run ends by syncing all resident buffers to the host; turns off the fixed arena and whole-run replay |
+| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP | If set, Gated DeltaNet state ops run on the host instead of the device |
+| `FORGE_GPU_QMATMUL=0` | CUDA, HIP | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
+| `FORGE_GPU_QGATHER=0` | CUDA, HIP | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_WEIGHT_BUDGET` | resident backends | f32 bytes of decoded quantised weights mirrored on the device, e.g. `4G`, `512M` (suffix `k`, `m`, `g`; default 8 GiB). The rest stay encoded and run on the CPU. Codecs with a device quantised matmul stay encoded on the device instead |
+| `FORGE_GPU_ARENA_MB` | CUDA, HIP | Largest activation arena held at fixed device addresses as one buffer, in MiB (default 1024; 0 disables) |
+| `FORGE_GPU_POOL_MB` | CUDA, HIP | MiB of freed device buffers kept for reuse (default 4096) |
+| `FORGE_GPU_REPLAY` | CUDA | If set, enables experimental whole-run decode replay (relaunches recorded device work without the executor). Needs `FORGE_GRAPHS=1` and the fixed arena |
+| `FORGE_REPLAY_VERIFY` | CUDA | With `FORGE_GPU_REPLAY`: do one real run every N runs (default 32) |
+| `FORGE_GRAPHS=1` | CUDA | Capture decode kernel launches into CUDA graphs and replay them |
+| `FORGE_GRAPH_REPLAY=0` | CUDA | With `FORGE_GRAPHS=1`: always re-capture instead of patching kernel parameters in place |
+| `FORGE_GRAPH_SEG` | CUDA | With `FORGE_GRAPHS=1`: kernels per captured segment (default 64; 0 = no splitting) |
+| `FORGE_MMVQ=0` | CUDA, HIP | Disable the q8_1/dp4a decode matmul kernels |
+| `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMQ kernel (default 16; 0 disables MMQ) |
+| `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
+| `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernel |
+| `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` |
+| `FORGE_PLAN_TRACE` | all devices | If set, print at exit the ops (with shapes and counts) that ran on the host during device runs |
+| `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
+| `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |
+| `FORGE_VK_PIPELINE_CACHE=0` | Vulkan | Disable the pipeline cache |
+| `FORGE_CACHE_DIR` | Vulkan | Pipeline cache directory (else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge`) |
+| `FORGE_OPENCL_TYPE` | OpenCL | Devices to enumerate: `gpu`, `cpu` or `all` (default; GPUs listed first) |
+
+## Sessions and memory
 
 See [memory.md](memory.md) for how the budget is used.
 
 | Variable | Effect |
 |----------|--------|
-| `FORGE_MEM_LIMIT` | Host memory budget: `6G`, `512M`, `1.5GiB`, bytes, or `75%` of the detected limit; `0`/`off` disables. Default: `FORGE_MEM_FRACTION` of min(RAM, cgroup limit, `RLIMIT_AS`) |
+| `FORGE_KV_CACHE_TYPE`, `FORGE_KV_CODEC` | KV cache codec when `session_options.kv_codec` is empty (`FORGE_KV_CACHE_TYPE` is checked first): `f32` (default), `int8`, `fp8`, `tbq4`, `tbq3`, `tbq4p`, `tbq3p`, or `k8v4` (int8 keys, tbq4 values) |
+| `FORGE_KV_OFFLOAD=1` | Keep the KV cache on the host and drop device copies after each attention (when `session_options.kv_offload` is unset) |
+| `FORGE_DECODE_WEIGHTS=1` | Decode every weight to f32 at load time, instead of reading quantised weights in place from the mapped file |
+| `FORGE_HUGEPAGES=1` | Advise huge pages for memory mappings of 2 MiB or more |
+| `FORGE_MEM_LIMIT` | Host memory budget: `6G`, `512M`, `1.5GiB`, bytes, or `75%` of the detected limit; `0` / `off` disables. Default: `FORGE_MEM_FRACTION` of min(RAM, cgroup limit, `RLIMIT_AS`) |
 | `FORGE_MEM_FRACTION` | Share of the detected limit used when `FORGE_MEM_LIMIT` is unset (default `0.85`) |
-| `FORGE_MEM_SOFT` | Soft watermark as a share of the limit; above it caches are trimmed and new requests wait (default `0.9`) |
+| `FORGE_MEM_SOFT` | Soft watermark as a share of the limit (default `0.9`) |
 | `FORGE_MEM_DEVICE_LIMIT` | Limit for device memory pools (default: accounting only) |
 | `FORGE_MEM_PRESSURE=0` | Ignore OS memory-pressure signals |
-| `FORGE_MEM_SPILL_DIR` / `FORGE_MEM_SPILL_MAX` | Spill-store directory (default `<tmp>/forge-spill-<pid>`) and size cap |
+| `FORGE_MEM_SPILL_DIR`, `FORGE_MEM_SPILL_MAX` | Spill-store directory (default `<tmp>/forge-spill-<pid>`) and size cap |
 
 ## Models and security
 
 | Variable | Effect |
 |----------|--------|
-| `FORGE_MODEL_KEY` / `FORGE_MODEL_KEY_FILE` | Key (hex) or key file for encrypted `.fpk` files |
-| `FORGE_REQUIRE_SIGNED=1` | Refuse to load unsigned models |
-| `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` | Only accept signatures from these Ed25519 public keys |
-| `FORGE_CACHE` | Where `forge run` caches imported models (default `~/.cache/forge`) |
-| `FORGE_TEMPLATES` | Directory of blueprint templates for importers (default: `import/templates` in the source tree the binary was built from) |
+| `FORGE_MODEL_KEY`, `FORGE_MODEL_KEY_FILE` | Key (64 hex digits) or key file for encrypted `.fpk` files. `FORGE_MODEL_KEY` wins if both are set |
+| `FORGE_REQUIRE_SIGNED=1` | Refuse models without a valid signature |
+| `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` | Only accept signatures from these Ed25519 public keys (implies a signature is required) |
+| `FORGE_CACHE` | Where `forge run` / `forge bench` cache models imported on the fly (default `~/.cache/forge`) |
+| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `import/templates` in the source tree the binary was built from) |
 
-## Caches and GPU debugging
+## RPC clients
+
+Read by `rpc:host:port` devices and `forge::remote` (see [rpc.md](rpc.md)).
 
 | Variable | Effect |
 |----------|--------|
-| `FORGE_CACHE_DIR` | Vulkan pipeline cache directory (else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge`) |
-| `FORGE_VK_PIPELINE_CACHE=0` | Disable the Vulkan pipeline cache |
-| `FORGE_VK_DEBUG` | Log why an op was not offloaded to Vulkan |
-| `FORGE_VK_SSBO_ALIGN=N` | Emulate a stricter storage-buffer offset alignment (testing) |
-| `FORGE_OPENCL_TYPE` | OpenCL devices to enumerate: `gpu`, `cpu` or `all` (default; GPUs listed first) |
+| `FORGE_RPC_TOKEN` | Bearer token |
+| `FORGE_RPC_KEY` | Secret key file for key authentication |
+| `FORGE_RPC_TLS=1` | Use TLS (also implied by any of the next three variables) |
+| `FORGE_RPC_CA` | CA file used to verify the server certificate |
+| `FORGE_RPC_FINGERPRINT` | SHA-256 fingerprint of the server certificate |
+| `FORGE_RPC_TLS_CERT`, `FORGE_RPC_TLS_KEY` | Client certificate and key, for servers started with `--tls-client-ca` |
+| `FORGE_RPC_SERVER_NAME` | Server name for TLS verification |
+
+`forge rpc-serve --allow-scripts` removes `FORGE_SCRIPT_CACHE_SIGN_SEED`, `FORGE_RPC_TOKEN`, `FORGE_RPC_KEY` and `FORGE_RPC_TLS_KEY` from the environment of script child processes.
+
+## Scripting
+
+| Variable | Effect |
+|----------|--------|
+| `FORGE_SCRIPT_PATH` | Extra module search directories for script imports (separated by `:` or `;`; `;` only on Windows) |
+| `FORGE_SCRIPT_CACHE` | Directory for the compiled-script cache (unless `--cache-dir` is given) |
+| `FORGE_SCRIPT_CACHE_SIGN_SEED` | 64-hex Ed25519 seed used to sign cache entries (unless `--cache-sign-seed` is given) |
+| `FORGE_SHELL` | Shell used by `forge::host_shell()` and `forge script --emit auto` |
+| `FORGE_ASK_MODEL` | `.fpk` that `forge::ask` and related calls run in-process (unless `--ask-model` is given) |
+| `FORGE_ASK_MAX_TOKENS` | Reply cap for those calls (default 256) |
+| `FORGE_AI_ENDPOINT` | OpenAI-compatible endpoint used when no in-process model is set, e.g. `http://127.0.0.1:8080` from `forge-serve` |
+| `FORGE_AI_MODEL` | `model` field sent to that endpoint (default `default`) |
+| `FORGE_AI_KEY` | Sent as `Authorization: Bearer <key>` to that endpoint |
+
+## Logging and console
+
+| Variable | Effect |
+|----------|--------|
+| `FORGE_LOG` | Global and per-module thresholds, e.g. `info` or `warn,graph=debug`. Levels are matched by first letter: `trace`, `debug`, `info`, `warn` (default), `error`, `fatal`, `off` |
+| `FORGE_LOG_FORMAT=json` | JSON-lines log output |
+| `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE=1`, `TERM=dumb` | Colour on or off for `os::console` output |
 
 ## OS layer
 
 | Variable | Effect |
 |----------|--------|
-| `FORGE_AIO=threads` | Force the thread-pool backend for async file I/O instead of io_uring |
+| `FORGE_AIO=threads` | Force the thread-pool backend for async file I/O instead of io_uring, IOCP or kqueue |
 | `FORGE_KEYSTORE=file` | Force the file keystore |
-| `FORGE_KEYSTORE_DIR` | File keystore directory |
-| `NOTIFY_SOCKET`, `WATCHDOG_USEC` | Standard systemd variables, honoured by `os::service` |
+| `FORGE_KEYSTORE_DIR` | File keystore directory (default `$XDG_DATA_HOME/forge/keys`, `%LOCALAPPDATA%\forge\keys` on Windows) |
+| `FORGE_MOBILE_TRACE` | Replay a JSON trace file instead of opening the real device in `os::mobile` |
+| `FORGE_MOBILE_SYSFS`, `FORGE_MOBILE_INPUT` | Linux `os::mobile`: roots used instead of `/sys` and `/dev/input` |
+| `NOTIFY_SOCKET`, `WATCHDOG_USEC`, `INVOCATION_ID`, `JOURNAL_STREAM` | Standard systemd variables, used by `os::service` |
+| `TZ`, `TZDIR` | Time zone and zoneinfo directory, used by `os::time` and `forge::os::locale` |
+
+## Bindings
+- `FORGE_LIB`: path to `libforge` for the Python binding (tried first). Treat it as trusted configuration.
+- The Android example and the Swift binding set `FORGE_DEVICE` themselves.
 
 ## Test-only
-`FORGE_OS_EXT_CHILD`, `FORGE_OS_T`, `FORGE_TEST_H264`, `FORGE_ZE_TEST_IMAGE`, `FORGE_OPENCL_TEST_ALIGN`, `MOCK_DEVICES`, `MOCK_ALIGN` are used by the test suites and mock drivers. **Do not export `FORGE_OS_EXT_CHILD` in a shell**: it switches `test_os_ext` into a child-process mode. `FORGE_TEST_TIMEOUT` is read by `tests/android_emulator.sh`; `FORGE_TEST_FPK` by the Android and Swift binding tests; `FORGE_LIB` by the Python binding.
+Used by the test suites, mock drivers and test scripts; not by the library:
+
+| Variable | Used by |
+|----------|---------|
+| `FORGE_TEST_ONLY` | Every `test_*` binary: run only cases whose name contains the value |
+| `FORGE_OS_EXT_CHILD` | `test_os_ext` child-process mode. **Do not export it in a shell** |
+| `FORGE_OS_T`, `FORGE_TEST_DYNLIB_PATH`, `FORGE_TEST_LOG_EXIT_FILE`, `FORGE_TST_*`, `FORGE_EMIT_X`, `FORGE_EMIT_NOPE` | Set and read by the tests themselves |
+| `FORGE_TEST_H264` | `test_video` input file |
+| `FORGE_TEST_PLUGIN_PATH`, `FORGE_TEST_SHELL_PATH` | `test_script`: plugin to load, extra shell directories |
+| `FORGE_UPDATE_EMIT_GOLDEN`, `FORGE_GOLDEN_UPDATE` | Rewrite emit and script goldens instead of comparing |
+| `FORGE_UCD_DIR` | `test_text_conformance` data directory (default `tests/data/ucd`) |
+| `FORGE_ZE_TEST_IMAGE`, `MOCK_DEVICES`, `MOCK_ALIGN`, `MOCK_MEM_LIMIT` | GPU tests and mock drivers |
+| `FORGE_OPENCL_TEST_ALIGN` | The OpenCL runtime: overrides its buffer alignment, for tests |
+| `FORGE_RUNNER` | Golden scripts: emulator prefix when cross-compiling |
+| `FORGE_TEST_FPK` | Android and Swift binding tests |
+| `FORGE_TEST_TIMEOUT` | `tests/android_emulator.sh` per-test limit (default 600 s) |
+| `FORGE_MOBILE_BUILD_DIR` | `tests/mobile_build.sh` build directory |

@@ -17,7 +17,7 @@ int main() {
     auto grads = grad(g, loss, {x});                                              // reverse-mode autodiff
     g.output("dx", grads[x]);
 
-    auto plan = compile(g);                 // passes -> memory plan -> lowering; cached per shape bucket
+    auto plan = compile(g);                 // passes -> memory plan -> lowering (inference caches plans per shape bucket)
     executor ex(*plan);
     std::vector<float> in{0, 1, -1, 2, 0.5f, -0.5f, 3, -3};
     ex.set_input("x", in);

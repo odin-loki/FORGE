@@ -1,116 +1,222 @@
-# OS wrapper design (forge::os, full surface)
+# OS wrapper: processes, files, system, network
 
-Status: **implemented** (phases 1–5 below; remaining platform gaps are listed at the end of Phasing). Scripts reach it through `forge::sh/pwsh/cmd`, `fs`, `os`, `time`, `net`, `service`, `proc` and `json`. This extends the existing header-only `forge::os` layer
-(`os/include/forge/os/`) into a complete, portable wrapper over the operating system. It is the
-foundation for the scripting layer in [scripting.md](scripting.md).
+This page covers the `forge::os` headers beyond the core layer in [os.md](os.md): process control, pipes, signals, file-system extras, users, time, system information, console, networking, recursive file watching, service control, the Windows registry, devices, the clipboard, dynamic libraries and process pools. It started as a design; it is now built, and the parts that are still missing are listed under [Not built yet](#not-built-yet).
 
-## Goals
+The scripting layer uses these headers for `run`, `proc`, `fs`, `os`, `time`, `net` and `service` and for `ProcessPool` (see [scripting.md](scripting.md)).
 
-- One C++23 API for the whole OS surface on Linux, Android, Windows, macOS, iOS and FreeBSD.
-- Keep the current conventions: header-only, `forge::os::result<T>` / `status`, `error{code, what}`,
-  `unsupported(...)` instead of silent no-ops, UTF-8 strings everywhere (wide conversion only at the
-  Windows boundary), no exceptions across the API.
-- Every call is either implemented natively or returns `is_unsupported(e) == true`, so callers and
-  scripts can feature-test at runtime. `os::caps()` reports what the current platform supports.
-- No new third-party dependencies.
+## Concepts
+- Same conventions as `os.hpp`: header-only, UTF-8 strings (wide strings only at the Windows boundary), `os::result<T>` / `os::status` returns, no exceptions (except `process_pool`, below).
+- A call either works natively or returns an error with `os::is_unsupported(err) == true`, so callers can test for a feature at run time.
+- All headers below are included by `<forge/os/all.hpp>` except `process_pool.hpp`.
 
-## What already exists
+## Module reference
+| Header | Namespace | Main API |
+|---|---|---|
+| `process.hpp` | `forge::os` | `spawn_wait(spawn_spec)` → `proc_result`; `child` (streaming); `wait_any`, `wait_all`; `find_executable`; `apply_limits`; `kill_group`; `list_processes`, `process_info`; `process_caps` |
+| `pipe.hpp` | `forge::os` | `make_pipe()` → `{read, write}` RAII `pipe_end`s with `write_all`, `read_some(max, timeout_ms)`, `read_all` |
+| `signal.hpp` | `forge::os` | `signal_id` (interrupt, terminate, kill, hangup, quit, user1, user2), `sig_name`, `sig_from_name`, `sig_native`, `send_signal(pid, sig, group)` |
+| `fs.hpp` | `forge::os::fs` | `copy`, `copy_tree`, `move`, `remove_all`, `symlink`, `hardlink`, `read_link`, `mode`, `chmod`, `chown`, `mtime_ns`, `set_mtime_ns`, `touch`, `glob_match`, `glob`, `walk`, `file_lock`, `disk_usage`, `mounts`, `make_temp_file`, `make_temp_dir`, `write_file_atomic` |
+| `users.hpp` | `forge::os` | `current_user`, `lookup_user`, `lookup_uid`, `is_elevated`, `user_directory(user_dir)`, `config_dir`, `cache_dir`, `data_dir` |
+| `time.hpp` | `forge::os` | `unix_time_ns`, civil-time conversion, `utc_offset_seconds`, `timezone_name`, `format_iso8601`, `format_local_iso8601`, `parse_iso8601`, `timer_queue`, `stopwatch`, `deadline` |
+| `sysinfo.hpp` | `forge::os` | `release_info`, `uptime_seconds`, `load_average`, `memory()`, `per_cpu_times`, `cpu_usage`, `self_usage`, `current_rss` |
+| `console.hpp` | `forge::os::console` | `is_tty`, `size`, `enable_vt`, `color_enabled`, `paint`, `mode_guard` (raw or no-echo), `read_password`, `confirm` |
+| `net.hpp` | `forge::os::net` | `resolve`, `interfaces`, `port_open`, `parse_url`, `http(request)`, `http_get` |
+| `file_watch_tree.hpp` | `forge::os` | `tree_watcher::open(root, tree_watch_opts)`, `poll(ms)` |
+| `service_control.hpp` | `forge::os::service` | `service_spec`, `render_systemd_unit`, `render_launchd_plist`, `install`, `start`, `stop`, `query`, `uninstall` |
+| `registry.hpp` | `forge::os::registry` | `get`, `set` (string or 64-bit integer), `remove_value`, `remove_key`, `list` |
+| `devices.hpp` | `forge::os::devices` | `block()`, `pci()`, `usb()` |
+| `clipboard.hpp` | `forge::os::clipboard` | `available`, `get`, `set` |
+| `dynlib.hpp` | `forge::os` | `dynlib::open`, `get<F>`, `require<F>`, `path()`, `symbols()`, `file_symbols(path)`, `file_format(path)` |
+| `process_pool.hpp` | `forge::os` (alias `forge::process_pool`) | `process_pool`, `FORGE_PROCESS_TASK`, `register_process_task` |
 
-`os.hpp` already covers files (`file`, `read_file`, `stat`, `mkdirs`, `list_dir`, `rename`), paths,
-`mapping` (mmap), virtual memory (`reserve`/`commit`/`protect`/`lock_memory`), `library` (dlopen),
-env, clocks, threads/mutex/condvar/semaphore, `run()` (blocking exec), basic signals, `sysinfo`,
-`entropy`, sockets and `poll`. Separate headers cover async files, file watch, CPU topology, NUMA,
-huge pages, memory pressure, shared memory, local IPC, keystore, sandbox, service, power, perf,
-crash handling and GPU device enumeration.
+## Processes (`process.hpp`)
+`spawn_wait(spec)` starts a program, feeds stdin, collects output and waits.
 
-## New and extended modules
-
-| Header | Surface |
+| `spawn_spec` field | Meaning |
 |---|---|
-| `process.hpp` | `spawn(spec)` with argv/env/cwd, stdin/stdout/stderr as pipe, file, null or inherit; `child.wait(timeout)`, `kill(sig)`, `pid`; process groups / Job Objects so a tree dies together; `list_processes()`, `process_info(pid)` (cmdline, RSS, CPU, parent) ; resource limits applied at spawn (memory, CPU time, open files) via rlimit / cgroups v2 / Job Objects |
-| `pipe.hpp` | anonymous pipes, named pipes / FIFOs, non-blocking read with deadline, `read_all` helpers |
-| `signal.hpp` | full portable signal set, `sigint`/`sigterm` → console ctrl events on Windows, signal-to-fd / self-pipe for event loops |
-| `fs.hpp` (extends file API) | `copy`, `copy_tree`, symlinks/hardlinks, `chmod`/`chown`, timestamps, `glob`, recursive `walk`, file locks, disk usage (`statvfs` / `GetDiskFreeSpaceEx`), mount list, temp files, atomic `write_file_atomic` |
-| `file_watch.hpp` (extend) | recursive watch, debounce, inotify / FSEvents / kqueue / ReadDirectoryChangesW, polling fallback |
-| `users.hpp` | current user/group, uid/gid or SID, `lookup_user`, `is_elevated()`, effective permissions (`access`), home/config/cache/data dirs per platform convention |
-| `net.hpp` (extends sockets) | TCP/UDP/Unix-domain, IPv4/IPv6, DNS `resolve`, interface list with addresses/MAC, simple blocking HTTP/1.1 client (no TLS), port probe |
-| `time.hpp` | monotonic/wall/CPU clocks (existing), timezone offset, ISO-8601 format/parse, high-resolution timers, `timer_queue` for scheduled callbacks |
-| `sysinfo.hpp` (extends) | OS name/version/kernel, arch, uptime, load average, per-CPU usage, memory (incl. cgroup limit, shared with `forge::mem`), disks, battery/thermal (via `power.hpp`), GPU list (via `gpu_devices.hpp`) |
-| `devices.hpp` | block devices, USB/PCI enumeration where the OS exposes it (sysfs, SetupAPI, IOKit); read-only |
-| `service.hpp` (extend) | install/start/stop/status for systemd user units, launchd agents, Windows SCM; `unsupported` on mobile |
-| `os.hpp` (`library`), `dynlib.hpp` | `os::library` (open / symbol / close); `os::dynlib` on top of it: search dirs and an env var before the system loader, typed `get<F>` / `require<F>`, `path()` of the loaded file, `symbols()` of a loaded library and `file_symbols(path)` for ELF / PE / Mach-O files on any host |
-| `registry.hpp` | Windows registry read/write/enumerate; `unsupported` elsewhere |
-| `console.hpp` | is-a-tty, terminal size, ANSI/VT enabling on Windows, raw mode for the REPL line editor |
-| `clipboard.hpp` | text get/set on desktop platforms (optional, low priority) |
+| `argv`, `cwd` | Program and arguments; empty `cwd` inherits |
+| `env_set`, `env_unset`, `clear_env` | Environment changes |
+| `stdin_data` | Bytes for stdin (`nullopt` = null device) |
+| `capture_stdout`, `capture_stderr`, `merge_stderr` | Capture into `out`/`err`, or inherit; merge stderr into `out` |
+| `stdin_file`, `stdout_file`, `stderr_file`, `append_output` | Redirect a stream to a file (wins over capture / `stdin_data`) |
+| `timeout_ms` | Kill the whole process tree on expiry; `timed_out = true` |
+| `max_output` | Per-stream cap (default 64 MiB); `truncated = true` |
+| `limits` | `proc_limits`: `memory_bytes`, `cpu_seconds`, `open_files`, `file_size_bytes`, `no_core` |
+| `stop` | `std::stop_token`; on request the tree is killed, `cancelled = true`, exit code 125 |
+| `new_session` | POSIX `setsid()`; Windows `CREATE_NEW_PROCESS_GROUP` |
+| `watch_memory_bytes` | Kill the tree past this many bytes; `memory_killed = true`, exit code 137 |
 
-### Mobile and device services
+`proc_result` holds `exit_code` (128 + signal when killed by a signal), `term_signal`, `out`, `err`, `wall_ms`, `peak_rss_bytes`, and the flags `timed_out`, `truncated`, `cancelled`, `memory_killed` and `unreaped` (killed but not reaped within 2 s; a detached thread reaps it later).
 
-`forge::os::mobile` (`forge_mobile`, see [mobile.md](mobile.md)): 16 sensor kinds, touch and gestures,
-GNSS/geofencing, camera/torch, audio, haptics, power, connectivity, BLE, NFC, clipboard, notifications,
-display controls, biometrics, lifecycle (low_memory → forge::mem pressure), device info, paths, share,
-open_url and permissions — on Android, iOS/iPadOS, macOS, Windows, Linux, FreeBSD, plus null and simulated
-backends. Missing platform features return `unsupported`.
+How it works per platform:
 
-### Platform notes
+| | POSIX (Linux, Android, macOS, FreeBSD) | Windows | iOS |
+|---|---|---|---|
+| Start | `serialized_fork` + `execve`; the child leads its own process group | `CreateProcessW` in a kill-on-close Job Object | unsupported |
+| Tree kill | the process group (and, for a session leader, the session) | the Job Object | — |
+| `memory_bytes` | `RLIMIT_AS`; macOS and Android use a resident-size watchdog instead | Job Object process memory | — |
+| `cpu_seconds` | `RLIMIT_CPU` (soft, hard = soft + 1) | Job Object user time | — |
+| `open_files`, `file_size_bytes`, `no_core` | `RLIMIT_NOFILE`, `RLIMIT_FSIZE`, `RLIMIT_CORE` | not applied | — |
+| `watch_memory_bytes` | Linux/Android: RSS of the process group; elsewhere use `limits.memory_bytes` | Job Object committed memory | — |
+| Handle inheritance | close-on-exec pipes | only the three std handles (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), so one child never holds another child's pipe open | — |
 
-- **Android / iOS:** no `fork`, restricted spawn (iOS: `unsupported`), no services, sandboxed paths.
-  App-container dirs are returned by the path helpers.
-- **Windows:** `CreateProcessW` + Job Objects, overlapped pipes, `ReadDirectoryChangesW`, SCM, registry.
-- **macOS / FreeBSD:** `posix_spawn`, kqueue, `sysctl`; FSEvents on macOS.
-- **Linux:** `posix_spawn`/`pidfd`, inotify, cgroups v2 for limits, `/proc` and `/sys` for info.
+`apply_limits` lowers any request above an existing hard limit to that limit, so an unprivileged process still gets a limit. It is async-signal-safe and can run in a forked child.
 
-## Capability model
+`find_executable(name)` searches `PATH`. A name with a separator is checked as is. On Windows a bare name without an extension resolves only to `.exe`, `.cmd`, `.bat` or `.com`, as `CreateProcess` would, so an extensionless shell script on `PATH` (MSYS2, Git) cannot shadow `cmd.exe`. `spawn_wait` runs `.cmd`/`.bat` files through `cmd.exe /d /c`.
 
-`os::caps()` returns a flat set of named capabilities (`"spawn"`, `"process.limits.memory"`,
-`"registry"`, `"watch.recursive"`, ...). The scripting layer exposes this as `os.caps()` so scripts
-can branch on features rather than on platform names.
+`child::start(argv)` or `child::start(spec)` starts a process without waiting: `read(max, timeout_ms)` streams stdout (and merged stderr), `try_wait`, `wait(timeout_ms)`, `kill(sig)` (whole group). The destructor kills and reaps a child still running. `wait_any(children, timeout_ms)` and `wait_all(...)` wait on several. `child` is POSIX only; elsewhere `start` returns unsupported.
 
-## Testing
+`list_processes()` and `process_info(pid)` return pid, ppid, RSS, name and command line on Linux and Android only.
 
-- Unit tests per module under `tests/os/`, running on the host; platform-specific tests skip with
-  the standard skip code when `is_unsupported` is returned.
-- Cross-compile build checks for Windows, macOS, FreeBSD, Android, iOS with the zig toolchain.
-- Fuzz target for path/glob parsing.
+`process_caps()` lists what the platform supports: `spawn`, `process.limits.memory`, `process.limits.cpu`, `process.limits.files` (POSIX), `process.tree_kill`, `process.timeout`, `signals` (POSIX). It is empty on iOS. ForgeScript's `os.caps()` returns this list with the platform name and the script's own capabilities.
 
-## Phasing
+`mem::spawn_leased` ([memory.md](memory.md)) starts a `child` whose memory cap is a lease on a memory budget.
 
-1. **Done:** `process` + `pipe` + `signal` (needed by scripting `sh {}` blocks and `run`). `process.hpp`: `spawn_wait(spawn_spec)` (argv/env/cwd, stdin data, separate or merged stdout/stderr, output cap, timeout with process-group / Job Object kill, memory/CPU/open-file limits), RAII `child` (stream, wait, kill; POSIX), `serialized_fork`/`fork_mutex` (os.hpp: every FORGE fork holds one process-wide lock, so pthread_atfork prepare handlers such as Z3's never run concurrently; embedders use it for their own forks), `find_executable`, `list_processes`/`process_info` (Linux). `pipe.hpp`: RAII `pipe_end`, `make_pipe` (POSIX). `signal.hpp`: `signal_id`, `send_signal` (process or group). Tests: `tests/test_os_process.cpp`, plus cross compile/link checks for FreeBSD, macOS, Windows and musl.
-2. **Done:** `fs` extensions, `users`, `time`, `sysinfo`, `console`.
-   - `fs.hpp` (`forge::os::fs`): `copy`/`copy_tree`/`move` (moves across devices fall back to copy then remove), `remove_all`, `symlink`/`hardlink`/`read_link`, `mode`/`chmod`/`chown`, `mtime_ns`/`set_mtime_ns`/`touch`, `glob_match` (`*`, `?`, `**`, `[a-z]`, `[!x]`, `\` escapes) and `glob(pattern, base)`, recursive `walk` (depth limit, hidden filter, symlink following), RAII `file_lock` (flock / LockFileEx, shared or exclusive, wait or try), `disk_usage`, `mounts` (Linux and Windows), `make_temp_file`/`make_temp_dir`, `write_file_atomic` (temp file, fsync, rename).
-   - `users.hpp`: `current_user`, `lookup_user`/`lookup_uid` with groups (POSIX), `is_elevated` (root or an elevated token), and `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` following XDG, `~/Library` or `%APPDATA%`.
-   - `time.hpp`: `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name`, `format_iso8601`/`format_local_iso8601`/`parse_iso8601` (RFC 3339 with offsets and fractions up to ns), and `timer_queue` (`after`, `every`, `cancel` on one worker thread).
-   - `sysinfo.hpp`: `release_info` (os-release / sysctl / RtlGetVersion), `uptime_seconds`, `load_average`, `memory()` (available, swap, cgroup v1/v2 limit), `per_cpu_times` + `cpu_usage` (Linux), `self_usage` (rusage / GetProcessTimes).
-   - `console.hpp` (`forge::os::console`): `is_tty`, `size`, `enable_vt`, `color_enabled` (NO_COLOR / FORCE_COLOR / TERM=dumb), `paint`, RAII `mode_guard` (raw or no-echo), `read_password`, `confirm`.
-   - Scripts: `fs.copy/move/glob/walk/match/symlink/readlink/chmod/mode/touch/set_mtime/write_atomic/temp_file/make_temp_dir/disk_usage/lock`, `os.user/dir/release/uptime/loadavg/memory/is_tty/term_size`, `time.iso/parse/utc_offset/zone`.
-   - Tests: `tests/test_os_sys.cpp` (also cross-compiled for FreeBSD, macOS, Windows and musl) and `os_phase2_surface` in `tests/test_script.cpp`.
-3. **Done:** `net` extensions, recursive `file_watch`, `service` control, `registry`.
-   - `file_watch_tree.hpp`: `tree_watcher::open(root, {debounce_ms, force_polling, include_hidden, ignore globs})` registers every directory with the native watcher, picks up new directories as they appear (reporting their existing contents as created), keeps a per-path snapshot so coarse kqueue directory events become exact created/modified/removed events, falls back to rescanning where native watching is unavailable, and coalesces bursts (create+modify → created, create+remove → nothing, one event per path per poll).
-   - `net.hpp` (`forge::os::net`): `resolve(host)` → address strings (v4/v6), `interfaces()` (getifaddrs; Windows unsupported for now), `port_open`, `parse_url`, and a blocking HTTP/1.1 client `http(request)` / `http_get` (Content-Length and chunked bodies, redirects, size cap; `https://` returns unsupported).
-   - `service_control.hpp` (`forge::os::service`): `service_spec` → `render_systemd_unit` / `render_launchd_plist`, `install`, `start`, `stop`, `query` (`not_installed`/`stopped`/`running`/`failed`), `uninstall` through `systemctl --user`, `launchctl` or `sc.exe`. `spec.dir` writes the unit elsewhere without registering it.
-   - `registry.hpp` (`forge::os::registry`): `get`/`set` (string or 64-bit integer), `remove_value`, `remove_key`, `list` on Windows; unsupported elsewhere.
-   - Scripts: `fs.watch_tree(root, opts)` → handle with `poll(ms)` and `backend()`; `net.resolve/interfaces/port_open/http/parse_url`; `service.unit/install/uninstall/start/stop/status`. Option bags may be maps or `{{"key", value}, ...}` lists.
-   - Tests: `tests/test_os_net.cpp` (native and polling tree watch, local HTTP server, service units in a temp dir; also cross-compiled) and `os_phase3_surface` in `tests/test_script.cpp`.
-4. **Done:** `devices`, `clipboard`.
-   - `devices.hpp` (`forge::os::devices`): `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver) and `usb()` (vendor/product ids, strings, bus/devnum) from sysfs on Linux/Android; unsupported elsewhere.
-   - `clipboard.hpp` (`forge::os::clipboard`): `available`, `get`, `set` — Win32 clipboard on Windows, pbcopy/pbpaste on macOS, wl-copy/wl-paste or xclip/xsel on Linux/FreeBSD; unsupported without a display or helper and on mobile.
-   - Scripts: `os.devices("block"|"pci"|"usb")`, `os.clipboard()` / `os.clipboard(text)`.
-   - Tests: `tests/test_os_dev.cpp` (cross-compiled too).
+## Pipes and signals
+- `pipe.hpp` is POSIX only. Pipes are close-on-exec. `read_some` with a timeout returns an empty string on timeout or EOF.
+- `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported.
+- Handler installation is `os::on_signal` in `os.hpp`; on Windows it maps Ctrl-C to `interrupt` and close / Ctrl-Break / shutdown to `terminate`.
 
-5. **Done:** `dynlib`.
-   - `dynlib.hpp` (`forge::os::dynlib`, in `all.hpp`): `dynlib::open(name, {search_dirs, env_var, system_search})` tries `name` and `library::decorate(name)` (`m` → `libm.so` / `libm.dylib` / `m.dll`) in each dir, then hands both to the system loader exactly as `os::library::open` does; `""` is the running program; a name with a path separator is opened as is. `dynlib::adopt(library)` wraps an existing `os::library`. `get<int (*)(int)>` / `get<int(int)>` / `get<T*>` return typed pointers (nullptr when missing), `require<F>` returns an error naming the symbol. `path()` is the loaded file (dl_iterate_phdr + `RTLD_NOLOAD` handle match on ELF, `GetModuleFileNameW`, dyld image list).
-   - Symbols: `dynlib_symbol{name, type (function/data/tls/other), weak, indirect, value (offset from load base), address, version, default_version, ordinal, forwarder}`. `file_symbols(path)` / `file_format(path)` parse any format on any host: ELF `.dynsym` with `.gnu.version`/`.gnu.version_d` (both `foo@@V2` and hidden `foo@V1` are listed), or `PT_DYNAMIC` + `DT_HASH`/`DT_GNU_HASH` when section headers are stripped, 32/64-bit, either endianness; PE32/PE32+ export directory (named exports, ordinals, forwarders); Mach-O export trie (`LC_DYLD_INFO[_ONLY]`, `LC_DYLD_EXPORTS_TRIE`) or external `LC_SYMTAB` entries, fat files (host slice), leading `_` stripped. `dynlib::symbols()` adds run-time addresses: ELF reads the file and adds the `dl_iterate_phdr` load base (IFUNCs through `dlsym`, hidden versions through `dlvsym` on glibc); Windows parses the mapped module; Apple parses the image in memory (works for the dyld shared cache). The parsers are bounds-checked and never read past their input.
-   - Tests: `tests/test_os_dynlib.cpp` loads a fixture library built in the test target (`tests/dynlib_fixture.c`) through search dirs and an env var, calls it through `get<>` and through enumerated addresses, enumerates libm (calls `cos`), and, when clang + lld are installed, parses fixtures cross-linked by `cmake/dynlib_fixtures.cmake` (PE32+/PE32 DLLs with a forwarder, arm64/x86_64/exports-trie/fat Mach-O dylibs, ELF32, big-endian ELF, section-stripped ELF with DT_HASH and DT_GNU_HASH, symbol versions + IFUNC + TLS, the last also loaded and called on x86_64 glibc), plus ~14k truncated and mutated inputs. Windows and Apple loaded-image code is compile-checked only (zig `xos_test_os_dynlib_*` where zig is installed).
+## Files (`fs.hpp`)
+| Function | Notes |
+|---|---|
+| `copy`, `copy_tree`, `move` | `move` across devices falls back to copy then remove |
+| `symlink`, `hardlink`, `read_link` | |
+| `mode`, `chmod`, `chown` | `chown` is unsupported on Windows |
+| `mtime_ns`, `set_mtime_ns`, `touch` | |
+| `glob_match(pattern, path)`, `glob(pattern, base)` | `*`, `?`, `**`, `[a-z]`, `[!x]`, `\` escapes |
+| `walk(root, walk_opts)` | `max_depth`, `follow_symlinks`, `include_dirs`, `include_hidden` |
+| `file_lock` | RAII advisory lock: `flock` / `LockFileEx`, shared or exclusive, wait or try |
+| `disk_usage(path)` | total, free, available |
+| `mounts()` | Linux and Windows; unsupported elsewhere |
+| `make_temp_file`, `make_temp_dir` | |
+| `write_file_atomic(path, data, mode)` | temp file, fsync, rename, then fsync of the directory (POSIX) |
 
-Remaining platform gaps (tracked, not blocking): Windows/macOS device enumeration (SetupAPI / IOKit), Windows `interfaces()` (GetAdaptersAddresses), per-CPU times off Linux, `mounts()` on macOS/FreeBSD, user lookup by SID on Windows, and HTTPS in `net::http`.
+## Users, time, system, console
+- **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) on POSIX only. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows XDG on Linux and FreeBSD, `~/Library` on Apple, Known Folders on Windows.
+- **`time.hpp`.** `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name`, `format_iso8601` / `format_local_iso8601` / `parse_iso8601` (RFC 3339 with offsets and fractions to ns). `timer_queue` runs `after(ms, fn)` and `every(ms, fn)` callbacks on one worker thread; `cancel(id)`. `stopwatch` and `deadline` are described in [support.md](support.md).
+- **`sysinfo.hpp`.**
 
-### Process control additions (spawn_spec)
-- `limits.file_size_bytes` (RLIMIT_FSIZE) and `limits.no_core` (RLIMIT_CORE=0), POSIX only; `apply_limits(lim)` applies a
-  `proc_limits` to the calling process (async-signal-safe), lowering each request to an existing hard limit.
-- `current_rss()` (sysinfo.hpp): this process's resident set in bytes on Linux/Android, macOS/iOS, FreeBSD and Windows.
-- `stdin_file` / `stdout_file` / `stderr_file` (+ `append_output`): redirect streams to files.
-- `stop` (std::stop_token): cancels the run, kills the tree; `cancelled`, exit code 125.
-- `new_session`: setsid() on POSIX, CREATE_NEW_PROCESS_GROUP on Windows (the Job Object kills the tree);
-  `kill_group(pgid, sig)` signals a whole group (POSIX).
-- `watch_memory_bytes`: memory watchdog; Windows uses the Job Object's peak committed memory, Linux/Android the
-  process group's RSS; other POSIX: use `limits.memory_bytes`. `memory_killed`, exit code 137.
-- iOS: spawning is unavailable, all of the above return the existing unsupported error.
+  | Call | Linux | Android | Windows | macOS / iOS | FreeBSD |
+  |---|---|---|---|---|---|
+  | `release_info` | os-release | yes | `RtlGetVersion` | sysctl | sysctl |
+  | `uptime_seconds` | `/proc/uptime` | yes | `GetTickCount64` | `kern.boottime` | `kern.boottime` |
+  | `load_average` | `getloadavg` | `/proc/loadavg` | unsupported | `getloadavg` | `getloadavg` |
+  | `memory()` | incl. swap and the root cgroup v1/v2 limit | yes | yes | yes | yes |
+  | `per_cpu_times`, `cpu_usage` | yes | yes | unsupported | unsupported | unsupported |
+  | `self_usage`, `current_rss` | yes | yes | yes | yes | yes |
+
+- **`console.hpp`.** `is_tty`, `size`, `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo), `read_password`, `confirm`.
+
+## Networking (`net.hpp`)
+| Call | Notes |
+|---|---|
+| `resolve(host)` | IPv4 and IPv6 address strings |
+| `interfaces()` | `getifaddrs`: name, addresses, up, loopback. Unsupported on Windows and Android |
+| `port_open(host, port, timeout_ms)` | TCP connect probe |
+| `parse_url(url)` | scheme, host, port, path, query |
+| `http(request)`, `http_get(url)` | Blocking HTTP/1.1 client: Content-Length and chunked bodies, redirects, size cap. `https://` returns unsupported |
+
+## Recursive file watching (`file_watch_tree.hpp`)
+`tree_watcher::open(root, {debounce_ms = 50, force_polling, include_hidden, ignore})` registers every directory with the native `file_watcher` (inotify, kqueue, `ReadDirectoryChangesW`) and picks up new directories as they appear, reporting their existing contents as created. A per-path snapshot turns coarse kqueue directory events into exact created / modified / removed events. Where native watching is unavailable, or with `force_polling`, it rescans on each `poll()`. `poll(ms)` waits until the tree has been quiet for `debounce_ms` and coalesces bursts: create + modify → created, create + remove → nothing, one event per path. FSEvents is not used on macOS.
+
+## Service control (`service_control.hpp`)
+A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_on_failure`, `start_at_login`, optional `dir`) becomes a per-user service:
+
+| Platform | Backend |
+|---|---|
+| Linux, FreeBSD with systemd | user unit in `$XDG_CONFIG_HOME/systemd/user`, driven by `systemctl --user` |
+| macOS | LaunchAgent plist in `~/Library/LaunchAgents`, driven by `launchctl` |
+| Windows | Service Control Manager service through `sc.exe` (needs an elevated process) |
+| Android, iOS | unsupported |
+
+`render_systemd_unit` and `render_launchd_plist` return the file text without touching the system. `query` returns `not_installed`, `stopped`, `running`, `failed` or `unknown`. Setting `spec.dir` writes the unit elsewhere without registering it (the tests use this).
+
+## Registry, devices, clipboard
+- **`registry.hpp`.** Windows only: `get` / `set` string and 64-bit integer values (`REG_SZ`, `REG_DWORD`, `REG_QWORD`), `remove_value`, `remove_key`, `list`. Every call is unsupported elsewhere.
+- **`devices.hpp`.** Read-only enumeration from sysfs on Linux and Android: `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver), `usb()` (vendor/product ids, strings, bus/devnum). Unsupported elsewhere.
+- **`clipboard.hpp`.** Text get/set: Win32 clipboard on Windows, `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux and FreeBSD. Unsupported without a display or helper, and on mobile.
+
+## Dynamic libraries (`dynlib.hpp`)
+`os::dynlib` sits on top of `os::library`.
+
+```cpp
+auto m = os::dynlib::open("forge_plugin", {.search_dirs = {plugin_dir}, .env_var = "MYAPP_PLUGIN_PATH"});
+auto add = m->get<int (*)(int, int)>("add");          // nullptr when missing; get<int(int, int)> works too
+auto sub = m->require<int(int, int)>("sub");          // error naming the symbol when missing
+std::printf("%s\n", m->path().c_str());               // file actually loaded
+for (auto& s : m->symbols().value) std::printf("%s %p\n", s.name.c_str(), s.address);
+auto syms = os::file_symbols("libm.so.6");            // without loading it
+```
+
+- **Search.** `open(name, opts)` tries `name` and `library::decorate(name)` in each of `search_dirs`, then in the dirs listed in `$env_var` (`:`-separated, `;` on Windows), then (if `system_search`) hands both names to the system loader exactly as `library::open` does. `""` is the running program (`dynlib::self()`); a name with a path separator is opened as is. `adopt(library, hint)` wraps an existing `os::library`. `find_library(name, dirs)` only searches the dirs.
+- **`path()`.** Found through `dl_iterate_phdr` + `RTLD_NOLOAD` handle matching (ELF), `GetModuleFileNameW` (Windows) or the dyld image list (Apple). Empty if the platform cannot tell.
+- **Symbols.** `dynlib_symbol{name, type (function/data/tls/other), weak, indirect, value (offset from the load base), address, version, default_version, ordinal, forwarder}`.
+  - `file_symbols(path)` and `file_format(path)` parse any format on any host. ELF: `.dynsym` with `.gnu.version` / `.gnu.version_d` (both `foo@@V2` and hidden `foo@V1` are listed), or `PT_DYNAMIC` + `DT_HASH` / `DT_GNU_HASH` when section headers are stripped; 32/64-bit, either endianness. PE32/PE32+: the export directory (named exports, ordinals, forwarders). Mach-O: the export trie (`LC_DYLD_INFO[_ONLY]`, `LC_DYLD_EXPORTS_TRIE`) or external `LC_SYMTAB` entries; fat files use the host slice; the leading `_` is stripped.
+  - `symbols()` adds run-time addresses. ELF reads the file and adds the load base (IFUNCs through `dlsym`, hidden versions through `dlvsym` on glibc). Windows parses the mapped module. Apple parses the image in memory, which also works for the dyld shared cache.
+  - The parsers are bounds-checked: bad input gives an error or a shorter list, never an out-of-range read.
+
+## Process pools (`process_pool.hpp`)
+A pool of worker processes with an API like `task::pool` ([support.md](support.md)).
+
+```cpp
+FORGE_PROCESS_TASK(square, [](std::string in) { int v = std::stoi(in); return std::to_string(v * v); });
+int main(int argc, char** argv) {
+    if (forge::os::process_pool::run_worker_if_requested(argc, argv)) return 0;   // needed for spawn mode
+    forge::os::process_pool pp({.workers = 4});
+    auto f = pp.submit("square", "7");        // std::future<std::string>
+    pp.wait_all(); std::string r = f.get();   // "49"
+}
+```
+
+| API | Meaning |
+|---|---|
+| `options{workers, mode, exe, sandbox}` | `workers = 0` uses `FORGE_PROCESSES`, then `hardware_concurrency()` |
+| `submit(name, payload)` | `std::future<std::string>`; payloads and results are byte strings you serialise yourself |
+| `wait_all()`, `wait_all_for(ms)` | Wait until every queued and running task is done; `wait_all_for` returns false on timeout |
+| `pending()`, `size()`, `set_workers(n)` | Queue length, worker count, grow or retire workers after their current task |
+| `shutdown()` | Graceful: finishes queued tasks, sends each worker a quit message, reaps it. Also run by the destructor. Waits without a bound |
+| `terminate()` | Abrupt: queued and running tasks fail with `os_errc::cancelled`, every worker is killed and reaped |
+
+- **Modes.** `fork` (default on Linux, macOS, FreeBSD, Android) forks workers that run the registered tasks. `spawn` re-launches the program with `--forge-process-worker=...`: fork + exec on POSIX, `CreateProcessW` with the worker's stdin/stdout as the IPC pipes on Windows, where it is the only mode (`fork` throws `os_exception{not_supported}`). Spawn mode needs `run_worker_if_requested(argc, argv)` first in `main()`; a test harness must do the same, or a worker re-runs the test suite. On iOS the constructor throws `os_exception{not_supported}`.
+- **IPC.** One pipe pair per worker; frames are length-prefixed (type, id, task name, payload).
+- **Errors.** A task that throws fails its future with `os_exception` (kind carried over from the worker). A worker that dies mid-task fails that future with `os_errc::signal` and the signal number (Windows access violation / illegal instruction / divide by zero map to 1 / 2 / 3), or `os_errc::io` for a non-zero exit. The worker is respawned; other tasks keep running.
+- **Sandbox.** `options.sandbox` applies `os::apply_sandbox` in every worker before its first task.
+- ForgeScript exposes it as `ProcessPool(n, {...})`.
+
+## Platform notes
+- **iOS.** No spawning: `spawn_wait`, `child` and `os::run` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
+- **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control, no `interfaces()`.
+- **Windows.** `CreateProcessW` + Job Objects, `ReadDirectoryChangesW`, SCM through `sc.exe`, registry. `child`, `pipe.hpp`, `kill_group` and `chown` are POSIX only.
+- **macOS.** `RLIMIT_AS` is ignored by the kernel, so `memory_bytes` uses a resident-size watchdog. kqueue for file watching.
+- **Linux.** fork/exec, inotify, `/proc` and `/sys`.
+
+## Not built yet
+| Item | Today |
+|---|---|
+| `os::caps()` for the whole OS layer | Only `process_caps()`; ForgeScript `os.caps()` wraps it |
+| Process listing off Linux/Android | `list_processes` / `process_info` unsupported |
+| `child` streaming and `pipe.hpp` on Windows | POSIX only; use `spawn_wait` |
+| Named pipes / FIFOs in `pipe.hpp`, signal-to-fd for event loops | Not present (`local_ipc.hpp` covers named pipes) |
+| cgroup v2 limits for spawned processes | rlimits, Job Objects and watchdogs instead |
+| Device enumeration on Windows / macOS (SetupAPI / IOKit) | unsupported |
+| `net::interfaces()` on Windows (GetAdaptersAddresses) and Android | unsupported |
+| `per_cpu_times` / `cpu_usage` off Linux/Android | unsupported |
+| `fs::mounts()` on macOS / FreeBSD | unsupported |
+| User lookup on Windows (by name or SID) | unsupported |
+| HTTPS in `net::http` | unsupported; use the RPC client or a TLS library |
+| FSEvents on macOS | kqueue is used instead (immediate per-file events) |
+| Fuzz target for glob/path parsing | none |
+
+## Tests
+| Test | Covers |
+|---|---|
+| `test_os_process` | spawn, limits, timeouts, tree kill, redirection, cancellation, memory watchdog, `find_executable` |
+| `test_os_sys` | `fs`, users, time, sysinfo, console |
+| `test_os_net` | net, local HTTP server, native and polling tree watch, service units in a temp dir |
+| `test_os_dev` | devices, clipboard |
+| `test_os_dynlib` | loads `tests/dynlib_fixture.c` through search dirs and an env var, calls it through `get<>` and through enumerated addresses, enumerates libm; when clang + lld are installed, parses fixtures cross-linked by `cmake/dynlib_fixtures.cmake` (PE32/PE32+ with a forwarder, arm64/x86_64/exports-trie/fat Mach-O, ELF32, big-endian ELF, section-stripped ELF, versions + IFUNC + TLS), plus ~14k truncated and mutated inputs |
+| `test_process_pool` | fork and spawn modes, crash recovery, typed task errors, grow/shrink, shutdown, `terminate`, sandboxed workers, Windows spawn |
+| `test_script` `os_phase2_surface`, `os_phase3_surface`; `test_script_oserror` `script_process_pool` | script bindings |
+
+All of these passed in CI on Linux, macOS (arm64), Windows (MSVC and MinGW) and FreeBSD 14.3 on 2026-11-04. Cases a platform does not support are skipped inside each test. With `zig` installed, `xos_test_os_{process,sys,net,dev,dynlib}_*` compile and link them for FreeBSD, macOS, MinGW and aarch64 musl. iOS has not been built.

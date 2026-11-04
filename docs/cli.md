@@ -1,75 +1,136 @@
 # The `forge` command-line tool
 
-Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text.
+Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
-Options are `--name value`, `--name=value`, or a single-letter `-x value`. Unknown commands print the usage and exit.
+## Concepts
+- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `script`.
+- Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
+- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
+- Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
+- Wherever a model path is taken by `run` and `bench`, it may be a `.fpk`, a Hugging Face directory, a `.gguf` or an `.onnx` file. Non-`.fpk` inputs are imported once into `$FORGE_CACHE` (default `~/.cache/forge`) with `--codec` (default `f32`) and reused while the source files are unchanged.
 
 ## Commands
 
 ### `forge info`
-Prints the CPU name and feature flags, the simd kernel table in use, and for each gpu backend (cpu, cuda, hip, level_zero, vulkan, metal) whether its runtime was found. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
+Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
-### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME]`
+### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [options]`
 Converts a model to `.fpk`.
-- `--codec` (default `f32`): `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`.
-- `--template`: blueprint template from `import/templates/` (`llama`, `mixtral`, `deepseek_v2`); normally chosen from the model's architecture; the import fails with a hint to pass `--template` when none matches. Templates are read from the source tree path compiled into the binary; set `FORGE_TEMPLATES` to use another directory (for example when running an installed binary).
+
+| Option | Meaning |
+|--------|---------|
+| `--codec C` | Weight codec (default `f32`): `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`, or the mixed-precision presets `q4_k_m` / `q5_k_m` |
+| `--emb-codec C` | Codec for the token embedding (default `q8_0` when `--codec` is quantised, else the same as `--codec`) |
+| `--template NAME` | Blueprint template from `import/templates/`: `llama`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`. Normally chosen from the model's architecture |
+| `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
+| `--output-tensor-type T`, `--token-embedding-type T` | Mixed precision: codec for the output head / token embedding |
+| `--tensor-type REGEX=TYPE[,REGEX=TYPE...]` | Mixed precision: per-tensor overrides |
+| `--pure` | Mixed precision: no per-tensor rules, one codec for all |
+| `--bf16-head` | Mixed precision: keep the output head in bf16 |
+
+The mixed-precision options are documented for Hugging Face inputs. Templates are read from the source tree compiled into the binary; set `FORGE_TEMPLATES` for another directory (for example with an installed binary).
 
 ### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint]`
-Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a blueprint summary. `--tensors` lists every tensor, `--blueprint` prints the graph text, `--verify` checks hashes. Works on encrypted files without the key (metadata stays readable).
+Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a blueprint summary. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
 
 ### `forge run <model> (--prompt TEXT | --tokens 1,2,3) [options]`
-`<model>` may be a `.fpk`, a Hugging Face directory, a `.gguf` or an `.onnx` file; non-`.fpk` inputs are imported once into `$FORGE_CACHE` (default `~/.cache/forge`) using `--codec`.
 
 | Option | Default | Meaning |
 |--------|---------|---------|
 | `-n N` | 32 | New tokens to generate |
-| `--temp` | 0 | Temperature (0 = greedy) |
-| `--top-k`, `--top-p`, `--min-p` | 0, 1, 0 | Sampling filters (values shown are "off") |
+| `--temp T` | 0 | Temperature (0 = greedy) |
+| `--top-k`, `--top-p`, `--min-p` | 0, 1, 0 | Sampling filters (the defaults are "off") |
 | `--repeat-penalty` | 1 | Repetition penalty |
 | `--seed` | 0 | RNG seed |
 | `--ctx N` | 0 | Context length; 0 = model maximum |
-| `--ids` | off | Print token ids instead of text |
+| `--ids` | off | Print token ids instead of text (always on when the model has no tokenizer) |
 | `--no-bos` | off | Do not prepend the BOS token |
-| `--logits FILE` | | Write raw f32 logits |
+| `--logits FILE` | | Write the prefill logits as raw f32 |
 | `--verify` | off | Check BLAKE3 hashes on open |
-| `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar |
+| `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
 | `--draft draft.fpk [--spec-k 4]` | | Speculative decoding with a draft model |
+| `--codec C` | `f32` | Codec for on-the-fly import of non-`.fpk` inputs |
 
-Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`; without `--out` the outputs are printed.
+Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr.
 
-### `forge bench <model.fpk> [-p 32] [-n 32]` / `forge bench --gemm 512`
-Measures prefill (`-p` prompt tokens) and decode (`-n` tokens) throughput, or an N×N GEMM. On a GPU device (`FORGE_DEVICE=cuda`) it also prints driver calls for the prefill and per decode token: kernels launched directly or captured into a CUDA graph (`FORGE_GRAPHS=1`), graph launches, DtoH/HtoD/DtoD copies and stream syncs. `tools/bench_llm.sh` wraps it for a side-by-side run against llama.cpp.
+Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
+
+### `forge bench <model> [-p 32] [-n 32] [--warmup 1] [--codec C]` / `forge bench --gemm N`
+Measures prefill (`-p` prompt tokens) and decode (`-n` new tokens, always all of them) throughput after `--warmup` untimed runs. With `--gemm N` it instead times an N×N `gemm_nt` with each available simd table (one thread) and with `gpu::prims` (all threads).
+
+On a CUDA or HIP device it also prints driver calls for the prefill and per decode token: kernels launched directly, kernels captured into a CUDA graph (`FORGE_GRAPHS=1`), graph launches, graph instantiations, kernel-node updates, replayed runs, DtoH/HtoD/DtoD copies and stream syncs. `tools/bench_llm.sh` wraps it for a side-by-side run against llama.cpp.
 
 ### `forge dump <model.fpk> <tensor> <out.f32>`
-Decodes one tensor to raw f32.
+Decodes one tensor to raw little-endian f32.
 
 ### `forge keygen -o NAME`
-Writes an Ed25519 key pair: `NAME.key` (secret seed, keep private) and `NAME.pub`.
+Writes an Ed25519 key pair: `NAME.key` (secret seed, owner read/write only) and `NAME.pub`.
 
 ### `forge sign <model.fpk> --key NAME.key [-o out.fpk]`
-Adds a signature (or appends one to an existing signature section).
+Adds a signature, or appends one to an existing signature section. Without `-o` the input file is rewritten.
 
 ### `forge verify <model.fpk> [--pubkey NAME.pub]...`
-Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or prints the failure and exits 1. Without `--pubkey` any valid signature is accepted (integrity only), so an unsigned file fails; with `--pubkey`, at least one valid signature must come from a listed key.
+Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or prints the failure and exits 1. Without `--pubkey` any valid signature is accepted (integrity only), so an unsigned file fails. With one or more `--pubkey`, at least one valid signature must come from a listed key.
 
 ### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey)`
-Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file. Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
+Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file (64 hex digits, mode 0600 where supported). Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
 
-### `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu] [auth/TLS/script flags]`
-Exposes a local device to other processes as a remote `rpc:host:port` device (see [graph.md](graph.md)), and optionally runs remote scripts. Auth: `--token`, `--token-file`, `--authorized-keys`, `--pubkey`; TLS: `--tls-cert`, `--tls-key`; scripts: `--allow-scripts`, `--script-timeout`, `--script-mem-mb`, `--script-no-proc|fs|net`. Without auth it is open to anyone who can reach it. See [rpc.md](rpc.md).
+### `forge rpc-serve [options]`
+Lends a local device to other processes as a remote `rpc:host:port` device (see [graph.md](graph.md)), and optionally runs remote scripts. Details: [rpc.md](rpc.md).
+
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--port N` | 7000 | Listen port |
+| `--bind ADDR` | `127.0.0.1` | Listen address. Without authentication on a non-loopback address it prints a warning |
+| `--device D` | `cpu` | Device to serve (`FORGE_DEVICE` syntax); falls back to the CPU if unavailable |
+| `--token T`, `--token-file F` | | Accept this bearer token (repeatable) |
+| `--authorized-keys FILE` | | One key per line: `[allow=device,scripts] <64-hex key> [comment]`; a line without `allow=` has full access (repeatable) |
+| `--pubkey HEX\|FILE` | | Accept this Ed25519 public key (repeatable) |
+| `--tls-cert C --tls-key K` | | Serve TLS (needs a build with OpenSSL). Both or neither |
+| `--tls-client-ca CA.pem` | | Require a client certificate signed by this CA (mTLS); needs `--tls-cert`/`--tls-key` |
+| `--allow-scripts` | off | Run scripts sent by authenticated clients |
+| `--script-timeout MS` | 60000 | Upper limit per script |
+| `--script-mem-mb N` | 2048 | Memory limit per script process |
+| `--script-no-proc`, `--script-no-fs`, `--script-no-net` | off | Deny those capabilities to remote scripts |
+
+Without tokens or keys the server is open to anyone who can reach it. Each remote script runs in its own `forge script` child process with the OS sandbox set to `require` (`best-effort` on Windows) when any `--script-no-*` flag is given. Over TLS, token and key authentication are bound to the TLS connection (RFC 9266 `tls-exporter`). Clients take their settings from the `FORGE_RPC_*` variables ([configuration.md](configuration.md#rpc-clients)).
+
+### `forge script`
+
+```
+forge script [options] <file.cpp> [args...]   run a script; int main()'s return value is the exit status
+forge script [options] -e '<code>' [args...]  run a snippet
+forge script [options]                        interactive REPL
+forge script --emit <target> <file.cpp> [-o out]   translate to a standalone shell script
+forge script --emit-targets                   list the shells that have an emitter
+forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp>   static checks only
+```
 
 | Option | Meaning |
 |--------|---------|
-| `--tls-client-ca CA.pem` | Require a client certificate signed by this CA (mTLS); needs `--tls-cert`/`--tls-key` |
-| `--authorized-keys FILE` | One key per line: `[allow=device,scripts] <64-hex key> [comment]`; a line without `allow=` has full access ([rpc.md](rpc.md#authorized_keys-and-per-key-permissions)) |
+| `--tree` | Tree-walking interpreter only (default: compile to verified bytecode) |
+| `--debug` | Race detector, lock-order and stall deadlock detection |
+| `--timeout MS`, `--max-steps N`, `--heap BYTES` | Wall-clock limit, instruction budget, managed heap cap |
+| `--no-proc`, `--no-fs`, `--no-net` | Capability sandbox |
+| `--os-sandbox off\|best-effort\|require` | How the capability flags are also enforced by the OS sandbox |
+| `--no-check` | Skip the static checks that run before a script |
+| `--check`, `--json`, `--strict-check`, `--module-dir DIR` | Static checks only. Diagnostics go to stderr, or to stdout as JSON with `--json`. Exit 2 on errors, or on any diagnostic with `--strict-check`. `--module-dir` adds an import directory |
+| `--cache-dir DIR`, `--cache-trust HEX`, `--cache-require-signed`, `--cache-sign-seed HEX` | Compiled-script cache: directory, trusted public keys, refuse unsigned entries, signing seed |
+| `--ask-model M.fpk`, `--ask-max-tokens N` | Run `forge::ask` and related calls on this model in-process (defaults `$FORGE_ASK_MODEL`, `$FORGE_ASK_MAX_TOKENS` or 256) |
+| `--emit TARGET`, `-o FILE` | Translate instead of running. `TARGET` is a shell from `--emit-targets`, `auto` (`$FORGE_SHELL` or the host shell), `android` (mksh), or `ast` |
+| `--` | End of options; the next argument is the script file |
 
-Over TLS, token and key authentication are bound to the TLS connection (RFC 9266 `tls-exporter`). Clients (`rpc:host:port` devices, `forge::remote`) take their settings from `FORGE_RPC_*` environment variables; the client certificate for mTLS is `FORGE_RPC_TLS_CERT` + `FORGE_RPC_TLS_KEY`.
+- Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md). Arguments after the file are available as `forge::args()`.
+- REPL commands: `:help`, `:type`, `:dis`, `:mem`, `:gc`, `:vm on|off`, `:reset`, `:quit`.
+- Code drafted by AI calls (`forge::ai_run` / `ai_eval`) runs only after you answer `y` on the terminal.
+- `--emit` prints to stdout, or writes `-o FILE` and marks it executable. A construct the target cannot express exits 2 and prints `file:line: emit <target>: <reason>`. See [scripting.md, "Write once, emit anywhere"](scripting.md#write-once-emit-anywhere).
+- A bad option or unreadable file prints `forge script: <message>` and exits 2.
 
 ## Strict loading
-`FORGE_REQUIRE_SIGNED=1` refuses unsigned models; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` only accepts signatures from those public keys.
+`FORGE_REQUIRE_SIGNED=1` refuses unsigned models; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` only accepts signatures from those public keys. Both apply to every command that loads a model through `inference`.
 
-## Verified session
-These were run against the golden model on Linux x86_64:
+## Example session
+These commands were run against the golden model on Linux x86_64 in an earlier revision; they were not re-run for this revision of the page:
 
 ```sh
 B=build/dev
@@ -84,23 +145,8 @@ $B/forge encrypt s.fpk -o sealed.fpk --new-key k.mkey
 FORGE_MODEL_KEY_FILE=k.mkey $B/forge inspect sealed.fpk
 ```
 
-## `forge script`
+`tests/sign_test.py` (ctest `modelfile_signing`) runs `keygen`, `sign`, `verify` and `encrypt` on every test run.
 
-```
-forge script <file.cpp> [args...]     # run a script; int main()'s return value is the exit status
-forge script -e '<code>' [args...]    # run a snippet
-forge script --emit <shell|auto|android|ast> <file.cpp> [-o out]   # translate to a standalone shell script (chmod +x)
-forge script --emit-targets           # list backends that have an emitter
-forge script                          # interactive REPL (:help, :type, :dis, :mem, :gc, :vm on|off)
-  --tree          tree-walker only (default: compile to verified bytecode)
-  --debug         race detector + lock-order / stall deadlock detection
-  --timeout MS    wall-clock limit      --max-steps N   instruction budget
-  --heap BYTES    managed heap cap      --no-proc / --no-fs / --no-net   capability sandbox
-  --ask-model M.fpk  run forge::ask & co on this model in-process (default $FORGE_ASK_MODEL)
-  --ask-max-tokens N reply cap for those calls (default $FORGE_ASK_MAX_TOKENS or 256)
-```
-
-Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md).
-Arguments after the file are available as `forge::args()`.
-`--emit` prints the script to stdout, or writes it to `-o`. A construct the target can't express exits with status 2 and prints `file:line: emit <target>: <reason>`.
-See [scripting.md, "Write once, emit anywhere"](scripting.md#write-once-emit-anywhere).
+## Platform notes
+- `forge encrypt` sets the new key file's mode with `chmod 0600`, which has no effect on Windows.
+- `forge rpc-serve` TLS options need a build with OpenSSL (configure prints `FORGE: rpc TLS via OpenSSL ...`).
