@@ -120,15 +120,17 @@ inline cpu_topology cpu_topology_query() {
     if (len && GetLogicalProcessorInformationEx(RelationAll, reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
         BYTE maxeff = 0, mineff = 255; unsigned core = 0, pkg = 0;
         std::vector<std::pair<unsigned, BYTE>> eff;
+        // PROCESSOR_RELATIONSHIP.EfficiencyClass is the byte after Flags; older MinGW headers still call it Reserved[0].
+        auto effc = [](const PROCESSOR_RELATIONSHIP& p) { return reinterpret_cast<const BYTE*>(&p)[1]; };
         for (DWORD o = 0; o < len;) {
             auto* e = reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data() + o);
             if (e->Relationship == RelationProcessorCore) {
                 for (WORD g = 0; g < e->Processor.GroupCount; ++g)
                     for (unsigned b = 0; b < 64; ++b) if (e->Processor.GroupMask[g].Mask & (KAFFINITY(1) << b)) {
                         logical_cpu c; c.id = unsigned(e->Processor.GroupMask[g].Group) * 64 + b; c.core = core;
-                        t.cpus.push_back(c); eff.push_back({c.id, e->Processor.EfficiencyClass});
+                        t.cpus.push_back(c); eff.push_back({c.id, effc(e->Processor)});
                     }
-                maxeff = std::max(maxeff, e->Processor.EfficiencyClass); mineff = std::min(mineff, e->Processor.EfficiencyClass); ++core;
+                maxeff = std::max(maxeff, effc(e->Processor)); mineff = std::min(mineff, effc(e->Processor)); ++core;
             } else if (e->Relationship == RelationProcessorPackage) {
                 for (WORD g = 0; g < e->Processor.GroupCount; ++g)
                     for (auto& c : t.cpus) if (c.id / 64 == e->Processor.GroupMask[g].Group && (e->Processor.GroupMask[g].Mask & (KAFFINITY(1) << (c.id % 64)))) c.package = pkg;
@@ -186,8 +188,10 @@ inline status pin_thread_to(const std::vector<unsigned>& cpus) {
     if (::sched_setaffinity(0, sizeof s, &s)) return {{}, last_error("sched_setaffinity")};
     return {};
 #elif defined(FORGE_OS_WINDOWS)
-    DWORD_PTR m = 0; for (auto c : cpus) if (c < 64) m |= DWORD_PTR(1) << c;
-    if (!m || !SetThreadAffinityMask(GetCurrentThread(), m)) return {{}, last_error("SetThreadAffinityMask")};
+    // cpu id = group * 64 + bit (as cpu_topology_query numbers them); a thread's affinity lives in one processor group.
+    GROUP_AFFINITY ga{}; ga.Group = WORD(cpus[0] / 64);
+    for (auto c : cpus) { if (c / 64 != ga.Group) return {{}, {22, "pin_thread_to: cpus span processor groups"}}; ga.Mask |= KAFFINITY(1) << (c % 64); }
+    if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return {{}, last_error("SetThreadGroupAffinity")};
     return {};
 #elif defined(FORGE_OS_FREEBSD)
     cpuset_t s; CPU_ZERO(&s); for (auto c : cpus) CPU_SET(c, &s);
