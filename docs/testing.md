@@ -3,7 +3,7 @@
 ## Concepts
 - Each `tests/test_*.cpp` builds into its own executable and ctest entry. It runs its `TEST(...)` cases (`tests/check.hpp`) and prints a failure count.
 - **Exit code 77 means skipped** (missing hardware, runtime or SDK). Most hardware tests declare `SKIP_RETURN_CODE 77`.
-- **The oracle** (`verify/include/forge/verify/oracle.hpp`): every SIMD, GPU and quantised lowering is compared against the scalar reference in `spec/` within each op's declared tolerance. `test_flow`'s `oracle_matrix_all_ops` covers every registered lowering of every op.
+- **The oracle** (`verify/include/forge/verify/oracle.hpp`): every SIMD, GPU and quantised lowering is compared against the scalar reference in `ops/` within each op's declared tolerance. `test_graph`'s `oracle_matrix_all_ops` covers every registered lowering of every op.
 
 ## Kinds of test
 
@@ -13,7 +13,7 @@
 | Golden models | `verify/golden/tiny_llama.py`, `tiny_moe.py` | `golden_tiny_llama`, `golden_moe_mla` (+ `_vulkan` when Vulkan is built). Writes `build/<preset>/golden/tiny_f32.fpk`, which later tests use |
 | Mock GPU drivers | `tests/mock_cuda.c`, `mock_opencl.c`, `mock_ze.c` stand in for the vendor libraries | `test_gpu_*_mock`, `golden_tiny_llama_*_mock`, label `gpu` |
 | GPU compile checks | generated kernels compiled with clang | `gpu_compile_*`, label `gpu` |
-| Script tests | `tests/*.py` | `pack_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` |
+| Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` |
 | C ABI | `tests/capi_smoke.c` | `capi_smoke` |
 | Doc examples | `docs/examples/*` | `doc_example_*` |
 | Integration examples | `examples/integrations/*.cpp` | `example_*`, label `integration` |
@@ -38,7 +38,7 @@ Wine and the Android emulator: see [building.md](building.md). Results per platf
 
 ## Useful environment variables
 - `FORGE_THREADS`: worker pool size (use 2 on small emulators).
-- `FORGE_LANE_TARGET=scalar`: run with a specific kernel table.
+- `FORGE_SIMD_TARGET=scalar`: run with a specific kernel table.
 - `FORGE_VK_SSBO_ALIGN=256`: emulate strict Vulkan drivers (used by `test_vulkan_align256`).
 - `MOCK_DEVICES=N`: number of devices the mock GPU drivers report.
 

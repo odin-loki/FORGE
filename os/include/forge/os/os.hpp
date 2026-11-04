@@ -183,6 +183,36 @@ inline std::string narrow(std::wstring_view w) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
     std::string s(std::size_t(n), '\0'); WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr); return s;
 }
+// CreateProcessW whose child inherits only si's three std handles (PROC_THREAD_ATTRIBUTE_HANDLE_LIST). Plain
+// bInheritHandles=TRUE also hands the child every inheritable handle other threads hold at that moment, such
+// as another child's pipe ends; that pipe then reports no EOF until the unrelated child exits.
+inline BOOL create_process_std_only(const wchar_t* app, wchar_t* cmd, DWORD flags, void* env, const wchar_t* cwd,
+                                    const STARTUPINFOW& si, PROCESS_INFORMATION& pi) {
+    HANDLE self = GetCurrentProcess();
+    STARTUPINFOEXW sx{}; sx.StartupInfo = si; sx.StartupInfo.cb = sizeof sx;
+    HANDLE* std3[3] = {&sx.StartupInfo.hStdInput, &sx.StartupInfo.hStdOutput, &sx.StartupInfo.hStdError};
+    HANDLE orig[3] = {}, dups[3] = {}; DWORD n = 0;
+    if (si.dwFlags & STARTF_USESTDHANDLES)
+        for (HANDLE* p : std3) {   // inheritable duplicates, so std handles the parent opened non-inheritable work too
+            if (!*p || *p == INVALID_HANDLE_VALUE) continue;
+            DWORD k = 0; while (k < n && orig[k] != *p) ++k;
+            if (k == n) { if (!DuplicateHandle(self, *p, self, &dups[n], 0, TRUE, DUPLICATE_SAME_ACCESS)) { *p = nullptr; continue; } orig[n++] = *p; }
+            *p = dups[k];
+        }
+    SIZE_T sz = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &sz);
+    std::vector<char> buf(sz ? sz : 1);
+    auto* al = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buf.data());
+    bool init = n && InitializeProcThreadAttributeList(al, 1, 0, &sz);
+    bool attr = init && UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, dups, n * sizeof(HANDLE), nullptr, nullptr);
+    if (attr) sx.lpAttributeList = al;
+    BOOL ok = CreateProcessW(app, cmd, nullptr, nullptr, n ? TRUE : FALSE, flags | (attr ? EXTENDED_STARTUPINFO_PRESENT : 0), env, cwd,
+                             &sx.StartupInfo, &pi);
+    DWORD err = ok ? 0 : GetLastError();
+    if (init) DeleteProcThreadAttributeList(al);
+    for (DWORD i = 0; i < n; ++i) CloseHandle(dups[i]);
+    if (!ok) SetLastError(err);
+    return ok;
+}
 #endif
 
 // ---------------------------------------------------------------- files
@@ -598,11 +628,12 @@ inline void advise_willneed(void* p, std::size_t n) {
 }
 
 // ---------------------------------------------------------------- dynamic libraries
+// Plain open / symbol / close. <forge/os/dynlib.hpp> adds search dirs, typed get<>, path() and symbol enumeration.
 class library {
 public:
     library() = default;
-    library(library&& o) noexcept : h_(std::exchange(o.h_, nullptr)) {}
-    library& operator=(library&& o) noexcept { if (this != &o) { close(); h_ = std::exchange(o.h_, nullptr); } return *this; }
+    library(library&& o) noexcept : h_(std::exchange(o.h_, nullptr)), self_(std::exchange(o.self_, false)) {}
+    library& operator=(library&& o) noexcept { if (this != &o) { close(); h_ = std::exchange(o.h_, nullptr); self_ = std::exchange(o.self_, false); } return *this; }
     ~library() { close(); }
     static result<library> open(const std::string& name) {   // empty name = the running program
         library l;
@@ -625,6 +656,7 @@ public:
     }
     template <class F> F get(const char* s) const { return reinterpret_cast<F>(symbol(s)); }
     bool valid() const { return h_ != nullptr; }
+    bool is_self() const { return self_; }   // opened with "" (the running program)
     void* native() const { return h_; }
     void close() {
         if (!h_) return;
@@ -955,7 +987,7 @@ inline result<exec_result> run(const std::vector<std::string>& argv, bool merge_
     STARTUPINFOW si{}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = w; si.hStdError = merge_stderr ? w : GetStdHandle(STD_ERROR_HANDLE); si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION pi{};
-    BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    BOOL ok = create_process_std_only(nullptr, cmd.data(), CREATE_NO_WINDOW, nullptr, nullptr, si, pi);
     CloseHandle(w);
     if (!ok) { auto e = last_error("CreateProcess " + argv[0]); CloseHandle(r); return {{}, e}; }
     exec_result res; char buf[4096]; DWORD n;

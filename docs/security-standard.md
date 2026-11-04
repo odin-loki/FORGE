@@ -2,7 +2,7 @@
 
 Status: normative. Applies to every FORGE component on every OS: the `forge` CLI, `forge-serve`,
 `forge rpc-serve`, `forge script`, native plugins, and anything that loads models through
-`forge::pack`. There is ONE standard and ONE API: `forge::security` (C++) / `forge::security::`
+`forge::modelfile`. There is ONE standard and ONE API: `forge::security` (C++) / `forge::security::`
 (scripts). Applications never write OS-specific security code; each OS's native mechanism is a
 backend behind the same call and the same policy file.
 

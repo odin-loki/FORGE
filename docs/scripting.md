@@ -2,8 +2,8 @@
 
 Status: **core runtime implemented** (C++23-subset language, tree-walker + verified bytecode VM, ARC +
 cycle collector, exceptions, tasks/channels, shell calls, limits, sandbox, `forge script` CLI/REPL).
-Automation (pipelines, file-watch triggers, schedules) and modules/native plugins implemented.
-Still to come: AI commands, remote execution. See *Phasing* at the end.
+Automation (pipelines, file-watch triggers, schedules), modules/native plugins, AI commands and remote
+execution implemented. See *Phasing* at the end.
 
 ## Purpose
 
@@ -31,7 +31,7 @@ destructor calls. Everything else that a typical tool script needs is supported:
 - Declarations: `int`/`long long`/`double`/`bool`/`char`/`std::string`/`auto`, `const`/`constexpr`,
   several declarators, brace/paren initialisation, structured bindings `auto [k, v] = ...`.
   Narrowing (`int x = 3.5;`) and assigning to a `const` are compile-time errors.
-- Control flow: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (incl. bindings), `switch`
+- Control graph: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (incl. bindings), `switch`
   with fall-through, `break`/`continue`, `try`/`catch`/`throw`/`throw;`, `catch (...)`.
 - Functions with defaults, by-value (copied) and by-reference parameters, recursion, templates
   (type-erased), lambdas with `[=]`, `[&]`, `[x]`, `[&x]` captures and `mutable`.
@@ -241,16 +241,51 @@ int main() {
 
 ### Resource limits
 
-`forge::limit(opts, fn)` runs `fn` with narrower limits and restores them afterwards. The keys are
-`timeout` (wall-clock ms, raising `TimeoutError`), `cpu_s` (CPU seconds of the running thread, raising
-`LimitExceededError`), `mem` (extra heap bytes, raising `OutOfMemoryError`), and `proc_mem` / `proc_cpu`
-(OS limits for child processes started inside the block). Example:
-`forge::limit(std::map<std::string, double>{{"timeout", 500}, {"cpu_s", 0.2}}, [] { work(); });`
+`forge::limit(opts, fn)` runs `fn` with narrower limits and restores them afterwards, also when `fn` throws.
+`opts` is a map, or a braced list of `{"key", value}` pairs. Unknown keys and malformed values raise
+`ValueError`. The options are:
+
+| key | limit | raises |
+|---|---|---|
+| `timeout` | wall-clock time (ms, or a duration string) | `TimeoutError` |
+| `cpu_s` | CPU time of the running thread (seconds, or a duration string) | `LimitExceededError` |
+| `mem` | extra managed-heap bytes (a number or a size string) | `OutOfMemoryError` |
+| `proc_mem`, `proc_cpu` | OS memory (bytes / size string) and CPU-second (number / duration string) limits for child processes started inside the block | the child is killed by the OS |
+| `allocs` | managed-heap objects allocated by the running thread inside the block | `OutOfMemoryError` |
+| `handles` | OS handles open at the same time: files, locks, file watchers, `proc::start` processes, `ProcessPool`s and their futures. A handle counts until it is closed, disposed or released | `TooManyFilesError` |
+| `procs` | child processes started inside the block: `forge::sh`/`bash`/`pwsh`/... calls, `run`/`proc::run`, `proc::start`, and each `ProcessPool` worker | `LimitExceededError` |
+
+**Sizes** are a number of bytes or a string such as `"64K"`, `"512M"`, `"2G"`, `"1T"` or `"1.5G"`. K, M, G and T are
+powers of 1024, `KB`/`KiB` mean the same as `K`, and a trailing `B` is optional. **Durations** are a number (ms
+for `timeout`, seconds for `cpu_s` and `proc_cpu`) or a string with a unit: `"250us"`, `"200ms"`, `"5s"`, `"2m"`
+(or `"2min"`), `"1h"`. A child-process CPU limit is rounded up to whole seconds.
+
+**Block syntax.** `limit {opts} { body }` is sugar for `forge::limit(opts, [&] { body })`; `forge::limit` may
+be written instead of `limit`. The options are `{"key", value}` pairs or C++20-style designators, and the parser
+rejects unknown or repeated keys. `limit (expr) { body }` takes the options from any map expression:
+
+```cpp
+limit {{"timeout", "5s"}, {"mem", "64M"}} { build(); }          // statement: value discarded
+auto r = limit {.cpu_s = "2s", .allocs = 100000} { return solve(); };   // expression: the block's return value
+limit (opts) { work(); }                                         // options from a variable
+```
+
+The body sees and changes the enclosing locals. In the statement form `return` is a syntax error, because it would
+only leave the block. `break` and `continue` cannot jump out of a block in either form. The static checker reports
+an unknown key or a malformed size or duration string in a literal option list as error `limit-option`.
+
+**Nesting and scope.** Nested blocks can only narrow a limit. The inner block gets the earlier of the two
+deadlines, the smaller heap cap, and the smaller child-process limits. Each `handles` and `procs` block has its
+own counter, and an acquisition counts against every enclosing block too. Tasks started inside a block (`std::async`,
+`std::thread`, `forge::parallel`) and modules it imports share its `handles`/`procs` counters, child-process limits
+and deadline. `cpu_s` and `allocs` count only the thread that entered the block. When a limit fires it is switched
+off until its block exits, so `catch` and `finally` code can still run. The limit is restored when the block exits.
+Over the `handles` limit the new resource is closed again before the error is raised. Over `procs` nothing is started.
 
 Also implemented (`Limits` in `script/src/interp.hpp`; CLI `--timeout MS`, `--max-steps N`, `--heap BYTES`):
 step count, wall-clock timeout, managed-heap cap, call depth (default 800, checked so the C++ stack is
-safe) and per-child output size (64 MiB). Tested by `tests/script/limits.fs`. **Planned, not implemented:**
-`limit {}` block syntax, string sizes such as `"2G"`, allocation-count, open-handle and child-count limits.
+safe) and per-child output size (64 MiB). Tested by `tests/script/limits.fs`, `limit_block.fs` (block syntax,
+sizes and durations) and `limit_counts.fs` (`allocs`, `handles`, `procs`).
 
 ### Interpreter implementation rules (safe ISO C++23)
 
@@ -328,7 +363,7 @@ be expressed in bash`. Unsupported constructs include classes, lambdas, containe
 | tcsh, csh | `.csh` | functions (only `int main()` is inlined), `fs.read`, `forge::sh` results (csh drops newlines) |
 | cmd (golden-tested under wine) | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |
 | rc (Byron rc), es | `.rc`, `.es` | string ordering. Integers go through `expr(1)`, and locals use dynamic-scope blocks |
-| ysh | | no emitter (osh covers Oils) |
+| ysh | `.ysh` | string ordering. J8 `b'...'` literals, typed procs, `/` and `%` through `_div`/`_mod` funcs (YSH's `//` refuses negative divisors) |
 
 **Tests.** `emit_golden_all_shells` in `tests/test_script.cpp` emits `tests/data/emit/functions.cpp` and `flat.cpp` for every
 installed backend. It runs each output with the real shell and requires exactly the interpreter's stdout and exit code. Shells that
@@ -336,6 +371,11 @@ are missing are skipped. ctest sets `FORGE_TEST_SHELL_PATH` from the `FORGE_TEST
 `../opt/shells/bin` when that directory exists. **Golden-tested on Linux**: sh, bash, zsh, dash, ash (busybox), yash, fish, tcsh,
 pwsh, xonsh, elvish, nu, ksh, mksh, oksh, osh, hush, rc and es, plus csh and powershell through tcsh and pwsh, and cmd under wine
 (`batch.cpp`). **Untested**: posh, real csh, Windows PowerShell 5.1, and mksh as Android's /system/bin/sh.
+
+`emit_text_golden` also compares the emitted *text* for ysh, rc and es with `tests/data/emit/expected/*.{ysh,rc,es}`, so
+emitter changes are caught on machines without those shells (`FORGE_UPDATE_EMIT_GOLDEN=1` rewrites the files). The ysh,
+rc and es outputs of all three goldens were run against real shells built from source (Oils 0.29.0 `ysh`, rakitzis/rc
+HEAD, wryun/es-shell HEAD) and matched the interpreter's output and exit code.
 
 **OS targets.**
 
@@ -358,8 +398,8 @@ release, uptime, loadavg, memory, is_tty, term_size, devices, clipboard), `proc.
 
 ## FORGE built-ins
 
-- `model.load(path)`, `model.generate(prompt, opts)` (inference via `mind`).
-- `gpu.devices()`, grid dispatch helpers.
+- `model.load(path)`, `model.generate(prompt, opts)` (inference via `inference`).
+- `gpu.devices()`, gpu dispatch helpers.
 - `mem.budget()`, `mem.usage()`, `mem.limit(size)` from `forge::mem`.
 - `serve.start(opts)` / `serve.stop()`.
 
@@ -388,7 +428,7 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 ## Higher-level features (approved, all in scope)
 
 1. **Parallel tasks** — `spawn fn`, `await`, `parallel(list, fn, n)`; thread pool from `forge::os`.
-2. **Resource-limited runs** — `forge::limit(opts, fn)` with an options map (`timeout` ms, `cpu_s`, `mem` bytes, `proc_mem`, `proc_cpu`) (block syntax `limit {...} {}` is planned) applies to
+2. **Resource-limited runs** — `forge::limit(opts, fn)` or the block `limit {opts} { ... }` with options `timeout`, `cpu_s`, `mem`, `proc_mem`, `proc_cpu`, `allocs`, `handles` and `procs`, where sizes and durations may be strings such as `"2G"` or `"5s"` (see Resource limits). It applies to
    child processes (cgroups / Job Objects) and to script work via the `forge::mem` budget, so
    jobs fail cleanly instead of OOM-killing the box.
 3. **Job pipelines** — declare steps with dependencies (`job build after fetch { }`), run as a DAG,
@@ -398,7 +438,8 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 6. **AI-assisted commands** — `ai "find the 5 largest files here"` asks a local model to draft a
    script, shows it, and runs only on confirmation; `ai.explain(r.err)` for failed commands.
 7. **Remote execution** — `forge::remote("host:7000", source, opts)` runs on `forge rpc-serve
-   --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS. Implemented; see docs/rpc.md.
+   --allow-scripts`, authenticated (token / Ed25519) and optionally over TLS; `forge::remote_call(node, fn,
+   args, opts)` ships one function and returns its result. Implemented; see *Remote execution* below and docs/rpc.md.
 8. **Modules/plugins** — `import` from a search path, native plugins via `os::library`.
 9. **Sandboxed runs** — run untrusted scripts with fs/net/proc capabilities off. ForgeScript enforces
    the flags twice: the interpreter raises `PermissionError`, and the engine applies the OS sandbox from
@@ -417,6 +458,15 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
      then widened again in the same process. `isolate` is POSIX only (Windows and iOS have no `fork`;
      there it raises `PermissionError` without running the block). Forking a process with other running
      threads copies only the calling thread: avoid `isolate` while tasks hold locks the block needs.
+   - **Checked at the call, not at the name:** a capability is checked when a built-in runs, against the
+     capabilities of the interpreter that runs it. Aliases (`auto r = forge::fs::read;`), `std::function`s,
+     lambdas, methods or map entries made before the sandbox, higher-order calls (`std::transform`,
+     `std::for_each`), `eval`, `forge::reflect::call`, imports, shell calls, and tasks started inside the
+     block (`std::async`, `std::thread`, `forge::parallel`, which inherit the capabilities) are all denied. A
+     nested `forge::sandbox` cannot turn a capability back on, and a `ProcessPool` worker never gets one its
+     parent lacks. File handles opened before a no-fs block cannot be read or written inside it, and a process
+     started before a no-proc block cannot be killed from inside it. `std::getenv` is gated by `env` like
+     `os::env`. Escape tests: `tests/script/sandbox_escape.fs`.
    - **rpc-serve:** each remote script runs in its own child (`forge script --rpc-child`, source on
      stdin) under `--script-timeout`, a `--script-mem-mb` memory cap (default 2048), and with
      `--os-sandbox require` whenever a `--script-no-*` flag is set, so the OS sandbox applies to remote
@@ -450,6 +500,45 @@ in the task is `ValueError` in the caller); a worker that crashes raises `Signal
 `print` output is replayed in the caller when the result is collected. Programs embedding the engine that use spawn
 mode must call `forge::script::run_process_worker_if_requested(argc, argv)` first in `main()` (the `forge` CLI does).
 
+## Remote execution (implemented)
+
+`script/src/remote.cpp`. Both calls go to a `forge rpc-serve --allow-scripts` node (docs/rpc.md) and take the same
+options: `{{"token", s}}`, `{{"key", file}}`, `{{"tls", bool}}`, `{{"ca", file}}`, `{{"fingerprint", hex}}`,
+`{{"server_name", s}}`, `{{"timeout_ms", n}}`, `{{"name", s}}` (credentials default to the `FORGE_RPC_*` environment).
+
+```cpp
+auto r = forge::remote("box2:7000", "std::println(\"{}\", os.hostname());", {{"token", tok}});   // {ok, output, error_type, error}
+
+int k = 10;
+std::map<std::string, int> weights = {{"a", 2}};
+auto score = [k, &weights](std::string key, int x) { return weights[key] * x + k; };
+int v = forge::remote_call("box2:7000", score, {"a", 5}, {{"token", tok}});                 // 20, computed on box2
+auto n = forge::remote_call("box2:7000", [](auto xs) { return xs.size(); }, {std::vector<int>{1, 2, 3}});
+```
+
+`forge::remote_call(node, fn[, args-list[, opts]])` ships a lambda or free function:
+
+- **What travels**: the function's source text (kept by the parser for every function and lambda, and in `.fsc`
+  caches), plus every variable it uses from outside its own body: captured locals (by value or by reference),
+  globals, and other script functions it calls (shipped the same way, recursively). Built-ins are not shipped; the
+  node has its own. On the node the generated script defines each captured name at top level, so captures are
+  **copies**: assignments the function makes to them are not seen by the caller.
+- **Only plain data**: captured values and arguments must be nil, bool, int, double, string, list or map (std::map /
+  unordered_map / set, including their default value), nested to any depth. Ints and doubles stay distinct (a typed
+  encoding, `forge::__marshal` / `forge::__unmarshal`, not JSON). Anything else — file and process handles, objects
+  and `this`, classes, tasks, channels, natives, bound methods — is refused before connecting, with a `TypeError`
+  naming the variable: `forge::remote_call: captured 'h' is a handle; only nil, bool, numbers, strings, lists and maps
+  (and script functions over them) can be sent to a remote node`. Two different values captured under one name (shadowing)
+  and namespaced names are refused as well.
+- **Sandbox**: the function runs exactly like a `forge::remote` script: in its own `forge script --rpc-child` process
+  with the node's `--script-timeout`, `--script-mem-mb` and `--script-no-*` capabilities (OS sandbox `require`).
+  The script's static checks run there too, so e.g. `fs.write` on a `--script-no-fs` node fails with `PermissionError`.
+- **Result**: the return value (same plain-data rule) comes back typed. An exception keeps its type (`ValueError` on the
+  node is `ValueError` here, message prefixed `remote: `); the node's `print` output is replayed locally first. Wrong
+  credentials raise `PermissionError`, connection failures `IOError`.
+- Tested over loopback in `tests/test_script.cpp` (`remote_call_functions`; the node is an in-process engine with fs
+  denied) and by hand against `forge rpc-serve --allow-scripts --script-no-fs`.
+
 ## AI-assisted commands (implemented)
 
 `script/src/ai.cpp`. Drafted code never runs without confirmation.
@@ -463,9 +552,22 @@ auto j = forge::ask_json("give {name, version} for this package", fs.read("packa
 std::println("{}", forge::explain(forge::sh("make").err));
 ```
 
-- Backend: the host's `options::ai` callback, else `FORGE_AI_ENDPOINT` — any OpenAI-compatible
-  `/v1/chat/completions` server, normally FORGE's own `forge-serve` (`FORGE_AI_MODEL`, `FORGE_AI_KEY`
-  optional). Endpoint calls need the `net` capability; plain `http://` only.
+- Backend, first match wins:
+  1. the host's `options::ai` callback;
+  2. **in-process inference**: `options::ask_model`, `forge script --ask-model M.fpk` or `$FORGE_ASK_MODEL` names a
+     `.fpk`, and the host registered a generator. `forge_script` itself does not link the inference module; a host
+     that does calls `forge::script::install_local_ai()` from `<forge/script/local_ai.hpp>` (the `forge` CLI does,
+     so `forge script` and rpc-serve's script children have it). The model is loaded once per path and shared; each
+     call is a fresh session, greedy (same question, same answer), formatted like forge-serve's chat endpoint
+     (`system: …\nuser: …\nassistant:`), and capped at `options::ask_max_tokens` / `--ask-max-tokens` /
+     `$FORGE_ASK_MAX_TOKENS` (default 256). `ask_json` constrains decoding to a JSON value with the grammar sampler,
+     so a small model cannot answer in prose; a value cut off by the token cap raises `AIError`. No `net` capability
+     is needed. If a model is configured but the host has no generator, the endpoint below is used when set, else
+     `AIError`;
+  3. `FORGE_AI_ENDPOINT` — any OpenAI-compatible `/v1/chat/completions` server, normally FORGE's own `forge-serve`
+     (`FORGE_AI_MODEL`, `FORGE_AI_KEY` optional). Endpoint calls need the `net` capability; plain `http://` only.
+- Tested: `ask_local_model` in `tests/test_script.cpp` runs `ask` / `ask_json` on a tiny random Llama built in-process
+  (`tests/tiny_model.hpp`) and checks `ask` against direct greedy decoding through `forge::inference::session`.
 - Confirmation: `{{"confirm", fn}}` per call, else `options::confirm`. `forge script` prompts
   `Run it? [y/N]` on the terminal. With no confirmer, `ran` is `false` and nothing executes.
 - `ai_run` takes `{{"shell", "sh"|"bash"|"pwsh"|"cmd"}}`; it runs through `forge::<shell>` so sandbox
@@ -577,7 +679,7 @@ in both execution modes.
 - Scripts run with the user's privileges. Capability flags (`forge::sandbox`, `--no-*`) are checked by
   the interpreter only; there is no OS-level sandbox for scripts yet. See [security.md](security.md).
 - AI-generated code is never run without confirmation.
-- Remote execution is refused unless rpc-serve has authentication (`flow/include/forge/flow/rpc.hpp`).
+- Remote execution is refused unless rpc-serve has authentication (`graph/include/forge/graph/rpc.hpp`).
 
 ## Testing
 
@@ -622,6 +724,7 @@ Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the
 | `unique-copy` | error | copy-initialising from a `std::make_unique` local |
 | `iter-mutation` | error for a list/map-literal or `list`/`map`/`vector`-typed local, else warning | size-changing method on the container a range-for is iterating |
 | `capability` | error | `fs.*`, `net.*`, `proc.*`, `service.*`, `os.env/setenv/chdir/processes/kill`, `run()`, shell blocks when the run's `--no-fs/--no-net/--no-proc` or an enclosing `sandbox({fs: false, ...}, fn)` literal denies them |
+| `limit-option` | error | in a literal `limit {...}` / `forge::limit({...}, fn)` option list: an unknown key, a malformed size or duration string, or a string for `allocs`/`handles`/`procs` |
 | `pool-task` | error | `submit`/`map` with a literal task source that does not parse, does not define `task`, or whose `task` does not take one argument |
 | `pool-json` | error | a lambda or shell value (or a literal containing one) passed as a ProcessPool argument |
 | `thread-send` | warning | an argument to `forge::spawn`/`std::thread`/`std::async` that is not a literal, moved, frozen, const or `forge::shared` |

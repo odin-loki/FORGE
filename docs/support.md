@@ -3,15 +3,27 @@
 Added in PRs #5-#9. Header-only unless noted.
 
 ## Logger: `core/include/forge/core/log.hpp` (tests: `tests/test_log.cpp`, `tests/test_log_strip.cpp`)
-- Levels trace, debug, info, warn, error, fatal, off; default warn. `FORGE_LOG="info,mind=debug"` sets the
+- Levels trace, debug, info, warn, error, fatal, off; default warn. `FORGE_LOG="info,inference=debug"` sets the
   global and per-module thresholds; `set_level`, `set_module_level`, `configure(spec)` at run time.
-- `forge::log::info(...)` (module "forge") or `forge::log::logger L{"mind"}`; `std::format` style.
-- Sinks: stderr (default, `set_stderr`), `add_file_sink(path, max_bytes, keep)` with size rotation, syslog,
-  any callback (`add_sink`/`remove_sink`). Text or JSON lines (`set_format`, `FORGE_LOG_FORMAT=json`).
-  One locked write per line.
+- `forge::log::info(...)` (module "forge") or `forge::log::logger L{"inference"}`; `std::format` style.
+- Sinks: stderr (default, `set_stderr`), `add_file_sink(path, max_bytes, keep)` with size rotation,
+  `add_syslog_sink(ident)` (POSIX), `add_eventlog_sink(source)` (Windows only), any callback
+  (`add_sink`/`remove_sink`). Each also has a `make_*_sink` form (`make_stderr_sink`, `make_file_sink`,
+  `make_syslog_sink`, `make_eventlog_sink`) that returns the sink without registering it, empty on failure.
+  Text or JSON lines (`set_format`, `FORGE_LOG_FORMAT=json`). Synchronous sinks: one locked write per line.
+- Windows event log: `RegisterEventSourceW` + `ReportEventW` to the Application log; error/fatal are
+  error events, warn is a warning, the rest information. Event id 0 and no message file, so Event Viewer
+  shows the line after a "description for Event ID 0 cannot be found" note. Links `advapi32`.
+- Async: `add_async_sink(sink, capacity = 8192)` puts a bounded queue in front of any sink, drained by one
+  background thread ("forge-log"). A log call only copies the record into the queue; when the queue is full
+  the line is dropped, never waited for. Drops are counted (`async_sink_stats(id)`: written, dropped,
+  pending) and reported to the sink as a `[forge:log W] dropped N log line(s): async queue full` record.
+  `flush()` waits until everything queued before it is written; `remove_sink(id)` and process exit drain the
+  queue and join the thread. The wrapped sink runs on that thread, one line at a time, outside the logger lock.
+  For a fully non-blocking setup: `set_stderr(false); add_async_sink(make_stderr_sink());`.
 - `FORGE_LOG_MIN` / `FORGE_LOG_MIN_LEVEL` (0..6) strip calls at compile time; the `FORGE_LOG_TRACE..FATAL`
-  macros skip argument evaluation when disabled.
-- Not yet: async sink, Windows event log sink, CMake option for the strip level (TODO.md).
+  macros skip argument evaluation when disabled. The CMake cache variable `FORGE_LOG_MIN_LEVEL`
+  (`trace`..`off`, default `none`) defines it for everything linking `forge_core` (docs/building.md).
 
 ## Processes: `os/include/forge/os/process.hpp`, `core/include/forge/core/memory.hpp` (tests: `tests/test_os_process.cpp`, `tests/test_memory.cpp`)
 - `spawn_spec` (argv, env, cwd, limits, output cap); `wait_any(children, timeout_ms)`, `wait_all(...)`.

@@ -5,8 +5,8 @@
 #include <sys/stat.h>
 #include <forge/import/gguf.hpp>
 #include <forge/import/onnx.hpp>
-#include <forge/lane/dispatch.hpp>
-#include <forge/mind/mind.hpp>
+#include <forge/simd/dispatch.hpp>
+#include <forge/inference/inference.hpp>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -15,10 +15,11 @@
 #include <sstream>
 #include <mutex>
 #include <chrono>
-#include <forge/grid/prims.hpp>
-#include <forge/grid/cuda.hpp>
+#include <forge/gpu/prims.hpp>
+#include <forge/gpu/cuda.hpp>
 #include <forge/script/script.hpp>
 #include <forge/script/check.hpp>
+#include <forge/script/local_ai.hpp>
 
 using namespace forge;
 
@@ -78,7 +79,7 @@ int usage() {
 std::string resolve_model(const std::string& path, const std::string& codec) {
     namespace fs = std::filesystem;
     if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
-    std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(pack::format_version));
+    std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(modelfile::format_version));
     auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
                                                             (long long)fs::last_write_time(f).time_since_epoch().count()); };
     if (fs::is_directory(path)) { std::vector<fs::path> fl; for (auto& e : fs::directory_iterator(path)) if (e.is_regular_file()) fl.push_back(e.path());
@@ -106,9 +107,9 @@ std::vector<int> parse_ids(const std::string& s) {
 }
 
 int cmd_info() {
-    auto& f = lane::detect();
-    std::printf("cpu      %s\nfeatures %s\nlane     %s\n", f.brand.c_str(), f.summary().c_str(), lane::active().target);
-    for (auto& b : grid::probe_backends()) std::printf("grid     %-10s %s  %s\n", grid::name(b.kind), b.available ? "yes" : "no ", b.detail.c_str());
+    auto& f = simd::detect();
+    std::printf("cpu      %s\nfeatures %s\nlane     %s\n", f.brand.c_str(), f.summary().c_str(), simd::active().target);
+    for (auto& b : gpu::probe_backends()) std::printf("grid     %-10s %s  %s\n", gpu::name(b.kind), b.available ? "yes" : "no ", b.detail.c_str());
     std::fputs(mem::governor::instance().describe().c_str(), stdout);
     return 0;
 }
@@ -132,11 +133,11 @@ int cmd_import(const args& a) {
 
 int cmd_inspect(const args& a) {
     if (a.pos.empty()) return usage();
-    pack::reader r(a.pos[0]);
+    modelfile::reader r(a.pos[0]);
     std::printf("file      %s (%zu bytes)\nmanifest  %s\n", a.pos[0].c_str(), r.file_size(), json::dump(r.manifest()).c_str());
     for (auto& [n, s] : r.sections()) std::printf("section   %-10s offset %10llu size %10llu blake3 %s\n", n.c_str(),
                                                    (unsigned long long)s.offset, (unsigned long long)s.size, hash::blake3::hex(s.hash).substr(0, 16).c_str());
-    auto bp = pack::parse_blueprint(r.section_text("blueprint"));
+    auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
     std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors\n", bp.name.c_str(), bp.opset,
                 bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size());
     if (a.has("tensors")) for (auto& [n, e] : r.tensors()) std::printf("  %-28s %-9s %s\n", n.c_str(), e.codec.c_str(), shape_str(e.shape).c_str());
@@ -151,7 +152,7 @@ int cmd_inspect(const args& a) {
 
 int cmd_dump(const args& a) {  // decode one tensor to raw little-endian f32
     if (a.pos.size() < 3) return usage();
-    pack::reader r(a.pos[0]);
+    modelfile::reader r(a.pos[0]);
     auto t = r.load(a.pos[1]);
     std::ofstream f(a.pos[2], std::ios::binary);
     f.write(reinterpret_cast<const char*>(t.data.data()), std::streamsize(t.size() * 4));
@@ -161,47 +162,47 @@ int cmd_dump(const args& a) {  // decode one tensor to raw little-endian f32
 
 int cmd_keygen(const args& a) {
     if (a.get("o").empty()) return usage();
-    auto k = pack::generate_keypair();
+    auto k = modelfile::generate_keypair();
     auto base = a.get("o");
-    { std::ofstream f(base + ".key"); f << pack::detail::to_hex(k.seed) << "\n"; }
+    { std::ofstream f(base + ".key"); f << modelfile::detail::to_hex(k.seed) << "\n"; }
     std::filesystem::permissions(base + ".key", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
-    { std::ofstream f(base + ".pub"); f << pack::detail::to_hex(k.pub) << "\n"; }
-    std::printf("key id %s\npublic %s\nwrote %s.key (keep secret) and %s.pub\n", pack::key_id(k.pub).c_str(), pack::detail::to_hex(k.pub).c_str(), base.c_str(), base.c_str());
+    { std::ofstream f(base + ".pub"); f << modelfile::detail::to_hex(k.pub) << "\n"; }
+    std::printf("key id %s\npublic %s\nwrote %s.key (keep secret) and %s.pub\n", modelfile::key_id(k.pub).c_str(), modelfile::detail::to_hex(k.pub).c_str(), base.c_str(), base.c_str());
     return 0;
 }
 int cmd_sign(const args& a) {
     if (a.pos.empty() || a.get("key").empty()) return usage();
-    auto k = pack::load_secret_key(a.get("key"));
+    auto k = modelfile::load_secret_key(a.get("key"));
     auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
-    pack::sign_file(a.pos[0], out, k);
-    std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), pack::key_id(k.pub).c_str(), out.c_str());
+    modelfile::sign_file(a.pos[0], out, k);
+    std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
     return 0;
 }
 int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key k.mkey | --new-key k.mkey]
     if (a.pos.empty() || a.get("o").empty() || (a.get("key").empty() && a.get("new-key").empty())) return usage();
-    pack::model_key k;
+    modelfile::model_key k;
     if (!a.get("new-key").empty()) {
-        k = pack::generate_model_key();
-        std::ofstream f(a.get("new-key")); f << pack::detail::hex(k.data(), 32) << "\n";
+        k = modelfile::generate_model_key();
+        std::ofstream f(a.get("new-key")); f << modelfile::detail::hex(k.data(), 32) << "\n";
         if (!f) throw std::runtime_error("cannot write " + a.get("new-key"));
         ::chmod(a.get("new-key").c_str(), 0600);
     } else {
         std::ifstream f(a.get("key")); std::string h, w; while (f >> w) h += w;
-        auto b = pack::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
+        auto b = modelfile::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
         std::memcpy(k.data(), b.data(), 32);
     }
-    pack::encrypt_file(a.pos[0], a.get("o"), k);
-    std::printf("encrypted %s -> %s (key id %s)\n", a.pos[0].c_str(), a.get("o").c_str(), pack::detail::enc_key_id(k).c_str());
+    modelfile::encrypt_file(a.pos[0], a.get("o"), k);
+    std::printf("encrypted %s -> %s (key id %s)\n", a.pos[0].c_str(), a.get("o").c_str(), modelfile::detail::enc_key_id(k).c_str());
     return 0;
 }
 int cmd_verify(const args& a) {
     if (a.pos.empty()) return usage();
-    pack::reader r(a.pos[0]);
+    modelfile::reader r(a.pos[0]);
     auto bad = r.verify();
     for (auto& b : bad) std::printf("hash MISMATCH %s\n", b.c_str());
     std::vector<std::string> trusted;
-    for (auto& p : a.all("pubkey")) trusted.push_back(pack::load_public_key(p));
-    auto rep = pack::verify_signature(r, trusted);
+    for (auto& p : a.all("pubkey")) trusted.push_back(modelfile::load_public_key(p));
+    auto rep = modelfile::verify_signature(r, trusted);
     for (auto& k : rep.valid_keys) std::printf("signature ok   key %s\n", k.c_str());
     for (auto& k : rep.invalid_keys) std::printf("signature BAD  key %s\n", k.c_str());
     std::printf("%s: %s\n", a.pos[0].c_str(), bad.empty() && rep.trusted ? "VERIFIED" : rep.message.c_str());
@@ -209,7 +210,7 @@ int cmd_verify(const args& a) {
 }
 
 // one_shot models: --input name=file.f32 (raw little-endian f32, repeatable), --out prefix -> prefix.<output>.f32
-int run_one_shot(mind::session& s, const args& a) {
+int run_one_shot(inference::session& s, const args& a) {
     std::map<std::string, std::vector<float>> in; i64 seq = 1;
     const json::value* decl = s.manifest().find("onnx_inputs");
     for (auto& spec : a.all("input")) {
@@ -238,8 +239,8 @@ int run_one_shot(mind::session& s, const args& a) {
 
 int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
-    mind::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
-    mind::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
+    inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
+    inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
@@ -248,10 +249,10 @@ int cmd_run(const args& a) {
         prompt = s.tokenizer()->encode(a.get("prompt"));
         if (s.tokenizer()->bos() >= 0 && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
     } else return usage();
-    mind::sampler_config sc;
+    inference::sampler_config sc;
     sc.temperature = float(a.num("temp", 0)); sc.top_k = int(a.num("top-k", 0)); sc.top_p = float(a.num("top-p", 1));
     sc.min_p = float(a.num("min-p", 0)); sc.repetition_penalty = float(a.num("repeat-penalty", 1)); sc.seed = std::uint64_t(a.num("seed", 0));
-    mind::sampler smp(sc);
+    inference::sampler smp(sc);
     bool ids = a.has("ids") || !s.tokenizer();
     if (a.kv.count("logits")) {  // dump prefill logits for golden comparison
         auto l = s.forward(prompt);
@@ -259,11 +260,11 @@ int cmd_run(const args& a) {
         f.write(reinterpret_cast<const char*>(l.data()), std::streamsize(l.size() * 4));
         s.reset();
     }
-    std::unique_ptr<mind::grammar_constraint> gc;
+    std::unique_ptr<inference::grammar_constraint> gc;
     if (a.kv.count("grammar")) {
         if (!s.tokenizer()) raise(errc::unsupported, "--grammar needs a model tokenizer");
-        auto g = std::make_shared<mind::grammar>(import::read_file(a.get("grammar")));
-        gc = std::make_unique<mind::grammar_constraint>(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
+        auto g = std::make_shared<inference::grammar>(import::read_file(a.get("grammar")));
+        gc = std::make_unique<inference::grammar_constraint>(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
         smp.filter = [&](std::span<float> l) { gc->apply(l); };
     }
     auto show = [&](int t) {
@@ -273,15 +274,15 @@ int cmd_run(const args& a) {
         return !(gc && gc->finished());
     };
     if (a.kv.count("draft")) {
-        mind::session d(resolve_model(a.get("draft"), a.get("codec", "f32")), so);
-        mind::speculative_stats sst;
-        mind::speculative_generate(s, d, prompt, int(a.num("n", 32)), smp, int(a.num("spec-k", 4)), show, &sst);
+        inference::session d(resolve_model(a.get("draft"), a.get("codec", "f32")), so);
+        inference::speculative_stats sst;
+        inference::speculative_generate(s, d, prompt, int(a.num("n", 32)), smp, int(a.num("spec-k", 4)), show, &sst);
         std::printf("\n");
         std::fprintf(stderr, "[speculative: %zu tokens in %.3fs = %.1f tok/s; %zu rounds, acceptance %.0f%%]\n", sst.new_tokens, sst.seconds,
                      double(sst.new_tokens) / sst.seconds, sst.rounds, 100 * sst.acceptance());
         return 0;
     }
-    mind::generate_stats st;
+    inference::generate_stats st;
     std::vector<int> out = s.generate(prompt, int(a.num("n", 32)), smp, show, &st);
     std::printf("\n");
     std::fprintf(stderr, "[%zu prompt tokens in %.3fs, %zu new tokens in %.3fs = %.1f tok/s; plans %zu compiled, %zu reused]\n",
@@ -293,49 +294,49 @@ int cmd_run(const args& a) {
 int cmd_bench_gemm(int n) {
     std::vector<float> A(std::size_t(n) * n, 0.5f), B(std::size_t(n) * n, 0.25f), C(std::size_t(n) * n);
     for (const char* t : {"scalar", "avx2", "avx512", "neon", "sve", "rvv"}) {
-        auto* k = lane::by_name(t); if (!k) continue;
+        auto* k = simd::by_name(t); if (!k) continue;
         k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n));
         auto t0 = std::chrono::steady_clock::now(); int reps = 0;
         do { k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n)); ++reps; }
         while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
-        std::printf("lane::%-7s gemm_nt %d^3: %8.2f GFLOP/s (1 thread)\n", t, n, 2.0 * n * n * n / s / 1e9);
+        std::printf("simd::%-7s gemm_nt %d^3: %8.2f GFLOP/s (1 thread)\n", t, n, 2.0 * n * n * n / s / 1e9);
     }
     auto t0 = std::chrono::steady_clock::now(); int reps = 0;
-    do { grid::prims::gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n)); ++reps; }
+    do { gpu::prims::gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n)); ++reps; }
     while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
     double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / reps;
-    std::printf("grid::prims gemm_nt %d^3: %8.2f GFLOP/s (all threads)\n", n, 2.0 * n * n * n / s / 1e9);
+    std::printf("gpu::prims gemm_nt %d^3: %8.2f GFLOP/s (all threads)\n", n, 2.0 * n * n * n / s / 1e9);
     return 0;
 }
 
 int cmd_bench(const args& a) {
     if (a.kv.count("gemm")) return cmd_bench_gemm(int(a.num("gemm", 512)));
     if (a.pos.empty()) return usage();
-    mind::session s(resolve_model(a.pos[0], a.get("codec", "f32")));
+    inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")));
     int p = int(a.num("p", 32)), n = int(a.num("n", 32));
     std::vector<int> prompt(std::size_t(p), 1);
-    mind::sampler smp;
+    inference::sampler smp;
     // --warmup N (default 1): untimed short runs first, so one-off weight uploads / page-ins of the mmapped
     // model and kernel loads are not counted as prefill or decode time (llama-bench does the same).
     for (int w = int(a.num("warmup", 1)); w > 0; --w) {
-        std::vector<int> wp(std::size_t(std::min(p, 64)), 1); mind::generate_stats ws;
+        std::vector<int> wp(std::size_t(std::min(p, 64)), 1); inference::generate_stats ws;
         s.generate(wp, 2, smp, {}, &ws); s.reset();
     }
     // GPU driver calls (CUDA/HIP): a prefill-only run (1 new token) and the full run, so the decode share is
     // (full - prefill-only) / (n - 1) per token. "launches" are kernels issued directly, "captured" are kernels
     // recorded into a CUDA graph (replayed by one graph launch), instantiates are graphs (re)built, node_updates are
     // kernel nodes patched in place on replay, dtoh/htod/dtod are copies (dtod a copy kernel under graphs), syncs are stream syncs.
-    using snap = grid::gpu::call_counters::snapshot;
-    auto now = [] { return grid::gpu::counters().read(); };
+    using snap = gpu::cuda_hip::call_counters::snapshot;
+    auto now = [] { return gpu::cuda_hip::counters().read(); };
     auto diff = [](const snap& a, const snap& b) {
         return snap{b.launches - a.launches, b.captured - a.captured, b.graph_launches - a.graph_launches, b.dtoh - a.dtoh,
                     b.htod - a.htod, b.dtod - a.dtod, b.syncs - a.syncs, b.instantiates - a.instantiates, b.node_updates - a.node_updates, b.replayed_runs - a.replayed_runs};
     };
     snap c0 = now();
-    { mind::generate_stats ps; s.generate(prompt, 1, smp, {}, &ps, false); s.reset(); }
+    { inference::generate_stats ps; s.generate(prompt, 1, smp, {}, &ps, false); s.reset(); }
     snap pre = diff(c0, now());
-    mind::generate_stats st;
+    inference::generate_stats st;
     snap c1 = now();
     s.generate(prompt, n, smp, {}, &st, /*stop_at_eos=*/false);   // bench: always decode n tokens
     snap all = diff(c1, now());
@@ -353,34 +354,34 @@ int cmd_bench(const args& a) {
 }
 
 // forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]
-//   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]... [--tls-cert C --tls-key K]
+//   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]... [--tls-cert C --tls-key K [--tls-client-ca CA]]
 //   [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
 // Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
     std::string why, dev = a.get("device", "cpu");
-    auto reg = flow::device_registry(dev, &why, false);
+    auto reg = graph::device_registry(dev, &why, false);
     if (!reg && dev != "cpu") std::fprintf(stderr, "forge: %s; serving on cpu\n", why.c_str());
-    flow::rpc::server_security sec;
-    auto trim = [](std::string s) { while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back(); std::size_t i = 0; while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i; return s.substr(i); };
+    graph::rpc::server_security sec;
     for (auto& t : a.all("token")) sec.tokens.push_back(t);
     if (a.has("token") && a.all("token").empty()) sec.tokens.push_back(a.get("token"));
     auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
-    for (auto& f : files) sec.tokens.push_back(flow::rpc::read_key_file(f));
+    for (auto& f : files) sec.tokens.push_back(graph::rpc::read_key_file(f));
     auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
-    for (auto& f : keyfiles) {
+    for (auto& f : keyfiles) {   // "[allow=device,scripts] <hex> [comment]" per line (graph/rpc_secure.hpp)
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
-        std::istringstream in(r.value); std::string line;
-        while (std::getline(in, line)) { line = trim(line); if (!line.empty() && line[0] != '#') sec.authorized_keys.push_back(line.substr(0, 64)); }
+        try { for (auto& k : graph::rpc::parse_authorized_keys(r.value)) sec.authorized_keys.push_back(std::move(k)); }
+        catch (const std::exception& e) { throw std::runtime_error(f + ": " + e.what()); }
     }
     auto pubs = a.all("pubkey"); if (pubs.empty() && a.has("pubkey")) pubs.push_back(a.get("pubkey"));
-    for (auto& p : pubs) sec.authorized_keys.push_back(p.size() == 64 && p.find('/') == std::string::npos && !std::filesystem::exists(p) ? p : pack::load_public_key(p));
-    sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key");
+    for (auto& p : pubs) sec.authorized_keys.push_back(p.size() == 64 && p.find('/') == std::string::npos && !std::filesystem::exists(p) ? p : modelfile::load_public_key(p));
+    sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key"); sec.tls.client_ca_file = a.get("tls-client-ca");
     if (sec.tls.cert_file.empty() != sec.tls.key_file.empty()) throw std::runtime_error("--tls-cert and --tls-key go together");
+    if (!sec.tls.client_ca_file.empty() && sec.tls.cert_file.empty()) throw std::runtime_error("--tls-client-ca needs --tls-cert and --tls-key");
     sec.allow_scripts = a.has("allow-scripts");
     std::string bind = a.get("bind", "127.0.0.1");
-    if (!sec.auth_required() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
+    if (!sec.auth_required() && sec.tls.client_ca_file.empty() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
         std::fprintf(stderr, "forge rpc: WARNING: no authentication and bound to %s; anyone who can reach it can use it\n", bind.c_str());
-    flow::rpc::server srv(reg.get(), int(a.num("port", 7000)), bind, sec);
+    graph::rpc::server srv(reg.get(), int(a.num("port", 7000)), bind, sec);
     if (sec.allow_scripts) {
         auto def_tmo = std::uint64_t(a.num("script-timeout", 60000));
         auto mem_mb = std::uint64_t(a.num("script-mem-mb", 2048));
@@ -407,22 +408,23 @@ int cmd_rpc_serve(const args& a) {
             sp.argv.push_back("--args"); for (auto& x : argv) sp.argv.push_back(x);
             sp.stdin_data = src; sp.timeout_ms = t + 5000; sp.max_output = 32u << 20;
             sp.limits.memory_bytes = mem_mb << 20;
-            sp.env_unset = {"FORGE_SCRIPT_CACHE_SIGN_SEED", "FORGE_RPC_TOKEN", "FORGE_RPC_KEY"};
+            sp.env_unset = {"FORGE_SCRIPT_CACHE_SIGN_SEED", "FORGE_RPC_TOKEN", "FORGE_RPC_KEY", "FORGE_RPC_TLS_KEY"};
             auto r = os::spawn_wait(sp);
-            if (!r) return flow::rpc::server::script_result{false, "RuntimeError", "could not start script child: " + r.err.what, ""};
+            if (!r) return graph::rpc::server::script_result{false, "RuntimeError", "could not start script child: " + r.err.what, ""};
             auto& pr = r.value;
-            if (pr.timed_out) return flow::rpc::server::script_result{false, "TimeoutError", "script exceeded " + std::to_string(t) + " ms", pr.out};
-            if (pr.exit_code == 0) return flow::rpc::server::script_result{true, "", "", pr.out};
+            if (pr.timed_out) return graph::rpc::server::script_result{false, "TimeoutError", "script exceeded " + std::to_string(t) + " ms", pr.out};
+            if (pr.exit_code == 0) return graph::rpc::server::script_result{true, "", "", pr.out};
             // child protocol: stderr = "<ErrorType>\n<message>"; a signal death or sandbox failure has none.
             std::string et = "RuntimeError", em = pr.err;
             if (auto nl = pr.err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && pr.err.find(' ') > nl) { et = pr.err.substr(0, nl); em = pr.err.substr(nl + 1); }
             if (pr.term_signal) { et = "RuntimeError"; em = "script child killed by signal " + std::to_string(pr.term_signal) + (pr.err.empty() ? "" : ": " + pr.err); }
             while (!em.empty() && em.back() == '\n') em.pop_back();
-            return flow::rpc::server::script_result{false, et, em, pr.out};
+            return graph::rpc::server::script_result{false, et, em, pr.out};
         };
     }
-    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
-                srv.tls() ? " tls" : "", sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
+    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
+                srv.tls() ? " tls" : "", sec.tls.client_ca_file.empty() ? "" : " mtls",
+                sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
     std::fflush(stdout);
     srv.run();
     return 0;
@@ -449,6 +451,8 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--json") check_json = true;
         else if (s == "--module-dir") module_dirs.push_back(val("--module-dir"));   // extra import dir for --check
         else if (s == "--no-check") o.static_check = false;
+        else if (s == "--ask-model") o.ask_model = val("--ask-model");   // in-process model for forge::ask & co
+        else if (s == "--ask-max-tokens") o.ask_max_tokens = std::stoi(val("--ask-max-tokens"));
         else if (s == "--strict-check") o.strict_check = true;
         else if (s == "--tree") o.use_vm = false;
         else if (s == "--debug") o.debug = true;
@@ -512,6 +516,7 @@ int cmd_script(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
+    forge::script::install_local_ai();   // forge::ask & co run FORGE_ASK_MODEL / --ask-model in-process
     if (argc < 2) return usage();
     std::string c = argv[1];
     if (c == "script") {

@@ -23,7 +23,7 @@
 
 namespace forge::script::fsc {
 
-inline constexpr std::uint32_t vm_version = 1;   // bump when Node/FnDecl/ClassDecl or the compiler changes meaning
+inline constexpr std::uint32_t vm_version = 2;   // bump when Node/FnDecl/ClassDecl or the compiler changes meaning
 
 using key_t = std::array<std::uint8_t, 32>;
 key_t key_of(std::string_view src, const std::string& file);

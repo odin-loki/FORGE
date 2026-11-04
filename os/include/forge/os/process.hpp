@@ -319,6 +319,9 @@ inline std::string find_executable(const std::string& name) {
     std::vector<std::string> exts = {"", ".exe", ".cmd", ".bat", ".com"};
     auto is_file = [](const std::string& p) { DWORD a = GetFileAttributesW(widen(p).c_str()); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); };
     if (name.find_first_of("/\\") != std::string::npos) { for (auto& e : exts) if (is_file(name + e)) return name + e; return {}; }
+    // A bare name ("cmd") resolves like CreateProcess: by extension only, so an extensionless file on PATH
+    // (an MSYS2 / Git shell script, which CreateProcess cannot start) never shadows cmd.exe.
+    if (name.find('.') == std::string::npos) exts.erase(exts.begin());
 #else
     const char sep = ':';
     std::vector<std::string> exts = {""};
@@ -414,8 +417,8 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     }
     PROCESS_INFORMATION pi{};
     std::wstring wcwd = widen(sp.cwd);
-    BOOL ok = CreateProcessW(widen(exe).c_str(), cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
-                             envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), &si, &pi);
+    BOOL ok = create_process_std_only(widen(exe).c_str(), cmd.data(), CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
+                                      envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi);
     closeh(in_r); closeh(out_w); closeh(err_w); closeh(fin); closeh(fout); closeh(ferr);
     if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); closeh(in_w); closeh(out_r); closeh(err_r); if (job) CloseHandle(job); return {{}, e}; }
     if (job) AssignProcessToJobObject(job, pi.hProcess);

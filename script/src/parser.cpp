@@ -23,7 +23,7 @@ namespace forge::script {
 namespace {
 
 enum class T { Ident, Int, Float, Str, Op, Kw, End };
-struct Tok { T t; std::string s; int line = 0; int col = 0; std::int64_t i = 0; double d = 0; };
+struct Tok { T t; std::string s; int line = 0; int col = 0; std::int64_t i = 0; double d = 0; std::size_t off = 0; std::size_t end = 0; };   // off/end: byte span in the source (0/0 for synthesised tokens)
 
 const std::unordered_set<std::string> kKeywords = {
     "auto", "const", "constexpr", "consteval", "constinit", "static", "inline", "virtual", "override", "final",
@@ -57,7 +57,7 @@ public:
             }
             if (p_ >= s_.size()) { out.push_back({T::End, "", line_}); return out; }
             bol = false;
-            { auto nl = p_ ? s_.rfind('\n', p_ - 1) : std::string_view::npos; int col = int(p_ - (nl == std::string_view::npos ? 0 : nl + 1)) + 1; out.push_back(next()); out.back().col = col; }
+            { auto nl = p_ ? s_.rfind('\n', p_ - 1) : std::string_view::npos; int col = int(p_ - (nl == std::string_view::npos ? 0 : nl + 1)) + 1; std::size_t b = p_; out.push_back(next()); out.back().col = col; out.back().off = b; out.back().end = p_; }
         }
     }
 private:
@@ -238,6 +238,7 @@ struct FnScope {
     std::string cls;            // enclosing class for member functions
     bool is_static = false;     // static member function: no `this`
     std::shared_ptr<TI> ret;    // declared return type (brace-init returns)
+    bool limit_stmt = false;    // body of a `limit {...} { }` statement: `return` would only leave the block
 };
 
 struct ClassInfo {
@@ -250,7 +251,7 @@ struct ClassInfo {
 
 class Parser {
 public:
-    Parser(std::vector<Tok> toks, std::string file) : t_(std::move(toks)), file_(std::move(file)) { prescan(); }
+    Parser(std::vector<Tok> toks, std::string file, std::shared_ptr<const std::string> src = {}) : t_(std::move(toks)), file_(std::move(file)), src_(std::move(src)) { prescan(); }
 
     std::shared_ptr<const FnDecl> program() {
         auto fd = std::make_shared<FnDecl>(); fd->name = "<main>"; fd->is_top = true; fd->file = file_; fd->line = 1;
@@ -557,6 +558,7 @@ private:
                 while (!is_op(">") && !is_op(">>") && !is_op(">=") && !is_op(">>=")) {
                     if (at(T::Int)) { take(); args.push_back(TI{TK::Int}); }   // std::array<int, 3>
                     else args.push_back(parse_type());
+                    if (is_op("(")) skip_balanced("(", ")");   // function type std::function<R(Args...)>: erased
                     if (!accept_op(",")) break;
                 }
                 close_angle();
@@ -814,6 +816,7 @@ private:
                 fail_at(line, "'" + k + "' is not supported in FORGE scripts");
             if (k == "new" || k == "delete") fail_at(line, "new/delete are not allowed; use std::make_unique / std::make_shared");
         }
+        if (limit_block_ahead()) { auto e = limit_block(line, true); accept_op(";"); return expr_stmt_of(std::move(e), line); }
         if (at(T::Ident) && ahead_op(1, "(")) {   // Cls::Cls(...) defined out of line
             const std::string& q = cur().s; auto p = q.rfind("::");
             if (p != std::string::npos && classes_.count(q.substr(0, p)) && short_name(q.substr(0, p)) == q.substr(p + 2)) { std::string qn = take().s; return out_of_line(TI{TK::Void}, qn, line); }
@@ -1003,7 +1006,9 @@ private:
         std::size_t save = i_;
         { skip_balanced("(", ")"); TI dummy; bool pure = false; fn_qualifiers(&dummy, nullptr, &pure); if (accept_op(";")) return nullptr; i_ = save; }
         VarRef v = declare(name, false);   // declared first: recursion
+        std::size_t sb = cur().off;
         auto fd = function_body(name, line, cls, false, ret);
+        keep_source(*fd, sb);
         if (name == "main" && fns_.back().top && ns_.empty()) {
             if (!fd->params.empty()) fail_at(line, "main must take no parameters in a script; use forge::args()");
             has_main_ = true;
@@ -1013,6 +1018,7 @@ private:
     }
     NodeP return_stmt() {
         int line = take().line; auto n = mk(NK::Return, line);
+        if (fns_.back().limit_stmt) fail_at(line, "'return' inside a limit block statement would only leave the block; write `auto r = limit {...} { return x; };` to get a value out");
         if (accept_op(";")) return n;
         std::shared_ptr<TI> fret = fns_.back().ret;   // copy: parsing a lambda below may grow fns_
         if (is_op("{")) {
@@ -1731,6 +1737,7 @@ private:
         }
         // local variables shadow everything else
         if (is_local(w)) return var_node(w, line);
+        if (limit_word(w) && limit_block_after(i_)) return limit_block(line, false, true);
         // members of the enclosing class (fields, methods, statics), including inherited ones
         if (const FnScope* ms = method_scope(); ms && w.find("::") == std::string::npos) {
             if (class_has_static(ms->cls, w)) { auto f = mk(NK::Field, line); f->s = w; f->kids.push_back(var_node(short_name(ms->cls), line)); return f; }
@@ -1817,6 +1824,61 @@ private:
         if (ti.k == TK::Any && !ti.name.empty()) return builtin_call(ti.name, args, line);
         return construct(ti, std::move(args), false, line);
     }
+    // ---- limit blocks: `limit {opts} { body }` / `limit (opts_expr) { body }` (docs/scripting.md "Resource limits").
+    // Sugar for forge::limit(opts, [&] { body }). opts entries are `{"key", value}` pairs or `.key = value`.
+    bool limit_word(const std::string& w) const { return (w == "limit" || w == "forge::limit") && !is_local(w) && !types_.count(w); }
+    // Is the token at index k a `{...}` or `(...)` group directly followed by `{`?
+    bool limit_block_after(std::size_t k) const {
+        if (k >= t_.size() || t_[k].t != T::Op || (t_[k].s != "{" && t_[k].s != "(")) return false;
+        const std::string open = t_[k].s, close = open == "{" ? "}" : ")";
+        int depth = 0;
+        for (std::size_t j = k; j < t_.size() && t_[j].t != T::End; ++j) {
+            if (t_[j].t != T::Op) continue;
+            if (t_[j].s == open) ++depth;
+            else if (t_[j].s == close && --depth == 0) return j + 1 < t_.size() && t_[j + 1].t == T::Op && t_[j + 1].s == "{";
+        }
+        return false;
+    }
+    bool limit_block_ahead() const { return at(T::Ident) && limit_word(canon_fn_name(cur().s)) && limit_block_after(i_ + 1); }
+    // stmt: statement form (value discarded, `return` refused). taken: the `limit` word was already consumed.
+    NodeP limit_block(int line, bool stmt, bool taken = false) {
+        if (!taken) take();
+        NodeP opts;
+        if (accept_op("(")) { opts = expr(); expect_op(")"); }
+        else {
+            auto m = mk(NK::Map, line);
+            std::set<std::string> keys;
+            expect_op("{");
+            while (!is_op("}")) {
+                std::string k; NodeP v;
+                if (accept_op(".")) { k = ident(); expect_op("="); v = copy_of(assign_expr()); }
+                else {
+                    expect_op("{");
+                    if (!at(T::Str)) fail("a limit option name must be a string literal, e.g. {\"timeout\", 500}");
+                    k = take().s; expect_op(","); v = copy_of(assign_expr()); expect_op("}");
+                }
+                static const std::set<std::string> known = {"timeout", "cpu_s", "mem", "proc_mem", "proc_cpu", "allocs", "handles", "procs"};
+                if (!known.count(k)) fail_at(line, "unknown limit option '" + k + "' (timeout, cpu_s, mem, proc_mem, proc_cpu, allocs, handles, procs)");
+                if (!keys.insert(k).second) fail_at(line, "limit option '" + k + "' given twice");
+                m->kids.push_back(str_node(k, line)); m->kids.push_back(std::move(v));
+                if (!accept_op(",")) break;
+            }
+            expect_op("}");
+            opts = m;
+        }
+        auto fd = std::make_shared<FnDecl>(); fd->name = "<limit>"; fd->line = line; fd->file = file_;
+        auto saved_brk = std::exchange(brk_, {});   // break / continue cannot leave the block
+        push_fn("", false);
+        fns_.back().cls.clear(); fns_.back().limit_stmt = stmt;
+        TI r; r.k = TK::Auto; fns_.back().ret = std::make_shared<TI>(r);
+        try { fd->body = block_body(line, false); } catch (...) { brk_ = std::move(saved_brk); throw; }
+        brk_ = std::move(saved_brk);
+        fd->nslots = fns_.back().nslots;
+        pop_fn();
+        auto lam = mk(NK::Lambda, line); lam->fn = fd;
+        return builtin_call("forge::limit", {opts, lam}, line);
+    }
+
     NodeP lambda() {
         int line = cur().line;
         expect_op("[");
@@ -1835,6 +1897,7 @@ private:
             if (!accept_op(",")) break;
         }
         expect_op("]");
+        std::size_t sb = cur().off;   // source after the capture list (forge::remote_call re-captures by name)
         if (is_op("<")) template_params();
         // copy captures: an immediately-invoked outer function binds the copies, the lambda closes over them
         std::shared_ptr<FnDecl> outer;
@@ -1859,6 +1922,7 @@ private:
         fd->body = block_body(line, false);
         fd->nslots = fns_.back().nslots;
         pop_fn();
+        keep_source(*fd, sb);
         auto lam = mk(NK::Lambda, line); lam->fn = fd;
         if (!outer) return lam;
         auto body = mk(NK::Block, line); auto ret = mk(NK::Return, line); ret->kids.push_back(lam); body->kids.push_back(ret);
@@ -1869,8 +1933,15 @@ private:
         return call_node(ol, args, line);
     }
 
+    // Source text of a function from byte `b` (its parameter list) to the end of the last token consumed.
+    void keep_source(FnDecl& fd, std::size_t b) const {
+        if (!src_ || i_ == 0) return;
+        std::size_t e = t_[i_ - 1].end;
+        if (b < e && e <= src_->size()) { fd.src = src_; fd.src_b = b; fd.src_e = e; }
+    }
+
     // ---- state
-    std::vector<Tok> t_; std::size_t i_ = 0; std::string file_;
+    std::vector<Tok> t_; std::size_t i_ = 0; std::string file_; std::shared_ptr<const std::string> src_;
     std::vector<std::pair<std::size_t, std::string>> undo_;   // token splits made by close_angle(), for backtracking
     std::vector<FnScope> fns_;
     std::vector<NodeP> extra_, extra_after_class_;
@@ -1892,7 +1963,7 @@ private:
 
 std::shared_ptr<const FnDecl> parse_program(std::string_view src, const std::string& file) {
     Lexer lx(src, file);
-    Parser p(lx.run(), file);
+    Parser p(lx.run(), file, std::make_shared<const std::string>(src));
     return p.program();
 }
 

@@ -15,7 +15,7 @@ A backend can also provide an emitter (`b.emitter`), which `forge script --emit`
 | ksh | ksh93 | `-c` | yes |
 | mksh, oksh (pdksh), hush | | `-c` | yes |
 | posh | | `-c` | **untested** |
-| osh / ysh | oils | `-c` | yes |
+| osh / ysh | oils (osh) | `-c`; ysh (`ysh.cpp`) uses J8 `b'…'` literals | yes (Oils 0.29.0 from source) |
 | fish | | `-c` | yes |
 | tcsh | | `-f -c`, `!` escaped | yes |
 | csh | | falls back to tcsh | yes, via tcsh; real BSD csh **untested** |

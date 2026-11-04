@@ -1,12 +1,12 @@
 // AMX / SME tile GEMMs vs a double-precision reference. Skips (prints) when the unit is absent:
 // run under Intel SDE (`sde64 -spr -- test_tile`) or qemu-aarch64 -cpu max (SME) to exercise them without hardware.
 #include "check.hpp"
-#include <forge/lane/tile.hpp>
+#include <forge/simd/tile.hpp>
 #include <array>
 #include <cmath>
 #include <random>
 #include <vector>
-using namespace forge::lane;
+using namespace forge::simd;
 
 static void ref(const float* A, const float* B, double* C, std::size_t m, std::size_t n, std::size_t k) {
     for (std::size_t i = 0; i < m; ++i) for (std::size_t j = 0; j < n; ++j) { double s = 0; for (std::size_t p = 0; p < k; ++p) s += double(A[i*k+p]) * B[j*k+p]; C[i*n+j] = s; } }

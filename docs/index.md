@@ -16,22 +16,22 @@ Every guide follows the same shape: **concepts**, **API or command reference**, 
 
 ## Library layers, bottom up
 9. [os.md](os.md): `forge::os`, the portability layer and its 16 extension modules
-10. [lane.md](lane.md): CPU feature detection and SIMD kernel dispatch
-11. [grid.md](grid.md): devices, graphs, parallel primitives, GPU backends
-12. [flow.md](flow.md): graph IR, passes, plans, codecs, autodiff, RPC devices
-13. [pack.md](pack.md): the `.fpk` container, signing, encryption, importing
+10. [simd.md](simd.md): CPU feature detection and SIMD kernel dispatch
+11. [gpu.md](gpu.md): devices, graphs, parallel primitives, GPU backends
+12. [graph.md](graph.md): graph IR, passes, plans, codecs, autodiff, RPC devices
+13. [modelfile.md](modelfile.md): the `.fpk` container, signing, encryption, importing
 14. [format.md](format.md): `.fpk` byte layout
-15. [mind.md](mind.md): models, sessions, samplers, generation
+15. [inference.md](inference.md): models, sessions, samplers, generation
 
 ## Serving and embedding
 16. [serve.md](serve.md): `forge-serve` HTTP server
-17. [balance.md](balance.md): load-balancing pool and `forge-serve proxy`
+17. [loadbalancer.md](loadbalancer.md): load-balancing pool and `forge-serve proxy`
 18. [capi.md](capi.md): the stable C ABI (`forge.h`)
 19. [bindings.md](bindings.md): Python, Kotlin and Swift
 
 ## Reference and project
 20. [reference.md](reference.md): op table, GPU kernel list and C ABI, **generated** by `tools/gen_docs.py` (do not edit by hand)
-21. [../spec/README.md](../spec/README.md): op specs and code generators
+21. [../ops/README.md](../ops/README.md): op specs and code generators
 22. [STATUS.md](STATUS.md): what has been tested where
 23. [RELEASING.md](RELEASING.md): release procedure
 24. [../CONTRIBUTING.md](../CONTRIBUTING.md): how to change code and docs
@@ -46,11 +46,11 @@ Each file in `docs/examples/` is built and run by ctest as `doc_example_<name>`,
 
 | Example | Guide |
 |---------|-------|
-| `lane_dispatch.cpp` | lane.md |
-| `grid_graph.cpp` | grid.md |
-| `flow_graph.cpp` | flow.md |
-| `pack_roundtrip.cpp` | pack.md |
-| `mind_generate.cpp` | mind.md |
+| `simd_dispatch.cpp` | simd.md |
+| `gpu_graph.cpp` | gpu.md |
+| `graph_build.cpp` | graph.md |
+| `modelfile_roundtrip.cpp` | modelfile.md |
+| `inference_generate.cpp` | inference.md |
 | `os_features.cpp` | os.md |
-| `balance_pool.cpp` | balance.md |
+| `loadbalancer_pool.cpp` | loadbalancer.md |
 | `capi_generate.c` | capi.md |

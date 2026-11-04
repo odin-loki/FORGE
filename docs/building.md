@@ -3,7 +3,7 @@
 ## Requirements
 - CMake **3.25+** and Ninja (the presets use the Ninja generator; `ios` uses Xcode).
 - A **C++23** compiler (the build sets `CMAKE_CXX_STANDARD 23`) and a C compiler. Tested with g++ and with clang (including `zig c++`).
-- **Python 3** (required at configure time: it runs the code generators in `spec/gen/`).
+- **Python 3** (required at configure time: it runs the code generators in `ops/gen/`).
 - Optional, each enabling more at configure time:
   - `glslangValidator` + Vulkan headers (`vulkan/vulkan.h`): builds and embeds the SPIR-V kernels and enables the Vulkan backend. `spirv-val` additionally validates them.
   - `clang` (named `clang`, `clang-18/19/20`) and `ld.lld` (or the `ziglang` Python package for its lld): builds the embedded CUDA PTX and HIP code objects. Without it the CUDA/HIP runtimes have no kernels.
@@ -34,26 +34,27 @@ Other host presets: `release` (`build/release`) and `asan` (`build/asan`, Debug 
 | `FORGE_LIBFUZZER` | OFF | Link fuzz targets with libFuzzer instead of the built-in driver |
 | `FORGE_FUZZ_ITERS` | 4000 | Mutated inputs per fuzz target under ctest |
 | `FORGE_HIP_ARCHS` | `gfx90a gfx942 gfx1100` | AMDGPU targets embedded for HIP |
+| `FORGE_LOG_MIN_LEVEL` | `none` | Compile-time log strip: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, `off` or `none`. Adds `FORGE_LOG_MIN_LEVEL=<0..6>` to every target linking `forge_core`, so log calls below that level compile to nothing (see [support.md](support.md)). Any other value is a configure error. With it set, `test_log` reports skipped |
 
 ## Targets
-Most layers are header-only INTERFACE libraries: `forge_core`, `forge_os`, `forge_spec`, `forge_lane`, `forge_verify`, `forge_grid`, `forge_flow`, `forge_pack`, `forge_mind`, `forge_balance`. Compiled targets:
+Most layers are header-only INTERFACE libraries: `forge_core`, `forge_os`, `forge_ops`, `forge_simd`, `forge_verify`, `forge_gpu`, `forge_graph`, `forge_modelfile`, `forge_inference`, `forge_loadbalancer`. Compiled targets:
 
 | Target | Output |
 |--------|--------|
-| `forge_lane_mv` | Static library with every compiled kernel variant (link this whenever you use lane, grid, flow or mind) |
+| `forge_simd_mv` | Static library with every compiled kernel variant (link this whenever you use simd, gpu, graph or inference) |
 | `forge_trust` | Static library: vendored Monocypher |
 | `forge_video` | Static library: video decode support |
-| `forge_metal` | Static library, Apple only (`grid/src/metal.mm`) |
+| `forge_metal` | Static library, Apple only (`gpu/src/metal.mm`) |
 | `forge_c` | `libforge.so`, soname `libforge.so.1`, version `0.1.0`: the C ABI |
 | `forge_jni` | `libforge_jni.so` (with `FORGE_JNI=ON`) |
 | `forge`, `forge-serve` | The apps |
 
-Generated files go to `build/<preset>/generated/`: the op table (`forge/spec/ops.gen.hpp`, `ops.md`), x86 intrinsic wrappers (`forge/lane/raw/x86.gen.hpp`) and GPU kernels (`gpu/*.comp`, `kernels.cu`, `kernels.cl`, `kernels.metal`, and embedded SPIR-V).
+Generated files go to `build/<preset>/generated/`: the op table (`forge/ops/ops.gen.hpp`, `ops.md`), x86 intrinsic wrappers (`forge/simd/raw/x86.gen.hpp`) and GPU kernels (`gpu/*.comp`, `kernels.cu`, `kernels.cl`, `kernels.metal`, and embedded SPIR-V).
 
 ## Installing and packaging
-`cmake --install build/release --prefix /opt/forge` installs `libforge`, `forge_lane_mv`, `forge_trust`, the apps, the licence files and headers. CPack (`cd build/release && cpack`, or `tools/release.py build`) produces binary and source archives: TGZ (plus DEB on Linux), or ZIP on Windows.
+`cmake --install build/release --prefix /opt/forge` installs `libforge`, `forge_simd_mv`, `forge_trust`, the apps, the licence files and headers. CPack (`cd build/release && cpack`, or `tools/release.py build`) produces binary and source archives: TGZ (plus DEB on Linux), or ZIP on Windows.
 
-**Known gap:** the install rule copies headers from `core`, `lane`, `spec`, `grid`, `flow`, `pack`, `mind`, `support` and `verify`, but not from `os/include` or `balance/include`, and not the generated headers. Since `core` includes `<forge/os/os.hpp>`, an installed tree is not yet usable for compiling against the C++ headers; build against the source tree (or use the C ABI) for now. Installed binaries also look for import templates in the source tree unless `FORGE_TEMPLATES` is set.
+**Known gap:** the install rule copies headers from `core`, `simd`, `ops`, `gpu`, `graph`, `modelfile`, `inference`, `support` and `verify`, but not from `os/include` or `loadbalancer/include`, and not the generated headers. Since `core` includes `<forge/os/os.hpp>`, an installed tree is not yet usable for compiling against the C++ headers; build against the source tree (or use the C ABI) for now. Installed binaries also look for import templates in the source tree unless `FORGE_TEMPLATES` is set.
 
 ## Presets
 
@@ -84,8 +85,8 @@ ANDROID_HOME=/path/to/sdk tests/android_emulator.sh native build/android-x64
 - A software (TCG) emulator that boots on a shared machine: `emulator -avd <name> -no-window -no-audio -no-snapshot -gpu swiftshader_indirect -memory 2048 -cores 2 -accel off` (about 6 minutes to boot).
 
 ## qemu and cross-link checks
-- `cmake/toolchains/aarch64-sve-qemu.cmake` and `riscv64-rvv-qemu.cmake` cross-build and run ctest under qemu-user; extra `lane_<sve|rvv>_vl<N>` tests run the lane suite at several vector lengths and check that the scalable lane is active; `tile_sme_svl<N>` does the same for SME when the compiler supports it.
-- With zig available, the `xos_*` tests (labels `cross;slow`) compile and link `test_os`, `test_balance` and `test_os_ext` for x86_64-freebsd, aarch64-macos, x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl. They are link checks only.
+- `cmake/toolchains/aarch64-sve-qemu.cmake` and `riscv64-rvv-qemu.cmake` cross-build and run ctest under qemu-user; extra `lane_<sve|rvv>_vl<N>` tests run the simd suite at several vector lengths and check that the scalable lane is active; `tile_sme_svl<N>` does the same for SME when the compiler supports it.
+- With zig available, the `xos_*` tests (labels `cross;slow`) compile and link `test_os`, `test_loadbalancer` and `test_os_ext` for x86_64-freebsd, aarch64-macos, x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl. They are link checks only.
 - With Intel SDE installed, `tile_amx_sde_*` tests run the AMX tile kernels under emulation (label `emu`).
 
 ## Apple

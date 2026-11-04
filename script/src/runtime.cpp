@@ -268,6 +268,11 @@ void Interp::step() {
         if (cpu_deadline_ns && os::thread_cpu_time_ns() > cpu_deadline_ns) { cpu_deadline_ns = 0; raise("LimitExceededError", "CPU time limit reached"); }
     }
 }
+void Interp::charge_process(const std::string& what) {
+    if (!proc_quota) return;
+    if (const Quota* full = Quota::acquire(proc_quota))
+        raise("LimitExceededError", "child-process limit of " + std::to_string(full->max) + " reached (not starting " + what + ")");
+}
 
 // ---------------------------------------------------------------- variables
 Value Interp::load(const VarRef& v, const Ref<Env>& env) {
@@ -895,6 +900,7 @@ Value Interp::shell(const Node& n, const std::vector<Value>& parts) {
     std::string exe = shell_exe(*be);
     if (exe.empty()) raise("ShellError", kind + " is not installed (looked for " + [&] { std::string l; for (auto& e : be->exes) l += (l.empty() ? "'" : ", '") + e + "'"; return l; }() + " on PATH)");
     std::vector<std::string> argv = be->argv(exe, script);
+    charge_process(kind);
     os::spawn_spec sp; sp.argv = argv; sp.max_output = sh->limits.max_output;
     sp.limits.memory_bytes = child_mem; sp.limits.cpu_seconds = child_cpu_s;
     sp.timeout_ms = child_timeout_ms;
@@ -976,14 +982,16 @@ Value Interp::spawn(const Value& f, std::vector<Value> args) {
     auto st = t->st; auto shared = sh;
     Heap::instance().active_tasks.fetch_add(1);
     Caps c = caps; auto cm = child_mem, cc = child_cpu_s, ct = child_timeout_ms; auto dl = deadline_ns; std::string fl = file;
+    auto hq = handle_quota, pq = proc_quota;
     struct Payload { Value g, f; std::vector<Value> a; };
     auto pl = std::make_shared<Payload>(Payload{std::move(g), std::move(fc), std::move(ac)});
-    t->th = std::thread([st, shared, pl, c, cm, cc, ct, dl, fl]() mutable {
+    t->th = std::thread([st, shared, pl, c, cm, cc, ct, dl, fl, hq, pq]() mutable {
         {
             debug::thread_started();
             debug::adopt(pl->g); debug::adopt(pl->f); for (auto& x : pl->a) debug::adopt(x);
             Interp child(shared, as_ref<Globals>(pl->g));
             child.task = st; child.caps = c; child.child_mem = cm; child.child_cpu_s = cc; child.child_timeout_ms = ct; child.deadline_ns = dl; child.file = fl;
+            child.handle_quota = std::move(hq); child.proc_quota = std::move(pq);
             Value result; bool failed = false; std::string et, em;
             try { result = child.call(pl->f, pl->a); }
             catch (...) {
@@ -1077,6 +1085,8 @@ Value Interp::import_module(const std::string& path) {
     catch (const syntax_error& e) { std::lock_guard g(sh->mod_m); sh->modules.erase(key); raise("SyntaxError", e.what()); }
     auto g = make<Globals>();
     Interp sub(sh, g); sub.caps = caps; sub.depth = depth; sub.task = task; sub.deadline_ns = deadline_ns;
+    sub.cpu_deadline_ns = cpu_deadline_ns; sub.child_mem = child_mem; sub.child_cpu_s = child_cpu_s; sub.child_timeout_ms = child_timeout_ms;
+    sub.handle_quota = handle_quota; sub.proc_quota = proc_quota;
     try { sub.run_top(top, sh->use_vm); }
     catch (...) { std::lock_guard lk(sh->mod_m); sh->modules.erase(key); throw; }
     { std::lock_guard lk(sh->mod_m); sh->modules[key] = g; sh->keep.push_back(top); }

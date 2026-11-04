@@ -48,5 +48,5 @@ hp=$(sed -n 's/^Python3_EXECUTABLE:[A-Z]*=//p' "$b/CMakeCache.txt")
 [ -z "$hp" ] || ssh_ "echo | su root -c 'mkdir -p $(dirname "$hp") && ln -sf /usr/local/bin/python3 $hp'"
 tar cf - -C "$b" --exclude='*.o' --exclude='*.a' . | ssh_ "tar xf - -C '$b'"
 # FreeBSD packages no python safetensors/onnx (pip would build them from Rust/C++ source under TCG), so the
-# tests that need them (and doc_example_mind_generate, which uses golden_tiny_llama's model) run on linux-* only.
-ssh_ "cd '$b' && env CTEST_OUTPUT_ON_FAILURE=1 FORGE_THREADS=2 ctest -LE 'slow|emu|gpu' -E '^(golden_tiny_llama|golden_moe_mla|pack_signing|onnx_import|doc_example_mind_generate)\$' -j2 --timeout 1200 --output-on-failure"
+# tests that need them (and doc_example_inference_generate, which uses golden_tiny_llama's model) run on linux-* only.
+ssh_ "cd '$b' && env CTEST_OUTPUT_ON_FAILURE=1 FORGE_THREADS=2 ctest -LE 'slow|emu|gpu' -E '^(golden_tiny_llama|golden_moe_mla|modelfile_signing|onnx_import|doc_example_inference_generate)\$' -j2 --timeout 1200 --output-on-failure"

@@ -161,7 +161,7 @@ private:
         if (s.cfg.minidump) if (auto& d = detail::dbghelp::get(); d.MiniDumpWriteDump) {
             HANDLE f = CreateFileA(s.dump, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
             if (f != INVALID_HANDLE_VALUE) {
-                // MINIDUMP_EXCEPTION_INFORMATION is declared under #pragma pack(4) in dbghelp.h: the pointer sits at
+                // MINIDUMP_EXCEPTION_INFORMATION is declared under #pragma modelfile(4) in dbghelp.h: the pointer sits at
                 // offset 4, not 8. A naturally aligned copy makes MiniDumpWriteDump fail and leaves an empty .dmp.
 #pragma pack(push, 4)
                 struct mei_t { DWORD ThreadId; EXCEPTION_POINTERS* ExceptionPointers; BOOL ClientPointers; };

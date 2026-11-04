@@ -56,7 +56,20 @@ struct options {
     // returns true to run it; null = AI code never runs (unless the script passes its own confirm callback).
     std::function<std::string(const std::string& system, const std::string& prompt)> ai;
     std::function<bool(const std::string& code)> confirm;
+    // In-process model for the AI commands when `ai` is null: a .fpk path (empty = $FORGE_ASK_MODEL). Used only if
+    // the host registered set_local_ai() (the forge CLI does); otherwise FORGE_AI_ENDPOINT is used. ask_max_tokens
+    // caps each reply (0 = $FORGE_ASK_MAX_TOKENS, else 256).
+    std::string ask_model;
+    int ask_max_tokens = 0;
 };
+
+// In-process inference for forge::ask / forge::ask_json / ... (docs/scripting.md "AI-assisted commands").
+// forge_script does not link the inference module; a host that does registers a generator once, e.g. with
+// forge/script/local_ai.hpp's install_local_ai(). json = constrain the reply to JSON (ask_json).
+struct local_ai_request { std::string model, system, prompt; bool json = false; int max_tokens = 256; };
+using local_ai_fn = std::function<std::string(const local_ai_request&)>;
+void set_local_ai(local_ai_fn fn);   // process-wide; null clears
+bool has_local_ai();
 
 struct result {
     bool ok = true;

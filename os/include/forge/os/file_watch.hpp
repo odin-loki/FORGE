@@ -1,7 +1,7 @@
 #pragma once
 // File watching: inotify (Linux/Android), kqueue EVFILT_VNODE (macOS/iOS/FreeBSD), ReadDirectoryChangesW (Windows).
 // Watching a file watches its directory and filters by name, so atomic replace-by-rename (editors, os::rename,
-// forge pack writers) is seen as a modification of that file.  FSEvents is not used on macOS: it needs a
+// forge modelfile writers) is seen as a modification of that file.  FSEvents is not used on macOS: it needs a
 // CFRunLoop/dispatch queue per stream and is coalesced/latent; kqueue gives immediate per-file events.
 #include <forge/os/detail.hpp>
 #if defined(__linux__)

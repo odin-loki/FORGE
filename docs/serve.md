@@ -1,9 +1,9 @@
 # serve: the forge-serve HTTP server
 
 ## Concepts
-`forge-serve` serves one model over HTTP with an OpenAI-compatible API. Requests share a continuous-batching scheduler (`mind/batch.hpp`), which also reuses KV-cache entries for prompts with a shared prefix.
+`forge-serve` serves one model over HTTP with an OpenAI-compatible API. Requests share a continuous-batching scheduler (`inference/batch.hpp`), which also reuses KV-cache entries for prompts with a shared prefix.
 
-The same binary also runs as a load-balancing proxy in front of several servers (`forge-serve proxy`, see [balance.md](balance.md)).
+The same binary also runs as a load-balancing proxy in front of several servers (`forge-serve proxy`, see [loadbalancer.md](loadbalancer.md)).
 
 If you pass a Hugging Face directory or a `.gguf` file, it is imported into a temporary `.fpk` first. `--codec` picks the weight codec for that import.
 
@@ -14,13 +14,13 @@ Defaults are taken from `apps/forge_serve.cpp`:
 
 ```
 forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx 0] [--codec f32]
-            [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0]
-forge-serve proxy ...                      # see balance.md
+            [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0] [--kv-spill]
+forge-serve proxy ...                      # see loadbalancer.md
 ```
 
 `--ctx 0` means use the model's maximum context.
 
-`--mem-limit` sets the host memory budget (overrides `FORGE_MEM_LIMIT`; by default 85% of RAM or the cgroup limit). Under it the scheduler reports live KV bytes, evicts cached prefixes, and keeps new requests queued while the budget is over its soft watermark, so a tight limit runs requests one at a time instead of OOM-ing. `--max-queue N` (default 0, no cap) answers `503` with `Retry-After: 1` once N requests are waiting. An out-of-memory error while handling a request also returns 503. See [memory.md](memory.md).
+`--mem-limit` sets the host memory budget (overrides `FORGE_MEM_LIMIT`; by default 85% of RAM or the cgroup limit). Under it the scheduler reports live KV bytes, evicts cached prefixes, and keeps new requests queued while the budget is over its soft watermark, so a tight limit runs requests one at a time instead of OOM-ing. `--max-queue N` (default 0, no cap) answers `503` with `Retry-After: 1` once N requests are waiting. An out-of-memory error while handling a request also returns 503. `--kv-spill` writes cached prefixes evicted from memory to the spill directory (`FORGE_MEM_SPILL_DIR`, capped by `FORGE_MEM_SPILL_MAX`) and reads them back when a new prompt shares the prefix, instead of recomputing it. See [memory.md](memory.md).
 
 ### Endpoints
 

@@ -6,8 +6,8 @@ FORGE has no config file. Programs take command-line flags ([cli.md](cli.md), [s
 
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `FORGE_DEVICE` | `mind::model` (so `forge run`, `forge-serve`, C ABI, bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to CPU |
-| `FORGE_LANE_TARGET` | lane | Force a kernel table: `scalar`, `avx2`, `avx512` (x86), `neon`, `sve` (aarch64), `rvv` (riscv64). Ignored if not usable on this CPU |
+| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge-serve`, C ABI, bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to CPU |
+| `FORGE_SIMD_TARGET` | simd | Force a kernel table: `scalar`, `avx2`, `avx512` (x86), `neon`, `sve` (aarch64), `rvv` (riscv64). Ignored if not usable on this CPU (old name `FORGE_LANE_TARGET` still works) |
 | `FORGE_THREADS` | task pool | Worker thread count (default: hardware concurrency) |
 | `FORGE_LOG` | logging | Threshold by first letter: `trace`, `debug`, `info`, `warn` (default), `error` |
 | `FORGE_HUGEPAGES=1` | memory-mapped files | Request huge pages (`madvise`) for mappings of 2 MiB or more |
@@ -16,7 +16,7 @@ FORGE has no config file. Programs take command-line flags ([cli.md](cli.md), [s
 | `FORGE_GPU_NO_RESIDENCY` | Vulkan lowerings | If set, tensors are not kept resident on the device between ops |
 | `FORGE_GPU_REPLAY` | CUDA/HIP lowerings | If set, enables experimental whole-run decode replay (relaunches recorded device work without the executor) |
 | `FORGE_REPLAY_VERIFY` | CUDA/HIP lowerings | With `FORGE_GPU_REPLAY`, run one real (verifying) run every N runs (default 32) |
-| `FORGE_SVE_KEEP_VL=1` | lane (aarch64) | Do not change the SVE vector length at start-up |
+| `FORGE_SVE_KEEP_VL=1` | simd (aarch64) | Do not change the SVE vector length at start-up |
 
 ## Memory
 

@@ -1,6 +1,6 @@
 #pragma once
 // The oracle: every lowering is differential-tested against the spec's scalar reference.
-#include <forge/spec/ops.gen.hpp>
+#include <forge/ops/ops.gen.hpp>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -24,7 +24,7 @@ struct compare_result {
     std::string message;
 };
 
-inline compare_result compare(const tensor& got, const tensor& ref, spec::tolerance tol) {
+inline compare_result compare(const tensor& got, const tensor& ref, ops::tolerance tol) {
     compare_result r;
     if (got.shape != ref.shape) { r.ok = false; r.message = "shape " + shape_str(got.shape) + " vs " + shape_str(ref.shape); return r; }
     for (std::size_t i = 0; i < ref.size(); ++i) {
@@ -35,10 +35,10 @@ inline compare_result compare(const tensor& got, const tensor& ref, spec::tolera
         auto u = ulp_distance(g, e);
         bool pass = true;
         switch (tol.kind) {
-            case spec::tol_kind::exact: pass = u == 0; break;
-            case spec::tol_kind::ulp: pass = u <= std::int64_t(tol.value); break;
-            case spec::tol_kind::rel: pass = re <= tol.value || ae <= tol.value; break;  // abs floor near 0
-            case spec::tol_kind::abs: pass = ae <= tol.value; break;
+            case ops::tol_kind::exact: pass = u == 0; break;
+            case ops::tol_kind::ulp: pass = u <= std::int64_t(tol.value); break;
+            case ops::tol_kind::rel: pass = re <= tol.value || ae <= tol.value; break;  // abs floor near 0
+            case ops::tol_kind::abs: pass = ae <= tol.value; break;
         }
         if (ae > r.max_abs) { r.max_abs = ae; if (!pass) r.worst = i; }
         r.max_rel = std::max(r.max_rel, re); r.max_ulp = std::max(r.max_ulp, u);
@@ -68,16 +68,16 @@ inline std::pair<float, float> domain(std::string_view op) {
 }
 
 // Build a valid random input set (shapes + attrs) for any spec op.
-struct case_t { std::vector<tensor> in; spec::attrs a; };
-inline case_t make_case(spec::op o, std::mt19937& rng, i64 n = 37) {
-    const auto& inf = spec::info(o);
+struct case_t { std::vector<tensor> in; ops::attrs a; };
+inline case_t make_case(ops::op o, std::mt19937& rng, i64 n = 37) {
+    const auto& inf = ops::info(o);
     auto [lo, hi] = domain(inf.name);
     case_t c;
     auto rt = [&](shape_t s) { return random_tensor(std::move(s), rng, lo, hi); };
     std::string_view nm = inf.name;
     switch (inf.shape) {
-    case spec::shape_rule::same:
-    case spec::shape_rule::broadcast:
+    case ops::shape_rule::same:
+    case ops::shape_rule::broadcast:
         if (nm == "rms_norm") { c.in = {rt({3, n}), rt({n})}; c.a.set("eps", 1e-5); }
         else if (nm == "layer_norm") { c.in = {rt({3, n}), rt({n}), rt({n})}; c.a.set("eps", 1e-5); }
         else if (nm == "rope") {
@@ -92,19 +92,19 @@ inline case_t make_case(spec::op o, std::mt19937& rng, i64 n = 37) {
             if (nm == "moe_gate") { c.in = {rt({5, 8})}; c.a.set("k", 2.0); c.a.set("norm", 1.0); }
         }
         break;
-    case spec::shape_rule::reduce: c.in = {rt({4, n})}; c.a.set("axis", -1.0); break;
-    case spec::shape_rule::matmul: c.in = {rt({2, 5, n}), rt({n, 11})}; break;
-    case spec::shape_rule::matmul_t: c.in = {rt({2, 5, n}), rt({11, n})}; break;
-    case spec::shape_rule::attention:
+    case ops::shape_rule::reduce: c.in = {rt({4, n})}; c.a.set("axis", -1.0); break;
+    case ops::shape_rule::matmul: c.in = {rt({2, 5, n}), rt({n, 11})}; break;
+    case ops::shape_rule::matmul_t: c.in = {rt({2, 5, n}), rt({11, n})}; break;
+    case ops::shape_rule::attention:
         c.in = {rt({3, 4, 16}), rt({7, 2, 16}), rt({7, 2, 12})}; c.a.set("causal", 1.0); break;
-    case spec::shape_rule::transpose: c.in = {rt({3, 4, 5})}; c.a.set("perm", std::vector<i64>{2, 0, 1}); break;
-    case spec::shape_rule::reshape: c.in = {rt({3, 4, 5})}; c.a.set("shape", std::vector<i64>{-1, 10}); break;
-    case spec::shape_rule::gather: {
+    case ops::shape_rule::transpose: c.in = {rt({3, 4, 5})}; c.a.set("perm", std::vector<i64>{2, 0, 1}); break;
+    case ops::shape_rule::reshape: c.in = {rt({3, 4, 5})}; c.a.set("shape", std::vector<i64>{-1, 10}); break;
+    case ops::shape_rule::gather: {
         tensor idx({2, 3}); for (std::size_t i = 0; i < 6; ++i) idx.data[i] = float(rng() % 9);
         c.in = {rt({9, n}), idx}; break; }
-    case spec::shape_rule::concat: c.in = {rt({3, 4}), rt({3, 6})}; c.a.set("axis", 1.0); break;
-    case spec::shape_rule::expand: c.in = {rt({3, 1, 5})}; c.a.set("axis", 1.0); c.a.set("n", 4.0); break;
-    case spec::shape_rule::slice: c.in = {rt({6, 5})}; c.a.set("axis", 0.0); c.a.set("start", 1.0); c.a.set("end", 4.0); break;
+    case ops::shape_rule::concat: c.in = {rt({3, 4}), rt({3, 6})}; c.a.set("axis", 1.0); break;
+    case ops::shape_rule::expand: c.in = {rt({3, 1, 5})}; c.a.set("axis", 1.0); c.a.set("n", 4.0); break;
+    case ops::shape_rule::slice: c.in = {rt({6, 5})}; c.a.set("axis", 0.0); c.a.set("start", 1.0); c.a.set("end", 4.0); break;
     }
     return c;
 }

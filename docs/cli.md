@@ -7,7 +7,7 @@ Options are `--name value`, `--name=value`, or a single-letter `-x value`. Unkno
 ## Commands
 
 ### `forge info`
-Prints the CPU name and feature flags, the lane kernel table in use, and for each grid backend (cpu, cuda, hip, level_zero, vulkan, metal) whether its runtime was found. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
+Prints the CPU name and feature flags, the simd kernel table in use, and for each gpu backend (cpu, cuda, hip, level_zero, vulkan, metal) whether its runtime was found. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
 ### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME]`
 Converts a model to `.fpk`.
@@ -56,7 +56,14 @@ Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or 
 Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file. Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
 
 ### `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu] [auth/TLS/script flags]`
-Exposes a local device to other processes as a remote `rpc:host:port` device (see [flow.md](flow.md)), and optionally runs remote scripts. Auth: `--token`, `--token-file`, `--authorized-keys`, `--pubkey`; TLS: `--tls-cert`, `--tls-key`; scripts: `--allow-scripts`, `--script-timeout`, `--script-no-proc|fs|net`. Without auth it is open to anyone who can reach it. See [rpc.md](rpc.md).
+Exposes a local device to other processes as a remote `rpc:host:port` device (see [graph.md](graph.md)), and optionally runs remote scripts. Auth: `--token`, `--token-file`, `--authorized-keys`, `--pubkey`; TLS: `--tls-cert`, `--tls-key`; scripts: `--allow-scripts`, `--script-timeout`, `--script-mem-mb`, `--script-no-proc|fs|net`. Without auth it is open to anyone who can reach it. See [rpc.md](rpc.md).
+
+| Option | Meaning |
+|--------|---------|
+| `--tls-client-ca CA.pem` | Require a client certificate signed by this CA (mTLS); needs `--tls-cert`/`--tls-key` |
+| `--authorized-keys FILE` | One key per line: `[allow=device,scripts] <64-hex key> [comment]`; a line without `allow=` has full access ([rpc.md](rpc.md#authorized_keys-and-per-key-permissions)) |
+
+Over TLS, token and key authentication are bound to the TLS connection (RFC 9266 `tls-exporter`). Clients (`rpc:host:port` devices, `forge::remote`) take their settings from `FORGE_RPC_*` environment variables; the client certificate for mTLS is `FORGE_RPC_TLS_CERT` + `FORGE_RPC_TLS_KEY`.
 
 ## Strict loading
 `FORGE_REQUIRE_SIGNED=1` refuses unsigned models; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` only accepts signatures from those public keys.
@@ -89,6 +96,8 @@ forge script                          # interactive REPL (:help, :type, :dis, :m
   --debug         race detector + lock-order / stall deadlock detection
   --timeout MS    wall-clock limit      --max-steps N   instruction budget
   --heap BYTES    managed heap cap      --no-proc / --no-fs / --no-net   capability sandbox
+  --ask-model M.fpk  run forge::ask & co on this model in-process (default $FORGE_ASK_MODEL)
+  --ask-max-tokens N reply cap for those calls (default $FORGE_ASK_MAX_TOKENS or 256)
 ```
 
 Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md).

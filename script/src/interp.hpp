@@ -34,6 +34,7 @@ struct Shared {
     std::function<void(std::string_view)> out = [](std::string_view s) { std::fwrite(s.data(), 1, s.size(), stdout); };
     std::function<bool(const std::string&)> confirm;           // y/N prompt for ai.run; null = never confirm
     std::function<std::string(const std::string&, const std::string&)> ai;   // (system, prompt) -> completion
+    std::string ask_model; int ask_max_tokens = 0;             // in-process model for the AI commands (ai.cpp)
     std::atomic<bool> interrupt{false};
     std::atomic<std::uint64_t> steps{0};
     std::uint64_t start_ns = 0;
@@ -65,6 +66,8 @@ struct Interp {
     std::uint64_t child_mem = 0, child_cpu_s = 0, child_timeout_ms = 0;   // applied to spawned processes
     std::uint64_t deadline_ns = 0;                             // limit({timeout}) / Limits::timeout_ms
     std::uint64_t cpu_deadline_ns = 0;                         // limit({cpu_s}): this thread's CPU time (os::thread_cpu_time_ns)
+    std::shared_ptr<Quota> handle_quota, proc_quota;           // limit({handles}) / limit({procs}); shared with tasks started inside
+    void charge_process(const std::string& what);              // count one child process against limit({procs})
 
     explicit Interp(std::shared_ptr<Shared> s, Ref<Globals> g = {}) : sh(std::move(s)), globals(g ? std::move(g) : make<Globals>()), caps(sh->caps) {}
 

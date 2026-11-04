@@ -1,10 +1,10 @@
 #include "check.hpp"
-#include <forge/mind/diffusion.hpp>
-#include <forge/mind/streaming.hpp>
+#include <forge/inference/diffusion.hpp>
+#include <forge/inference/streaming.hpp>
 #include <cmath>
 #include <numeric>
 
-using namespace forge::mind;
+using namespace forge::inference;
 
 // Oracle denoiser for data concentrated at mu_c (cond) / mu_u (uncond): the exact epsilon is (x - sqrt(ab) mu)/sqrt(1-ab).
 static diffusion::denoiser oracle(const diffusion::noise_scheduler& s, float mu_c, float mu_u, diffusion::prediction p) {

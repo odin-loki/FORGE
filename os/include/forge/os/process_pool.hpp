@@ -249,6 +249,25 @@ public:
     }
     std::size_t pending() const { std::lock_guard l(m_); return q_.size(); }
     void wait_all() { std::unique_lock l(m_); idle_cv_.wait(l, [&] { return outstanding_ == 0; }); }
+    // true if every queued and running task finished within `ms`
+    bool wait_all_for(std::uint64_t ms) {
+        std::unique_lock l(m_); return idle_cv_.wait_for(l, std::chrono::milliseconds(ms), [&] { return outstanding_ == 0; });
+    }
+
+    // Abrupt: queued tasks fail with os_errc::cancelled, every worker process is killed (its running task fails
+    // the same way) and reaped. For callers whose deadline has passed; shutdown() would wait for the tasks.
+    void terminate() {
+        std::deque<job> dropped;
+        {
+            std::lock_guard l(m_);
+            stop_ = killing_ = true; dropped.swap(q_);
+            for (auto& s : slots_) kill_worker(*s);
+        }
+        cv_.notify_all();
+        for (auto& j : dropped) { j.pr->set_exception(std::make_exception_ptr(cancelled_error())); finish_one(); }
+        for (auto& s : slots_) if (s->th.joinable()) s->th.join();
+        slots_.clear();
+    }
 
     // Graceful: finishes queued tasks, then sends quit to every worker and reaps it. Idempotent.
     void shutdown() {
@@ -270,7 +289,32 @@ private:
         pid_t pid = -1;
 #endif
     };
-    struct slot { std::thread th; };
+    struct slot {
+        std::thread th;
+#if defined(FORGE_OS_WINDOWS)
+        HANDLE proc = nullptr;   // the slot's live worker, published under m_ for terminate()
+#else
+        pid_t pid = -1;
+#endif
+    };
+    static os_exception cancelled_error() { return os_exception(os_errc::cancelled, 0, "process_pool: terminated"); }
+    static void kill_worker(slot& s) {
+#if defined(FORGE_OS_WINDOWS)
+        if (s.proc) TerminateProcess(s.proc, 1);
+#else
+        if (s.pid > 0) ::kill(s.pid, SIGKILL);
+#endif
+    }
+    // Publish / withdraw the slot's worker (before it is reaped, so terminate() never signals a reused pid).
+    void publish(slot& s, const worker* w) {
+        std::lock_guard l(m_);
+#if defined(FORGE_OS_WINDOWS)
+        s.proc = w ? w->proc : nullptr;
+#else
+        s.pid = w ? w->pid : -1;
+#endif
+        if (w && killing_) kill_worker(s);
+    }
 
     static sandbox_policy parse_sb(const char* s) {
         sandbox_policy p; for (; *s; ++s) { if (*s == 'n') p.deny_network = true; if (*s == 'x') p.deny_exec = true; if (*s == 'w') p.deny_fs_write = true; } return p;
@@ -294,7 +338,7 @@ private:
         STARTUPINFOW si{}; si.cb = sizeof si; si.dwFlags = STARTF_USESTDHANDLES;
         si.hStdInput = c_in_r; si.hStdOutput = c_out_w; si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
         PROCESS_INFORMATION pi{};
-        BOOL ok = CreateProcessW(nullptr, wc.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+        BOOL ok = create_process_std_only(nullptr, wc.data(), CREATE_NO_WINDOW, nullptr, nullptr, si, pi);
         CloseHandle(c_in_r); CloseHandle(c_out_w);
         if (!ok) { err = last_error("CreateProcess " + opt_.exe).what; CloseHandle(c_in_w); CloseHandle(c_out_r); return std::nullopt; }
         CloseHandle(pi.hThread);
@@ -355,7 +399,7 @@ private:
 
     void finish_one() { std::lock_guard l(m_); if (--outstanding_ == 0) idle_cv_.notify_all(); }
 
-    void dispatch(slot*) {
+    void dispatch(slot* s) {
 #if !defined(FORGE_OS_WINDOWS)
         { sigset_t ss; sigemptyset(&ss); sigaddset(&ss, SIGPIPE); ::pthread_sigmask(SIG_BLOCK, &ss, nullptr); }   // dead worker -> EPIPE, not a parent kill
 #endif
@@ -371,12 +415,15 @@ private:
             if (!w) {
                 std::string err; w = start(err);
                 if (!w) { j.pr->set_exception(std::make_exception_ptr(os_exception(os_errc::other, 0, "process_pool: cannot start worker: " + err))); finish_one(); continue; }
+                publish(*s, &*w);
             }
             bool sent = detail::pp::write_msg(w->to, {detail::pp::msg_task, j.id, j.name, std::move(j.payload)});
             auto r = sent ? detail::pp::read_msg(w->from) : std::nullopt;
             if (!r || r->id != j.id) {   // crash / protocol failure: reap, report, respawn on next task
+                publish(*s, nullptr);
                 auto e = reap(*w); w.reset();
                 if (e.kind == os_errc::ok) e = os_exception(os_errc::broken_pipe, 0, "process_pool: worker closed its pipe mid-task");
+                { std::lock_guard l(m_); if (killing_) e = cancelled_error(); }
                 j.pr->set_exception(std::make_exception_ptr(e));
             } else if (r->type == detail::pp::msg_ok) {
                 j.pr->set_value(std::move(r->payload));
@@ -387,7 +434,7 @@ private:
             }
             finish_one();
         }
-        if (w) { detail::pp::write_msg(w->to, {detail::pp::msg_quit, 0, {}, {}}); (void)reap(*w); }
+        if (w) { publish(*s, nullptr); detail::pp::write_msg(w->to, {detail::pp::msg_quit, 0, {}, {}}); (void)reap(*w); }
     }
 
     options opt_;
@@ -398,7 +445,7 @@ private:
     std::uint64_t next_id_ = 1;
     std::size_t outstanding_ = 0;
     unsigned target_ = 0, live_ = 0;
-    bool stop_ = false;
+    bool stop_ = false, killing_ = false;
 };
 
 } // namespace forge::os

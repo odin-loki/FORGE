@@ -1,12 +1,12 @@
 # C ABI (`forge.h`)
 
 ## Concepts
-`mind/include/forge.h` is a stable C interface to the inference engine. The Python, Kotlin and Swift bindings all build on it, and so can any other language.
+`inference/include/forge.h` is a stable C interface to the inference engine. The Python, Kotlin and Swift bindings all build on it, and so can any other language.
 - All handles are opaque.
 - The ABI is versioned (`FORGE_ABI_VERSION 3`), and each new version only adds to the previous one.
 - Errors are reported through `forge_last_error()`. The message is thread-local and stays valid until the next call on the same thread.
 
-The CMake target `forge_c` builds `libforge.so` (soname `libforge.so.1`) from `mind/capi/forge_c.cpp`.
+The CMake target `forge_c` builds `libforge.so` (soname `libforge.so.1`) from `inference/capi/forge_c.cpp`.
 
 ## API reference
 

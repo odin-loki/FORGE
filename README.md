@@ -2,10 +2,10 @@
 
 FORGE is a C++23 library and toolset for running AI models on CPUs and GPUs. One codebase covers:
 
-- **SIMD kernels** picked at run time for the CPU you are on (`lane`)
-- **GPU compute** behind one API, with backends loaded at run time: CPU, Vulkan, CUDA, HIP, Level Zero, OpenCL and Metal (`grid`)
-- **Inference** from a self-describing model file, `.fpk`, which carries its own computation graph (`flow`, `pack`, `mind`)
-- **Serving**: an OpenAI-compatible HTTP server with a built-in load-balancing proxy (`forge-serve`, `balance`)
+- **SIMD kernels** picked at run time for the CPU you are on (`simd`)
+- **GPU compute** behind one API, with backends loaded at run time: CPU, Vulkan, CUDA, HIP, Level Zero, OpenCL and Metal (`gpu`)
+- **Inference** from a self-describing model file, `.fpk`, which carries its own computation graph (`graph`, `modelfile`, `inference`)
+- **Serving**: an OpenAI-compatible HTTP server with a built-in load-balancing proxy (`forge-serve`, `loadbalancer`)
 - **A portable OS layer** for Linux, Android, Windows, macOS, iOS and FreeBSD (`os`)
 
 Because the model file describes its own graph, adding an architecture means importing a file, not writing engine code. FORGE is a clean-room design, not a fork or wrapper of another project.
@@ -19,7 +19,7 @@ You need CMake 3.25 or newer, Ninja, Python 3 and a C++23 compiler (recent g++ o
 ```sh
 cmake --preset dev                      # configure into build/dev (RelWithDebInfo)
 cmake --build build/dev -j4             # or: ninja -C build/dev -j4
-./build/dev/forge info                  # CPU features, chosen lane target, GPU backends found
+./build/dev/forge info                  # CPU features, chosen simd target, GPU backends found
 (cd build/dev && ctest -j4)             # full test suite; also generates build/dev/golden/tiny_f32.fpk
 ./build/dev/forge run build/dev/golden/tiny_f32.fpk --prompt "Hello" -n 8
 ```
@@ -40,13 +40,13 @@ To run a real model, import it first, or pass a Hugging Face directory, `.gguf` 
 |-------|---------|----------|
 | core | `core/include/forge/core` | Tensors, dtypes (incl. FP4/FP6/FP8, bf16, complex), errors, logging, memory-mapped files |
 | os | `os/include/forge/os` | Files, processes, threads, sockets, polling, IPC, NUMA, huge pages, CPU topology, sandboxing, keystore, service integration, … |
-| spec | `spec/` | One declaration per tensor op (`.fspec`) plus a scalar reference; code generators |
-| lane | `lane/include/forge/lane` | CPU feature detection and kernel tables: scalar, AVX2, AVX-512, NEON, SVE, RVV; AMX/SME tile kernels |
-| grid | `grid/include/forge/grid` | Devices, recorded graphs, parallel primitives, GPU backends loaded with `dlopen` |
-| flow | `flow/include/forge/flow` | Graph IR, optimisation passes, memory planning, weight and KV codecs, autodiff, remote (RPC) devices |
-| pack | `pack/include/forge/pack`, `forge/import` | The `.fpk` container (BLAKE3, Ed25519 signing, XChaCha20-Poly1305 encryption), BPE tokenizer, importers for Hugging Face safetensors, GGUF and ONNX |
-| mind | `mind/include/forge/mind`, `forge.h` | Sessions, samplers, continuous batching, speculative decoding, GBNF grammars, JSON Schema, LoRA, diffusion and streaming sessions, the C ABI |
-| balance | `balance/include/forge/balance` | Load-balancing pool (7 strategies, circuit breakers, retries, backpressure) and L4/L7 proxy |
+| ops | `ops/` | One declaration per tensor op (`.fspec`) plus a scalar reference; code generators |
+| simd | `simd/include/forge/simd` | CPU feature detection and kernel tables: scalar, AVX2, AVX-512, NEON, SVE, RVV; AMX/SME tile kernels |
+| gpu | `gpu/include/forge/gpu` | Devices, recorded graphs, parallel primitives, GPU backends loaded with `dlopen` |
+| graph | `graph/include/forge/graph` | Graph IR, optimisation passes, memory planning, weight and KV codecs, autodiff, remote (RPC) devices |
+| modelfile | `modelfile/include/forge/modelfile`, `forge/import` | The `.fpk` container (BLAKE3, Ed25519 signing, XChaCha20-Poly1305 encryption), BPE tokenizer, importers for Hugging Face safetensors, GGUF and ONNX |
+| inference | `inference/include/forge/inference`, `forge.h` | Sessions, samplers, continuous batching, speculative decoding, GBNF grammars, JSON Schema, LoRA, diffusion and streaming sessions, the C ABI |
+| loadbalancer | `loadbalancer/include/forge/loadbalancer` | Load-balancing pool (7 strategies, circuit breakers, retries, backpressure) and L4/L7 proxy |
 | support | `support/include/forge/*` | BLAKE3, JSON, async I/O, thread pool, allocators, linear algebra, FFT/audio, vision, profiler, RNGs |
 | verify | `verify/` | The oracle that checks every lowering against the spec, and golden-model scripts |
 
@@ -59,7 +59,7 @@ Programs built by default:
 ## Repository layout
 
 ```
-core/ os/ spec/ lane/ grid/ flow/ pack/ mind/ balance/ support/ verify/   library layers
+core/ os/ ops/ simd/ gpu/ graph/ modelfile/ inference/ loadbalancer/ support/ verify/   library layers
 apps/                  forge and forge-serve
 import/templates/      blueprint templates used by the importers (llama, mixtral, deepseek_v2)
 python/ bindings/      Python (ctypes), Android (Kotlin + JNI) and Apple (Swift) bindings

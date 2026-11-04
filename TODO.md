@@ -4,7 +4,7 @@
 Grow today's minimal `core/include/forge/core/log.hpp` (stderr only, `FORGE_LOG` threshold) into a proper
 logger module, so PRISM can use it instead of its own logger.
 - **Levels:** trace, debug, info, warn, error, fatal; global threshold plus per-component/category overrides
-  (`FORGE_LOG=warn,flow=debug`), settable at run time.
+  (`FORGE_LOG=warn,graph=debug`), settable at run time.
 - **Sinks:** stderr (default), file with rotation, syslog/journald and Windows event log via the OS wrapper,
   a callback sink for embedders (PRISM, bindings), and an optional JSON-lines structured format.
   Thread-safe, with an async/buffered option that never blocks hot paths.
@@ -15,4 +15,7 @@ logger module, so PRISM can use it instead of its own logger.
   (`FORGE_LOG`, `configure`, `set_module_level`), stderr/file (size rotation)/syslog/callback sinks, JSON lines,
   one locked write per line, `FORGE_LOG_MIN`/`FORGE_LOG_MIN_LEVEL` strip and `FORGE_LOG_*` macros that skip
   argument evaluation. Clock and thread ids come from the OS wrapper.
-- [ ] Still open: async/buffered sink, Windows event log sink, a CMake option for the strip level.
+- [x] Async/buffered sink (`add_async_sink`: bounded queue + drain thread, drops counted and reported, `flush()`,
+  drained at `remove_sink` and exit), Windows event log sink (`add_eventlog_sink`), and the
+  `FORGE_LOG_MIN_LEVEL` CMake cache variable (tests: `test_log`, `log_min_level_cmake`). The event log sink
+  has not been compiled yet (no mingw toolchain where it was written); check it with the `windows-mingw` preset.

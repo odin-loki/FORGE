@@ -48,6 +48,7 @@ struct W {
         ann(f.ret); node(f.body); i32(f.nslots);
         u8(f.is_method); u8(f.has_out); u8(f.is_top); u8(f.has_main); str(f.file); str(f.ret_name);
         u8(f.is_const); u8(f.is_static); u8(f.is_virtual); strs(f.attrs); str(f.access);
+        str(f.src && f.src_b < f.src_e && f.src_e <= f.src->size() ? f.src->substr(f.src_b, f.src_e - f.src_b) : std::string());
     }
     void meta(const std::shared_ptr<ClassMeta>& m) {
         if (!ref(m.get())) return;
@@ -119,6 +120,7 @@ struct R {
         f->ret = ann(); f->body = node(); f->nslots = i32();
         f->is_method = bl(); f->has_out = bl(); f->is_top = bl(); f->has_main = bl(); f->file = str(); f->ret_name = str();
         f->is_const = bl(); f->is_static = bl(); f->is_virtual = bl(); f->attrs = strs(); f->access = str();
+        if (auto s = str(); !s.empty()) { f->src_e = s.size(); f->src = std::make_shared<const std::string>(std::move(s)); }
         if (f->nslots < 0 || f->nslots > (1 << 20)) throw bad("bad slot count");
         return f;
     }

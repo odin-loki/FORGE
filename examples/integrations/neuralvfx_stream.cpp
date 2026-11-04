@@ -1,5 +1,5 @@
 // NeuralVFX (Part F.2): `streaming` session + audio module, Philox RNG for reproducible generation.
-#include <forge/mind/streaming.hpp>
+#include <forge/inference/streaming.hpp>
 #include <forge/rand/philox.hpp>
 #include <forge/signal/audio.hpp>
 #include <forge/signal/fft.hpp>
@@ -14,8 +14,8 @@ static std::vector<float> render(std::uint64_t seed, std::size_t n) {
     for (std::size_t i = 0; i < n; ++i) noise[i] = rand::philox4x32::to_unit(rng(i / 4)[i % 4]) * 2 - 1;
     auto lp = signal::biquad::make(signal::biquad::lowpass, 48000, 2000);
     std::vector<float> out(n), frame_energy;
-    mind::streaming::options o; o.window = 1024; o.hop = 512; o.deadline = std::chrono::microseconds(2000);
-    mind::streaming::session s(o, [&](const float* fr, std::size_t len, std::size_t idx) {
+    inference::streaming::options o; o.window = 1024; o.hop = 512; o.deadline = std::chrono::microseconds(2000);
+    inference::streaming::session s(o, [&](const float* fr, std::size_t len, std::size_t idx) {
         auto spec = signal::rfft(fr, len); double e = 0; for (auto& c : spec) e += std::norm(c);
         frame_energy.push_back(float(e)); (void)idx;
     });
