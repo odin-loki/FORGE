@@ -110,6 +110,16 @@ TEST(cpu_topology) {
     CHECK(!t.caches.empty()); CHECK(t.cache_size(1, 'D') > 0);
 #endif
     std::thread th([] { auto s = os::pin_thread_to_kind(os::core_kind::performance); CHECK(s || os::is_unsupported(s.err)); }); th.join();
+    std::thread th2([&] {   // the highest-numbered cpu (group > 0 on Windows hosts with more than 64)
+        auto s = os::pin_thread_to({t.cpus.back().id});
+        if (!s) skip("pin_thread_to last cpu", s.err.what);   // a container cpuset may exclude it; macOS has no hard affinity
+#if defined(_WIN32)
+        CHECK(s);
+#elif defined(__linux__)
+        if (s) CHECK(unsigned(os::current_cpu()) == t.cpus.back().id);
+#endif
+    }); th2.join();
+    CHECK(!os::pin_thread_to({}));
     CHECK(os::detail::parse_cpulist("0-2,5,7-8") == (std::vector<unsigned>{0, 1, 2, 5, 7, 8}));
 }
 // ---------------------------------------------------------------- 5 power / thermal
@@ -263,11 +273,14 @@ TEST(file_watching) {
     CHECK(saw(collect(w, "model.fpk", 3000), "model.fpk"));
     os::file_watcher wd; CHECK(wd.add(d)); CHECK(os::write_file(os::join(d, "new.txt"), "x"));
     auto ev2 = collect(wd, "new.txt", 3000);
-#if defined(__linux__) || defined(_WIN32)
-    CHECK(saw(ev2, "new.txt"));
-#else
-    CHECK(!ev2.empty());   // kqueue reports the directory itself
-#endif
+    CHECK(saw(ev2, "new.txt"));   // kqueue: by rescanning the directory
+    bool created = false; for (auto& e : ev2) if (os::basename(e.path) == "new.txt" && e.kind == os::watch_kind::created) created = true;
+    CHECK(created);
+    CHECK(os::remove(os::join(d, "new.txt")));
+    bool removed = false;   // events left over from the write may come first
+    for (auto end = os::monotonic_ns() + 3000000000ull; !removed && os::monotonic_ns() < end;)
+        for (auto& e : wd.poll(100)) if (os::basename(e.path) == "new.txt" && e.kind == os::watch_kind::removed) removed = true;
+    CHECK(removed);
     CHECK(!w.add(os::join(d, "no/such/dir/x")));
     os::remove_all(d);
 }

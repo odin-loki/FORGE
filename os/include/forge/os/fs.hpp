@@ -15,6 +15,11 @@
 #include <sys/statvfs.h>
 #include <sys/time.h>
 #endif
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/param.h>
+#include <sys/ucred.h>
+#include <sys/mount.h>
+#endif
 
 namespace forge::os::fs {
 namespace stdfs = std::filesystem;
@@ -83,7 +88,8 @@ inline status chown(const std::string& p, long uid, long gid) {
 #if defined(FORGE_OS_POSIX)
     if (::lchown(p.c_str(), uid_t(uid), gid_t(gid))) return {{}, last_error("chown " + p)};
     return {};
-#else
+#else   // NTFS owners are SIDs set through ACL APIs (and need SeRestorePrivilege for anyone but yourself); a
+        // numeric uid/gid pair has no faithful mapping, so this stays unsupported.
     (void)p; (void)uid; (void)gid; return {{}, unsupported("chown")};
 #endif
 }
@@ -319,6 +325,20 @@ inline result<std::vector<mount_info>> mounts() {
     for (char* p = buf; p < buf + n && *p; p += std::strlen(p) + 1) {
         char fsname[64] = {}; GetVolumeInformationA(p, nullptr, 0, nullptr, nullptr, nullptr, fsname, sizeof fsname);
         out.push_back({p, p, fsname, ""});
+    }
+    return {std::move(out), {}};
+#elif defined(__APPLE__) || defined(__FreeBSD__)
+    // getfsstat into our own buffer (getmntinfo's buffer is shared process state, so not thread-safe).
+    int n = ::getfsstat(nullptr, 0, MNT_NOWAIT); if (n < 0) return {{}, last_error("getfsstat")};
+    std::vector<struct statfs> v(std::size_t(n) + 8);
+    n = ::getfsstat(v.data(), int(v.size() * sizeof(struct statfs)), MNT_NOWAIT); if (n < 0) return {{}, last_error("getfsstat")};
+    for (int i = 0; i < n; ++i) {
+        const auto& s = v[std::size_t(i)]; std::string o = (s.f_flags & MNT_RDONLY) ? "ro" : "rw";
+        if (s.f_flags & MNT_NOSUID) o += ",nosuid";
+        if (s.f_flags & MNT_NOEXEC) o += ",noexec";
+        if (s.f_flags & MNT_SYNCHRONOUS) o += ",sync";
+        if (s.f_flags & MNT_LOCAL) o += ",local";
+        out.push_back({s.f_mntfromname, s.f_mntonname, s.f_fstypename, o});
     }
     return {std::move(out), {}};
 #else

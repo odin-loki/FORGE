@@ -2,8 +2,11 @@
 // File watching: inotify (Linux/Android), kqueue EVFILT_VNODE (macOS/iOS/FreeBSD), ReadDirectoryChangesW (Windows).
 // Watching a file watches its directory and filters by name, so atomic replace-by-rename (editors, os::rename,
 // forge modelfile writers) is seen as a modification of that file.  FSEvents is not used on macOS: it needs a
-// CFRunLoop/dispatch queue per stream and is coalesced/latent; kqueue gives immediate per-file events.
+// CFRunLoop/dispatch queue per stream and is coalesced/latent; kqueue gives immediate per-file events.  kqueue
+// directory watches rescan the directory on each change and report created/removed/replaced entries by name;
+// in-place writes to an entry need add_file() (inotify and ReadDirectoryChangesW see them through the directory).
 #include <forge/os/detail.hpp>
+#include <map>
 #if defined(__linux__)
 #include <sys/inotify.h>
 #endif
@@ -127,7 +130,18 @@ public:
             auto idx = std::size_t(reinterpret_cast<std::uintptr_t>(ev[i].udata)); if (idx >= kw_.size()) continue;
             auto w = kw_[idx];   // copy: kq_add_ may grow kw_
             if (w.is_dir) {
-                if (w.name.empty()) { out.push_back({w.dir, watch_kind::modified}); continue; }
+                if (w.name.empty()) {   // a directory watch: rescan and diff against the snapshot, as inotify reports per entry
+                    auto now = kq_scan_(w.dir); bool any = false;
+                    for (auto& [nm, mt] : now) {
+                        auto o = w.ents.find(nm);
+                        if (o == w.ents.end()) { out.push_back({join(w.dir, nm), watch_kind::created}); any = true; }
+                        else if (o->second != mt) { out.push_back({join(w.dir, nm), watch_kind::modified}); any = true; }
+                    }
+                    for (auto& [nm, mt] : w.ents) if (!now.count(nm)) { out.push_back({join(w.dir, nm), watch_kind::removed}); any = true; }
+                    if (ev[i].fflags & (NOTE_DELETE | NOTE_RENAME)) { out.push_back({w.dir, ev[i].fflags & NOTE_DELETE ? watch_kind::removed : watch_kind::renamed}); any = true; }
+                    if (!any) out.push_back({w.dir, watch_kind::modified});
+                    kw_[idx].ents = std::move(now); continue;
+                }
                 // directory changed: did our file appear / get replaced?
                 std::string p = join(w.dir, w.name); auto st = stat(p);
                 bool tracked = false; for (auto& x : kw_) if (!x.is_dir && x.path == p && x.fd >= 0) tracked = true;
@@ -175,7 +189,12 @@ private:
     struct target { int wd; std::string dir, name; };
     std::vector<target> targets_; int fd_ = -1;
 #elif defined(FORGE_OS_KQUEUE)
-    struct kwatch { int fd = -1; bool is_dir = false; std::string path, dir, name; std::int64_t mtime = 0; };
+    struct kwatch { int fd = -1; bool is_dir = false; std::string path, dir, name; std::int64_t mtime = 0; std::map<std::string, std::int64_t> ents; };
+    // name -> mtime of a directory's entries (kqueue only says "the directory changed": diffing gives created/removed/replaced)
+    static std::map<std::string, std::int64_t> kq_scan_(const std::string& dir) {
+        std::map<std::string, std::int64_t> m; if (auto l = list_dir(dir)) for (auto& e : l.value) m[e.name] = stat(join(dir, e.name)).mtime_ns;
+        return m;
+    }
     status kq_add_(const std::string& p, bool is_dir, const std::string& dir, const std::string& name) {
 #if defined(__APPLE__)
         int f = ::open(p.c_str(), O_EVTONLY | O_CLOEXEC);
@@ -183,7 +202,7 @@ private:
         int f = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
 #endif
         if (f < 0) return {{}, last_error("open " + p)};
-        kw_.push_back({f, is_dir, p, dir, name, is_dir && !name.empty() ? stat(join(dir, name)).mtime_ns : 0});
+        kw_.push_back({f, is_dir, p, dir, name, is_dir && !name.empty() ? stat(join(dir, name)).mtime_ns : 0, is_dir && name.empty() ? kq_scan_(p) : std::map<std::string, std::int64_t>{}});
         struct kevent ev; EV_SET(&ev, f, EVFILT_VNODE, EV_ADD | EV_CLEAR, NOTE_WRITE | NOTE_DELETE | NOTE_RENAME | NOTE_EXTEND | NOTE_ATTRIB, 0, reinterpret_cast<void*>(std::uintptr_t(kw_.size() - 1)));
         if (::kevent(fd_, &ev, 1, nullptr, 0, nullptr)) return {{}, last_error("kevent")};
         return {};

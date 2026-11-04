@@ -4,9 +4,15 @@
 // TLS library for https). Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
 #include <map>
-#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_ANDROID)
+#if defined(FORGE_OS_POSIX) && (!defined(FORGE_OS_ANDROID) || __ANDROID_API__ >= 24)   // bionic: getifaddrs from API 24
+#define FORGE_NET_IFADDRS 1
 #include <ifaddrs.h>
 #include <net/if.h>
+#elif defined(FORGE_OS_ANDROID)
+#include <net/if.h>
+#include <sys/ioctl.h>
+#elif defined(FORGE_OS_WINDOWS)
+#include <iphlpapi.h>   // types only: iphlpapi.dll is loaded at run time
 #endif
 
 namespace forge::os::net {
@@ -27,9 +33,10 @@ inline result<std::vector<address>> resolve(const std::string& host) {
     ::freeaddrinfo(r);
     return {std::move(out), {}};
 }
+// Windows names an interface by its friendly name ("Ethernet", "Wi-Fi"); old Android (API < 24) lists IPv4 only.
 struct interface_info { std::string name; std::vector<address> addresses; bool up = false, loopback = false; };
 inline result<std::vector<interface_info>> interfaces() {
-#if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_ANDROID)
+#if defined(FORGE_NET_IFADDRS)
     ifaddrs* ifs = nullptr; if (::getifaddrs(&ifs)) return {{}, last_error("getifaddrs")};
     std::vector<interface_info> out;
     for (auto* p = ifs; p; p = p->ifa_next) {
@@ -41,6 +48,52 @@ inline result<std::vector<interface_info>> interfaces() {
         if (::inet_ntop(fam, src, b, sizeof b)) it->addresses.push_back({b, fam == AF_INET ? 4 : 6});
     }
     ::freeifaddrs(ifs);
+    return {std::move(out), {}};
+#elif defined(FORGE_OS_ANDROID)   // SIOCGIFCONF: interfaces with an IPv4 address
+    int fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0); if (fd < 0) return {{}, last_error("socket")};
+    std::vector<ifreq> rq(64); ifconf ic{};
+    for (;;) {
+        ic.ifc_len = int(rq.size() * sizeof(ifreq)); ic.ifc_req = rq.data();
+        if (::ioctl(fd, SIOCGIFCONF, &ic) < 0) { auto e = last_error("SIOCGIFCONF"); ::close(fd); return {{}, e}; }
+        if (std::size_t(ic.ifc_len) < rq.size() * sizeof(ifreq)) break;
+        rq.resize(rq.size() * 2);
+    }
+    std::vector<interface_info> out;
+    for (std::size_t i = 0; i < std::size_t(ic.ifc_len) / sizeof(ifreq); ++i) {
+        ifreq& r = rq[i]; interface_info* it = nullptr; for (auto& x : out) if (x.name == r.ifr_name) it = &x;
+        if (!it) {
+            ifreq f{}; std::memcpy(f.ifr_name, r.ifr_name, IFNAMSIZ); short fl = ::ioctl(fd, SIOCGIFFLAGS, &f) == 0 ? f.ifr_flags : 0;
+            out.push_back({r.ifr_name, {}, (fl & IFF_UP) != 0, (fl & IFF_LOOPBACK) != 0}); it = &out.back();
+        }
+        char b[INET_ADDRSTRLEN] = {};
+        if (r.ifr_addr.sa_family == AF_INET && ::inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(&r.ifr_addr)->sin_addr, b, sizeof b)) it->addresses.push_back({b, 4});
+    }
+    ::close(fd);
+    return {std::move(out), {}};
+#elif defined(FORGE_OS_WINDOWS)
+    net_init();
+    static HMODULE h = LoadLibraryW(L"iphlpapi.dll"); if (!h) return {{}, last_error("iphlpapi.dll")};
+    auto gaa = reinterpret_cast<decltype(&GetAdaptersAddresses)>(reinterpret_cast<void*>(GetProcAddress(h, "GetAdaptersAddresses")));
+    if (!gaa) return {{}, unsupported("GetAdaptersAddresses")};
+    ULONG n = 16384, rc = 0; std::vector<unsigned char> buf;
+    for (int k = 0; k < 4; ++k) {   // the list can grow between the size query and the call
+        buf.assign(n, 0);
+        rc = gaa(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &n);
+        if (rc != ERROR_BUFFER_OVERFLOW) break;
+    }
+    std::vector<interface_info> out;
+    if (rc == ERROR_NO_DATA) return {std::move(out), {}};
+    if (rc != ERROR_SUCCESS) return {{}, error{int(rc), "GetAdaptersAddresses failed"}};
+    for (auto* a = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()); a; a = a->Next) {
+        interface_info it{a->FriendlyName ? narrow(a->FriendlyName) : std::string(a->AdapterName), {}, a->OperStatus == IfOperStatusUp, a->IfType == IF_TYPE_SOFTWARE_LOOPBACK};
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            auto* sa = u->Address.lpSockaddr; if (!sa || (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)) continue;
+            char b[INET6_ADDRSTRLEN] = {}; int fam = sa->sa_family;
+            const void* src = fam == AF_INET ? static_cast<const void*>(&reinterpret_cast<sockaddr_in*>(sa)->sin_addr) : static_cast<const void*>(&reinterpret_cast<sockaddr_in6*>(sa)->sin6_addr);
+            if (::inet_ntop(fam, src, b, sizeof b)) it.addresses.push_back({b, fam == AF_INET ? 4 : 6});
+        }
+        out.push_back(std::move(it));
+    }
     return {std::move(out), {}};
 #else
     return {{}, unsupported("network interfaces")};
