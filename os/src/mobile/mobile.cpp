@@ -78,6 +78,7 @@ void feed_sensor(const sensor_event& e) {
 }
 void report_display(const display_info& d) { auto& br = bridge::get(); std::lock_guard g(br.m); br.disp = d; }
 void report_permission(permission p, permission_state s) { auto& br = bridge::get(); std::lock_guard g(br.m); br.perms[int(p)] = s; }
+void provide_sensor(sensor_kind k, bool on) { auto& br = bridge::get(); std::lock_guard g(br.m); br.provided[std::size_t(k)] = on; }
 void set_action_hooks(action_hooks h) { auto& br = bridge::get(); std::lock_guard g(br.m); br.hooks = std::move(h); }
 
 // ------------------------------------------------------------------ streams
@@ -246,8 +247,9 @@ struct sim_backend final : backend, std::enable_shared_from_this<sim_backend> {
             if (auto* p = services.find("photo")) return json::dump(*p);
             return std::string("{\"bytes\":[255,216,255,224,0,16,74,70,73,70,0,1,255,217]}");   // minimal JFIF SOI..EOI
         }
-        if (op == "record_audio") { if (auto r = act(); *r != "true") return r; if (auto* a = services.find("audio")) return json::dump(*a); return std::string("{}"); }
-        if (op == "keep_awake" || op == "lock_orientation" || op == "show_keyboard" || op == "open_url" || op == "share" || op == "play_audio") return act();
+        if (op == "record_audio") { if (auto r = act(); *r != "true") return r; if (auto* a = services.find("audio")) return json::dump(*a); return std::string("{\"unsupported\":\"audio recording (no audio in trace)\"}"); }
+        if (op == "play_audio") { auto v = json::parse(args); log.push_back({"play_audio", std::to_string(v["samples"].arr().size()) + " samples @" + std::to_string(int(v.num_or("sample_rate", 0)))}); return std::string("true"); }
+        if (op == "keep_awake" || op == "lock_orientation" || op == "show_keyboard" || op == "open_url" || op == "share") return act();
         if (op == "haptic_pattern") return act(permission::vibrate);
         if (op == "bluetooth_scan" || op == "gnss") { if (deny(permission::location)) return act(permission::location); }
         if (auto* v = services.find(op)) return json::dump(*v);
@@ -363,9 +365,26 @@ result<device> device::open() {
 
 #define FORGE_MOBILE_NEED(ret) if (!b_) return {{}, {22, "mobile: empty device"}}
 std::string device::backend_name() const { return b_ ? b_->name() : "none"; }
-result<std::vector<sensor_info>> device::sensors() { FORGE_MOBILE_NEED(); return b_->sensors(); }
+result<std::vector<sensor_info>> device::sensors() {
+    FORGE_MOBILE_NEED(); auto r = b_->sensors();
+    if (!r && !is_unsupported(r.err)) return r;
+    if (!r) r = {{}, {}};
+    auto& br = bridge::get(); std::lock_guard g(br.m);
+    for (int k = 0; k < sensor_kind_count; ++k)
+        if (br.provided[std::size_t(k)] && std::none_of(r.value.begin(), r.value.end(), [&](auto& s) { return s.kind == sensor_kind(k); }))
+            r.value.push_back({sensor_kind(k), std::string("app:") + sensor_name(sensor_kind(k)), "feed_sensor", 0, 0, 0});
+    return r;
+}
 bool device::has_sensor(sensor_kind k) { auto s = sensors(); return s && std::any_of(s.value.begin(), s.value.end(), [&](auto& x) { return x.kind == k; }); }
-result<sensor_stream> device::open_sensor(sensor_kind k, double hz) { FORGE_MOBILE_NEED(); if (!(hz > 0) || hz > 10000) return {{}, {22, "open_sensor: rate_hz must be in (0, 10000]"}}; return b_->open_sensor(k, hz); }
+result<sensor_stream> device::open_sensor(sensor_kind k, double hz) {
+    FORGE_MOBILE_NEED(); if (!(hz > 0) || hz > 10000) return {{}, {22, "open_sensor: rate_hz must be in (0, 10000]"}};
+    auto r = b_->open_sensor(k, hz);
+    if (r || !is_unsupported(r.err)) return r;
+    // No native source: a stream fed only by the app glue, when the glue said it provides this kind.
+    auto& br = bridge::get(); { std::lock_guard g(br.m); if (!br.provided[std::size_t(k)]) return r; }
+    auto q = std::make_shared<queue>(); br.add_sensor(k, q);
+    return {backend::make_sensor(k, q, nullptr), {}};
+}
 result<touch_stream> device::open_touch() { FORGE_MOBILE_NEED(); return b_->open_touch(); }
 status device::vibrate(int ms, double amp) { FORGE_MOBILE_NEED(); if (ms <= 0 || ms > 60000 || amp < 0 || amp > 1) return {{}, {22, "vibrate: ms in (0, 60000], amplitude in [0, 1]"}}; return b_->vibrate(ms, amp); }
 result<display_info> device::display() { FORGE_MOBILE_NEED(); return b_->display(); }

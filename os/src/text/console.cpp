@@ -6,6 +6,8 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <mutex>
+#include <string>
 #if defined(_WIN32)
 #  ifndef NOMINMAX
 #    define NOMINMAX
@@ -24,12 +26,25 @@ namespace {
 int env_int(const char* n) { const char* v = std::getenv(n); return v ? std::atoi(v) : 0; }
 #if defined(_WIN32)
 HANDLE handle_for(int fd) { return GetStdHandle(fd == 2 ? STD_ERROR_HANDLE : fd == 0 ? STD_INPUT_HANDLE : STD_OUTPUT_HANDLE); }
+// mintty (MSYS2, Cygwin and the Windows shells built on them) gives programs named pipes, not consoles:
+// "\\msys-<hash>-pty0-to-master" or "\\cygwin-<hash>-pty0-from-master".
+bool is_mintty_pipe(HANDLE h) {
+    if (h == INVALID_HANDLE_VALUE || !h || GetFileType(h) != FILE_TYPE_PIPE) return false;
+    struct { DWORD len; WCHAR name[MAX_PATH]; } info{};
+    if (!GetFileInformationByHandleEx(h, FileNameInfo, &info, sizeof info)) return false;
+    std::wstring n(info.name, std::min<std::size_t>(info.len / sizeof(WCHAR), MAX_PATH));
+    bool cyg = n.find(L"msys-") != std::wstring::npos || n.find(L"cygwin-") != std::wstring::npos;
+    return cyg && n.find(L"-pty") != std::wstring::npos && (n.find(L"-from-master") != std::wstring::npos || n.find(L"-to-master") != std::wstring::npos);
+}
+HANDLE crt_handle(int fd) { auto h = reinterpret_cast<HANDLE>(_get_osfhandle(fd)); return h == INVALID_HANDLE_VALUE ? handle_for(fd) : h; }
+UINT g_saved_cp = 0;
+void restore_cp() { if (g_saved_cp) SetConsoleOutputCP(g_saved_cp); }
 #endif
 }  // namespace
 
 bool is_terminal(int fd) {
 #if defined(_WIN32)
-    return _isatty(fd) != 0;
+    return _isatty(fd) != 0 || is_mintty_pipe(crt_handle(fd));
 #else
     return ::isatty(fd) == 1;
 #endif
@@ -52,8 +67,13 @@ status enable_vt(int fd) {
 #if defined(_WIN32)
     HANDLE h = handle_for(fd); DWORD mode = 0;
     if (!GetConsoleMode(h, &mode)) { s.err = last_error("enable_vt"); return s; }
-    if (!(mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) && !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) s.err = last_error("enable_vt");
-    SetConsoleOutputCP(CP_UTF8);
+    if (!(mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) && !SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) { s.err = last_error("enable_vt"); return s; }
+    // The output code page belongs to the console (every process attached to it), not to this process: switch it to
+    // UTF-8 once and put the previous one back at exit so the parent shell is left as it was.
+    if (UINT cp = GetConsoleOutputCP(); cp && cp != CP_UTF8) {
+        static std::once_flag once;
+        std::call_once(once, [cp] { if (SetConsoleOutputCP(CP_UTF8)) { g_saved_cp = cp; std::atexit(restore_cp); } });
+    }
 #else
     (void)fd;
 #endif
@@ -76,7 +96,14 @@ color_level color_support(int fd) {
     auto term = env("TERM");
     if (term == "dumb") return forced ? color_level::basic : color_level::none;
 #if defined(_WIN32)
-    if (term.empty()) return color_level::truecolor;   // Windows 10+ conhost / Terminal with VT enabled
+    if (env("TERM_PROGRAM") == "mintty" || is_mintty_pipe(crt_handle(fd))) return color_level::truecolor;   // mintty 2.x+
+    if (term.empty()) {
+        // A console renders escapes only with VT processing on (enable_vt); Windows Terminal always has it.
+        if (!env("WT_SESSION").empty()) return color_level::truecolor;
+        DWORD mode = 0;
+        if (GetConsoleMode(crt_handle(fd), &mode)) return (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) ? color_level::truecolor : (forced ? color_level::basic : color_level::none);
+        return forced ? color_level::basic : color_level::none;
+    }
 #endif
     if (env("TERM_PROGRAM") == "iTerm.app" || env("TERM_PROGRAM") == "WezTerm" || term.find("kitty") != std::string_view::npos || term.find("direct") != std::string_view::npos) return color_level::truecolor;
     if (term.find("256") != std::string_view::npos) return color_level::ansi256;
@@ -114,19 +141,25 @@ void color_code(std::string& o, bool bg, const std::optional<rgb>& c, int c16, c
 
 std::string style(std::string_view s, const text_style& st, color_level lv) {
     std::string o;
-    if (lv == color_level::none) {
-        if (!st.link.empty()) { o += "\x1b]8;;" + st.link + "\x1b\\"; o.append(s); o += "\x1b]8;;\x1b\\"; return o; }
-        return std::string(s);
+    if (lv == color_level::none) return std::string(s);   // no escapes at all, hyperlinks included
+    // The URI goes inside an OSC string: C0/C1 controls (ESC, BEL, the 8-bit ST) would end it early and let the
+    // rest of the link run as terminal commands, so they are dropped (UTF-8 continuation bytes 0x80-0x9F stay).
+    std::string link;
+    for (std::size_t i = 0; i < st.link.size(); ++i) {
+        unsigned char c = (unsigned char)st.link[i];
+        if (c < 0x20 || c == 0x7F) continue;
+        if (c == 0xC2 && i + 1 < st.link.size() && (unsigned char)st.link[i + 1] >= 0x80 && (unsigned char)st.link[i + 1] <= 0x9F) { ++i; continue; }   // U+0080-U+009F
+        link += char(c);
     }
     std::string sgr;
     if (st.bold) sgr += "1;"; if (st.dim) sgr += "2;"; if (st.italic) sgr += "3;"; if (st.underline) sgr += "4;";
     if (st.blink) sgr += "5;"; if (st.reverse) sgr += "7;"; if (st.strike) sgr += "9;";
     color_code(sgr, false, st.fg, st.fg16, lv); color_code(sgr, true, st.bg, st.bg16, lv);
-    if (!st.link.empty()) o += "\x1b]8;;" + st.link + "\x1b\\";
+    if (!link.empty()) o += "\x1b]8;;" + link + "\x1b\\";
     if (!sgr.empty()) { sgr.pop_back(); o += "\x1b[" + sgr + "m"; }
     o.append(s);
     if (!sgr.empty()) o += "\x1b[0m";
-    if (!st.link.empty()) o += "\x1b]8;;\x1b\\";
+    if (!link.empty()) o += "\x1b]8;;\x1b\\";
     return o;
 }
 

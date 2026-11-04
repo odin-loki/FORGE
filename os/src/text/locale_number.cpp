@@ -143,7 +143,7 @@ pattern_info parse_number_pattern(std::string_view p) {
     if (semi != std::string_view::npos) { body(p.substr(semi + 1), pi.neg_prefix, pi.neg_suffix, false); pi.has_neg = true; }
     return pi;
 }
-std::string format_with_pattern(double v, const pattern_info& pi, std::string_view b, const number_options& o, std::string_view nu) {
+std::string format_with_pattern(double v, const pattern_info& pi, std::string_view b, const number_options& o, std::string_view nu, bool user_syms) {
     bool latn_syms = nu == "latn" && get(b, "num/system") != "latn";
     bool arab_syms = nu == "arab" && get(b, "num/system") != "arab";   // CLDR arab symbols (ar-EG and friends)
     auto sym = [&](const char* k) {
@@ -153,6 +153,7 @@ std::string format_with_pattern(double v, const pattern_info& pi, std::string_vi
             if (kk == "percentSign") return std::string("\xD9\xAA\xD8\x9C"); if (kk == "minusSign") return std::string("\xD8\x9C-");
             if (kk == "plusSign") return std::string("\xD8\x9C+");
         }
+        if (user_syms && !latn_syms && !arab_syms) if (auto u = user_symbol(k)) return *u;   // OS-customised separators
         std::string key = std::string(latn_syms ? "latn/sym/" : "sym/") + k; auto r = find(b, key); return std::string(r ? *r : get(b, std::string("sym/") + k)); };
     if (std::isnan(v)) return sym("nan");
     bool neg = std::signbit(v) && v != 0; double a = std::fabs(v);
@@ -240,37 +241,37 @@ std::string format_with_pattern(double v, const pattern_info& pi, std::string_vi
 }
 }  // namespace detail
 
-std::string number_symbol(std::string_view name, std::string_view locale) { return std::string(get(resolve(locale), "sym/" + std::string(name))); }
+std::string number_symbol(std::string_view name, std::string_view locale) { return std::string(get(resolve(locale, category::numeric), "sym/" + std::string(name))); }
 std::string format_number(double v, std::string_view locale, const number_options& o) {
-    auto b = resolve(locale); std::string tag(locale.empty() ? current() : std::string(locale));
-    return format_with_pattern(v, parse_number_pattern(get(b, "fmt/decimal")), b, o, numbering_for(b, o.numbering, tag));
+    auto b = resolve(locale, category::numeric); std::string tag(locale.empty() ? current(category::numeric) : std::string(locale));
+    return format_with_pattern(v, parse_number_pattern(get(b, "fmt/decimal")), b, o, numbering_for(b, o.numbering, tag), locale.empty());
 }
 std::string format_integer(std::int64_t v, std::string_view locale, const number_options& o) {
     number_options x = o; x.max_fraction = 0; x.min_fraction = 0;
     if (std::llabs(v) < (1LL << 53)) return format_number(double(v), locale, x);
     // Large values: format digits exactly through the pattern with grouping on a string.
-    auto s = std::to_string(v); auto b = resolve(locale);
+    auto s = std::to_string(v); auto b = resolve(locale, category::numeric);
     auto pi = parse_number_pattern(get(b, "fmt/decimal"));
     std::string grp(get(b, "sym/group")), out; bool neg = s[0] == '-'; if (neg) s.erase(0, 1);
     for (std::size_t i = 0; i < s.size(); ++i) { if (o.grouping && i && pi.group1 && (s.size() - i) % std::size_t(pi.group1) == 0) out += grp; out += s[i]; }
     return (neg ? std::string(get(b, "sym/minusSign")) : "") + out;
 }
 std::string format_percent(double f, std::string_view locale, const number_options& o) {
-    auto b = resolve(locale); std::string tag(locale.empty() ? current() : std::string(locale));
-    return format_with_pattern(f * 100, parse_number_pattern(get(b, "fmt/percent")), b, o, numbering_for(b, o.numbering, tag));
+    auto b = resolve(locale, category::numeric); std::string tag(locale.empty() ? current(category::numeric) : std::string(locale));
+    return format_with_pattern(f * 100, parse_number_pattern(get(b, "fmt/percent")), b, o, numbering_for(b, o.numbering, tag), locale.empty());
 }
 std::string format_permille(double f, std::string_view locale, const number_options& o) {
-    auto b = resolve(locale); auto pi = parse_number_pattern(get(b, "fmt/percent"));
+    auto b = resolve(locale, category::numeric); auto pi = parse_number_pattern(get(b, "fmt/percent"));
     pi.prefix = replace_all(pi.prefix, "%", "\xE2\x80\xB0"); pi.suffix = replace_all(pi.suffix, "%", "\xE2\x80\xB0");
-    return format_with_pattern(f * 1000, pi, b, o, numbering_for(b, o.numbering, locale.empty() ? current() : std::string(locale)));
+    return format_with_pattern(f * 1000, pi, b, o, numbering_for(b, o.numbering, locale.empty() ? current(category::numeric) : std::string(locale)), locale.empty());
 }
 std::string format_scientific(double v, std::string_view locale, int maxf) {
-    auto b = resolve(locale);
+    auto b = resolve(locale, category::numeric);
     if (v == 0 || !std::isfinite(v)) return format_number(v, locale);
     int e = int(std::floor(std::log10(std::fabs(v)))); double m = v / std::pow(10.0, e);
     if (std::fabs(m) >= 10 - 0.5 * std::pow(10.0, -maxf)) { m /= 10; ++e; }
     number_options o; o.max_fraction = maxf; o.grouping = false;
-    auto nu = numbering_for(b, "", locale.empty() ? current() : std::string(locale));
+    auto nu = numbering_for(b, "", locale.empty() ? current(category::numeric) : std::string(locale));
     std::string es = std::to_string(std::abs(e));
     return format_number(m, locale, o) + std::string(get(b, "sym/exponential")) + (e < 0 ? std::string(get(b, "sym/minusSign")) : "") + localize_digits(es, nu);
 }
@@ -306,7 +307,7 @@ std::string compact_core(double v, std::string_view b, std::string_view locale, 
 }
 }  // namespace
 std::string format_compact(double v, std::string_view locale, compact_width w, int maxsig) {
-    auto b = resolve(locale);
+    auto b = resolve(locale, category::numeric);
     return compact_core(v, b, locale, w == compact_width::long_ ? "fmt/compact-long" : "fmt/compact-short", maxsig, nullptr);
 }
 int currency_digits(std::string_view c, bool cash) {
@@ -316,29 +317,29 @@ int currency_digits(std::string_view c, bool cash) {
     return cash ? d[2] : d[0];
 }
 std::string currency_symbol(std::string_view c, std::string_view locale, bool narrow) {
-    auto b = resolve(locale); auto code = text::to_upper(c);
+    auto b = resolve(locale, category::numeric); auto code = text::to_upper(c);
     if (narrow) if (auto n = find(b, "cur/" + code + "/symbol-alt-narrow")) return std::string(*n);
     if (auto s = find(b, "cur/" + code + "/symbol")) return std::string(*s);
     return code;
 }
 std::string currency_name(std::string_view c, std::string_view locale, std::optional<double> count) {
-    auto b = resolve(locale); auto code = text::to_upper(c);
+    auto b = resolve(locale, category::numeric); auto code = text::to_upper(c);
     if (count) if (auto n = find(b, "cur/" + code + "/displayName-count-" + plural_name(plural_category(*count, locale)))) return std::string(*n);
     if (count) if (auto n = find(b, "cur/" + code + "/displayName-count-other")) return std::string(*n);
     if (auto n = find(b, "cur/" + code + "/displayName")) return std::string(*n);
     return code;
 }
 std::string format_currency(double amount, std::string_view c, std::string_view locale, currency_display d, bool accounting, const number_options& o) {
-    auto b = resolve(locale); auto code = text::to_upper(c);
+    auto b = resolve(locale, category::numeric); auto code = text::to_upper(c);
     number_options x = o;
     int digs = currency_digits(code);
     if (x.min_fraction < 0) x.min_fraction = digs;
     if (x.max_fraction < 0) x.max_fraction = std::max(digs, x.min_fraction);
-    std::string tag(locale.empty() ? current() : std::string(locale));
+    std::string tag(locale.empty() ? current(category::numeric) : std::string(locale));
     auto nu = numbering_for(b, x.numbering, tag);
     if (d == currency_display::name) {
         auto pi = parse_number_pattern(get(b, "fmt/decimal"));
-        auto num = format_with_pattern(amount, pi, b, x, nu);
+        auto num = format_with_pattern(amount, pi, b, x, nu, locale.empty());
         char tmp[64]; std::snprintf(tmp, sizeof tmp, "%.*f", x.min_fraction, std::fabs(amount));
         auto cat = plural_category(std::string_view(tmp), locale);
         auto up = find(b, std::string("fmt/currency-unit/") + plural_name(cat)); if (!up) up = find(b, "fmt/currency-unit/other");
@@ -359,11 +360,11 @@ std::string format_currency(double amount, std::string_view c, std::string_view 
     auto pi = parse_number_pattern(pat);
     auto put = [&](std::string& a) { a = replace_all(a, "\xC2\xA4", "\x01"); };
     put(pi.prefix); put(pi.suffix); put(pi.neg_prefix); put(pi.neg_suffix);
-    auto s = format_with_pattern(amount, pi, b, x, nu);
+    auto s = format_with_pattern(amount, pi, b, x, nu, locale.empty());
     return replace_all(s, "\x01", symbol);
 }
 std::string format_currency_compact(double amount, std::string_view c, std::string_view locale) {
-    auto b = resolve(locale); std::string pat;
+    auto b = resolve(locale, category::numeric); std::string pat;
     if (std::fabs(amount) < 1000) return format_currency(amount, c, locale);
     auto s = compact_core(amount, b, locale, "fmt/currency-compact", 2, &pat);
     // The compact currency patterns embed the number; prefix/suffix the symbol through the pattern's ¤.
@@ -409,7 +410,7 @@ std::string normalize_number_text(std::string_view s, std::string_view b, bool& 
 }
 }  // namespace
 result<double> parse_number(std::string_view s, std::string_view locale) {
-    result<double> r; auto b = resolve(locale);
+    result<double> r; auto b = resolve(locale, category::numeric);
     bool pct = false, pm = false, paren = false;
     auto t = normalize_number_text(s, b, pct, pm, paren);
     if (t.empty() || t.find('\x02') != std::string::npos) { r.err = {EINVAL, "parse_number: not a number: '" + std::string(s) + "'"}; return r; }
@@ -419,12 +420,12 @@ result<double> parse_number(std::string_view s, std::string_view locale) {
     r.value = v; return r;
 }
 result<currency_amount> parse_currency(std::string_view s, std::string_view locale) {
-    result<currency_amount> r; auto b = resolve(locale);
+    result<currency_amount> r; auto b = resolve(locale, category::numeric);
     std::string str(s), code;
     static const char* codes[] = {"USD", "EUR", "GBP", "JPY", "CNY", "AUD", "CAD", "CHF", "HKD", "NZD", "SEK", "NOK", "DKK", "PLN", "CZK", "HUF", "RON", "BGN", "RUB", "UAH", "TRY",
         "ILS", "AED", "SAR", "EGP", "INR", "PKR", "BDT", "IDR", "MYR", "SGD", "THB", "VND", "PHP", "KRW", "TWD", "BRL", "MXN", "ARS", "CLP", "COP", "PEN", "ZAR", "NGN", "KES", "IRR", "ISK", "BTC"};
     // Longest symbol/code present wins; the locale's own currency is preferred for ambiguous "$".
-    auto home = currency_for_region(locale.empty() ? current() : std::string(locale));
+    auto home = currency_for_region(locale.empty() ? current(category::numeric) : std::string(locale));
     std::size_t best = 0;
     auto consider = [&](const std::string& c, const std::string& sym) {
         if (sym.empty()) return; auto p = str.find(sym);

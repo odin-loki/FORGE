@@ -37,6 +37,12 @@ std::vector<std::string> bundled_locales();
 std::string negotiate(std::span<const std::string> requested, std::span<const std::string> available, std::string_view fallback = "en");
 
 std::string system_locale();                                    // OS user locale, canonical tag; "en" if unknown
+// Formatting category. POSIX: LC_ALL, then LC_MESSAGES / LC_TIME / LC_NUMERIC, then LANG. Everywhere, the time
+// category carries the user's OS overrides (Windows Region settings, Apple Language & Region: 24-hour clock, first
+// weekday) as -u-hc / -u-fw keywords; number formatting with the default locale uses the user's separators.
+enum class category { messages, time, numeric };
+std::string system_locale(category c);
+std::string current(category c);                                // set_current() override, else system_locale(c)
 std::vector<std::string> preferred_languages();                 // OS UI language list, most preferred first
 std::string current();                                          // set_current() override, else system_locale()
 void set_current(std::string_view locale);                      // process-wide default for "" locale arguments

@@ -44,6 +44,7 @@ struct bridge {
     std::vector<std::pair<sensor_kind, std::weak_ptr<queue>>> sensor;
     std::optional<display_info> disp;
     std::array<std::optional<permission_state>, 5> perms{};
+    std::array<bool, sensor_kind_count> provided{};   // provide_sensor: app glue feeds this kind
     action_hooks hooks;
     service_hook svc;
     std::vector<std::weak_ptr<std::function<void(app_event)>>> life;
@@ -102,6 +103,8 @@ struct backend {
 };
 
 std::shared_ptr<backend> make_null();
+// open_url policy: absolute URL, RFC 3986 scheme on the set_url_schemes allow-list, no controls or spaces.
+status check_url(std::string_view url);
 void dispatch_lifecycle(app_event e, bool drive_mem = true);
 // Run argv[0] from PATH and wait (unix: posix_spawnp; Windows: CreateProcess). Returns exit code or -1 if not found;
 // with `out`, stdout is captured.

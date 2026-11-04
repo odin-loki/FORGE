@@ -38,14 +38,14 @@ Generators: `tools/unicode/gen_ucd.py` → `ucd_data.inc` (~1.7 MB), `tools/cldr
 | Fuzzy | `levenshtein`, `damerau_levenshtein` (optimal string alignment), `similarity`, `jaro_winkler`, `fuzzy_score` (editor-style subsequence match with positions), `fuzzy_filter`; all over graphemes |
 | Regex | `regex::compile(pattern, flags)`; `match`, `search`, `find_all`, `replace` (`$0..$9`, `${name}`, `$$`), `split`. Syntax: classes, `\p{..}` / `\P{..}`, `\d \w \s \b \B \X` with Unicode semantics, `^ $ \A \z`, groups, named groups, lookahead, backrefs, greedy and lazy quantifiers; flags `i m s x`. Backtracking is capped per search (default 1e7 steps; `set_step_limit`, `step_limit_hit`) |
 | Encodings | `decode(bytes, charset, on_error)`, `encode(utf8, charset, on_error)` with `fail`, `replace` or `skip`; `charsets()`, `canonical_charset` (WHATWG labels), `detect_bom`, `sniff_charset` (BOM, strict UTF-8, BOM-less UTF-16, then byte statistics), `to_utf8_auto` |
-| Console | `terminal_size`, `is_terminal`, `enable_vt`, `color_support` (`NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `COLORTERM`, `TERM`, isatty), `style` (16/256/truecolor, bold, italic, underline, OSC 8 links, downgraded to the level), `parse_style("bold red on #202020")`, `strip_ansi`, `display_width_ansi`, `wrap`, `wrap_lines`, `truncate` (ellipsis at a grapheme boundary), `pad(s, w, align)` |
+| Console | `terminal_size`, `is_terminal` (Windows: consoles and mintty's pty pipes), `enable_vt` (Windows: VT processing, and the console output code page set to UTF-8 once and restored at exit — the code page belongs to the whole console, parent shell included), `color_support` (`NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `COLORTERM`, `TERM`, isatty; on Windows with no `TERM`: truecolor in Windows Terminal, mintty or a console with VT processing on, otherwise none), `style` (16/256/truecolor, bold, italic, underline, OSC 8 links with C0/C1 controls removed from the URI, downgraded to the level; `color_level::none` emits no escapes at all, links included), `parse_style("bold red on #202020")`, `strip_ansi`, `display_width_ansi`, `wrap`, `wrap_lines`, `truncate` (ellipsis at a grapheme boundary), `pad(s, w, align)` |
 
-Charsets: UTF-8, UTF-16LE/BE, UTF-32LE/BE, US-ASCII, ISO-8859-1 to -8, -10 and -13 to -16 (-11 is an alias of windows-874; -9 is not supported), windows-874 and 1250 to 1258, KOI8-R, KOI8-U, IBM866, IBM437, IBM850, macintosh, Shift_JIS, EUC-JP, ISO-2022-JP, GBK (GB2312), GB18030, Big5, EUC-KR.
+Charsets: UTF-8, UTF-16LE/BE, UTF-32LE/BE, US-ASCII, ISO-8859-1 to -8, -10 and -13 to -16 (-11 is an alias of windows-874 and -9 / Latin-5 of windows-1254, as in WHATWG), windows-874 and 1250 to 1258, KOI8-R, KOI8-U, IBM866, IBM437, IBM850, macintosh, Shift_JIS, EUC-JP, ISO-2022-JP, GBK (GB2312), GB18030, Big5, EUC-KR.
 
 ## API reference: `forge::os::locale`
 | Area | API |
 |---|---|
-| Detection | `system_locale()`, `preferred_languages()`, `current()` / `set_current()`, `android_set_locale(locale, preferred)` |
+| Detection | `system_locale()`, `system_locale(category)`, `preferred_languages()`, `current()` / `current(category)` / `set_current()`, `android_set_locale(locale, preferred)`. `category::messages`, `time`, `numeric`: number, unit and currency formatting with the default locale use `numeric`, dates and week data use `time` |
 | Tags (BCP 47) | `parse_tag` (accepts POSIX `en_AU.UTF-8@euro`, Windows and Apple forms), `canonicalize`, `maximize` / `minimize` (likely subtags), `fallback_chain` (`zh-Hant-TW` → `zh-Hant` → `zh` → root), `best_bundled`, `bundled_locales`, `negotiate`, `display_name` |
 | Region data | `first_day_of_week`, `min_days_in_first_week`, `weekend`, `measurement_system`, `paper_size`, `preferred_hour_cycle`, `currency_for_region` |
 | Plurals | `plural_category(number, locale, ordinal)` (CLDR rules evaluated at run time, so every CLDR language is covered; `"1.0"` keeps its visible fraction digits), `plural_categories` |
@@ -60,19 +60,23 @@ Charsets: UTF-8, UTF-16LE/BE, UTF-32LE/BE, US-ASCII, ISO-8859-1 to -8, -10 and -
 ### Locale detection per platform
 | Platform | `system_locale()` | `preferred_languages()` |
 |---|---|---|
-| Linux, FreeBSD | `LC_ALL`, `LC_MESSAGES`, `LANG`, then the current `LC_MESSAGES` locale | `LANGUAGE`, then the system locale |
-| macOS, iOS | the same variables, then `CFLocaleCopyCurrent` (`locale_apple.mm`) | `LANGUAGE`, then `CFLocaleCopyPreferredLanguages` |
+| Linux, FreeBSD | `LC_ALL`, `LC_MESSAGES` (`LC_TIME` / `LC_NUMERIC` for those categories), `LANG`, then the current `setlocale` locale of the category | `LANGUAGE`, then the system locale |
+| macOS, iOS | the same variables, then `CFLocaleCopyCurrent` (`locale_apple.mm`) with the user's Language & Region changes | `LANGUAGE`, then `CFLocaleCopyPreferredLanguages` |
 | Android | a value pushed by `android_set_locale`, the variables, then `persist.sys.locale` / `ro.product.locale` | pushed list, `LANGUAGE`, system locale |
-| Windows | `GetUserDefaultLocaleName` | `GetUserPreferredUILanguages` |
+| Windows | `GetUserDefaultLocaleName` with the user's Region changes | `GetUserPreferredUILanguages` |
 
-`"C"`, `"POSIX"` and `"C.UTF-8"` are skipped; the fallback is `"en"`.
+`"C"`, `"POSIX"` and `"C.UTF-8"` are skipped; the fallback is `"en"`. When the locale comes from the OS rather than the environment, settings the user changed away from the locale's own data (Windows `LOCALE_NOUSEROVERRIDE` comparison, Apple: against a plain `CFLocale` of the same identifier) are honoured: a 24-hour clock and the first weekday become `-u-hc-*` / `-u-fw-*` keywords of `system_locale(category::time)`, and the decimal and grouping separators are used by number formatting with the default locale (not after `set_current`).
 
 ### Time zone backends
 | Build | `tz_backend()` |
 |---|---|
 | MSVC | `chrono-tzdb` (`std::chrono::tzdb`) |
 | Others | `tzif:<dir>`: TZif v1–v4 files plus the POSIX TZ footer, from `$TZDIR`, `/usr/share/zoneinfo`, `/usr/lib/zoneinfo`, `/usr/share/lib/zoneinfo`, `/var/db/timezone/zoneinfo` or `/etc/zoneinfo` |
-| No zoneinfo found (Android, MinGW without `TZDIR`) | `utc-only`; bare POSIX TZ strings still work |
+| Android | `tzdata:<file>`: the single-file bundle (`/apex/com.android.tzdata/etc/tz/tzdata`, `/data/misc/zoneinfo/current/tzdata`, `/system/usr/share/zoneinfo/tzdata`; also `$TZDIR/tzdata` anywhere), indexed and read zone by zone |
+| MinGW without zoneinfo | `windows-registry`: `local_zone()` maps the Windows zone (`GetDynamicTimeZoneInformation`) to IANA with a CLDR windowsZones table (an unmapped key is returned as is), and `zone_at` evaluates the current rules from the registry `TZI` value (no historical transitions; abbreviations are numeric, "+11") |
+| Nothing found | `utc-only`; bare POSIX TZ strings and `Etc/GMT±N` still work |
+
+Zone names must be IANA-style (letters, digits, `_ + - /`, no empty, `.` or `..` component); zone files are read only if they are regular files of at most 1 MiB, opened non-blocking. An absolute path is accepted only when it is what `$TZ` names (`TZ=:/path/to/zone`). Parsed zones are cached (64 entries; failures are not cached).
 
 ## Bundled locales
 CLDR formatting data for 52 locales plus root: en, en-GB, en-AU, en-IN, en-CA, de, de-CH, fr, fr-CA, es, es-MX, it, pt, pt-PT, nl, sv, da, nb, fi, pl, cs, ru, uk, tr, el, he, ar, fa, hi, bn, th, vi, id, ja, ko, zh, zh-Hant, ro, hu, sk, bg, hr, ga, cy, ms, sw, et, lt, lv, sl, sr, ca. Other locales use `best_bundled` (for example en-NZ → en-GB, es-AR → es-MX), then their language, then root. Plural rules cover every CLDR language.
@@ -91,7 +95,7 @@ CLDR formatting data for 52 locales plus root: en, en-GB, en-AU, en-IN, en-CA, d
 | `test_text_conformance` | NormalizationTest, Grapheme/Word/Sentence/LineBreakTest, BidiCharacterTest, CollationTest (shifted and non-ignorable). Every suite must pass 100%. Needs the files in `$FORGE_UCD_DIR` or `tests/data/ucd` (`cmake -DFORGE_FETCH_UCD=ON` downloads them); exits 77 (skipped) without them |
 | `xos_text_<target>` | compiles the C++ sources for FreeBSD, macOS, MinGW and aarch64 musl with zig |
 
-`test_text` and `test_locale` pass in CI on Linux, macOS (which also compiles `locale_apple.mm`), Windows (MSVC and MinGW) and FreeBSD. `test_text_conformance` is skipped in CI because the data is not fetched there; it passed 100% locally on Linux. iOS and Android builds of `forge_text` have not been run.
+`test_text` and `test_locale` pass in CI on Linux, macOS (which also compiles `locale_apple.mm`), Windows (MSVC and MinGW) and FreeBSD. `test_text_conformance` is skipped in CI because the data is not fetched there; it passed 100% locally on Linux. The Android CI job runs `test_text` and `test_locale` on an x86_64 API 34 emulator (time zones from the tzdata bundle); the iOS job compiles `forge_text` (including `locale_apple.mm`) but runs nothing.
 
 ## Limits
 - Not ICU: no full CLDR (only the 52 locales above, and not every field), no IDNA/UTS 46, no spoof checking, no spellout, no Chinese or Indian lunisolar calendars.

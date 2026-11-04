@@ -14,6 +14,7 @@
 #include <camera/NdkCameraManager.h>
 #include <forge/os/power.hpp>
 #include <dlfcn.h>
+#include <future>
 #include <sys/system_properties.h>
 
 namespace forge::os::mobile {
@@ -51,7 +52,7 @@ int ndk_type(sensor_kind k) {
     case sensor_kind::pressure: return ASENSOR_TYPE_PRESSURE;
     case sensor_kind::gravity: return 9;               // ASENSOR_TYPE_GRAVITY
     case sensor_kind::linear_acceleration: return 10;
-    case sensor_kind::rotation_vector: return 11;      // v = x,y,z of the unit quaternion
+    case sensor_kind::rotation_vector: return 11;      // v = x,y,z,w of the unit quaternion
     case sensor_kind::humidity: return 12;
     case sensor_kind::temperature: return 13;          // ambient
     case sensor_kind::step_detector: return 18;
@@ -106,11 +107,15 @@ struct android_backend final : backend {
         auto* m = manager(); if (!m) return {{}, unsupported("ASensorManager")};
         const ASensor* s = ASensorManager_getDefaultSensor(m, ndk_type(k));
         if (!s) return {{}, unsupported(std::string("sensor ") + sensor_name(k) + " (not on this device)")};
-        w->start([m, s, q, k, wp = w.get(), us = int32_t(1e6 / hz)] {
+        // The queue lives on this worker's ALooper; registration happens there too, and its result comes back here
+        // (registerSensor fails, for example, for heart rate without BODY_SENSORS or above the rate limit).
+        auto ready = std::make_shared<std::promise<int>>(); auto started = ready->get_future();
+        w->start([m, s, q, k, ready, wp = w.get(), us = int32_t(1e6 / hz)] {
             ALooper* lp = ALooper_prepare(0);
             ASensorEventQueue* eq = ASensorManager_createEventQueue(m, lp, 1, nullptr, nullptr);
-            if (!eq) { q->finish(); return; }
-            ASensorEventQueue_registerSensor(eq, s, us, 0);
+            if (!eq) { ready->set_value(-1); q->finish(); return; }
+            if (int rc = ASensorEventQueue_registerSensor(eq, s, us, 0); rc < 0) { ASensorManager_destroyEventQueue(m, eq); ready->set_value(rc); q->finish(); return; }
+            ready->set_value(0);
             while (!wp->stop) {
                 int fd, ev; void* data;
                 if (ALooper_pollOnce(100, &fd, &ev, &data) != 1) continue;
@@ -125,13 +130,18 @@ struct android_backend final : backend {
                         case sensor_kind::humidity: case sensor_kind::temperature: case sensor_kind::heart_rate: case sensor_kind::step_detector:
                             e.v[0] = buf[i].data[0]; e.n = 1; break;
                         case sensor_kind::step_counter: e.v[0] = double(buf[i].u64.step_counter); e.n = 1; break;
-                        default: for (int a = 0; a < 3; ++a) e.v[a] = buf[i].data[a]; e.n = 3;
+                        case sensor_kind::rotation_vector:   // x, y, z, w (data[3] = cos(theta/2), API 18+)
+                            for (int a = 0; a < 4; ++a) e.v[std::size_t(a)] = buf[i].data[a];
+                            e.n = 4; break;
+                        default: for (int a = 0; a < 3; ++a) e.v[std::size_t(a)] = buf[i].data[a]; e.n = 3;
                         }
                         q->push({false, e, {}});
                     }
             }
             ASensorEventQueue_disableSensor(eq, s); ASensorManager_destroyEventQueue(m, eq); q->finish();
         });
+        if (int rc = started.get(); rc < 0)
+            return {{}, {rc == -1 ? 5 : -rc, std::string("sensor ") + sensor_name(k) + (rc == -1 ? ": ASensorManager_createEventQueue failed" : ": ASensorEventQueue_registerSensor failed (permission or rate)")}};
         return {make_sensor(k, q, w), {}};
     }
     result<touch_stream> open_touch() override { auto q = std::make_shared<queue>(); bridge::get().add_touch(q); return {make_touch(q, nullptr), {}}; }

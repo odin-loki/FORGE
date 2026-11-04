@@ -5,8 +5,11 @@
 //             NativeActivity/GameActivity glue (android_feed_motion), ACameraManager, JNI hooks for the rest.
 //   iOS       CoreMotion, CoreLocation, UIKit (UIScreen, UIDevice, UIImpactFeedbackGenerator,
 //             FORGETouchView), AVFoundation, UserNotifications (apple.mm, Apple targets only).
+//   macOS     IOKit power assertions, NSWorkspace, UserNotifications (apple.mm); touch/location from app glue.
+//   Windows   WM_POINTER via windows_feed_pointer, display/DPI, power requests, Known Folders, ShellExecuteW.
 //   Linux     IIO sensors (/sys/bus/iio), evdev multitouch (/dev/input) + force feedback, DRM/fbdev
 //             display, V4L2 cameras, power_supply battery, notify-send.
+//   FreeBSD   sysctl thermal + ACPI battery, evdev multitouch.
 //   other     null backend: every call returns os::unsupported(...).
 //   sim       a JSON trace replayed on any platform (device::simulated / FORGE_MOBILE_TRACE).
 // All event queues are bounded and charge forge::mem's host budget (tag "mobile"); a full queue drops
@@ -210,6 +213,10 @@ private:
 // Events pushed here reach every open touch_stream / sensor_stream of the platform device.
 void feed_touch(const touch_event& e);
 void feed_sensor(const sensor_event& e);
+// Declares that app glue feeds sensor kind k through feed_sensor (WinRT sensors, CoreLocation on macOS, GeoClue on
+// Linux, ...). open_sensor(k) then returns a bridge-only stream wherever the backend has no native source for k,
+// and sensors() lists k. Pass false to withdraw.
+void provide_sensor(sensor_kind k, bool provided = true);
 // Values only app code can know (Activity/Context/JNI): they override probing where the backend can't ask.
 void report_display(const display_info& d);
 void report_permission(permission p, permission_state s);
@@ -226,6 +233,9 @@ void set_action_hooks(action_hooks h);
 using service_hook = std::function<std::optional<std::string>(std::string_view op, std::string_view args_json)>;
 void set_service_hook(service_hook h);
 void feed_lifecycle(app_event e);
+// URL schemes open_url accepts (case-insensitive). Default: http, https, mailto, tel. Anything else (file:, a bare
+// path, javascript:, custom handlers, a leading '-') is refused before reaching the hook or the OS opener.
+void set_url_schemes(std::vector<std::string> schemes);
 #if defined(__ANDROID__)
 // Pass the AInputEvent* from AInputQueue_getEvent (NativeActivity) or the GameActivity motion event
 // translated by the app; returns true when it was a motion event and was consumed.

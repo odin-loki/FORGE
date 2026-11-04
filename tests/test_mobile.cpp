@@ -8,6 +8,9 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <fcntl.h>
 #include <linux/input.h>
@@ -123,6 +126,65 @@ TEST(sim_lifecycle) {
     CHECK(std::find(got.begin(), got.end(), m::app_event::low_memory) != got.end());
     CHECK(std::find(got.begin(), got.end(), m::app_event::background) != got.end());
 }
+TEST(open_url_policy) {
+    auto d = m::device::simulated(k_svc); CHECK(d); if (!d) return;
+    for (const char* ok : {"https://example.com", "HTTP://example.com/a?b=c", "mailto:a@example.com", "tel:+15551234"}) CHECK_MSG(d->open_url(ok), "%s", ok);
+    for (const char* bad : {"file:///etc/passwd", "/bin/sh", "C:\\Windows\\notepad.exe", "-oProxyCommand=x", "javascript:alert(1)",
+                            "https://", "https:///x", "http:example.com", "https://a b", "https://a\x1b]8;;", "ms-settings:", "", "x"})
+        CHECK_MSG(!d->open_url(bad), "%s", bad);
+    m::set_url_schemes({"https", "MyApp"});
+    CHECK(d->open_url("myapp:open?id=1")); CHECK(!d->open_url("http://example.com")); CHECK(d->open_url("https://example.com"));
+    m::set_url_schemes({"http", "https", "mailto", "tel"});
+    auto log = d->sim_log(); int opened = 0; for (auto& r : log) if (r.what == "open_url") ++opened;
+    CHECK(opened == 6);   // refused URLs never reach the hook / opener
+}
+TEST(bridge_only_sensors) {
+    auto d = m::device::null_device(); CHECK(d); if (!d) return;
+    CHECK(is_unsupported(d->open_sensor(m::sensor_kind::heart_rate).err));
+    m::provide_sensor(m::sensor_kind::heart_rate);
+    auto s = d->open_sensor(m::sensor_kind::heart_rate); CHECK(s);
+    auto list = d->sensors(); CHECK(list && list->size() == 1 && list->at(0).kind == m::sensor_kind::heart_rate);
+    if (s) {
+        m::sensor_event e; e.kind = m::sensor_kind::heart_rate; e.v[0] = 72; e.n = 1; m::feed_sensor(e);
+        auto v = s->poll(100); CHECK(v.size() == 1 && v[0].v[0] == 72);
+    }
+    m::provide_sensor(m::sensor_kind::heart_rate, false);
+    CHECK(is_unsupported(d->open_sensor(m::sensor_kind::heart_rate).err));
+}
+TEST(audio_and_haptics_hooks) {
+    auto d = m::device::null_device(); CHECK(d); if (!d) return;
+    std::string played; std::mutex mu;
+    m::set_service_hook([&](std::string_view op, std::string_view args) -> std::optional<std::string> {
+        if (op == "play_audio") { std::lock_guard g(mu); played = std::string(args); return std::string("true"); }
+        if (op == "record_audio") return std::string("{\"sample_rate\":8000}");   // recorded nothing
+        return std::nullopt;
+    });
+    m::audio_clip c; c.sample_rate = 8000; c.samples = {1, -2, 300};
+    CHECK(d->play_audio(c));
+    { std::lock_guard g(mu); CHECK(played.find("\"samples\":[1,-2,300]") != std::string::npos); }
+    CHECK(!d->record_audio(100, 8000));                    // no samples: an error, not invented silence
+    m::set_service_hook(nullptr);
+    auto sim = m::device::simulated("{}"); if (sim) CHECK(!sim->record_audio(50));
+    // haptic_pattern waits out each "on" even when the vibrator returns at once (hook, iOS)
+    m::set_action_hooks({[](int, double) { return true; }, nullptr, nullptr});
+    auto t0 = std::chrono::steady_clock::now();
+    CHECK(d->haptic_pattern({40, 20, 40}));
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(95));
+    m::set_action_hooks({});
+}
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+TEST(xdg_user_dirs) {
+    auto root = fs::temp_directory_path() / ("forge-xdg-" + std::to_string(::getpid()));
+    fs::create_directories(root / "cfg");
+    std::ofstream(root / "cfg/user-dirs.dirs") << "# comment\nXDG_DOCUMENTS_DIR=\"$HOME/Papers\"\nXDG_DOWNLOAD_DIR=\"/data/dl\"\n";
+    const char* oh = std::getenv("HOME"); const char* oc = std::getenv("XDG_CONFIG_HOME"); std::string sh = oh ? oh : "", sc = oc ? oc : "";
+    forge_test::set_env("HOME", root.c_str()); forge_test::set_env("XDG_CONFIG_HOME", (root / "cfg").c_str());
+    auto d = m::device::null_device(); auto p = d ? d->paths() : decltype(d->paths()){};
+    CHECK(p && p->documents == (root / "Papers").string() && p->downloads == "/data/dl");
+    forge_test::set_env("HOME", oh ? sh.c_str() : nullptr); forge_test::set_env("XDG_CONFIG_HOME", oc ? sc.c_str() : nullptr);
+    fs::remove_all(root);
+}
+#endif
 TEST(geofencing) {
     CHECK(std::abs(m::geofence_monitor::distance_m(0, 0, 0, 1) - 111195) < 200);
     m::geofence_monitor gm; gm.add({"home", -33.87, 151.21, 100});
@@ -156,6 +218,12 @@ TEST(linux_iio_fake_sysfs) {
     put(root / "sys/class/drm/card0-DSI-1/status", "connected"); put(root / "sys/class/drm/card0-DSI-1/modes", "720x1440");
     put(root / "sys/class/video4linux/video0/name", "ov5640 front");
     put(root / "sys/class/input/event0/device/capabilities/abs", "260800000000000");   // ABS_MT_POSITION_X/Y, TRACKING_ID, SLOT
+    put(root / "sys/class/input/event0/device/properties", "2");                       // INPUT_PROP_DIRECT: a touchscreen
+    put(root / "sys/class/input/event1/device/capabilities/abs", "260800000000000");   // same axes, but a touchpad:
+    put(root / "sys/class/input/event1/device/properties", "5");                       // INPUT_PROP_POINTER | BUTTONPAD
+    put(root / "sys/class/video4linux/video1/name", "ov5640 front"); put(root / "sys/class/video4linux/video1/index", "1");   // UVC metadata node
+    put(root / "sys/class/video4linux/video0/index", "0");
+    put(root / "sys/firmware/devicetree/base/model", std::string("Raspberry Pi 4 Model B") + char(0));
     fs::create_directories(root / "input");
     auto d = m::device::linux_with((root / "sys").string(), (root / "input").string()); CHECK(d); if (!d) return;
     auto ss = d->sensors(); CHECK(ss && ss->size() == 4);
@@ -167,6 +235,8 @@ TEST(linux_iio_fake_sysfs) {
     auto cams = d->cameras(); CHECK(cams && cams->size() == 1 && cams->at(0).front);
     CHECK(d->permission_status(m::permission::camera).value == m::permission_state::not_required);
     CHECK(is_unsupported(d->open_sensor(m::sensor_kind::location).err));
+    auto inf = d->info(); CHECK(inf && inf->model == "Raspberry Pi 4 Model B");
+    if (inf) CHECK(inf->form != m::form_factor::desktop);   // battery + touchscreen here: phone; never desktop from a DT model alone
 
     // evdev multitouch protocol B through a FIFO standing in for /dev/input/event0
     auto node = root / "input/event0"; CHECK(::mkfifo(node.c_str(), 0600) == 0);

@@ -73,8 +73,8 @@ std::string region_of(std::string_view locale) {
     auto t = maximize(parse_tag(locale.empty() ? std::string_view(current()) : locale));
     return t.region.empty() ? "001" : t.region;
 }
-std::string resolve(std::string_view locale) {
-    std::string cur; if (locale.empty()) { cur = current(); locale = cur; }
+std::string resolve(std::string_view locale, category c) {
+    std::string cur; if (locale.empty()) { cur = current(c); locale = cur; }
     return best_bundled(locale);
 }
 }  // namespace detail
@@ -204,30 +204,96 @@ void set_current(std::string_view l) { std::lock_guard lk(g_mu); g_current = l.e
 void android_set_locale(std::string_view l, std::span<const std::string> pref) {
     std::lock_guard lk(g_mu); g_android = canonicalize(l); g_android_pref.clear(); for (auto& p : pref) g_android_pref.push_back(canonicalize(p));
 }
-std::string current() {
+std::string current() { return current(category::messages); }
+std::string current(category c) {
     { std::lock_guard lk(g_mu); if (!g_current.empty()) return g_current; }
-    return system_locale();
+    return system_locale(c);
 }
-std::string system_locale() {
+namespace {
+#if defined(_WIN32)
+std::string user_info(LCTYPE t) {
+    wchar_t b[128]; int n = GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, t, b, 128); if (n <= 1) return {};
+    int m = WideCharToMultiByte(CP_UTF8, 0, b, n - 1, nullptr, 0, nullptr, nullptr); std::string s(std::size_t(m > 0 ? m : 0), '\0');
+    if (m > 0) WideCharToMultiByte(CP_UTF8, 0, b, n - 1, s.data(), m, nullptr, nullptr);
+    return s;
+}
+#endif
+// 'H'/'h'/'K'/'k' outside quotes in a time pattern -> CLDR hour cycle keyword.
+std::string hc_of(std::string_view p) {
+    bool q = false;
+    for (char c : p) { if (c == '\'') q = !q; else if (!q) { if (c == 'H') return "h23"; if (c == 'h') return "h12"; if (c == 'K') return "h11"; if (c == 'k') return "h24"; } }
+    return {};
+}
+}  // namespace
+namespace detail {
+// User customisations made in the OS settings (Windows Region, macOS/iOS Language & Region), read once.
+const os_overrides& user_overrides() {
+    static const os_overrides o = [] {
+        os_overrides r;
+#if defined(_WIN32)
+        // Only what the user changed: each value is compared with the locale's own (LOCALE_NOUSEROVERRIDE).
+        auto changed = [](LCTYPE t) { auto v = user_info(t); return v == user_info(t | LOCALE_NOUSEROVERRIDE) ? std::string() : v; };
+        static const char* wd[] = {"mon", "tue", "wed", "thu", "fri", "sat", "sun"};   // LOCALE_IFIRSTDAYOFWEEK: 0 = Monday
+        if (auto f = changed(LOCALE_IFIRSTDAYOFWEEK); f.size() == 1 && f[0] >= '0' && f[0] <= '6') r.fw = wd[f[0] - '0'];
+        if (auto t = changed(LOCALE_STIMEFORMAT); !t.empty() && hc_of(t) != hc_of(user_info(LOCALE_STIMEFORMAT | LOCALE_NOUSEROVERRIDE))) r.hc = hc_of(t);
+        r.decimal = changed(LOCALE_SDECIMAL); r.group = changed(LOCALE_STHOUSAND);
+#elif defined(__APPLE__)
+        std::string fmt; apple_user_overrides(r.fw, fmt, r.decimal, r.group); r.hc = hc_of(fmt);
+#endif
+        return r;
+    }();
+    return o;
+}
+std::optional<std::string> user_symbol(std::string_view name) {
+    { std::lock_guard lk(g_mu); if (!g_current.empty() || !g_android.empty()) return std::nullopt; }
+#if !defined(_WIN32)
+    for (auto n : {"LC_ALL", "LC_NUMERIC", "LANG"}) { auto v = env(n); if (!v.empty() && v != "C" && v != "POSIX" && v != "C.UTF-8") return std::nullopt; }   // locale chosen by the environment
+#endif
+    auto& o = user_overrides();
+    if (name == "decimal" && !o.decimal.empty()) return o.decimal;
+    if (name == "group" && !o.group.empty()) return o.group;
+    return std::nullopt;
+}
+}  // namespace detail
+std::string system_locale() { return system_locale(category::messages); }
+std::string system_locale(category c) {
     { std::lock_guard lk(g_mu); if (!g_android.empty()) return g_android; }
+    std::string base;
 #if defined(_WIN32)
     wchar_t buf[LOCALE_NAME_MAX_LENGTH];
-    if (GetUserDefaultLocaleName(buf, LOCALE_NAME_MAX_LENGTH) > 0) {
-        std::string s; for (wchar_t* p = buf; *p; ++p) s += char(*p);
-        return canonicalize(s);
-    }
-    return "en";
+    if (GetUserDefaultLocaleName(buf, LOCALE_NAME_MAX_LENGTH) > 0) { std::string s; for (wchar_t* p = buf; *p; ++p) s += char(*p); base = canonicalize(s); }
+    else return "en";
 #else
-    for (auto n : {"LC_ALL", "LC_MESSAGES", "LANG"}) { auto v = env(n); if (!v.empty() && v != "C" && v != "POSIX" && v != "C.UTF-8") return canonicalize(v); }
+    // POSIX precedence: LC_ALL, then the category's own variable, then LANG.
+    const char* var = c == category::time ? "LC_TIME" : c == category::numeric ? "LC_NUMERIC" : "LC_MESSAGES";
+    for (auto n : {"LC_ALL", var, "LANG"}) { auto v = env(n); if (!v.empty() && v != "C" && v != "POSIX" && v != "C.UTF-8") return canonicalize(v); }
 #  if defined(__APPLE__)
-    if (auto a = apple_system_locale(); !a.empty()) return canonicalize(a);
+    if (auto a = apple_system_locale(); !a.empty()) base = canonicalize(a);
 #  elif defined(__ANDROID__)
     char v[PROP_VALUE_MAX] = {};
     if (__system_property_get("persist.sys.locale", v) > 0 || __system_property_get("ro.product.locale", v) > 0) return canonicalize(v);
 #  endif
-    if (const char* l = std::setlocale(LC_MESSAGES, nullptr); l && std::strcmp(l, "C") && std::strcmp(l, "POSIX")) return canonicalize(l);
-    return "en";
+    if (base.empty()) {
+        int lc = c == category::time ? LC_TIME : c == category::numeric ? LC_NUMERIC : LC_MESSAGES;
+        if (const char* l = std::setlocale(lc, nullptr); l && std::strcmp(l, "C") && std::strcmp(l, "POSIX")) return canonicalize(l);
+        return "en";
+    }
 #endif
+    // Time formatting follows the user's OS choices (24-hour clock, first weekday) as -u-hc / -u-fw keywords, added
+    // only where they differ from the CLDR default for the locale. Separators are applied by number formatting.
+    if (c == category::time) {
+        auto& o = user_overrides(); tag t = parse_tag(base); bool add = false;
+        if (!o.hc.empty() && t.keyword("hc").empty()) {
+            static const char* hn[] = {"h11", "h12", "h23", "h24"};
+            if (o.hc != hn[int(preferred_hour_cycle(base))]) { t.unicode.push_back({"hc", o.hc}); add = true; }
+        }
+        if (!o.fw.empty() && t.keyword("fw").empty()) {
+            static const char* wn[] = {"sun", "mon", "tue", "wed", "thu", "fri", "sat"};
+            if (o.fw != wn[int(first_day_of_week(base))]) { t.unicode.push_back({"fw", o.fw}); add = true; }
+        }
+        if (add) return t.str();
+    }
+    return base;
 }
 std::vector<std::string> preferred_languages() {
     std::vector<std::string> r;
@@ -274,11 +340,14 @@ weekday wd(std::string_view s) {
 }
 }  // namespace
 weekday first_day_of_week(std::string_view l) {
-    auto t = parse_tag(l.empty() ? std::string_view(current()) : l);
+    std::string cur; if (l.empty()) { cur = current(category::time); l = cur; }
+    auto t = parse_tag(l);
     if (auto fw = t.keyword("fw"); !fw.empty()) return wd(fw);
     return wd(region_value("week/firstDay/", l));
 }
-int min_days_in_first_week(std::string_view l) { auto v = region_value("week/minDays/", l); return v.empty() ? 1 : std::atoi(std::string(v).c_str()); }
+int min_days_in_first_week(std::string_view l) {
+    std::string cur; if (l.empty()) { cur = current(category::time); l = cur; }
+    auto v = region_value("week/minDays/", l); return v.empty() ? 1 : std::atoi(std::string(v).c_str()); }
 std::pair<weekday, weekday> weekend(std::string_view l) { return {wd(region_value("week/weekendStart/", l)), wd(region_value("week/weekendEnd/", l))}; }
 measurement measurement_system(std::string_view l) {
     auto t = parse_tag(l.empty() ? std::string_view(current()) : l);
@@ -287,7 +356,8 @@ measurement measurement_system(std::string_view l) {
 }
 std::string paper_size(std::string_view l) { return std::string(region_value("paper/", l)); }
 hour_cycle preferred_hour_cycle(std::string_view l) {
-    auto t = parse_tag(l.empty() ? std::string_view(current()) : l);
+    std::string cur; if (l.empty()) { cur = current(category::time); l = cur; }
+    auto t = parse_tag(l);
     if (auto hc = t.keyword("hc"); !hc.empty()) return hc == "h11" ? hour_cycle::h11 : hc == "h12" ? hour_cycle::h12 : hc == "h24" ? hour_cycle::h24 : hour_cycle::h23;
     auto p = get(resolve(l), "cal/time/short");
     for (std::size_t i = 0; i < p.size(); ++i) {
