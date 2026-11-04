@@ -14,6 +14,8 @@ FORGE has no config file. Programs take command-line flags ([cli.md](cli.md), [s
 | `FORGE_KV_CODEC` | sessions | KV cache codec when `session_options.kv_codec` is empty: `f32` (default), `int8`, `fp8` |
 | `FORGE_KV_OFFLOAD=1` | sessions | Keep KV on the host and drop device copies after each attention |
 | `FORGE_GPU_NO_RESIDENCY` | Vulkan lowerings | If set, tensors are not kept resident on the device between ops |
+| `FORGE_GPU_REPLAY` | CUDA/HIP lowerings | If set, enables experimental whole-run decode replay (relaunches recorded device work without the executor) |
+| `FORGE_REPLAY_VERIFY` | CUDA/HIP lowerings | With `FORGE_GPU_REPLAY`, run one real (verifying) run every N runs (default 32) |
 | `FORGE_SVE_KEEP_VL=1` | lane (aarch64) | Do not change the SVE vector length at start-up |
 
 ## Memory
