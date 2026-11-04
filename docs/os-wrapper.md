@@ -64,9 +64,9 @@ How it works per platform:
 
 `find_executable(name)` searches `PATH`. A name with a separator is checked as is. On Windows a bare name without an extension resolves only to `.exe`, `.cmd`, `.bat` or `.com`, as `CreateProcess` would, so an extensionless shell script on `PATH` (MSYS2, Git) cannot shadow `cmd.exe`. `spawn_wait` runs `.cmd`/`.bat` files through `cmd.exe /d /c`.
 
-`child::start(argv)` or `child::start(spec)` starts a process without waiting: `read(max, timeout_ms)` streams stdout (and merged stderr), `try_wait`, `wait(timeout_ms)`, `kill(sig)` (whole group). The destructor kills and reaps a child still running. `wait_any(children, timeout_ms)` and `wait_all(...)` wait on several. `child` is POSIX only; elsewhere `start` returns unsupported.
+`child::start(argv)` or `child::start(spec)` starts a process without waiting: `read(max, timeout_ms)` streams stdout (and merged stderr), `try_wait`, `wait(timeout_ms)`, `kill(sig)` (whole group). The destructor kills and reaps a child still running. `wait_any(children, timeout_ms)` and `wait_all(...)` wait on several. On Windows `child` uses `CreateProcessW` (only the std handles inherited) in a Job Object that carries the limits; stdout is a pipe read with `PeekNamedPipe` polling for the timeout, and `kill(sig)` (and the destructor) ends the whole tree with exit code 128 + sig, so `wait()` reports what POSIX would. `kill(0)` only checks that it is running. Unsupported on iOS.
 
-`list_processes()` and `process_info(pid)` return pid, ppid, RSS, name and command line on Linux and Android only.
+`list_processes()` and `process_info(pid)` return pid, ppid, RSS, name and command line: `/proc` on Linux and Android; Toolhelp32 + `K32GetProcessMemoryInfo` + `NtQueryInformationProcess` (command line) on Windows; `proc_listpids` / `proc_pid_rusage` / `KERN_PROCARGS2` on macOS; `kern.proc.proc` / `kern.proc.args` on FreeBSD. A field the caller may not read (another user's argv or RSS on macOS, protected processes on Windows) stays empty or 0. Unsupported on iOS.
 
 `process_caps()` lists what the platform supports: `spawn`, `process.limits.memory`, `process.limits.cpu`, `process.limits.files` (POSIX), `process.tree_kill`, `process.timeout`, `signals` (POSIX). It is empty on iOS. ForgeScript's `os.caps()` returns this list with the platform name and the script's own capabilities.
 
@@ -74,7 +74,7 @@ How it works per platform:
 
 ## Pipes and signals
 - `pipe.hpp` is POSIX only. Pipes are close-on-exec. `read_some` with a timeout returns an empty string on timeout or EOF.
-- `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported.
+- `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported (a console control event cannot be aimed at one process).
 - Handler installation is `os::on_signal` in `os.hpp`; on Windows it maps Ctrl-C to `interrupt` and close / Ctrl-Break / shutdown to `terminate`.
 
 ## Files (`fs.hpp`)
@@ -82,18 +82,18 @@ How it works per platform:
 |---|---|
 | `copy`, `copy_tree`, `move` | `move` across devices falls back to copy then remove |
 | `symlink`, `hardlink`, `read_link` | |
-| `mode`, `chmod`, `chown` | `chown` is unsupported on Windows |
+| `mode`, `chmod`, `chown` | `chown` is unsupported on Windows (owners are SIDs, and changing them needs privileges) |
 | `mtime_ns`, `set_mtime_ns`, `touch` | |
 | `glob_match(pattern, path)`, `glob(pattern, base)` | `*`, `?`, `**`, `[a-z]`, `[!x]`, `\` escapes |
 | `walk(root, walk_opts)` | `max_depth`, `follow_symlinks`, `include_dirs`, `include_hidden` |
 | `file_lock` | RAII advisory lock: `flock` / `LockFileEx`, shared or exclusive, wait or try |
 | `disk_usage(path)` | total, free, available |
-| `mounts()` | Linux and Windows; unsupported elsewhere |
+| `mounts()` | `/proc/self/mounts` (Linux, Android), volume enumeration (Windows), `getfsstat` (macOS, FreeBSD) |
 | `make_temp_file`, `make_temp_dir` | |
 | `write_file_atomic(path, data, mode)` | temp file, fsync, rename, then fsync of the directory (POSIX) |
 
 ## Users, time, system, console
-- **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) on POSIX only. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows XDG on Linux and FreeBSD, `~/Library` on Apple, Known Folders on Windows.
+- **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) everywhere but iOS. Windows has no numeric ids: `uid` is the last sub-authority (RID) of the account SID and `gid` that of its primary group; `user_info::sid` holds the SID string, the home directory comes from the profile list and full name / groups from netapi32 (loaded at run time). `current_user()` reports the process token's primary group, which can differ from the account's. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows XDG on Linux and FreeBSD, `~/Library` on Apple, Known Folders on Windows.
 - **`time.hpp`.** `unix_time_ns`, civil-time conversion, DST-aware `utc_offset_seconds`, `timezone_name`, `format_iso8601` / `format_local_iso8601` / `parse_iso8601` (RFC 3339 with offsets and fractions to ns). `timer_queue` runs `after(ms, fn)` and `every(ms, fn)` callbacks on one worker thread; `cancel(id)`. `stopwatch` and `deadline` are described in [support.md](support.md).
 - **`sysinfo.hpp`.**
 
@@ -101,9 +101,9 @@ How it works per platform:
   |---|---|---|---|---|---|
   | `release_info` | os-release | yes | `RtlGetVersion` | sysctl | sysctl |
   | `uptime_seconds` | `/proc/uptime` | yes | `GetTickCount64` | `kern.boottime` | `kern.boottime` |
-  | `load_average` | `getloadavg` | `/proc/loadavg` | unsupported | `getloadavg` | `getloadavg` |
+  | `load_average` | `getloadavg` | `/proc/loadavg` | unsupported (no run-queue average) | `getloadavg` | `getloadavg` |
   | `memory()` | incl. swap and the root cgroup v1/v2 limit | yes | yes | yes | yes |
-  | `per_cpu_times`, `cpu_usage` | yes | yes | unsupported | unsupported | unsupported |
+  | `per_cpu_times`, `cpu_usage` | `/proc/stat` | yes | `NtQuerySystemInformationEx` per processor group | `host_processor_info` | `kern.cp_times` |
   | `self_usage`, `current_rss` | yes | yes | yes | yes | yes |
 
 - **`console.hpp`.** `is_tty`, `size`, `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo), `read_password`, `confirm`.
@@ -112,13 +112,13 @@ How it works per platform:
 | Call | Notes |
 |---|---|
 | `resolve(host)` | IPv4 and IPv6 address strings |
-| `interfaces()` | `getifaddrs`: name, addresses, up, loopback. Unsupported on Windows and Android |
+| `interfaces()` | name, addresses, up, loopback: `getifaddrs`; `GetAdaptersAddresses` (iphlpapi, loaded at run time) on Windows; Android `getifaddrs` from API 24, else an IPv4-only `SIOCGIFCONF` fallback |
 | `port_open(host, port, timeout_ms)` | TCP connect probe |
 | `parse_url(url)` | scheme, host, port, path, query |
 | `http(request)`, `http_get(url)` | Blocking HTTP/1.1 client: Content-Length and chunked bodies, redirects, size cap. `https://` returns unsupported |
 
 ## Recursive file watching (`file_watch_tree.hpp`)
-`tree_watcher::open(root, {debounce_ms = 50, force_polling, include_hidden, ignore})` registers every directory with the native `file_watcher` (inotify, kqueue, `ReadDirectoryChangesW`) and picks up new directories as they appear, reporting their existing contents as created. A per-path snapshot turns coarse kqueue directory events into exact created / modified / removed events. Where native watching is unavailable, or with `force_polling`, it rescans on each `poll()`. `poll(ms)` waits until the tree has been quiet for `debounce_ms` and coalesces bursts: create + modify → created, create + remove → nothing, one event per path. FSEvents is not used on macOS.
+`tree_watcher::open(root, {debounce_ms = 50, force_polling, include_hidden, ignore})` registers every directory with the native `file_watcher` (inotify, kqueue, `ReadDirectoryChangesW`) and picks up new directories as they appear, reporting their existing contents as created. A per-path snapshot turns coarse kqueue directory events into exact created / modified / removed events. Where native watching is unavailable, or with `force_polling`, it rescans on each `poll()`. `poll(ms)` waits until the tree has been quiet for `debounce_ms` and coalesces bursts: create + modify → created, create + remove → nothing, one event per path. FSEvents is not used on macOS. A plain kqueue `file_watcher` on a directory also rescans and reports per-name created / removed / modified events; an in-place edit of a file inside a watched directory needs `add_file()` for that file.
 
 ## Service control (`service_control.hpp`)
 A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_on_failure`, `start_at_login`, optional `dir`) becomes a per-user service:
@@ -134,7 +134,7 @@ A `service_spec` (`name`, `description`, `argv`, `working_dir`, `env`, `restart_
 
 ## Registry, devices, clipboard
 - **`registry.hpp`.** Windows only: `get` / `set` string and 64-bit integer values (`REG_SZ`, `REG_DWORD`, `REG_QWORD`), `remove_value`, `remove_key`, `list`. Every call is unsupported elsewhere.
-- **`devices.hpp`.** Read-only enumeration from sysfs on Linux and Android: `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver), `usb()` (vendor/product ids, strings, bus/devnum). Unsupported elsewhere.
+- **`devices.hpp`.** Read-only enumeration: `block()` (name, model, vendor, serial, size, removable, rotational, read-only, partitions), `pci()` (address, vendor/device/class ids, driver), `usb()` (vendor/product ids, strings, bus/devnum). Linux and Android read sysfs. Windows lists `PhysicalDriveN` disks with drive letters as partitions (storage IOCTLs, no admin needed) and PCI/USB through SetupAPI loaded at run time; USB `bus` / `devnum` are the hub number and hub port (Windows has no USB address). FreeBSD uses the GEOM sysctls, `/dev/pci` (`PCIOCGETCONF`) and the newbus device tree. macOS uses IOKit loaded at run time. Unsupported on iOS.
 - **`clipboard.hpp`.** Text get/set: Win32 clipboard on Windows, `pbcopy`/`pbpaste` on macOS, `wl-copy`/`wl-paste` or `xclip`/`xsel` on Linux and FreeBSD. Unsupported without a display or helper, and on mobile.
 
 ## Dynamic libraries (`dynlib.hpp`)
@@ -186,8 +186,8 @@ int main(int argc, char** argv) {
 
 ## Platform notes
 - **iOS.** No spawning: `spawn_wait`, `child` and `os::run` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
-- **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control, no `interfaces()`.
-- **Windows.** `CreateProcessW` + Job Objects, `ReadDirectoryChangesW`, SCM through `sc.exe`, registry. `child`, `pipe.hpp`, `kill_group` and `chown` are POSIX only.
+- **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control.
+- **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM through `sc.exe`, registry, event-log service log. `pipe.hpp`, `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error.
 - **macOS.** `RLIMIT_AS` is ignored by the kernel, so `memory_bytes` uses a resident-size watchdog. kqueue for file watching.
 - **Linux.** fork/exec, inotify, `/proc` and `/sys`.
 
@@ -195,18 +195,13 @@ int main(int argc, char** argv) {
 | Item | Today |
 |---|---|
 | `os::caps()` for the whole OS layer | Only `process_caps()`; ForgeScript `os.caps()` wraps it |
-| Process listing off Linux/Android | `list_processes` / `process_info` unsupported |
-| `child` streaming and `pipe.hpp` on Windows | POSIX only; use `spawn_wait` |
+| `pipe.hpp` on Windows | POSIX only (`child` and `local_ipc.hpp` cover the uses) |
 | Named pipes / FIFOs in `pipe.hpp`, signal-to-fd for event loops | Not present (`local_ipc.hpp` covers named pipes) |
 | cgroup v2 limits for spawned processes | rlimits, Job Objects and watchdogs instead |
-| Device enumeration on Windows / macOS (SetupAPI / IOKit) | unsupported |
-| `net::interfaces()` on Windows (GetAdaptersAddresses) and Android | unsupported |
-| `per_cpu_times` / `cpu_usage` off Linux/Android | unsupported |
-| `fs::mounts()` on macOS / FreeBSD | unsupported |
-| User lookup on Windows (by name or SID) | unsupported |
 | HTTPS in `net::http` | unsupported; use the RPC client or a TLS library |
 | FSEvents on macOS | kqueue is used instead (immediate per-file events) |
 | Fuzz target for glob/path parsing | none |
+| `load_average` on Windows, `chown` on Windows, signals other than kill/terminate on Windows, `advise_huge` on Windows/macOS, hard CPU affinity on macOS | no OS facility (see the sections above) |
 
 ## Tests
 | Test | Covers |
