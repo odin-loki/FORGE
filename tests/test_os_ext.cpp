@@ -84,21 +84,37 @@ static int run_child(const std::string& mode) {
 // ---------------------------------------------------------------- 1 NUMA
 TEST(numa) {
     auto ns = os::numa_nodes(); CHECK(!ns.empty());
-    for (auto& n : ns) std::printf("  node %u: %zu cpus, %llu MiB\n", n.id, n.cpus.size(), (unsigned long long)(n.total_bytes >> 20));
+    for (auto& n : ns) std::printf("  node %u: %zu cpus, %llu MiB, %llu MiB free\n", n.id, n.cpus.size(), (unsigned long long)(n.total_bytes >> 20), (unsigned long long)(n.free_bytes >> 20));
     CHECK(!ns[0].cpus.empty());
     auto a = os::numa_alloc(1 << 20, ns[0].id); CHECK(a);
-    if (a) { std::memset(a.value, 7, 1 << 20); int nd = os::numa_node_of_address(a.value); CHECK(nd == -1 || nd == int(ns[0].id)); os::numa_free(a.value, 1 << 20); }
+    if (a) {
+        std::memset(a.value, 7, 1 << 20); int nd = os::numa_node_of_address(a.value); std::printf("  numa_alloc(node %u) -> page on node %d\n", ns[0].id, nd);
+#if defined(_WIN32)
+        CHECK(nd >= 0 && nd < int(ns.size() + 64));   // VirtualAllocExNuma's node is a preference: a short node spills to another
+#else
+        CHECK(nd == -1 || nd == int(ns[0].id));
+#endif
+        os::numa_free(a.value, 1 << 20);
+    }
     std::thread t([&] { CHECK(os::bind_thread_to_node(ns[0].id)); int c = os::current_numa_node(); CHECK(c == -1 || c == int(ns[0].id)); }); t.join();
     CHECK(!os::bind_thread_to_node(9999));
+    int cpu = os::current_cpu();   // numbered like cpu_topology (Windows: group * 64 + number)
+    if (cpu >= 0) { bool known = false; for (auto& c : os::cpu_topology_query().cpus) known |= int(c.id) == cpu; CHECK_MSG(known, "current_cpu %d not in the topology", cpu); }
+#if defined(__linux__) || defined(_WIN32) || defined(__FreeBSD__)
+    CHECK(cpu >= 0);
+#endif
 }
 // ---------------------------------------------------------------- 2 huge pages
 TEST(huge_pages) {
     auto sz = os::huge_page_sizes(); std::printf("  sizes:"); for (auto s : sz) std::printf(" %s", os::detail::format_size(s).c_str()); std::printf(" thp=%d\n", int(os::thp_enabled()));
     auto r = os::huge_alloc(3 << 20, os::page_kind::huge_2m); CHECK(r); CHECK(r->size >= (3u << 20));
     if (r) { std::printf("  2M request -> %s\n", os::page_kind_name(r->kind)); std::memset(r->ptr, 1, r->size); os::huge_free(r.value); CHECK(!r->ptr); }
-    auto g = os::huge_alloc(1 << 20, os::page_kind::huge_1g, false);   // strict: may legitimately fail
+    auto g = os::huge_alloc(1 << 20, os::page_kind::huge_1g, false);   // strict: may legitimately fail, never degrades
     std::printf("  strict 1G -> %s\n", g ? os::page_kind_name(g->kind) : g.err.what.c_str());
-    if (g) os::huge_free(g.value);
+    if (g) { CHECK(g->kind == os::page_kind::huge_1g); std::memset(g->ptr, 1, 1 << 20); os::huge_free(g.value); }
+    auto s2 = os::huge_alloc(3 << 20, os::page_kind::huge_2m, false);
+    std::printf("  strict 2M -> %s\n", s2 ? os::page_kind_name(s2->kind) : s2.err.what.c_str());
+    if (s2) { CHECK(s2->kind == os::page_kind::huge_2m); CHECK(s2->size >= (3u << 20)); std::memset(s2->ptr, 2, s2->size); os::huge_free(s2.value); }
     auto m = os::mapping::anonymous(4 << 20); CHECK(m);
     auto a = os::advise_huge(m->data(), m->size()); if (!a) std::printf("  advise_huge: %s\n", a.err.what.c_str());
 }
@@ -146,6 +162,9 @@ TEST(cpu_topology) {
 #endif
     }); th2.join();
     CHECK(!os::pin_thread_to({}));
+    std::thread th3([] {   // ids past CPU_SETSIZE / any processor group: an error, never a stack overwrite
+        CHECK(!os::pin_thread_to({5000})); CHECK(!os::pin_thread_to({1u << 20}));
+    }); th3.join();
     CHECK(os::detail::parse_cpulist("0-2,5,7-8") == (std::vector<unsigned>{0, 1, 2, 5, 7, 8}));
 }
 // ---------------------------------------------------------------- 5 power / thermal
@@ -171,7 +190,14 @@ TEST(memory_pressure) {
     os::memory_pressure::on_trim_memory(5); CHECK(last == int(os::pressure_level::moderate));
     os::memory_pressure::on_trim_memory(20); CHECK(last == int(os::pressure_level::normal));
     mp.unsubscribe(id); int s1 = seen; mp.notify(os::pressure_level::critical); CHECK(seen == s1);
-    mp.stop();
+    CHECK(mp.monitoring());
+    mp.stop(); CHECK(!mp.monitoring());
+    // A second subscription after stop() gets a live monitor again (the wake byte of the first stop is gone).
+    for (int round = 0; round < 3; ++round) {
+        int id2 = mp.subscribe([](os::pressure_level) {}); os::sleep_ns(100000000);
+        CHECK_MSG(mp.monitoring(), "monitor dead after restart %d (source %s)", round, mp.source().c_str());
+        mp.unsubscribe(id2); mp.stop(); CHECK(!mp.monitoring());
+    }
 }
 // ---------------------------------------------------------------- 7 shared memory
 TEST(shared_memory) {
@@ -193,6 +219,16 @@ TEST(gpu_discovery) {
                                   (unsigned long long)(d.dedicated_memory >> 20), d.integrated ? " (integrated)" : "");
     if (g.empty()) std::printf("  no GPUs visible\n");
     for (auto& d : g) CHECK(!d.name.empty());
+#if defined(_WIN32)
+    for (auto& d : g) {   // DXCore answers integrated/discrete for every hardware adapter on Windows 10 2004+
+        unsigned long hi = 0, lo = 0; if (std::sscanf(d.bus.c_str(), "luid:%8lx%8lx", &hi, &lo) != 2) continue;
+        LUID l{}; l.HighPart = LONG(hi); l.LowPart = DWORD(lo);
+        int v = os::detail::dxcore_is_integrated(l); std::printf("  %s: dxcore integrated=%d\n", d.name.c_str(), v);
+        CHECK(v == -1 || v == int(d.integrated));
+    }
+#endif
+    CHECK(!os::intel_discrete_id(0x9a49)); CHECK(os::intel_discrete_id(0x56a0)); CHECK(os::intel_discrete_id(0xe20b));   // Iris Xe (TGL) / Arc A770 / Arc B580
+    CHECK(os::gpu_integrated_guess(0x8086, 0x9a49, 0, 2, 0)); CHECK(!os::gpu_integrated_guess(0x8086, 0x56a0, 3, 0, 0)); CHECK(!os::gpu_integrated_guess(0x10de, 0x2204, 1, 0, 0));
     CHECK(std::string(os::gpu_vendor_name(0x10de)) == "NVIDIA");
 }
 // ---------------------------------------------------------------- 9 local IPC
@@ -432,7 +468,7 @@ TEST(timers_and_perf) {
     if (!o) { skip("hw counters", o.err.what); o = pc.open({os::perf_event::cycles}); }
     if (o) {
         pc.start(); for (int i = 0; i < 1000000; ++i) x = x * 1.0000001 + 1e-9; auto r = pc.stop();
-        for (auto& v : r) std::printf("  [%s] %s = %llu%s\n", pc.backend(), os::perf_event_name(v.event), (unsigned long long)v.value, v.valid ? "" : " (invalid)");
+        for (auto& v : r) std::printf("  [%s] %s = %llu%s%s\n", pc.backend(), os::perf_event_name(v.event), (unsigned long long)v.value, v.valid ? "" : " (invalid)", v.scaled ? " (scaled)" : "");
         CHECK(!r.empty() && r[0].valid && r[0].value > 0);
     } else skip("cycle counter", o.err.what);
 }

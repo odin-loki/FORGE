@@ -3,15 +3,39 @@
 //   Linux/Android: /sys/devices/system/node + mbind/sched_setaffinity.  Windows: GetNumaNodeProcessorMaskEx +
 //   VirtualAllocExNuma + SetThreadGroupAffinity.  FreeBSD: vm.ndomains + cpuset_setdomain (first-touch under a
 //   domain policy).  macOS/iOS are UMA: one node, allocation is plain, binding to node 0 trivially succeeds.
+//   Windows: nodes spanning processor groups via GetNumaNodeProcessorMask2 (Windows 11 / Server 2022), the node
+//   of a page via QueryWorkingSetEx. FreeBSD: free bytes per domain from vm.domain.N.stats.free_count.
+//   total_bytes is filled where the OS reports it (Linux; one-node systems); 0 otherwise.
 #include <forge/os/detail.hpp>
+#include <forge/os/cpu_topology.hpp>
 #if defined(FORGE_OS_FREEBSD)
 #include <sys/param.h>
 #include <sys/cpuset.h>
 #include <sys/domainset.h>
+#include <sched.h>
+#elif defined(FORGE_OS_WINDOWS)
+#include <psapi.h>   // K32QueryWorkingSetEx lives in kernel32 (no psapi.lib)
 #endif
 
 namespace forge::os {
 struct numa_node { unsigned id = 0; std::vector<unsigned> cpus; std::uint64_t total_bytes = 0, free_bytes = 0; };
+#if defined(FORGE_OS_WINDOWS)
+namespace detail {
+// Every processor group of a node: GetNumaNodeProcessorMask2 where present, else the node's primary group.
+inline std::vector<GROUP_AFFINITY> numa_node_groups(USHORT node) {
+    using fn = BOOL(WINAPI*)(USHORT, PGROUP_AFFINITY, USHORT, PUSHORT);
+    static const auto f = reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetNumaNodeProcessorMask2")));
+    std::vector<GROUP_AFFINITY> v;
+    if (f) {
+        USHORT need = 0; f(node, nullptr, 0, &need);
+        if (need) { v.resize(need); if (f(node, v.data(), need, &need)) { v.resize(need); return v; } }
+        v.clear();
+    }
+    GROUP_AFFINITY ga{}; if (GetNumaNodeProcessorMaskEx(node, &ga)) v.push_back(ga);
+    return v;
+}
+}
+#endif
 
 inline std::vector<numa_node> numa_nodes() {
     std::vector<numa_node> out;
@@ -33,10 +57,9 @@ inline std::vector<numa_node> numa_nodes() {
     ULONG hi = 0;
     if (GetNumaHighestNodeNumber(&hi)) {
         for (USHORT i = 0; i <= USHORT(hi); ++i) {
-            GROUP_AFFINITY ga{};
-            if (!GetNumaNodeProcessorMaskEx(i, &ga)) continue;
+            auto gs = detail::numa_node_groups(i); if (gs.empty()) continue;
             numa_node n; n.id = i;
-            for (unsigned b = 0; b < 64; ++b) if (ga.Mask & (KAFFINITY(1) << b)) n.cpus.push_back(unsigned(ga.Group) * 64 + b);
+            for (auto& ga : gs) for (unsigned b = 0; b < 64; ++b) if (ga.Mask & (KAFFINITY(1) << b)) n.cpus.push_back(unsigned(ga.Group) * 64 + b);
             ULONGLONG avail = 0; if (GetNumaAvailableMemoryNodeEx(i, &avail)) n.free_bytes = avail;
             if (n.cpus.empty() && !n.free_bytes) continue;
             out.push_back(std::move(n));
@@ -50,6 +73,8 @@ inline std::vector<numa_node> numa_nodes() {
         if (nd > 1 && ::cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_DOMAIN, id_t(i), sizeof s, &s) == 0) {
             for (unsigned c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &s)) n.cpus.push_back(c);
         }
+        long long fc = detail::sysctl_ll(("vm.domain." + std::to_string(i) + ".stats.free_count").c_str(), -1);
+        if (fc >= 0) n.free_bytes = std::uint64_t(fc) * page_size();
         out.push_back(std::move(n));
     }
 #endif
@@ -68,10 +93,11 @@ inline int numa_node_of_cpu(unsigned cpu) {
     for (auto& n : numa_nodes()) for (auto c : n.cpus) if (c == cpu) return int(n.id);
     return -1;
 }
+// The logical CPU the calling thread runs on, numbered like cpu_topology (Windows: group * 64 + number).
 inline int current_cpu() {
 #if defined(FORGE_OS_WINDOWS)
-    return int(GetCurrentProcessorNumber());
-#elif defined(__linux__)
+    PROCESSOR_NUMBER pn{}; GetCurrentProcessorNumberEx(&pn); return int(pn.Group) * 64 + int(pn.Number);
+#elif defined(__linux__) || (defined(FORGE_OS_FREEBSD) && __FreeBSD_version >= 1300000)
     return ::sched_getcpu();
 #else
     return -1;
@@ -84,21 +110,19 @@ inline status bind_thread_to_node(unsigned node) {
     auto ns = numa_nodes(); const numa_node* n = nullptr; for (auto& x : ns) if (x.id == node) n = &x;
     if (!n) return {{}, {22, "numa: no node " + std::to_string(node)}};
 #if defined(__linux__)
-    cpu_set_t s; CPU_ZERO(&s); for (auto c : n->cpus) CPU_SET(c, &s);
-    if (::sched_setaffinity(0, sizeof s, &s)) return {{}, last_error("sched_setaffinity")};
-    return {};
+    return pin_thread_to(n->cpus);   // bounds-checked, CPU_ALLOC beyond CPU_SETSIZE
 #elif defined(FORGE_OS_WINDOWS)
-    GROUP_AFFINITY ga{};
-    if (GetNumaNodeProcessorMaskEx(USHORT(node), &ga) && ga.Mask && SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return {};
+    // A thread's affinity lives in one processor group: a node spanning groups binds to its first one.
+    for (auto& ga : detail::numa_node_groups(USHORT(node))) if (ga.Mask && SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return {};
     DWORD_PTR m = 0; for (auto c : n->cpus) if (c < sizeof(DWORD_PTR) * 8) m |= DWORD_PTR(1) << c;   // group-0 fallback (wine, old kernels)
     if (m && SetThreadAffinityMask(GetCurrentThread(), m)) return {};
     return {{}, last_error("SetThreadAffinityMask")};
 #elif defined(FORGE_OS_FREEBSD)
     if (ns.size() > 1) {
+        if (node >= DOMAINSET_SETSIZE) return {{}, {22, "numa: node out of range"}};
         domainset_t d; DOMAINSET_ZERO(&d); DOMAINSET_SET(node, &d);
         if (::cpuset_setdomain(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof d, &d, DOMAINSET_POLICY_PREFER)) return {{}, last_error("cpuset_setdomain")};
-        cpuset_t s; CPU_ZERO(&s); for (auto c : n->cpus) CPU_SET(c, &s);
-        if (!n->cpus.empty() && ::cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof s, &s)) return {{}, last_error("cpuset_setaffinity")};
+        if (!n->cpus.empty()) return pin_thread_to(n->cpus);
     }
     return {};
 #else
@@ -143,14 +167,18 @@ inline void numa_free(void* p, std::size_t n) {
     ::munmap(p, n);
 #endif
 }
-// Which node backs the page at p (Linux: move_pages query); -1 when unknown.
+// Which node backs the page at p (Linux: move_pages; Windows: QueryWorkingSetEx); -1 when unknown or the page is
+// not resident (touch it first).
 inline int numa_node_of_address(const void* p) {
 #if defined(__linux__)
     void* pages[1] = {const_cast<void*>(p)}; int st[1] = {-1};
     if (::syscall(SYS_move_pages, 0, 1ul, pages, nullptr, st, 0)) return -1;
     return st[0] < 0 ? -1 : st[0];
 #elif defined(FORGE_OS_WINDOWS)
-    (void)p; return -1;
+    PSAPI_WORKING_SET_EX_INFORMATION w{}; w.VirtualAddress = const_cast<void*>(p);
+    if (!K32QueryWorkingSetEx(GetCurrentProcess(), &w, sizeof w)) return -1;
+    auto bits = std::uint64_t(w.VirtualAttributes.Flags);   // Valid:1 ShareCount:3 Win32Protection:11 Shared:1 Node:6
+    return (bits & 1) ? int((bits >> 16) & 0x3f) : -1;
 #else
     (void)p; return numa_node_count() == 1 ? 0 : -1;
 #endif

@@ -47,22 +47,22 @@ The work is split by file ownership so changes can proceed in parallel without c
 | B16 | D | Tests: non-ASCII paths, classify tables, IOCP errors, handle reuse, shm collisions, timezone, console |
 
 ### W1-C: system, hardware, network, watching (`net.hpp`, `sysinfo.hpp`, `cpu_topology.hpp`, `numa.hpp`, `hugepages.hpp`, `memory_pressure.hpp`, `power.hpp`, `perf.hpp`, `gpu_devices.hpp`, `devices.hpp`, `clipboard.hpp`, `dynlib.hpp`, `file_watch.hpp`, `file_watch_tree.hpp`)
-| ID | Cat | Item |
-|---|---|---|
-| C1 | C | `net::http`: CR/LF/NUL injection in method, path, headers; credentials copied across redirect origins; IPv6 `Host`; relative redirects |
-| C2 | C | `net::http`: truncated bodies returned as success; no overall deadline; repeated `Set-Cookie` merged |
-| C3 | C | `CPU_SET` without bounds (`pin_thread_to`, `bind_thread_to_node`) on Linux and FreeBSD |
-| C4 | C | `memory_pressure`: dead monitor after stop/subscribe; Windows event leak; Apple dispatch source never cancelled |
-| C5 | C | Windows clipboard reads unterminated foreign data; no retry on contention |
-| C6 | C | System DLLs loaded through the default search order (use `LoadLibraryExW` + `LOAD_LIBRARY_SEARCH_SYSTEM32`) |
-| C7 | C | FreeBSD partition prefix match; `gpu_devices` PCI batch; Windows `current_cpu` group-relative; hugepages privilege race; perf timer handle leak |
-| C8 | C | `file_watch`: >64 Windows directories silently dead; overflow dropped; case-sensitive names on Windows; kqueue fd exhaustion; tree watcher symlink loops |
-| C9 | B | MSVC: no rdtsc/cpuid (`cycle_counter` in ns, empty CPU brand) |
-| C10 | B | `sysinfo::memory`: swap 0 on macOS/FreeBSD, Windows free = available, Linux root cgroup only; Windows `self_usage` peak RSS/faults; Windows 11 version |
-| C11 | B | `gpu_devices` integrated/VRAM heuristics; `power` thermal/throttle/charging/multi-battery heuristics; perf hybrid PMUs and multiplexing |
-| C12 | B | Clipboard: macOS UTF-8, X11 empty selection; `dlvsym` on FreeBSD/bionic; Linux PSI in containers |
-| C13 | A | perf: macOS `proc_pid_rusage` cycles/instructions, FreeBSD libpmc; numa on Windows/FreeBSD; hugepages Windows 1G and FreeBSD largepage shm |
-| C14 | D | Tests for each of the above |
+| ID | Cat | Item | Status |
+|---|---|---|---|
+| C1 | C | `net::http`: CR/LF/NUL injection in method, path, headers; credentials copied across redirect origins; IPv6 `Host`; relative redirects | fixed 2702fd4: CR/LF/NUL rejected, credential headers dropped across origins, bracketed IPv6, RFC 3986 `resolve_reference` |
+| C2 | C | `net::http`: truncated bodies returned as success; no overall deadline; repeated `Set-Cookie` merged | fixed 2702fd4, 5038e80: short/unterminated/bad-chunk bodies are errors; `deadline_ms` (default 5 min); `header_list` keeps repeats |
+| C3 | C | `CPU_SET` without bounds (`pin_thread_to`, `bind_thread_to_node`) on Linux and FreeBSD | fixed 2bbe188: bounds-checked (dynamic sets for large ids) |
+| C4 | C | `memory_pressure`: dead monitor after stop/subscribe; Windows event leak; Apple dispatch source never cancelled | fixed 3f4a547: pipe drained, event reused, dispatch source cancelled; `monitoring()` |
+| C5 | C | Windows clipboard reads unterminated foreign data; no retry on contention | fixed 3b6241b: bounded by `GlobalSize`, `OpenClipboard` retried |
+| C6 | C | System DLLs loaded through the default search order (use `LoadLibraryExW` + `LOAD_LIBRARY_SEARCH_SYSTEM32`) | fixed 2702fd4, 3b6241b (os.hpp copy fixed by W1-B) |
+| C7 | C | FreeBSD partition prefix match; `gpu_devices` PCI batch; Windows `current_cpu` group-relative; hugepages privilege race; perf timer handle leak | fixed 3b6241b, 2bbe188 |
+| C8 | C | `file_watch`: >64 Windows directories silently dead; overflow dropped; case-sensitive names on Windows; kqueue fd exhaustion; tree watcher symlink loops | fixed 63b7840: one IOCP, `overflow` + rescan, case-insensitive, kqueue cap → polling, loop detection by file id |
+| C9 | B | MSVC: no rdtsc/cpuid (`cycle_counter` in ns, empty CPU brand) | fixed 2bbe188 (`__rdtsc`/`__cpuid`; MSVC ARM64 still ns) |
+| C10 | B | `sysinfo::memory`: swap 0 on macOS/FreeBSD, Windows free = available, Linux root cgroup only; Windows `self_usage` peak RSS/faults; Windows 11 version | fixed 3f4a547 |
+| C11 | B | `gpu_devices` integrated/VRAM heuristics; `power` thermal/throttle/charging/multi-battery heuristics; perf hybrid PMUs and multiplexing | fixed 3b6241b, 2bbe188; AMD APU and MhzLimit checks stay heuristics |
+| C12 | B | Clipboard: macOS UTF-8, X11 empty selection; `dlvsym` on FreeBSD/bionic; Linux PSI in containers | fixed 3b6241b, 3f4a547 |
+| C13 | A | perf: macOS `proc_pid_rusage` cycles/instructions, FreeBSD libpmc; numa on Windows/FreeBSD; hugepages Windows 1G and FreeBSD largepage shm | fixed 2bbe188; per-node `total_bytes` 0 on multi-node Windows/FreeBSD (no API) |
+| C14 | D | Tests for each of the above | fixed (tests in each commit) |
 
 ### W1-D: services, keystore, users, settings, registry, background (`keystore.hpp`, `service.hpp`, `service_control.hpp`, `background.hpp`, `users.hpp`, `registry.hpp`, `settings.hpp`)
 | ID | Cat | Item |

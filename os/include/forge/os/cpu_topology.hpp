@@ -3,8 +3,11 @@
 // classification (Intel hybrid via sysfs cpu_core/cpu_atom or Windows EfficiencyClass; ARM big.LITTLE via
 // cpu_capacity / max frequency; Apple via hw.perflevelN).  Plus pinning helpers for P- or E-cores.
 #include <forge/os/detail.hpp>
-#if (defined(__x86_64__) || defined(__i386__) || defined(_M_X64)) && !defined(_MSC_VER)
+#if (defined(__x86_64__) || defined(__i386__)) && !defined(_MSC_VER)
 #include <cpuid.h>
+#define FORGE_OS_HAVE_CPUID 1
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
 #define FORGE_OS_HAVE_CPUID 1
 #endif
 #if defined(FORGE_OS_FREEBSD)
@@ -28,10 +31,21 @@ struct cpu_topology {
     }
 };
 namespace detail {
+#if defined(FORGE_OS_HAVE_CPUID)
+// cpuid(leaf, subleaf) for GCC/Clang (<cpuid.h>) and MSVC (<intrin.h>).
+inline void cpuid(unsigned leaf, unsigned sub, unsigned& a, unsigned& b, unsigned& c, unsigned& d) {
+#if defined(_MSC_VER)
+    int r[4] = {}; __cpuidex(r, int(leaf), int(sub)); a = unsigned(r[0]); b = unsigned(r[1]); c = unsigned(r[2]); d = unsigned(r[3]);
+#else
+    __cpuid_count(leaf, sub, a, b, c, d);
+#endif
+}
+inline unsigned cpuid_max(unsigned base) { unsigned a, b, c, d; cpuid(base, 0, a, b, c, d); return a; }
+#endif
 inline std::string cpu_brand() {
 #if defined(FORGE_OS_HAVE_CPUID)
-    unsigned r[12] = {}; unsigned a, b, c, d; if (!__get_cpuid(0x80000000, &a, &b, &c, &d) || a < 0x80000004) return {};
-    for (unsigned i = 0; i < 3; ++i) __get_cpuid(0x80000002 + i, &r[i * 4], &r[i * 4 + 1], &r[i * 4 + 2], &r[i * 4 + 3]);
+    unsigned r[12] = {}; if (cpuid_max(0x80000000) < 0x80000004) return {};
+    for (unsigned i = 0; i < 3; ++i) cpuid(0x80000002 + i, 0, r[i * 4], r[i * 4 + 1], r[i * 4 + 2], r[i * 4 + 3]);
     return trim(std::string(reinterpret_cast<char*>(r), 48).c_str());
 #elif defined(__APPLE__) || defined(FORGE_OS_FREEBSD)
     auto s = sysctl_str("machdep.cpu.brand_string"); return s.empty() ? sysctl_str("hw.model") : s;
@@ -45,14 +59,14 @@ inline std::string cpu_brand() {
 }
 #if defined(FORGE_OS_HAVE_CPUID)
 inline void cpuid_caches(std::vector<cpu_cache>& out) {   // deterministic cache parameters (Intel leaf 4 / AMD 0x8000001D)
-    unsigned a, b, c, d; __get_cpuid(0, &a, &b, &c, &d); bool amd = b == 0x68747541; unsigned max_std = a;
-    unsigned max_ext = __get_cpuid_max(0x80000000, nullptr);
+    unsigned a, b, c, d; cpuid(0, 0, a, b, c, d); bool amd = b == 0x68747541; unsigned max_std = a;
+    unsigned max_ext = cpuid_max(0x80000000);
     unsigned leaf = amd ? 0x8000001D : 4;
     std::size_t first = out.size();
     // Only walk the deterministic leaf when the CPU reports it (QEMU's qemu64 is "AMD" without 0x8000001D/topoext).
     bool have = amd ? max_ext >= 0x8000001D : max_std >= 4;
     for (unsigned i = 0; have && i < 16; ++i) {
-        __cpuid_count(leaf, i, a, b, c, d); unsigned t = a & 31; if (!t) break;
+        cpuid(leaf, i, a, b, c, d); unsigned t = a & 31; if (!t) break;
         cpu_cache k; k.level = (a >> 5) & 7; k.type = t == 1 ? 'D' : t == 2 ? 'I' : 'U';
         k.line = (b & 0xfff) + 1; k.size = std::uint64_t(((b >> 22) & 0x3ff) + 1) * (((b >> 12) & 0x3ff) + 1) * k.line * (c + 1);
         out.push_back(k);
@@ -60,9 +74,9 @@ inline void cpuid_caches(std::vector<cpu_cache>& out) {   // deterministic cache
     if (out.size() > first || max_ext < 0x80000006) return;
     // Legacy AMD-style leaves (also filled by QEMU/TCG CPU models): L1D/L1I from 0x80000005, L2/L3 from 0x80000006.
     auto add = [&](unsigned lvl, char ty, std::uint64_t bytes, unsigned line) { if (bytes) { cpu_cache k; k.level = lvl; k.type = ty; k.size = bytes; k.line = line ? line : 64; out.push_back(k); } };
-    __get_cpuid(0x80000005, &a, &b, &c, &d);
+    cpuid(0x80000005, 0, a, b, c, d);
     add(1, 'D', std::uint64_t(c >> 24) << 10, c & 0xff); add(1, 'I', std::uint64_t(d >> 24) << 10, d & 0xff);
-    __get_cpuid(0x80000006, &a, &b, &c, &d);
+    cpuid(0x80000006, 0, a, b, c, d);
     add(2, 'U', std::uint64_t(c >> 16) << 10, c & 0xff); add(3, 'U', std::uint64_t(d >> 18) * 512 * 1024, d & 0xff);
 }
 #endif
@@ -180,12 +194,17 @@ inline cpu_topology cpu_topology_query() {
     return t;
 }
 
-// Restrict the calling thread to a set of logical CPUs.
+// Restrict the calling thread to a set of logical CPUs. Ids past what the kernel's mask can hold are EINVAL.
 inline status pin_thread_to(const std::vector<unsigned>& cpus) {
     if (cpus.empty()) return {{}, {22, "pin_thread_to: empty set"}};
 #if defined(__linux__)
-    cpu_set_t s; CPU_ZERO(&s); for (auto c : cpus) CPU_SET(c, &s);
-    if (::sched_setaffinity(0, sizeof s, &s)) return {{}, last_error("sched_setaffinity")};
+    unsigned hi = 0; for (auto c : cpus) hi = std::max(hi, c);
+    if (hi >= (1u << 16)) return {{}, {22, "pin_thread_to: cpu " + std::to_string(hi) + " out of range"}};
+    std::size_t n = std::max<std::size_t>(CPU_SETSIZE, hi + 1), sz = CPU_ALLOC_SIZE(n);   // a dynamic set beyond CPU_SETSIZE
+    cpu_set_t* s = CPU_ALLOC(n); if (!s) return {{}, {12, "pin_thread_to: CPU_ALLOC"}};
+    CPU_ZERO_S(sz, s); for (auto c : cpus) CPU_SET_S(c, sz, s);
+    int rc = ::sched_setaffinity(0, sz, s); auto e = rc ? last_error("sched_setaffinity") : error{}; CPU_FREE(s);
+    if (rc) return {{}, e};
     return {};
 #elif defined(FORGE_OS_WINDOWS)
     // cpu id = group * 64 + bit (as cpu_topology_query numbers them); a thread's affinity lives in one processor group.
@@ -194,7 +213,8 @@ inline status pin_thread_to(const std::vector<unsigned>& cpus) {
     if (!SetThreadGroupAffinity(GetCurrentThread(), &ga, nullptr)) return {{}, last_error("SetThreadGroupAffinity")};
     return {};
 #elif defined(FORGE_OS_FREEBSD)
-    cpuset_t s; CPU_ZERO(&s); for (auto c : cpus) CPU_SET(c, &s);
+    cpuset_t s; CPU_ZERO(&s);
+    for (auto c : cpus) { if (c >= CPU_SETSIZE) return {{}, {22, "pin_thread_to: cpu " + std::to_string(c) + " out of range"}}; CPU_SET(c, &s); }
     if (::cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof s, &s)) return {{}, last_error("cpuset_setaffinity")};
     return {};
 #else

@@ -531,7 +531,7 @@ public:
             if (s.type == dynlib_symbol::kind::tls) continue;
             if (!s.indirect) s.address = reinterpret_cast<void*>(b + std::uintptr_t(s.value));
             else if (s.default_version) s.address = symbol(s.name);   // let the loader run the resolver
-#if defined(__GLIBC__)
+#if defined(__GLIBC__) || defined(__FreeBSD__) || (defined(__ANDROID__) && __ANDROID_API__ >= 24)   // dlvsym: glibc, FreeBSD libc, bionic 24+
             else s.address = ::dlvsym(native(), s.name.c_str(), s.version.c_str());
 #endif
         }

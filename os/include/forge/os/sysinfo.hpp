@@ -20,6 +20,7 @@
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/user.h>
+#include <vm/vm_param.h>   // struct xswdev
 #endif
 
 namespace forge::os {
@@ -54,7 +55,10 @@ inline os_release release_info() {
     using rtl_t = LONG(WINAPI*)(OSVERSIONINFOW*);
     if (auto m = GetModuleHandleW(L"ntdll.dll")) if (auto f = reinterpret_cast<rtl_t>(reinterpret_cast<void*>(GetProcAddress(m, "RtlGetVersion")))) {
         OSVERSIONINFOW v{}; v.dwOSVersionInfoSize = sizeof v;
-        if (f(&v) == 0) { r.version = std::to_string(v.dwMajorVersion) + "." + std::to_string(v.dwMinorVersion); r.kernel_version = r.version + "." + std::to_string(v.dwBuildNumber); }
+        if (f(&v) == 0) {   // marketing version: NT 10.0 is Windows 10 below build 22000 and Windows 11 from it
+            std::string nt = std::to_string(v.dwMajorVersion) + "." + std::to_string(v.dwMinorVersion); r.kernel_version = nt + "." + std::to_string(v.dwBuildNumber);
+            r.version = v.dwMajorVersion == 10 ? (v.dwBuildNumber >= 22000 ? "11" : "10") : nt == "6.3" ? "8.1" : nt == "6.2" ? "8" : nt == "6.1" ? "7" : nt;
+        }
     }
     SYSTEM_INFO si{}; GetNativeSystemInfo(&si);
     r.arch = si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? "x86_64" : si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? "aarch64" : "x86";
@@ -91,7 +95,32 @@ inline result<load_avg> load_average() {
 #endif
 }
 
+#if defined(__linux__)
+namespace detail {
+// The calling process's cgroup directory: v2 ("0::/path" in /proc/self/cgroup) under /sys/fs/cgroup, or for v1
+// the memory controller's ("N:memory:/path") under /sys/fs/cgroup/memory. Inside a container without a cgroup
+// namespace the host path does not exist there; the mount root (the container's own cgroup) is used instead.
+// "" when neither hierarchy is mounted.
+inline std::string cgroup_dir_(bool v2, const std::string& self = "/proc/self/cgroup") {
+    std::string root = v2 ? "/sys/fs/cgroup" : "/sys/fs/cgroup/memory", probe = v2 ? "/memory.max" : "/memory.limit_in_bytes";
+    std::ifstream f(self); std::string line, rel; bool found = false;
+    while (std::getline(f, line)) {
+        auto a = line.find(':'), b = a == std::string::npos ? a : line.find(':', a + 1); if (b == std::string::npos) continue;
+        auto ctl = line.substr(a + 1, b - a - 1); bool hit = v2 ? line.compare(0, a, "0") == 0 && ctl.empty() : ("," + ctl + ",").find(",memory,") != std::string::npos;
+        if (hit) { rel = line.substr(b + 1); found = true; break; }
+    }
+    std::string d = root + (rel == "/" ? "" : rel);
+    if (found && os::stat(d + probe).exists) return d;
+    if (os::stat(root + probe).exists || (v2 && os::stat(root + "/cgroup.controllers").exists)) return root;
+    return {};
+}
+inline std::string cgroup2_dir() { return cgroup_dir_(true); }
+inline std::uint64_t cg_read_(const std::string& p) { std::ifstream g(p); std::string s; if (!(g >> s) || s == "max") return 0; return std::strtoull(s.c_str(), nullptr, 10); }
+}
+#endif
 struct memory_info { std::uint64_t total = 0, available = 0, free = 0, swap_total = 0, swap_free = 0, cgroup_limit = 0, cgroup_usage = 0; };
+// free: memory nobody uses (no cache); available: what can be had without swapping (free + reclaimable cache).
+// cgroup_limit: the tightest memory.max on the path from this process's cgroup to the root (0 = none).
 inline memory_info memory() {
     memory_info m; m.total = total_memory();
 #if defined(__linux__)
@@ -101,12 +130,47 @@ inline memory_info memory() {
         if (k == "MemAvailable:") m.available = v; else if (k == "MemFree:") m.free = v;
         else if (k == "SwapTotal:") m.swap_total = v; else if (k == "SwapFree:") m.swap_free = v;
     }
-    auto rd = [](const char* p) -> std::uint64_t { std::ifstream g(p); std::string s; if (!(g >> s) || s == "max") return 0; return std::strtoull(s.c_str(), nullptr, 10); };
-    m.cgroup_limit = rd("/sys/fs/cgroup/memory.max"); m.cgroup_usage = rd("/sys/fs/cgroup/memory.current");
-    if (!m.cgroup_limit) { auto l = rd("/sys/fs/cgroup/memory/memory.limit_in_bytes"); if (l && l < (1ull << 60)) m.cgroup_limit = l; m.cgroup_usage = rd("/sys/fs/cgroup/memory/memory.usage_in_bytes"); }
+    if (auto d = detail::cgroup_dir_(true); !d.empty()) {
+        m.cgroup_usage = detail::cg_read_(d + "/memory.current");
+        for (std::string p = d; p.size() >= 14 && p.rfind("/sys/fs/cgroup", 0) == 0; p = p.substr(0, p.rfind('/'))) {   // walk up to the mount root
+            auto l = detail::cg_read_(p + "/memory.max"); if (l && (!m.cgroup_limit || l < m.cgroup_limit)) m.cgroup_limit = l;
+            if (p == "/sys/fs/cgroup") break;
+        }
+    } else if (auto d1 = detail::cgroup_dir_(false); !d1.empty()) {
+        auto l = detail::cg_read_(d1 + "/memory.limit_in_bytes"); if (l && l < (1ull << 60)) m.cgroup_limit = l;
+        m.cgroup_usage = detail::cg_read_(d1 + "/memory.usage_in_bytes");
+    }
 #elif defined(FORGE_OS_WINDOWS)
     MEMORYSTATUSEX s{}; s.dwLength = sizeof s;
     if (GlobalMemoryStatusEx(&s)) { m.available = m.free = s.ullAvailPhys; m.swap_total = s.ullTotalPageFile - s.ullTotalPhys; m.swap_free = s.ullAvailPageFile > s.ullAvailPhys ? s.ullAvailPageFile - s.ullAvailPhys : 0; }
+    // Free = zeroed + free page lists (SystemMemoryListInformation; may need SeProfileSingleProcessPrivilege),
+    // else available minus the standby/system cache (K32GetPerformanceInfo).
+    struct mem_lists { ULONG_PTR zero, free, modified, modified_nowrite, bad, standby[8], repurposed[8], modified_pagefile; } ml{};
+    using nqsi = LONG(WINAPI*)(int, void*, ULONG, ULONG*);
+    auto q = reinterpret_cast<nqsi>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation")));
+    PERFORMANCE_INFORMATION pi{}; pi.cb = sizeof pi;
+    if (q && q(80 /*SystemMemoryListInformation*/, &ml, sizeof ml, nullptr) >= 0 && (ml.zero || ml.free)) m.free = std::uint64_t(ml.zero + ml.free) * page_size();
+    else if (K32GetPerformanceInfo(&pi, sizeof pi)) { std::uint64_t cache = std::uint64_t(pi.SystemCache) * pi.PageSize; m.free = m.available > cache ? m.available - cache : 0; }
+#elif defined(__APPLE__)
+    m.available = available_memory();
+    vm_statistics64_data_t vs{}; mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vs), &n) == KERN_SUCCESS) m.free = std::uint64_t(vs.free_count) * page_size();
+    else m.free = m.available;
+    xsw_usage sw{}; std::size_t sn = sizeof sw;
+    if (::sysctlbyname("vm.swapusage", &sw, &sn, nullptr, 0) == 0) { m.swap_total = sw.xsu_total; m.swap_free = sw.xsu_avail; }
+#elif defined(FORGE_OS_FREEBSD)
+    m.available = available_memory();
+    u_int fc = 0; std::size_t fcn = sizeof fc;
+    m.free = ::sysctlbyname("vm.stats.vm.v_free_count", &fc, &fcn, nullptr, 0) == 0 ? std::uint64_t(fc) * page_size() : m.available;
+    // Swap without libkvm: vm.swap_info.<n> is one struct xswdev per swap device (block counts in pages).
+    int mib[16]; std::size_t ml = 16 - 1;
+    if (::sysctlnametomib("vm.swap_info", mib, &ml) == 0) {
+        for (int i = 0;; ++i) {
+            mib[ml] = i; xswdev x{}; std::size_t xn = sizeof x;
+            if (::sysctl(mib, unsigned(ml + 1), &x, &xn, nullptr, 0)) break;   // ENOENT past the last device
+            m.swap_total += std::uint64_t(x.xsw_nblks) * page_size(); m.swap_free += std::uint64_t(x.xsw_nblks - x.xsw_used) * page_size();
+        }
+    }
 #else
     m.available = m.free = available_memory();
 #endif
@@ -192,7 +256,10 @@ inline result<process_usage> self_usage() {
 #else
     FILETIME c, e, k, us; if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &us)) return {{}, last_error("GetProcessTimes")};
     auto s = [](FILETIME f) { return double((std::uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime) / 1e7; };
-    process_usage u; u.user_s = s(us); u.system_s = s(k); return {u, {}};
+    process_usage u; u.user_s = s(us); u.system_s = s(k);
+    PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;   // Windows counts soft and hard faults together: minor_faults
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) { u.max_rss = std::uint64_t(pmc.PeakWorkingSetSize); u.minor_faults = long(pmc.PageFaultCount); }
+    return {u, {}};
 #endif
 }
 // Resident set size of this process now, in bytes (0 if unknown). Linux/Android: /proc/self/statm;

@@ -35,6 +35,27 @@ TEST(devices_enumerate) {
     CHECK(!b ? os::is_unsupported(b.err) : true);
 #endif
 }
+TEST(freebsd_geom_partitions) {   // fixture: ada1 must not claim ada10's partitions, MBR slices and BSD labels count
+    const char* conftxt =
+        "0 DISK ada1 21474836480 512 hd 16 sc 63\n"
+        "1 PART ada1p1 524288 512 i 1 o 20480 ty freebsd-boot xs GPT xt 83bd6b9d\n"
+        "1 PART ada1p2 21474000000 512 i 2 o 544768 ty freebsd-ufs xs GPT xt 516e7cb6\n"
+        "0 DISK ada10 1000204886016 512 hd 16 sc 63\n"
+        "1 PART ada10p1 1000204000000 512 i 1 o 40960 ty freebsd-zfs xs GPT xt 516e7cba\n"
+        "0 DISK da0 8053063680 512 hd 255 sc 63\n"
+        "1 PART da0s1 8053000000 512 i 1 o 32256 ty freebsd xs MBR xt 165\n"
+        "2 PART da0s1a 8000000000 512 i 1 o 0 ty freebsd-ufs xs BSD xt 7\n"
+        "0 DISK nvd0 512110190592 512 hd 0 sc 0\n"
+        "1 PART nvd0p1 209715200 512 i 1 o 20480 ty efi xs GPT xt c12a7328\n"
+        "0 DISK cd0 0 2048 hd 0 sc 0\n";
+    auto v = os::devices::geom_conftxt_disks(conftxt);
+    CHECK(v.size() == 5); if (v.size() != 5) return;
+    CHECK(v[0].name == "ada1" && v[0].size_bytes == 21474836480ull); CHECK((v[0].partitions == std::vector<std::string>{"ada1p1", "ada1p2"}));
+    CHECK(v[1].name == "ada10"); CHECK((v[1].partitions == std::vector<std::string>{"ada10p1"}));
+    CHECK((v[2].partitions == std::vector<std::string>{"da0s1", "da0s1a"}));
+    CHECK((v[3].partitions == std::vector<std::string>{"nvd0p1"})); CHECK(v[4].partitions.empty());
+    CHECK(!os::devices::geom_partition_of("ada1", "ada10p1")); CHECK(!os::devices::geom_partition_of("da0", "da0p")); CHECK(os::devices::geom_partition_of("da0", "da0s2"));
+}
 TEST(clipboard_roundtrip_or_unsupported) {
     if (!os::clipboard::available()) { CHECK(os::is_unsupported(os::clipboard::get().err)); return; }
     auto old = os::clipboard::get();
