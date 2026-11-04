@@ -561,7 +561,7 @@ public:
                     q81_src_ = xd; q81_n_ = nb;
                 } else ++dispatches_["quant_q81_reused"];
                 void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-                unsigned grid = ((cols + 3) / 4) * ((rows + 3) / 4);   // a warp per column, 4 columns per block
+                unsigned grid = cols * ((rows + 3) / 4);   // a 4-warp block per column (and 4 activation rows)
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
                 q81_keep_ = false;
                 if (yd < xd + std::uint64_t(nb) * 128 && xd < yd + std::uint64_t(out.size()) * 4) q81_drop();   // y overwrote the source
@@ -721,7 +721,8 @@ public:
             std::uint32_t fnb = 0; std::uint64_t qx = 0;
             if (in_run_ && fuse_q81() && use_mmvq() && rows < mmq_min_rows()) {
                 if (s == sig::rms && cols % 32 == 0 && has_fn_locked("forge_rms_norm_q81")) {
-                    fn = function("forge_rms_norm_q81"); fnb = rows * (cols / 32); }
+                    fn = function("forge_rms_norm_q81"); fnb = rows * (cols / 32);
+                    if (rows <= 4 && cols >= 2048) block = 1024; }   // one wide row: a 1024-thread block
                 else if (op == "silu_mul" && n % 32 == 0 && n <= (1u << 18) && has_fn_locked("forge_silu_mul_q81")) {
                     fn = function("forge_silu_mul_q81"); fnb = n / 32; block = 256; grid = (fnb + 7) / 8; }
                 if (fnb) { q81_reserve(std::size_t(fnb) * 40); qx = q81_; args.push_back(&qx); ++dispatches_["fused_q81"]; }

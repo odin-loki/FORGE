@@ -240,7 +240,7 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     if (!strcmp(op, "copy_words")) { unsigned n = ARG(2, unsigned); if (gx * bx < n) return 1; memmove(P(ARG(1, dptr)), P(ARG(0, dptr)), (size_t)n * 4); return 0; }
     if (!strcmp(op, "rms_norm_q81")) { float *x = P(ARG(0, dptr)), *w = P(ARG(1, dptr)), *y = P(ARG(2, dptr));
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), r, j; float eps = ARG(5, float);
-        if (gx != rows || bx != 256 || cols % 32u) return 1;
+        if (gx != rows || (bx != 256 && bx != 1024) || cols % 32u) return 1;   /* 1024 threads for one wide row */
         for (r = 0; r < rows; ++r) { float s = 0; for (j = 0; j < cols; ++j) s += x[r * cols + j] * x[r * cols + j];
             float inv = 1.0f / sqrtf(s / (float)cols + eps); for (j = 0; j < cols; ++j) y[r * cols + j] = x[r * cols + j] * inv * w[j]; }
         mock_q81(y, (unsigned char*)(uintptr_t)ARG(6, dptr), rows * (cols / 32u)); return 0; }

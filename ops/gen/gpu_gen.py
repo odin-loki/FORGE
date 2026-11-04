@@ -264,12 +264,16 @@ FORGE_DEV unsigned bid_() { return __builtin_amdgcn_workgroup_id_x(); }
 FORGE_DEV unsigned tid_() { return __builtin_amdgcn_workitem_id_x(); }
 FORGE_DEV void bar_() { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup"); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"); }
 #endif
+#if defined(__NVPTX__)
+FORGE_DEV float h2f(unsigned h) { float f; unsigned short x = (unsigned short)h; asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(x)); return f; }   // exact, one instruction
+#else
 FORGE_DEV float h2f(unsigned h) {
   unsigned s = (h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u, b;
   if (e == 0u) { if (m == 0u) b = s; else { e = 113u; while (!(m & 1024u)) { m <<= 1; --e; } m &= 1023u; b = s | (e << 23) | (m << 13); } }
   else if (e == 31u) b = s | 0x7f800000u | (m << 13);
   else b = s | ((e + 112u) << 23) | (m << 13);
   return __builtin_bit_cast(float, b); }
+#endif
 FORGE_DEV unsigned ld16(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
 FORGE_DEV void scmin(unsigned j, const unsigned char* q, unsigned* d, unsigned* m) {
   if (j < 4u) { *d = q[j] & 63u; *m = q[j + 4u] & 63u; }
@@ -319,7 +323,6 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
   unsigned nr = rows - r0 < 4u ? rows - r0 : 4u;
   if (fmt == 2u) {   // q4_k: a warp per 256-value super-block, lane = 4 bytes = 8 values (two groups' nibbles)
     unsigned j = l >> 3, o = (l & 7u) * 4u;
-#pragma unroll 2
     for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
       const unsigned char* b = row + sb * 144u;
       float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned s0, m0, s1, m1;
@@ -334,7 +337,6 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
         acc[rr] = sacc; } }
   } else if (fmt == 3u) {   // q6_k: a warp per 210-byte super-block; lane = 4 ql bytes (byte loads: blocks are not 4-aligned)
     unsigned h = l >> 4, p = (l & 15u) * 4u, tb = p >= 32u ? 1u : 0u, lo0 = p & 31u;
-#pragma unroll 2
     for (unsigned sb = t >> 5; sb < k / 256u; sb += 4u) {
       const unsigned char* b = row + sb * 210u;
       const unsigned char* ql = b + 64u * h + p; const unsigned char* qh = b + 128u + 32u * h + lo0;
@@ -350,7 +352,6 @@ FORGE_GLOBAL void forge_qmatmul_t(const float* a, const unsigned char* w, float*
         for (unsigned i = 0; i < 4u; ++i) { sacc = fma_(ap[32u * tb + i], vA[i], sacc); sacc = fma_(ap[32u * (tb + 2u) + i], vB[i], sacc); }
         acc[rr] = sacc; } }
   } else
-#pragma unroll 4
   for (unsigned g = t >> 5; g < k / 32u; g += 4u) {   // 4 warps, one group each; lane l owns element l
     float v = qelem(fmt, row, g, l);
     for (unsigned rr = 0; rr < nr; ++rr) acc[rr] = fma_(a[(unsigned long long)(r0 + rr) * k + g * 32u + l], v, acc[rr]); }
@@ -375,13 +376,17 @@ FORGE_DEV void q81_put(float v, unsigned l, unsigned char* b) {   // one 32-valu
 // Fused decode producers: write y as the unfused kernel does and also its q8_1 blocks into xq, so the matmul that
 // consumes y skips forge_quant_q81 (bit-identical: the blocks are quantised from the same float values).
 FORGE_GLOBAL void forge_rms_norm_q81(const float* x, const float* w, float* y, unsigned rows, unsigned cols, float eps, unsigned char* xq) {
-  __attribute__((shared)) float red[256];
-  unsigned t = tid_(), r = bid_(), l = t & 31u; const float* xr = x + (unsigned long long)r * cols; float s = 0.0f;
-  for (unsigned j = t; j < cols; j += 256u) s = fma_(xr[j], xr[j], s);
-  red[t] = s; bar_();
-  for (unsigned st = 128u; st > 0u; st >>= 1) { if (t < st) red[t] += red[t + st]; bar_(); }
-  float inv = 1.0f / fsqrt(red[0] / (float)cols + eps); unsigned nb = cols / 32u;
-  for (unsigned b = t >> 5; b < nb; b += 8u) {
+  // any block size (256 per row, 1024 for one wide row): per-warp sums by shuffles, one barrier across the warps
+  __attribute__((shared)) float red[32];
+  unsigned nt = __nvvm_read_ptx_sreg_ntid_x(), nw = nt >> 5, t = tid_(), r = bid_(), l = t & 31u;
+  const float* xr = x + (unsigned long long)r * cols; float s = 0.0f;
+  for (unsigned j = t; j < cols; j += nt) s = fma_(xr[j], xr[j], s);
+  for (unsigned o = 16u; o > 0u; o >>= 1) { float v; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(v) : "f"(s), "r"(o)); s += v; }
+  if (l == 0u) red[t >> 5] = s;
+  bar_();
+  float tot = 0.0f; for (unsigned i = 0; i < nw; ++i) tot += red[i];
+  float inv = 1.0f / fsqrt(tot / (float)cols + eps); unsigned nb = cols / 32u;
+  for (unsigned b = t >> 5; b < nb; b += nw) {
     unsigned j = b * 32u + l; float v = xr[j] * inv * w[j]; y[(unsigned long long)r * cols + j] = v;
     q81_put(v, l, xq + ((unsigned long long)r * nb + b) * 40u); } }
 FORGE_GLOBAL void forge_silu_mul_q81(const float* a, const float* b, float* y, unsigned n, unsigned char* xq) {
@@ -431,20 +436,21 @@ FORGE_GLOBAL void forge_attention_comb(const float* part, float* y, unsigned nro
     for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu != -__builtin_inff()) a = fma_(pp[u * (dv + 2u) + 2u + e], fexp(mu - M), a); }
     y[(unsigned long long)id * dv + e] = a * inv; } }
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
-// y[rows, cols] = xq . W^T for q8_0 (fmt 1), q4_k (fmt 2) and q6_k (fmt 3, or 5 = padded to 224-byte blocks). A warp per output column (4 per 128-thread
-// block, no shared memory or barriers: the warp reduces with shuffles), up to 4 activation rows per block, as in
-// llama.cpp's mul_mat_vec_q. q4_k lanes take 16 weight bytes in one 128-bit load (8 lanes per super-block, 4
+// y[rows, cols] = xq . W^T for q8_0 (fmt 1, or 6 = regrouped), q4_k (fmt 2) and q6_k (fmt 3, or 5 = padded to 224-byte
+// blocks). A 128-thread block per output column (and up to 4 activation rows), its 4 warps splitting k by interleaved
+// super-blocks; each warp reduces with shuffles and the 4 partial sums meet in shared memory, as in llama.cpp's
+// mul_mat_vec_q. q4_k lanes take 16 weight bytes in one 128-bit load (8 lanes per super-block, 4
 // super-blocks per warp step); q6_k (210-byte blocks, 2-aligned) a whole super-block per warp step; q8_0 (34-byte
 // blocks) 8 lanes per block, 4 blocks per step.
 FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
-  unsigned t = tid_(), l = t & 31u, cg = (cols + 3u) / 4u, bi = bid_(), c = (bi % cg) * 4u + (t >> 5), r0 = (bi / cg) * 4u, nbk = k / 32u;
-  if (c >= cols) return;
+  __attribute__((shared)) float red[4][4];
+  unsigned t = tid_(), l = t & 31u, wq = t >> 5, bi = bid_(), c = bi % cols, r0 = (bi / cols) * 4u, nbk = k / 32u;
   const unsigned char* row = w + (unsigned long long)c * rb;
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
   unsigned nr = rows - r0 < 4u ? rows - r0 : 4u;
   if (fmt == 2u) {
     unsigned j = (l & 7u) >> 1, o = (l & 1u) * 16u;
-    for (unsigned sb = l >> 3; sb < k / 256u; sb += 4u) {
+    for (unsigned sb = (l >> 3) + 4u * wq; sb < k / 256u; sb += 16u) {
       const unsigned char* b = row + sb * 144u;
       u32x4 q = *(const u32x4*)(b + 16u + j * 32u + o);
       float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned s0, m0, s1, m1;
@@ -462,28 +468,35 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
           sa = dp4a_us(q[i] & 0x0F0F0F0Fu, ia, sa); ua = dp4a_us(0x01010101u, ia, ua);
           sbb = dp4a_us((q[i] >> 4) & 0x0F0F0F0Fu, ib, sbb); ub = dp4a_us(0x01010101u, ib, ub); }
         acc[rr] += *(const float*)xa * (d0 * (float)sa - n0 * (float)ua) + *(const float*)xb * (d1 * (float)sbb - n1 * (float)ub); } }
-  } else if (fmt == 5u) {   // q6_k padded to 224-byte blocks: 8 lanes per super-block (4 per warp step), 32 values per lane
-    unsigned li = l & 7u, h = li >> 2, l0 = (li & 3u) * 8u;
-    for (unsigned sb = l >> 3; sb < k / 256u; sb += 4u) {
+  } else if (fmt == 5u) {   // q6_k padded to 224-byte blocks: 8 lanes per super-block (4 per warp step)
+    // Lane li reads ql bytes 16li..16li+15 and the matching 16 qh bytes, both as aligned 16-byte loads: half h = li / 4,
+    // positions l = 16 (li % 2) .. +15, quarters qa = (li / 2) % 2 (low nibbles) and qa + 2 (high nibbles).
+    unsigned li = l & 7u, h = li >> 2, l0 = (li & 1u) * 16u, qa = (li >> 1) & 1u;
+    for (unsigned sb = (l >> 3) + 4u * wq; sb < k / 256u; sb += 16u) {
       const unsigned char* b = row + sb * 224u;
-      unsigned long long qa = *(const unsigned long long*)(b + 64u * h + l0), qb = *(const unsigned long long*)(b + 64u * h + 32u + l0);
-      unsigned long long qhh = *(const unsigned long long*)(b + 128u + 32u * h + l0);
-      float d = h2f(ld16(b + 208u)); const signed char* sc = (const signed char*)(b + 192u);
-      unsigned ql0[2] = {(unsigned)qa, (unsigned)(qa >> 32)}, ql1[2] = {(unsigned)qb, (unsigned)(qb >> 32)}, qh[2] = {(unsigned)qhh, (unsigned)(qhh >> 32)};
+      u32x4 ql = *(const u32x4*)(b + 16u * li), qh = *(const u32x4*)(b + 128u + 32u * h + l0);
+      unsigned long long sc8 = *(const unsigned long long*)(b + 192u + 8u * h);
+      float d = h2f(ld16(b + 208u));
+      float dlo = d * (float)(signed char)(sc8 >> (8u * (2u * qa + (l0 >> 4)))), dhi = d * (float)(signed char)(sc8 >> (8u * (2u * (qa + 2u) + (l0 >> 4))));
+      unsigned glo = sb * 8u + 4u * h + qa, ghi = glo + 2u;
 #pragma unroll
-      for (unsigned q = 0; q < 4u; ++q) {   // quarter q of the half: values 128h + 32q + l0 .. +7, activation group 8sb + 4h + q
-        const unsigned* ql = (q & 1u) ? ql1 : ql0; unsigned sh = 4u * (q >> 1), hs = 2u * q;
-        unsigned w0 = ((ql[0] >> sh) & 0x0F0F0F0Fu) | (((qh[0] >> hs) & 0x03030303u) << 4), w1 = ((ql[1] >> sh) & 0x0F0F0F0Fu) | (((qh[1] >> hs) & 0x03030303u) << 4);
-        w0 = ((w0 | 0x80808080u) - 0x20202020u) ^ 0x80808080u; w1 = ((w1 | 0x80808080u) - 0x20202020u) ^ 0x80808080u;   // per byte - 32
-        float ds = d * (float)sc[8u * h + 2u * q + (l0 >> 4)]; unsigned g = sb * 8u + 4u * h + q;
+      for (unsigned rr = 0; rr < 4u; ++rr) {
+        if (rr >= nr) continue;
+        const unsigned char* xl = xq + ((unsigned long long)(r0 + rr) * nbk + glo) * 40u; const unsigned char* xh = xq + ((unsigned long long)(r0 + rr) * nbk + ghi) * 40u;
+        unsigned long long xl0 = *(const unsigned long long*)(xl + 8u + l0), xl1 = *(const unsigned long long*)(xl + 16u + l0);
+        unsigned long long xh0 = *(const unsigned long long*)(xh + 8u + l0), xh1 = *(const unsigned long long*)(xh + 16u + l0);
+        int xlo[4] = {(int)xl0, (int)(xl0 >> 32), (int)xl1, (int)(xl1 >> 32)}, xhi[4] = {(int)xh0, (int)(xh0 >> 32), (int)xh1, (int)(xh1 >> 32)};
+        int slo = 0, shi = 0;
 #pragma unroll
-        for (unsigned rr = 0; rr < 4u; ++rr) {
-          if (rr >= nr) continue;
-          const unsigned char* xa = xq + ((unsigned long long)(r0 + rr) * nbk + g) * 40u;
-          acc[rr] += *(const float*)xa * ds * (float)dp4a_ss((int)w1, *(const int*)(xa + 12u + l0), dp4a_ss((int)w0, *(const int*)(xa + 8u + l0), 0)); } } }
+        for (unsigned i = 0; i < 4u; ++i) {
+          unsigned wl = (ql[i] & 0x0F0F0F0Fu) | (((qh[i] >> (2u * qa)) & 0x03030303u) << 4);
+          unsigned wh = ((ql[i] >> 4) & 0x0F0F0F0Fu) | (((qh[i] >> (2u * (qa + 2u))) & 0x03030303u) << 4);
+          slo = dp4a_ss((int)0xE0E0E0E0u, xlo[i], dp4a_ss((int)wl, xlo[i], slo));   // (w - 32) . x: second dp4a adds -32 * x
+          shi = dp4a_ss((int)0xE0E0E0E0u, xhi[i], dp4a_ss((int)wh, xhi[i], shi)); }
+        acc[rr] += *(const float*)xl * dlo * (float)slo + *(const float*)xh * dhi * (float)shi; } }
   } else if (fmt == 3u) {
     unsigned h = l >> 4, p = (l & 15u) * 4u, tb = p >= 32u ? 1u : 0u, lo0 = p & 31u, bs = 210u;
-    for (unsigned sb = 0; sb < k / 256u; ++sb) {
+    for (unsigned sb = wq; sb < k / 256u; sb += 4u) {
       const unsigned char* b = row + sb * bs;
       unsigned ql = ld16(b + 64u * h + p) | (ld16(b + 64u * h + p + 2u) << 16), qh = ld16(b + 128u + 32u * h + lo0) | (ld16(b + 130u + 32u * h + lo0) << 16);
       const signed char* sc = (const signed char*)(b + 192u + 8u * h);
@@ -500,7 +513,7 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
                  + *(const float*)xb * dB * (float)(dp4a_us(vB, ib, 0) - 32 * dp4a_us(0x01010101u, ib, 0)); } }
   } else {   // q8_0 (fmt 1: 34-byte blocks; fmt 6: regrouped 272-byte blocks of 8, aligned 4-byte loads)
     unsigned part = (l & 7u) * 4u;
-    for (unsigned g = l >> 3; g < nbk; g += 4u) {
+    for (unsigned g = (l >> 3) + 4u * wq; g < nbk; g += 16u) {
       int wv; float dw;
       if (fmt == 6u) { const unsigned char* b = row + (g >> 3) * 272u; wv = *(const int*)(b + 16u + 32u * (g & 7u) + part); dw = h2f(ld16(b + 2u * (g & 7u))); }
       else { const unsigned char* b = row + g * 34u; wv = (int)(ld16(b + 2u + part) | (ld16(b + 4u + part) << 16)); dw = h2f(ld16(b)); }
@@ -511,7 +524,9 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
         acc[rr] += *(const float*)xa * dw * (float)dp4a_ss(wv, *(const int*)(xa + 8u + part), 0); } }
   }
 #pragma unroll
-  for (unsigned rr = 0; rr < 4u; ++rr) { if (rr >= nr) continue; float v = wsum_(acc[rr]); if (l == 0u) y[(unsigned long long)(r0 + rr) * cols + c] = v; } }
+  for (unsigned rr = 0; rr < 4u; ++rr) { float v = wsum_(acc[rr]); if (l == 0u) red[wq][rr] = v; }
+  bar_();
+  if (t < nr) y[(unsigned long long)(r0 + t) * cols + c] = red[0][t] + red[1][t] + red[2][t] + red[3][t]; }
 // delta_rule with the state in registers (same contract and arguments as forge_delta_rule): a 256-thread block per
 // (value head, 32 state columns); lane = 4 * rg + cw, so the 8 threads sharing column j = 32 * cb + 4 * warp + cw are
 // adjacent lanes rg = 0..7 of one warp, each holding rows i = rg * R .. rg * R + R - 1 of S[h][:, j] (R = dk / 8).
