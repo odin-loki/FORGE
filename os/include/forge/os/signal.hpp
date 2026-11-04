@@ -1,6 +1,7 @@
 #pragma once
 // forge::os portable signal names and delivery. Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
+#include <limits>
 
 namespace forge::os {
 
@@ -29,13 +30,19 @@ inline int sig_native(signal_id s) {
 }
 
 // Deliver to a process (or, with group = true, its whole process group). Windows: kill/terminate only.
+// Rejected with EINVAL / ERROR_INVALID_PARAMETER: pid 0 (kill(0) would signal our own group), a pid that does
+// not fit pid_t / DWORD (it would be truncated to some other process), and group with pid <= 1 (kill(-1)
+// signals every process we may signal).
 inline status send_signal(std::uint64_t pid, signal_id s, bool group = false) {
 #if defined(FORGE_OS_POSIX)
+    if (pid == 0 || pid > std::uint64_t(std::numeric_limits<pid_t>::max()) || (group && pid <= 1))
+        return {{}, {EINVAL, "send_signal: invalid pid " + std::to_string(pid) + (group ? " (group)" : "")}};
     int n = sig_native(s);
     pid_t p = pid_t(pid);
     if (::kill(group ? -p : p, n) != 0) return {{}, last_error("kill")};
     return {};
 #else
+    if (pid == 0 || pid > 0xFFFFFFFFull) return {{}, {ERROR_INVALID_PARAMETER, "send_signal: invalid pid " + std::to_string(pid)}};
     // Windows has no signals to send. GenerateConsoleCtrlEvent reaches only processes on our own console, cannot
     // target CTRL_C at one group, and broadcasts to the whole console when the id is not a group leader, so
     // interrupt/quit are not emulated with it.
