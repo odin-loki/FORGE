@@ -19,7 +19,7 @@ static std::string run_path(const std::string& src, const std::string& name, boo
     std::fprintf(stderr, "== %s (%s)\n", name.c_str(), vm ? "vm" : "tree"); std::fflush(stderr);
     o.out = [&](std::string_view s) { out += s; std::fwrite(s.data(), 1, s.size(), stderr); std::fflush(stderr); };
     script::engine e(o); auto r = e.run(src, name);
-    if (!r.ok) out += "!" + r.error_type + "\n";
+    if (!r.ok) { out += "!" + r.error_type + "\n"; std::fprintf(stderr, "!! %s\n", r.error.c_str()); }   // message in the log only
     return out;
 }
 

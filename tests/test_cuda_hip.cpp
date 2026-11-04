@@ -127,12 +127,39 @@ static int state_ops_check(graph::registry& reg, const std::string& api) {
     return ok ? 0 : 1;
 }
 
+// attention at the shapes the split-K decode kernels (forge_attention_dec + _comb) take: head dims a multiple of 32
+// up to 256 and rows x heads <= 256, with GQA, causal prefill and decode, against the reference.
+template<class RT> static int attention_dec_check(RT& rt, const std::string& api) {
+    int fails = 0, n = 0;
+    struct cfg { i64 s, t, hq, hk, d; bool causal; };
+    for (auto c : {cfg{1, 1, 4, 2, 32, true}, cfg{1, 37, 4, 2, 32, true}, cfg{6, 6, 4, 2, 32, true}, cfg{5, 12, 8, 2, 64, true},
+                   cfg{1, 300, 16, 4, 128, true}, cfg{3, 9, 4, 4, 32, false}, cfg{16, 16, 8, 8, 32, true}}) {
+        auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.613f + ph); return v; };
+        tensor q({c.s, c.hq, c.d}), k({c.t, c.hk, c.d}), v({c.t, c.hk, c.d}), y({c.s, c.hq, c.d});
+        q.data = rnd(q.data.size(), 1); k.data = rnd(k.data.size(), 2); v.data = rnd(v.data.size(), 3);
+        ops::attrs a{{"causal", c.causal ? 1.0 : 0.0}};
+        ++n;
+        if (!rt.run_op("attention", {{q.data.data(), q.shape}, {k.data.data(), k.shape}, {v.data.data(), v.shape}}, a, {y.data.data(), y.shape})) {
+            std::printf("FAIL %s.attention s %lld t %lld d %lld: run_op refused the shape\n", api.c_str(), (long long)c.s, (long long)c.t, (long long)c.d); ++fails; continue;
+        }
+        auto want = ops::ref::attention({q, k, v}, a);
+        double worst = 0; for (std::size_t i = 0; i < y.data.size(); ++i) worst = std::max(worst, std::fabs(double(y.data[i]) - want.data[i]));
+        if (!(worst < 1e-4)) { std::printf("FAIL %s.attention s %lld t %lld hq %lld hk %lld d %lld: worst abs error %.3g\n", api.c_str(),
+                                                (long long)c.s, (long long)c.t, (long long)c.hq, (long long)c.hk, (long long)c.d, worst); ++fails; }
+    }
+    std::printf("%s %d/%d %s decode-attention shapes match the reference\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
     if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
     const std::string api = rt->backend();
     std::printf("%s device: %s (image %s)\n", api.c_str(), rt->device_name().c_str(), rt->image_arch().c_str());
+    int dec_fails = 0;
+    if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); })
+        if (api == "cuda" || api == "hip") dec_fails = attention_dec_check(*rt, api);
     auto reg = graph::gpu_registry(std::shared_ptr<RT>(std::move(rt)));
     int fails = 0, n = 0;
     for (std::size_t i = 0; i < ops::op_count; ++i) for (auto& l : reg->lowerings(ops::op(i))) {
@@ -141,6 +168,7 @@ template<class RT, class Open> static int device_t(Open open) {
         if (!graph::registry::oracle_check(l, &msg)) { std::printf("FAIL %s: %s\n", l.name.c_str(), msg.c_str()); ++fails; }
     }
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    fails += dec_fails;
     fails += qmatmul_check<RT>(*reg, api);
     fails += state_ops_check(*reg, api);
     return fails ? 1 : 0;

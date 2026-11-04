@@ -319,6 +319,9 @@ inline std::string find_executable(const std::string& name) {
     std::vector<std::string> exts = {"", ".exe", ".cmd", ".bat", ".com"};
     auto is_file = [](const std::string& p) { DWORD a = GetFileAttributesW(widen(p).c_str()); return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY); };
     if (name.find_first_of("/\\") != std::string::npos) { for (auto& e : exts) if (is_file(name + e)) return name + e; return {}; }
+    // A bare name ("cmd") resolves like CreateProcess: by extension only, so an extensionless file on PATH
+    // (an MSYS2 / Git shell script, which CreateProcess cannot start) never shadows cmd.exe.
+    if (name.find('.') == std::string::npos) exts.erase(exts.begin());
 #else
     const char sep = ':';
     std::vector<std::string> exts = {""};
