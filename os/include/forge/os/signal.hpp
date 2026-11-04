@@ -36,6 +36,9 @@ inline status send_signal(std::uint64_t pid, signal_id s, bool group = false) {
     if (::kill(group ? -p : p, n) != 0) return {{}, last_error("kill")};
     return {};
 #else
+    // Windows has no signals to send. GenerateConsoleCtrlEvent reaches only processes on our own console, cannot
+    // target CTRL_C at one group, and broadcasts to the whole console when the id is not a group leader, so
+    // interrupt/quit are not emulated with it.
     (void)group;
     if (s != signal_id::kill && s != signal_id::terminate) return {{}, {unsupported_code, "send_signal: only kill/term on Windows"}};
     HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, DWORD(pid));

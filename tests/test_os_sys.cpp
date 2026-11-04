@@ -48,14 +48,23 @@ TEST(file_lock_exclusive) {
     a->unlock(); auto c = fs::file_lock::acquire(*p, true, false); CHECK(c);
     c->unlock(); fs::remove_all(*p);
 }
-#if defined(__linux__)
-TEST(mounts_list) { auto m = fs::mounts(); CHECK(m); CHECK(!m->empty()); }
+#if !defined(FORGE_OS_ANDROID) && !defined(FORGE_OS_IOS)
+TEST(mounts_list) {
+    auto m = fs::mounts(); CHECK(m); CHECK(!m->empty());
+    bool root = false; for (auto& x : *m) { CHECK(!x.path.empty()); root |= x.path == "/" || (x.path.size() == 3 && x.path[1] == ':'); }
+    CHECK(root);
+}
 #endif
 TEST(users_dirs) {
     auto u = os::current_user(); CHECK(!u.name.empty() || !u.home.empty());
-#if defined(FORGE_OS_POSIX)
-    CHECK(u.uid >= 0); auto r = os::lookup_uid(u.uid); CHECK(r); CHECK(r->name == u.name);
+    CHECK(u.uid >= 0); auto r = os::lookup_uid(u.uid); CHECK(r); CHECK(r->name == u.name); CHECK(r->uid == u.uid);
+    auto n = os::lookup_user(u.name); CHECK(n); CHECK(n->uid == u.uid); CHECK(!n->home.empty());
     CHECK(!os::lookup_user("no-such-user-forge-xyz"));
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(u.sid.rfind("S-1-", 0) == 0); CHECK(n->sid == u.sid); CHECK(u.gid >= 0);
+    CHECK(!os::lookup_uid(0x7FFFFFF0));
+#else
+    CHECK(u.sid.empty());
 #endif
     CHECK(!os::config_dir().empty()); CHECK(!os::cache_dir().empty());
 }
@@ -92,11 +101,22 @@ TEST(sysinfo_ext) {
         std::vector<char> big(64u << 20); volatile char* vp = big.data(); for (std::size_t i = 0; i < big.size(); i += 4096) vp[i] = char(i | 1);
         std::uint64_t r1 = os::current_rss(); CHECK(r1 >= r0 + (32ull << 20)); CHECK(r1 < m.total); CHECK(vp[4096] != 0);
     }
-#if defined(__linux__)
-    CHECK(*os::uptime_seconds() > 0); CHECK(os::load_average());
-    auto a = os::per_cpu_times(); CHECK(a); CHECK(!a->empty()); CHECK(m.available > 0);
-    double x = os::cpu_usage((*a)[0], (*a)[0]); CHECK(x == 0);
+    CHECK(*os::uptime_seconds() > 0); CHECK(m.available > 0);
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(os::is_unsupported(os::load_average().err));
+#else
+    CHECK(os::load_average());
 #endif
+    auto a = os::per_cpu_times(); CHECK(a); CHECK(!a->empty()); CHECK(a->size() >= 1u);
+    double x = os::cpu_usage((*a)[0], (*a)[0]); CHECK(x == 0);
+    {   // the counters advance, and a busy loop shows up as busy time somewhere
+        double busy0 = 0, all0 = 0; for (auto& t : *a) { CHECK(t.idle >= 0 && t.user >= 0 && t.system >= 0); busy0 += t.total() - t.idle; all0 += t.total(); }
+        CHECK(all0 > 0);
+        volatile std::uint64_t spin = 0; auto t0 = os::unix_time_ns(); while (os::unix_time_ns() - t0 < 300'000'000) spin = spin + 1;
+        auto b = os::per_cpu_times(); CHECK(b); CHECK(b->size() == a->size());
+        double busy1 = 0, all1 = 0; for (auto& t : *b) { busy1 += t.total() - t.idle; all1 += t.total(); }
+        CHECK(all1 > all0); CHECK(busy1 > busy0);
+    }
 }
 TEST(console_bits) {
     CHECK(os::console::paint("x", os::console::color::red, false) == "x");
