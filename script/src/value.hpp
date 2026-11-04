@@ -119,7 +119,19 @@ private:
     std::atomic<bool> collecting_{false};
 };
 
+// limit {allocs: N}: per-thread count of managed-object allocations. `count` only advances while a cap is
+// set; `cap` is the absolute count at which the next allocation fails (0 = no cap). The cap is cleared when
+// it fires, so the OutOfMemoryError and its handlers can still allocate; the limit scope restores it.
+struct AllocQuota {
+    static inline thread_local std::uint64_t count = 0, cap = 0;
+    static void charge() {
+        if (!cap) return;
+        if (++count > cap) { cap = 0; throw heap_exhausted("allocation count limit reached"); }
+    }
+};
+
 template <class T, class... A> Ref<T> make(A&&... a) {
+    AllocQuota::charge();
     auto u = std::make_unique<T>(std::forward<A>(a)...);
     static_cast<Obj*>(u.get())->owner = std::this_thread::get_id();
     Heap::instance().note_object(1);

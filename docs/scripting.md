@@ -241,16 +241,51 @@ int main() {
 
 ### Resource limits
 
-`forge::limit(opts, fn)` runs `fn` with narrower limits and restores them afterwards. The keys are
-`timeout` (wall-clock ms, raising `TimeoutError`), `cpu_s` (CPU seconds of the running thread, raising
-`LimitExceededError`), `mem` (extra heap bytes, raising `OutOfMemoryError`), and `proc_mem` / `proc_cpu`
-(OS limits for child processes started inside the block). Example:
-`forge::limit(std::map<std::string, double>{{"timeout", 500}, {"cpu_s", 0.2}}, [] { work(); });`
+`forge::limit(opts, fn)` runs `fn` with narrower limits and restores them afterwards, also when `fn` throws.
+`opts` is a map, or a braced list of `{"key", value}` pairs. Unknown keys and malformed values raise
+`ValueError`. The options are:
+
+| key | limit | raises |
+|---|---|---|
+| `timeout` | wall-clock time (ms, or a duration string) | `TimeoutError` |
+| `cpu_s` | CPU time of the running thread (seconds, or a duration string) | `LimitExceededError` |
+| `mem` | extra managed-heap bytes (a number or a size string) | `OutOfMemoryError` |
+| `proc_mem`, `proc_cpu` | OS memory (bytes / size string) and CPU-second (number / duration string) limits for child processes started inside the block | the child is killed by the OS |
+| `allocs` | managed-heap objects allocated by the running thread inside the block | `OutOfMemoryError` |
+| `handles` | OS handles open at the same time: files, locks, file watchers, `proc::start` processes, `ProcessPool`s and their futures. A handle counts until it is closed, disposed or released | `TooManyFilesError` |
+| `procs` | child processes started inside the block: `forge::sh`/`bash`/`pwsh`/... calls, `run`/`proc::run`, `proc::start`, and each `ProcessPool` worker | `LimitExceededError` |
+
+**Sizes** are a number of bytes or a string such as `"64K"`, `"512M"`, `"2G"`, `"1T"` or `"1.5G"`. K, M, G and T are
+powers of 1024, `KB`/`KiB` mean the same as `K`, and a trailing `B` is optional. **Durations** are a number (ms
+for `timeout`, seconds for `cpu_s` and `proc_cpu`) or a string with a unit: `"250us"`, `"200ms"`, `"5s"`, `"2m"`
+(or `"2min"`), `"1h"`. A child-process CPU limit is rounded up to whole seconds.
+
+**Block syntax.** `limit {opts} { body }` is sugar for `forge::limit(opts, [&] { body })`; `forge::limit` may
+be written instead of `limit`. The options are `{"key", value}` pairs or C++20-style designators, and the parser
+rejects unknown or repeated keys. `limit (expr) { body }` takes the options from any map expression:
+
+```cpp
+limit {{"timeout", "5s"}, {"mem", "64M"}} { build(); }          // statement: value discarded
+auto r = limit {.cpu_s = "2s", .allocs = 100000} { return solve(); };   // expression: the block's return value
+limit (opts) { work(); }                                         // options from a variable
+```
+
+The body sees and changes the enclosing locals. In the statement form `return` is a syntax error, because it would
+only leave the block. `break` and `continue` cannot jump out of a block in either form. The static checker reports
+an unknown key or a malformed size or duration string in a literal option list as error `limit-option`.
+
+**Nesting and scope.** Nested blocks can only narrow a limit. The inner block gets the earlier of the two
+deadlines, the smaller heap cap, and the smaller child-process limits. Each `handles` and `procs` block has its
+own counter, and an acquisition counts against every enclosing block too. Tasks started inside a block (`std::async`,
+`std::thread`, `forge::parallel`) and modules it imports share its `handles`/`procs` counters, child-process limits
+and deadline. `cpu_s` and `allocs` count only the thread that entered the block. When a limit fires it is switched
+off until its block exits, so `catch` and `finally` code can still run. The limit is restored when the block exits.
+Over the `handles` limit the new resource is closed again before the error is raised. Over `procs` nothing is started.
 
 Also implemented (`Limits` in `script/src/interp.hpp`; CLI `--timeout MS`, `--max-steps N`, `--heap BYTES`):
 step count, wall-clock timeout, managed-heap cap, call depth (default 800, checked so the C++ stack is
-safe) and per-child output size (64 MiB). Tested by `tests/script/limits.fs`. **Planned, not implemented:**
-`limit {}` block syntax, string sizes such as `"2G"`, allocation-count, open-handle and child-count limits.
+safe) and per-child output size (64 MiB). Tested by `tests/script/limits.fs`, `limit_block.fs` (block syntax,
+sizes and durations) and `limit_counts.fs` (`allocs`, `handles`, `procs`).
 
 ### Interpreter implementation rules (safe ISO C++23)
 
@@ -388,7 +423,7 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
 ## Higher-level features (approved, all in scope)
 
 1. **Parallel tasks** — `spawn fn`, `await`, `parallel(list, fn, n)`; thread pool from `forge::os`.
-2. **Resource-limited runs** — `forge::limit(opts, fn)` with an options map (`timeout` ms, `cpu_s`, `mem` bytes, `proc_mem`, `proc_cpu`) (block syntax `limit {...} {}` is planned) applies to
+2. **Resource-limited runs** — `forge::limit(opts, fn)` or the block `limit {opts} { ... }` with options `timeout`, `cpu_s`, `mem`, `proc_mem`, `proc_cpu`, `allocs`, `handles` and `procs`, where sizes and durations may be strings such as `"2G"` or `"5s"` (see Resource limits). It applies to
    child processes (cgroups / Job Objects) and to script work via the `forge::mem` budget, so
    jobs fail cleanly instead of OOM-killing the box.
 3. **Job pipelines** — declare steps with dependencies (`job build after fetch { }`), run as a DAG,
@@ -417,6 +452,15 @@ Device handle: `backend`, `display`, `power`, `connectivity`, `info`, `vibrate`,
      then widened again in the same process. `isolate` is POSIX only (Windows and iOS have no `fork`;
      there it raises `PermissionError` without running the block). Forking a process with other running
      threads copies only the calling thread: avoid `isolate` while tasks hold locks the block needs.
+   - **Checked at the call, not at the name:** a capability is checked when a built-in runs, against the
+     capabilities of the interpreter that runs it. Aliases (`auto r = forge::fs::read;`), `std::function`s,
+     lambdas, methods or map entries made before the sandbox, higher-order calls (`std::transform`,
+     `std::for_each`), `eval`, `forge::reflect::call`, imports, shell calls, and tasks started inside the
+     block (`std::async`, `std::thread`, `forge::parallel`, which inherit the capabilities) are all denied. A
+     nested `forge::sandbox` cannot turn a capability back on, and a `ProcessPool` worker never gets one its
+     parent lacks. File handles opened before a no-fs block cannot be read or written inside it, and a process
+     started before a no-proc block cannot be killed from inside it. `std::getenv` is gated by `env` like
+     `os::env`. Escape tests: `tests/script/sandbox_escape.fs`.
    - **rpc-serve:** each remote script runs in its own child (`forge script --rpc-child`, source on
      stdin) under `--script-timeout`, a `--script-mem-mb` memory cap (default 2048), and with
      `--os-sandbox require` whenever a `--script-no-*` flag is set, so the OS sandbox applies to remote
@@ -622,6 +666,7 @@ Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the
 | `unique-copy` | error | copy-initialising from a `std::make_unique` local |
 | `iter-mutation` | error for a list/map-literal or `list`/`map`/`vector`-typed local, else warning | size-changing method on the container a range-for is iterating |
 | `capability` | error | `fs.*`, `net.*`, `proc.*`, `service.*`, `os.env/setenv/chdir/processes/kill`, `run()`, shell blocks when the run's `--no-fs/--no-net/--no-proc` or an enclosing `sandbox({fs: false, ...}, fn)` literal denies them |
+| `limit-option` | error | in a literal `limit {...}` / `forge::limit({...}, fn)` option list: an unknown key, a malformed size or duration string, or a string for `allocs`/`handles`/`procs` |
 | `pool-task` | error | `submit`/`map` with a literal task source that does not parse, does not define `task`, or whose `task` does not take one argument |
 | `pool-json` | error | a lambda or shell value (or a literal containing one) passed as a ProcessPool argument |
 | `thread-send` | warning | an argument to `forge::spawn`/`std::thread`/`std::async` that is not a literal, moved, frozen, const or `forge::shared` |

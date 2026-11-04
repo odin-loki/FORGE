@@ -65,6 +65,8 @@ struct Interp {
     std::uint64_t child_mem = 0, child_cpu_s = 0, child_timeout_ms = 0;   // applied to spawned processes
     std::uint64_t deadline_ns = 0;                             // limit({timeout}) / Limits::timeout_ms
     std::uint64_t cpu_deadline_ns = 0;                         // limit({cpu_s}): this thread's CPU time (os::thread_cpu_time_ns)
+    std::shared_ptr<Quota> handle_quota, proc_quota;           // limit({handles}) / limit({procs}); shared with tasks started inside
+    void charge_process(const std::string& what);              // count one child process against limit({procs})
 
     explicit Interp(std::shared_ptr<Shared> s, Ref<Globals> g = {}) : sh(std::move(s)), globals(g ? std::move(g) : make<Globals>()), caps(sh->caps) {}
 

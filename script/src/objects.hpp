@@ -168,6 +168,26 @@ struct WeakRef final : Obj {
     Value get() const;
 };
 
+// limit {handles: N} / limit {procs: N}: a counter shared by every interpreter (task) running inside one limit
+// block. Nested blocks chain to the enclosing block's quota, so an acquire counts against all of them.
+struct Quota {
+    std::atomic<std::int64_t> used{0};
+    std::int64_t max = 0;
+    std::shared_ptr<Quota> parent;
+    Quota(std::int64_t m, std::shared_ptr<Quota> p) : max(m), parent(std::move(p)) {}
+    // Counts one use against every quota in the chain. Returns the full quota (and counts nothing) on failure.
+    static const Quota* acquire(const std::shared_ptr<Quota>& q) {
+        for (Quota* p = q.get(); p; p = p->parent.get()) {
+            if (p->used.fetch_add(1) + 1 > p->max) {
+                for (Quota* r = q.get(); ; r = r->parent.get()) { r->used.fetch_sub(1); if (r == p) break; }
+                return p;
+            }
+        }
+        return nullptr;
+    }
+    static void release(const std::shared_ptr<Quota>& q) noexcept { for (Quota* p = q.get(); p; p = p->parent.get()) p->used.fetch_sub(1); }
+};
+
 // OS resource owned by a C++ RAII object. dispose() is deterministic; destruction also releases it.
 struct Handle final : Obj {
     std::string kind;
@@ -175,10 +195,14 @@ struct Handle final : Obj {
     std::shared_ptr<void> payload;       // the C++ owner (type-erased, typed access via payload_as)
     std::unordered_map<std::string, Value> props;
     bool disposed = false;
+    std::shared_ptr<Quota> quota;        // limit {handles: N} this handle counts against (released on dispose)
     explicit Handle(std::string k) : kind(std::move(k)) { Heap::instance().track(*this); }
     ~Handle() override { dispose(); Heap::instance().untrack(*this); }
     const char* type_name() const override { return "handle"; }
-    void dispose() noexcept { if (!disposed) { disposed = true; if (closer) { try { closer(); } catch (...) {} } closer = nullptr; payload.reset(); } }
+    void dispose() noexcept {
+        if (!disposed) { disposed = true; if (closer) { try { closer(); } catch (...) {} } closer = nullptr; payload.reset(); }
+        if (quota) { Quota::release(quota); quota.reset(); }
+    }
     template <class T> std::shared_ptr<T> payload_as() const { return std::static_pointer_cast<T>(payload); }
     // Script values a handle keeps (callbacks of pipelines / schedulers) live in props, visible to the cycle collector.
     void trace(const Visit& f) const override { for (auto& [k, v] : props) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) f(**r); }

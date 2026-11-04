@@ -236,6 +236,7 @@ struct Checker {
             D(b->cnst && !b->param ? L::error : L::warning, "capability", n, "'" + c->s + "' holds a builtin that needs the '" + b->cap + "' capability, which this run denies", c->s);
         if (c && (is_builtin_var(*c, "eval") || is_builtin_var(*c, "forge::eval")) && argc == 1 && n.kids[1]->k == NK::Str) sub_check(n, n.kids[1]->s, "eval");
         if (c) deprecated(n, *c);
+        if (c && (is_builtin_var(*c, "forge::limit") || is_builtin_var(*c, "limit")) && argc == 2 && n.kids[1]->k == NK::Map) limit_options(*n.kids[1]);
         if (c && (is_builtin_var(*c, "forge::plugin") || is_builtin_var(*c, "forge::import")) && argc == 1 && n.kids[1]->k == NK::Str) {
             Node fake; fake.k = NK::Import; fake.s = n.kids[1]->s; fake.line = n.line; fake.col = start_col(*c, n.line); import_check(fake);
         }
@@ -404,6 +405,29 @@ struct Checker {
         if (o == Op::Mul) bad = !num_a && !num_b;
         if ((o == Op::Lt || o == Op::Le || o == Op::Gt || o == Op::Ge) && num_a != num_b) bad = true;
         if (bad) D(L::warning, "type", n, std::string("operator ") + op_name(o) + " on " + (num_a ? "number" : "string") + " and " + (num_b ? "number" : "string") + " likely raises TypeError");
+    }
+    // limit {...} / forge::limit(<map literal>, fn): unknown keys and malformed size / duration strings raise ValueError.
+    void limit_options(const Node& m) {
+        static const std::set<std::string> sizes = {"mem", "proc_mem"}, times = {"timeout", "cpu_s", "proc_cpu"}, counts = {"allocs", "handles", "procs"};
+        auto split = [](const std::string& s, std::string& unit) {
+            std::size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
+            std::size_t b = i; bool dot = false; while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || (s[i] == '.' && !dot))) { dot = dot || s[i] == '.'; ++i; }
+            if (i == b || (i == b + 1 && s[b] == '.')) return false;
+            for (; i < s.size(); ++i) if (s[i] != ' ') unit += char(std::tolower(static_cast<unsigned char>(s[i])));
+            return true;
+        };
+        for (std::size_t j = 0; j + 1 < m.kids.size(); j += 2) {
+            if (m.kids[j]->k != NK::Str) continue;
+            const std::string& k = m.kids[j]->s; const Node& v = *m.kids[j + 1];
+            if (!sizes.count(k) && !times.count(k) && !counts.count(k)) { D(L::error, "limit-option", v, "unknown limit option '" + k + "' (raises ValueError)", k); continue; }
+            if (v.k != NK::Str) continue;
+            if (counts.count(k)) { D(L::error, "limit-option", v, "limit option '" + k + "' is a count and needs an integer (raises TypeError)", v.s); continue; }
+            std::string u;
+            bool ok = split(v.s, u);
+            if (ok && sizes.count(k)) { static const std::set<std::string> su = {"", "b", "k", "kb", "kib", "m", "mb", "mib", "g", "gb", "gib", "t", "tb", "tib"}; ok = su.count(u) > 0; }
+            if (ok && times.count(k)) { static const std::set<std::string> tu = {"", "ns", "us", "ms", "s", "m", "min", "h"}; ok = tu.count(u) > 0; }
+            if (!ok) D(L::error, "limit-option", v, "bad value \"" + v.s + "\" for limit option '" + k + "' (raises ValueError)", v.s);
+        }
     }
     void pool_task(const Node& n) {
         auto& s = *n.kids[1];
