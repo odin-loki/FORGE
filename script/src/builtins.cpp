@@ -34,6 +34,9 @@
 #include <algorithm>
 #include <cctype>
 #include <charconv>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <cmath>
 #include <format>
 #include <regex>
@@ -196,6 +199,22 @@ struct Scope {
     }
 };
 
+// Parse a whole string as a double (hex: digits as written by std::to_chars(..., chars_format::hex), no "0x").
+// Older libc++ (FreeBSD 14 base, LLVM 18) has no floating-point std::from_chars, so fall back to strtod there.
+[[maybe_unused]] static bool parse_double(std::string_view t, double& out, bool hex = false) {
+    if (t.empty()) return false;
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    auto r = hex ? std::from_chars(t.data(), t.data() + t.size(), out, std::chars_format::hex) : std::from_chars(t.data(), t.data() + t.size(), out);
+    return r.ec == std::errc{} && r.ptr == t.data() + t.size();
+#else
+    if (t[0] == '+' || std::isspace(static_cast<unsigned char>(t[0]))) return false;
+    std::string s(t);
+    if (hex) { bool neg = s[0] == '-'; s = (neg ? "-0x" : "0x") + s.substr(neg ? 1 : 0); }
+    char* end = nullptr; errno = 0; out = std::strtod(s.c_str(), &end);
+    return errno == 0 && end == s.c_str() + s.size();
+#endif
+}
+
 // ---- limit option values. Sizes: a number of bytes or a string "64K", "512M", "2G", "1T" (powers of 1024; "KB",
 // "KiB", "MB", ... and a trailing "B" are accepted). Durations: a number (ms for timeout, seconds for cpu_s /
 // proc_cpu) or a string with a unit "250us", "200ms", "5s", "2m", "1h".
@@ -203,8 +222,7 @@ std::pair<double, std::string> num_unit(Interp& in, const std::string& s, const 
     std::size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
     std::size_t b = i; while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '.')) ++i;
     double v = 0; std::string num = s.substr(b, i - b);
-    auto r = std::from_chars(num.data(), num.data() + num.size(), v);
-    if (num.empty() || r.ec != std::errc{} || r.ptr != num.data() + num.size()) in.raise("ValueError", std::string("limit: bad ") + key + " value \"" + s + "\"");
+    if (!parse_double(num, v)) in.raise("ValueError", std::string("limit: bad ") + key + " value \"" + s + "\"");
     while (i < s.size() && s[i] == ' ') ++i;
     std::string u; for (; i < s.size(); ++i) if (s[i] != ' ') u += char(std::tolower(static_cast<unsigned char>(s[i])));
     return {v, u};

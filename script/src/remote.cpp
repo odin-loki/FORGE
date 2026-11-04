@@ -17,6 +17,9 @@
 #include <forge/graph/rpc.hpp>
 #include <algorithm>
 #include <charconv>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
 #include <map>
 
 namespace forge::script {
@@ -63,6 +66,22 @@ graph::rpc::client::script_reply run_remote(Interp& in, Conn& c, const std::stri
     catch (const std::exception& e) { std::string m = e.what(); in.raise(m.find("disabled") != std::string::npos || m.find("permission denied") != std::string::npos ? "PermissionError" : "IOError", m); }
 }
 
+// Parse a whole string as a double (hex: digits as written by std::to_chars(..., chars_format::hex), no "0x").
+// Older libc++ (FreeBSD 14 base, LLVM 18) has no floating-point std::from_chars, so fall back to strtod there.
+[[maybe_unused]] static bool parse_double(std::string_view t, double& out, bool hex = false) {
+    if (t.empty()) return false;
+#if defined(__cpp_lib_to_chars) && __cpp_lib_to_chars >= 201611L
+    auto r = hex ? std::from_chars(t.data(), t.data() + t.size(), out, std::chars_format::hex) : std::from_chars(t.data(), t.data() + t.size(), out);
+    return r.ec == std::errc{} && r.ptr == t.data() + t.size();
+#else
+    if (t[0] == '+' || std::isspace(static_cast<unsigned char>(t[0]))) return false;
+    std::string s(t);
+    if (hex) { bool neg = s[0] == '-'; s = (neg ? "-0x" : "0x") + s.substr(neg ? 1 : 0); }
+    char* end = nullptr; errno = 0; out = std::strtod(s.c_str(), &end);
+    return errno == 0 && end == s.c_str() + s.size();
+#endif
+}
+
 // ---- typed value encoding: n t f i<int>; d<hexfloat>; s<len>:<bytes> l<n>:<items> m<flags><n>:[dflt]<k v>...
 const char* plain_hint = "only nil, bool, numbers, strings, lists and maps (and script functions over them) can be sent to a remote node";
 void marshal(Interp& in, const Value& v, std::string& o, const std::string& what, int depth = 0) {
@@ -98,7 +117,7 @@ struct Unmarshal {
         case 't': return true;
         case 'f': return false;
         case 'i': { auto t = upto(';'); std::int64_t x = 0; auto r = std::from_chars(t.data(), t.data() + t.size(), x); if (r.ec != std::errc() || r.ptr != t.data() + t.size()) bad(); return x; }
-        case 'd': { auto t = upto(';'); double x = 0; auto r = std::from_chars(t.data(), t.data() + t.size(), x, std::chars_format::hex); if (r.ec != std::errc() || r.ptr != t.data() + t.size()) bad(); return x; }
+        case 'd': { auto t = upto(';'); double x = 0; if (!parse_double(t, x, true)) bad(); return x; }
         case 's': { auto n = count(); if (s.size() - p < n) bad(); auto r = strv(std::string(s.substr(p, n))); p += n; return r; }
         case 'l': { auto n = count(); auto l = make<List>(); for (std::size_t i = 0; i < n; ++i) l->push(val(depth + 1)); return obj(l); }
         case 'm': {
