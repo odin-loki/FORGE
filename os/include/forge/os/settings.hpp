@@ -9,11 +9,15 @@
 // Reading a name that was never defined through settings::get_raw() throws, so ad-hoc getenv() calls can
 // be replaced one by one and the table stays complete. Kinds: string, int, bool (1/0/true/false/yes/no/
 // on/off), size (bytes with K/M/G/T suffixes, base 1024) and real. A value that does not parse falls back
-// to the default and is reported by problems().
+// to the default and is reported by problems(). Integers are decimal, or hexadecimal with a 0x prefix ("010" is
+// ten, not octal); a value outside the setting's integer type is a problem too. On Windows the environment is read
+// through the UTF-16 API (non-ASCII values arrive as UTF-8, whatever the ANSI code page).
 #include <forge/os/os.hpp>
 #include <cctype>
 #include <cerrno>
 #include <type_traits>
+#include <utility>
+#include <cwchar>
 #include <cstdint>
 #include <cstdlib>
 #include <map>
@@ -40,8 +44,15 @@ inline std::optional<bool> parse_bool(std::string s) {
     return std::nullopt;
 }
 inline std::optional<std::int64_t> parse_int(const std::string& s) {
-    if (s.empty()) return std::nullopt; char* e = nullptr; errno = 0; long long v = std::strtoll(s.c_str(), &e, 0);
-    if (errno || *e) return std::nullopt; return v;
+    std::size_t i = 0; while (i < s.size() && std::isspace((unsigned char)s[i])) ++i;
+    std::size_t d = i + (i < s.size() && (s[i] == '+' || s[i] == '-'));
+    int base = d + 1 < s.size() && s[d] == '0' && (s[d + 1] == 'x' || s[d + 1] == 'X') ? 16 : 10;
+    char* e = nullptr; errno = 0; long long v = std::strtoll(s.c_str() + i, &e, base);
+    if (errno || *e || e == s.c_str() + i) return std::nullopt; return v;
+}
+// The environment value (nullopt when unset); UTF-16 environment on Windows.
+inline std::optional<std::string> env(const std::string& name) {
+    if (!os::has_env(name)) return std::nullopt; return os::getenv(name);
 }
 inline std::optional<std::uint64_t> parse_size(const std::string& s) {
     if (s.empty()) return std::nullopt; char* e = nullptr; double v = std::strtod(s.c_str(), &e);
@@ -89,8 +100,7 @@ inline bool defined(std::string_view name) { auto& t = detail::tab(); std::lock_
 // The raw environment value of a defined name (nullopt if unset). Throws std::logic_error if undefined.
 inline std::optional<std::string> get_raw(std::string_view name) {
     if (!defined(name)) throw std::logic_error("settings: " + std::string(name) + " is read but was never defined");
-    if (const char* v = std::getenv(std::string(name).c_str())) return std::string(v);
-    return std::nullopt;
+    return detail::env(std::string(name));
 }
 inline void reload() { auto& t = detail::tab(); std::lock_guard g(t.m); ++t.generation; t.problems.clear(); }
 inline std::vector<std::string> problems() { auto& t = detail::tab(); std::lock_guard g(t.m); return t.problems; }
@@ -104,21 +114,22 @@ public:
     }
     const std::string& name() const { return name_; }
     const T& default_value() const { return dflt_; }
-    bool is_set() const { return std::getenv(name_.c_str()) != nullptr; }
+    bool is_set() const { return os::has_env(name_); }
     // The parsed value is cached per raw value: a setenv/unsetenv (a test's
     // environment guard, a parent setting a child's knob) is seen by the next
     // get(), and reload() forces a re-parse (and clears problems()).
     T get() const {
         auto& t = detail::tab();
-        const char* e = std::getenv(name_.c_str());
-        std::optional<std::string> raw = e ? std::optional<std::string>(e) : std::nullopt;
+        std::optional<std::string> raw = detail::env(name_);
         { std::lock_guard g(t.m); if (gen_ == t.generation && raw == raw_) return val_; }
         T v = dflt_;
         if (raw) {
             std::string s(*raw); bool ok = true;
             if constexpr (std::is_same_v<T, bool>) { auto p = detail::parse_bool(s); ok = bool(p); if (p) v = *p; }
             else if constexpr (std::is_same_v<T, std::uint64_t>) { auto p = detail::parse_size(s); ok = bool(p); if (p) v = *p; }
-            else if constexpr (std::is_integral_v<T>) { auto p = detail::parse_int(s); ok = bool(p); if (p) v = T(*p); }
+            else if constexpr (std::is_integral_v<T>) {
+                auto p = detail::parse_int(s); ok = p && std::in_range<T>(*p); if (ok) v = T(*p);
+            }
             else if constexpr (std::is_floating_point_v<T>) { auto p = detail::parse_real(s); ok = bool(p); if (p) v = T(*p); }
             else v = T(s);
             if (!ok) { std::lock_guard g(t.m); t.problems.push_back(name_ + "=" + s + ": not a valid " + kind_name(detail::kind_of<T>()) + ", using " + detail::to_text(dflt_)); }
@@ -136,15 +147,16 @@ inline setting<std::string> define(std::string name, const char* dflt, std::stri
 // Environment variables that start with `prefix` but were never defined (likely typos or dead settings).
 inline std::vector<std::string> undocumented(std::string_view prefix) {
     std::vector<std::string> out;
+    auto one = [&](std::string_view kv) { auto eq = kv.find('=', 1); auto k = kv.substr(0, eq); if (!k.empty() && k[0] != '=' && k.starts_with(prefix) && !defined(k)) out.emplace_back(k); };
 #if defined(_WIN32)
-    char** env = _environ;
-#else
-    char** env = environ;
-#endif
-    for (char** e = env; e && *e; ++e) {
-        std::string_view kv(*e); auto eq = kv.find('='); auto k = kv.substr(0, eq);
-        if (k.starts_with(prefix) && !defined(k)) out.emplace_back(k);
+    // The process environment block (UTF-16), not the CRT's ANSI copy (_environ is null under wmain).
+    if (wchar_t* blk = GetEnvironmentStringsW()) {
+        for (const wchar_t* e = blk; *e; e += std::wcslen(e) + 1) one(os::narrow(e));
+        FreeEnvironmentStringsW(blk);
     }
+#else
+    for (char** e = environ; e && *e; ++e) one(*e);
+#endif
     return out;
 }
 // Markdown table of every defined setting (optionally only those starting with prefix), sorted by name.
