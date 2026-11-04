@@ -467,6 +467,82 @@ TEST(key_storage) {
         os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(rd);
     }
 #endif
+    {   // store key wrapped by an Argon2id passphrase (small Argon2 cost to keep the test fast)
+        auto wd = scratch("keys_wrap"); os::setenv("FORGE_KEYSTORE_DIR", wd); auto mp = os::join(wd, ".master"); auto old_kdf = os::keystore::kdf();
+        CHECK(!os::keystore::set_kdf({1024, 3, 1})); CHECK(!os::keystore::set_kdf({8192, 1, 1})); CHECK(!os::keystore::set_kdf({8192, 2, 0}));
+        CHECK(os::keystore::kdf().memory_kib == old_kdf.memory_kib); CHECK(os::keystore::set_kdf({8192, 2, 1}));
+        CHECK(os::keystore::put(svc, "w", secret)); CHECK(os::keystore::backend() == "file");   // plain store first
+#if !defined(FORGE_OS_WINDOWS)
+        CHECK(os::read_file(mp)->rfind("FKK1", 0) == 0);
+#endif
+        os::keystore::set_passphrase("correct horse"); CHECK(os::keystore::backend() == "file+argon2id");
+        { auto r = os::keystore::get(svc, "w"); CHECK(r && r.value == secret); }   // migration: wrapped on first use
+        auto wrapped = os::read_file(mp).value;
+#if !defined(FORGE_OS_WINDOWS)
+        CHECK(wrapped.size() == 104 && wrapped.rfind("FKKP", 0) == 0); CHECK(wrapped.find(secret) == std::string::npos);
+#else
+        CHECK(wrapped.rfind("FKKD", 0) == 0);
+#endif
+        os::keystore::clear_passphrase(); os::keystore::set_passphrase("correct horse");   // fresh cache: derives again
+        CHECK(os::keystore::put(svc, "w2", "two")); CHECK(os::keystore::get(svc, "w2").value == "two"); CHECK(os::keystore::get(svc, "w").value == secret);
+        os::keystore::set_passphrase("wrong horse"); { auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK_MSG(r.err.code == EACCES, "wrong passphrase: %s", r.err.what.c_str()); }
+        os::keystore::clear_passphrase(); { auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK(r.err.code == EACCES); CHECK(!os::keystore::put(svc, "w3", "x")); }
+        os::setenv("FORGE_KEYSTORE_PASSPHRASE", "correct horse"); CHECK(os::keystore::get(svc, "w").value == secret); os::unsetenv("FORGE_KEYSTORE_PASSPHRASE");
+        int asked = 0; os::keystore::set_passphrase_provider([&] { ++asked; return std::string("correct horse"); });
+        CHECK(os::keystore::get(svc, "w").value == secret); CHECK(os::keystore::get(svc, "w2").value == "two"); CHECK(asked == 1);   // asked once, then cached
+        os::keystore::clear_passphrase(); os::keystore::set_passphrase("correct horse");
+#if !defined(FORGE_OS_WINDOWS)
+        // header tamper: parameters, salt, nonce, tag and ciphertext are all authenticated
+        for (std::size_t i : {std::size_t(8), std::size_t(20), std::size_t(40), std::size_t(60), std::size_t(90)}) {
+            auto t = wrapped; t[i] = char(t[i] ^ 1); CHECK(os::write_file(mp, t)); auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK_MSG(r.err.code == EACCES, "tamper %zu: %s", i, r.err.what.c_str());
+        }
+        {   // Argon2 parameters below the minimum in a stored header are refused, not run
+            auto t = wrapped; t[4] = 0; t[5] = 4; t[6] = 0; t[7] = 0; CHECK(os::write_file(mp, t)); auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK(r.err.what.find("Argon2") != std::string::npos);
+        }
+        CHECK(os::write_file(mp, wrapped)); CHECK(os::keystore::get(svc, "w").value == secret);
+#else
+        { auto t = wrapped; t[t.size() / 2] = char(t[t.size() / 2] ^ 1); CHECK(os::write_file(mp, t)); CHECK(!os::keystore::get(svc, "w")); CHECK(os::write_file(mp, wrapped)); }
+#endif
+        // rewrap: change the passphrase, then remove it
+        { auto r = os::keystore::rewrap("bad", "new pass"); CHECK(!r); CHECK(r.err.code == EACCES); }
+        CHECK(os::keystore::rewrap("correct horse", "new pass")); CHECK(os::keystore::get(svc, "w").value == secret);
+        os::keystore::set_passphrase("correct horse"); CHECK(!os::keystore::get(svc, "w"));
+        os::keystore::set_passphrase("new pass"); CHECK(os::keystore::get(svc, "w2").value == "two");
+        CHECK(os::keystore::rewrap("new pass", "")); CHECK(os::keystore::backend() == "file");
+#if !defined(FORGE_OS_WINDOWS)
+        CHECK(os::read_file(mp)->rfind("FKK1", 0) == 0);
+#endif
+        CHECK(os::keystore::get(svc, "w").value == secret);
+        os::keystore::clear_passphrase(); CHECK(os::keystore::set_kdf(old_kdf)); os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(wd);
+    }
+    {   // TPM wrapping (opt-in): skipped where no TPM is usable, which must then fail cleanly as unsupported
+        auto ta = os::keystore::tpm_available(); std::printf("  TPM wrapping: %s\n", ta ? "available" : ta.err.what.c_str());
+        auto td = scratch("keys_tpm"); os::setenv("FORGE_KEYSTORE_DIR", td); os::setenv("FORGE_KEYSTORE_TPM", "1");
+        auto mp = os::join(td, ".master"), tp = os::join(td, ".master.tpm");
+        if (!ta) { auto r = os::keystore::put(svc, "t", "x"); CHECK(!r); CHECK(os::is_unsupported(r.err)); CHECK(os::keystore::backend() == "file"); }
+        else {
+            os::setenv("FORGE_KEYSTORE_TPM_KEY_PREFIX", "forge-test-"); CHECK(os::keystore::set_kdf({8192, 2, 1}));
+            CHECK(os::keystore::backend() == "file+tpm");
+            auto p = os::keystore::put(svc, "t", "tpm-secret"); CHECK_MSG(p, "TPM put: %s", p.err.what.c_str());
+            CHECK(os::read_file(mp).value == "FKKT"); CHECK(os::exists(tp));
+            os::keystore::clear_passphrase();   // drop the cached key: next get unseals
+            { auto g2 = os::keystore::get(svc, "t"); CHECK_MSG(g2 && g2.value == "tpm-secret", "TPM get: %s", g2.err.what.c_str()); }
+            auto tb = os::read_file(tp).value;
+            { auto t = tb; t.back() = char(t.back() ^ 1); CHECK(os::write_file(tp, t)); os::keystore::clear_passphrase(); CHECK(!os::keystore::get(svc, "t")); CHECK(os::write_file(tp, tb)); }
+            os::keystore::set_passphrase("rescue"); CHECK(os::keystore::backend() == "file+tpm+argon2id");
+            CHECK(os::keystore::get(svc, "t").value == "tpm-secret"); CHECK(os::read_file(mp).value != "FKKT"); CHECK(os::read_file(tp).value == tb);   // recovery copy added
+            // TPM copy lost (cleared TPM): the passphrase copy still opens the store
+            os::unsetenv("FORGE_KEYSTORE_TPM"); CHECK(os::remove(tp)); os::keystore::clear_passphrase(); os::keystore::set_passphrase("rescue");
+            CHECK(os::keystore::get(svc, "t").value == "tpm-secret");
+            CHECK(os::write_file(tp, tb)); os::setenv("FORGE_KEYSTORE_TPM", "1");
+            os::keystore::clear_passphrase(); CHECK(os::keystore::get(svc, "t").value == "tpm-secret");   // TPM first, no passphrase needed
+            os::keystore::set_passphrase("rescue"); CHECK(os::keystore::disable_tpm()); CHECK(!os::exists(tp));   // also deletes the NCrypt key
+            os::unsetenv("FORGE_KEYSTORE_TPM"); os::keystore::clear_passphrase(); CHECK(!os::keystore::get(svc, "t"));
+            os::keystore::set_passphrase("rescue"); CHECK(os::keystore::get(svc, "t").value == "tpm-secret");
+            os::keystore::clear_passphrase(); os::unsetenv("FORGE_KEYSTORE_TPM_KEY_PREFIX"); CHECK(os::keystore::set_kdf({}));
+        }
+        os::unsetenv("FORGE_KEYSTORE_TPM"); os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(td);
+    }
     os::unsetenv("FORGE_KEYSTORE");
     std::map<std::string, std::string> mem;
     os::keystore::set_backend({"mem", [&](auto& s, auto& a, auto& v) { mem[s + "/" + a] = v; return os::status{}; },

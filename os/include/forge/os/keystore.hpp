@@ -12,15 +12,35 @@
 //   random 32-byte store key, with a random nonce and the (service, account) pair as associated data, so a
 //   tampered, truncated or swapped file fails get(). The store key lives in `.master` beside the secrets (0600,
 //   created exclusively; DPAPI-wrapped on Windows), so this protects against other users and against copies of
-//   one secret file, not against an attacker who can read the whole directory as this user. Key wrapping by a
-//   TPM or a passphrase is planned (docs/os-audit.md W2-4). Files from the old XOR format are re-encrypted on
-//   first read and the old pad is deleted once no old file remains.
+//   one secret file, not against an attacker who can read the whole directory as this user, unless the store
+//   key is wrapped (below). Files from the old XOR format are re-encrypted on first read and the old pad is
+//   deleted once no old file remains.
+//   Store key wrapping (file backend only):
+//   - Passphrase: FORGE_KEYSTORE_PASSPHRASE, keystore::set_passphrase() or set_passphrase_provider(). `.master`
+//     then holds the key sealed with XChaCha20-Poly1305 under Argon2id(passphrase, 16-byte random salt); the
+//     Argon2 parameters (keystore_kdf, default m=64 MiB t=3 p=1, minimum m=8 MiB t=2) are in the header, which
+//     is authenticated. A wrong passphrase or a modified header fails with EACCES, never with a wrong key. A plain
+//     `.master` is wrapped the first time a passphrase is supplied; rewrap() changes or removes the passphrase.
+//   - TPM (opt-in, FORGE_KEYSTORE_TPM=1): Linux/FreeBSD seal the key to a TPM 2.0 (/dev/tpmrm0) through tpm2-tss
+//     loaded at run time (libtss2-esys/-mu/-tctildr): an SRK-template primary (ECC P-256, RSA-2048 fallback)
+//     under the owner hierarchy parents a keyedhash sealed object whose public/private blobs are `.master.tpm`.
+//     Windows encrypts the key with a non-exportable RSA-2048 key in the Microsoft Platform Crypto Provider
+//     (NCrypt, TPM-backed); `.master.tpm` names the key and holds the RSA-OAEP ciphertext. A sealed key is lost
+//     when the TPM is cleared: with a passphrase also set, `.master` keeps a passphrase-wrapped copy for recovery,
+//     otherwise it holds only a marker. FORGE_KEYSTORE_TPM=1 without a usable TPM makes the file backend fail
+//     with an unsupported error (tpm_available() says why); disable_tpm() unseals and removes the TPM copy.
+//   backend() reports the wrapping in force: "file", "file+argon2id", "file+tpm", "file+tpm+argon2id".
+//   The unwrapped store key is cached in memory per (directory, key files, passphrase); clear_passphrase() wipes it.
 // Link: the file backend needs Monocypher (forge_os links forge_trust in CMake).
 #include <forge/os/detail.hpp>
 #include <monocypher.h>
+#include <cstdlib>
+#include <functional>
+#include <map>
 #include <thread>
 #if (defined(__linux__) && !defined(__ANDROID__)) || defined(FORGE_OS_FREEBSD)
 #define FORGE_OS_KS_LIBSECRET_ 1
+#define FORGE_OS_KS_TSS_ 1
 #endif
 
 namespace forge::os {
@@ -30,24 +50,97 @@ struct keystore_backend {
     std::function<result<std::string>(const std::string&, const std::string&)> get;
     std::function<status(const std::string&, const std::string&)> remove;
 };
+// Argon2id cost for passphrase wrapping. Stored in each wrapped `.master`, so changing it affects new wraps only.
+struct keystore_kdf {
+    std::uint32_t memory_kib = 65536, passes = 3, lanes = 1;
+    static constexpr std::uint32_t min_memory_kib = 8192, min_passes = 2, max_memory_kib = 1u << 20, max_passes = 64, max_lanes = 16;
+    bool valid() const { return memory_kib >= min_memory_kib && memory_kib <= max_memory_kib && passes >= min_passes && passes <= max_passes && lanes >= 1 && lanes <= max_lanes && memory_kib >= 8 * lanes; }
+};
 class keystore {
 public:
     static void set_backend(keystore_backend b) { std::lock_guard<std::mutex> g(m_()); custom_() = std::make_unique<keystore_backend>(std::move(b)); }
     static void reset_backend() { std::lock_guard<std::mutex> g(m_()); custom_().reset(); }
     static std::string backend() {
         { std::lock_guard<std::mutex> g(m_()); if (custom_()) return custom_()->name; }
-        if (force_file_()) return "file";
+        if (force_file_()) return file_name_backend_();
 #if defined(__APPLE__)
         return "keychain";
 #elif defined(FORGE_OS_WINDOWS)
         return "dpapi";
 #elif defined(__ANDROID__)
-        return getenv("FORGE_KEYSTORE_DIR").empty() ? "none" : "file";
+        return getenv("FORGE_KEYSTORE_DIR").empty() ? "none" : file_name_backend_();
 #elif defined(FORGE_OS_KS_LIBSECRET_)
-        return use_libsecret_() ? "libsecret" : "file";
+        return use_libsecret_() ? "libsecret" : file_name_backend_();
 #else
-        return "file";
+        return file_name_backend_();
 #endif
+    }
+    // Passphrase for wrapping the file backend's store key (takes precedence over the provider and
+    // FORGE_KEYSTORE_PASSPHRASE). An empty string forgets it.
+    static void set_passphrase(std::string_view p) { std::lock_guard<std::mutex> g(m_()); auto& s = ps_(); wipe_(s.pass); s.pass.assign(p); wipe_cache_(); }
+    // Called when a passphrase is needed and none is set (e.g. to prompt); return "" for none.
+    static void set_passphrase_provider(std::function<std::string()> f) { std::lock_guard<std::mutex> g(m_()); ps_().provider = std::move(f); }
+    // Forgets the passphrase, the provider and the cached store key.
+    static void clear_passphrase() { std::lock_guard<std::mutex> g(m_()); auto& s = ps_(); wipe_(s.pass); s.pass.clear(); s.provider = nullptr; wipe_cache_(); }
+    static status set_kdf(keystore_kdf k) {
+        if (!k.valid()) return {{}, {EINVAL, "keystore: Argon2 parameters out of range (memory >= 8192 KiB, passes >= 2, 1-16 lanes)"}};
+        std::lock_guard<std::mutex> g(m_()); ps_().kdf = k; return {};
+    }
+    static keystore_kdf kdf() { std::lock_guard<std::mutex> g(m_()); return ps_().kdf; }
+    // Re-wraps the file backend's store key: unlocks with old_pass ("" = not passphrase-wrapped, or unlock
+    // through the TPM copy) and wraps with new_pass ("" = remove the passphrase layer). Secrets are not touched.
+    // On success new_pass becomes the process passphrase (set_passphrase). The TPM copy, if any, is kept.
+    static status rewrap(std::string_view old_pass, std::string_view new_pass) {
+        auto d = dir_(); if (!d) return {{}, d.err};
+        auto p = join(d.value, ".master"), tp = join(d.value, ".master.tpm");
+        auto r = read_file(p); if (!r) return {{}, {2, "keystore: no store key in " + d.value}};
+        auto mk = parse_master_(r.value); wipe_(r.value); if (!mk) return {{}, mk.err};
+        auto t = read_file(tp); std::string tblob = t ? std::move(t.value) : std::string();
+        bool tpm_copy = mk.value.kind != mk_kind::plain && !tblob.empty();
+        std::string key; error terr;
+        if (tpm_copy && (mk.value.kind == mk_kind::tpm || old_pass.empty())) { auto u = tpm_unseal_(tblob); if (u) key = std::move(u.value); else terr = u.err; }
+        if (key.empty()) {
+            if (mk.value.kind == mk_kind::plain) key = mk.value.payload;
+            else if (mk.value.kind == mk_kind::tpm) return {{}, terr};
+            else { auto u = fkkp_unlock_(mk.value.payload, old_pass); if (!u) return {{}, u.err}; key = std::move(u.value); }
+        }
+        wipe_(mk.value.payload);
+        bool tpm_on = tpm_requested_();
+        auto s = store_(d.value, key, std::string(new_pass), tpm_copy ? tpm_mode::keep : tpm_on ? tpm_mode::seal : tpm_mode::drop, tblob);
+        wipe_(key); if (!s) return s;
+        set_passphrase(new_pass); return {};
+    }
+    // Whether TPM wrapping can be used here (tpm2-tss + /dev/tpmrm0 on Linux/FreeBSD, the Platform Crypto Provider
+    // on Windows); the error says what is missing.
+    static status tpm_available() {
+#if defined(FORGE_OS_KS_TSS_)
+        auto& a = tss_api::get(); if (!a.ok) return {{}, unsupported("keystore TPM: tpm2-tss (libtss2-esys.so.0, libtss2-mu.so.0, libtss2-tctildr.so.0)")};
+        if (!getenv("FORGE_KEYSTORE_TPM_TCTI").empty()) return {};
+        if (!exists("/dev/tpmrm0")) return {{}, unsupported("keystore TPM: no /dev/tpmrm0")};
+        if (::access("/dev/tpmrm0", R_OK | W_OK)) return {{}, {unsupported_code, "keystore TPM: /dev/tpmrm0 is not accessible (add the user to the tss group): " + error_text(errno)}};
+        return {};
+#elif defined(FORGE_OS_WINDOWS)
+        auto& a = ncrypt_api::get(); if (!a.ok) return {{}, unsupported("keystore TPM: ncrypt.dll")};
+        std::uintptr_t prov = 0; long rc = a.open_provider(&prov, L"Microsoft Platform Crypto Provider", 0);
+        if (rc) return {{}, {unsupported_code, "keystore TPM: Microsoft Platform Crypto Provider unavailable (" + hex_(std::uint32_t(rc)) + ")"}};
+        a.free_obj(prov); return {};
+#else
+        return {{}, unsupported("keystore TPM wrapping")};
+#endif
+    }
+    // Unseals the store key and removes the TPM copy (.master.tpm and, on Windows, the NCrypt key); `.master`
+    // keeps or gets the passphrase wrapping if a passphrase is available, else becomes a plain (DPAPI on Windows) key.
+    static status disable_tpm() {
+        auto d = dir_(); if (!d) return {{}, d.err};
+        auto p = join(d.value, ".master"), tp = join(d.value, ".master.tpm");
+        auto t = read_file(tp); if (!t) return {};
+        auto r = read_file(p); if (!r) { tpm_destroy_(t.value); return os::remove(tp); }
+        auto mk = parse_master_(r.value); wipe_(r.value); if (!mk) return {{}, mk.err};
+        if (mk.value.kind == mk_kind::pass) { wipe_(mk.value.payload); tpm_destroy_(t.value); return os::remove(tp); }
+        if (mk.value.kind == mk_kind::plain) { wipe_(mk.value.payload); tpm_destroy_(t.value); return os::remove(tp); }   // stale copy
+        auto u = tpm_unseal_(t.value); if (!u) return {{}, u.err};
+        auto pass = passphrase_(); if (pass.empty()) pass = provided_passphrase_();
+        auto s = store_(d.value, u.value, pass, tpm_mode::drop, t.value); wipe_(u.value); wipe_(pass); return s;
     }
     static status put(const std::string& service, const std::string& account, const std::string& secret) {
         if (auto c = custom_copy_()) return c->put(service, account, secret);
@@ -186,41 +279,383 @@ private:
         return {true, {}};
 #endif
     }
-    static result<std::string> wrap_key_(const std::string& k) {
-#if defined(FORGE_OS_WINDOWS)
-        auto b = dpapi_(k, true); if (!b) return {{}, b.err}; return {"FKKD" + b.value, {}};
-#else
-        return {"FKK1" + k, {}};
-#endif
+    // ---- store key wrapping
+    static void wipe_(std::string& s) { if (!s.empty()) crypto_wipe(s.data(), s.size()); }
+    static std::string hex_(std::uint32_t v) { char b[16]; std::snprintf(b, sizeof b, "0x%08x", unsigned(v)); return b; }
+    struct pass_state { std::string pass; std::function<std::string()> provider; std::map<std::string, std::string> cache; keystore_kdf kdf; };
+    static pass_state& ps_() { static pass_state s; return s; }
+    static void wipe_cache_() { for (auto& [k, v] : ps_().cache) wipe_(v); ps_().cache.clear(); }   // caller holds m_()
+    static bool tpm_requested_() { return getenv("FORGE_KEYSTORE_TPM") == "1"; }
+    // API passphrase, else FORGE_KEYSTORE_PASSPHRASE (the provider is asked only when a key must be unwrapped/wrapped).
+    static std::string passphrase_() { { std::lock_guard<std::mutex> g(m_()); if (!ps_().pass.empty()) return ps_().pass; } return getenv("FORGE_KEYSTORE_PASSPHRASE"); }
+    static bool has_provider_() { std::lock_guard<std::mutex> g(m_()); return bool(ps_().provider); }
+    static std::string provided_passphrase_() {
+        std::function<std::string()> f; { std::lock_guard<std::mutex> g(m_()); f = ps_().provider; }
+        return f ? f() : std::string();
     }
-    static result<std::string> unwrap_key_(const std::string& f) {
+    static std::string file_name_backend_() {
+        std::string n = "file";
+        if (tpm_requested_() && tpm_available()) n += "+tpm";
+        if (!passphrase_().empty() || has_provider_()) n += "+argon2id";
+        return n;
+    }
+    static std::string cache_tag_(const std::string& d, const std::string& m, const std::string& t, const std::string& pass) {
+        crypto_blake2b_ctx c; crypto_blake2b_init(&c, 32); std::uint8_t h[32];
+        for (auto* s : {&d, &m, &t, &pass}) { std::uint64_t n = s->size(); crypto_blake2b_update(&c, reinterpret_cast<const std::uint8_t*>(&n), 8); crypto_blake2b_update(&c, reinterpret_cast<const std::uint8_t*>(s->data()), s->size()); }
+        crypto_blake2b_final(&c, h); return std::string(reinterpret_cast<char*>(h), 32);
+    }
+    static std::string cache_get_(const std::string& tag) { std::lock_guard<std::mutex> g(m_()); auto it = ps_().cache.find(tag); return it == ps_().cache.end() ? std::string() : it->second; }
+    static void cache_put_(const std::string& tag, const std::string& key) {
+        std::lock_guard<std::mutex> g(m_()); auto& c = ps_().cache; if (c.size() >= 16) wipe_cache_(); c[tag] = key;
+    }
+    static void put_u32_(char* p, std::uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = char(v >> (8 * i)); }
+    static std::uint32_t get_u32_(const char* p) { std::uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= std::uint32_t(std::uint8_t(p[i])) << (8 * i); return v; }
+    static result<std::string> argon2id_(std::string_view pass, const std::uint8_t* salt, const keystore_kdf& k) {
+        if (!k.valid()) return {{}, {EINVAL, "keystore: Argon2 parameters out of range"}};
+        std::size_t bytes = std::size_t(k.memory_kib) * 1024; void* wa = std::malloc(bytes);
+        if (!wa) return {{}, {ENOMEM, "keystore: no memory for Argon2 (" + std::to_string(k.memory_kib) + " KiB)"}};
+        crypto_argon2_config cfg{CRYPTO_ARGON2_ID, k.memory_kib, k.passes, k.lanes};
+        crypto_argon2_inputs in{reinterpret_cast<const std::uint8_t*>(pass.data()), salt, std::uint32_t(pass.size()), 16};
+        std::string out(32, '\0'); crypto_argon2(reinterpret_cast<std::uint8_t*>(out.data()), 32, wa, cfg, in, crypto_argon2_no_extras);
+        crypto_wipe(wa, bytes); std::free(wa); return {std::move(out), {}};
+    }
+    // Passphrase-wrapped store key: "FKKP" | m_kib t lanes (u32 LE) | salt[16] | nonce[24] | mac[16] | key[32],
+    // the first 32 bytes (magic, parameters, salt) authenticated as associated data.
+    static constexpr std::size_t fkkp_size_ = 104;
+    static result<std::string> fkkp_lock_(const std::string& key, std::string_view pass) {
+        auto k = kdf(); std::string out(fkkp_size_, '\0'); std::memcpy(out.data(), "FKKP", 4);
+        put_u32_(&out[4], k.memory_kib); put_u32_(&out[8], k.passes); put_u32_(&out[12], k.lanes);
+        auto* u = reinterpret_cast<std::uint8_t*>(out.data());
+        if (!entropy(u + 16, 16 + 24)) return {{}, {EIO, "keystore: no entropy"}};
+        auto kek = argon2id_(pass, u + 16, k); if (!kek) return kek;
+        crypto_aead_lock(u + 72, u + 56, reinterpret_cast<const std::uint8_t*>(kek.value.data()), u + 32, u, 32, reinterpret_cast<const std::uint8_t*>(key.data()), 32);
+        wipe_(kek.value); return {std::move(out), {}};
+    }
+    static result<std::string> fkkp_unlock_(const std::string& blob, std::string_view pass) {
+        if (pass.empty()) return {{}, {EACCES, "keystore: the store key is passphrase-protected; set FORGE_KEYSTORE_PASSPHRASE or call keystore::set_passphrase()"}};
+        keystore_kdf k; k.memory_kib = get_u32_(&blob[4]); k.passes = get_u32_(&blob[8]); k.lanes = get_u32_(&blob[12]);
+        if (!k.valid()) return {{}, {EACCES, "keystore: store key header has out-of-range Argon2 parameters (tampered)"}};
+        auto* u = reinterpret_cast<const std::uint8_t*>(blob.data());
+        auto kek = argon2id_(pass, u + 16, k); if (!kek) return kek;
+        std::string key(32, '\0');
+        int bad = crypto_aead_unlock(reinterpret_cast<std::uint8_t*>(key.data()), u + 56, reinterpret_cast<const std::uint8_t*>(kek.value.data()), u + 32, u, 32, u + 72, 32);
+        wipe_(kek.value);
+        if (bad) return {{}, {EACCES, "keystore: wrong passphrase or tampered store key (authentication failed)"}};
+        return {std::move(key), {}};
+    }
+    // `.master` forms. POSIX: "FKK1"+key | FKKP blob | "FKKT" (key only in .master.tpm).
+    // Windows: "FKKD"+DPAPI(key or FKKP blob) | "FKKT".
+    enum class mk_kind { plain, pass, tpm };
+    struct mk_t { mk_kind kind = mk_kind::plain; std::string payload; };   // plain: the key; pass: the FKKP blob
+    static result<mk_t> parse_master_(const std::string& f) {
+        if (f == "FKKT") return {{mk_kind::tpm, {}}, {}};
 #if defined(FORGE_OS_WINDOWS)
-        if (f.size() > 4 && f.compare(0, 4, "FKKD") == 0) { auto k = dpapi_(f.substr(4), false); if (k && k.value.size() == 32) return k; }
+        if (f.size() > 4 && f.compare(0, 4, "FKKD") == 0) {
+            auto in = dpapi_(f.substr(4), false);
+            if (in && in.value.size() == 32) return {{mk_kind::plain, std::move(in.value)}, {}};
+            if (in && in.value.size() == fkkp_size_ && in.value.compare(0, 4, "FKKP") == 0) return {{mk_kind::pass, std::move(in.value)}, {}};
+            if (in) wipe_(in.value);
+        }
 #else
-        if (f.size() == 36 && f.compare(0, 4, "FKK1") == 0) return {f.substr(4), {}};
+        if (f.size() == 36 && f.compare(0, 4, "FKK1") == 0) return {{mk_kind::plain, f.substr(4)}, {}};
+        if (f.size() == fkkp_size_ && f.compare(0, 4, "FKKP") == 0) return {{mk_kind::pass, f}, {}};
 #endif
         return {{}, {EIO, "keystore: store key is corrupt"}};
     }
-    // The store key: read it, or create it exclusively; concurrent creators converge on the first one published.
+    static result<std::string> encode_master_(const std::string& key, const std::string& pass, bool tpm) {
+        if (pass.empty() && tpm) return {"FKKT", {}};
+        std::string inner = key;
+        if (!pass.empty()) { auto w = fkkp_lock_(key, pass); wipe_(inner); if (!w) return w; inner = std::move(w.value); }
+#if defined(FORGE_OS_WINDOWS)
+        auto b = dpapi_(inner, true); wipe_(inner); if (!b) return {{}, b.err}; return {"FKKD" + b.value, {}};
+#else
+        if (pass.empty()) { auto r = "FKK1" + inner; wipe_(inner); return {std::move(r), {}}; }
+        return {std::move(inner), {}};
+#endif
+    }
+    enum class tpm_mode { drop, keep, seal };
+    // Rewrite `.master` (and `.master.tpm`) for an already-unwrapped key; each file is replaced atomically, the
+    // TPM copy first, so a reader always finds a usable combination.
+    static status store_(const std::string& d, const std::string& key, const std::string& pass, tpm_mode mode, const std::string& old_tblob) {
+        auto p = join(d, ".master"), tp = join(d, ".master.tpm");
+        if (mode == tpm_mode::seal) {
+            auto s = tpm_seal_(key, old_tblob); if (!s) return {{}, s.err};
+            if (auto w = replace_(d, tp, s.value); !w) return w;
+        }
+        auto enc = encode_master_(key, pass, mode != tpm_mode::drop); if (!enc) return {{}, enc.err};
+        auto w = replace_(d, p, enc.value); wipe_(enc.value); if (!w) return w;
+        if (mode == tpm_mode::drop && exists(tp)) { if (!old_tblob.empty()) tpm_destroy_(old_tblob); return os::remove(tp); }
+        return {};
+    }
+    // First key in a store: published exclusively, so concurrent creators converge on one key. With the TPM the
+    // sealed copy is written first and renamed into place only by the winner.
+    static status create_key_(const std::string& d, bool tpm_on) {
+        auto p = join(d, ".master"), tp = join(d, ".master.tpm");
+        std::string k(32, '\0'); if (!entropy(k.data(), k.size())) return {{}, {EIO, "keystore: no entropy"}};
+        auto pass = passphrase_(); if (pass.empty()) pass = provided_passphrase_();
+        std::string sealed, ttmp;
+        if (tpm_on) { auto s = tpm_seal_(k, {}); if (!s) { wipe_(k); wipe_(pass); return {{}, s.err}; } sealed = std::move(s.value); }
+        auto w = encode_master_(k, pass, tpm_on); wipe_(k); wipe_(pass); if (!w) { if (tpm_on) tpm_destroy_(sealed); return {{}, w.err}; }
+        if (tpm_on) { ttmp = tmp_name_(d, ".master.tpm"); if (auto c = create_excl_(ttmp, sealed); !c) { tpm_destroy_(sealed); wipe_(w.value); return c; } }
+        auto tmp = tmp_name_(d, ".master");
+        auto c = create_excl_(tmp, w.value); if (!c) { wipe_(w.value); if (tpm_on) { os::remove(ttmp); tpm_destroy_(sealed); } return c; }
+        auto pub = publish_excl_(tmp, p, w.value); wipe_(w.value);
+        if (tpm_on) {
+            if (pub && pub.value) { if (auto r = rename(ttmp, tp); !r) return r; }
+            else { os::remove(ttmp); tpm_destroy_(sealed); }
+        }
+        if (!pub && pub.err.code) return {{}, pub.err};
+        return {};   // published or lost the race: the caller reads back whichever key won
+    }
+    // The store key: read and unwrap it (TPM copy first, then the passphrase), wrapping it further when a
+    // passphrase or the TPM is newly configured; or create it.
     static result<std::string> key_(const std::string& d) {
-        auto p = join(d, ".master"); error last{EIO, "keystore: store key is corrupt"};
+        auto p = join(d, ".master"), tp = join(d, ".master.tpm"); error last{EIO, "keystore: store key is corrupt"};
+        bool tpm_on = tpm_requested_();
+        if (tpm_on) if (auto a = tpm_available(); !a) return {{}, {a.err.code, a.err.what + " (FORGE_KEYSTORE_TPM=1)"}};
+        auto nap = [] { std::this_thread::sleep_for(std::chrono::milliseconds(10)); };
         for (int attempt = 0; attempt < 100; ++attempt) {
-            if (auto r = read_file(p)) {
-                auto k = unwrap_key_(r.value); crypto_wipe(r.value.data(), r.value.size()); if (k) return k;
-                last = k.err; std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue;   // maybe still being written
+            auto r = read_file(p);
+            if (!r) {
+                // Exists but unreadable: on Windows a scanner or a concurrent rename can hold it briefly; retry.
+                if (exists(p)) { last = last_error("keystore: read " + p); nap(); continue; }
+                if (auto c = create_key_(d, tpm_on); !c) return {{}, c.err};
+                continue;
             }
-            // Exists but unreadable: on Windows a scanner or a concurrent rename can hold it briefly; retry.
-            if (exists(p)) { last = last_error("keystore: read " + p); std::this_thread::sleep_for(std::chrono::milliseconds(10)); continue; }
-            std::string k(32, '\0'); if (!entropy(k.data(), k.size())) return {{}, {EIO, "keystore: no entropy"}};
-            auto w = wrap_key_(k); crypto_wipe(k.data(), k.size()); if (!w) return {{}, w.err};
-            auto tmp = tmp_name_(d, ".master");
-            auto c = create_excl_(tmp, w.value); if (!c) { crypto_wipe(w.value.data(), w.value.size()); return {{}, c.err}; }
-            auto pub = publish_excl_(tmp, p, w.value); crypto_wipe(w.value.data(), w.value.size());
-            if (!pub && pub.err.code) return {{}, pub.err};
-            // published or lost the race: read back whichever key won
+            auto t = read_file(tp); std::string tblob = t ? std::move(t.value) : std::string();
+            std::string pass = passphrase_();
+            auto tag = cache_tag_(d, r.value, tblob, pass);
+            if (auto c = cache_get_(tag); !c.empty()) { wipe_(r.value); wipe_(pass); return {std::move(c), {}}; }
+            auto mk = parse_master_(r.value); wipe_(r.value);
+            if (!mk) { last = mk.err; nap(); continue; }   // maybe still being written
+            auto kind = mk.value.kind;
+            bool tpm_copy = kind != mk_kind::plain && !tblob.empty();
+            std::string key; error terr;
+            if (tpm_copy && (kind == mk_kind::tpm || tpm_on)) { auto u = tpm_unseal_(tblob); if (u) key = std::move(u.value); else terr = u.err; }
+            if (key.empty()) {
+                if (kind == mk_kind::plain) key = std::move(mk.value.payload);
+                else if (kind == mk_kind::tpm) {
+                    if (tblob.empty()) { last = {EIO, "keystore: the TPM-sealed store key (.master.tpm) is missing"}; nap(); continue; }
+                    return {{}, {terr.code ? terr.code : EIO, terr.what + " (no passphrase copy to recover from)"}};
+                } else {
+                    if (pass.empty()) pass = provided_passphrase_();
+                    auto u = fkkp_unlock_(mk.value.payload, pass);
+                    if (!u) { wipe_(pass); wipe_(mk.value.payload); if (terr) u.err.what += " (TPM: " + terr.what + ")"; return {{}, u.err}; }
+                    key = std::move(u.value);
+                }
+            }
+            wipe_(mk.value.payload);
+            if (pass.empty() && kind != mk_kind::pass && has_provider_()) pass = provided_passphrase_();
+            bool want_seal = tpm_on && !tpm_copy;
+            if ((!pass.empty() && kind != mk_kind::pass) || want_seal) {   // migrate: plain -> wrapped, add a TPM copy
+                auto s = store_(d, key, pass, want_seal ? tpm_mode::seal : tpm_copy ? tpm_mode::keep : tpm_mode::drop, tblob);
+                if (!s) { wipe_(key); wipe_(pass); return {{}, s.err}; }
+            } else cache_put_(tag, key);
+            wipe_(pass); return {std::move(key), {}};
         }
         return {{}, last};
     }
+#if defined(FORGE_OS_KS_TSS_)
+    // tpm2-tss, loaded at run time. Structures are built in TPM wire format and unmarshalled by libtss2-mu into
+    // opaque buffers, so no TSS headers or struct layouts are needed here.
+    struct tss_api {
+        using rc_t = std::uint32_t; using tr = std::uint32_t;
+        rc_t (*ldr_init)(const char*, void**) = nullptr; void (*ldr_fini)(void**) = nullptr;
+        rc_t (*init)(void**, void*, void*) = nullptr; void (*fini)(void**) = nullptr; rc_t (*startup)(void*, std::uint16_t) = nullptr;
+        rc_t (*create_primary)(void*, tr, tr, tr, tr, const void*, const void*, const void*, const void*, tr*, void**, void**, void**, void**) = nullptr;
+        rc_t (*create)(void*, tr, tr, tr, tr, const void*, const void*, const void*, const void*, void**, void**, void**, void**, void**) = nullptr;
+        rc_t (*load)(void*, tr, tr, tr, tr, const void*, const void*, tr*) = nullptr;
+        rc_t (*unseal)(void*, tr, tr, tr, tr, void**) = nullptr; rc_t (*flush)(void*, tr) = nullptr; void (*free_)(void*) = nullptr;
+        using um_t = rc_t (*)(const std::uint8_t*, std::size_t, std::size_t*, void*); using m_t = rc_t (*)(const void*, std::uint8_t*, std::size_t, std::size_t*);
+        um_t pub_um = nullptr, priv_um = nullptr, sens_um = nullptr, data_um = nullptr, pcr_um = nullptr; m_t pub_m = nullptr, priv_m = nullptr, sdata_m = nullptr;
+        const char* (*decode)(rc_t) = nullptr; bool ok = false;
+        static constexpr tr none = 0xfff, password = 0x0ff, owner = 0x101;
+        static tss_api& get() {
+            static tss_api a = [] {
+                tss_api x; void* e = ::dlopen("libtss2-esys.so.0", RTLD_LAZY); void* m = ::dlopen("libtss2-mu.so.0", RTLD_LAZY); void* l = ::dlopen("libtss2-tctildr.so.0", RTLD_LAZY);
+                if (!e || !m || !l) return x;
+                auto f = [](void* h, const char* n, auto& p) { p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(::dlsym(h, n)); return p != nullptr; };
+                bool ok = f(l, "Tss2_TctiLdr_Initialize", x.ldr_init) & f(l, "Tss2_TctiLdr_Finalize", x.ldr_fini) & f(e, "Esys_Initialize", x.init) & f(e, "Esys_Finalize", x.fini)
+                    & f(e, "Esys_Startup", x.startup) & f(e, "Esys_CreatePrimary", x.create_primary) & f(e, "Esys_Create", x.create) & f(e, "Esys_Load", x.load)
+                    & f(e, "Esys_Unseal", x.unseal) & f(e, "Esys_FlushContext", x.flush) & f(e, "Esys_Free", x.free_)
+                    & f(m, "Tss2_MU_TPM2B_PUBLIC_Unmarshal", x.pub_um) & f(m, "Tss2_MU_TPM2B_PRIVATE_Unmarshal", x.priv_um) & f(m, "Tss2_MU_TPM2B_SENSITIVE_CREATE_Unmarshal", x.sens_um)
+                    & f(m, "Tss2_MU_TPM2B_DATA_Unmarshal", x.data_um) & f(m, "Tss2_MU_TPML_PCR_SELECTION_Unmarshal", x.pcr_um) & f(m, "Tss2_MU_TPM2B_PUBLIC_Marshal", x.pub_m)
+                    & f(m, "Tss2_MU_TPM2B_PRIVATE_Marshal", x.priv_m) & f(m, "Tss2_MU_TPM2B_SENSITIVE_DATA_Marshal", x.sdata_m);
+                if (void* r = ::dlopen("libtss2-rc.so.0", RTLD_LAZY)) f(r, "Tss2_RC_Decode", x.decode);
+                x.ok = ok; return x;
+            }();
+            return a;
+        }
+        error err(const char* what, rc_t rc) const { return {EIO, std::string("keystore TPM: ") + what + " failed: " + (decode ? decode(rc) : hex_(rc))}; }
+    };
+    struct wire_ {
+        std::string b;
+        void u16(unsigned v) { b += char((v >> 8) & 0xff); b += char(v & 0xff); }
+        void u32(std::uint32_t v) { u16(v >> 16); u16(v & 0xffff); }
+        void zeros(std::size_t n) { b.append(n, '\0'); }
+        std::string tpm2b() const { wire_ w; w.u16(unsigned(b.size())); return w.b + b; }
+    };
+    struct opaque_ { alignas(16) unsigned char b[8192] = {}; ~opaque_() { crypto_wipe(b, sizeof b); } };
+    // SRK-style primary under the owner hierarchy (TCG template: restricted decrypt, AES-128-CFB, noDA).
+    static std::string srk_template_(int alg) {
+        wire_ t; t.u16(alg == 1 ? 0x0023 : 0x0001); t.u16(0x000B); t.u32(0x00030472); t.u16(0);
+        t.u16(0x0006); t.u16(128); t.u16(0x0043);
+        if (alg == 1) { t.u16(0x0010); t.u16(0x0003); t.u16(0x0010); t.u16(32); t.zeros(32); t.u16(32); t.zeros(32); }
+        else { t.u16(0x0010); t.u16(2048); t.u32(0); t.u16(256); t.zeros(256); }
+        return t.tpm2b();
+    }
+    struct tpm_session_ {
+        tss_api& a = tss_api::get(); void* tcti = nullptr; void* esys = nullptr; std::uint32_t primary = tss_api::none;
+        ~tpm_session_() { if (primary != tss_api::none) a.flush(esys, primary); if (esys) a.fini(&esys); if (tcti) a.ldr_fini(&tcti); }
+        error open() {
+            auto conf = getenv("FORGE_KEYSTORE_TPM_TCTI");
+            if (auto rc = a.ldr_init(conf.empty() ? "device:/dev/tpmrm0" : conf.c_str(), &tcti)) return a.err("TCTI init", rc);
+            if (auto rc = a.init(&esys, tcti, nullptr)) return a.err("Esys_Initialize", rc);
+            if (!conf.empty()) a.startup(esys, 0x0000);   // simulators start cold; TPM_RC_INITIALIZE otherwise
+            return {};
+        }
+        error make_primary(int alg) {
+            opaque_ sens, pub, out, pcr; std::size_t off = 0; wire_ s; s.u16(4); s.u16(0); s.u16(0);
+            auto tpl = srk_template_(alg); const std::uint8_t z[4] = {};
+            if (a.sens_um(reinterpret_cast<const std::uint8_t*>(s.b.data()), s.b.size(), &off, sens.b)) return {EIO, "keystore TPM: marshal"};
+            off = 0; if (a.pub_um(reinterpret_cast<const std::uint8_t*>(tpl.data()), tpl.size(), &off, pub.b)) return {EIO, "keystore TPM: marshal"};
+            off = 0; if (a.data_um(z, 2, &off, out.b)) return {EIO, "keystore TPM: marshal"};
+            off = 0; if (a.pcr_um(z, 4, &off, pcr.b)) return {EIO, "keystore TPM: marshal"};
+            if (auto rc = a.create_primary(esys, tss_api::owner, tss_api::password, tss_api::none, tss_api::none, sens.b, pub.b, out.b, pcr.b, &primary, nullptr, nullptr, nullptr, nullptr)) {
+                primary = tss_api::none; return a.err("CreatePrimary", rc);
+            }
+            return {};
+        }
+    };
+    static result<std::string> marshal_(tss_api::m_t m, const void* obj) {
+        std::string b(8192, '\0'); std::size_t off = 0;
+        if (m(obj, reinterpret_cast<std::uint8_t*>(b.data()), b.size(), &off)) return {{}, {EIO, "keystore TPM: marshal"}};
+        b.resize(off); return {std::move(b), {}};
+    }
+    // `.master.tpm` (Linux/FreeBSD): "FKTL" | alg (1 ECC, 2 RSA) | u32 len + TPM2B_PUBLIC | u32 len + TPM2B_PRIVATE.
+    static result<std::string> tpm_seal_(const std::string& key, const std::string&) {
+        if (auto av = tpm_available(); !av) return {{}, av.err};
+        tpm_session_ s; if (auto e = s.open()) return {{}, e};
+        int alg = 1; error e = s.make_primary(1); if (e) { alg = 2; if (auto e2 = s.make_primary(2)) return {{}, e}; }
+        auto& a = s.a; opaque_ sens, pub, out, pcr; std::size_t off = 0;
+        wire_ in; in.u16(0); in.u16(32); in.b += key; auto sw = in.tpm2b(); wipe_(in.b);
+        wire_ t; t.u16(0x0008); t.u16(0x000B); t.u32(0x00000452); t.u16(0); t.u16(0x0010); t.u16(0); auto tpl = t.tpm2b();
+        const std::uint8_t z[4] = {};
+        bool bad = a.sens_um(reinterpret_cast<const std::uint8_t*>(sw.data()), sw.size(), &off, sens.b); wipe_(sw);
+        off = 0; bad |= a.pub_um(reinterpret_cast<const std::uint8_t*>(tpl.data()), tpl.size(), &off, pub.b) != 0;
+        off = 0; bad |= a.data_um(z, 2, &off, out.b) != 0; off = 0; bad |= a.pcr_um(z, 4, &off, pcr.b) != 0;
+        if (bad) return {{}, {EIO, "keystore TPM: marshal"}};
+        void *opriv = nullptr, *opub = nullptr;
+        if (auto rc = a.create(s.esys, s.primary, tss_api::password, tss_api::none, tss_api::none, sens.b, pub.b, out.b, pcr.b, &opriv, &opub, nullptr, nullptr, nullptr)) return {{}, a.err("Create (seal)", rc)};
+        auto mp = marshal_(a.pub_m, opub), mv = marshal_(a.priv_m, opriv); a.free_(opub); a.free_(opriv);
+        if (!mp || !mv) return {{}, {EIO, "keystore TPM: marshal"}};
+        std::string r = "FKTL"; r += char(alg);
+        char n[4]; put_u32_(n, std::uint32_t(mp.value.size())); r.append(n, 4); r += mp.value;
+        put_u32_(n, std::uint32_t(mv.value.size())); r.append(n, 4); r += mv.value;
+        return {std::move(r), {}};
+    }
+    static result<std::string> tpm_unseal_(const std::string& blob) {
+        if (blob.size() < 13 || blob.compare(0, 4, "FKTL") != 0 || (blob[4] != 1 && blob[4] != 2)) return {{}, {EIO, "keystore TPM: .master.tpm is corrupt"}};
+        std::size_t pl = get_u32_(&blob[5]); if (9 + pl + 4 > blob.size()) return {{}, {EIO, "keystore TPM: .master.tpm is corrupt"}};
+        std::size_t vl = get_u32_(&blob[9 + pl]); if (13 + pl + vl != blob.size()) return {{}, {EIO, "keystore TPM: .master.tpm is corrupt"}};
+        if (auto av = tpm_available(); !av) return {{}, av.err};
+        tpm_session_ s; if (auto e = s.open()) return {{}, e};
+        if (auto e = s.make_primary(blob[4])) return {{}, e};
+        auto& a = s.a; opaque_ pub, priv; std::size_t off = 0;
+        if (a.pub_um(reinterpret_cast<const std::uint8_t*>(blob.data() + 9), pl, &off, pub.b)) return {{}, {EIO, "keystore TPM: .master.tpm is corrupt"}};
+        off = 0; if (a.priv_um(reinterpret_cast<const std::uint8_t*>(blob.data() + 13 + pl), vl, &off, priv.b)) return {{}, {EIO, "keystore TPM: .master.tpm is corrupt"}};
+        std::uint32_t obj = tss_api::none;
+        if (auto rc = a.load(s.esys, s.primary, tss_api::password, tss_api::none, tss_api::none, priv.b, pub.b, &obj)) return {{}, a.err("Load (sealed key; TPM cleared or replaced?)", rc)};
+        void* outd = nullptr; auto rc = a.unseal(s.esys, obj, tss_api::password, tss_api::none, tss_api::none, &outd); a.flush(s.esys, obj);
+        if (rc) return {{}, a.err("Unseal", rc)};
+        auto m = marshal_(a.sdata_m, outd); crypto_wipe(outd, 2 + 128); a.free_(outd);
+        if (!m || m.value.size() != 34 || std::uint8_t(m.value[0]) != 0 || std::uint8_t(m.value[1]) != 32) { if (m) wipe_(m.value); return {{}, {EIO, "keystore TPM: unsealed data is not a store key"}}; }
+        std::string key = m.value.substr(2); wipe_(m.value); return {std::move(key), {}};
+    }
+    static void tpm_destroy_(const std::string&) {}   // sealed objects live only in .master.tpm
+#elif defined(FORGE_OS_WINDOWS)
+    // NCrypt, loaded at run time: a persisted non-exportable RSA-2048 key in the Platform Crypto Provider (TPM).
+    struct ncrypt_api {
+        using h = std::uintptr_t;
+        long (WINAPI* open_provider)(h*, const wchar_t*, DWORD) = nullptr; long (WINAPI* open_key)(h, h*, const wchar_t*, DWORD, DWORD) = nullptr;
+        long (WINAPI* create_key)(h, h*, const wchar_t*, const wchar_t*, DWORD, DWORD) = nullptr; long (WINAPI* set_prop)(h, const wchar_t*, BYTE*, DWORD, DWORD) = nullptr;
+        long (WINAPI* finalize)(h, DWORD) = nullptr; long (WINAPI* encrypt)(h, BYTE*, DWORD, void*, BYTE*, DWORD, DWORD*, DWORD) = nullptr;
+        long (WINAPI* decrypt)(h, BYTE*, DWORD, void*, BYTE*, DWORD, DWORD*, DWORD) = nullptr; long (WINAPI* del)(h, DWORD) = nullptr; long (WINAPI* free_obj)(h) = nullptr;
+        bool ok = false;
+        static ncrypt_api& get() {
+            static ncrypt_api a = [] {
+                ncrypt_api x; HMODULE m = LoadLibraryExW(L"ncrypt.dll", nullptr, 0x00000800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); if (!m) return x;
+                auto f = [&](const char* n, auto& p) { p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(reinterpret_cast<void*>(GetProcAddress(m, n))); return p != nullptr; };
+                x.ok = f("NCryptOpenStorageProvider", x.open_provider) & f("NCryptOpenKey", x.open_key) & f("NCryptCreatePersistedKey", x.create_key) & f("NCryptSetProperty", x.set_prop)
+                    & f("NCryptFinalizeKey", x.finalize) & f("NCryptEncrypt", x.encrypt) & f("NCryptDecrypt", x.decrypt) & f("NCryptDeleteKey", x.del) & f("NCryptFreeObject", x.free_obj);
+                return x;
+            }();
+            return a;
+        }
+    };
+    struct oaep_ { const wchar_t* alg; BYTE* label; ULONG cb; };
+    static constexpr DWORD nc_silent_ = 0x40, nc_oaep_ = 0x4;
+    // Opens the named key, creating it when missing. `created` tells whether this call made it.
+    static result<ncrypt_api::h> nc_key_(ncrypt_api::h prov, const std::string& name, bool create, bool* created) {
+        auto& a = ncrypt_api::get(); ncrypt_api::h k = 0; auto wn = widen(name); if (created) *created = false;
+        long rc = a.open_key(prov, &k, wn.c_str(), 0, nc_silent_); if (!rc) return {k, {}};
+        if (!create) return {0, {EIO, "keystore TPM: key " + name + " not found in the Platform Crypto Provider (" + hex_(std::uint32_t(rc)) + ")"}};
+        rc = a.create_key(prov, &k, L"RSA", wn.c_str(), 0, 0);
+        if (rc) return {0, {EIO, "keystore TPM: NCryptCreatePersistedKey " + hex_(std::uint32_t(rc))}};
+        DWORD bits = 2048; a.set_prop(k, L"Length", reinterpret_cast<BYTE*>(&bits), sizeof bits, 0);
+        if ((rc = a.finalize(k, nc_silent_))) { a.free_obj(k); return {0, {EIO, "keystore TPM: NCryptFinalizeKey " + hex_(std::uint32_t(rc))}}; }
+        if (created) *created = true; return {k, {}};
+    }
+    // `.master.tpm` (Windows): "FKTW" | u16 name length | key name (UTF-8) | RSA-OAEP-SHA256 ciphertext.
+    static bool nc_parse_(const std::string& blob, std::string& name, std::string& ct) {
+        if (blob.size() < 6 || blob.compare(0, 4, "FKTW") != 0) return false;
+        std::size_t n = std::uint8_t(blob[4]) | (std::size_t(std::uint8_t(blob[5])) << 8); if (6 + n >= blob.size()) return false;
+        name = blob.substr(6, n); ct = blob.substr(6 + n); return true;
+    }
+    static result<std::string> tpm_seal_(const std::string& key, const std::string& old_blob) {
+        if (auto av = tpm_available(); !av) return {{}, av.err};
+        auto& a = ncrypt_api::get(); ncrypt_api::h prov = 0;
+        if (long rc = a.open_provider(&prov, L"Microsoft Platform Crypto Provider", 0)) return {{}, {unsupported_code, "keystore TPM: Platform Crypto Provider " + hex_(std::uint32_t(rc))}};
+        std::string name, oct; result<ncrypt_api::h> k{0, {EIO, ""}}; bool created = false;
+        if (nc_parse_(old_blob, name, oct)) k = nc_key_(prov, name, false, nullptr);   // reuse this store's key
+        if (!k) {
+            std::uint64_t r = 0; entropy(&r, sizeof r); char b[24]; std::snprintf(b, sizeof b, "%016llx", (unsigned long long)r);
+            auto pre = getenv("FORGE_KEYSTORE_TPM_KEY_PREFIX"); name = (pre.empty() ? std::string("forge-keystore-") : pre) + b;
+            k = nc_key_(prov, name, true, &created);
+        }
+        if (!k) { a.free_obj(prov); return {{}, k.err}; }
+        oaep_ pad{L"SHA256", nullptr, 0}; BYTE ct[512]; DWORD n = 0;
+        long rc = a.encrypt(k.value, reinterpret_cast<BYTE*>(const_cast<char*>(key.data())), DWORD(key.size()), &pad, ct, sizeof ct, &n, nc_oaep_ | nc_silent_);
+        if (rc && created) a.del(k.value, 0); else a.free_obj(k.value);
+        a.free_obj(prov);
+        if (rc) return {{}, {EIO, "keystore TPM: NCryptEncrypt " + hex_(std::uint32_t(rc))}};
+        std::string out = "FKTW"; out += char(name.size() & 0xff); out += char(name.size() >> 8); out += name; out.append(reinterpret_cast<char*>(ct), n);
+        return {std::move(out), {}};
+    }
+    static result<std::string> tpm_unseal_(const std::string& blob) {
+        std::string name, ct; if (!nc_parse_(blob, name, ct)) return {{}, {EIO, "keystore TPM: .master.tpm is corrupt"}};
+        if (auto av = tpm_available(); !av) return {{}, av.err};
+        auto& a = ncrypt_api::get(); ncrypt_api::h prov = 0;
+        if (long rc = a.open_provider(&prov, L"Microsoft Platform Crypto Provider", 0)) return {{}, {unsupported_code, "keystore TPM: Platform Crypto Provider " + hex_(std::uint32_t(rc))}};
+        auto k = nc_key_(prov, name, false, nullptr); if (!k) { a.free_obj(prov); return {{}, k.err}; }
+        oaep_ pad{L"SHA256", nullptr, 0}; BYTE pt[512]; DWORD n = 0;
+        long rc = a.decrypt(k.value, reinterpret_cast<BYTE*>(ct.data()), DWORD(ct.size()), &pad, pt, sizeof pt, &n, nc_oaep_ | nc_silent_);
+        a.free_obj(k.value); a.free_obj(prov);
+        if (rc || n != 32) { SecureZeroMemory(pt, sizeof pt); return {{}, {EIO, "keystore TPM: NCryptDecrypt " + hex_(std::uint32_t(rc))}}; }
+        std::string key(reinterpret_cast<char*>(pt), 32); SecureZeroMemory(pt, sizeof pt); return {std::move(key), {}};
+    }
+    static void tpm_destroy_(const std::string& blob) {   // deletes the store's NCrypt key
+        std::string name, ct; if (!nc_parse_(blob, name, ct)) return;
+        auto& a = ncrypt_api::get(); if (!a.ok) return; ncrypt_api::h prov = 0;
+        if (a.open_provider(&prov, L"Microsoft Platform Crypto Provider", 0)) return;
+        if (auto k = nc_key_(prov, name, false, nullptr)) { if (a.del(k.value, 0)) a.free_obj(k.value); }
+        a.free_obj(prov);
+    }
+#else
+    static result<std::string> tpm_seal_(const std::string&, const std::string&) { return {{}, unsupported("keystore TPM wrapping")}; }
+    static result<std::string> tpm_unseal_(const std::string&) { return {{}, unsupported("keystore TPM wrapping")}; }
+    static void tpm_destroy_(const std::string&) {}
+#endif
     static std::string ad_(const std::string& s, const std::string& a) { return "forge-ks-v1" + s + '\x1f' + a; }
     static status file_put_(const std::string& s, const std::string& a, const std::string& v) {
         auto d = dir_(); if (!d) return {{}, d.err}; if (auto m = ensure_dir_(d.value); !m) return m;
@@ -399,3 +834,4 @@ private:
 };
 } // namespace forge::os
 #undef FORGE_OS_KS_LIBSECRET_
+#undef FORGE_OS_KS_TSS_
