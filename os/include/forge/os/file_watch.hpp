@@ -1,15 +1,19 @@
 #pragma once
-// File watching: inotify (Linux/Android), kqueue EVFILT_VNODE (macOS/iOS/FreeBSD), ReadDirectoryChangesW (Windows).
+// File watching: inotify (Linux/Android), kqueue EVFILT_VNODE (macOS/iOS/FreeBSD), ReadDirectoryChangesW (Windows),
+// FSEvents (macOS add_tree).
 // Watching a file watches its directory and filters by name, so atomic replace-by-rename (editors, os::rename,
-// forge modelfile writers) is seen as a modification of that file.  FSEvents is not used on macOS: it needs a
-// CFRunLoop/dispatch queue per stream and is coalesced/latent; kqueue gives immediate per-file events.  kqueue
-// directory watches rescan the directory on each change and report created/removed/replaced entries by name;
-// in-place writes to an entry need add_file() (inotify and ReadDirectoryChangesW see them through the directory).
+// forge modelfile writers) is seen as a modification of that file.  add() uses kqueue on macOS: immediate,
+// uncoalesced events.  kqueue directory watches rescan the directory on each change and report created/removed/
+// replaced entries by name; in-place writes to an entry need add_file() (inotify and ReadDirectoryChangesW see them
+// through the directory).
 // kqueue holds one descriptor per watched path: add() fails with EMFILE past max_handles() (default half the
 // RLIMIT_NOFILE soft limit, at most 8192) instead of starving the process; tree_watcher then polls that part.
+// add_tree() on macOS opens one recursive FSEvents stream (CoreServices, late-bound; per-file events, 50 ms latency,
+// delivered on a private dispatch queue and woken through the kqueue): no descriptor per path, but events are
+// coalesced (one event may carry created+modified) and reported for the real path, mapped back to the root as given.
 // Windows completes every directory through one I/O completion port (no 64-handle wait limit) and matches names
-// case-insensitively.  When the kernel drops events (inotify IN_Q_OVERFLOW, a Windows buffer overflow) poll()
-// reports watch_kind::overflow for each affected directory: rescan it.
+// case-insensitively.  When the kernel drops events (inotify IN_Q_OVERFLOW, a Windows buffer overflow, FSEvents
+// MustScanSubDirs / UserDropped / KernelDropped) poll() reports watch_kind::overflow for the affected directory: rescan it.
 #include <forge/os/detail.hpp>
 #include <algorithm>
 #include <map>
@@ -17,6 +21,11 @@
 #include <sys/inotify.h>
 #elif defined(FORGE_OS_KQUEUE)
 #include <sys/resource.h>
+#if defined(FORGE_OS_MACOS)
+#include <climits>
+#include <cstdlib>
+#include <strings.h>
+#endif
 #endif
 
 namespace forge::os {
@@ -50,6 +59,10 @@ public:
         for (auto& d : closing_) (void)d.release();
         if (iocp_) CloseHandle(iocp_);
 #elif defined(FORGE_OS_KQUEUE)
+#if defined(FORGE_OS_MACOS)
+        for (auto& s : fse_) fse_close_(*s);   // before the kqueue closes: callbacks trigger it
+        fse_.clear();
+#endif
         for (auto& [id, w] : kw_) ::close(w.fd);
         if (fd_ >= 0) ::close(fd_);
 #else
@@ -61,6 +74,9 @@ public:
 #if defined(__linux__)
         return "inotify";
 #elif defined(FORGE_OS_KQUEUE)
+#if defined(FORGE_OS_MACOS)
+        if (!fse_.empty()) return kw_.empty() ? "fsevents" : "fsevents+kqueue";
+#endif
         return "kqueue";
 #elif defined(FORGE_OS_WINDOWS)
         return "ReadDirectoryChangesW";
@@ -107,15 +123,42 @@ public:
         return {{}, unsupported("file watching")};
 #endif
     }
-    // Windows: watch a whole tree through one handle on its root. Per-directory handles would keep a deleted
-    // subdirectory delete-pending (still visible) until the watch closed. Returns false where unsupported,
-    // and the caller then watches each directory with add().
+    // Watch a whole tree natively: Windows through one handle on its root (per-directory handles would keep a
+    // deleted subdirectory delete-pending, still visible, until the watch closed); macOS through one recursive
+    // FSEvents stream. Events name the changed entry anywhere below dir. Returns false where unsupported (or
+    // CoreServices cannot be loaded), and the caller then watches each directory with add().
     bool add_tree(const std::string& dir) {
 #if defined(FORGE_OS_WINDOWS)
         if (!iocp_) return false;
         auto d = std::make_unique<wdir>(); d->dir = dir; d->names.push_back({}); d->subtree = true;
         if (open_(*d)) return false;
         dirs_.push_back(std::move(d)); return true;
+#elif defined(FORGE_OS_MACOS)
+        if (fd_ < 0) return false;
+        const auto& a = fse_api::get(); const auto& cf = detail::cf_api::get();
+        if (!a.ok || !cf.ok || !cf.CFArrayCreate || !cf.kCFTypeArrayCallBacks) return false;
+        if (!fse_armed_) {   // the callback wakes poll() through this user event on the kqueue (udata 0: no kw_ id)
+            struct kevent ev; EV_SET(&ev, fse_ident_, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, nullptr);
+            if (::kevent(fd_, &ev, 1, nullptr, 0, nullptr)) return false;
+            fse_armed_ = true;
+        }
+        char real[PATH_MAX]; if (!::realpath(dir.c_str(), real)) return false;
+        auto s = std::make_unique<fse_stream>(); s->root = dir; s->real = real; s->kq = fd_;
+        while (s->root.size() > 1 && s->root.back() == '/') s->root.pop_back();
+        const void* str = cf.str(s->real.c_str()); if (!str) return false;
+        const void* vals[1] = {str};
+        const void* paths = cf.CFArrayCreate(nullptr, vals, 1, cf.kCFTypeArrayCallBacks); cf.CFRelease(str);
+        if (!paths) return false;
+        fse_api::context ctx{0, s.get(), nullptr, nullptr, nullptr};
+        // kFSEventStreamEventIdSinceNow; NoDefer | WatchRoot | FileEvents
+        s->stream = a.create(nullptr, &fse_cb_, &ctx, paths, ~std::uint64_t(0), 0.05, 0x02u | 0x04u | 0x10u);
+        cf.CFRelease(paths);
+        if (!s->stream) return false;
+        s->queue = a.queue_create("forge.file_watch.fsevents", nullptr);
+        if (!s->queue) { a.release(s->stream); return false; }
+        a.set_queue(s->stream, s->queue);
+        if (!a.start(s->stream)) { a.invalidate(s->stream); a.release(s->stream); a.queue_release(s->queue); return false; }
+        fse_.push_back(std::move(s)); return true;
 #else
         (void)dir; return false;
 #endif
@@ -147,6 +190,11 @@ public:
             bool hit = w.path == path || w.dir == path || (!w.name.empty() && join(w.dir, w.name) == path);
             if (hit) { ::close(w.fd); it = kw_.erase(it); any = true; } else ++it;
         }
+#if defined(FORGE_OS_MACOS)
+        for (auto it = fse_.begin(); it != fse_.end();) {
+            if ((*it)->root == path || (*it)->real == path) { fse_close_(**it); it = fse_.erase(it); any = true; } else ++it;
+        }
+#endif
 #elif defined(FORGE_OS_WINDOWS)
         for (std::size_t i = 0; i < dirs_.size();) {
             auto& d = *dirs_[i];
@@ -196,6 +244,9 @@ public:
         struct kevent ev[32]; timespec ts{timeout_ms / 1000, (timeout_ms % 1000) * 1000000L};
         int n = ::kevent(fd_, nullptr, 0, ev, 32, timeout_ms < 0 ? nullptr : &ts);
         for (int i = 0; i < n; ++i) {
+#if defined(FORGE_OS_MACOS)
+            if (ev[i].filter == EVFILT_USER) { fse_drain_(out); continue; }
+#endif
             auto id = std::uint64_t(reinterpret_cast<std::uintptr_t>(ev[i].udata));
             auto it = kw_.find(id); if (it == kw_.end()) continue;   // removed since the event was queued
             auto w = it->second;   // copy: kq_add_/erase below change kw_
@@ -263,6 +314,105 @@ private:
         return {};
     }
     std::map<std::uint64_t, kwatch> kw_; std::uint64_t next_id_ = 0; std::size_t max_handles_ = 128; int fd_ = -1;
+#if defined(FORGE_OS_MACOS)
+    // ---- FSEvents (CoreServices, late-bound like the other Apple frameworks in forge::os; C ABI, no SDK headers)
+    struct fse_api {
+        // FSEventStreamCallback: (ConstFSEventStreamRef, info, numEvents, char** paths, const FSEventStreamEventFlags[], const FSEventStreamEventId[])
+        using callback = void (*)(const void*, void*, std::size_t, void*, const std::uint32_t*, const std::uint64_t*);
+        struct context { long version; void* info; const void* (*retain)(const void*); void (*release)(const void*); const void* (*describe)(const void*); };
+        void* (*create)(const void*, callback, context*, const void*, std::uint64_t, double, std::uint32_t) = nullptr;
+        void (*set_queue)(void*, void*) = nullptr;
+        unsigned char (*start)(void*) = nullptr;
+        void (*stop)(void*) = nullptr;
+        void (*invalidate)(void*) = nullptr;
+        void (*release)(void*) = nullptr;
+        void* (*queue_create)(const char*, void*) = nullptr;               // libdispatch (libSystem)
+        void (*sync_f)(void*, void*, void (*)(void*)) = nullptr;
+        void (*queue_release)(void*) = nullptr;
+        bool ok = false;
+        static const fse_api& get() {
+            static const fse_api a = [] {
+                fse_api x;
+                void* h = ::dlopen("/System/Library/Frameworks/CoreServices.framework/CoreServices", RTLD_LAZY);
+                if (!h) h = ::dlopen("/System/Library/Frameworks/CoreServices.framework/Frameworks/FSEvents.framework/FSEvents", RTLD_LAZY);
+                auto sym = [h](const char* n) -> void* { void* p = h ? ::dlsym(h, n) : nullptr; return p ? p : ::dlsym(RTLD_DEFAULT, n); };
+                x.create = reinterpret_cast<decltype(x.create)>(sym("FSEventStreamCreate"));
+                x.set_queue = reinterpret_cast<decltype(x.set_queue)>(sym("FSEventStreamSetDispatchQueue"));
+                x.start = reinterpret_cast<decltype(x.start)>(sym("FSEventStreamStart"));
+                x.stop = reinterpret_cast<decltype(x.stop)>(sym("FSEventStreamStop"));
+                x.invalidate = reinterpret_cast<decltype(x.invalidate)>(sym("FSEventStreamInvalidate"));
+                x.release = reinterpret_cast<decltype(x.release)>(sym("FSEventStreamRelease"));
+                x.queue_create = reinterpret_cast<decltype(x.queue_create)>(::dlsym(RTLD_DEFAULT, "dispatch_queue_create"));
+                x.sync_f = reinterpret_cast<decltype(x.sync_f)>(::dlsym(RTLD_DEFAULT, "dispatch_sync_f"));
+                x.queue_release = reinterpret_cast<decltype(x.queue_release)>(::dlsym(RTLD_DEFAULT, "dispatch_release"));
+                x.ok = x.create && x.set_queue && x.start && x.stop && x.invalidate && x.release && x.queue_create && x.sync_f && x.queue_release;
+                return x;
+            }();
+            return a;
+        }
+    };
+    // One stream; the callback runs on its serial dispatch queue and only queues raw (path, flags) pairs.
+    struct fse_stream {
+        std::string root, real;   // as given / canonical (FSEvents reports real paths: /private/var/..., not /var/...)
+        void* stream = nullptr; void* queue = nullptr; int kq = -1;
+        std::mutex m; std::vector<std::pair<std::string, std::uint32_t>> pending; bool dropped = false;
+    };
+    static constexpr std::uintptr_t fse_ident_ = 0x46534556;   // EVFILT_USER ident ("FSEV")
+    static constexpr std::size_t fse_cap_ = 65536;              // queued events per stream; past it: overflow
+    static void fse_cb_(const void*, void* info, std::size_t n, void* paths, const std::uint32_t* flags, const std::uint64_t*) {
+        auto* s = static_cast<fse_stream*>(info); auto** p = static_cast<char**>(paths);
+        {
+            std::lock_guard g(s->m);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (s->pending.size() >= fse_cap_) { s->dropped = true; break; }
+                try { s->pending.emplace_back(p && p[i] ? p[i] : "", flags ? flags[i] : 0u); } catch (...) { s->dropped = true; break; }
+            }
+        }
+        struct kevent ev; EV_SET(&ev, fse_ident_, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+        ::kevent(s->kq, &ev, 1, nullptr, 0, nullptr);
+    }
+    static void fse_noop_(void*) {}
+    static void fse_close_(fse_stream& s) {
+        const auto& a = fse_api::get();
+        if (s.stream) { a.stop(s.stream); a.invalidate(s.stream); }
+        if (s.queue) a.sync_f(s.queue, nullptr, &fse_noop_);   // a callback already running finishes before s is freed
+        if (s.stream) a.release(s.stream);
+        if (s.queue) a.queue_release(s.queue);
+        s.stream = s.queue = nullptr;
+    }
+    // A real path below s.real -> the same path below the root as the caller named it (APFS: case-insensitive).
+    static std::string fse_map_(const fse_stream& s, std::string p) {
+        while (p.size() > 1 && p.back() == '/') p.pop_back();
+        const auto& r = s.real;
+        if (r.size() > 1 && p.size() >= r.size() && (p.size() == r.size() || p[r.size()] == '/') && ::strncasecmp(p.c_str(), r.c_str(), r.size()) == 0)
+            return s.root + p.substr(r.size());
+        return p;
+    }
+    void fse_drain_(std::vector<watch_event>& out) {
+        for (auto& sp : fse_) {
+            auto& s = *sp;
+            std::vector<std::pair<std::string, std::uint32_t>> got; bool dropped = false;
+            { std::lock_guard g(s.m); got.swap(s.pending); dropped = s.dropped; s.dropped = false; }
+            if (dropped) out.push_back({s.root, watch_kind::overflow});
+            for (auto& [raw, f] : got) {
+                if (f & 0x18u) continue;                               // EventIdsWrapped, HistoryDone: bookkeeping
+                std::string p = raw.empty() ? s.root : fse_map_(s, raw);
+                if (f & 0x07u) { out.push_back({p, watch_kind::overflow}); continue; }   // MustScanSubDirs, UserDropped, KernelDropped
+                if (f & 0x20u) { out.push_back({s.root, stat(s.root).exists ? watch_kind::renamed : watch_kind::removed}); continue; }   // RootChanged
+                // Flags accumulate over the coalescing window (a file created and then written carries Created|Modified),
+                // so the kind comes from the flags checked against what is on disk now.
+                struct ::stat st{}; bool exists = ::lstat(p.c_str(), &st) == 0;
+                watch_kind k = watch_kind::modified;
+                if (f & 0x800u) k = exists ? watch_kind::created : watch_kind::renamed;              // ItemRenamed: moved in / out
+                else if (f & 0x200u) k = exists ? (f & 0x100u ? watch_kind::created : watch_kind::modified) : watch_kind::removed;   // ItemRemoved (and re-created?)
+                else if (f & 0x100u) k = exists ? watch_kind::created : watch_kind::removed;         // ItemCreated
+                else if (!exists && (f & 0xff00u)) k = watch_kind::removed;
+                out.push_back({p, k});
+            }
+        }
+    }
+    std::vector<std::unique_ptr<fse_stream>> fse_; bool fse_armed_ = false;
+#endif
 #elif defined(FORGE_OS_WINDOWS)
     struct wdir { std::string dir; std::vector<std::string> names; bool subtree = false, pending = false, dead = false; HANDLE h = INVALID_HANDLE_VALUE; OVERLAPPED ov{}; alignas(DWORD) std::uint8_t buf[32768]; };
     static bool ieq_(const std::string& a, const std::string& b) {   // NTFS names compare case-insensitively
