@@ -74,7 +74,7 @@ How it works per platform:
 
 ## Pipes and signals
 - `pipe.hpp` works on POSIX and Windows. Pipes are close-on-exec (non-inheritable on Windows, where the read end is an overlapped named pipe so it can time out). `read_some` with a timeout returns an empty string on timeout or EOF; a signal does not cut the wait short.
-- `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported (a console control event cannot be aimed at one process).
+- `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). Pid 0, pids that do not fit `pid_t` / `DWORD`, and group signals to pid 1 or below are rejected, so a bad pid can never reach our own group or every process. On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported (a console control event cannot be aimed at one process).
 - Handler installation is `os::on_signal` in `os.hpp`; on Windows it maps Ctrl-C to `interrupt`, Ctrl-Break / shutdown to `terminate`, and console close / logoff to `hangup` (to `terminate` when no hangup handler is installed).
 
 ## Files (`fs.hpp`)

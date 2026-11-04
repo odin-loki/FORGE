@@ -45,19 +45,19 @@ API: `sandbox_policy { deny_network, deny_exec, deny_fs_write }`, `apply_sandbox
 
 | Platform | `apply_sandbox` (current process) | `run_sandboxed` (child) |
 |---|---|---|
-| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls; `unsupported` on architectures with no audit arch | fork, apply, exec (see note) |
-| FreeBSD | Capsicum `cap_enter()` (all-or-nothing, coarser than asked) | fork, apply, exec |
+| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls (io_uring, x32 and i386 `socketcall` closed; the `*at` file-write calls and `*setxattr` denied); `unsupported` on architectures with no audit arch | fork, apply, exec (see note) |
+| FreeBSD | Capsicum `cap_enter()` (all-or-nothing, coarser than asked) | fork, open the binary, `cap_enter`, then `fexecve` (static) or `ld-elf.so.1 -f` with `LD_LIBRARY_PATH_FDS` (dynamic; libraries from the system dirs and `/usr/local/lib` only); scripts refused |
 | OpenBSD | `pledge()` | fork, apply, exec |
 | macOS | `sandbox_init` named profiles, found with `dlsym` | fork, apply, exec |
 | iOS | no-op; the app sandbox already applies | unsupported |
-| Windows | exec denial only (job object, one active process); net/fs denial returns `unsupported` | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job |
+| Windows | exec denial only (job object, one active process); net/fs denial returns `unsupported` | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job; arguments quoted like `spawn_wait` |
 
 On POSIX, `run_sandboxed` applies the network and file-write parts in the child before `execvp`, and drops
 `deny_exec` so the target can start; the target itself may still exec.
 
 Tests: the `sandboxing` case of `tests/test_os_ext.cpp` runs in CI on Linux, macOS, Windows and FreeBSD
 (sub-cases that report `unsupported` skip; FreeBSD skips when Capsicum refuses a partial policy).
-`run_sandboxed` has no test.
+`run_sandboxed` is tested on Linux, FreeBSD and Windows (AppContainer included) in `tests/test_os_process.cpp`. `process_pool` workers that cannot apply a requested sandbox (Windows net/fs) fail instead of running unsandboxed.
 
 ## Native plugins
 
@@ -127,8 +127,8 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 
 - RPC: tokens always have full access. Client-certificate identities are not mapped to permissions.
 - Windows: no in-process network or file-write denial; scripts there get only the job object plus the
-  interpreter checks. `run_sandboxed` (AppContainer) is untested.
-- POSIX `run_sandboxed` does not apply `deny_exec` to the target.
+  interpreter checks.
+- POSIX `run_sandboxed` does not apply `deny_exec` to the target (Linux Landlock is planned, `docs/os-audit.md` W2-3).
 - `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
 - Nested non-isolated `sandbox` blocks are interpreter-checked only.
 - Static capability checks miss indirect calls.
