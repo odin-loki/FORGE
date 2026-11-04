@@ -95,7 +95,18 @@ TEST(timer_queue_runs) {
 TEST(sysinfo_ext) {
     auto r = os::release_info(); CHECK(!r.name.empty());
     auto m = os::memory(); CHECK(m.total > 0);
+    std::printf("  %s (%s %s) mem total %llu MiB avail %llu free %llu swap %llu/%llu cgroup %llu/%llu\n", r.pretty.c_str(), r.kernel.c_str(), r.kernel_version.c_str(),
+                (unsigned long long)(m.total >> 20), (unsigned long long)(m.available >> 20), (unsigned long long)(m.free >> 20), (unsigned long long)(m.swap_free >> 20),
+                (unsigned long long)(m.swap_total >> 20), (unsigned long long)(m.cgroup_usage >> 20), (unsigned long long)(m.cgroup_limit >> 20));
+    CHECK(m.free > 0); CHECK(m.free <= m.total); CHECK(m.swap_free <= m.swap_total);
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(r.version == "10" || r.version == "11"); CHECK(m.free <= m.available);
+    CHECK(m.swap_total > 0);   // the page file
+#elif defined(__linux__)
+    if (os::stat("/sys/fs/cgroup/cgroup.controllers").exists) { auto d = os::detail::cgroup2_dir(); CHECK(!d.empty()); CHECK(os::stat(d).is_dir); }
+#endif
     auto u = os::self_usage(); CHECK(u);
+    CHECK(u->max_rss > 0); CHECK(u->minor_faults + u->major_faults > 0);
     {   // current_rss grows with touched memory, on every OS
         std::uint64_t r0 = os::current_rss(); CHECK(r0 > 0);
         std::vector<char> big(64u << 20); volatile char* vp = big.data(); for (std::size_t i = 0; i < big.size(); i += 4096) vp[i] = char(i | 1);
