@@ -358,7 +358,7 @@ if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
   add_library(forge_metal STATIC gpu/src/metal.mm)
   target_compile_options(forge_metal PRIVATE -fobjc-arc)
   target_compile_definitions(forge_metal PUBLIC FORGE_GPU_METAL=1)
-  target_include_directories(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include ops/include simd/include)
+  target_include_directories(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
   add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
   target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
   target_link_libraries(forge_gpu INTERFACE forge_metal)
