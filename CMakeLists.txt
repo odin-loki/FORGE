@@ -617,6 +617,10 @@ if(FORGE_BUILD_TESTS)
     if(n MATCHES "^test_script" AND FORGE_TEST_SHELL_PATH)
       set_tests_properties(${n} PROPERTIES ENVIRONMENT "FORGE_TEST_SHELL_PATH=${FORGE_TEST_SHELL_PATH}")
     endif()
+    if(n STREQUAL "test_rpc")   # the TLS / mTLS / channel-binding cases alone; exits 77 without OpenSSL
+      add_test(NAME test_rpc_tls COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(test_rpc_tls PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "FORGE_TEST_ONLY=rpc_tls")
+    endif()
   endforeach()
   # Scalable vectors at many lengths under qemu: the sve/rvv lane must be active at every VL, including the
   # ones without a power-of-two table (lowered at load time) and ones above 1024 bits.

@@ -93,13 +93,15 @@ public:
         return c;
     }
     // Credentials from the environment: FORGE_RPC_KEY (secret key file), FORGE_RPC_TOKEN, FORGE_RPC_TLS=1,
-    // FORGE_RPC_CA, FORGE_RPC_FINGERPRINT (sha256 of the server cert), FORGE_RPC_SERVER_NAME.
+    // FORGE_RPC_CA, FORGE_RPC_FINGERPRINT (sha256 of the server cert), FORGE_RPC_SERVER_NAME,
+    // FORGE_RPC_TLS_CERT + FORGE_RPC_TLS_KEY (client certificate for mTLS servers).
     static client_security env_security() {
         client_security s; auto env = [](const char* k) { const char* v = std::getenv(k); return std::string(v ? v : ""); };
         if (auto k = env("FORGE_RPC_KEY"); !k.empty()) s.key = std::make_shared<identity>(identity_from_seed_hex(read_key_file(k)));
         s.token = env("FORGE_RPC_TOKEN");
         s.tls.ca_file = env("FORGE_RPC_CA"); s.tls.fingerprint_sha256 = env("FORGE_RPC_FINGERPRINT"); s.tls.server_name = env("FORGE_RPC_SERVER_NAME");
-        s.tls.enabled = env("FORGE_RPC_TLS") == "1" || !s.tls.ca_file.empty() || !s.tls.fingerprint_sha256.empty();
+        s.tls.cert_file = env("FORGE_RPC_TLS_CERT"); s.tls.key_file = env("FORGE_RPC_TLS_KEY");
+        s.tls.enabled = env("FORGE_RPC_TLS") == "1" || !s.tls.ca_file.empty() || !s.tls.fingerprint_sha256.empty() || !s.tls.cert_file.empty();
         return s;
     }
     struct script_reply { bool ok = false; std::string error_type, error, output; };
@@ -165,6 +167,7 @@ public:
     std::function<script_result(const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t timeout_ms)> script_handler;
     server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1", server_security sec = {}) : reg_(reg ? reg : &registry::cpu()), sec_(std::move(sec)) {
         detail::wsa();
+        if (!sec_.tls.client_ca_file.empty() && sec_.tls.cert_file.empty()) raise(errc::invalid_argument, "rpc: client certificates (mTLS) need TLS (a server certificate and key)");
         if (!sec_.tls.cert_file.empty()) {
 #ifdef FORGE_HAVE_TLS
             tls_ = make_server_tls(sec_.tls);
@@ -215,7 +218,7 @@ private:
 #ifdef FORGE_HAVE_TLS
         if (tls_) { s.sock().set_timeout_ms(15000); if (!s.accept_tls(tls_, nullptr)) return; s.sock().set_timeout_ms(0); }
 #endif
-        bool authed = false, first = true;
+        peer_info peer; bool first = true;
         for (;;) {
 #if defined(_WIN32)
             // Winsock: shutdown() from stop() does not reliably wake a blocked recv(), so idle between requests in slices.
@@ -227,10 +230,10 @@ private:
             if (!r.ok) return;
             if (first) {
                 first = false;
-                if (!server_auth(s, sec_, magic, authed, nullptr)) return;
-                if (authed) continue;   // handshake consumed; next frame
+                if (!server_auth(s, sec_, magic, peer)) return;
+                if (peer.authed) continue;   // handshake consumed; next frame
             }
-            if (std::memcmp(magic, "FRPS", 4) == 0) { if (!serve_script(s, r, authed)) return; continue; }
+            if (std::memcmp(magic, "FRPS", 4) == 0) { if (!serve_script(s, r, peer)) return; continue; }
             if (std::memcmp(magic, "FRPC", 4) != 0) return;
             auto name = r.str(256); auto a = detail::get_attrs(r);
             auto n = r.u32(); if (n > 64) return;
@@ -244,6 +247,7 @@ private:
             detail::writer w;
             int oi = detail::op_index(name);
             try {
+                if (!(peer.perms & perm_device)) raise(errc::unsupported,"permission denied: this key may not run device ops (authorized_keys allow=)");
                 if (oi < 0) raise(errc::unsupported, "unknown op '{}'", name);
                 tensor out(os);
                 auto& l = reg_->select(ops::op(oi), shapes, os, a);
@@ -257,12 +261,13 @@ private:
             if (!detail::send_all(s, w.b.data(), w.b.size())) return;
         }
     }
-    bool serve_script(channel& s, detail::reader& r, bool authed) {
+    bool serve_script(channel& s, detail::reader& r, const peer_info& peer) {
         auto src = r.str(16u << 20); auto name = r.str(4096); auto n = r.u32(); if (!r.ok || n > 4096) return false;
         std::vector<std::string> argv; for (std::uint32_t i = 0; i < n && r.ok; ++i) argv.push_back(r.str(1 << 20));
         auto tmo = r.u32(); if (!r.ok) return false;
         detail::writer w;
-        if (!sec_.allow_scripts || !authed) { w.u32(1); w.str("remote scripts are disabled on this server"); }
+        if (!sec_.allow_scripts || !peer.authed) { w.u32(1); w.str("remote scripts are disabled on this server"); }
+        else if (!(peer.perms & perm_scripts)) { w.u32(1); w.str("permission denied: this key may not run scripts (authorized_keys allow=)"); }
         else if (!script_handler) { w.u32(1); w.str("this server has no script runtime"); }
         else {
             script_result res;

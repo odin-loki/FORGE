@@ -353,7 +353,7 @@ int cmd_bench(const args& a) {
 }
 
 // forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]
-//   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]... [--tls-cert C --tls-key K]
+//   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]... [--tls-cert C --tls-key K [--tls-client-ca CA]]
 //   [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
 // Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
@@ -361,24 +361,24 @@ int cmd_rpc_serve(const args& a) {
     auto reg = graph::device_registry(dev, &why, false);
     if (!reg && dev != "cpu") std::fprintf(stderr, "forge: %s; serving on cpu\n", why.c_str());
     graph::rpc::server_security sec;
-    auto trim = [](std::string s) { while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back(); std::size_t i = 0; while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i; return s.substr(i); };
     for (auto& t : a.all("token")) sec.tokens.push_back(t);
     if (a.has("token") && a.all("token").empty()) sec.tokens.push_back(a.get("token"));
     auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
     for (auto& f : files) sec.tokens.push_back(graph::rpc::read_key_file(f));
     auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
-    for (auto& f : keyfiles) {
+    for (auto& f : keyfiles) {   // "[allow=device,scripts] <hex> [comment]" per line (graph/rpc_secure.hpp)
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
-        std::istringstream in(r.value); std::string line;
-        while (std::getline(in, line)) { line = trim(line); if (!line.empty() && line[0] != '#') sec.authorized_keys.push_back(line.substr(0, 64)); }
+        try { for (auto& k : graph::rpc::parse_authorized_keys(r.value)) sec.authorized_keys.push_back(std::move(k)); }
+        catch (const std::exception& e) { throw std::runtime_error(f + ": " + e.what()); }
     }
     auto pubs = a.all("pubkey"); if (pubs.empty() && a.has("pubkey")) pubs.push_back(a.get("pubkey"));
     for (auto& p : pubs) sec.authorized_keys.push_back(p.size() == 64 && p.find('/') == std::string::npos && !std::filesystem::exists(p) ? p : modelfile::load_public_key(p));
-    sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key");
+    sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key"); sec.tls.client_ca_file = a.get("tls-client-ca");
     if (sec.tls.cert_file.empty() != sec.tls.key_file.empty()) throw std::runtime_error("--tls-cert and --tls-key go together");
+    if (!sec.tls.client_ca_file.empty() && sec.tls.cert_file.empty()) throw std::runtime_error("--tls-client-ca needs --tls-cert and --tls-key");
     sec.allow_scripts = a.has("allow-scripts");
     std::string bind = a.get("bind", "127.0.0.1");
-    if (!sec.auth_required() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
+    if (!sec.auth_required() && sec.tls.client_ca_file.empty() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
         std::fprintf(stderr, "forge rpc: WARNING: no authentication and bound to %s; anyone who can reach it can use it\n", bind.c_str());
     graph::rpc::server srv(reg.get(), int(a.num("port", 7000)), bind, sec);
     if (sec.allow_scripts) {
@@ -407,7 +407,7 @@ int cmd_rpc_serve(const args& a) {
             sp.argv.push_back("--args"); for (auto& x : argv) sp.argv.push_back(x);
             sp.stdin_data = src; sp.timeout_ms = t + 5000; sp.max_output = 32u << 20;
             sp.limits.memory_bytes = mem_mb << 20;
-            sp.env_unset = {"FORGE_SCRIPT_CACHE_SIGN_SEED", "FORGE_RPC_TOKEN", "FORGE_RPC_KEY"};
+            sp.env_unset = {"FORGE_SCRIPT_CACHE_SIGN_SEED", "FORGE_RPC_TOKEN", "FORGE_RPC_KEY", "FORGE_RPC_TLS_KEY"};
             auto r = os::spawn_wait(sp);
             if (!r) return graph::rpc::server::script_result{false, "RuntimeError", "could not start script child: " + r.err.what, ""};
             auto& pr = r.value;
@@ -421,8 +421,9 @@ int cmd_rpc_serve(const args& a) {
             return graph::rpc::server::script_result{false, et, em, pr.out};
         };
     }
-    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
-                srv.tls() ? " tls" : "", sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
+    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
+                srv.tls() ? " tls" : "", sec.tls.client_ca_file.empty() ? "" : " mtls",
+                sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
     std::fflush(stdout);
     srv.run();
     return 0;
