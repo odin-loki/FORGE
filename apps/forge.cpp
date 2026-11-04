@@ -330,7 +330,7 @@ int cmd_bench(const args& a) {
     auto now = [] { return grid::gpu::counters().read(); };
     auto diff = [](const snap& a, const snap& b) {
         return snap{b.launches - a.launches, b.captured - a.captured, b.graph_launches - a.graph_launches, b.dtoh - a.dtoh,
-                    b.htod - a.htod, b.dtod - a.dtod, b.syncs - a.syncs, b.instantiates - a.instantiates, b.node_updates - a.node_updates};
+                    b.htod - a.htod, b.dtod - a.dtod, b.syncs - a.syncs, b.instantiates - a.instantiates, b.node_updates - a.node_updates, b.replayed_runs - a.replayed_runs};
     };
     snap c0 = now();
     { mind::generate_stats ps; s.generate(prompt, 1, smp, {}, &ps, false); s.reset(); }
@@ -343,8 +343,8 @@ int cmd_bench(const args& a) {
                 st.new_tokens > 1 ? double(st.new_tokens - 1) / st.decode_s : 0.0);
     if (all.launches + all.captured > 0) {
         auto pr = [](const char* what, const snap& c, double per) {
-            std::printf("%s: launches %.1f captured %.1f graph_launches %.1f instantiates %.1f node_updates %.1f dtoh %.1f htod %.1f dtod %.1f syncs %.1f\n", what,
-                        c.launches / per, c.captured / per, c.graph_launches / per, double(std::int64_t(c.instantiates)) / per, double(std::int64_t(c.node_updates)) / per, c.dtoh / per, c.htod / per, c.dtod / per, c.syncs / per);
+            std::printf("%s: launches %.1f captured %.1f graph_launches %.1f instantiates %.1f node_updates %.1f replayed %.2f dtoh %.1f htod %.1f dtod %.1f syncs %.1f\n", what,
+                        c.launches / per, c.captured / per, c.graph_launches / per, double(std::int64_t(c.instantiates)) / per, double(std::int64_t(c.node_updates)) / per, double(std::int64_t(c.replayed_runs)) / per, c.dtoh / per, c.htod / per, c.dtod / per, c.syncs / per);
         };
         pr("gpu prefill (total)", pre, 1.0);
         if (st.new_tokens > 1) pr("gpu decode (per token)", diff(pre, all), double(st.new_tokens - 1));

@@ -208,6 +208,7 @@ public:
     device_hooks* hooks = nullptr;     // device residency protocol (null = everything on the host)
     std::shared_ptr<device_hooks> hooks_ref;   // keeps the hooks (and the runtime behind them) alive for ~plan
     bool arena_resident = false;       // arena held on the device across runs (device_hooks::arena)
+    std::size_t replays = 0;           // device_hooks::replay runs since the last real run
     plan() = default;
     plan(const plan&) = delete;
     plan& operator=(const plan&) = delete;
@@ -392,7 +393,19 @@ public:
         if (h->arena && h->forget && p_.arena.size() * sizeof(float) <= arena_cap) {
             try { h->arena(p_.arena.data(), p_.arena.size()); p_.arena_resident = true; } catch (...) { h->end_run(); throw; }
         }
-        try { run_steps(h); } catch (...) { h->end_run(); throw; }
+        const void* key = reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(&p_) ^ (reinterpret_cast<std::uintptr_t>(st_) * 31));
+        bool replayed = false;
+        try {
+            if (h->replay && p_.arena_resident && h->end_run_discard && replayable()) {
+                static const std::size_t verify = [] { auto* e = std::getenv("FORGE_REPLAY_VERIFY"); auto v = e ? std::strtoull(e, nullptr, 10) : 32ull; return std::size_t(v ? v : 1); }();
+                if (p_.replays + 1 < verify && h->replay(key)) { replayed = true; ++p_.replays; advance_state(); }
+            }
+            if (!replayed) {
+                p_.replays = 0; host_ops_ = false;
+                run_steps(h);
+                if (h->ran) h->ran(key, !host_ops_);
+            }
+        } catch (...) { h->end_run(); throw; }
         if (!h->end_run_discard) return h->end_run();
         // only outputs and persistent state outlive the run: fetch those, drop the device intermediates unread
         try {
@@ -405,6 +418,32 @@ public:
         h->end_run_discard();
     }
 private:
+    bool host_ops_ = false;   // a step of this run went through the host
+    // A replayed run repeats the device work of the previous one; the host bookkeeping it would have done is only
+    // the state slot lengths. Not when a slot would grow or move, holds a host-encoded codec, or offloads.
+    bool replayable() const {
+        if (!st_ || st_->offload) return false;
+        for (auto& s : p_.steps) {
+            if (s.kind == 0) continue;
+            auto it = st_->slots.find(p_.g.at(s.out).name);
+            if (it == st_->slots.end() || it->second.len == 0) return false;
+            if (s.kind == 1 && (it->second.codec != kv_codec::f32 || it->second.len + p_.views[s.in[0]].shape[0] > it->second.capacity)) return false;
+        }
+        return true;
+    }
+    void advance_state() {
+        for (auto& s : p_.steps) {
+            if (s.kind == 0) continue;
+            auto& sl = st_->slots[p_.g.at(s.out).name];
+            sl.len += p_.views[s.in[0]].shape[0];
+            if (s.kind == 1) {
+                auto& out = p_.views[s.out];
+                out.data = sl.buf.data.data();
+                for (auto [a, r] : p_.state_aliases) if (r == s.out) p_.views[a].data = out.data;
+                out.shape[0] = sl.len;
+            }
+        }
+    }
     void run_steps(device_hooks* h) {
         std::vector<tensor_view> ins;
         for (auto& s : p_.steps) {
@@ -418,12 +457,14 @@ private:
                 auto ss = state_ops::state_shape(fn, shs);
                 auto& sl = st_->slots[node.name];
                 if (sl.len == 0 || sl.buf.shape != ss) {   // fresh: zeros (in place when the shape is unchanged, so a device copy stays keyed)
+                    host_ops_ = true;
                     if (sl.buf.shape == ss && !sl.buf.data.empty()) { std::fill(sl.buf.data.begin(), sl.buf.data.end(), 0.f); if (h) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
                     else { if (h && !sl.buf.data.empty()) h->release(sl.buf.data.data(), sl.buf.data.size()); sl.buf = tensor(ss); }
                     sl.len = 0; sl.fixed = true;
                 }
                 if (h && h->state && h->state(fn, ins, sl.buf.data.data(), sl.buf.data.size(), out, *s.attrs)) { sl.len += ins[0].shape[0]; continue; }
                 if (h) { for (auto& v : ins) h->to_host(v.data, v.size()); h->to_host(out.data, out.size()); h->to_host(sl.buf.data.data(), sl.buf.data.size()); }
+                host_ops_ = true;
                 if (fn == "causal_conv")
                     state_ops::causal_conv(ins[0].data, ins[1].data, sl.buf.data.data(), out.data, ins[0].shape[0], ins[0].shape[1], ins[1].shape[1]);
                 else if (fn == "delta_rule") {
@@ -442,12 +483,14 @@ private:
                 i64 rows = ins[0].shape[0];
                 auto ps = state_store::physical(ins[0].shape, sl.codec);
                 i64 row = numel(ps) / std::max<i64>(rows, 1);
+                if (sl.len + rows > sl.capacity) host_ops_ = true;   // the slot grows: its buffer moves
                 if (h && sl.capacity && sl.len + rows > sl.capacity) h->release(sl.buf.data.data(), sl.buf.data.size());  // about to move: sync + drop
                 const float* before = sl.buf.data.data();
                 st_->ensure(sl, ps, sl.len + rows);
                 float* dst = sl.buf.data.data() + sl.len * row;
                 std::size_t nphys = std::size_t(rows * row);
                 if (sl.codec != kv_codec::f32) {   // quantise on the host (the device copy of the rows is patched)
+                host_ops_ = true;
                     if (h) { h->to_host(ins[0].data, ins[0].size()); h->to_host(dst, nphys); if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
                     i64 heads = ins[0].shape[1], d = ins[0].shape[2], hw = kv_head_words(d, sl.codec);
                     for (i64 r = 0; r < rows * heads; ++r) kv_encode_head(ins[0].data + r * d, d, sl.codec, dst + r * hw);
@@ -457,6 +500,7 @@ private:
                     h->copy(ins[0].data, ins[0].size(), sl.buf.data.data(), sl.buf.data.size(), std::size_t(sl.len * row));
                 } else {
                     if (h) { h->to_host(ins[0].data, ins[0].size()); h->to_host(dst, ins[0].size()); }
+                host_ops_ = true;
                     std::copy_n(ins[0].data, ins[0].size(), dst);
                     if (h) h->host_wrote(dst, ins[0].size());
                 }
@@ -473,6 +517,7 @@ private:
             }
             if (h && h->copy && p_.g.at(s.out).op == spec::op::concat && !ins.empty() && concat_on_device(*h, ins, out, *s.attrs)) continue;
             if (h && !s.low->on_device) {
+                host_ops_ = true;
                 if (std::getenv("FORGE_PLAN_TRACE")) {   // which ops round-trip through the host on a device run
                     static std::map<std::string, std::size_t> c; static bool reg = false;
                     if (!reg) { reg = true; std::atexit([] { for (auto& [k, n] : c) std::fprintf(stderr, "host-op %s %zu\n", k.c_str(), n); }); }

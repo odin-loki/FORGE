@@ -45,6 +45,11 @@ struct device_hooks {
     // forget drops that device copy without fetching it (the plan is going away)
     std::function<void(float*, std::size_t)> arena;
     std::function<void(const float*, std::size_t)> forget;
+    // optional whole-run replay: after a run's steps, ran(key, clean) reports whether every step ran on the device
+    // (key: plan + state store); replay(key), called after begin_run, relaunches the device work of the previous
+    // runs under that key with their per-run arguments advanced, and returns false when it cannot
+    std::function<void(const void*, bool)> ran;
+    std::function<bool(const void*)> replay;
     std::function<void(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off)> copy;  // device-side
     // optional strided copy: dst_base[off + r * ds + c] = src[r * w + c] for r < rows, c < w; false = unsupported
     std::function<bool(float* src, std::size_t sn, float* dst_base, std::size_t dst_count, std::size_t rows, std::size_t w, std::size_t ds, std::size_t off)> copy2d;

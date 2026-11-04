@@ -21,6 +21,7 @@
 #include <forge/core/dl.hpp>
 #include <algorithm>
 #include <atomic>
+#include <set>
 #include <unordered_map>
 #include <cmath>
 #include <cstdint>
@@ -40,11 +41,11 @@ enum class api { cuda, hip };
 // kernels are issued (directly or recorded into a captured graph), graphs replayed, copies and syncs. Relaxed
 // atomics, so the cost is one uncontended increment per call.
 struct call_counters {
-    std::atomic<std::uint64_t> launches{0}, captured{0}, graph_launches{0}, dtoh{0}, htod{0}, dtod{0}, syncs{0}, instantiates{0}, node_updates{0};
-    struct snapshot { std::uint64_t launches = 0, captured = 0, graph_launches = 0, dtoh = 0, htod = 0, dtod = 0, syncs = 0, instantiates = 0, node_updates = 0; };
+    std::atomic<std::uint64_t> launches{0}, captured{0}, graph_launches{0}, dtoh{0}, htod{0}, dtod{0}, syncs{0}, instantiates{0}, node_updates{0}, replayed_runs{0};
+    struct snapshot { std::uint64_t launches = 0, captured = 0, graph_launches = 0, dtoh = 0, htod = 0, dtod = 0, syncs = 0, instantiates = 0, node_updates = 0, replayed_runs = 0; };
     snapshot read() const {
         auto r = [](const std::atomic<std::uint64_t>& a) { return a.load(std::memory_order_relaxed); };
-        return {r(launches), r(captured), r(graph_launches), r(dtoh), r(htod), r(dtod), r(syncs), r(instantiates), r(node_updates)};
+        return {r(launches), r(captured), r(graph_launches), r(dtoh), r(htod), r(dtod), r(syncs), r(instantiates), r(node_updates), r(replayed_runs)};
     }
 };
 inline call_counters& counters() { static call_counters c; return c; }
@@ -186,7 +187,51 @@ public:
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); return s; }
 
     // ---- residency protocol (see flow::device_hooks) ----
-    void begin_run() { std::lock_guard lk(mu_); q81_drop(); in_run_ = true; seg_ = 0; }
+    void begin_run() { std::lock_guard lk(mu_); q81_drop(); in_run_ = true; seg_ = 0; dirty_ = false; }
+    // ---- whole-run replay (flow::device_hooks::replay / ran) ----
+    // A run whose work was all graph-recorded kernels (no transfers, syncs or host ops inside it) can be replayed
+    // without the executor: every segment's exec is relaunched with its kernel arguments advanced by the change
+    // seen between the last two runs (decode: the KV write row and the attention length move by one row per
+    // token; everything else -- weights, the resident arena, state slots -- sits at fixed addresses). A run only
+    // becomes replayable once such a prediction has been confirmed by a real run, and the executor re-checks one
+    // real run in every $FORGE_REPLAY_VERIFY; a wrong prediction disables replay for that plan.
+    void ran(const void* key, bool clean) {
+        std::lock_guard lk(mu_); bind(); flush();
+        bool hit = clean && !dirty_ && replay_ok() && gmode() && seg_ > 0 && seg_ <= segc_.size();
+        for (std::size_t s = 0; hit && s < seg_; ++s) hit = segc_[s].replay && segc_[s].hit;
+        if (key != run_key_) { run_key_ = key; streak_ = 0; }
+        if (!hit && replayed_ && !replay_bad_.count(key)) {   // a replayed run predicted something a real run did not do
+            replay_bad_.insert(key);
+            std::fprintf(stderr, "forge: %s: whole-run replay mispredicted; disabled for this plan\n", api_name(api_));
+        }
+        streak_ = hit ? streak_ + 1 : 0; replayed_ = false; nseg_ = seg_;
+        for (std::size_t s = 0; s < seg_ && s < segc_.size(); ++s) predict(segc_[s]);
+    }
+    bool replay(const void* key) {
+        std::lock_guard lk(mu_);
+        if (!(key == run_key_ && streak_ >= 2 && !replay_bad_.count(key) && replay_ok() && gmode() && nseg_ && nseg_ <= segc_.size())) return false;
+        bind(); flush();
+        std::vector<void*> ap;
+        for (std::size_t s = 0; s < nseg_; ++s) {   // patch everything first: a failure leaves nothing launched
+            auto& c = segc_[s];
+            if (!c.replay || !c.exec || c.pred.size() != c.bytes.size()) { streak_ = 0; return false; }
+            for (std::size_t i = 0; i < c.recs.size(); ++i) {
+                auto& r = c.recs[i];
+                if (!std::memcmp(c.pred.data() + r.off, c.bytes.data() + r.off, r.len)) continue;
+                arg_ptrs(r, c.pred.data(), ap);
+                struct { void* fn; unsigned d[7]; void** kp; void** ex; } kp{r.fn, {r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6]}, ap.data(), nullptr};
+                if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) { for (std::size_t t = 0; t <= s; ++t) drop_seg(segc_[t]); streak_ = 0; return false; }
+                gpu::count(counters().node_updates);
+            }
+        }
+        for (std::size_t s = 0; s < nseg_; ++s) {
+            auto& c = segc_[s];
+            c.prev.swap(c.bytes); c.bytes.swap(c.pred); predict(c);
+            gpu::count(counters().graph_launches); ck(f_.graph_launch(c.exec, stream_), "graph launch");
+        }
+        gpu::count(counters().replayed_runs); replayed_ = true;
+        return true;
+    }
     void end_run() {
         std::lock_guard lk(mu_); bind();
         for (auto it = res_.begin(); it != res_.end();) {
@@ -674,7 +719,23 @@ private:
     // relaunches the exec graph -- no capture, no cuGraphExecUpdate. A mismatch falls back to capturing the recorded
     // launches. Needs cuFuncGetParamInfo (CUDA 12.4+); without it every segment is captured and exec-updated.
     struct krec { void* fn; unsigned d[7]; std::uint32_t off, len; };
-    struct segc { void* exec = nullptr; void* graph = nullptr; std::vector<void*> nodes; std::vector<krec> recs; std::vector<unsigned char> bytes; bool replay = false; };
+    struct segc { void* exec = nullptr; void* graph = nullptr; std::vector<void*> nodes; std::vector<krec> recs; std::vector<unsigned char> bytes, prev, pred; bool replay = false, hit = false; };
+    // pred = bytes + (bytes - prev), per parameter (8-byte and 4-byte integers; other sizes word by word)
+    void predict(segc& c) {
+        c.pred = c.bytes;
+        if (c.prev.size() != c.bytes.size()) { c.pred.clear(); return; }
+        for (auto& r : c.recs) {
+            std::size_t at = r.off;
+            for (auto z : *params_of(r.fn)) {
+                at = (at + 7) & ~std::size_t(7);
+                if (z == 8) { std::uint64_t b, p; std::memcpy(&b, &c.bytes[at], 8); std::memcpy(&p, &c.prev[at], 8); b += b - p; std::memcpy(&c.pred[at], &b, 8); }
+                else for (std::size_t w = 0; w + 4 <= z; w += 4) { std::uint32_t b, p; std::memcpy(&b, &c.bytes[at + w], 4); std::memcpy(&p, &c.prev[at + w], 4); b += b - p; std::memcpy(&c.pred[at + w], &b, 4); }
+                at += z;
+            }
+        }
+    }
+    const void* run_key_ = nullptr; std::size_t streak_ = 0, nseg_ = 0; bool dirty_ = false, replayed_ = false;
+    std::set<const void*> replay_bad_;
     std::vector<segc> segc_;
     std::vector<krec> prec_; std::vector<unsigned char> pbytes_;
     bool recording_ = false, deferring_ = false;
@@ -715,7 +776,7 @@ private:
         }
         nwr_ = 0;
         if (!(in_run_ && !user_cap_ && gmode() && st == stream_ && !ex)) {
-            count(user_cap_ ? counters().captured : counters().launches);
+            count(user_cap_ ? counters().captured : counters().launches); if (in_run_) dirty_ = true;
             return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
         }
         if (!recording_) {
@@ -742,9 +803,9 @@ private:
         static const std::size_t v = [] { auto* e = std::getenv("FORGE_GRAPH_SEG"); std::size_t n = e ? std::strtoul(e, nullptr, 10) : 64; return n ? n : ~std::size_t(0); }();
         return v;
     }
-    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); gpu::count(counters().htod); return f_.htod_async(d, h, n, st); }
-    int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); gpu::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
-    int free_s(std::uint64_t p) { flush(); q81_drop(); return f_.free_(p); }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); dirty_ |= in_run_; gpu::count(counters().htod); return f_.htod_async(d, h, n, st); }
+    int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; gpu::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
+    int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return f_.free_(p); }
     // device-to-device copy on the stream; inside a graph-mode run it is a kernel (forge_copy_words), so segments hold
     // kernel nodes only and replay can patch them
     int dtod_s(std::uint64_t d, std::uint64_t s, std::size_t n) {
@@ -754,6 +815,7 @@ private:
             return w ? launch_s(function("forge_copy_words"), (w + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr) : 0;
         }
         if (deferring_) reissue_captured();   // a memcpy node: this segment is captured (and not replayed)
+        dirty_ |= in_run_;
         return f_.dtod_async(d, s, n, stream_);
     }
     void drop_seg(segc& c) {
@@ -791,7 +853,8 @@ private:
                 if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) ok = false; else gpu::count(counters().node_updates);
             }
             if (ok) {
-                c.recs.swap(prec_); c.bytes.swap(pbytes_);
+                c.hit = c.pred.size() == pbytes_.size() && !std::memcmp(c.pred.data(), pbytes_.data(), pbytes_.size());
+                c.recs.swap(prec_); c.prev.swap(c.bytes); c.bytes.swap(pbytes_);
                 gpu::count(counters().graph_launches); ck(f_.graph_launch(c.exec, stream_), "graph launch");
                 return;
             }
@@ -829,7 +892,7 @@ private:
         }
         else if (f_.set_device) f_.set_device(ordinal_);
     }
-    void sync() { flush(); gpu::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
+    void sync() { flush(); dirty_ |= in_run_; gpu::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
         void* f = nullptr; ck(f_.get_fn(&f, mod_, n.c_str()), ("get function " + n).c_str());
