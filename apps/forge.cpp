@@ -19,6 +19,7 @@
 #include <forge/gpu/cuda.hpp>
 #include <forge/script/script.hpp>
 #include <forge/script/check.hpp>
+#include <forge/script/local_ai.hpp>
 
 using namespace forge;
 
@@ -449,6 +450,8 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--json") check_json = true;
         else if (s == "--module-dir") module_dirs.push_back(val("--module-dir"));   // extra import dir for --check
         else if (s == "--no-check") o.static_check = false;
+        else if (s == "--ask-model") o.ask_model = val("--ask-model");   // in-process model for forge::ask & co
+        else if (s == "--ask-max-tokens") o.ask_max_tokens = std::stoi(val("--ask-max-tokens"));
         else if (s == "--strict-check") o.strict_check = true;
         else if (s == "--tree") o.use_vm = false;
         else if (s == "--debug") o.debug = true;
@@ -512,6 +515,7 @@ int cmd_script(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
+    forge::script::install_local_ai();   // forge::ask & co run FORGE_ASK_MODEL / --ask-model in-process
     if (argc < 2) return usage();
     std::string c = argv[1];
     if (c == "script") {

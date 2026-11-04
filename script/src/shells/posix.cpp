@@ -120,20 +120,16 @@ void forge_shell_register_posix(fs::shell_registry& r) {
         {"yash", {}, {"yash"}, true, ""},
         {"posh", {}, {"posh"}, false, "Policy-compliant Ordinary SHell"},
         {"osh", {"oils"}, {"osh"}, true, "Oils, POSIX/bash-compatible mode"},
-        {"ysh", {}, {"ysh"}, true, "Oils new shell; accepts '...' literals"},
         {"hush", {}, {"hush"}, true, "BusyBox hush"},
     };
     for (auto& s : list) {
         fs::shell_backend b; b.name = s.name; b.aliases = s.aliases; b.exes = s.exes; b.family = "posix"; b.golden_tested = s.tested; b.notes = s.notes;
         b.quote = fs::shellq::posix;
-        if (std::string(s.name) == "ysh")   // YSH rejects the POSIX '\'' idiom; J8 b'...' takes \\ and \' escapes
-            b.quote = [](const std::string& v) { std::string o = "b'"; for (char c : v) { if (c == '\\' || c == '\'') o += '\\'; o += c; } return o + "'"; };
         b.argv = [](const std::string& exe, const std::string& sc) -> std::vector<std::string> {
             if (exe.ends_with("busybox")) return {exe, "sh", "-c", sc};
             return {exe, "-c", sc};
         };
-        std::string nm = s.name;
-        if (nm != "ysh") { b.emitter = [] { return std::make_unique<posix_dialect>(); }; b.emit_tested = s.tested; }
+        b.emitter = [] { return std::make_unique<posix_dialect>(); }; b.emit_tested = s.tested;
         r.add(std::move(b));
     }
 }

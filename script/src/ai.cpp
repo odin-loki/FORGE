@@ -5,14 +5,17 @@
 //   forge::ask_json(prompt)                -> reply parsed as JSON into script values
 //   forge::ai_run(task[, opts])            -> drafts a command, shows it to confirm(), runs it only on yes
 //   forge::ai_eval(task[, opts])           -> same, for drafted *script* code (runs via eval)
-// Backend: options::ai if the host set one, else FORGE_AI_ENDPOINT (an OpenAI-compatible server such as
-// `forge-serve`; FORGE_AI_MODEL optional). Confirmation: opts {"confirm", fn} if given, else options::confirm;
+// Backend: options::ai if the host set one; else an in-process model when options::ask_model / FORGE_ASK_MODEL names a
+// .fpk and the host registered set_local_ai() (the forge CLI does; forge_script itself does not link inference);
+// else FORGE_AI_ENDPOINT (an OpenAI-compatible server such as `forge-serve`; FORGE_AI_MODEL optional). Confirmation: opts {"confirm", fn} if given, else options::confirm;
 // with neither, drafted code never runs ({ran:false}). Endpoint calls need the net capability; running needs proc.
 #include "interp.hpp"
 #include "shells/shell.hpp"
+#include <forge/script/script.hpp>
 #include <forge/json/json.hpp>
 #include <forge/os/net.hpp>
 #include <cstdlib>
+#include <mutex>
 
 namespace forge::script {
 namespace {
@@ -39,14 +42,31 @@ Value from_json(const json::value& j) {
 const char* kShellSys = "You write one shell command for the user's task. Reply with only the command, no prose, no code fences.";
 const char* kScriptSys = "You write a FORGE script (C++23-style syntax, safe subset: no raw pointers/new/delete) for the user's task. Reply with only the code, no prose, no code fences.";
 
-std::string complete(Interp& in, const std::string& system, const std::string& prompt) {
+std::mutex local_mu;
+local_ai_fn& local_slot() { static local_ai_fn f; return f; }
+local_ai_fn local_get() { std::lock_guard lk(local_mu); return local_slot(); }
+
+std::string complete(Interp& in, const std::string& system, const std::string& prompt, bool want_json = false) {
     if (in.sh->ai) {
         try { return in.sh->ai(system, prompt); }
         catch (const ScriptError&) { throw; }
         catch (const std::exception& e) { in.raise("AIError", std::string("ai backend: ") + e.what()); }
     }
     const char* ep = std::getenv("FORGE_AI_ENDPOINT");
-    if (!ep || !*ep) in.raise("AIError", "no AI backend: set FORGE_AI_ENDPOINT (e.g. http://127.0.0.1:8080 from forge-serve) or options::ai");
+    std::string fpk = in.sh->ask_model;
+    if (fpk.empty()) if (const char* m = std::getenv("FORGE_ASK_MODEL")) fpk = m;
+    if (!fpk.empty()) {
+        if (auto gen = local_get()) {
+            local_ai_request rq{fpk, system, prompt, want_json, in.sh->ask_max_tokens};
+            if (rq.max_tokens <= 0) if (const char* m = std::getenv("FORGE_ASK_MAX_TOKENS")) rq.max_tokens = std::atoi(m);
+            if (rq.max_tokens <= 0) rq.max_tokens = 256;
+            try { return gen(rq); }
+            catch (const ScriptError&) { throw; }
+            catch (const std::exception& e) { in.raise("AIError", "local model " + fpk + ": " + e.what()); }
+        }
+        if (!ep || !*ep) in.raise("AIError", "FORGE_ASK_MODEL is set, but this host has no in-process inference (run under `forge script`) and FORGE_AI_ENDPOINT is not set");
+    }
+    if (!ep || !*ep) in.raise("AIError", "no AI backend: set FORGE_ASK_MODEL (a local .fpk), FORGE_AI_ENDPOINT (e.g. http://127.0.0.1:8080 from forge-serve) or options::ai");
     if (!in.caps.net) in.raise("PermissionError", "AI endpoint access needs network access, which is disabled in this sandbox");
     std::string url = ep; while (!url.empty() && url.back() == '/') url.pop_back();
     if (!url.ends_with("/chat/completions")) url += url.ends_with("/v1") ? "/chat/completions" : "/v1/chat/completions";
@@ -102,7 +122,7 @@ void install(Shared& sh) {
         return strv(clean_code(complete(in, std::string(kShellSys) + " Target shell: " + shell + ".", with_ctx(in, a, in.str(a[0])))));
     });
     B["forge::ask_json"] = nat("forge::ask_json", 1, 2, [](Interp& in, Args& a) -> Value {
-        auto txt = clean_code(complete(in, "Reply with only valid JSON, no prose.", with_ctx(in, a, in.str(a[0]))));
+        auto txt = clean_code(complete(in, "Reply with only valid JSON, no prose.", with_ctx(in, a, in.str(a[0])), true));
         try { return from_json(json::parse(txt)); } catch (const std::exception& e) { in.raise("AIError", std::string("model reply is not valid JSON: ") + e.what()); }
     });
     B["forge::ai_run"] = nat("forge::ai_run", 1, 2, [](Interp& in, Args& a) -> Value {
@@ -128,4 +148,6 @@ void install(Shared& sh) {
 }
 } // namespace
 void install_ai(Shared& sh) { install(sh); }
+void set_local_ai(local_ai_fn fn) { std::lock_guard lk(local_mu); local_slot() = std::move(fn); }
+bool has_local_ai() { std::lock_guard lk(local_mu); return bool(local_slot()); }
 } // namespace forge::script

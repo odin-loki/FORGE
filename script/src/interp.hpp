@@ -34,6 +34,7 @@ struct Shared {
     std::function<void(std::string_view)> out = [](std::string_view s) { std::fwrite(s.data(), 1, s.size(), stdout); };
     std::function<bool(const std::string&)> confirm;           // y/N prompt for ai.run; null = never confirm
     std::function<std::string(const std::string&, const std::string&)> ai;   // (system, prompt) -> completion
+    std::string ask_model; int ask_max_tokens = 0;             // in-process model for the AI commands (ai.cpp)
     std::atomic<bool> interrupt{false};
     std::atomic<std::uint64_t> steps{0};
     std::uint64_t start_ns = 0;

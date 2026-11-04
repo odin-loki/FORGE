@@ -23,7 +23,7 @@ namespace forge::script {
 namespace {
 
 enum class T { Ident, Int, Float, Str, Op, Kw, End };
-struct Tok { T t; std::string s; int line = 0; int col = 0; std::int64_t i = 0; double d = 0; };
+struct Tok { T t; std::string s; int line = 0; int col = 0; std::int64_t i = 0; double d = 0; std::size_t off = 0; std::size_t end = 0; };   // off/end: byte span in the source (0/0 for synthesised tokens)
 
 const std::unordered_set<std::string> kKeywords = {
     "auto", "const", "constexpr", "consteval", "constinit", "static", "inline", "virtual", "override", "final",
@@ -57,7 +57,7 @@ public:
             }
             if (p_ >= s_.size()) { out.push_back({T::End, "", line_}); return out; }
             bol = false;
-            { auto nl = p_ ? s_.rfind('\n', p_ - 1) : std::string_view::npos; int col = int(p_ - (nl == std::string_view::npos ? 0 : nl + 1)) + 1; out.push_back(next()); out.back().col = col; }
+            { auto nl = p_ ? s_.rfind('\n', p_ - 1) : std::string_view::npos; int col = int(p_ - (nl == std::string_view::npos ? 0 : nl + 1)) + 1; std::size_t b = p_; out.push_back(next()); out.back().col = col; out.back().off = b; out.back().end = p_; }
         }
     }
 private:
@@ -250,7 +250,7 @@ struct ClassInfo {
 
 class Parser {
 public:
-    Parser(std::vector<Tok> toks, std::string file) : t_(std::move(toks)), file_(std::move(file)) { prescan(); }
+    Parser(std::vector<Tok> toks, std::string file, std::shared_ptr<const std::string> src = {}) : t_(std::move(toks)), file_(std::move(file)), src_(std::move(src)) { prescan(); }
 
     std::shared_ptr<const FnDecl> program() {
         auto fd = std::make_shared<FnDecl>(); fd->name = "<main>"; fd->is_top = true; fd->file = file_; fd->line = 1;
@@ -1003,7 +1003,9 @@ private:
         std::size_t save = i_;
         { skip_balanced("(", ")"); TI dummy; bool pure = false; fn_qualifiers(&dummy, nullptr, &pure); if (accept_op(";")) return nullptr; i_ = save; }
         VarRef v = declare(name, false);   // declared first: recursion
+        std::size_t sb = cur().off;
         auto fd = function_body(name, line, cls, false, ret);
+        keep_source(*fd, sb);
         if (name == "main" && fns_.back().top && ns_.empty()) {
             if (!fd->params.empty()) fail_at(line, "main must take no parameters in a script; use forge::args()");
             has_main_ = true;
@@ -1835,6 +1837,7 @@ private:
             if (!accept_op(",")) break;
         }
         expect_op("]");
+        std::size_t sb = cur().off;   // source after the capture list (forge::remote_call re-captures by name)
         if (is_op("<")) template_params();
         // copy captures: an immediately-invoked outer function binds the copies, the lambda closes over them
         std::shared_ptr<FnDecl> outer;
@@ -1859,6 +1862,7 @@ private:
         fd->body = block_body(line, false);
         fd->nslots = fns_.back().nslots;
         pop_fn();
+        keep_source(*fd, sb);
         auto lam = mk(NK::Lambda, line); lam->fn = fd;
         if (!outer) return lam;
         auto body = mk(NK::Block, line); auto ret = mk(NK::Return, line); ret->kids.push_back(lam); body->kids.push_back(ret);
@@ -1869,8 +1873,15 @@ private:
         return call_node(ol, args, line);
     }
 
+    // Source text of a function from byte `b` (its parameter list) to the end of the last token consumed.
+    void keep_source(FnDecl& fd, std::size_t b) const {
+        if (!src_ || i_ == 0) return;
+        std::size_t e = t_[i_ - 1].end;
+        if (b < e && e <= src_->size()) { fd.src = src_; fd.src_b = b; fd.src_e = e; }
+    }
+
     // ---- state
-    std::vector<Tok> t_; std::size_t i_ = 0; std::string file_;
+    std::vector<Tok> t_; std::size_t i_ = 0; std::string file_; std::shared_ptr<const std::string> src_;
     std::vector<std::pair<std::size_t, std::string>> undo_;   // token splits made by close_angle(), for backtracking
     std::vector<FnScope> fns_;
     std::vector<NodeP> extra_, extra_after_class_;
@@ -1892,7 +1903,7 @@ private:
 
 std::shared_ptr<const FnDecl> parse_program(std::string_view src, const std::string& file) {
     Lexer lx(src, file);
-    Parser p(lx.run(), file);
+    Parser p(lx.run(), file, std::make_shared<const std::string>(src));
     return p.program();
 }
 

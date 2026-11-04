@@ -89,6 +89,8 @@ forge script                          # interactive REPL (:help, :type, :dis, :m
   --debug         race detector + lock-order / stall deadlock detection
   --timeout MS    wall-clock limit      --max-steps N   instruction budget
   --heap BYTES    managed heap cap      --no-proc / --no-fs / --no-net   capability sandbox
+  --ask-model M.fpk  run forge::ask & co on this model in-process (default $FORGE_ASK_MODEL)
+  --ask-max-tokens N reply cap for those calls (default $FORGE_ASK_MAX_TOKENS or 256)
 ```
 
 Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md).
