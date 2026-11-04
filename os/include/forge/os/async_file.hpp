@@ -1,7 +1,8 @@
 #pragma once
 // Completion-based async file I/O with one API:
-//   Linux: io_uring (raw syscalls, no liburing), falling back to a worker pool when the kernel or a seccomp
-//   policy (e.g. Android app sandbox) refuses it.  Windows: IOCP (overlapped ReOpenFile).  FreeBSD: POSIX AIO
+//   Linux: io_uring (raw syscalls, no liburing), falling back to a worker pool when the kernel lacks it or its
+//   READ/WRITE opcodes (before 5.6; probed with IORING_REGISTER_PROBE) or a seccomp policy (e.g. Android app
+//   sandbox) refuses it.  Windows: IOCP (overlapped ReOpenFile).  FreeBSD: POSIX AIO
 //   with kqueue EVFILT_AIO completions.  macOS/iOS: POSIX AIO + aio_suspend.  Everywhere: FORGE_AIO=threads forces
 //   the portable worker-pool backend.
 #include <forge/os/detail.hpp>
@@ -55,6 +56,14 @@ public:
 
     status read(file& f, void* buf, std::size_t n, std::uint64_t off, std::uint64_t user) { return op_(f, buf, n, off, user, false); }
     status write(file& f, const void* buf, std::size_t n, std::uint64_t off, std::uint64_t user) { return op_(f, const_cast<void*>(buf), n, off, user, true); }
+    // Release per-file state before closing f (Windows: the overlapped reopen of f; a no-op elsewhere).
+    void forget(const file& f) {
+#if defined(FORGE_OS_WINDOWS)
+        cp_.forget(f);
+#else
+        (void)f;
+#endif
+    }
 
     // Wait for at least min_n completions (or timeout_ms; -1 = forever); returns what completed (possibly fewer on timeout).
     std::vector<io_completion> wait(std::size_t min_n = 1, int timeout_ms = -1) {
@@ -79,10 +88,18 @@ private:
             unsigned tail = *sq_tail_, idx = tail & *sq_mask_;
             io_uring_sqe* s = &sqes_[idx]; std::memset(s, 0, sizeof *s);
             s->opcode = wr ? IORING_OP_WRITE : IORING_OP_READ; s->fd = f.native(); s->off = off;
-            s->addr = reinterpret_cast<std::uint64_t>(buf); s->len = unsigned(n); s->user_data = user;
+            // Linux moves at most 0x7ffff000 bytes per read/write: longer requests complete short, as with pread.
+            s->addr = reinterpret_cast<std::uint64_t>(buf); s->len = unsigned(n < 0x7ffff000u ? n : 0x7ffff000u); s->user_data = user;
             sq_array_[idx] = idx;
             __atomic_store_n(sq_tail_, tail + 1, __ATOMIC_RELEASE);
-            if (::syscall(__NR_io_uring_enter, ring_fd_, 1u, 0u, 0u, nullptr, 0) < 0) return {{}, last_error("io_uring_enter")};
+            long r;
+            do r = ::syscall(__NR_io_uring_enter, ring_fd_, 1u, 0u, 0u, nullptr, 0); while (r < 0 && errno == EINTR);
+            if (r < 1 && __atomic_load_n(sq_head_, __ATOMIC_ACQUIRE) == tail) {
+                // The kernel did not take the entry: withdraw it, or the next submission would carry it along
+                // (an untracked I/O into a buffer the caller has since reused).
+                auto e = r < 0 ? last_error("io_uring_enter") : error{EBUSY, "io_uring_enter: not submitted"};
+                __atomic_store_n(sq_tail_, tail, __ATOMIC_RELEASE); return {{}, e};
+            }
             ++inflight_; return {};
         }
 #endif
@@ -173,6 +190,15 @@ private:
         io_uring_params p{}; int fd = int(::syscall(__NR_io_uring_setup, depth_, &p));
         if (fd < 0) return false;
         ring_fd_ = fd; sq_entries_ = p.sq_entries;
+        // IORING_OP_READ/WRITE arrived in 5.6, together with IORING_REGISTER_PROBE; io_uring itself in 5.1. Without
+        // a probe (5.1-5.5) or without both opcodes, use the worker pool. Layout from <linux/io_uring.h>, spelled out
+        // so older uapi headers still build.
+        struct probe_op { std::uint8_t op, resv; std::uint16_t flags; std::uint32_t resv2; };
+        struct probe { std::uint8_t last_op, ops_len; std::uint16_t resv; std::uint32_t resv2[3]; probe_op ops[256]; };
+        auto pr = std::make_unique<probe>(); std::memset(pr.get(), 0, sizeof *pr);
+        if (::syscall(__NR_io_uring_register, fd, 8u /*IORING_REGISTER_PROBE*/, pr.get(), 256u) < 0) return uring_fail_();
+        auto has = [&](unsigned op) { return op <= pr->last_op && op < pr->ops_len && (pr->ops[op].flags & 1u /*IO_URING_OP_SUPPORTED*/); };
+        if (!has(IORING_OP_READ) || !has(IORING_OP_WRITE)) return uring_fail_();
         sq_sz_ = p.sq_off.array + p.sq_entries * sizeof(unsigned); cq_sz_ = p.cq_off.cqes + p.cq_entries * sizeof(io_uring_cqe);
         bool single = p.features & IORING_FEAT_SINGLE_MMAP; if (single) sq_sz_ = cq_sz_ = std::max(sq_sz_, cq_sz_);
         sq_ptr_ = ::mmap(nullptr, sq_sz_, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
@@ -184,7 +210,7 @@ private:
         if (s == MAP_FAILED) return uring_fail_();
         sqes_ = static_cast<io_uring_sqe*>(s);
         auto* sq = static_cast<std::uint8_t*>(sq_ptr_); auto* cq = static_cast<std::uint8_t*>(cq_ptr_);
-        sq_tail_ = reinterpret_cast<unsigned*>(sq + p.sq_off.tail); sq_mask_ = reinterpret_cast<unsigned*>(sq + p.sq_off.ring_mask); sq_array_ = reinterpret_cast<unsigned*>(sq + p.sq_off.array);
+        sq_head_ = reinterpret_cast<unsigned*>(sq + p.sq_off.head); sq_tail_ = reinterpret_cast<unsigned*>(sq + p.sq_off.tail); sq_mask_ = reinterpret_cast<unsigned*>(sq + p.sq_off.ring_mask); sq_array_ = reinterpret_cast<unsigned*>(sq + p.sq_off.array);
         cq_head_ = reinterpret_cast<unsigned*>(cq + p.cq_off.head); cq_tail_ = reinterpret_cast<unsigned*>(cq + p.cq_off.tail); cq_mask_ = reinterpret_cast<unsigned*>(cq + p.cq_off.ring_mask);
         cqes_ = reinterpret_cast<io_uring_cqe*>(cq + p.cq_off.cqes);
         return true;
@@ -192,7 +218,7 @@ private:
     bool uring_fail_() { if (sq_ptr_) ::munmap(sq_ptr_, sq_sz_); if (cq_ptr_ && cq_ptr_ != sq_ptr_) ::munmap(cq_ptr_, cq_sz_); sq_ptr_ = cq_ptr_ = nullptr; ::close(ring_fd_); ring_fd_ = -1; return false; }
     int ring_fd_ = -1; unsigned sq_entries_ = 0; std::size_t sq_sz_ = 0, cq_sz_ = 0, sqes_sz_ = 0; void* sq_ptr_ = nullptr; void* cq_ptr_ = nullptr;
     io_uring_sqe* sqes_ = nullptr; io_uring_cqe* cqes_ = nullptr;
-    unsigned *sq_tail_ = nullptr, *sq_mask_ = nullptr, *sq_array_ = nullptr, *cq_head_ = nullptr, *cq_tail_ = nullptr, *cq_mask_ = nullptr;
+    unsigned *sq_head_ = nullptr, *sq_tail_ = nullptr, *sq_mask_ = nullptr, *sq_array_ = nullptr, *cq_head_ = nullptr, *cq_tail_ = nullptr, *cq_mask_ = nullptr;
 #endif
 #if defined(FORGE_OS_WINDOWS)
     completion_port cp_; std::uint64_t next_key_ = 1; std::map<std::uint64_t, std::uint64_t> keys_;
