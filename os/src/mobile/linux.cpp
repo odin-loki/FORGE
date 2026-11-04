@@ -1,11 +1,17 @@
 // forge_mobile Linux backend (postmarketOS, Mobian, PinePhone, Librem 5, any IIO/evdev device):
-//   sensors   IIO sysfs channels under <sysfs>/bus/iio/devices, sampled at the requested rate;
-//             battery from <sysfs>/class/power_supply. Location: not_supported (needs GeoClue over D-Bus).
+//   sensors   IIO sysfs channels under <sysfs>/bus/iio/devices found by attribute name (iio_channels: accel,
+//             anglvel, magn, gravity, illuminance, proximity, pressure, temp, humidityrelative, steps,
+//             rot_quaternion; indexed and modified names), sampled at the requested rate; battery from
+//             <sysfs>/class/power_supply. Location: GeoClue2 over the system D-Bus (sd-bus from libsystemd.so.0,
+//             loaded at run time), live /sys only.
 //   touch     evdev nodes in <input> whose <sysfs>/class/input/<node>/device/capabilities/abs has
 //             ABS_MT_POSITION_X (multitouch protocol B), or ABS_X + BTN_TOUCH (single touch).
 //   haptics   evdev force feedback (FF_RUMBLE) — the vibra motor on most phones.
 //   display   DRM connector modes, else fbdev virtual_size; orientation from the accelerometer.
-//   cameras   <sysfs>/class/video4linux.  notify: notify-send.  permissions: not_required.
+//             Brightness: backlight sysfs, else logind Session.SetBrightness (no root needed). keep_awake: logind
+//             Inhibit("idle:sleep", block), the fd held until keep_awake(false).
+//   cameras   <sysfs>/class/video4linux; capture_photo: one MJPEG/JPEG frame through V4L2 mmap streaming.
+//   notify: notify-send.  permissions: not_required.
 #include "internal.hpp"
 #if defined(__linux__) && !defined(__ANDROID__)
 #include "evdev.hpp"
@@ -22,6 +28,9 @@
 #include <unistd.h>
 #include <fstream>
 #include <linux/videodev2.h>
+#include <dlfcn.h>
+#include <sys/mman.h>
+#include <type_traits>
 #include <map>
 #include <forge/os/process.hpp>
 
@@ -58,43 +67,204 @@ bool cap_bit(const std::string& mask, int bit) {
     return (w[w.size() - 1 - word] >> (bit % 64)) & 1ull;
 }
 
-struct channel { std::string dev; std::string base; int axes; double mul; };   // value = (raw+offset)*scale*mul
-struct iio_sensor { sensor_info info; std::vector<channel> ch; std::string input_file; double input_mul = 1; };
+struct channel { std::string dev; iio_channel c; };   // value = (raw+offset)*scale*mul
+struct iio_sensor { sensor_info info; std::vector<channel> ch; };
 
-double read_chan(const channel& c, int axis, bool& ok) {
+// Shared attributes fall back from the channel (in_accel_x_scale) to the stem (in_accel_scale, in_illuminance0_scale)
+// to the type (in_illuminance_scale).
+bool chan_attr(const channel& c, const std::string& axis, const char* what, double& out) {
+    return num(c.dev + "/" + c.c.prefix + axis + what, out) || num(c.dev + "/" + c.c.prefix + what, out) || num(c.dev + "/" + c.c.type_prefix + what, out);
+}
+bool read_chan(const channel& c, sensor_event& e) {
+    if (c.c.axes == 4) {   // in_rot_quaternion_raw: "x y z w" in one attribute (HID order)
+        auto s = slurp(c.dev + "/" + c.c.prefix + "_raw"); if (s.empty()) return false;
+        double sc = 1; chan_attr(c, "", "_scale", sc);
+        const char* p = s.c_str();
+        for (int i = 0; i < 4; ++i) { char* end = nullptr; double v = std::strtod(p, &end); if (end == p) return false; e.v[std::size_t(i)] = v * sc * c.c.mul; p = end; }
+        e.n = 4; return true;
+    }
     static const char* ax[] = {"_x", "_y", "_z"};
-    std::string a = c.axes > 1 ? ax[axis] : "";
-    double v; ok = true;
-    if (num(c.dev + "/" + c.base + a + "_input", v)) return v * c.mul;
-    double raw; if (!num(c.dev + "/" + c.base + a + "_raw", raw)) { ok = false; return 0; }
-    double off = 0, sc = 1; if (!num(c.dev + "/" + c.base + a + "_offset", off)) num(c.dev + "/" + c.base + "_offset", off);
-    if (!num(c.dev + "/" + c.base + a + "_scale", sc)) num(c.dev + "/" + c.base + "_scale", sc);
-    return (raw + off) * sc * c.mul;
+    for (int i = 0; i < c.c.axes; ++i) {
+        std::string a = c.c.axes > 1 ? ax[i] : "";
+        double v;
+        if (num(c.dev + "/" + c.c.prefix + a + "_input", v)) { e.v[std::size_t(i)] = v * c.c.mul; continue; }
+        double raw; if (!num(c.dev + "/" + c.c.prefix + a + "_raw", raw)) return false;
+        double off = 0, sc = 1; chan_attr(c, a, "_offset", off); chan_attr(c, a, "_scale", sc);
+        e.v[std::size_t(i)] = (raw + off) * sc * c.c.mul;
+    }
+    e.n = c.c.axes; return true;
+}
+
+// ---- sd-bus (libsystemd.so.0, loaded at run time; same approach as background.hpp's logind inhibitor)
+struct bus_error { const char* name; const char* message; int need_free; };
+struct sdbus {
+    int (*open_system)(void**) = nullptr;
+    int (*call)(void*, const char*, const char*, const char*, const char*, bus_error*, void**, const char*, ...) = nullptr;
+    int (*read)(void*, const char*, ...) = nullptr;
+    int (*get_prop)(void*, const char*, const char*, const char*, const char*, bus_error*, void**, const char*) = nullptr;
+    int (*set_prop)(void*, const char*, const char*, const char*, const char*, bus_error*, const char*, ...) = nullptr;
+    void* (*msg_unref)(void*) = nullptr; void* (*bus_unref)(void*) = nullptr; void (*err_free)(bus_error*) = nullptr;
+    bool ok() const { return open_system && call && read && get_prop && set_prop && msg_unref && bus_unref && err_free; }
+    static const sdbus& get() {
+        static const sdbus a = [] {
+            sdbus x; void* h = ::dlopen("libsystemd.so.0", RTLD_LAZY | RTLD_LOCAL); if (!h) return x;
+            auto f = [&](auto& p, const char* n) { p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(::dlsym(h, n)); };
+            f(x.open_system, "sd_bus_open_system"); f(x.call, "sd_bus_call_method"); f(x.read, "sd_bus_message_read");
+            f(x.get_prop, "sd_bus_get_property"); f(x.set_prop, "sd_bus_set_property"); f(x.msg_unref, "sd_bus_message_unref");
+            f(x.bus_unref, "sd_bus_flush_close_unref"); f(x.err_free, "sd_bus_error_free");
+            return x; }();
+        return a;
+    }
+};
+// Owning system-bus connection; empty when there is no libsystemd or no system bus.
+struct bus_conn {
+    void* b = nullptr;
+    bus_conn() { auto& a = sdbus::get(); if (a.ok() && a.open_system(&b) < 0) b = nullptr; }
+    ~bus_conn() { if (b) sdbus::get().bus_unref(b); }
+    bus_conn(const bus_conn&) = delete; bus_conn& operator=(const bus_conn&) = delete;
+    explicit operator bool() const { return b != nullptr; }
+};
+// Error from a failed call: unsupported when the service is absent, else EACCES/EIO with the D-Bus message.
+error bus_fail(int r, bus_error& e, const std::string& what) {
+    std::string n = e.name ? e.name : "", m = e.message ? e.message : (n.empty() ? error_text(-r) : n);
+    sdbus::get().err_free(&e);
+    if (n == "org.freedesktop.DBus.Error.ServiceUnknown" || n == "org.freedesktop.DBus.Error.NameHasNoOwner" || n == "org.freedesktop.DBus.Error.UnknownMethod"
+        || n == "org.freedesktop.DBus.Error.UnknownObject" || n == "org.freedesktop.DBus.Error.UnknownInterface")
+        return unsupported(what + " (" + m + ")");
+    bool denied = n == "org.freedesktop.DBus.Error.AccessDenied" || n == "org.freedesktop.DBus.Error.AuthFailed" || n.find("NotAuthorized") != std::string::npos || r == -EACCES || r == -EPERM;
+    return {denied ? EACCES : (r < 0 ? -r : EIO), what + ": " + m, err_domain::posix};
+}
+double bus_get_double(void* bus, const char* path, const char* iface, const char* prop, bool& ok) {
+    auto& a = sdbus::get(); bus_error e{}; void* reply = nullptr; double v = 0;
+    ok = a.get_prop(bus, "org.freedesktop.GeoClue2", path, iface, prop, &e, &reply, "d") >= 0 && reply && a.read(reply, "d", &v) >= 0;
+    if (reply) a.msg_unref(reply); a.err_free(&e); return v;
+}
+std::string bus_get_path(void* bus, const char* path, const char* iface, const char* prop) {
+    auto& a = sdbus::get(); bus_error e{}; void* reply = nullptr; const char* v = nullptr; std::string out;
+    if (a.get_prop(bus, "org.freedesktop.GeoClue2", path, iface, prop, &e, &reply, "o") >= 0 && reply && a.read(reply, "o", &v) >= 0 && v) out = v;
+    if (reply) a.msg_unref(reply); a.err_free(&e); return out;
+}
+
+// GeoClue2 client: Manager.GetClient, DesktopId + accuracy, Start; Location is polled (no signal match, so nothing
+// queues up on the connection) and each new Location object is read once.
+struct geoclue {
+    bus_conn bus; std::string client; std::string last;
+    status start() {
+        auto& a = sdbus::get();
+        if (!bus) return {{}, unsupported("location (no system D-Bus / libsystemd for GeoClue2)")};
+        bus_error e{}; void* reply = nullptr;
+        int r = a.call(bus.b, "org.freedesktop.GeoClue2", "/org/freedesktop/GeoClue2/Manager", "org.freedesktop.GeoClue2.Manager", "GetClient", &e, &reply, "");
+        if (r < 0) { if (reply) a.msg_unref(reply); return {{}, bus_fail(r, e, "GeoClue2 GetClient")}; }
+        const char* p = nullptr; if (a.read(reply, "o", &p) >= 0 && p) client = p; a.msg_unref(reply); a.err_free(&e);
+        if (client.empty()) return {{}, {EIO, "GeoClue2 GetClient: no client path", err_domain::posix}};
+        const char* ci = "org.freedesktop.GeoClue2.Client";
+        e = {}; r = a.set_prop(bus.b, "org.freedesktop.GeoClue2", client.c_str(), ci, "DesktopId", &e, "s", "forge");
+        if (r < 0) return {{}, bus_fail(r, e, "GeoClue2 DesktopId")};
+        a.err_free(&e); e = {};
+        a.set_prop(bus.b, "org.freedesktop.GeoClue2", client.c_str(), ci, "RequestedAccuracyLevel", &e, "u", std::uint32_t(8) /* EXACT */); a.err_free(&e);
+        e = {}; reply = nullptr;
+        r = a.call(bus.b, "org.freedesktop.GeoClue2", client.c_str(), ci, "Start", &e, &reply, "");
+        if (reply) a.msg_unref(reply);
+        if (r < 0) return {{}, bus_fail(r, e, "GeoClue2 Start (is the app allowed by the GeoClue agent?)")};
+        a.err_free(&e); return {};
+    }
+    // A new fix since the last call, if any.
+    bool poll(sensor_event& ev) {
+        auto loc = bus_get_path(bus.b, client.c_str(), "org.freedesktop.GeoClue2.Client", "Location");
+        if (loc.empty() || loc == "/" || loc == last) return false;
+        const char* li = "org.freedesktop.GeoClue2.Location"; bool ok1, ok2, ok3, ok4;
+        double lat = bus_get_double(bus.b, loc.c_str(), li, "Latitude", ok1), lon = bus_get_double(bus.b, loc.c_str(), li, "Longitude", ok2);
+        double alt = bus_get_double(bus.b, loc.c_str(), li, "Altitude", ok3), acc = bus_get_double(bus.b, loc.c_str(), li, "Accuracy", ok4);
+        if (!ok1 || !ok2) return false;
+        last = loc; ev = {}; ev.kind = sensor_kind::location; ev.t_ns = now_ns();
+        ev.v = {lat, lon, ok3 && alt > -1e300 ? alt : 0.0, ok4 ? acc : 0.0}; ev.n = 4; return true;   // GeoClue: -DBL_MAX altitude = unknown
+    }
+    ~geoclue() {
+        if (!bus || client.empty()) return;
+        auto& a = sdbus::get(); bus_error e{}; void* reply = nullptr;
+        a.call(bus.b, "org.freedesktop.GeoClue2", client.c_str(), "org.freedesktop.GeoClue2.Client", "Stop", &e, &reply, "");
+        if (reply) a.msg_unref(reply); a.err_free(&e);
+    }
+};
+
+// ---- V4L2 single-frame capture (mmap streaming). Motion-JPEG / JPEG formats only: the frame is returned as delivered
+// with the standard Huffman tables added when the camera leaves them out.
+result<std::vector<std::uint8_t>> v4l2_capture_jpeg(const std::string& node) {
+    int fd = ::open(node.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0) return {{}, errno == ENOENT ? unsupported("camera capture (" + node + " missing)") : last_error("open " + node)};
+    struct closer { int fd; std::vector<std::pair<void*, std::size_t>> maps; bool on = false;
+        ~closer() { if (on) { int t = V4L2_BUF_TYPE_VIDEO_CAPTURE; ::ioctl(fd, VIDIOC_STREAMOFF, &t); } for (auto& m : maps) ::munmap(m.first, m.second); ::close(fd); } } cl{fd, {}};
+    auto xioctl = [&](unsigned long req, void* arg) { int r; do r = ::ioctl(fd, req, arg); while (r < 0 && errno == EINTR); return r; };
+    std::uint32_t fmt_jpeg = 0;
+    for (std::uint32_t i = 0; i < 64; ++i) {
+        v4l2_fmtdesc d{}; d.index = i; d.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        if (xioctl(VIDIOC_ENUM_FMT, &d) < 0) break;
+        if (d.pixelformat == V4L2_PIX_FMT_MJPEG || d.pixelformat == V4L2_PIX_FMT_JPEG) { fmt_jpeg = d.pixelformat; break; }
+    }
+    if (!fmt_jpeg) return {{}, unsupported("camera capture (" + node + " offers no MJPEG/JPEG format; raw YUV is not encoded)")};
+    v4l2_format f{}; f.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(VIDIOC_G_FMT, &f) < 0) return {{}, last_error("VIDIOC_G_FMT")};
+    // Largest discrete frame size of the JPEG format.
+    for (std::uint32_t i = 0; i < 256; ++i) {
+        v4l2_frmsizeenum s{}; s.index = i; s.pixel_format = fmt_jpeg;
+        if (xioctl(VIDIOC_ENUM_FRAMESIZES, &s) < 0) break;
+        if (s.type == V4L2_FRMSIZE_TYPE_DISCRETE) { if (std::uint64_t(s.discrete.width) * s.discrete.height > std::uint64_t(f.fmt.pix.width) * f.fmt.pix.height || i == 0) { f.fmt.pix.width = s.discrete.width; f.fmt.pix.height = s.discrete.height; } }
+        else { f.fmt.pix.width = s.stepwise.max_width; f.fmt.pix.height = s.stepwise.max_height; break; }
+    }
+    f.fmt.pix.pixelformat = fmt_jpeg; f.fmt.pix.field = V4L2_FIELD_ANY;
+    if (xioctl(VIDIOC_S_FMT, &f) < 0) return {{}, last_error("VIDIOC_S_FMT")};
+    if (f.fmt.pix.pixelformat != fmt_jpeg) return {{}, unsupported("camera capture (driver refused MJPEG)")};
+    v4l2_requestbuffers rb{}; rb.count = 4; rb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; rb.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(VIDIOC_REQBUFS, &rb) < 0) return {{}, last_error("VIDIOC_REQBUFS")};
+    if (rb.count < 1) return {{}, {ENOMEM, "VIDIOC_REQBUFS: no buffers", err_domain::posix}};
+    for (std::uint32_t i = 0; i < rb.count; ++i) {
+        v4l2_buffer b{}; b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; b.memory = V4L2_MEMORY_MMAP; b.index = i;
+        if (xioctl(VIDIOC_QUERYBUF, &b) < 0) return {{}, last_error("VIDIOC_QUERYBUF")};
+        void* p = ::mmap(nullptr, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
+        if (p == MAP_FAILED) return {{}, last_error("mmap video buffer")};
+        cl.maps.emplace_back(p, b.length);
+        if (xioctl(VIDIOC_QBUF, &b) < 0) return {{}, last_error("VIDIOC_QBUF")};
+    }
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(VIDIOC_STREAMON, &type) < 0) return {{}, last_error("VIDIOC_STREAMON")};
+    cl.on = true;
+    // Skip a few frames so auto exposure settles; give up after 5 s without a frame.
+    std::vector<std::uint8_t> frame;
+    for (int got = 0; got < 4;) {
+        pollfd p{fd, POLLIN, 0}; int pr = ::poll(&p, 1, 5000);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) { if (!frame.empty()) break; return {{}, pr == 0 ? error{ETIMEDOUT, "camera capture: no frame within 5 s", err_domain::posix} : last_error("poll video")}; }
+        v4l2_buffer b{}; b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE; b.memory = V4L2_MEMORY_MMAP;
+        if (xioctl(VIDIOC_DQBUF, &b) < 0) { if (errno == EAGAIN) continue; return {{}, last_error("VIDIOC_DQBUF")}; }
+        if (b.index < cl.maps.size() && b.bytesused > 0 && !(b.flags & V4L2_BUF_FLAG_ERROR)) {
+            auto* p8 = static_cast<const std::uint8_t*>(cl.maps[b.index].first);
+            frame.assign(p8, p8 + std::min<std::size_t>(b.bytesused, cl.maps[b.index].second)); ++got;
+        }
+        if (xioctl(VIDIOC_QBUF, &b) < 0) break;
+    }
+    if (frame.empty()) return {{}, {EIO, "camera capture: no frame", err_domain::posix}};
+    return {jpeg_with_dht(std::move(frame)), {}};
 }
 
 struct linux_backend final : backend, std::enable_shared_from_this<linux_backend> {
     std::string sys, input;
-    linux_backend(std::string s, std::string i) : sys(std::move(s)), input(std::move(i)) {}
+    bool real;   // the live /sys: D-Bus services (GeoClue2, logind) are only consulted then, never for fake test trees
+    std::mutex awake_m; int inhibit_fd = -1;
+    linux_backend(std::string s, std::string i) : sys(std::move(s)), input(std::move(i)) { real = sys == "/sys"; }
+    ~linux_backend() override { if (inhibit_fd >= 0) ::close(inhibit_fd); }
     std::string name() const override { return "linux"; }
 
     std::vector<iio_sensor> scan() const {
         std::vector<iio_sensor> out; std::string root = sys + "/bus/iio/devices";
-        struct kind_def { sensor_kind k; const char* base; int axes; double mul; };
-        static const kind_def defs[] = {
-            {sensor_kind::accelerometer, "in_accel", 3, 1.0}, {sensor_kind::gyroscope, "in_anglvel", 3, 1.0},
-            {sensor_kind::magnetometer, "in_magn", 3, 100.0 /* gauss -> uT */}, {sensor_kind::light, "in_illuminance", 1, 1.0},
-            {sensor_kind::proximity, "in_proximity", 1, 1.0}, {sensor_kind::pressure, "in_pressure", 1, 10.0 /* kPa -> hPa */},
-            {sensor_kind::temperature, "in_temp", 1, 0.001 /* milli degC */}, {sensor_kind::humidity, "in_humidityrelative", 1, 0.001 /* milli %RH */},
-            {sensor_kind::step_counter, "in_steps", 1, 1.0}, {sensor_kind::gravity, "in_gravity", 3, 1.0}};
         for (auto& d : ls(root)) {
             std::string dev = root + "/" + d; auto nm = slurp(dev + "/name");
-            for (auto& k : defs) {
-                std::string probe = dev + "/" + k.base + (k.axes > 1 ? "_x" : "");
-                if (!exists(probe + "_raw") && !exists(probe + "_input")) continue;
-                iio_sensor s; s.info = {k.k, nm.empty() ? d : nm, "iio", 0, 0, 0};
-                double sc; if (num(dev + "/" + k.base + "_scale", sc)) s.info.resolution = sc * k.mul;
-                if (auto f = slurp(dev + "/sampling_frequency"); !f.empty()) s.info.max_rate_hz = std::strtod(f.c_str(), nullptr);
-                s.ch.push_back({dev, k.base, k.axes, k.mul}); out.push_back(std::move(s));
+            for (auto& c : iio_channels(ls(dev))) {
+                if (std::any_of(out.begin(), out.end(), [&](const iio_sensor& s) { return s.info.kind == c.kind; })) continue;   // first device wins
+                iio_sensor s; s.info = {c.kind, nm.empty() ? d : nm, "iio", 0, 0, 0};
+                channel ch{dev, c}; double sc;
+                if (chan_attr(ch, c.axes == 3 ? "_x" : "", "_scale", sc)) s.info.resolution = sc * c.mul;
+                double hz; if (num(dev + "/" + c.type_prefix + "_sampling_frequency", hz) || num(dev + "/sampling_frequency", hz)) s.info.max_rate_hz = hz;
+                s.ch.push_back(std::move(ch)); out.push_back(std::move(s));
             }
         }
         if (!battery_dir().empty()) { iio_sensor b; b.info = {sensor_kind::battery, "power_supply", "linux", 1, 100, 1}; out.push_back(b); }
@@ -105,7 +275,14 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         for (auto& e : ls(r)) if (slurp(r + "/" + e + "/type") == "Battery") return r + "/" + e;
         return {};
     }
-    result<std::vector<sensor_info>> sensors() override { std::vector<sensor_info> v; for (auto& s : scan()) v.push_back(s.info); return {v, {}}; }
+    bool geoclue_installed() const {
+        return real && (exists("/usr/share/dbus-1/system-services/org.freedesktop.GeoClue2.service") || exists("/usr/local/share/dbus-1/system-services/org.freedesktop.GeoClue2.service"));
+    }
+    result<std::vector<sensor_info>> sensors() override {
+        std::vector<sensor_info> v; for (auto& s : scan()) v.push_back(s.info);
+        if (geoclue_installed()) v.push_back({sensor_kind::location, "GeoClue2", "freedesktop", 1, 0, 0});
+        return {v, {}};
+    }
 
     bool sample(const iio_sensor& s, sensor_event& e) const {
         e = {}; e.kind = s.info.kind; e.t_ns = now_ns();
@@ -113,12 +290,21 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
             auto d = battery_dir(); double cap; if (d.empty() || !num(d + "/capacity", cap)) return false;
             auto st = slurp(d + "/status"); e.v = {cap, (st == "Charging" || st == "Full") ? 1.0 : 0.0}; e.n = 2; return true;
         }
-        auto& c = s.ch[0];
-        for (int a = 0; a < c.axes; ++a) { bool ok; e.v[a] = read_chan(c, a, ok); if (!ok) return false; }
-        e.n = c.axes; return true;
+        return read_chan(s.ch[0], e);
     }
     result<sensor_stream> open_sensor(sensor_kind k, double hz) override {
-        if (k == sensor_kind::location) return {{}, unsupported("location on Linux (use GeoClue)")};
+        if (k == sensor_kind::location) {
+            if (!real) return {{}, unsupported("location (GeoClue2 is only used with the live /sys)")};
+            auto gc = std::make_shared<geoclue>();
+            if (auto st = gc->start(); !st) return {{}, st.err};
+            auto q = std::make_shared<queue>(); bridge::get().add_sensor(k, q);
+            auto w = std::make_shared<worker>(); auto period = std::max<std::uint64_t>(std::uint64_t(1e9 / hz), 200'000'000ull);
+            // The sd-bus connection is used only by this thread from here on (sd-bus objects are not thread-safe).
+            w->start([gc, q, wp = w.get(), period] { do { sensor_event e; if (gc->poll(e)) q->push({false, e, {}}); } while (wp->sleep_ns(period)); });
+            struct both { std::shared_ptr<worker> w; std::shared_ptr<geoclue> g; };   // stop the thread before Stop()/unref
+            auto keep = std::shared_ptr<both>(new both{w, gc}, [](both* b) { b->w.reset(); delete b; });
+            return {make_sensor(k, q, keep), {}};
+        }
         for (auto& s : scan()) if (s.info.kind == k) {
             auto q = std::make_shared<queue>(); bridge::get().add_sensor(k, q);
             auto w = std::make_shared<worker>(); auto period = std::uint64_t(1e9 / hz);
@@ -232,20 +418,68 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         }
         return {v, {}};
     }
+    result<std::vector<std::uint8_t>> capture_photo(std::string_view id) override {
+        std::string cam(id);
+        if (cam.empty()) { auto c = cameras(); if (!c || c.value.empty()) return {{}, unsupported("camera capture (no V4L2 capture device)")}; cam = c.value[0].id; }
+        if (cam.find('/') != std::string::npos || cam.rfind("video", 0) != 0) return {{}, {EINVAL, "capture_photo: camera id is a video4linux node name (video0)", err_domain::posix}};
+        return v4l2_capture_jpeg(input.substr(0, input.rfind('/')) + "/" + cam);
+    }
     // ---- services
     std::string first_class(const char* cls, const char* contains = nullptr) const {
         std::string r = sys + "/class/" + cls;
         for (auto& e : ls(r)) { if (!contains) return r + "/" + e; auto lc = e; for (auto& c : lc) c = char(std::tolower(c)); if (lc.find(contains) != std::string::npos) return r + "/" + e; }
         return {};
     }
+    // The backlight logind and systemd-backlight would pick: firmware (ACPI) over platform over raw.
+    std::string backlight_dir() const {
+        std::string r = sys + "/class/backlight", best; int rank = 99;
+        for (auto& e : ls(r)) {
+            auto t = slurp(r + "/" + e + "/type"); int k = t == "firmware" ? 0 : t == "platform" ? 1 : t == "raw" ? 2 : 3;
+            if (k < rank) { rank = k; best = r + "/" + e; }
+        }
+        return best;
+    }
     result<double> brightness() override {
-        auto d = first_class("backlight"); double b, m;
+        auto d = backlight_dir(); double b, m;
         if (d.empty() || !num(d + "/brightness", b) || !num(d + "/max_brightness", m) || m <= 0) return {{}, unsupported("screen brightness (no backlight)")};
         return {b / m, {}};
     }
+    // sysfs needs root (or a udev rule); without write access, logind's Session.SetBrightness does it for the user
+    // of the active session.
     status set_brightness(double l) override {
-        auto d = first_class("backlight"); double m; if (d.empty() || !num(d + "/max_brightness", m)) return {{}, unsupported("screen brightness (no backlight)")};
-        return write_attr(d + "/brightness", std::to_string(std::lround(l * m)) + "\n");
+        auto d = backlight_dir(); double m; if (d.empty() || !num(d + "/max_brightness", m)) return {{}, unsupported("screen brightness (no backlight)")};
+        auto value = std::uint32_t(std::lround(l * m));
+        auto st = write_attr(d + "/brightness", std::to_string(value) + "\n");
+        if (st || !real || (st.err.code != EACCES && st.err.code != EPERM && st.err.code != EROFS)) return st;
+        bus_conn bus; if (!bus) return st;
+        auto& a = sdbus::get(); bus_error e{}; void* reply = nullptr;
+        std::string name = d.substr(d.rfind('/') + 1);
+        int r = a.call(bus.b, "org.freedesktop.login1", "/org/freedesktop/login1/session/auto", "org.freedesktop.login1.Session", "SetBrightness", &e, &reply, "ssu", "backlight", name.c_str(), value);
+        if (reply) a.msg_unref(reply);
+        if (r < 0) { auto er = bus_fail(r, e, "logind SetBrightness"); return {{}, is_unsupported(er) ? st.err : er}; }
+        a.err_free(&e); return {};
+    }
+    // logind idle + sleep inhibitor ("block"), held while inhibit_fd is open.
+    status keep_awake(bool on) override {
+        std::lock_guard g(awake_m);
+        if (!on) { if (inhibit_fd >= 0) { ::close(inhibit_fd); inhibit_fd = -1; } return {}; }
+        if (inhibit_fd >= 0) return {};
+        if (!real) return {{}, unsupported("keep awake (logind is only used with the live /sys)")};
+        bus_conn bus; if (!bus) return {{}, unsupported("keep awake (no system D-Bus / libsystemd for logind)")};
+        auto& a = sdbus::get(); error last{};
+        for (const char* what : {"idle:sleep", "idle"}) {
+            bus_error e{}; void* reply = nullptr;
+            int r = a.call(bus.b, "org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "Inhibit", &e, &reply, "ssss", what, "forge", "keep_awake", "block");
+            if (r >= 0 && reply) {
+                int fd = -1; int dup = a.read(reply, "h", &fd) >= 0 && fd >= 0 ? ::fcntl(fd, F_DUPFD_CLOEXEC, 3) : -1;   // the reply owns fd
+                a.msg_unref(reply); a.err_free(&e);
+                if (dup >= 0) { inhibit_fd = dup; return {}; }
+                last = {EIO, "logind Inhibit: reply without a file descriptor", err_domain::posix}; continue;
+            }
+            if (reply) a.msg_unref(reply);
+            last = bus_fail(r, e, "logind Inhibit"); if (is_unsupported(last)) break;
+        }
+        return {{}, last};
     }
     status torch(bool on) override {
         auto d = first_class("leds", "flash"); if (d.empty()) d = first_class("leds", "torch");
