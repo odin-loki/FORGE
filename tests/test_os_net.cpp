@@ -49,6 +49,109 @@ static void tree_watch_case(bool polling) {
 }
 TEST(tree_watch_native) { tree_watch_case(false); }
 TEST(tree_watch_polling) { tree_watch_case(true); }
+static std::vector<os::watch_event> drain(os::file_watcher& w, const std::string& suffix, int ms) {
+    std::vector<os::watch_event> all;
+    for (auto end = os::monotonic_ns() + std::uint64_t(ms) * 1000000ull; os::monotonic_ns() < end;) {
+        auto e = w.poll(100); all.insert(all.end(), e.begin(), e.end());
+        bool hit = false; for (auto& x : all) hit |= x.path.size() >= suffix.size() && x.path.compare(x.path.size() - suffix.size(), suffix.size(), suffix) == 0;
+        if (hit && !suffix.empty()) break;
+    }
+    return all;
+}
+TEST(watch_many_dirs_and_removal) {   // > 64 directories: one Windows wait could not cover them
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    os::file_watcher w; const int n = 80;
+    for (int i = 0; i < n; ++i) { auto s = r + "/d" + std::to_string(i); CHECK(fs::make_dirs(s)); CHECK(w.add(s)); }
+    os::sleep_ns(20'000'000);
+    CHECK(os::write_file(r + "/d75/x.txt", "1"));
+    auto ev = drain(w, "/d75/x.txt", 3000); CHECK(has_event(ev, "/d75/x.txt", os::watch_kind::created));
+    CHECK(os::write_file(r + "/d3/y.txt", "1"));
+    ev = drain(w, "/d3/y.txt", 3000); CHECK(has_event(ev, "/d3/y.txt", os::watch_kind::created));
+    // remove(): no more events from that directory
+    CHECK(w.remove(r + "/d5")); CHECK(!w.remove(r + "/not-watched"));
+    CHECK(os::write_file(r + "/d5/z.txt", "1")); CHECK(os::write_file(r + "/d6/z.txt", "1"));
+    ev = drain(w, "/d6/z.txt", 3000); CHECK(has_event(ev, "/d6/z.txt", os::watch_kind::created));
+    for (auto& e : drain(w, "", 200)) ev.push_back(e);
+    for (auto& e : ev) CHECK_MSG(e.path.find("/d5/") == std::string::npos, "event after remove: %s", e.path.c_str());
+#if defined(_WIN32)
+    {   // names match case-insensitively, as NTFS does
+        os::file_watcher wc; CHECK(os::write_file(r + "/d0/CaseFile.txt", "a")); CHECK(wc.add(r + "/d0/CaseFile.txt"));
+        CHECK(os::write_file(r + "/d0/casefile.TXT", "bb"));
+        auto ce = drain(wc, "CaseFile.txt", 3000); CHECK(has_event(ce, "/d0/CaseFile.txt", os::watch_kind::modified));
+    }
+#endif
+    fs::remove_all(r);
+}
+TEST(tree_watch_symlink_loop) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    CHECK(fs::make_dirs(r + "/a/b"));
+    auto s = fs::symlink(r, r + "/a/b/up");   // a/b/up -> root: following it forever would never end
+#if defined(_WIN32)
+    if (!s) {   // symlinks need Developer Mode or a privilege; a directory junction does not
+        auto bs = [](std::string p) { for (auto& c : p) if (c == '/') c = '\\'; return p; };
+        std::string cmd = "cmd /c mklink /J \"" + bs(r + "/a/b/up") + "\" \"" + bs(r) + "\" >NUL";
+        if (std::system(cmd.c_str()) == 0 && os::stat(r + "/a/b/up").is_dir) s = {};
+    }
+#endif
+    if (!s) { std::printf("  skip: %s\n", s.err.what.c_str()); fs::remove_all(r); return; }
+    auto w = os::tree_watcher::open(r); CHECK(w); if (!w) return;
+    std::printf("  watched %zu dirs\n", (*w)->watched_dirs());
+    CHECK((*w)->watched_dirs() == 3);   // root, a, a/b: the loop back to the root is not entered
+    CHECK(os::write_file(r + "/a/b/f.txt", "1"));
+    std::vector<os::watch_event> ev; for (int i = 0; i < 20 && !has_event(ev, "/a/b/f.txt", os::watch_kind::created); ++i) { auto m = (*w)->poll(300); ev.insert(ev.end(), m.begin(), m.end()); }
+    CHECK(has_event(ev, "/a/b/f.txt", os::watch_kind::created));
+    w.value.reset();
+#if defined(_WIN32)
+    RemoveDirectoryW(os::widen(r + "/a/b/up").c_str());   // the link itself, before remove_all could walk through it
+#endif
+    fs::remove_all(r);
+}
+TEST(tree_watch_native_cap_falls_back_to_polling) {   // kqueue: more paths than descriptors allowed
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    for (int i = 0; i < 6; ++i) { CHECK(fs::make_dirs(r + "/s" + std::to_string(i) + "/deep")); CHECK(os::write_file(r + "/s" + std::to_string(i) + "/deep/f.txt", "1")); }
+    os::tree_watch_opts o; o.max_native_handles = 4; o.debounce_ms = 30;
+    auto w = os::tree_watcher::open(r, o); CHECK(w); if (!w) return;
+    std::printf("  backend %s, %zu of %zu dirs polled\n", (*w)->backend(), (*w)->polled_dirs(), (*w)->watched_dirs());
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    CHECK((*w)->polled_dirs() > 0);
+#endif
+    os::sleep_ns(30'000'000);
+    CHECK(os::write_file(r + "/s5/deep/f.txt", "changed!")); CHECK(os::write_file(r + "/s4/deep/new.txt", "n"));
+    std::vector<os::watch_event> ev;
+    for (int i = 0; i < 20 && !(has_event(ev, "/s5/deep/f.txt", os::watch_kind::modified) && has_event(ev, "/s4/deep/new.txt", os::watch_kind::created)); ++i) { auto m = (*w)->poll(300); ev.insert(ev.end(), m.begin(), m.end()); }
+    CHECK(has_event(ev, "/s5/deep/f.txt", os::watch_kind::modified)); CHECK(has_event(ev, "/s4/deep/new.txt", os::watch_kind::created));
+    fs::remove_all(r);
+}
+TEST(watch_overflow_rescans) {   // more changes than the kernel buffers between two polls
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    int n = 3000;
+#if defined(__linux__)
+    long q = std::atol(os::read_file("/proc/sys/fs/inotify/max_queued_events").value.c_str());
+    if (q <= 0 || q > 60000) { std::printf("  skip: max_queued_events=%ld\n", q); fs::remove_all(r); return; }
+    n = int(q / 2) + 200;   // >= 2 events per file (create, close_write)
+#endif
+    {
+        os::file_watcher w; CHECK(w.add(r));
+        for (int i = 0; i < n; ++i) CHECK(os::write_file(r + "/file-with-a-longish-name-" + std::to_string(i) + ".txt", ""));
+        auto ev = w.poll(1000); bool overflow = false; std::size_t created = 0;
+        for (int i = 0; i < 50; ++i) { for (auto& e : ev) { overflow |= e.kind == os::watch_kind::overflow; created += e.kind == os::watch_kind::created; } ev = w.poll(50); if (ev.empty()) break; }
+        std::printf("  %d files: overflow=%d, %zu created events\n", n, int(overflow), created);
+#if defined(__linux__)
+        CHECK(overflow);
+#endif
+#if defined(_WIN32)
+        CHECK(overflow || created >= std::size_t(n));
+#endif
+    }
+    {   // the tree watcher turns an overflow into a rescan: every new file is reported
+        auto w = os::tree_watcher::open(r); CHECK(w); if (!w) return;
+        for (int i = 0; i < n; ++i) CHECK(os::write_file(r + "/second-" + std::to_string(i) + ".txt", ""));
+        std::set<std::string> seen;
+        for (int i = 0; i < 40 && seen.size() < std::size_t(n); ++i) for (auto& e : (*w)->poll(300)) if (e.kind == os::watch_kind::created && e.path.find("/second-") != std::string::npos) seen.insert(e.path);
+        CHECK_MSG(seen.size() == std::size_t(n), "%zu of %d created reported", seen.size(), n);
+    }
+    fs::remove_all(r);
+}
 
 TEST(url_parse) {
     auto u = os::net::parse_url("http://user@example.com:8080/a/b?x=1#frag"); CHECK(u);
