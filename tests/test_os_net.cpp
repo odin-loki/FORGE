@@ -109,7 +109,7 @@ TEST(tree_watch_symlink_loop) {
 TEST(tree_watch_native_cap_falls_back_to_polling) {   // kqueue: more paths than descriptors allowed
     auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
     for (int i = 0; i < 6; ++i) { CHECK(fs::make_dirs(r + "/s" + std::to_string(i) + "/deep")); CHECK(os::write_file(r + "/s" + std::to_string(i) + "/deep/f.txt", "1")); }
-    os::tree_watch_opts o; o.max_native_handles = 4; o.debounce_ms = 30;
+    os::tree_watch_opts o; o.max_native_handles = 4; o.debounce_ms = 30; o.fsevents = false;   // macOS: exercise the kqueue path
     auto w = os::tree_watcher::open(r, o); CHECK(w); if (!w) return;
     std::printf("  backend %s, %zu of %zu dirs polled\n", (*w)->backend(), (*w)->polled_dirs(), (*w)->watched_dirs());
 #if defined(__APPLE__) || defined(__FreeBSD__)
@@ -122,6 +122,41 @@ TEST(tree_watch_native_cap_falls_back_to_polling) {   // kqueue: more paths than
     CHECK(has_event(ev, "/s5/deep/f.txt", os::watch_kind::modified)); CHECK(has_event(ev, "/s4/deep/new.txt", os::watch_kind::created));
     fs::remove_all(r);
 }
+#if defined(FORGE_OS_MACOS)
+TEST(tree_watch_fsevents_deep) {   // one recursive FSEvents stream: events deep in the tree, in-place writes, no per-file descriptors
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;   // under /var/folders: FSEvents reports /private/var/...
+    const std::string deep = r + "/l1/l2/l3/l4/l5";
+    CHECK(fs::make_dirs(deep)); CHECK(os::write_file(deep + "/old.txt", "1"));
+    os::tree_watch_opts o; o.debounce_ms = 80;
+    auto w = os::tree_watcher::open(r, o); CHECK(w); if (!w) return;
+    std::printf("  backend %s, %zu dirs
+", (*w)->backend(), (*w)->watched_dirs());
+    CHECK(std::string((*w)->backend()) == "fsevents"); CHECK((*w)->watched_dirs() == 6); CHECK((*w)->polled_dirs() == 0);
+    os::sleep_ns(50'000'000);
+    CHECK(os::write_file(deep + "/new.txt", "n"));
+    CHECK(os::write_file(deep + "/old.txt", "changed in place"));
+    CHECK(fs::make_dirs(deep + "/l6")); CHECK(os::write_file(deep + "/l6/x.txt", "x"));
+    std::vector<os::watch_event> ev;
+    auto all = [&] { return has_event(ev, "/l5/new.txt", os::watch_kind::created) && has_event(ev, "/l5/old.txt", os::watch_kind::modified)
+                            && has_event(ev, "/l5/l6", os::watch_kind::created) && has_event(ev, "/l6/x.txt", os::watch_kind::created); };
+    for (int i = 0; i < 20 && !all(); ++i) { auto m = (*w)->poll(500); ev.insert(ev.end(), m.begin(), m.end()); }
+    CHECK(has_event(ev, "/l5/new.txt", os::watch_kind::created)); CHECK(has_event(ev, "/l5/old.txt", os::watch_kind::modified));
+    CHECK(has_event(ev, "/l5/l6", os::watch_kind::created)); CHECK(has_event(ev, "/l6/x.txt", os::watch_kind::created));
+    for (auto& e : ev) CHECK_MSG(e.path.compare(0, r.size(), r) == 0, "path not under the root as given: %s", e.path.c_str());
+    CHECK(fs::remove_all(r + "/l1/l2/l3"));
+    ev.clear(); for (int i = 0; i < 20 && !has_event(ev, "/l5/old.txt", os::watch_kind::removed); ++i) { auto m = (*w)->poll(500); ev.insert(ev.end(), m.begin(), m.end()); }
+    CHECK(has_event(ev, "/l1/l2/l3", os::watch_kind::removed)); CHECK(has_event(ev, "/l5/old.txt", os::watch_kind::removed));
+    {   // the plain file_watcher API: add_tree reports paths below the root as named
+        os::file_watcher fw; CHECK(fw.add_tree(r)); CHECK(std::string(fw.backend()) == "fsevents");
+        os::sleep_ns(50'000'000);
+        CHECK(os::write_file(r + "/l1/l2/z.txt", "z"));
+        auto e2 = drain(fw, "/l1/l2/z.txt", 3000); CHECK(has_event(e2, r + "/l1/l2/z.txt", os::watch_kind::created));
+        CHECK(fw.remove(r)); CHECK(std::string(fw.backend()) == "kqueue");
+    }
+    w.value.reset();
+    fs::remove_all(r);
+}
+#endif
 TEST(watch_overflow_rescans) {   // more changes than the kernel buffers between two polls
     auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
     int n = 3000;
