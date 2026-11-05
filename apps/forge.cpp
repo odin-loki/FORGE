@@ -20,6 +20,7 @@
 #include <forge/script/script.hpp>
 #include <forge/script/check.hpp>
 #include <forge/script/local_ai.hpp>
+#include <forge/security/security.hpp>
 
 using namespace forge;
 
@@ -71,6 +72,7 @@ int usage() {
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
+        "  security check [--policy F] [--json]   FSS controls: state, backend, verdict (exit 1 if a required one cannot be met)\n"
         "  (strict loading: FORGE_REQUIRE_SIGNED=1 and/or FORGE_TRUSTED_KEYS=<hex>[,<hex>])");
     return 2;
 }
@@ -104,6 +106,19 @@ std::vector<int> parse_ids(const std::string& s) {
     std::vector<int> r; std::size_t p = 0;
     while (p < s.size()) { auto e = s.find(',', p); if (e == std::string::npos) e = s.size(); if (e > p) r.push_back(std::stoi(s.substr(p, e - p))); p = e + 1; }
     return r;
+}
+
+// `forge security check [--policy F] [--json]`: what the FORGE Security Standard controls would be under the policy
+// (load_policy order: --policy, $FORGE_SECURITY_POLICY, ./forge-security.json, the user config dir). Exit 0 when
+// every required control can be met, 1 when one cannot, 2 for usage errors or a bad policy.
+int cmd_security(const args& a) {
+    if (a.pos.empty() || a.pos[0] != "check") return usage();
+    security::policy p;
+    try { p = security::load_policy(a.get("policy")); }
+    catch (const security::policy_violation& e) { std::fprintf(stderr, "forge security: %s\n", e.what()); return 2; }
+    auto r = security::check(p);
+    std::fputs(a.has("json") ? (r.json() + "\n").c_str() : r.text().c_str(), stdout);
+    return r.ok ? 0 : 1;
 }
 
 int cmd_info() {
@@ -524,7 +539,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "json"});
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
@@ -536,6 +551,7 @@ int main(int argc, char** argv) {
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);
+        if (c == "security") return cmd_security(a);
         return usage();
     } catch (const std::exception& e) {
         std::fprintf(stderr, "forge: error: %s\n", e.what());
