@@ -6,7 +6,9 @@
 `forge security check`. With an active policy, `forge script` derives its capabilities from it, scopes the script
 built-ins' file, network, process and environment operations through `enforce()` and calls `lockdown()` before
 running; `forge-serve` and `forge rpc-serve` (and its script children) call `lockdown()` after binding and loading;
-model loads check `fs.read` and `integrity.models`; native plugin loads go through `enforce(plugin_load)`
+model loads check `fs.read` and `integrity.models`; native plugins and script files (including imports and
+`rpc-serve` remote scripts) are checked against `integrity.plugins` / `integrity.scripts` with detached `.sig`
+signatures, and plugins against OS code signing when `integrity.os_code_signing` is set
 ([security-api.md, "Integration"](security-api.md#integration)). With no policy (profile `none`) all of this is
 skipped. There is no `FORGE_HARDENING` CMake option in this module. What FORGE enforces outside the module is in
 [security.md](security.md). The "Today" column says what exists for each control; everything else is a requirement
@@ -56,8 +58,9 @@ unless a policy file or `FORGE_SECURITY_PROFILE` says so; without one, script ca
 Today: the three profiles exist as policy defaults (`security::profile_defaults`, table in
 [security-api.md](security-api.md#policy)) and are applied by `lockdown()` / `enforce()` for programs that call them.
 "strict (default)" is not the default yet (see the status note). The credentials row is not part of the policy.
-The scripts row: `forge script` under a policy runs unsigned scripts with the policy's capabilities, so `strict` gives
-no net / proc / env and a confined file system; `standard` and `permissive` give what their policy grants, audited.
+The scripts row: `forge script` under a policy runs scripts with the policy's capabilities, so `strict` gives no net /
+proc / env and a confined file system; `standard` and `permissive` give what their policy grants, audited. Signed
+scripts do not get more capabilities; a signature only decides whether a script may run (`integrity.scripts`).
 
 ## Controls
 
@@ -84,10 +87,10 @@ no net / proc / env and a confined file system; `standard` and `permissive` give
 
 | ID | Requirement | Today |
 |----|-------------|-------|
-| INT-1 | Verify models, plugins and scripts before load; policy decides if a signature is required. | Models: `inference::model` reads the active policy. `integrity.models` `required` verifies the hashes and the embedded Ed25519 signature against `integrity.trusted_keys` (any valid signature when the list is empty) before the blueprint or any tensor is used; `optional` verifies signed files and audits unsigned ones. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` (also set by `lockdown`) still apply and add keys. `forge verify` / `verify_signature` on request; `.fsc` cache entries can require signatures. Plugins: `enforce(plugin_load)` refuses them when `integrity.plugins` is required (there is no verifier), audited. Scripts are not signed: `integrity.scripts` `required` makes `forge script` refuse to run; `optional` runs and audits. |
-| INT-2 | Ed25519 over BLAKE3 digests; `.fpk` embedded section, detached `.sig` elsewhere. | `.fpk` embedded signature: yes. Directories: signed bundles with `FORGE-SIGNATURE.json`. No detached `.sig` format. |
-| INT-3 | Plugins also pass OS code signing (Authenticode, `SecStaticCodeCheckValidity`, IMA). | Not implemented. |
-| INT-4 | Integrity failure ⇒ `IntegrityError`, audited, artefact not mapped. | Under an active policy with `integrity.models` not `off`, a failed check throws `security::integrity_error` (script class `IntegrityError`) and is audited (`INT-4`, `fail`). The file is mapped read-only and hashed before the check, but no blueprint, tokenizer or tensor is read from it. Without a policy the environment path still raises `forge_exception` (`errc::integrity_error`), unaudited. |
+| INT-1 | Verify models, plugins and scripts before load; policy decides if a signature is required. | Models: `inference::model` reads the active policy. `integrity.models` `required` verifies the hashes and the embedded Ed25519 signature against `integrity.trusted_keys` (any valid signature when the list is empty) before the blueprint or any tensor is used; `optional` verifies signed files and audits unsigned ones. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` (also set by `lockdown`) still apply and add keys. `forge verify` / `verify_signature` on request; `.fsc` cache entries can require signatures. Plugins (`forge::plugin`, `import "x.so"`, `security::open_plugin`): `integrity.plugins` `required` needs `<plugin>.sig` (INT-2) signed by a trusted key, checked on the bytes that are loaded; `optional` verifies signed plugins and audits unsigned ones (`weaken`). `enforce(plugin_load)` alone also refuses a plugin whose `.sig` does not verify under `required`. Scripts: `engine::run_file` (`forge script FILE`) and every import check `<file>.sig` on the buffer they parse; `rpc-serve` children check the signature the client sent with the source (`FRPZ`, `--rpc-sig`) against the script name. `required` refuses unsigned, tampered or untrusted scripts and code without a file (`-e`, REPL); `optional` runs unsigned scripts, audited. |
+| INT-2 | Ed25519 over BLAKE3 digests; `.fpk` embedded section, detached `.sig` elsewhere. `.fpk` embedded signature: yes. Directories: signed bundles with `FORGE-SIGNATURE.json`. Other files: detached `<file>.sig` (`forge-detached-sig` v1, JSON): Ed25519 over BLAKE3 of a domain-separated message binding the file's BLAKE3 digest, its size and its base name, several signers per file (`security/integrity.hpp`, [modelfile.md](modelfile.md#detached-signatures)); `forge sign` / `forge verify` produce and check it for any non-`.fpk` file. |
+| INT-3 | Plugins also pass OS code signing (Authenticode, `SecStaticCodeCheckValidity`, IMA). | `security::os_code_signature(path)` → state (`signed`, `unsigned`, `invalid`, `n/a`, `error`) and signer. Windows: `WinVerifyTrust` (`WINTRUST_ACTION_GENERIC_VERIFY_V2`, embedded signature, else the system catalog), no UI, revocation from the cache only, `wintrust.dll` loaded from System32. macOS: `SecStaticCodeCreateWithPath` + `SecStaticCodeCheckValidity` (Security.framework through `dlopen`); an ad-hoc signature counts as unsigned (CI only). Linux, FreeBSD and others: no standard mechanism for shared objects, reported `n/a` (Linux notes whether a `security.ima` xattr exists; IMA appraisal is not checked). With `integrity.os_code_signing` a plugin that is not OS-signed is refused (`integrity_error`, audited `INT-3`) on Windows and macOS; on the others the load proceeds and is audited `weaken`. `forge security check` shows INT-3 with the running executable's signature. |
+| INT-4 | Integrity failure ⇒ `IntegrityError`, audited, artefact not mapped. | Under an active policy with `integrity.models` not `off`, a failed check throws `security::integrity_error` (script class `IntegrityError`) and is audited (`INT-4`, `fail`). The file is mapped read-only and hashed before the check, but no blueprint, tokenizer or tensor is read from it. Plugins and scripts: the same exception and audit record; a plugin that fails is never passed to `LoadLibrary` / `dlopen`, a script is never parsed. Without a policy the environment path still raises `forge_exception` (`errc::integrity_error`), unaudited. |
 
 ### Cryptography and secrets (FSS-CRY)
 

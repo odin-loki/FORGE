@@ -5,7 +5,7 @@ Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage t
 ## Concepts
 - `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
-- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
+- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
 - Wherever a model path is taken by `run` and `bench`, it may be a `.fpk`, a Hugging Face directory, a `.gguf` or an `.onnx` file. Non-`.fpk` inputs are imported once into `$FORGE_CACHE` (default `~/.cache/forge`) with `--codec` (default `f32`) and reused while the source files are unchanged.
 
@@ -70,8 +70,14 @@ Writes an Ed25519 key pair: `NAME.key` (secret seed, owner read/write only) and 
 ### `forge sign <model.fpk> --key NAME.key [-o out.fpk]`
 Adds a signature, or appends one to an existing signature section. Without `-o` the input file is rewritten.
 
+### `forge sign <file> --key NAME.key [-o file.sig] [--name NAME] [--detached]`
+Any file that is not a `.fpk` (plugins `.so` / `.dll` / `.dylib`, scripts `.fs` / `.cpp`, ...), or any file with `--detached`: writes the detached signature `<file>.sig` (or `-o`), leaving the file untouched. An existing `.sig` for the same name and content is extended (several signers); one by the same key is replaced. The signature binds the file's base name; `--name` signs it under another name (for a remote script whose `forge::remote` `name` differs). Format: [modelfile.md](modelfile.md#detached-signatures).
+
 ### `forge verify <model.fpk> [--pubkey NAME.pub]...`
 Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or prints the failure and exits 1. Without `--pubkey` any valid signature is accepted (integrity only), so an unsigned file fails. With one or more `--pubkey`, at least one valid signature must come from a listed key.
+
+### `forge verify <file> [--sig file.sig] [--pubkey NAME.pub]... [--detached]`
+Checks a detached signature: `<file>.sig` (or `--sig`) must name this file's base name and match its BLAKE3 digest and size, and carry a valid signature (from a listed key when `--pubkey` is given). Prints `signature ok key <id>` / `signature BAD key <id>` per signer and `<file>: VERIFIED`, or the reason (`unsigned`, `content does not match the signed digest`, `signature is for 'x', not 'y'`, `not by a trusted key`), exit 0 or 1.
 
 ### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey)`
 Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file (64 hex digits, mode 0600 where supported). Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
@@ -142,7 +148,8 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 `forge run`, `forge bench`, `forge script`, `forge rpc-serve` and `forge-serve` take `--policy FILE`. Without it they use what `forge security check` would: `$FORGE_SECURITY_POLICY`, `./forge-security.json`, `<config dir>/forge/forge-security.json`, or `$FORGE_SECURITY_PROFILE` alone. With none of these (profile `none`) nothing changes. With a policy:
 
 - every model load through `inference` checks `fs.read` for the path and `integrity.models`: `required` needs a valid signature (by one of `integrity.trusted_keys`, if any) and fails with `IntegrityError` / `security::integrity_error` before the blueprint or any tensor is used; `optional` verifies signed files and audits unsigned ones. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` still apply on top;
-- `forge script` takes its capabilities from the policy and locks down before running ([scripting.md](scripting.md), "Security policy");
+- `forge script` takes its capabilities from the policy and locks down before running; `integrity.scripts` checks the script file's and its imports' detached `.sig`, and `required` refuses `-e` code ([scripting.md](scripting.md), "Security policy");
+- native plugins follow `integrity.plugins` (detached `.sig`) and `integrity.os_code_signing`;
 - the servers check the listen address, call `lockdown()` after binding and loading, and audit it ([rpc.md](rpc.md#security-policy), [serve.md](serve.md#security-policy)).
 
 A bad or unreadable policy file is an error (exit 1, or 2 for `forge script`). See [security-api.md](security-api.md).
