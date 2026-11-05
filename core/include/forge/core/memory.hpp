@@ -15,8 +15,8 @@
 // FORGE_MEM_FRACTION (default 0.85) of the detected limit = min(physical RAM, cgroup v2 memory.max,
 // cgroup v1 memory.limit_in_bytes, RLIMIT_AS). Device budgets come from FORGE_MEM_DEVICE_LIMIT or set_limit.
 #include <forge/core/error.hpp>
-#include <forge/os/fs.hpp>
 #include <forge/os/os.hpp>
+#include <forge/os/private_files.hpp>
 #include <forge/os/memory_pressure.hpp>
 #include <forge/os/process.hpp>
 #include <algorithm>
@@ -352,15 +352,15 @@ public:
     explicit spill_store(std::filesystem::path dir = {}) {
         if (dir.empty()) if (auto e = os::getenv("FORGE_MEM_SPILL_DIR"); !e.empty()) dir = std::filesystem::path(e);
         if (!dir.empty()) {
-            auto d = os::fs::u8str(dir);
+            auto u = dir.u8string(); std::string d(u.begin(), u.end());
             if (auto s = os::check_access(os::access_kind::write, d); !s) raise(errc::io_error, "spill directory {}: {}", d, s.err.what);
-            if (auto s = os::fs::ensure_private_dir(d); !s) raise(errc::io_error, "spill directory {}: {}", d, s.err.what);
+            if (auto s = os::ensure_private_dir(d); !s) raise(errc::io_error, "spill directory {}: {}", d, s.err.what);
             dir_ = std::move(dir);
         } else {
             if (auto s = os::check_access(os::access_kind::write, os::temp_dir()); !s) raise(errc::io_error, "spill directory {}: {}", os::temp_dir(), s.err.what);
-            auto t = os::fs::make_temp_dir(std::format("forge-spill-{}-", os::pid()));
+            auto t = os::make_private_dir_in(os::temp_dir(), std::format("forge-spill-{}-", os::pid()));
             if (!t) raise(errc::io_error, "spill directory: {}", t.err.what);
-            dir_ = os::fs::u8path(t.value);
+            dir_ = std::filesystem::path(std::u8string(t.value.begin(), t.value.end()));
         }
         if (auto m = os::getenv("FORGE_MEM_SPILL_MAX"); !m.empty()) cap_ = parse_size(m).value_or(0);
     }
@@ -371,7 +371,8 @@ public:
         std::lock_guard g(m_);
         if (cap_ && bytes_ + n > cap_) return 0;
         auto k = ++next_;
-        if (!os::fs::write_new_private_file(os::fs::u8str(path_(k)), std::string_view(static_cast<const char*>(data), n))) return 0;   // removes a partial file
+        auto u = path_(k).u8string();
+        if (!os::write_new_private_file(std::string(u.begin(), u.end()), std::string_view(static_cast<const char*>(data), n))) return 0;   // removes a partial file
         sizes_[k] = n; bytes_ += n; return k;
     }
     // Reads back and deletes. Empty optional if the key is unknown.
