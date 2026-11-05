@@ -70,7 +70,50 @@ struct state_store {
     // up to date, forget() also drops the device copies (before the host buffers are replaced or freed).
     device_hooks* hooks = nullptr;
     void flush() const { if (hooks && hooks->to_host) for (auto& [k, s] : slots) if (!s.buf.data.empty()) hooks->to_host(s.buf.data.data(), s.buf.data.size()); }
-    void forget() { if (hooks && hooks->release) for (auto& [k, s] : slots) if (!s.buf.data.empty()) hooks->release(s.buf.data.data(), s.buf.data.size()); }
+    void forget() {
+        if (hooks && hooks->release) for (auto& [k, s] : slots) if (!s.buf.data.empty()) hooks->release(s.buf.data.data(), s.buf.data.size());
+        drop_snapshots();
+    }
+    // ---- speculative rollback of fixed (recurrent) slots ----
+    // When snap_row >= 0, the next run copies every fixed slot aside after the first snap_row rows of its state op
+    // (the executor splits that op in two there). On a device backend with a device copy the copy stays on the
+    // device: no host transfer. restore_snapshots() then puts the slots back as they were at that row, so a
+    // speculative verify pass can be undone for the cost of one device-to-device copy (session::forward_spec).
+    struct snapshot { tensor buf; i64 len = 0; };
+    i64 snap_row = -1;
+    std::map<std::string, snapshot> snaps;
+    // called by the executor for a fixed slot `k` whose state buffer is S (n floats), `len` rows consumed
+    void take_snapshot(const std::string& k, float* S, std::size_t n, i64 len, device_hooks* h) {
+        auto& sn = snaps[k];
+        if (sn.buf.data.size() != n) { drop_device(h, sn.buf); sn.buf = tensor(shape_t{i64(n)}); }
+        sn.len = len;
+        if (h && h->copy && h->keep) { h->copy(S, n, sn.buf.data.data(), n, 0); if (h->keep) h->keep(sn.buf.data.data(), n); hooks = h; return; }
+        if (h) h->to_host(S, n);
+        std::copy_n(S, n, sn.buf.data.data());
+    }
+    // put the fixed slots back as of the last snapshot; returns false (nothing changed) when there is none
+    bool restore_snapshots() {
+        if (snaps.empty()) return false;
+        for (auto& [k, sn] : snaps) {
+            auto it = slots.find(k);
+            if (it == slots.end() || !it->second.fixed || it->second.buf.data.size() != sn.buf.data.size()) return false;
+        }
+        for (auto& [k, sn] : snaps) {
+            auto& sl = slots[k]; std::size_t n = sn.buf.data.size();
+            if (hooks && hooks->copy && hooks->keep) { hooks->copy(sn.buf.data.data(), n, sl.buf.data.data(), n, 0); hooks->keep(sl.buf.data.data(), n); }
+            else { if (hooks && hooks->to_host) hooks->to_host(sn.buf.data.data(), n); std::copy_n(sn.buf.data.data(), n, sl.buf.data.data()); if (hooks && hooks->host_wrote) hooks->host_wrote(sl.buf.data.data(), n); }
+            sl.len = sn.len;
+        }
+        return true;
+    }
+    void drop_snapshots() {
+        for (auto& [k, sn] : snaps) drop_device(hooks, sn.buf);
+        snaps.clear();
+    }
+    static void drop_device(device_hooks* h, tensor& t) {   // the device copy of a snapshot, unread
+        if (!h || t.data.empty()) return;
+        if (h->forget) h->forget(t.data.data(), t.data.size()); else if (h->release) h->release(t.data.data(), t.data.size());
+    }
     state_store() = default;
     state_store(const state_store& o) : slots((o.flush(), o.slots)), capacity(o.capacity), page_rows(o.page_rows), codec(o.codec), codec_v(o.codec_v), offload(o.offload) {}
     state_store& operator=(const state_store&) = delete;
@@ -527,7 +570,7 @@ private:
     // A replayed run repeats the device work of the previous one; the host bookkeeping it would have done is only
     // the state slot lengths. Not when a slot would grow or move, holds a host-encoded codec, or offloads.
     bool replayable() const {
-        if (!st_ || st_->offload) return false;
+        if (!st_ || st_->offload || st_->snap_row >= 0) return false;
         for (auto& s : p_.steps) {
             if (s.kind == 0) continue;
             auto it = st_->slots.find(p_.g.at(s.out).name);
@@ -578,6 +621,22 @@ private:
         if (p_.g.at(s.out).op == ops::op::attention) k += s.attrs->num("kv_codec_k", 0) != 0 ? ".q" : ".f32";
         return k;
     }
+    // one fixed-size state op over the rows of `ins`: on the device when the backend has the kernel, else on the host
+    void run_state_op(device_hooks* h, const std::string& fn, std::span<const tensor_view> ins, tensor_view out, state_store::slot& sl, const ops::attrs& at) {
+        if (h && h->state && h->state(fn, ins, sl.buf.data.data(), sl.buf.data.size(), out, at)) { sl.len += ins[0].shape[0]; return; }
+        if (h) { for (auto& v : ins) h->to_host(v.data, v.size()); h->to_host(out.data, out.size()); h->to_host(sl.buf.data.data(), sl.buf.data.size()); }
+        host_ops_ = true;
+        if (fn == "causal_conv")
+            state_ops::causal_conv(ins[0].data, ins[1].data, sl.buf.data.data(), out.data, ins[0].shape[0], ins[0].shape[1], ins[1].shape[1]);
+        else if (fn == "delta_rule") {
+            i64 dk = ins[0].shape[2];
+            state_ops::delta_rule(ins[0].data, ins[1].data, ins[2].data, ins[3].data, ins[4].data, sl.buf.data.data(), out.data,
+                                  ins[0].shape[0], ins[0].shape[1], dk, ins[2].shape[1], ins[2].shape[2],
+                                  at.num("l2norm", 1) != 0, float(at.num("scale", 1.0 / std::sqrt(double(dk)))));
+        } else raise(errc::not_found, "unknown state op '{}'", fn);
+        sl.len += ins[0].shape[0];
+        if (h) { h->host_wrote(out.data, out.size()); h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
+    }
     void run_steps(device_hooks* h) {
         std::vector<tensor_view> ins;
         for (std::size_t si = 0; si < p_.steps.size(); ++si) {
@@ -606,19 +665,22 @@ private:
                     else { if (h && !sl.buf.data.empty()) h->release(sl.buf.data.data(), sl.buf.data.size()); sl.buf = tensor(ss); }
                     sl.len = 0; sl.fixed = true;
                 }
-                if (h && h->state && h->state(fn, ins, sl.buf.data.data(), sl.buf.data.size(), out, *s.attrs)) { sl.len += ins[0].shape[0]; continue; }
-                if (h) { for (auto& v : ins) h->to_host(v.data, v.size()); h->to_host(out.data, out.size()); h->to_host(sl.buf.data.data(), sl.buf.data.size()); }
-                host_ops_ = true;
-                if (fn == "causal_conv")
-                    state_ops::causal_conv(ins[0].data, ins[1].data, sl.buf.data.data(), out.data, ins[0].shape[0], ins[0].shape[1], ins[1].shape[1]);
-                else if (fn == "delta_rule") {
-                    i64 dk = ins[0].shape[2];
-                    state_ops::delta_rule(ins[0].data, ins[1].data, ins[2].data, ins[3].data, ins[4].data, sl.buf.data.data(), out.data,
-                                          ins[0].shape[0], ins[0].shape[1], dk, ins[2].shape[1], ins[2].shape[2],
-                                          s.attrs->num("l2norm", 1) != 0, float(s.attrs->num("scale", 1.0 / std::sqrt(double(dk)))));
-                } else raise(errc::not_found, "unknown state op '{}'", fn);
-                sl.len += ins[0].shape[0];
-                if (h) { h->host_wrote(out.data, out.size()); h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
+                // speculative snapshot (state_store::snap_row): run rows [0, cut), copy the state aside, run the rest
+                if (i64 rows = ins[0].shape[0], cut = st_->snap_row; cut >= 0) {
+                    auto sub = [&](i64 a, i64 b) {
+                        std::vector<tensor_view> si = ins; tensor_view so = out;
+                        auto rows_of = [&](tensor_view& v) { std::size_t w = v.size() / std::size_t(rows); v.data += std::size_t(a) * w; v.shape[0] = b - a; };
+                        for (std::size_t i = 0; i < si.size(); ++i) if (!(fn == "causal_conv" && i == 1)) rows_of(si[i]);
+                        rows_of(so);
+                        run_state_op(h, fn, si, so, sl, *s.attrs);
+                    };
+                    cut = std::min(cut, rows);
+                    if (cut > 0) sub(0, cut);
+                    st_->take_snapshot(node.name, sl.buf.data.data(), sl.buf.data.size(), sl.len, h);
+                    if (cut < rows) sub(cut, rows);
+                    continue;
+                }
+                run_state_op(h, fn, ins, out, sl, *s.attrs);
                 continue;
             }
             if (s.kind == 1) {

@@ -62,7 +62,8 @@ int usage() {
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
-        "      [--grammar file.gbnf] [--draft draft.fpk [--spec-k 4]] [--codec C (for hf/gguf inputs)]\n"
+        "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
+        "      [--codec C (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512  |  bench --kernels 1024 (MB, quantised matvec GB/s)\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
@@ -340,7 +341,7 @@ int cmd_run(const args& a) {
         if (!s.tokenizer()) raise(errc::unsupported, "--grammar needs a model tokenizer");
         auto g = std::make_shared<inference::grammar>(import::read_file(a.get("grammar")));
         gc = std::make_unique<inference::grammar_constraint>(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
-        smp.filter = [&](std::span<float> l) { gc->apply(l); };
+        smp.filter = [&](std::span<float> l) { gc->apply(l); }; smp.allow = [&](int t) { return gc->allows(t); };
     }
     auto show = [&](int t) {
         if (gc && !gc->accept(t)) return false;
@@ -348,13 +349,25 @@ int cmd_run(const args& a) {
         std::fflush(stdout);
         return !(gc && gc->finished());
     };
-    if (a.kv.count("draft")) {
-        inference::session d(resolve_model(a.get("draft"), a.get("codec", "f32")), so);
+    // Speculative decoding: --draft model.fpk or --lookup (n-gram drafts from the prompt and output).
+    // --spec-k N: N drafts per pass; 0 (default) = chosen per pass by the planner from measured costs.
+    // Not with --grammar: the constraint advances one token at a time.
+    if ((a.kv.count("draft") || a.has("lookup")) && !gc) {
         inference::speculative_stats sst;
-        inference::speculative_generate(s, d, prompt, int(a.num("n", 32)), smp, int(a.num("spec-k", 4)), show, &sst);
+        int k = int(a.num("spec-k", 0)), n = int(a.num("n", 32));
+        if (a.kv.count("draft")) {
+            inference::session d(resolve_model(a.get("draft"), a.get("codec", "f32")), so);
+            inference::speculative_generate(s, d, prompt, n, smp, k, show, &sst);
+        } else {
+            int ng = std::max(1, int(a.num("ngram", 3)));
+            inference::lookup_generate(s, prompt, n, smp, k, ng, show, &sst, nullptr, int(a.num("ngram-min", 1)));
+        }
         std::printf("\n");
-        std::fprintf(stderr, "[speculative: %zu tokens in %.3fs = %.1f tok/s; %zu rounds, acceptance %.0f%%]\n", sst.new_tokens, sst.seconds,
-                     double(sst.new_tokens) / sst.seconds, sst.rounds, 100 * sst.acceptance());
+        std::string pos;
+        for (std::size_t i = 0; i < 8 && sst.pos_tried[i]; ++i) pos += std::format("{}{:.0f}%", i ? " " : "", 100.0 * double(sst.pos_won[i]) / double(sst.pos_tried[i]));
+        std::fprintf(stderr, "[speculative: %zu tokens in %.3fs = %.1f tok/s decode (prefill %.3fs); %zu passes, %zu with drafts, %zu drafted, acceptance %.0f%% (by position: %s), %.2f tokens/pass, %zu replay rows, %zu probes]\n",
+                     sst.new_tokens, sst.seconds, sst.decode_tps(), sst.prefill_seconds, sst.passes, sst.rounds, sst.drafted, 100 * sst.acceptance(), pos.c_str(),
+                     sst.tokens_per_pass(), sst.replayed, sst.probes);
         return 0;
     }
     inference::generate_stats st;
@@ -738,7 +751,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);

@@ -49,7 +49,7 @@ inline std::string local_ai_generate(const local_ai_request& r) {
     if (r.json) {
         static const auto g = std::make_shared<const inference::grammar>(inference::json_schema_to_gbnf(json::value(json::object{})));
         gc = std::make_unique<inference::grammar_constraint>(g, *tok, int(m->vocab()), tok->eos());
-        smp.filter = [&gc](std::span<float> l) { gc->apply(l); };
+        smp.filter = [&gc](std::span<float> l) { gc->apply(l); }; smp.allow = [&gc](int t) { return gc->allows(t); };
     }
     bool ended = false;
     auto out = s.generate(prompt, max_new, smp, [&](int t) {

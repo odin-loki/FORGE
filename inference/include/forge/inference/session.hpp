@@ -273,6 +273,32 @@ public:
         st_.truncate(ck.pos); pos_ = ck.pos;
         if (pos > ck.pos) forward(since.subspan(0, std::size_t(pos - ck.pos)));
     }
+    // ---- speculative verify with cheap recurrent rollback (used by speculative.hpp) ----
+    // forward_spec(ids, keep) is forward_all(ids); on a model with recurrent state it also sets that state aside
+    // after the first `keep` rows, inside the same pass (a device-to-device copy on GPU backends: no host transfer,
+    // no extra pass). spec_rewind(pos) then rolls back to any pos in [mark, position()], mark = position before the
+    // call + keep: KV-only models are cut at pos and it returns 0; recurrent models go back to the mark and it
+    // returns pos - mark, the number of tokens (ids[keep ...]) the caller must feed again, e.g. at the head of its
+    // next pass (they cost a few extra rows there, not a pass of their own).
+    // The returned rows ([ids.size(), vocab]) are the executor's output buffer: valid until the next forward.
+    std::span<const float> forward_spec(std::span<const int> ids, i64 keep) {
+        keep = std::clamp<i64>(keep, 0, i64(ids.size()));
+        spec_mark_ = pos_ + keep;
+        if (has_recurrent_state()) st_.snap_row = keep;
+        struct reset_snap { graph::state_store& s; ~reset_snap() { s.snap_row = -1; } } g{st_};
+        return run_view(ids, true);
+    }
+    i64 spec_rewind(i64 pos) {
+        if (pos >= pos_) return 0;
+        if (!has_recurrent_state()) { rewind(pos); return 0; }
+        if (pos < spec_mark_ || spec_mark_ > pos_ || !st_.restore_snapshots())
+            raise(errc::invalid_argument, "spec_rewind: position {} is outside the last forward_spec range", pos);
+        st_.truncate(spec_mark_); pos_ = spec_mark_;
+        return pos - spec_mark_;
+    }
+    // plain-greedy step: feed `ids`, return the argmax of the last position's raw logits (on the device when it can)
+    int forward_argmax(std::span<const int> ids) { return run_greedy(ids); }
+    // ---- end speculative ----
     // copy the first `n` tokens of another session's state (prefix sharing across sequences)
     void copy_prefix(const session& o, i64 n) {
         if (o.m_ != m_) raise(errc::invalid_argument, "copy_prefix: sessions use different models");
@@ -427,6 +453,7 @@ private:
     i64 pos_ = 0;
     std::string adapter_;
     bool greedy_next_ = false; long long last_argmax_ = -1;
+    i64 spec_mark_ = 0;   // forward_spec: position whose recurrent state was set aside
 };
 
 } // namespace forge::inference
