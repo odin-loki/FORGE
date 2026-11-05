@@ -277,7 +277,12 @@ std::optional<std::shared_ptr<const FnDecl>> load(const std::string& dir, const 
     bool priv = fd_private(dfd);
     int fd = ::openat(dfd, name.c_str(), O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     int e = errno; ::close(dfd);
-    if (fd < 0) return fail(e == ELOOP ? "cache entry is a symlink" : "no cache file");
+    // O_NOFOLLOW on a symlink: ELOOP (Linux, macOS), EMLINK (FreeBSD), EFTYPE (NetBSD).
+    bool link = e == ELOOP || e == EMLINK;
+#ifdef EFTYPE
+    link = link || e == EFTYPE;
+#endif
+    if (fd < 0) return fail(link ? "cache entry is a symlink" : "no cache file");
     struct stat fs{};
     if (::fstat(fd, &fs) != 0 || !S_ISREG(fs.st_mode)) { ::close(fd); return fail("cache entry is not a regular file"); }
     if (std::uint64_t(fs.st_size) > max_file_bytes) { ::close(fd); return fail("cache file too large"); }
