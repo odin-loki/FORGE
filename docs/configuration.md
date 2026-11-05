@@ -73,6 +73,8 @@ See [memory.md](memory.md) for how the budget is used.
 | `FORGE_MODEL_KEY`, `FORGE_MODEL_KEY_FILE` | Key (64 hex digits) or key file for encrypted `.fpk` files. `FORGE_MODEL_KEY` wins if both are set |
 | `FORGE_REQUIRE_SIGNED=1` | Refuse models without a valid signature |
 | `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` | Only accept signatures from these Ed25519 public keys (implies a signature is required) |
+| `FORGE_SECURITY_POLICY` | Policy file for `forge::security::load_policy` and `forge security check` (an error if it cannot be read). See [security-api.md](security-api.md) |
+| `FORGE_SECURITY_PROFILE` | Base FSS profile: `strict`, `standard` or `permissive` (audited). Without it and without a policy file no FSS profile is active |
 | `FORGE_CACHE` | Where `forge run` / `forge bench` cache models imported on the fly (default `~/.cache/forge`) |
 | `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `import/templates` in the source tree the binary was built from) |
 

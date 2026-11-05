@@ -1,7 +1,7 @@
 # Security model
 
 What FORGE enforces today and where. Checked against the source on 2026-11-04 (main at ccc0a7d).
-For the target standard (most of it not built yet) see [security-standard.md](security-standard.md).
+For the target standard see [security-standard.md](security-standard.md); its API is [security-api.md](security-api.md).
 
 ## Script capabilities (interpreter)
 
@@ -187,4 +187,6 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 - `forge-serve --kv-spill` writes KV-cache data (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
   (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
   destroyed). Use a private directory if prompts are sensitive.
-- No `forge::security` API, policy file or `forge security check` yet; see security-standard.md.
+- `forge::security` ([security-api.md](security-api.md)) has the policy file, `enforce`, `lockdown` and `forge security
+  check`, but no FORGE program calls `lockdown` or routes its operations through `enforce` yet, and no profile is
+  active without a policy file or `FORGE_SECURITY_PROFILE`.

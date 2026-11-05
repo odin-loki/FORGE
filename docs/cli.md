@@ -3,9 +3,9 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
-- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
+- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
 - Wherever a model path is taken by `run` and `bench`, it may be a `.fpk`, a Hugging Face directory, a `.gguf` or an `.onnx` file. Non-`.fpk` inputs are imported once into `$FORGE_CACHE` (default `~/.cache/forge`) with `--codec` (default `f32`) and reused while the source files are unchanged.
 
@@ -74,6 +74,9 @@ Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or 
 
 ### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey)`
 Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file (64 hex digits, mode 0600 where supported). Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
+
+### `forge security check [--policy FILE] [--json]`
+Loads the security policy (`--policy`, `$FORGE_SECURITY_POLICY`, `./forge-security.json`, `<config dir>/forge/forge-security.json`; `$FORGE_SECURITY_PROFILE` picks a base profile) and prints, for each FORGE Security Standard control, its state (`active`, `available`, `emulated`, `missing`, `n/a`, `failed`), backend, level and verdict. It changes nothing. Exits 0 when every required control can be met, 1 when one cannot, 2 when the policy is invalid. With no policy and no profile it reports "no FSS profile active" and exits 0. Details: [security-api.md](security-api.md).
 
 ### `forge rpc-serve [options]`
 Lends a local device to other processes as a remote `rpc:host:port` device (see [graph.md](graph.md)), and optionally runs remote scripts. Details: [rpc.md](rpc.md).
