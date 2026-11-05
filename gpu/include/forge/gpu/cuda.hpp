@@ -174,7 +174,8 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_);
+            if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
@@ -495,7 +496,7 @@ public:
     // read the same activation (qkv/z/a/b, gate/up) reuse it instead of re-quantising; any other kernel, copy or free
     // may change that buffer, so launch_s/htod_s/dtod/free_s drop it (q81_keep_ marks run_qmatmul's own launches).
     std::uint64_t q81_src_ = 0; std::uint32_t q81_n_ = 0; bool q81_keep_ = false;
-    void q81_drop() { q81_src_ = 0; }
+    void q81_drop() { q81_src_ = 0; g8_src_ = 0; }
     // Device ranges the next launch writes (set by callers that know them). launch_s keeps the q8_1 scratch when
     // none of them overlaps its source, so e.g. the a/b/z matmuls of a DeltaNet layer reuse the quantised input of
     // in_proj_qkv across the conv/slice kernels in between; a launch with no declared writes drops it.
@@ -563,10 +564,13 @@ public:
                 ++dispatches_["qmatmul_mma"];   // batched prefill on int8 tensor cores
                 std::uint32_t nb = rows * (k / 32);
                 std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256;
-                q8r_reserve(xbytes + std::size_t(nb) * 8);
                 std::uint64_t xq = q8r_, xds = q8r_ + xbytes;
-                void* qa[] = {&xd, &xq, &xds, &nb};
-                ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                if (g8_hit(xd, nb)) { xq = g8_; xds = g8_ + xbytes; ++dispatches_["quant_q8r_reused"]; }   // x came from run_qglu
+                else {
+                    q8r_reserve(xbytes + std::size_t(nb) * 8); xq = q8r_; xds = q8r_ + xbytes;
+                    void* qa[] = {&xd, &xq, &xds, &nb};
+                    ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                }
                 std::uint32_t ksplit = 0;
                 void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit};
                 // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
@@ -637,6 +641,104 @@ public:
             if (!in_run_) { ck(dtoh_s(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { q81_keep_ = false; q81_drop(); if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
+        return true;
+    }
+
+    // ---- FFN gate/up/SiLU fused (graph::compile's GLU pass; $FORGE_FUSE_GLU=0 off) ----
+    // y[rows, n] = silu(x . Wg^T) * (x . Wu^T). The two weights (same codec, [n, k] each) are uploaded once as one [2n, k]
+    // weight that interleaves them in groups of 16 rows (gate rows 8i..8i+7, then up rows 8i..8i+7), repacked like
+    // run_qmatmul's (q6_k padded, q8_0 regrouped), in place of the two separate copies. Prefill (rows >= the MMA
+    // threshold): forge_qmatmul_glu_* -- the int8 tensor-core kernel with a SiLU epilogue, whose block's 128 rows give 64
+    // whole output columns; it also writes the q8r form of y, which the down projection's run_qmatmul then uses instead
+    // of quantising y again (g8_*). Decode: forge_qmatmul_q81 over the 2n rows into scratch, then forge_glu_q81 (y and its
+    // q8_1 blocks for the down projection, like forge_silu_mul_q81). Only inside a run, k % 256 == 0, n % 64 == 0, and
+    // only where both the prefill and the decode kernels exist (so one process never holds both weight layouts).
+    // false: not taken; the caller runs the two matmuls and silu_mul instead.
+    static bool use_glu() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_GLU"); return !(e && std::string(e) == "0"); }(); return on; }
+    static std::string glu_fn(std::uint32_t efmt, unsigned bt) {
+        return std::string(bt == 128 ? "forge_qmatmul_glu128_" : "forge_qmatmul_glu_") + (efmt == 6 ? "q8_0g" : efmt == 2 ? "q4_k" : "q6_k"); }
+    std::uint64_t g8_ = 0; std::size_t g8_cap_ = 0;   // q8r form of the last forge_qmatmul_glu output (device buffer g8_src_)
+    std::uint64_t g8_src_ = 0, g8_stamp_ = 0; std::uint32_t g8_n_ = 0;
+    std::uint64_t gs_ = 0; std::size_t gs_cap_ = 0;   // decode GLU: the [rows, 2n] gate/up product
+    static std::uint64_t launch_stamp() { auto& c = counters(); return c.launches.load(std::memory_order_relaxed) + c.captured.load(std::memory_order_relaxed); }
+    // The q8r form in g8_ is that of x (device pointer, nb groups) when nothing was launched, copied or freed since.
+    bool g8_hit(std::uint64_t xd, std::uint32_t nb) const { return g8_src_ && g8_src_ == xd && g8_n_ == nb && g8_stamp_ == launch_stamp(); }
+    void scratch_reserve(std::uint64_t& p, std::size_t& cap, std::size_t need) {
+        if (cap >= need) return;
+        if (p) free_s(p); p = 0; cap = 0;
+        std::size_t n = std::max<std::size_t>(need, 1 << 20); p = dmalloc(n, "scratch"); cap = n;
+    }
+    bool run_qglu(const tensor_view& x, const std::uint8_t* qg, const std::uint8_t* qu, std::size_t rb, std::uint32_t n, std::uint32_t fmt, tensor_view out) {
+        if (x.shape.empty() || !qg || !qu || !use_glu() || (fmt != 1 && fmt != 2 && fmt != 3) || (reinterpret_cast<std::uintptr_t>(qg) & 3u)) return false;
+        const std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
+        if (!k || k % 256 || !n || n % 64 || !rows || out.size() != std::size_t(rows) * n) return false;
+        std::lock_guard lk(mu_); bind();
+        if (!in_run_ || !use_mma() || !use_mmvq()) return false;
+        const std::uint32_t ef = fmt == 1 ? 6 : fmt == 3 ? 5 : 2;   // the layouts run_qmatmul repacks to on this image
+        for (const char* f : {"forge_quant_q8r", "forge_quant_q81", "forge_qmatmul_q81", "forge_glu_q81"}) if (!has_fn_locked(f)) return false;
+        if (!has_fn_locked(glu_fn(ef, 64)) || !has_fn_locked(mma_fn(ef))) return false;
+        begin_op();
+        ++dispatches_["qmatmul_glu"];
+        const std::uint32_t cols = 2 * n;
+        const std::size_t drb = fmt == 3 ? rb / 210 * 224 : rb, qbytes = drb * cols;
+        auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(qg) | 2u, qbytes}]; qe.last = ++clock_;
+        if (!qe.d) {
+            std::uint64_t d = dmalloc(qbytes, "weights"); qe.d = d;
+            std::vector<std::uint8_t> tmp(qbytes, 0);
+            for (std::size_t c = 0; c < cols; ++c) {
+                const std::uint8_t* s = ((c & 8) ? qu : qg) + ((c >> 4) * 8 + (c & 7)) * rb;
+                std::uint8_t* o = tmp.data() + c * drb;
+                if (fmt == 3) for (std::size_t b = 0, nb = rb / 210; b < nb; ++b) std::memcpy(o + b * 224, s + b * 210, 210);
+                else if (fmt == 1) for (std::size_t g = 0, ng = rb / 272; g < ng; ++g)
+                    for (int j = 0; j < 8; ++j) { std::memcpy(o + g * 272 + 2 * j, s + g * 272 + 34 * j, 2); std::memcpy(o + g * 272 + 16 + 32 * j, s + g * 272 + 34 * j + 2, 32); }
+                else std::memcpy(o, s, rb);
+            }
+            ck(htod_s(qe.d, tmp.data(), qbytes, stream_), "memcpy HtoD");   // pageable: staged before the call returns
+            ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        }
+        std::uint64_t wd = qe.d, xd = acquire(x.data, x.size(), false).ptr;
+        auto yb = acquire(out.data, out.size(), true); yb.e->host_valid = false; std::uint64_t yd = yb.ptr;
+        xd = acquire(x.data, x.size(), false).ptr;   // final once a pass hits the cache (out may have replaced an overlapping x)
+        std::uint32_t fm = ef, rb32 = std::uint32_t(drb), kk = k, nn = n, rr = rows, cc = cols;
+        try {
+            if (rows >= mmq_min_rows()) {
+                std::uint32_t nb = rows * (k / 32), nbo = rows * (n / 32);
+                std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256, obytes = (std::size_t(rows) * n + 255) / 256 * 256;
+                q8r_reserve(xbytes + std::size_t(nb) * 8);
+                scratch_reserve(g8_, g8_cap_, obytes + std::size_t(nbo) * 8);
+                std::uint64_t xq = q8r_, xds = q8r_ + xbytes, gq = g8_, gds = g8_ + obytes;
+                void* qa[] = {&xd, &xq, &xds, &nb};
+                ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                const unsigned want = mma_bt() ? mma_bt() : ef == 2 ? 64u : 128u;
+                const unsigned bt = rows >= 128 && want == 128 && has_fn_locked(glu_fn(ef, 128)) ? 128u : 64u;
+                const unsigned smem = bt * 336 + (ef == 2 ? 144u : ef == 5 ? 240u : 272u) * 128 + 8192;
+                void* mf = function(glu_fn(ef, bt));
+                if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
+                void* a2[] = {&xq, &xds, &wd, &yd, &rr, &cc, &kk, &fm, &rb32, &gq, &gds};
+                writes(yd, out.size() * 4);
+                ck(launch_s(mf, ((rows + bt - 1) / bt) * (cols / 128), 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                g8_src_ = yd; g8_n_ = nbo; g8_stamp_ = launch_stamp();
+            } else {   // decode
+                std::uint32_t nb = rows * (k / 32), nbo = rows * (n / 32);
+                q81_reserve(std::size_t(std::max(nb, nbo)) * 40);
+                scratch_reserve(gs_, gs_cap_, std::size_t(rows) * cols * 4);
+                std::uint64_t qx = q81_, hs = gs_;
+                q81_keep_ = true;
+                if (q81_src_ != xd || q81_n_ != nb) {
+                    void* qa[] = {&xd, &qx, &nb};
+                    ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                    q81_src_ = xd; q81_n_ = nb;
+                } else ++dispatches_["quant_q81_reused"];
+                void* a2[] = {&qx, &wd, &hs, &rr, &cc, &kk, &fm, &rb32};
+                ck(launch_s(function("forge_qmatmul_q81"), cols * ((rows + 3) / 4), 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
+                q81_keep_ = false;
+                void* a3[] = {&hs, &yd, &rr, &nn, &qx};
+                writes(yd, out.size() * 4); writes(qx, std::size_t(nbo) * 40);
+                ck(launch_s(function("forge_glu_q81"), (nbo + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, a3, nullptr), "launch");
+                // the scratch now holds y's q8_1 blocks: the down projection reuses them ($FORGE_FUSE_Q81=0: not)
+                if (fuse_q81()) { q81_src_ = yd; q81_n_ = nbo; } else q81_drop();
+            }
+        } catch (...) { q81_keep_ = false; q81_drop(); throw; }
         return true;
     }
 

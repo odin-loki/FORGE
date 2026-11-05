@@ -46,6 +46,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernels (including the tiled `sm_80` ones) |
 | `FORGE_FA_TC=0` | CUDA | Prefill attention on the `sm_80` image uses the f32 tiled kernel instead of the fp16 tensor-core FlashAttention-2 kernel (`forge_attention_fa2tc_*`; Q/K/V/P rounded to fp16, f32 accumulation) |
 | `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` |
+| `FORGE_FUSE_GLU=0` | CUDA | Do not fuse the FFN gate and up projections and their SiLU product into one step (`silu_mul(linear(h, gate), linear(h, up))`); each gate/up weight pair is then uploaded as two weights instead of one interleaved one. Read when a plan is compiled |
 | `FORGE_PLAN_TRACE` | all devices | If set, print at exit the ops (with shapes and counts) that ran on the host during device runs |
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
 | `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |

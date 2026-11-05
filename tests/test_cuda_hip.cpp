@@ -10,6 +10,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <functional>
 #include <string>
@@ -32,7 +33,7 @@ static int images() {
         const bool sm80 = arch == "ptx sm_80";   // the sm_80 image adds the int8 tensor-core prefill matmul
         bool ok = has(img, ".version") && has(img, sm80 ? ".target sm_80" : ".target sm_70");
         for (auto op : kernel_ops) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
-        if (sm80) for (auto op : {"qmatmul_mma_q8_0", "qmatmul_mma_q4_k", "qmatmul_mma_q6_k", "quant_q8r"}) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
+        if (sm80) for (auto op : {"qmatmul_mma_q8_0", "qmatmul_mma_q4_k", "qmatmul_mma_q6_k", "quant_q8r", "qmatmul_glu_q4_k", "qmatmul_glu128_q6_k", "glu_q81"}) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
         std::printf("%s %s: %zu bytes, %zu kernels\n", ok ? "ok  " : "FAIL", arch.c_str(), img.size(), std::size(kernel_ops)); fails += !ok;
     }
     for (auto& [arch, img] : hip) {
@@ -177,6 +178,67 @@ template<class RT> static int attention_dec_check(RT& rt, const std::string& api
     return fails;
 }
 
+static void set_env(const char* k, const std::string& v);
+// FFN gate/up/SiLU fusion (plan.hpp fuse_glu + run_qglu): y = (silu(x Wg^T) * (x Wu^T)) Wd^T as a compiled plan on the
+// device, fused vs compiled with FORGE_FUSE_GLU=0 vs the CPU executor. Rows < 16: decode (forge_qmatmul_q81 over the
+// interleaved weight + forge_glu_q81, whose q8_1 the down projection reuses); >= 16: forge_qmatmul_glu_* (tensor cores),
+// whose q8r output the down projection reuses. q5_k has no fused kernel: the plan must stay unfused.
+template<class RT> static int glu_check(graph::registry& reg, RT& rt, const std::string& api) {
+    if (!reg.device_qglu) { std::printf("note %s: no fused FFN gate/up\n", api.c_str()); return 0; }
+    using namespace graph;
+    int fails = 0, n = 0;
+    std::deque<std::vector<std::uint8_t>> keep;
+    auto disp = [&](const char* key) -> std::size_t { auto d = rt.dispatches(); auto it = d.find(key); return it == d.end() ? 0 : it->second; };
+    for (std::string cn : {"q8_0", "q4_k", "q6_k", "q5_k"}) for (i64 rows : {1, 3, 16, 70, 130}) {
+        const auto* c = codecs::find(cn);
+        const i64 k = 512, ff = 256, od = 40;
+        auto enc = [&](i64 r, i64 kk, float ph) {
+            std::vector<float> w(std::size_t(r * kk)); std::vector<std::uint8_t> e(std::size_t(r) * c->bytes(std::size_t(kk)));
+            for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(float(i) * 0.731f + ph) * (0.05f + float(i % 89) / 900.f);
+            for (i64 j = 0; j < r; ++j) c->encode(w.data() + j * kk, std::size_t(kk), e.data() + std::size_t(j) * c->bytes(std::size_t(kk)));
+            return e; };
+        // kept alive for the whole check: device weights are cached by host address, so a freed buffer's address must
+        // not come back with other contents
+        auto& eg = keep.emplace_back(enc(ff, k, 1.f)); auto& eu = keep.emplace_back(enc(ff, k, 2.f)); auto& ed = keep.emplace_back(enc(od, ff, 3.f));
+        std::vector<float> x(std::size_t(rows * k)); for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+        auto build = [&] {
+            tensor_graph g; auto xi = g.input("x", {rows, k});
+            auto gt = g.apply(ops::op::matmul_t, {xi, g.qweight("wg", {ff, k}, eg.data(), cn)});
+            auto up = g.apply(ops::op::matmul_t, {xi, g.qweight("wu", {ff, k}, eu.data(), cn)});
+            g.output("y", g.apply(ops::op::matmul_t, {g.mul(g.apply(ops::op::silu, {gt}), up), g.qweight("wd", {od, ff}, ed.data(), cn)}));
+            return g; };
+        int fused_steps = 0;
+        auto run = [&](registry* r) {
+            pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po);
+            for (auto& s : p->steps) if (s.low && s.low->name.ends_with(".qglu")) ++fused_steps;
+            executor e(*p); e.set_input("x", x); e.run(); return e.output("y").data; };
+        run(&reg);   // warm-up: the first run uploads the weights (an upload drops the quantised-activation reuse)
+        fused_steps = 0;
+        const std::size_t glu0 = disp("qmatmul_glu"), re0 = disp("quant_q8r_reused") + disp("quant_q81_reused");
+        auto fused = run(&reg);
+        const int fs = fused_steps;
+        const bool took = disp("qmatmul_glu") > glu0, reused = disp("quant_q8r_reused") + disp("quant_q81_reused") > re0;
+        set_env("FORGE_FUSE_GLU", "0"); fused_steps = 0;
+        auto plain = run(&reg);
+        set_env("FORGE_FUSE_GLU", "");
+        const int ps = fused_steps;
+        auto cpu = run(nullptr);
+        double mx = 0, dp = 0, dc = 0;
+        for (auto v : cpu) mx = std::max(mx, double(std::fabs(v)));
+        for (std::size_t i = 0; i < cpu.size() && fused.size() == cpu.size() && plain.size() == cpu.size(); ++i) {
+            dp = std::max(dp, std::fabs(double(fused[i]) - plain[i])); dc = std::max(dc, std::fabs(double(fused[i]) - cpu[i])); }
+        const bool want = cn != "q5_k";
+        bool ok = fused.size() == cpu.size() && dp <= 2e-3 * (1 + mx) && dc <= 2e-2 * (1 + mx) && ps == 0 && fs == (want ? 1 : 0);
+        // where the runtime takes it (sm_80 image / mock), the fused kernel ran and the down projection reused its quantised output
+        if (want && took && !reused) ok = false;
+        ++n;
+        if (!ok) { std::printf("FAIL %s.qglu %s rows %lld: fused steps %d/%d, ran %d, reused %d, |fused-unfused| %.3g, |fused-cpu| %.3g (max %.3g)\n", api.c_str(),
+                               cn.c_str(), (long long)rows, fs, ps, int(took), int(reused), dp, dc, mx); ++fails; }
+    }
+    std::printf("%s %d/%d %s fused FFN gate/up cases match the unfused plan and the CPU\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
@@ -198,6 +260,7 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     fails += dec_fails;
     fails += qmatmul_check<RT>(*reg, api, mma_runs);
+    if constexpr (requires { shared->run_qglu(tensor_view{}, nullptr, nullptr, std::size_t(0), 0u, 0u, tensor_view{}); }) fails += glu_check(*reg, *shared, api);
     fails += state_ops_check(*reg, api);
     return fails ? 1 : 0;
 }

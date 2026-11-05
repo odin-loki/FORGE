@@ -399,6 +399,15 @@ FORGE_GLOBAL void forge_silu_mul_q81(const float* a, const float* b, float* y, u
   unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i * 32u >= n) return;
   unsigned j = i * 32u + l; float v = a[j] / (1.0f + fexp(-a[j])) * b[j]; y[j] = v;
   q81_put(v, l, xq + (unsigned long long)i * 40u); }
+// Decode GLU (FORGE_FUSE_GLU): h is x . W^T for the [2n, k] weight that interleaves the FFN gate and up rows in groups
+// of 16 (gate rows 8i..8i+7, then up rows 8i..8i+7); y[r, o] = silu(gate) * up, written as forge_silu_mul_q81 writes
+// it, with its q8_1 blocks (n % 32 == 0, so a block never straddles two rows).
+FORGE_GLOBAL void forge_glu_q81(const float* h, float* y, unsigned rows, unsigned n, unsigned char* xq) {
+  unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i * 32u >= rows * n) return;
+  unsigned j = i * 32u + l, r = j / n, o = j - r * n;
+  const float* hr = h + (unsigned long long)r * 2u * n + (o >> 3) * 16u + (o & 7u);
+  float a = hr[0], b = hr[8], v = a / (1.0f + fexp(-a)) * b; y[j] = v;
+  q81_put(v, l, xq + (unsigned long long)i * 40u); }
 FORGE_DEV unsigned ld32u(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
 FORGE_DEV int dp4a_ss(int a, int b, int c) { int r; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r; }
 FORGE_DEV float wsum_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v += w; } return v; }
@@ -732,7 +741,7 @@ FORGE_DEV void cpa_wait() { asm volatile("cp.async.commit_group;\n\tcp.async.wai
 // with cp.async while chunk kb is computed). Shared: NS x [Xq BT x 272 | Xs 8 x BT x 2 floats | Wr 128 x stride] | Wm 8 KB.
 static __attribute__((device, always_inline)) inline void mma_body(const signed char* xq, const float* xds, const unsigned char* w, float* y,
                                     unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT, const unsigned NS,
-                                    unsigned ksplit) {
+                                    unsigned ksplit, const unsigned GLU = 0u, signed char* gq = 0, float* gds = 0) {
   const unsigned SB = BT * 336u + 128u * mma_wstride(fmt);   // bytes per stage
   float* Wm = (float*)(forge_dsm + NS * SB);
   unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + BT * 272u); unsigned char* Wr = forge_dsm + BT * 336u;
@@ -828,6 +837,27 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
             acc[n][2] = fma_(-sb1, xm0, acc[n][2]); acc[n][3] = fma_(-sb1, xm1, acc[n][3]); }
         } } }
     bar_(); }
+  if (GLU) {
+    // FFN gate/up fused (forge_qmatmul_glu_*): W interleaves gate and up rows in groups of 16, so warp wp's rows ra and
+    // ra + 8 are the gate and up rows of output column (c0 / 2) + 8 wp + gid, and acc[n][0..1] / acc[n][2..3] pair up.
+    // y = silu(gate) * up (as forge_silu_mul) goes through shared memory (BT x 64 floats, row stride 68: conflict-free
+    // stores), then each warp writes whole 32-value groups of y, coalesced, together with their q8r form (exactly as
+    // forge_quant_q8r would quantise them) into gq / gds for the down projection. cols % 128 == 0, no split-K.
+    float* S = (float*)forge_dsm; const unsigned nout = cols >> 1, o0 = c0 >> 1, nbo = nout >> 5;
+#pragma unroll
+    for (unsigned n = 0; n < BT / 8u; ++n)
+#pragma unroll
+      for (unsigned e = 0; e < 2u; ++e) { float a = acc[n][e], b = acc[n][e + 2u]; S[(n * 8u + tig * 2u + e) * 68u + wp * 8u + gid] = a / (1.0f + fexp(-a)) * b; }
+    bar_();
+    for (unsigned gi = wp; gi < 2u * BT; gi += 8u) {
+      unsigned tl = gi >> 1, hf = gi & 1u, tok = t0 + tl; if (tok >= rows) continue;   // warp-uniform
+      float v = S[tl * 68u + hf * 32u + l]; y[(unsigned long long)tok * nout + o0 + hf * 32u + l] = v;
+      float am = wmax_(fabs_(v)), d = am / 127.0f; int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
+      unsigned wd = l >> 2, pos = (wd < 4u ? 2u * wd : 2u * (wd - 4u) + 1u) * 4u + (l & 3u);
+      unsigned long long ig = (unsigned long long)tok * nbo + (o0 >> 5) + hf;
+      gq[ig * 32u + pos] = (signed char)q; float sm = wsum_((float)q);
+      if (l == 0u) { gds[2ull * ig] = d; gds[2ull * ig + 1u] = d * sm; } }
+    return; }
   const unsigned ra = wp * 16u + gid;
 #pragma unroll
   for (unsigned n = 0; n < BT / 8u; ++n)
@@ -849,6 +879,17 @@ FORGE_MMA_KERNEL(forge_qmatmul_mma128_q4_k, 2u, 128u, 1, 1u)
 FORGE_MMA_KERNEL(forge_qmatmul_mma128_q6_k, 5u, 128u, 1, 1u)
 FORGE_MMA_KERNEL(forge_qmatmul_mma2_q4_k, 2u, 64u, 1, 2u)   // q4_k, 64 tokens, double-buffered (88 KB of shared memory)
 #undef FORGE_MMA_KERNEL
+// FFN gate/up/SiLU in one launch (mma_body with GLU): cols = 2n interleaved rows, y [rows, n], gq / gds its q8r form.
+#define FORGE_GLU_KERNEL(name, f, bt, nb) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
+    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb, signed char* gq, float* gds) { \
+    (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, 1u, 0u, 1u, gq, gds); }
+FORGE_GLU_KERNEL(forge_qmatmul_glu_q8_0g, 6u, 64u, 2)
+FORGE_GLU_KERNEL(forge_qmatmul_glu_q4_k, 2u, 64u, 2)
+FORGE_GLU_KERNEL(forge_qmatmul_glu_q6_k, 5u, 64u, 2)
+FORGE_GLU_KERNEL(forge_qmatmul_glu128_q8_0g, 6u, 128u, 1)
+FORGE_GLU_KERNEL(forge_qmatmul_glu128_q4_k, 2u, 128u, 1)
+FORGE_GLU_KERNEL(forge_qmatmul_glu128_q6_k, 5u, 128u, 1)
+#undef FORGE_GLU_KERNEL
 // Prefill attention, tiled (flash-attention style, fp32 SIMT): same contract as forge_attention for plain f32 K/V.
 // A 256-thread block takes BQ query rows of one head; key/value tiles of BK rows go through shared memory and are
 // shared by all BQ rows (the per-row kernel reads every key once per query row). Thread (ty = tid / 8, tx = tid % 8)

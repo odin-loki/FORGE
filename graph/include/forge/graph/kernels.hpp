@@ -97,6 +97,10 @@ public:
     std::optional<lowering> device_qgemm;
     std::vector<std::string> device_qgemm_codecs;
     std::optional<lowering> device_qgather;   // gather (embedding lookup) over an encoded table on the device
+    // FFN gate/up/SiLU fused on the device (plan.hpp's GLU pass): op silu_mul, inputs (x, Wg, Wu, gate, up) where Wg/Wu
+    // are encoded weights of one codec in device_qglu_codecs and gate/up the unfused products' buffers (its fallback).
+    std::optional<lowering> device_qglu;
+    std::vector<std::string> device_qglu_codecs;
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);

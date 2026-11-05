@@ -57,6 +57,8 @@ CUDA embeds two PTX images built from the same `kernels.cu`: `ptx sm_80` (`kerne
 | Quantised matmul_t, otherwise | `forge_qmatmul_t` | q5_k at few rows, or MMVQ off | |
 | Embedding gather from encoded rows | `forge_qgather` | q8_0, q4_k, q6_k, q5_k tables | `FORGE_GPU_QGATHER=0` |
 | rms_norm | `forge_rms_norm_b` (block per row) | when present | |
+| FFN gate/up/SiLU, prefill | `forge_quant_q8r` + `forge_qmatmul_glu_{q8_0g,q4_k,q6_k}` / `forge_qmatmul_glu128_*` (`sm_80` image): the tensor-core matmul over the interleaved gate/up weight with a SiLU epilogue that writes `silu(gate) * up` and its q8r form; the down projection uses that instead of running `forge_quant_q8r` | a fused GLU step (below), rows ≥ `FORGE_MMQ_MIN_ROWS` | `FORGE_FUSE_GLU=0` |
+| FFN gate/up/SiLU, decode | `forge_quant_q81` + `forge_qmatmul_q81` over the interleaved weight (2n rows) + `forge_glu_q81` (`silu(gate) * up` and its q8_1 blocks, reused by the down projection) | a fused GLU step, fewer rows | `FORGE_FUSE_GLU=0` |
 | q8_1 fusion | `forge_rms_norm_q81`, `forge_silu_mul_q81` also write the q8_1 form of their output for the next matmul. `forge_rms_norm_q81` reduces with warp shuffles and uses one 1024-thread block for a wide row (rows ≤ 4, cols ≥ 2048) | decode rows inside a run, with MMVQ on | `FORGE_FUSE_Q81=0` |
 | Broadcast add/sub/mul/div | `forge_bcast` | the smaller shape is a suffix of the larger | |
 | Gated DeltaNet state ops | `forge_delta_rule_p8` / `_p16` / `_p32`: the recurrent state in registers, a 64-thread block per (value head, 8 state columns); tokens in chunks of 4, the next chunk's q/k/v/g/beta loaded and l2-normalised into a double-buffered shared tile while the current one is computed. Bitwise the same results as `_rN` | CUDA (both images), inside a run; dk ∈ {64, 128, 256}, dv % 8 = 0 | `FORGE_DELTA_RULE_R` (any value) |
@@ -66,6 +68,15 @@ CUDA embeds two PTX images built from the same `kernels.cu`: `ptx sm_80` (`kerne
 | Device copies | `forge_copy2d` (concat), `forge_copy_words` (copies inside a captured segment) | | |
 
 Encoded weights (q8_0, q4_k, q6_k, q5_k) are uploaded once and stay on the device. With the `sm_80` image and both MMA and MMVQ on, two codecs are repacked on upload so the kernels can use aligned 16-byte loads (k % 256 = 0 only): q6_k blocks are padded from 210 to 224 bytes (about 6.7% more device memory), and q8_0 is regrouped so each 8 blocks become 8 fp16 scales followed by 256 int8 values (272 bytes, the same size). Decode MMVQ reads both layouts; q4_k reads its 16-byte super-block header in one load. Consecutive decode matmuls that read the same activation reuse its q8_1 form instead of re-quantising.
+
+### FFN gate/up fusion
+`graph::compile` (`fuse_glu` in `plan.hpp`) turns `silu_mul(matmul_t(x, Wg), matmul_t(x, Wu))` into one step when the backend registers `registry::device_qglu` (CUDA): the two matmuls must be device quantised matmuls in the two steps right before the `silu_mul`, read the same `x`, have weights of the same codec (q8_0, q4_k or q6_k) and shape, and feed nothing else. This matches `linear(silu(linear(h, w_gate)) * linear(h, w_up), w_down)` in the llama, qwen3, qwen3_5, mixtral and deepseek_v2 blueprints. The step runs `run_qglu`:
+
+- **One weight.** Gate and up are uploaded once as a single `[2n, k]` weight that interleaves them in groups of 16 rows (gate rows 8i…8i+7, then up rows 8i…8i+7), repacked like the separate weights (q6_k padded to 224-byte blocks, q8_0 regrouped). The separate copies are never uploaded, so device memory does not grow.
+- **Prefill** (rows ≥ `FORGE_MMQ_MIN_ROWS`): one `forge_qmatmul_glu_*` launch (llama.cpp's `mul_mat_q` with a GLU epilogue does the same). Each 256-thread block covers 128 interleaved rows, that is the gate and up rows of 64 output columns, so a thread holds matching gate and up accumulators. The epilogue computes `silu(gate) * up` exactly as `forge_silu_mul` does, stages it in shared memory, writes `y` with coalesced stores, and also writes its q8r form (int8 values plus `(d, d·sum)` per 32 values, as `forge_quant_q8r` computes them). The down projection's `run_qmatmul` uses that form when nothing was launched, copied or freed in between, and skips `forge_quant_q8r` (`quant_q8r_reused` in `dispatches()`). No split-K.
+- **Decode**: `forge_qmatmul_q81` over the 2n interleaved rows into a scratch buffer, then `forge_glu_q81` writes `y` and its q8_1 blocks, which the down projection reuses (unless `FORGE_FUSE_Q81=0`). That is two kernels where there were three (gate, up, `forge_silu_mul_q81`).
+
+Results are bitwise those of the unfused path, except where the unfused prefill matmul would have used split-K (rounding of the k-sum order). `run_qglu` takes the step only inside a run, for k % 256 = 0 and n % 64 = 0, and only when both the prefill and decode kernels exist (the `sm_80` image with MMA and MMVQ on), so a process never holds both weight layouts. Otherwise the step runs the two matmuls and `silu_mul` into the planned gate/up buffers, as before. HIP, the `sm_70` image, OpenCL, Level Zero and the CPU never fuse.
 
 Attention supports the KV codecs `int8`, `fp8`, `tbq4` and `tbq3` (tbq only up to head dim 256). `tbq4p` and `tbq3p` run on the CPU only. The same holds for Vulkan.
 
@@ -148,6 +159,7 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | `FORGE_DELTA_RULE_R` | unset | CUDA | Set: use the `forge_delta_rule_rN` register-state kernels instead of the staged `_pN` ones |
 | `FORGE_CAUSAL_CONV_OLD` | unset | CUDA/HIP | Set: use the per-channel `forge_causal_conv` instead of `forge_causal_conv_t` |
 | `FORGE_FUSE_Q81` | on | CUDA/HIP | `0`: rms_norm/silu_mul do not emit q8_1 |
+| `FORGE_FUSE_GLU` | on | CUDA | `0`: FFN gate and up run as two matmuls plus `silu_mul` (see [FFN gate/up fusion](#ffn-gateup-fusion)) |
 | `FORGE_GPU_QMATMUL` | on | CUDA/HIP | `0`: no device quantised matmul; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` |
 | `FORGE_GPU_QGATHER` | on | CUDA/HIP | `0`: no device quantised gather |
 | `FORGE_GPU_NO_STATE_OPS` | unset | CUDA/HIP | Set: DeltaNet state ops run on the host |

@@ -234,6 +234,34 @@ public:
     }
 };
 
+// FFN gate/up fusion ($FORGE_FUSE_GLU=0 off): silu_mul(matmul_t(x, Wg), matmul_t(x, Wu)) whose two device quantised
+// matmuls are the two steps right before it (so x is still live there), read the same x, have weights of one codec
+// (registry::device_qglu_codecs) and shape, and feed nothing else, becomes one registry::device_qglu step with inputs
+// (x, Wg, Wu, gate, up). The gate/up buffers stay planned: the step's fallback writes them as the unfused steps did.
+inline void fuse_glu(plan& p, registry& reg) {
+    if (!reg.device_qglu || !reg.device_qgemm || !p.hooks || !reg.stages.empty()) return;
+    if (auto* e = std::getenv("FORGE_FUSE_GLU"); e && std::string(e) == "0") return;
+    auto& G = p.g;
+    std::vector<int> uses(G.size(), 0);
+    for (auto& n : G.nodes()) for (auto in : n.inputs) ++uses[in];
+    for (auto& [nm, v] : G.outputs()) uses[v] += 2;
+    const lowering* qg = &*reg.device_qgemm;
+    for (std::size_t i = 2; i < p.steps.size(); ++i) {
+        const step s = p.steps[i], a = p.steps[i - 2], b = p.steps[i - 1];
+        if (s.kind || a.kind || b.kind || a.low != qg || b.low != qg || s.in.size() != 2 || G.at(s.out).kind != node_kind::op || G.at(s.out).op != ops::op::silu_mul) continue;
+        const step* gs = a.out == s.in[0] ? &a : b.out == s.in[0] ? &b : nullptr;
+        const step* us = a.out == s.in[1] ? &a : b.out == s.in[1] ? &b : nullptr;
+        if (!gs || !us || gs == us || gs->in.size() != 2 || us->in.size() != 2 || gs->in[0] != us->in[0]) continue;
+        const auto &wg = G.at(gs->in[1]), &wu = G.at(us->in[1]);
+        if (wg.qcodec != wu.qcodec || wg.shape != wu.shape || wg.shape.size() != 2 || !p.views[gs->in[1]].qdata || !p.views[us->in[1]].qdata ||
+            std::find(reg.device_qglu_codecs.begin(), reg.device_qglu_codecs.end(), wg.qcodec) == reg.device_qglu_codecs.end()) continue;
+        if (uses[s.in[0]] != 1 || uses[s.in[1]] != 1 || G.at(s.in[0]).shape != G.at(s.out).shape || G.at(s.in[1]).shape != G.at(s.out).shape) continue;
+        p.steps[i - 2] = step{&*reg.device_qglu, {gs->in[0], gs->in[1], us->in[1], s.in[0], s.in[1]}, s.out, s.attrs, 0};
+        // the steps now at i - 1 and i have the fused step among their two predecessors, so the scan goes on at i + 1
+        p.steps.erase(p.steps.begin() + std::ptrdiff_t(i) - 1, p.steps.begin() + std::ptrdiff_t(i) + 1);
+    }
+}
+
 inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, const pass_options& po = {}) {
     auto p = std::make_unique<plan>();
     auto sshapes = st ? st->shapes() : std::map<std::string, shape_t>{};
@@ -369,6 +397,7 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
+    fuse_glu(*p, reg);
     return p;
 }
 
