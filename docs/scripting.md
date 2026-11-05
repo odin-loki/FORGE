@@ -192,16 +192,31 @@ derive from `Error` or from the `std::` exception names.
 verified). It skips lexing, parsing and resolution on later runs. Off unless `options::fsc_cache_dir`,
 `--cache-dir DIR` or `$FORGE_SCRIPT_CACHE` is set.
 
-- File `<dir>/<key>.fsc`, key = BLAKE3(`"forge-fsc\0"` ‖ VM version ‖ file name ‖ source). A changed source, name
-  or VM version gives a different key.
-- Loading checks magic, VM version, the recomputed key, every length and count, node kinds and nesting, and
-  rejects trailing bytes. Any failure means the source is parsed normally.
+- File `<dir>/<key>.fsc`, key = BLAKE3(`"forge-fsc "` ‖ VM version ‖ file name ‖ source). A changed source (even
+  with the same size and mtime), name or VM version gives a different key. Options are not in the key: the
+  cache holds no capability decisions. Static checks run on the cached tree on every run, and capabilities,
+  limits and the OS sandbox apply at run time, so a tree cached by a run with `allow_fs` is still refused by
+  a run without it.
+- Loading checks magic, VM version, the recomputed key, a BLAKE3 checksum of the payload (catches corruption,
+  not forgery), every length and count, node kinds, nesting (≤ 4096) and back-references (no cycles), and
+  rejects trailing bytes and files over 64 MiB. Any failure means the source is parsed normally and the entry
+  is rewritten.
 - Signing: with `--cache-sign-seed HEX` / `options::fsc_sign_seed` / `$FORGE_SCRIPT_CACHE_SIGN_SEED` (32-byte
   Ed25519 seed) the files are signed. A signed file loads only if its signer is trusted (`--cache-trust HEX`, or the
   engine's own key).
-- Unsigned files load only from a directory owned by the current user and not writable by group or other (POSIX),
-  never on Windows. `--cache-require-signed` rejects them everywhere.
+- Unsigned files load only from a directory owned by the current user and not writable by group or other, and
+  only if the file is a regular file owned by the user and not group/other-writable (POSIX). Never on Windows.
+  `--cache-require-signed` rejects them everywhere. Unsigned files are not written where they would not load
+  (a non-private directory, or Windows): the run reports `miss: ...; not stored: ...`.
+- POSIX: the directory is created 0700 and opened once; the entry is read with `O_NOFOLLOW` relative to that
+  descriptor (a symlinked entry is rejected) and written 0600 through a unique `O_EXCL` temp file renamed into
+  place, so concurrent runs never see a torn file. Windows writes through a temp file and `MoveFileEx`; a
+  replace that loses a race with a reader fails and leaves the old, complete entry.
+- No size limit or eviction: delete the directory to clear it. A temp file is removed when a write fails; a
+  process killed mid-write can leave a `*.fsc.tmp-*` file behind.
 - `engine::cache_status()` reports `off`, `hit`, `miss (stored): <reason>` or `miss: <reason>`.
+- Tests: `tests/test_script_fsc.cpp` (round trip of every tree field, corrupt/stale/foreign files, trust rules,
+  permissions, concurrent stores, every `tests/script/*.fs` uncached, cold and warm). Fuzz: `fuzz/fuzz_fsc.cpp`.
 
 ## REPL
 
