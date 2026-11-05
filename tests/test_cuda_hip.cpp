@@ -754,6 +754,9 @@ static int bench_glu(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+    // The device kernels are checked against the CPU's exact f32 products: the CPU's default integer path rounds
+    // activations to int8 itself, which is a second approximation, not a reference (FORGE_CPU_INT8 set: kept).
+    if (!std::getenv("FORGE_CPU_INT8")) forge::os::setenv("FORGE_CPU_INT8", "0");
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
     if (mode == "bench") return bench_qmm(argc, argv);
