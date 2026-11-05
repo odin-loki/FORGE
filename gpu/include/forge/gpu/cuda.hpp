@@ -587,11 +587,16 @@ public:
                 // to the smaller S (less partial traffic). slots: blocks resident at once (64-token kernels fit 2 per SM).
                 const unsigned nch = k / 256, slots = sms() * (bt == 64 && !ns2 ? 2u : 1u);
                 unsigned splits = 1;
-                if (grid && grid < slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
-                    double best = double((grid + slots - 1) / slots);
-                    for (unsigned s = 2; s <= 8 && s <= nch / 2; ++s) {
+                // Grids of a few waves with a ragged last one (e.g. 256 blocks on 164 slots) also split, when that saves
+                // >= 10% of the waves; past 4 waves the tail costs little.
+                if (grid && grid < 4 * slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
+                    double best = double((grid + slots - 1) / slots); const double need = grid < slots ? 0.97 : 0.9;
+                    // a grid that already fills the device only splits long k (>= 16 chunks per slice): shorter slices
+                    // lose more to the partial sums than the ragged wave costs (512x8192x4096 q4_k: 528 -> 638 us)
+                    const unsigned min_ch = grid < slots ? 2u : 16u;
+                    for (unsigned s = 2; s <= 8 && s <= nch / min_ch; ++s) {
                         double t = double((grid * s + slots - 1) / slots) / s;
-                        if (t < best * 0.97) { best = t; splits = s; }
+                        if (t < best * need) { best = t; splits = s; }
                     }
                 }
                 if (grid && splits >= 2) {
