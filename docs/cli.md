@@ -50,6 +50,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
 | `--draft draft.fpk [--spec-k 4]` | | Speculative decoding with a draft model |
 | `--codec C` | `f32` | Codec for on-the-fly import of non-`.fpk` inputs |
+| `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 
 Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr.
 
@@ -95,6 +96,7 @@ Lends a local device to other processes as a remote `rpc:host:port` device (see 
 | `--script-timeout MS` | 60000 | Upper limit per script |
 | `--script-mem-mb N` | 2048 | Memory limit per script process |
 | `--script-no-proc`, `--script-no-fs`, `--script-no-net` | off | Deny those capabilities to remote scripts |
+| `--policy FILE` | | Security policy: the listen address must pass `net_listen`, `--allow-scripts` needs `exec`, and the server calls `lockdown()` after binding, before the first request; script children get the same policy ([rpc.md](rpc.md#security-policy)) |
 
 Without tokens or keys the server is open to anyone who can reach it. Each remote script runs in its own `forge script` child process with the OS sandbox set to `require` (`best-effort` on Windows) when any `--script-no-*` flag is given. Over TLS, token and key authentication are bound to the TLS connection (RFC 9266 `tls-exporter`). Clients take their settings from the `FORGE_RPC_*` variables ([configuration.md](configuration.md#rpc-clients)).
 
@@ -116,6 +118,7 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 | `--timeout MS`, `--max-steps N`, `--heap BYTES` | Wall-clock limit, instruction budget, managed heap cap |
 | `--no-proc`, `--no-fs`, `--no-net` | Capability sandbox |
 | `--os-sandbox off\|best-effort\|require` | How the capability flags are also enforced by the OS sandbox |
+| `--policy FILE` | Security policy: capabilities from the policy, file operations path-scoped to its roots, `lockdown()` before the script runs ([scripting.md](scripting.md), "Security policy") |
 | `--no-check` | Skip the static checks that run before a script |
 | `--check`, `--json`, `--strict-check`, `--module-dir DIR` | Static checks only. Diagnostics go to stderr, or to stdout as JSON with `--json`. Exit 2 on errors, or on any diagnostic with `--strict-check`. `--module-dir` adds an import directory |
 | `--cache-dir DIR`, `--cache-trust HEX`, `--cache-require-signed`, `--cache-sign-seed HEX` | Compiled-script cache: directory, trusted public keys, refuse unsigned entries, signing seed |
@@ -131,6 +134,15 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 
 ## Strict loading
 `FORGE_REQUIRE_SIGNED=1` refuses unsigned models; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` only accepts signatures from those public keys. Both apply to every command that loads a model through `inference`.
+
+## Security policy
+`forge run`, `forge bench`, `forge script`, `forge rpc-serve` and `forge-serve` take `--policy FILE`. Without it they use what `forge security check` would: `$FORGE_SECURITY_POLICY`, `./forge-security.json`, `<config dir>/forge/forge-security.json`, or `$FORGE_SECURITY_PROFILE` alone. With none of these (profile `none`) nothing changes. With a policy:
+
+- every model load through `inference` checks `fs.read` for the path and `integrity.models`: `required` needs a valid signature (by one of `integrity.trusted_keys`, if any) and fails with `IntegrityError` / `security::integrity_error` before the blueprint or any tensor is used; `optional` verifies signed files and audits unsigned ones. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` still apply on top;
+- `forge script` takes its capabilities from the policy and locks down before running ([scripting.md](scripting.md), "Security policy");
+- the servers check the listen address, call `lockdown()` after binding and loading, and audit it ([rpc.md](rpc.md#security-policy), [serve.md](serve.md#security-policy)).
+
+A bad or unreadable policy file is an error (exit 1, or 2 for `forge script`). See [security-api.md](security-api.md).
 
 ## Example session
 These commands were run against the golden model on Linux x86_64 in an earlier revision; they were not re-run for this revision of the page:

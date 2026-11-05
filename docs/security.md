@@ -10,6 +10,7 @@ For the target standard see [security-standard.md](security-standard.md); its AP
 | `struct Caps { fs, net, proc, env, reflect }`, all on by default | `script/src/interp.hpp` |
 | Narrow with `forge::sandbox(opts, fn)`; it can only turn flags off | `script/src/builtins.cpp` |
 | Narrow from the CLI: `forge script --no-fs --no-net --no-proc` | `apps/forge.cpp` |
+| Under a security policy: capabilities from the policy, path / host scoping via `enforce_scope` | `apps/forge.cpp` (`script_policy`), `script/src/builtins.cpp` |
 | Checks raise `PermissionError` | `need()` in `builtins.cpp`, `need_dev()` in `mobile.cpp`, `need_reflect()` in `reflect.cpp`, plus checks in `runtime.cpp`, `ai.cpp`, `remote.cpp`, `text.cpp`, `automation.cpp` |
 
 - `env` gates `std::getenv` and device access (`forge::mobile`, sensors).
@@ -187,5 +188,8 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
   (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
   destroyed). Use a private directory if prompts are sensitive.
 - `forge::security` ([security-api.md](security-api.md)) has the policy file, `enforce`, `lockdown` and `forge security
-  check`, but no FORGE program calls `lockdown` or routes its operations through `enforce` yet, and no profile is
-  active without a policy file or `FORGE_SECURITY_PROFILE`.
+  check`. FORGE uses it only when a policy is active (`--policy`, a policy file or `FORGE_SECURITY_PROFILE`): then
+  `forge script` takes its capabilities from the policy, scopes script file / net / exec / env built-ins through
+  `enforce` and locks down before running; `forge-serve` and `forge rpc-serve` lock down after binding; model loads
+  check `integrity.models`; plugin loads `plugin_load` ([security-api.md, "Integration"](security-api.md#integration)).
+  Without a policy none of this applies.

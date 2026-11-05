@@ -9,9 +9,9 @@ The C++ side of the [FORGE Security Standard](security-standard.md) (FSS). Heade
 This is FORGE's behaviour before the standard. The draft says "no file ⇒ `strict`"; making strict the default for
 every FORGE program is a separate, later decision.
 
-**Not wired in yet.** FORGE's own subsystems (script built-ins, `forge-serve`, `rpc-serve`, model and plugin
-loading) do not call `enforce()` or `lockdown()` yet. The module is usable by embedders and by `forge security
-check`; routing FORGE itself through it is the next step.
+**Wired into FORGE when a policy is active.** `forge script`, `forge rpc-serve`, `forge-serve`, model loading and
+native plugin loading use the module as described under [Integration](#integration). With profile `none` they skip
+it entirely, so FORGE behaves exactly as before.
 
 ## Headers
 
@@ -82,19 +82,21 @@ Profile defaults (`profile_defaults`):
 
 ## Errors
 
-| Class | Code | `os_exception::kind` | Script class today |
+| Class | Code | `os_exception::kind` | Script class |
 |---|---|---|---|
-| `policy_violation` | `0x5EC01` | `other` | `OSError` (planned: `PolicyViolation`) |
-| `integrity_error` | `0x5EC02` | `other` | `OSError` (planned: `IntegrityError`) |
-| `permission_denied` | `0x5EC03` | `permission_denied` | `PermissionError` |
-| `sandbox_error` | `0x5EC04` | `sandbox_violation` | `SandboxViolationError` |
+| `policy_violation` | `0x5EC01` | `other` | `PolicyViolation` (⊂ `SecurityError` ⊂ `OSError`) |
+| `integrity_error` | `0x5EC02` | `other` | `IntegrityError` (⊂ `SecurityError` ⊂ `OSError`) |
+| `permission_denied` | `0x5EC03` | `permission_denied` | `PermissionError` (⊂ `OSError`) |
+| `sandbox_error` | `0x5EC04` | `sandbox_violation` | `SandboxViolationError` (⊂ `PermissionError`) |
 
 All derive from `security_error`, which derives from `os::os_exception`, so existing `catch (os::os_exception&)` sites and
 the interpreter's C++-to-script mapping keep working. `security_error::control` holds the FSS control ID,
 `fss_name()` the FSS class name. Non-throwing calls return `os::status` whose `err.code` is one of these codes;
 `security::classify(err)` maps them to `os_errc` (plain `os::classify` reports `other`), `security::throw_if(err)` throws
-the matching class. Script classes `SecurityError`, `PolicyViolation` and `IntegrityError` are a later step; until then
-the two existing script classes are the mapping.
+the matching class. The interpreter maps a `security_error` reaching a script by its code (table above);
+`os_exception::script_type()` alone still reports `OSError` for the first two. `PermissionError` and
+`SandboxViolationError` keep their existing place in the script hierarchy, so `catch (const SecurityError&)` does not
+catch them.
 
 ## Audit
 
@@ -131,7 +133,8 @@ is left as it is.
 
 `enforce(capability, target)` checks the active policy (`set_active_policy`, set by `lockdown`), throws
 `permission_denied` and audits the denial. `try_enforce` returns `os::status`. Both have overloads taking an explicit
-policy.
+policy. `set_active_policy` makes the policy's `fs.read` / `fs.write` entries absolute at that moment (`.` is the
+working directory then), so a later `chdir` does not move the roots.
 
 | Capability | Allowed when |
 |---|---|
@@ -174,7 +177,9 @@ States: `active`, `available`, `emulated` (FORGE's in-process `enforce()` stands
 | dynamic code (W^X) | emulated | `ProcessDynamicCodePolicy` (ACG) | emulated | emulated | emulated | emulated |
 | mitigations | n/a | extension points off, no remote / low-label images; strict: strict handle checks | n/a | n/a | n/a | n/a |
 | MAC label (SBX-6) | `/proc/self/attr/current`, report only | not checked | not checked | not checked | not checked | not checked |
-| models required | sets `FORGE_REQUIRE_SIGNED=1` and `FORGE_TRUSTED_KEYS` (honoured by `inference::model`) | same | same | same | same | same |
+| models required / optional | `inference::model` checks the active policy (see Integration); `lockdown` also sets `FORGE_REQUIRE_SIGNED=1` and `FORGE_TRUSTED_KEYS` for `required` | same | same | same | same | same |
+| scripts required | emulated: `forge script` refuses to run (no script verifier) | same | same | same | same | same |
+| threads | seccomp `TSYNC` covers threads started before `lockdown`; Landlock write rules only the calling thread and later ones | job object / mitigations: whole process | whole process | n/a | whole process | n/a |
 | plugins required | emulated: `enforce(plugin_load)` refuses | same | same | same | same | same |
 | BLD-1 hardening | `forge::build_hardening()` when `core/build_info.hpp` exists, else the compiler's macros (`__SSP__`, `_FORTIFY_SOURCE`, `__PIE__`, `__CET__`) | same (MSVC: `/GS`) | same | same | same | same |
 
@@ -183,6 +188,29 @@ Also reported: CAP-1/CAP-2 (in-process, `info`), CRY-1 (OS CSPRNG probe), AUD-1 
 `forge security check [--policy F] [--json]` prints `check()` for `load_policy()` and exits 1 when `ok` is false (see
 [cli.md](cli.md)). A strict policy with `"emulation": "deny"` fails on every OS today, because file reads, W^X and
 plugin signatures are only emulated.
+
+## Integration
+
+Every FORGE program below loads its policy with `load_policy(--policy)` and does nothing more when the result is
+profile `none` (no policy file, no `FORGE_SECURITY_PROFILE`): output and behaviour are those of a build without the
+module. With an active policy:
+
+| Where | What happens | FSS |
+|---|---|---|
+| `forge script [--policy F]` | `integrity.scripts` `required` refuses to run (`integrity_error`, audited: scripts are unsigned). Capabilities from the policy: `net` iff `net.mode` ≠ `none`, `proc` iff `exec`, `env` iff `env`, `fs` unless both root lists are empty; `--no-*` flags narrow the policy. The decision is audited, then `lockdown(policy)` runs before any script code (it replaces `--os-sandbox`) | P1, INT-1, SBX-1 |
+| script built-ins (any host) | the runtime hook `enforce_scope(Interp&, SecScope, target)` (`script/src/interp.hpp`) calls `try_enforce` against `active_policy()` with the path (`fs_read` / `fs_write`), `host:port` (`net_connect`), program (`exec`), variable (`env`) or plugin path (`plugin_load`) and raises `PermissionError`. It runs after the `Caps` flag check and is a no-op under profile `none`. Embedders that call `lockdown` / `set_active_policy` get it too | CAP-1 |
+| native plugins (`forge::plugin`, `import "x.so"`) | `fs_read` and `plugin_load` on the path: `integrity.plugins` `required` refuses (no verifier); otherwise allowed and audited | INT-1, P4 |
+| `inference::model` (`forge run`, `forge bench`, `forge-serve`, `forge::ask`, the C API) | `fs_read` on the path before the file is opened. `integrity.models` `required`: BLAKE3 hashes, then the embedded Ed25519 signature against `trusted_keys` (any valid signature when empty) before the blueprint or a tensor is read; `optional`: signed files verified, unsigned audited (`weaken`). Failure: `integrity_error`, audited `INT-4`. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` keep working and add keys | INT-1, INT-4 |
+| `forge run`, `forge bench` | `set_active_policy(policy)` (no lockdown) so model loads follow it | INT-1 |
+| `forge rpc-serve` | `net_listen` on `--bind:--port`; `--allow-scripts` needs `exec` (`policy_violation` otherwise); `lockdown` after the listener is bound, before `run()`; children get `--policy <abs>` | SBX-1 |
+| `forge-serve` | policy active before the model loads; `net_listen` on `--host:--port`; `--watch` needs `exec`; `lockdown` after bind + load, before the first `accept` | SBX-1 |
+| `forge-serve proxy` | `net_listen`, `net_connect` for every backend; `lockdown` after the listener starts | SBX-1 |
+
+The servers print every control whose verdict is not `ok` to stderr and audit `SBX-1` with the listen address.
+`lockdown` on Linux also installs its seccomp filter with `SECCOMP_FILTER_FLAG_TSYNC`, so threads a server started
+before locking down (scheduler, pools) are filtered too; Landlock has no such flag on the kernels FORGE targets, so
+its write rules bind only the locking thread and threads started afterwards (the `fs: write confinement` detail says
+so). `forge security check` is unchanged.
 
 ## Tests
 
@@ -195,3 +223,18 @@ attack strings for `check_relative` / `safe_join` / `canonical_within` (POSIX an
 Windows, the audit file), `refuse` (strict with `emulation: deny` is refused before anything is applied) and `models`.
 Run on Linux (WSL2, kernel Landlock ABI 3; also with `FORGE_LANDLOCK=0`) and Windows (MinGW). macOS, FreeBSD and MSVC:
 CI only.
+
+`tests/test_script_security.cpp` (ctest `test_script_security`): no policy is profile `none` and audits nothing; every
+`tests/script/*.fs` golden gives the same output with no policy and with an active `permissive` policy; a strict
+policy confined to a directory allows script file operations inside it and refuses writes, reads, listings, copies,
+renames, `..` escapes and globs outside it (audited), refuses net / exec / env even with the `Caps` flags on; mode
+`hosts` allows listed hosts only; the `SecurityError` script classes; plugins under `integrity.plugins` optional /
+required; model loads under `integrity.models` required (signed by the trusted key: loads; unsigned, tampered or
+signed by another key: `integrity_error`, audited) and optional, and `fs_read` on the model path; a child process
+that runs `lockdown` and then a script. `tests/security_cli_test.py` (ctest `security_cli`, needs the tiny golden
+model): `forge run` / `forge script` give the same output with no policy and a permissive one; under a strict policy
+`forge run` needs the signed model, `forge script` is confined (fs scoped, no net / proc / env, lockdown audited) and
+`integrity.scripts: required` refuses; `rpc-serve` locks down and accepts loopback connections, refuses
+`--allow-scripts` without exec and a non-loopback bind, and with exec granted runs a remote script confined to the
+policy; `forge-serve` serves the signed model on loopback with the same tokens and refuses an unsigned model and a
+non-loopback host.
