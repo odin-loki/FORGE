@@ -162,6 +162,13 @@ The unwrapped key is cached in process memory, keyed by directory, key files and
 run once per process; `keystore::clear_passphrase()` wipes the cache. Derived keys, Argon2 work areas and key
 buffers are wiped after use.
 
+## Build hardening (`cmake/forge_hardening.cmake`)
+
+`FORGE_HARDENING` (default ON) adds compiler and linker hardening, probing each flag and skipping what the toolchain
+rejects; the flag list per toolchain is in docs/building.md. `forge::build_hardening()`
+(`core/include/forge/core/build_info.hpp`) returns `{name, enabled}` for each property. MSVC builds do not use `/sdl`
+(security-standard.md BLD-1).
+
 ## Exceptions
 
 `Interp::from_cpp` maps C++ exceptions to script exceptions and `engine` catches all of them, so an embedder never
