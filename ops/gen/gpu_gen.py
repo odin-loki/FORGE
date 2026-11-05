@@ -257,10 +257,12 @@ CU_QUANT = r"""// Quantised matmul_t: y[rows, cols] = a[rows, k] . W[cols, k]^T 
 // against up to 4 activation rows; the block reduces in shared memory. Bodies mirror flow/codecs.hpp's decoders.
 #if defined(__NVPTX__)
 FORGE_DEV unsigned bid_() { return __nvvm_read_ptx_sreg_ctaid_x(); }
+FORGE_DEV unsigned bidy_() { return __nvvm_read_ptx_sreg_ctaid_y(); }
 FORGE_DEV unsigned tid_() { return __nvvm_read_ptx_sreg_tid_x(); }
 FORGE_DEV void bar_() { __syncthreads(); }
 #else
 FORGE_DEV unsigned bid_() { return __builtin_amdgcn_workgroup_id_x(); }
+FORGE_DEV unsigned bidy_() { return __builtin_amdgcn_workgroup_id_y(); }
 FORGE_DEV unsigned tid_() { return __builtin_amdgcn_workitem_id_x(); }
 FORGE_DEV void bar_() { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup"); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup"); }
 #endif
@@ -440,6 +442,8 @@ FORGE_GLOBAL void forge_attention_comb(const float* part, float* y, unsigned nro
     for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu != -__builtin_inff()) a = fma_(pp[u * (dv + 2u) + 2u + e], fexp(mu - M), a); }
     y[(unsigned long long)id * dv + e] = a * inv; } }
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
+typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
+typedef float f32x4v __attribute__((ext_vector_type(4)));
 // y[rows, cols] = xq . W^T for q8_0 (fmt 1, or 6 = regrouped), q4_k (fmt 2) and q6_k (fmt 3, or 5 = padded to 224-byte
 // blocks). A 128-thread block per output column (and up to 4 activation rows), its 4 warps splitting k by interleaved
 // super-blocks; each warp reduces with shuffles and the 4 partial sums meet in shared memory, as in llama.cpp's
@@ -584,9 +588,16 @@ FORGE_GLOBAL void forge_quant_q8r(const float* x, signed char* xq, float* xds, u
   unsigned i = bid_() * 8u + (tid_() >> 5), l = tid_() & 31u; if (i >= nb) return;
   float v = x[(unsigned long long)i * 32u + l], am = wmax_(fabs_(v)), d = am / 127.0f;
   int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
-  xq[(unsigned long long)i * 32u + l] = (signed char)q;
+  // Stored with the 4-byte words of each group interleaved (0 4 1 5 2 6 3 7): the mma B fragment of lane tig is
+  // words tig and tig+4, which then sit side by side for one 8-byte shared load.
+  unsigned wd = l >> 2, pos = (wd < 4u ? 2u * wd : 2u * (wd - 4u) + 1u) * 4u + (l & 3u);
+  xq[(unsigned long long)i * 32u + pos] = (signed char)q;
   float sm = wsum_((float)q);
   if (l == 0u) { xds[2ull * i] = d; xds[2ull * i + 1u] = d * sm; } }
+FORGE_GLOBAL void forge_sum_splits(const float* p, float* y, unsigned n, unsigned s) {   // y = sum of s slices of n, in order
+  unsigned i = bid_() * 256u + tid_(); if (i >= n) return;
+  float a = p[i]; for (unsigned j = 1; j < s; ++j) a += p[(unsigned long long)j * n + i];
+  y[i] = a; }
 FORGE_DEV void mma_k32(int* c, unsigned a0, unsigned a1, unsigned a2, unsigned a3, unsigned b0, unsigned b1) {
   asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1)); }
@@ -617,13 +628,18 @@ FORGE_DEV void cpa_wait() { asm volatile("cp.async.commit_group;\n\tcp.async.wai
 // BT tokens per block (64 or 128; warp tile 16 weight rows x BT); NS shared-memory stages (2: chunk kb + 256 is copied
 // with cp.async while chunk kb is computed). Shared: NS x [Xq BT x 272 | Xs 8 x BT x 2 floats | Wr 128 x stride] | Wm 8 KB.
 static __attribute__((device, always_inline)) inline void mma_body(const signed char* xq, const float* xds, const unsigned char* w, float* y,
-                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT, const unsigned NS) {
+                                    unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT, const unsigned NS,
+                                    unsigned ksplit) {
   const unsigned SB = BT * 336u + 128u * mma_wstride(fmt);   // bytes per stage
   float* Wm = (float*)(forge_dsm + NS * SB);
   unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + BT * 272u); unsigned char* Wr = forge_dsm + BT * 336u;
   unsigned t = tid_(), wp = t >> 5, l = t & 31u, gid = l >> 2, tig = l & 3u;
   unsigned ntb = (rows + BT - 1u) / BT, bi = bid_(), t0 = (bi % ntb) * BT, c0 = (bi / ntb) * 128u, nbk = k / 32u;
   unsigned wsb = mma_wstride(fmt), bsz = fmt == 2u ? 144u : fmt == 5u ? 224u : 272u, nch = bsz / 16u;
+  // Split-K (ksplit > 0): grid row y takes 256-value chunks [y*ksplit, (y+1)*ksplit) of k and writes its partial
+  // product to slice y of y[] (rows x cols each); forge_sum_splits adds the slices in order (deterministic).
+  const unsigned ky = ksplit ? bidy_() : 0u, kbeg = ky * ksplit * 256u, kend = ksplit ? (kbeg + ksplit * 256u < k ? kbeg + ksplit * 256u : k) : k;
+  y += (unsigned long long)ky * rows * cols;
   float acc[16][4];
 #pragma unroll
   for (unsigned n = 0; n < BT / 8u; ++n)
@@ -638,10 +654,10 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
       if (cc < 128u) { bool ok = c0 + cc < cols; \
         cpa16((WR) + cc * wsb + ch * 16u, ok ? (const void*)(w + (unsigned long long)(c0 + cc) * rb + ((KB) >> 8) * bsz + ch * 16u) : (const void*)w, ok ? 16u : 0u); } } } \
     asm volatile("cp.async.commit_group;" ::: "memory"); }
-  if (NS == 2u) FORGE_MMA_STAGE(0u, Xq, Xs, Wr)
-  for (unsigned kb = 0, st = 0; kb < k; kb += 256u, st ^= NS - 1u) {
+  if (NS == 2u) FORGE_MMA_STAGE(kbeg, Xq, Xs, Wr)
+  for (unsigned kb = kbeg, st = 0; kb < kend; kb += 256u, st ^= NS - 1u) {
     unsigned* xqs = (unsigned*)(forge_dsm + st * SB); float* xss = (float*)(forge_dsm + st * SB + BT * 272u); unsigned char* wrs = forge_dsm + st * SB + BT * 336u;
-    if (NS == 2u && kb + 256u < k) {   // copy the next chunk into the other stage, then wait for this one only
+    if (NS == 2u && kb + 256u < kend) {   // copy the next chunk into the other stage, then wait for this one only
       FORGE_MMA_STAGE(kb + 256u, (unsigned*)(forge_dsm + (st ^ 1u) * SB), (float*)(forge_dsm + (st ^ 1u) * SB + BT * 272u), forge_dsm + (st ^ 1u) * SB + BT * 336u)
       asm volatile("cp.async.wait_group 1;" ::: "memory");
     } else if (NS == 2u) asm volatile("cp.async.wait_group 0;" ::: "memory");
@@ -689,10 +705,12 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
       }
 #pragma unroll
       for (unsigned n = 0; n < BT / 8u; ++n) {
-        const unsigned* xr = Xq + (n * 8u + gid) * 68u + g * 8u + tig;
-        unsigned b0 = xr[0], b1 = xr[4];
-        const float* xs = Xs + (g * BT + n * 8u + tig * 2u) * 2u;   // (d, d*sum) of tokens 2tig, 2tig+1 of this tile
-        float xd0 = xs[0], xm0 = xs[1], xd1 = xs[2], xm1 = xs[3];
+        // B fragment: words tig and tig+4 of the group, adjacent in the interleaved layout of forge_quant_q8r (one LDS.64);
+        // (d, d*sum) of tokens 2tig, 2tig+1: four floats, 16-byte aligned (one LDS.128).
+        const u32x2 bb = *(const u32x2*)(Xq + (n * 8u + gid) * 68u + g * 8u + 2u * tig);
+        unsigned b0 = bb.x, b1 = bb.y;
+        const f32x4v xs = *(const f32x4v*)(Xs + (g * BT + n * 8u + tig * 2u) * 2u);
+        float xd0 = xs.x, xm0 = xs.y, xd1 = xs.z, xm1 = xs.w;
         if (fmt == 5u) {
           int lo[4] = {0, 0, 0, 0}, hi[4] = {0, 0, 0, 0};
           mma_k16(lo, a0, a1, b0); mma_k16(hi, a2, a3, b1);
@@ -717,7 +735,7 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
 #undef FORGE_MMA_STAGE
 // One kernel per format, so the format checks fold away at compile time.
 #define FORGE_MMA_KERNEL(name, f, bt, nb, ns) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
-    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, ns); }
+    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb, unsigned ksplit) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, ns, ksplit); }
 FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u, 64u, 2, 1u)
 FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0g, 6u, 64u, 2, 1u)
 FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u, 64u, 2, 1u)

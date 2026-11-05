@@ -174,7 +174,7 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (att_) f_.free_(att_); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (att_) f_.free_(att_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
@@ -454,6 +454,13 @@ public:
     static unsigned mma_ns() { static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_STAGES"); return e && std::string(e) == "2" ? 2u : 1u; }(); return v; }   // $FORGE_MMA_STAGES=2: double-buffered q4_k (opt-in; no gain on an RTX 3090)
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
         static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
+    static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
+    std::uint64_t sk_ = 0; std::size_t sk_cap_ = 0;   // split-K partial products (stream-ordered reuse)
+    void sk_reserve(std::size_t need) {
+        if (sk_cap_ >= need) return;
+        if (sk_) free_s(sk_); sk_ = 0; sk_cap_ = 0;
+        std::size_t n = std::max<std::size_t>(need, 4 << 20); sk_ = dmalloc(n, "scratch"); sk_cap_ = n;
+    }
     std::uint64_t q8r_ = 0; std::size_t q8r_cap_ = 0;   // int8 activation rows + per-group (d, d*sum) for the mma path
     void q8r_reserve(std::size_t need) {
         if (q8r_cap_ >= need) return;
@@ -537,7 +544,8 @@ public:
                 std::uint64_t xq = q8r_, xds = q8r_ + xbytes;
                 void* qa[] = {&xd, &xq, &xds, &nb};
                 ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
-                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
+                std::uint32_t ksplit = 0;
+                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit};
                 // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
                 // q4_k keeps 64 tokens (47 KB of shared memory: two blocks per SM); q6_k / q8_0 use one block per SM anyway,
                 // so 128 tokens give each warp twice the work per weight fragment ($FORGE_MMA_BT=64|128 forces one)
@@ -549,7 +557,31 @@ public:
                 void* mf = function(ns2 ? std::string("forge_qmatmul_mma2_q4_k") : mma_fn(fmt, bt));
                 if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
                 unsigned grid = ((rows + bt - 1) / bt) * ((cols + 127) / 128);
-                if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                // Split-K when the grid cannot fill the device (k/v projections, DeltaNet a/b): S slices of k, each
+                // written to a partial buffer, then summed in order ($FORGE_MMA_SPLITK=0 off).
+                // S is chosen by wave efficiency: the time of S slices is ~ ceil(grid*S / slots) waves of 1/S the work,
+                // so pick the S (up to 8, each slice >= 2 chunks of k) with the fewest waves per unit of work; ties go
+                // to the smaller S (less partial traffic). slots: blocks resident at once (64-token kernels fit 2 per SM).
+                const unsigned nch = k / 256, slots = sms() * (bt == 64 && !ns2 ? 2u : 1u);
+                unsigned splits = 1;
+                if (grid && grid < slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
+                    double best = double((grid + slots - 1) / slots);
+                    for (unsigned s = 2; s <= 8 && s <= nch / 2; ++s) {
+                        double t = double((grid * s + slots - 1) / slots) / s;
+                        if (t < best * 0.97) { best = t; splits = s; }
+                    }
+                }
+                if (grid && splits >= 2) {
+                    ksplit = (nch + splits - 1) / splits;
+                    const unsigned s = (nch + ksplit - 1) / ksplit;   // slices actually used
+                    const std::size_t n = std::size_t(rows) * cols;
+                    sk_reserve(n * s * 4);
+                    std::uint64_t part = sk_; void* a3[] = {&xq, &xds, &wd, &part, &rows, &cols, &k, &fmt, &rb32, &ksplit};
+                    ck(launch_s(mf, grid, s, 1, 256, 1, 1, smem, stream_, a3, nullptr), "launch");
+                    std::uint32_t n32 = std::uint32_t(n), s32 = s; void* a4[] = {&part, &yd, &n32, &s32};
+                    ck(launch_s(function("forge_sum_splits"), (n32 + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, a4, nullptr), "launch");
+                    ++dispatches_["qmatmul_mma_splitk"];
+                } else if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
             } else if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
                 ++dispatches_["qmatmul_mmq"];
                 unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
@@ -749,6 +781,7 @@ private:
         int (*count)(int*) = nullptr;
         int (*name)(char*, int, int) = nullptr;
         int (*device_get)(int*, int) = nullptr;               // CUDA
+        int (*dev_attr)(int*, int, int) = nullptr;             // cuDeviceGetAttribute (multiprocessor count)
         int (*ctx_create)(void**, unsigned, int) = nullptr;   // CUDA
         int (*ctx_destroy)(void*) = nullptr;
         int (*ctx_set)(void*) = nullptr;                      // CUDA
@@ -1116,7 +1149,7 @@ private:
                  sym(f_.unload, "cuModuleUnload") && sym(f_.get_fn, "cuModuleGetFunction") && sym(f_.malloc_, "cuMemAlloc_v2") &&
                  sym(f_.free_, "cuMemFree_v2") && sym(f_.htod, "cuMemcpyHtoD_v2") && sym(f_.dtoh, "cuMemcpyDtoH_v2") &&
                  sym(f_.launch, "cuLaunchKernel") && sym(f_.sync_, "cuCtxSynchronize");
-            opt(f_.device_get, "cuDeviceGet"); opt(f_.ctx_set, "cuCtxSetCurrent");
+            opt(f_.device_get, "cuDeviceGet"); opt(f_.ctx_set, "cuCtxSetCurrent"); opt(f_.dev_attr, "cuDeviceGetAttribute");
             opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
             opt(f_.stream_create, "cuStreamCreate"); opt(f_.stream_destroy, "cuStreamDestroy_v2"); opt(f_.stream_sync, "cuStreamSynchronize");
             opt(f_.capture_begin, "cuStreamBeginCapture_v2"); opt(f_.capture_end, "cuStreamEndCapture");
@@ -1150,6 +1183,7 @@ private:
         int dev = ordinal_;
         if (api_ == api::cuda && f_.device_get && f_.device_get(&dev, ordinal_) != 0) return "cuDeviceGet failed";
         char buf[256] = {}; f_.name(buf, sizeof buf, dev); name_ = buf;
+        if (int v = 0; api_ == api::cuda && f_.dev_attr && f_.dev_attr(&v, 16 /* MULTIPROCESSOR_COUNT */, dev) == 0 && v > 0) sms_ = unsigned(v);
         if (api_ == api::cuda) { if (f_.ctx_create(&ctx_, 0, dev) != 0) return "context creation failed"; }
         else if (f_.set_device(ordinal_) != 0) return "hipSetDevice failed";
         if (f_.stream_create && f_.stream_create(&stream_, 1 /* non-blocking */) != 0) stream_ = nullptr;
@@ -1165,6 +1199,8 @@ private:
         return "module load failed (no embedded PTX/code object is accepted by this device)";
     }
     api api_;
+    unsigned sms_ = 80;   // streaming multiprocessors (sizes split-K); 80 when the driver cannot say
+    unsigned sms() const { return sms_; }
     int ordinal_ = 0;
     void* lib_ = nullptr; void* ctx_ = nullptr; void* mod_ = nullptr; void* stream_ = nullptr;
     fns f_;
