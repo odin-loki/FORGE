@@ -23,7 +23,8 @@ export SIMCTL_CHILD_FORGE_THREADS=${FORGE_THREADS:-2}
 fail=0; pass=0; skip=0
 for t in "$@"; do
   echo "::group::$t"
-  rc=0; xcrun simctl spawn "$udid" "$b/$t" || rc=$?
+  exe="$b/$t"; [ -f "$exe" ] || exe="$b/$t.app/$t"   # CMake builds iOS executables as .app bundles
+  rc=0; xcrun simctl spawn "$udid" "$exe" || rc=$?
   echo "::endgroup::"
   case $rc in 0) pass=$((pass+1)); echo "PASS $t";; 77) skip=$((skip+1)); echo "SKIP $t";;
     *) fail=$((fail+1)); echo "FAIL $t (rc=$rc)";; esac

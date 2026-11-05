@@ -314,12 +314,14 @@ TEST(local_ipc) {
         auto d = scratch("ipc"); auto f = os::join(d, "not-a-socket"); CHECK(os::write_file(f, "keep me"));
         auto bad = os::local_listener::listen(f); CHECK(!bad);
         CHECK(os::read_file(f).value == "keep me");
+#if !defined(__ANDROID__)   // the emulator's shell user may not create sockets under /data/local/tmp (SELinux)
         // a stale socket from a dead listener is replaced
         auto sp = os::join(d, "s.sock");
         { sockaddr_un a{}; socklen_t len = 0; CHECK(!os::local_stream::addr_(sp, a, len)); int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
           CHECK(fd >= 0 && ::bind(fd, reinterpret_cast<sockaddr*>(&a), len) == 0); ::close(fd); }   // left behind, as by a crash
         auto l2 = os::local_listener::listen(sp); CHECK_MSG(l2, "%s", l2.err.what.c_str());
         if (l2) { l2->close(); CHECK(!os::exists(sp)); }
+#endif
         os::remove_all(d);
     }
 #endif
