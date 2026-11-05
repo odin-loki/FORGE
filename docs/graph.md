@@ -58,7 +58,7 @@ The attention kernels decode quantised slots on the fly. inference selects the c
 Device lowerings have priority 20, above the CPU ones. The backends themselves are described in [gpu.md](gpu.md).
 
 ## Device execution
-A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
+A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`, `argmax` and `fused`. With `fused`, `compile` marks adjacent step pairs the backend may run as one kernel (`fuse_steps`: a residual `add` followed by the `rms_norm` of its result; an `rms_norm` whose only consumer is the next step, a `rope`); the executor offers each pair to the hook and runs the two steps as usual when it declines. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
 
 Quantised weights on a device:
 - CUDA and HIP keep q8_0, q4_k, q5_k and q6_k weights encoded on the device and run them with their own kernels.

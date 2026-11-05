@@ -402,6 +402,78 @@ FORGE_GLOBAL void forge_silu_mul_q81(const float* a, const float* b, float* y, u
 FORGE_DEV unsigned ld32u(const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24); }
 FORGE_DEV int dp4a_ss(int a, int b, int c) { int r; asm("dp4a.s32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c)); return r; }
 FORGE_DEV float wsum_(float v) { for (unsigned o = 16u; o > 0u; o >>= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v += w; } return v; }
+// ---- Elementwise fusions (cuda.hpp: run_fused, and run_op's rms_norm with q8r output) ----
+// Group i of the int8 activation rows + (d, d * sum) that forge_quant_q8r writes, from one warp (lane l holds value v);
+// the same operations as forge_quant_q8r, so the bytes are identical.
+FORGE_DEV void q8r_put(float v, unsigned l, signed char* xq, float* xds, unsigned long long i) {
+  float am = wmax_(fabs_(v)), d = am / 127.0f; int q = d == 0.0f ? 0 : (int)__builtin_rintf(v / d);
+  unsigned wd = l >> 2, pos = (wd < 4u ? 2u * wd : 2u * (wd - 4u) + 1u) * 4u + (l & 3u);
+  xq[i * 32u + pos] = (signed char)q;
+  float sm = wsum_((float)q);
+  if (l == 0u) { xds[2ull * i] = d; xds[2ull * i + 1u] = d * sm; } }
+// Residual add + RMS norm (+ the next matmul's quantised activations), a block per row:
+//   mode & 8: v = a + b, written to s (else v = a);  y = rms_norm(v) * w;
+//   mode & 1: reduce like forge_rms_norm_q81 (warp shuffles, then the warp sums in order; any block size), else like
+//             forge_rms_norm_b (a tree over 256 threads), so y is bit-identical to the unfused kernel run_op would pick;
+//   mode & 2: also write y's q8_1 blocks to xq (as forge_rms_norm_q81); mode & 4: its q8r rows to xq / xds (as
+//             forge_quant_q8r). cols % 32 == 0. s may be a (in place): each thread reads back only what it wrote.
+FORGE_GLOBAL void forge_rms_norm_f(const float* a, const float* b, float* s, const float* w, float* y, unsigned rows, unsigned cols, float eps,
+                                   unsigned mode, unsigned char* xq, float* xds) {
+  __attribute__((shared)) float red[256];
+  unsigned nt = __nvvm_read_ptx_sreg_ntid_x(), t = tid_(), r = bid_(), l = t & 31u;
+  const unsigned long long ro = (unsigned long long)r * cols;
+  float acc = 0.0f;
+  for (unsigned j = t; j < cols; j += nt) { float v = a[ro + j]; if (mode & 8u) { v = v + b[ro + j]; s[ro + j] = v; } acc = fma_(v, v, acc); }
+  float tot = 0.0f;
+  if (mode & 1u) {
+    for (unsigned o = 16u; o > 0u; o >>= 1) { float v; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(v) : "f"(acc), "r"(o)); acc += v; }
+    if (l == 0u) red[t >> 5] = acc;
+    bar_();
+    for (unsigned i = 0; i < (nt >> 5); ++i) tot += red[i];
+  } else {
+    red[t] = acc; bar_();
+    for (unsigned st = 128u; st > 0u; st >>= 1) { if (t < st) red[t] += red[t + st]; bar_(); }
+    tot = red[0];
+  }
+  float inv = 1.0f / fsqrt(tot / (float)cols + eps);
+  const float* src = (mode & 8u) ? s : a;
+  for (unsigned j = t; j < cols; j += nt) {
+    float v = src[ro + j] * inv * w[j]; y[ro + j] = v;
+    if (mode & 2u) q81_put(v, l, xq + ((ro + j) >> 5) * 40u);
+    if (mode & 4u) q8r_put(v, l, (signed char*)xq, xds, (ro + j) >> 5); } }
+// QK-norm + RoPE (Qwen3): y = rope(rms_norm(x, w), pos) for x [s, heads, d], d a power of two in 32..256. A 256-thread
+// block per (token, hpb heads), 256 / d heads at a time; the token's cos/sin (in double, as forge_rope) are computed
+// once for all its heads. The norm reduces like forge_rms_norm_b (mode 0) or forge_rms_norm_q81 (mode 1) over the same
+// row and each output takes forge_rope's expression, so y is bit-identical to the unfused kernels. y may be x.
+FORGE_GLOBAL void forge_rms_rope(const float* x, const float* w, const float* pos, const float* invf, float* y, unsigned s, unsigned heads,
+                                 unsigned d, float eps, unsigned neox, unsigned hpb, unsigned mode) {
+  __attribute__((shared)) float red[256]; __attribute__((shared)) float nv[256]; __attribute__((shared)) float cs[128]; __attribute__((shared)) float sn[128];
+  unsigned t = tid_(), ng = (heads + hpb - 1u) / hpb, tok = bid_() / ng, h0 = (bid_() % ng) * hpb, half_ = d / 2u, rpi = 256u / d;
+  unsigned h1 = h0 + hpb < heads ? h0 + hpb : heads, seg = t / d, e = t % d, l = t & 31u, base = seg * d;
+  if (t < half_) { double th = (double)pos[tok] * (double)invf[t]; float c, sv; fsincos(th, &sv, &c); cs[t] = c; sn[t] = sv; }
+  unsigned j = neox ? (e < half_ ? e : e - half_) : e >> 1, first = neox ? (e < half_) : !(e & 1u);
+  unsigned i0 = neox ? j : 2u * j, i1 = neox ? j + half_ : 2u * j + 1u;
+  for (unsigned hb = h0; hb < h1; hb += rpi) {
+    unsigned h = hb + seg; bool act = h < h1;
+    unsigned long long o = ((unsigned long long)tok * heads + h) * d;
+    float xv = act ? x[o + e] : 0.0f, acc = fma_(xv, xv, 0.0f), tot = 0.0f;
+    if (mode & 1u) {
+      for (unsigned q = 16u; q > 0u; q >>= 1) { float v; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(v) : "f"(acc), "r"(q)); acc += v; }
+      if (l == 0u) red[t >> 5] = acc;
+      bar_();
+      for (unsigned i = 0; i < d / 32u; ++i) tot += red[base / 32u + i];
+    } else {
+      red[t] = acc; bar_();
+      for (unsigned st = d / 2u; st > 0u; st >>= 1) { if (e < st) red[t] += red[t + st]; bar_(); }
+      tot = red[base];
+    }
+    float inv = 1.0f / fsqrt(tot / (float)d + eps);
+    nv[t] = xv * inv * w[e];
+    bar_();
+    float x0 = nv[base + i0], x1 = nv[base + i1], c = cs[j], sv = sn[j];
+    // the fma placement forge_rope compiles to (x0 * c - x1 * sn -> fma(x0, c, -(x1 * sn)); x0 * sn + x1 * c -> fma(x0, sn, x1 * c))
+    if (act) y[o + e] = first ? fma_(x0, c, -(x1 * sv)) : fma_(x0, sv, x1 * c);
+    bar_(); } }
 // Decode attention, split over keys (flash-decoding): block b = (row-head id, split sp) takes a contiguous chunk of
 // the visible keys; its 4 warps take every 4th key, a warp computing one score with a shuffle reduction (coalesced K
 // and V rows) and keeping an online softmax. Each block writes (max, sum, acc[dv]) to part[b]; forge_attention_comb
@@ -441,6 +513,17 @@ FORGE_GLOBAL void forge_attention_comb(const float* part, float* y, unsigned nro
   for (unsigned e = tx; e < dv; e += 128u) { float a = 0.0f;
     for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu != -__builtin_inff()) a = fma_(pp[u * (dv + 2u) + 2u + e], fexp(mu - M), a); }
     y[(unsigned long long)id * dv + e] = a * inv; } }
+// forge_attention_comb that also writes y's q8_1 blocks to xq for the output projection (decode; dv % 32 == 0), so
+// that matmul skips forge_quant_q81 (bit-identical: the blocks come from the same float values).
+FORGE_GLOBAL void forge_attention_comb_q81(const float* part, float* y, unsigned nrow, unsigned ns, unsigned dv, unsigned char* xq) {
+  unsigned id = bid_(), tx = tid_(), l = tx & 31u; if (id >= nrow) return; const float* pp = part + (unsigned long long)id * ns * (dv + 2u);
+  float M = -__builtin_inff(); for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; M = mu > M ? mu : M; }
+  float L = 0.0f; for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; L += mu == -__builtin_inff() ? 0.0f : pp[u * (dv + 2u) + 1u] * fexp(mu - M); }
+  float inv = L > 0.0f ? 1.0f / L : 0.0f;
+  for (unsigned e = tx; e < dv; e += 128u) { float a = 0.0f;
+    for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu != -__builtin_inff()) a = fma_(pp[u * (dv + 2u) + 2u + e], fexp(mu - M), a); }
+    unsigned long long j = (unsigned long long)id * dv + e; float v = a * inv; y[j] = v;
+    q81_put(v, l, xq + (j >> 5) * 40u); } }
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 typedef float f32x4v __attribute__((ext_vector_type(4)));

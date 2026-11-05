@@ -177,6 +177,143 @@ template<class RT> static int attention_dec_check(RT& rt, const std::string& api
     return fails;
 }
 
+// Elementwise fusions (cuda.hpp run_fused, the rms_norm q8r output): bit-identical to the unfused kernels inside a run,
+// and through the executor (plan.hpp fuse_steps) within the oracle tolerance of the CPU.
+template<class RT> static int fusion_check(RT& rt, const std::string& api) {
+    if constexpr (!requires { rt.run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); }) return 0;
+    else {
+    auto off = [](const char* v) { auto* e = std::getenv(v); return e && std::string(e) == "0"; };
+    if (off("FORGE_FUSE_ADD_NORM") || off("FORGE_FUSE_QK_ROPE")) { std::printf("note %s: elementwise fusions switched off\n", api.c_str()); return 0; }
+    int fails = 0, n = 0;
+    auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.613f + ph) * (1.f + float(i % 7) / 3.f); return v; };
+    auto disp = [&](const char* k) -> std::size_t { auto d = rt.dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; };
+    // add + rms_norm: decode rows (q8_1 reduction; 1024 threads for one wide row), prefill rows (tree; q8r output when
+    // cols % 256 == 0), in place (s = a) and out of place
+    struct an { i64 rows, cols; bool inplace; };
+    for (auto c : {an{1, 4096, true}, an{3, 256, false}, an{2, 96, false}, an{40, 512, true}, an{20, 160, false}, an{70, 1024, false}}) {
+        const std::size_t N = std::size_t(c.rows * c.cols);
+        auto a = rnd(N, 1), b = rnd(N, 2), w = rnd(std::size_t(c.cols), 3);
+        std::vector<float> a2 = a, s1(N), y1(N), s2(N), y2(N);
+        shape_t sh{c.rows, c.cols}, ws{c.cols};
+        ops::attrs at{{"eps", 1e-5}};
+        rt.begin_run();   // unfused: add, rms_norm
+        float* sp = c.inplace ? a.data() : s1.data();
+        rt.run_op("add", {{a.data(), sh}, {b.data(), sh}}, {}, {sp, sh});
+        rt.run_op("rms_norm", {{sp, sh}, {w.data(), ws}}, at, {y1.data(), sh});
+        rt.to_host(sp, N); rt.to_host(y1.data(), N); rt.end_run();
+        if (c.inplace) s1 = a;
+        rt.begin_run();
+        const std::size_t f0 = disp("fused_add_rms_norm");
+        float* sp2 = c.inplace ? a2.data() : s2.data();
+        bool ok = rt.run_fused("add_rms_norm", {{a2.data(), sh}, {b.data(), sh}, {w.data(), ws}}, {{sp2, sh}, {y2.data(), sh}}, at);
+        rt.to_host(sp2, N); rt.to_host(y2.data(), N); rt.end_run();
+        if (c.inplace) s2 = a2;
+        ++n;
+        if (!ok || disp("fused_add_rms_norm") != f0 + 1 || s1 != s2 || y1 != y2) {
+            std::printf("FAIL %s add_rms_norm rows %lld cols %lld: %s\n", api.c_str(), (long long)c.rows, (long long)c.cols, ok ? "differs from add + rms_norm" : "refused"); ++fails; }
+    }
+    // rms_norm + rope (QK-norm): decode (64 heads: tree; 8 heads: q8_1 reduction), prefill, neox and interleaved, in place
+    struct rr { i64 s, h, d; int neox; bool inplace; };
+    for (auto c : {rr{1, 64, 128, 1, false}, rr{1, 8, 128, 1, true}, rr{37, 4, 64, 0, false}, rr{5, 3, 256, 1, false}, rr{40, 64, 128, 1, true}, rr{3, 5, 32, 0, true}}) {
+        const std::size_t N = std::size_t(c.s * c.h * c.d);
+        auto x = rnd(N, 4), w = rnd(std::size_t(c.d), 5); std::vector<float> pos(std::size_t(c.s)), x2 = x, t1(N), y1(N), y2(N);
+        for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i * 37 + 3);
+        shape_t sh{c.s, c.h, c.d}, ws{c.d}, ps{c.s};
+        ops::attrs ar{{"base", 1000000.0}, {"neox", double(c.neox)}}, an_{{"eps", 1e-6}}, af = ar; af.v["eps"] = 1e-6;
+        rt.begin_run();
+        rt.run_op("rms_norm", {{x.data(), sh}, {w.data(), ws}}, an_, {t1.data(), sh});
+        rt.run_op("rope", {{t1.data(), sh}, {pos.data(), ps}}, ar, {y1.data(), sh});
+        rt.to_host(y1.data(), N); rt.end_run();
+        rt.begin_run();
+        float* yp = c.inplace ? x2.data() : y2.data();
+        bool ok = rt.run_fused("rms_rope", {{x2.data(), sh}, {w.data(), ws}, {pos.data(), ps}}, {{yp, sh}}, af);
+        rt.to_host(yp, N); rt.end_run();
+        if (c.inplace) y2 = x2;
+        ++n;
+        double worst = 0; for (std::size_t i = 0; i < N; ++i) worst = std::max(worst, std::fabs(double(y1[i]) - y2[i]));
+        if (!ok || y1 != y2) { std::printf("FAIL %s rms_rope s %lld heads %lld d %lld: %s (worst %.3g)\n", api.c_str(), (long long)c.s, (long long)c.h, (long long)c.d,
+                                           ok ? "differs from rms_norm + rope" : "refused", worst); ++fails; }
+    }
+    // a prefill rms_norm writes its q8r rows; the next two matmuls on its output reuse them (no forge_quant_q8r) and give
+    // the same bits as a matmul that quantises the same input itself
+    if (std::getenv("FORGE_FUSE_Q8R") == nullptr && rt.has_function("forge_quant_q8r")) {
+        const auto* c4 = graph::codecs::find("q4_k");
+        const std::size_t R = 48, K = 512, C = 40, rb = c4->bytes(K);
+        auto x = rnd(R * K, 6), w = rnd(K, 7), wf = rnd(C * K, 8); std::vector<float> h(R * K), o1(R * C), o2(R * C), o3(R * C);
+        std::vector<std::uint8_t> enc(C * rb); for (std::size_t j = 0; j < C; ++j) c4->encode(wf.data() + j * K, K, enc.data() + j * rb);
+        rt.begin_run();   // uploads the weight (an upload drops the q8r tracking)
+        rt.run_qmatmul({x.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o1.data(), {i64(R), i64(C)}});
+        rt.end_run();
+        const std::size_t r0 = disp("quant_q8r_reused"), q0 = disp("fused_q8r");
+        rt.begin_run();
+        rt.run_op("rms_norm", {{x.data(), {i64(R), i64(K)}}, {w.data(), {i64(K)}}}, {{"eps", 1e-6}}, {h.data(), {i64(R), i64(K)}});
+        rt.run_qmatmul({h.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o1.data(), {i64(R), i64(C)}});
+        rt.run_qmatmul({h.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o2.data(), {i64(R), i64(C)}});
+        rt.to_host(h.data(), h.size()); rt.to_host(o1.data(), o1.size()); rt.to_host(o2.data(), o2.size()); rt.end_run();
+        std::vector<float> hc = h;
+        rt.begin_run(); rt.run_qmatmul({hc.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o3.data(), {i64(R), i64(C)}}); rt.to_host(o3.data(), o3.size()); rt.end_run();
+        const bool used = disp("fused_q8r") == q0 + 1, reused = disp("quant_q8r_reused") == r0 + 2;
+        ++n;
+        if (disp("qmatmul_mma") && (!used || !reused || o1 != o3 || o2 != o3)) {
+            std::printf("FAIL %s rms_norm q8r output: emitted %d reused %d same %d\n", api.c_str(), int(used), int(reused), int(o1 == o3 && o2 == o3)); ++fails; }
+    }
+    // decode attention: forge_attention_comb_q81 writes the output projection's q8_1 input; the matmul reuses it
+    {
+        const i64 T = 37, HQ = 4, HK = 2, D = 128; const std::size_t K = std::size_t(HQ * D), C = 24;
+        const auto* c8 = graph::codecs::find("q8_0"); const std::size_t rb = c8->bytes(K);
+        auto q = rnd(std::size_t(HQ * D), 9), k = rnd(std::size_t(T * HK * D), 10), v = rnd(std::size_t(T * HK * D), 11), wf = rnd(C * K, 12);
+        std::vector<float> y1(K), y2(K), o1(C), o2(C);
+        std::vector<std::uint8_t> enc(C * rb); for (std::size_t j = 0; j < C; ++j) c8->encode(wf.data() + j * K, K, enc.data() + j * rb);
+        ops::attrs at{{"causal", 1.0}};
+        auto attn = [&](std::vector<float>& y) { return rt.run_op("attention", {{q.data(), {1, HQ, D}}, {k.data(), {T, HK, D}}, {v.data(), {T, HK, D}}}, at, {y.data(), {1, HQ, D}}); };
+        attn(y2);   // outside a run: no fusion
+        rt.begin_run(); rt.run_qmatmul({y2.data(), {1, i64(K)}}, enc.data(), rb, std::uint32_t(C), 1, {o2.data(), {1, i64(C)}}); rt.to_host(o2.data(), C); rt.end_run();
+        const std::size_t r0 = disp("quant_q81_reused");
+        rt.begin_run(); attn(y1); rt.run_qmatmul({y1.data(), {1, i64(K)}}, enc.data(), rb, std::uint32_t(C), 1, {o1.data(), {1, i64(C)}});
+        rt.to_host(y1.data(), K); rt.to_host(o1.data(), C); rt.end_run();
+        ++n;
+        if (disp("attention_dec") && (y1 != y2 || o1 != o2 || disp("quant_q81_reused") != r0 + 1)) {
+            std::printf("FAIL %s attention_comb_q81: y same %d, matmul same %d, reused %d\n", api.c_str(), int(y1 == y2), int(o1 == o2), int(disp("quant_q81_reused") - r0)); ++fails; }
+    }
+    std::printf("%s %d/%d %s elementwise fusions match the unfused kernels\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+    }
+}
+
+// The executor's fused step pairs (plan.hpp fuse_steps): residual add + rms_norm and QK-norm + rope on the device
+// against the CPU executor.
+static int fusion_plan_check(graph::registry& reg, const std::string& api, const std::function<std::size_t(const char*)>& disp) {
+    if (!reg.hooks || !reg.hooks->fused) return 0;
+    for (auto v : {"FORGE_FUSE_ADD_NORM", "FORGE_FUSE_QK_ROPE"}) if (auto* e = std::getenv(v); e && std::string(e) == "0") return 0;
+    using namespace graph; using ops::op;
+    const i64 S = 20, D = 256, H = 4, d = 64;
+    auto build = [&] {
+        tensor_graph g;
+        auto a = g.input("a", {S, D}), b = g.input("b", {S, D}), w = g.input("w", {D}), q = g.input("q", {S, H, d}), qw = g.input("qw", {d}), pos = g.input("pos", {S});
+        auto s = g.add(a, b);
+        auto hn = g.apply(op::rms_norm, {s, w}, {{"eps", 1e-5}});
+        auto r = g.apply(op::rope, {g.apply(op::rms_norm, {q, qw}, {{"eps", 1e-6}}), pos}, {{"base", 10000.0}, {"neox", 1.0}});
+        g.output("s", s); g.output("h", hn); g.output("r", r);
+        return g;
+    };
+    auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.37f + ph); return v; };
+    std::vector<float> pos(S); for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i);
+    auto run = [&](registry* r) {
+        pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po); executor e(*p);
+        e.set_input("a", rnd(S * D, 1)); e.set_input("b", rnd(S * D, 2)); e.set_input("w", rnd(D, 3)); e.set_input("q", rnd(S * H * d, 4));
+        e.set_input("qw", rnd(d, 5)); e.set_input("pos", pos); e.run();
+        std::vector<float> out; for (auto nm : {"s", "h", "r"}) { auto t = e.output(nm); out.insert(out.end(), t.data.begin(), t.data.end()); }
+        return out;
+    };
+    const std::size_t f1 = disp("fused_add_rms_norm"), f2 = disp("fused_rms_rope");
+    auto dev = run(&reg), cpu = run(nullptr);
+    double worst = dev.size() == cpu.size() ? 0 : 1e9;
+    for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) worst = std::max(worst, std::fabs(double(dev[i]) - cpu[i]) / (1.0 + std::fabs(double(cpu[i]))));
+    const bool fused = disp("fused_add_rms_norm") > f1 && disp("fused_rms_rope") > f2, ok = fused && worst < 1e-4;
+    std::printf("%s %s executor runs add+rms_norm and rms_norm+rope fused (%d) and matches the CPU (worst rel %.3g)\n", ok ? "ok  " : "FAIL", api.c_str(), int(fused), worst);
+    return ok ? 0 : 1;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
@@ -185,7 +322,7 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s device: %s (image %s)\n", api.c_str(), rt->device_name().c_str(), rt->image_arch().c_str());
     int dec_fails = 0;
     if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); })
-        if (api == "cuda" || api == "hip") dec_fails = attention_dec_check(*rt, api);
+        if (api == "cuda" || api == "hip") { dec_fails = attention_dec_check(*rt, api); dec_fails += fusion_check(*rt, api); }
     auto shared = std::shared_ptr<RT>(std::move(rt));
     auto reg = graph::gpu_registry(shared);
     auto mma_runs = [&]() -> std::size_t { auto d = shared->dispatches(); auto it = d.find("qmatmul_mma"); return it == d.end() ? 0 : it->second; };
@@ -199,6 +336,8 @@ template<class RT, class Open> static int device_t(Open open) {
     fails += dec_fails;
     fails += qmatmul_check<RT>(*reg, api, mma_runs);
     fails += state_ops_check(*reg, api);
+    if constexpr (requires { shared->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
+        fails += fusion_plan_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     return fails ? 1 : 0;
 }
 

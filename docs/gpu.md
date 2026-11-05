@@ -57,7 +57,10 @@ CUDA embeds two PTX images built from the same `kernels.cu`: `ptx sm_80` (`kerne
 | Quantised matmul_t, otherwise | `forge_qmatmul_t` | q5_k at few rows, or MMVQ off | |
 | Embedding gather from encoded rows | `forge_qgather` | q8_0, q4_k, q6_k, q5_k tables | `FORGE_GPU_QGATHER=0` |
 | rms_norm | `forge_rms_norm_b` (block per row) | when present | |
-| q8_1 fusion | `forge_rms_norm_q81`, `forge_silu_mul_q81` also write the q8_1 form of their output for the next matmul. `forge_rms_norm_q81` reduces with warp shuffles and uses one 1024-thread block for a wide row (rows ≤ 4, cols ≥ 2048) | decode rows inside a run, with MMVQ on | `FORGE_FUSE_Q81=0` |
+| q8_1 fusion | `forge_rms_norm_q81`, `forge_silu_mul_q81` and `forge_attention_comb_q81` (decode attention's combine pass, feeding the output projection) also write the q8_1 form of their output for the next matmul. `forge_rms_norm_q81` reduces with warp shuffles and uses one 1024-thread block for a wide row (rows ≤ 4, cols ≥ 2048) | decode rows inside a run, with MMVQ on | `FORGE_FUSE_Q81=0` |
+| q8r fusion (prefill) | `forge_rms_norm_f` writes the int8 rows and per-group `(d, d·sum)` of its output in `forge_quant_q8r`'s layout (same bytes), so the next tensor-core matmul skips `forge_quant_q8r`; a matmul whose input is the one the q8r scratch already holds (q/k/v, gate/up) also skips it. The scratch's source is tracked like the q8_1 one: dropped by any launch that writes it, an upload, a copy or a free | rms_norm rows ≥ `FORGE_MMQ_MIN_ROWS`, cols % 256 = 0, MMA on (`sm_80` image) | `FORGE_FUSE_Q8R=0` |
+| Residual add + rms_norm | `forge_rms_norm_f`: `s = a + b` and `y = rms_norm(s)` in one pass, plus y's q8_1 (decode) or q8r (prefill) output when the unfused rms_norm would write it. Reduces like the kernel run_op would pick (`forge_rms_norm_b` tree or `forge_rms_norm_q81` shuffles), so results are bit-identical | an `add` step followed by an `rms_norm` of its result (graph `fuse_steps`, device runs; `device_hooks::fused`); same-size inputs, cols % 32 = 0 | `FORGE_FUSE_ADD_NORM=0` |
+| QK-norm + RoPE | `forge_rms_rope`: a 256-thread block per (token, heads), the token's cos/sin computed once (double, as `forge_rope`) for all its heads; bit-identical to `rms_norm` + `forge_rope` | an `rms_norm` whose only consumer is the next step, a `rope` (Qwen3 per-head Q/K norm); head dim a power of two in 32..256 | `FORGE_FUSE_QK_ROPE=0` |
 | Broadcast add/sub/mul/div | `forge_bcast` | the smaller shape is a suffix of the larger | |
 | Gated DeltaNet state ops | `forge_delta_rule_p8` / `_p16` / `_p32`: the recurrent state in registers, a 64-thread block per (value head, 8 state columns); tokens in chunks of 4, the next chunk's q/k/v/g/beta loaded and l2-normalised into a double-buffered shared tile while the current one is computed. Bitwise the same results as `_rN` | CUDA (both images), inside a run; dk ∈ {64, 128, 256}, dv % 8 = 0 | `FORGE_DELTA_RULE_R` (any value) |
 | | `forge_delta_rule_r8` / `_r16` / `_r32`: the state in registers, a 256-thread block per (value head, 32 state columns), q/k read per token | with `FORGE_DELTA_RULE_R`; dv % 32 = 0 | `FORGE_DELTA_RULE_OLD` (any value) |
@@ -147,7 +150,11 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | `FORGE_DELTA_RULE_OLD` | unset | CUDA | Set: use `forge_delta_rule` instead of the register-state kernels |
 | `FORGE_DELTA_RULE_R` | unset | CUDA | Set: use the `forge_delta_rule_rN` register-state kernels instead of the staged `_pN` ones |
 | `FORGE_CAUSAL_CONV_OLD` | unset | CUDA/HIP | Set: use the per-channel `forge_causal_conv` instead of `forge_causal_conv_t` |
-| `FORGE_FUSE_Q81` | on | CUDA/HIP | `0`: rms_norm/silu_mul do not emit q8_1 |
+| `FORGE_FUSE_Q81` | on | CUDA/HIP | `0`: rms_norm/silu_mul/attention_comb do not emit q8_1 |
+| `FORGE_FUSE_Q8R` | on | CUDA | `0`: prefill rms_norm does not emit the tensor-core matmul's int8 rows, and matmuls on the same activation do not share them |
+| `FORGE_FUSE_ADD_NORM` | on | CUDA | `0`: residual add and the following rms_norm run as two kernels |
+| `FORGE_FUSE_QK_ROPE` | on | CUDA | `0`: QK-norm rms_norm and rope run as two kernels |
+| `FORGE_ROPE_HPB` | per shape | CUDA | Heads per `forge_rms_rope` block (tuning) |
 | `FORGE_GPU_QMATMUL` | on | CUDA/HIP | `0`: no device quantised matmul; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` |
 | `FORGE_GPU_QGATHER` | on | CUDA/HIP | `0`: no device quantised gather |
 | `FORGE_GPU_NO_STATE_OPS` | unset | CUDA/HIP | Set: DeltaNet state ops run on the host |

@@ -34,6 +34,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace forge::gpu::cuda_hip {
@@ -495,7 +496,12 @@ public:
     // read the same activation (qkv/z/a/b, gate/up) reuse it instead of re-quantising; any other kernel, copy or free
     // may change that buffer, so launch_s/htod_s/dtod/free_s drop it (q81_keep_ marks run_qmatmul's own launches).
     std::uint64_t q81_src_ = 0; std::uint32_t q81_n_ = 0; bool q81_keep_ = false;
-    void q81_drop() { q81_src_ = 0; }
+    // The q8r scratch (prefill MMA activations) likewise holds the int8 rows of device buffer q8r_src_ ([q8r_n_] floats,
+    // rows x k): written by forge_quant_q8r or by an rms_norm that emits it (forge_rms_norm_f), reused by the next
+    // matmuls on the same input (q/k/v, gate/up) and dropped by the same rules as q81_src_ ($FORGE_FUSE_Q8R=0 off).
+    std::uint64_t q8r_src_ = 0; std::size_t q8r_n_ = 0;
+    static bool fuse_q8r() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q8R"); return !(e && std::string(e) == "0"); }(); return on; }
+    void q81_drop() { q81_src_ = 0; q8r_src_ = 0; }
     // Device ranges the next launch writes (set by callers that know them). launch_s keeps the q8_1 scratch when
     // none of them overlaps its source, so e.g. the a/b/z matmuls of a DeltaNet layer reuse the quantised input of
     // in_proj_qkv across the conv/slice kernels in between; a launch with no declared writes drops it.
@@ -566,7 +572,18 @@ public:
                 q8r_reserve(xbytes + std::size_t(nb) * 8);
                 std::uint64_t xq = q8r_, xds = q8r_ + xbytes;
                 void* qa[] = {&xd, &xq, &xds, &nb};
-                ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                // [q8r reuse] skip the quantisation when the scratch already holds x (an rms_norm emitted it, or the
+                // previous matmul read the same x); this matmul's own launches below keep it (q81_keep_)
+                q81_keep_ = true;
+                if (fuse_q8r() && q8r_src_ == xd && q8r_n_ == std::size_t(rows) * k) ++dispatches_["quant_q8r_reused"];
+                else {
+                    ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                    if (fuse_q8r()) { q8r_src_ = xd; q8r_n_ = std::size_t(rows) * k; }
+                }
+                struct q8r_end { runtime* r; std::uint64_t y; std::size_t n; ~q8r_end() { r->q81_keep_ = false;   // y overwrote a tracked source
+                    auto ov = [&](std::uint64_t s, std::size_t b) { return s && y < s + b && s < y + n; };
+                    if (ov(r->q8r_src_, r->q8r_n_ * 4)) r->q8r_src_ = 0; if (ov(r->q81_src_, std::size_t(r->q81_n_) * 128)) r->q81_src_ = 0; } } q8r_guard{this, yd, out.size() * 4};
+                // [/q8r reuse]
                 std::uint32_t ksplit = 0;
                 void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit};
                 // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
@@ -801,18 +818,124 @@ public:
                     if (rows <= 4 && cols >= 2048) block = 1024; }   // one wide row: a 1024-thread block
                 else if (op == "silu_mul" && n % 32 == 0 && n <= (1u << 18) && has_fn_locked("forge_silu_mul_q81")) {
                     fn = function("forge_silu_mul_q81"); fnb = n / 32; block = 256; grid = (fnb + 7) / 8; }
+                else if (dec && u6 % 32 == 0 && has_fn_locked("forge_attention_comb_q81")) {   // the output projection's input
+                    fn = function("forge_attention_comb_q81"); fnb = nrow * (u6 / 32); }
                 if (fnb) { q81_reserve(std::size_t(fnb) * 40); qx = q81_; args.push_back(&qx); ++dispatches_["fused_q81"]; }
+            }
+            // prefill rms_norm also writes y's q8r rows for the next tensor-core matmul (forge_rms_norm_f, same reduction
+            // as forge_rms_norm_b), which then skips forge_quant_q8r ($FORGE_FUSE_Q8R=0 off)
+            std::uint64_t q8x = 0, q8d = 0, nul = 0; std::uint32_t q8m = 4; bool q8 = false;
+            if (s == sig::rms && !fnb && q8r_emit(rows, cols) && fn == function("forge_rms_norm_b")) {
+                auto [xq, xd2] = q8r_slot(rows, cols); q8x = xq; q8d = xd2; q8 = true;
+                fn = function("forge_rms_norm_f"); args = {&ptrs[0], &nul, &nul, &ptrs[1], &ptrs[2], &rows, &cols, &f0, &q8m, &q8x, &q8d};
+                ++dispatches_["fused_q8r"];
             }
             writes(ptrs.back(), out.size() * 4);
             if (grid) ck(launch_s(fn, grid, 1, 1, block, 1, 1, smem, stream_, args.data(), nullptr), "launch");
             if (fnb) { q81_src_ = ptrs.back(); q81_n_ = fnb; }
+            if (q8) { q8r_src_ = ptrs.back(); q8r_n_ = std::size_t(rows) * cols; }
             if (!in_run_) { ck(dtoh_s(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
     }
 
+    // ---- elementwise fusions (graph::device_hooks::fused): two adjacent plan steps as one kernel, inside a run ----
+    //   "add_rms_norm": in {a, b, w}, out {s = a + b, y = rms_norm(s, w)}            ($FORGE_FUSE_ADD_NORM=0 off)
+    //   "rms_rope":     in {x [s, heads, d], w [d], pos [s]}, out {rope(rms_norm(x, w), pos)}   ($FORGE_FUSE_QK_ROPE=0 off)
+    // attrs: the rms_norm's eps (and the rope's base / neox). The norm reduces as the kernel run_op would pick for the
+    // same rows (forge_rms_norm_b or forge_rms_norm_q81), and add_rms_norm also writes the q8_1 / q8r form of y when
+    // run_op's rms_norm would, so results are bit-identical to the two steps. false = not handled here (the executor
+    // runs the steps one by one): outside a run, a missing kernel, unsupported shapes, or outputs that partly overlap
+    // the inputs (in place is fine).
+    bool run_fused(const std::string& kind, const std::vector<tensor_view>& in, const std::vector<tensor_view>& out, const ops::attrs& a) {
+        auto on = [](const char* v) { auto* e = std::getenv(v); return !(e && std::string(e) == "0"); };
+        static const bool add_norm = on("FORGE_FUSE_ADD_NORM"), qk_rope = on("FORGE_FUSE_QK_ROPE");
+        auto ov = [](const tensor_view& p, const tensor_view& q) { return p.data < q.data + q.size() && q.data < p.data + p.size(); };
+        auto same_or_apart = [&](const tensor_view& p, const tensor_view& q) { return !ov(p, q) || (p.data == q.data && p.size() == q.size()); };
+        for (auto& v : in) if (!v.data) return false;
+        for (auto& v : out) if (!v.data) return false;
+        std::lock_guard lk(mu_); bind(); begin_op();
+        if (!in_run_ || !has_fn_locked("forge_rms_norm_b")) return false;
+        // device pointers: inputs, then outputs (acquired twice: a later acquire may replace an earlier overlapping one)
+        auto bind_all = [&](std::vector<std::uint64_t>& p) {
+            for (int pass = 0; pass < 2; ++pass) {
+                p.clear();
+                for (auto& v : in) p.push_back(acquire(v.data, v.size(), false).ptr);
+                for (auto& v : out) { auto b = acquire(v.data, v.size(), pass == 0); b.e->host_valid = false; p.push_back(b.ptr); }
+            } };
+        const float eps = float(a.num("eps", 1e-6));
+        if (kind == "add_rms_norm" && add_norm && in.size() == 3 && out.size() == 2 && has_fn_locked("forge_rms_norm_f")) {
+            const tensor_view &A = in[0], &B = in[1], &W = in[2], &S = out[0], &Y = out[1];
+            const std::size_t n = S.size(), c = W.size();
+            if (!c || c % 32 || A.size() != n || B.size() != n || Y.size() != n || n % c || n / c > 0xffffffffu || c > 0xffffffffu) return false;
+            if (!same_or_apart(S, A) || !same_or_apart(S, B) || ov(S, Y) || !same_or_apart(Y, A) || !same_or_apart(Y, B) || ov(W, S) || ov(W, Y)) return false;
+            std::uint32_t rows = std::uint32_t(n / c), cols = std::uint32_t(c); unsigned block = 256;
+            std::uint32_t mode = 8u | rms_mode(rows, cols, &block);
+            std::uint64_t xq = 0, xds = 0;
+            if (mode & 1u) { mode |= 2u; q81_reserve(std::size_t(rows) * (cols / 32) * 40); xq = q81_; }
+            else if (q8r_emit(rows, cols)) { mode |= 4u; std::tie(xq, xds) = q8r_slot(rows, cols); }
+            std::vector<std::uint64_t> p; bind_all(p);   // a, b, w, s, y
+            void* args[] = {&p[0], &p[1], &p[3], &p[2], &p[4], &rows, &cols, const_cast<float*>(&eps), &mode, &xq, &xds};
+            writes(p[3], n * 4); writes(p[4], n * 4);
+            if (rows) ck(launch_s(function("forge_rms_norm_f"), rows, 1, 1, block, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (mode & 2u) { q81_src_ = p[4]; q81_n_ = rows * (cols / 32); }
+            if (mode & 4u) { q8r_src_ = p[4]; q8r_n_ = n; }
+            ++dispatches_["fused_add_rms_norm"];
+            return true;
+        }
+        if (kind == "rms_rope" && qk_rope && in.size() == 3 && out.size() == 1 && has_fn_locked("forge_rms_rope")) {
+            const tensor_view &X = in[0], &W = in[1], &Pp = in[2], &Y = out[0];
+            if (X.shape.size() != 3) return false;
+            const i64 s = X.shape[0], H = X.shape[1], d = X.shape[2];
+            if (s <= 0 || H <= 0 || d < 32 || d > 256 || (d & (d - 1)) || i64(W.size()) != d || i64(Pp.size()) != s || Y.size() != X.size() || s * H > 0xffffffffll) return false;
+            if (!same_or_apart(Y, X) || ov(Y, W) || ov(Y, Pp)) return false;
+            unsigned block = 256;
+            std::uint32_t mode = rms_mode(std::uint32_t(s * H), std::uint32_t(d), &block);
+            if (block != 256) return false;
+            std::vector<float> invf(std::size_t(d / 2)); const double base = a.num("base", 10000.0);
+            for (std::size_t j = 0; j < invf.size(); ++j) invf[j] = float(std::pow(base, -2.0 * double(j) / double(d)));   // as run_op's rope
+            auto& tb = rope_[invf];
+            if (!tb) { tb = dmalloc(invf.size() * 4, "scratch"); ck(htod_s(tb, invf.data(), invf.size() * 4, stream_), "memcpy HtoD"); }
+            std::uint64_t tbl = tb;
+            // heads per block: a prefill block takes all of a token's heads (its cos/sin computed once); decode spreads them
+            static const unsigned hpb_env = [] { auto* e = std::getenv("FORGE_ROPE_HPB"); return e ? unsigned(std::strtoul(e, nullptr, 10)) : 0u; }();
+            std::uint32_t hpb = hpb_env ? hpb_env : s >= 32 ? std::uint32_t(H) : std::max<std::uint32_t>(8u, std::uint32_t(256 / d));
+            hpb = std::min<std::uint32_t>(hpb, std::uint32_t(H));
+            std::uint32_t su = std::uint32_t(s), hu = std::uint32_t(H), du = std::uint32_t(d), neox = a.num("neox", 1) != 0;
+            const unsigned grid = su * ((hu + hpb - 1) / hpb);
+            std::vector<std::uint64_t> p; bind_all(p);   // x, w, pos, y
+            void* args[] = {&p[0], &p[1], &p[2], &tbl, &p[3], &su, &hu, &du, const_cast<float*>(&eps), &neox, &hpb, &mode};
+            writes(p[3], Y.size() * 4);
+            ck(launch_s(function("forge_rms_rope"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            ++dispatches_["fused_rms_rope"];
+            return true;
+        }
+        return false;
+    }
+
 private:
+    // How run_op's rms_norm reduces rows x cols inside a run: 1 = forge_rms_norm_q81 (warp shuffles; *block 256, or 1024
+    // for a few wide rows), 0 = forge_rms_norm_b (tree over 256 threads). The fused kernels follow the same choice.
+    unsigned rms_mode(std::uint32_t rows, std::uint32_t cols, unsigned* block) {
+        *block = 256;
+        if (fuse_q81() && use_mmvq() && rows < mmq_min_rows() && cols % 32 == 0 && has_fn_locked("forge_rms_norm_q81")) {
+            if (rows <= 4 && cols >= 2048) *block = 1024;
+            return 1;
+        }
+        return 0;
+    }
+    // a prefill rms_norm output that the next matmul quantises for the tensor cores (run_qmatmul's MMA conditions)
+    bool q8r_emit(std::uint32_t rows, std::uint32_t cols) {
+        return in_run_ && fuse_q8r() && use_mma() && rows >= mmq_min_rows() && cols % 256 == 0 &&
+               has_fn_locked("forge_quant_q8r") && has_fn_locked("forge_rms_norm_f");
+    }
+    // the q8r scratch laid out as run_qmatmul's MMA path expects: int8 rows (padded to 256 bytes), then (d, d*sum) pairs
+    std::pair<std::uint64_t, std::uint64_t> q8r_slot(std::uint32_t rows, std::uint32_t k) {
+        const std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256, nb = std::size_t(rows) * (k / 32);
+        q8r_reserve(xbytes + nb * 8);
+        return {q8r_, q8r_ + xbytes};
+    }
     explicit runtime(api a) : api_(a) {}
     // Driver entry points, normalised: CUDA and HIP module APIs have the same shapes. Optional ones may be null.
     struct fns {
@@ -941,7 +1064,12 @@ private:
         if (!q81_keep_ && q81_src_) {
             bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q81_src_, hi = lo + std::uint64_t(q81_n_) * 128;
             for (unsigned i = 0; i < nwr_ && i < 3; ++i) if (wr_[i][0] < hi && lo < wr_[i][1]) hit = true;
-            if (hit) q81_drop();
+            if (hit) q81_src_ = 0;
+        }
+        if (!q81_keep_ && q8r_src_) {   // the same rule for the q8r scratch's source
+            bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q8r_src_, hi = lo + std::uint64_t(q8r_n_) * 4;
+            for (unsigned i = 0; i < nwr_ && i < 3; ++i) if (wr_[i][0] < hi && lo < wr_[i][1]) hit = true;
+            if (hit) q8r_src_ = 0;
         }
         nwr_ = 0;
         if (!(in_run_ && !user_cap_ && gmode() && st == stream_ && !ex)) {

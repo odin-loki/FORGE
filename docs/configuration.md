@@ -45,7 +45,11 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
 | `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernels (including the tiled `sm_80` ones) |
 | `FORGE_FA_TC=0` | CUDA | Prefill attention on the `sm_80` image uses the f32 tiled kernel instead of the fp16 tensor-core FlashAttention-2 kernel (`forge_attention_fa2tc_*`; Q/K/V/P rounded to fp16, f32 accumulation) |
-| `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` |
+| `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` / the attention combine pass |
+| `FORGE_FUSE_Q8R=0` | CUDA | Prefill `rms_norm` does not write the int8 activation rows for the tensor-core matmul, and consecutive tensor-core matmuls on the same activation (q/k/v, gate/up) each quantise it again |
+| `FORGE_FUSE_ADD_NORM=0` | CUDA | Do not run a residual `add` and the `rms_norm` of its result as one kernel (`forge_rms_norm_f`) |
+| `FORGE_FUSE_QK_ROPE=0` | CUDA | Do not run a per-head `rms_norm` and the `rope` that consumes it (Qwen3 QK-norm) as one kernel (`forge_rms_rope`) |
+| `FORGE_ROPE_HPB` | CUDA | Heads per block of `forge_rms_rope` (default: all of a token's heads at 32+ tokens, else 8); tuning only |
 | `FORGE_PLAN_TRACE` | all devices | If set, print at exit the ops (with shapes and counts) that ran on the host during device runs |
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
 | `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |

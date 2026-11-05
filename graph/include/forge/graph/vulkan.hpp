@@ -90,6 +90,9 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                     return raw->run_state(fn, std::vector<tensor_view>(in.begin(), in.end()), S, sn, out, a); };
         if constexpr (requires { raw->argmax_resident((const float*)nullptr, std::size_t(0)); })
             h->argmax = [raw](const float* p, std::size_t n) { return raw->argmax_resident(p, n); };
+        if constexpr (requires { raw->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
+            h->fused = [raw](const std::string& k, std::span<const tensor_view> in, std::span<const tensor_view> out, const ops::attrs& a) {
+                return raw->run_fused(k, std::vector<tensor_view>(in.begin(), in.end()), std::vector<tensor_view>(out.begin(), out.end()), a); };
         r->hooks = h;
     }
     for (std::size_t i = 0; i < ops::op_count; ++i) {
