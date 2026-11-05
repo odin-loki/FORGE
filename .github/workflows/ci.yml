@@ -32,6 +32,37 @@ jobs:
       - run: cmake --preset dev -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_C_COMPILER=${{ matrix.c }} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
       - run: cmake --build --preset dev -j4
       - run: ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200
+  linux-vulkan:
+    # Vulkan backend on Mesa lavapipe (llvmpipe, CPU): test_vulkan, its 256-byte-alignment rerun and the two
+    # Vulkan goldens. The loader is pinned to the lavapipe ICD; test_vulkan must report an llvmpipe device.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 ccache glslang-tools spirv-tools libvulkan-dev mesa-vulkan-drivers
+      - name: pin the Vulkan loader to lavapipe
+        run: |
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+          test -n "$icd"; cat "$icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-vulkan }
+      - name: configure (Vulkan must be enabled)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DPython3_EXECUTABLE=$(which python) | tee configure.log
+          grep -q "Vulkan backend enabled" configure.log
+      - run: cmake --build build -j4 --target forge test_vulkan
+      - name: test_vulkan on lavapipe
+        run: |
+          rc=0; ./build/test_vulkan | tee vk.log || rc=$?
+          [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
+          grep -q "^vulkan device: llvmpipe" vk.log
+      - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
+      - name: all four Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 4
   linux-tsan:
     runs-on: ubuntu-24.04
     env:
@@ -91,6 +122,16 @@ jobs:
       # apple.mm (UIKit, CoreMotion) and locale_apple.mm only compile in these
       - run: cmake --build build/ios --config Release --target forge_mobile -- -quiet CODE_SIGNING_ALLOWED=NO
       - run: cmake --build build/ios --config Release --target forge_text -- -quiet CODE_SIGNING_ALLOWED=NO
+      # Command-line test executables for the arm64 iOS simulator (Ninja; ld64 ad-hoc signs them), run with
+      # `xcrun simctl spawn` in a booted iPhone simulator.
+      - run: brew install ninja
+      - name: build tests for the iOS simulator
+        run: |
+          cmake -S . -B build/ios-sim -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake -DFORGE_IOS_SIMULATOR=ON -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release -DFORGE_BUILD_TESTS=ON -DFORGE_BUILD_APPS=OFF -DFORGE_BUILD_EXAMPLES=OFF
+          cmake --build build/ios-sim -j4 --target test_os test_text test_locale test_mobile test_util
+      - name: run tests in the iOS simulator
+        timeout-minutes: 20
+        run: sh .github/ios_sim_check.sh build/ios-sim test_os test_text test_locale test_mobile test_util
   windows-msvc:
     runs-on: windows-latest
     steps:
@@ -146,7 +187,7 @@ jobs:
           export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
           sh tests/mobile_build.sh android arm64-v8a
           cmake -S . -B build/android-x86_64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/android-arm64.cmake -DANDROID_ABI=x86_64 -DCMAKE_BUILD_TYPE=Release -DFORGE_BUILD_EXAMPLES=OFF
-          cmake --build build/android-x86_64 -j4 --target forge test_script forge_script_example_plugin test_mobile test_locale test_text
+          cmake --build build/android-x86_64 -j4 --target forge test_script forge_script_example_plugin test_mobile test_locale test_text test_os test_os_ext test_os_sys test_util test_loadbalancer
       - name: host forge for --emit android
         run: |
           cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_EXAMPLES=OFF
