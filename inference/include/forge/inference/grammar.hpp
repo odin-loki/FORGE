@@ -250,6 +250,14 @@ public:
         if (eos_ >= 0 && std::size_t(eos_) < ok.size() && grammar::can_end(stacks_)) ok[std::size_t(eos_)] = 1;
         for (std::size_t i = 0; i < logits.size(); ++i) if (!ok[i]) logits[i] = -INFINITY;
     }
+    // whether `t` may come next (the per-token form of apply(), for sampler::allow); the state is not changed
+    bool allows(int t) const {
+        if (t == eos_) return grammar::can_end(stacks_);
+        if (t < 0 || std::size_t(t) >= tokens_.size() || tokens_[std::size_t(t)].empty()) return false;
+        auto st = stacks_;
+        for (unsigned char c : tokens_[std::size_t(t)]) { st = g_->advance(st, c); if (st.empty()) return false; }
+        return true;
+    }
     // advance on a sampled token; returns false if the token was not allowed
     bool accept(int t) {
         if (t == eos_) return grammar::can_end(stacks_);

@@ -48,7 +48,9 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--logits FILE` | | Write the prefill logits as raw f32 |
 | `--verify` | off | Check BLAKE3 hashes on open |
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
-| `--draft draft.fpk [--spec-k 4]` | | Speculative decoding with a draft model |
+| `--draft draft.fpk` | | Speculative decoding with a draft model |
+| `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
+| `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
 | `--codec C` | `f32` | Codec for on-the-fly import of non-`.fpk` inputs |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 

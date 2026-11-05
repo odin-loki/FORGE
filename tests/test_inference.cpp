@@ -128,6 +128,41 @@ TEST(lookup_speculation_exact) {
     double tv = 0; for (std::size_t i = 0; i < pw.size(); ++i) tv += std::abs(cnt[i] / N - pw[i]);
     CHECK_MSG(tv / 2 < 0.08, "lookup tv %.3f", tv / 2);
 }
+TEST(spec_planner_and_ngram_index) {
+    // costs: 1 row 10 ms, each extra row +1 ms; acceptance ~0.9 -> drafts pay; acceptance ~0 -> none (plus probes)
+    spec_planner pl;
+    for (int r = 1; r <= 9; ++r) for (int i = 0; i < 3; ++i) pl.observe_pass(r, 0.010 + 0.001 * (r - 1));
+    for (int i = 0; i < 100; ++i) pl.observe_drafts(8, 8);
+    CHECK(pl.choose(8) == 8);
+    spec_planner bad;
+    for (int r = 1; r <= 9; ++r) for (int i = 0; i < 3; ++i) bad.observe_pass(r, 0.010 * r);
+    for (int i = 0; i < 100; ++i) bad.observe_drafts(4, 0);
+    int forced = 0; for (int i = 0; i < 32; ++i) forced += bad.choose(8);
+    CHECK(forced == 2 && bad.probes() == 2);   // one 1-draft probe every 16 refusals
+    ngram_index ix(3);
+    ix.push(std::vector<int>{1, 2, 3, 9, 1, 2, 3});
+    CHECK((ix.draft(4) == std::vector<int>{9, 1, 2, 3}));
+    ngram_index rep(2); rep.push(std::vector<int>{5, 6, 5, 6});
+    CHECK((rep.draft(4) == std::vector<int>{5, 6, 5, 6}));   // periodic continuation
+    ngram_index none(3); none.push(std::vector<int>{1, 2, 3});
+    CHECK(none.draft(4).empty());
+}
+TEST(lookup_planner_and_seed_exact) {
+    // planner mode (k = 0) and sampling with a fixed seed: identical text to plain decoding (CPU logits)
+    auto tm = model::open(model_a());
+    std::vector<int> p = {256, 72, 101, 108, 108, 111, 32, 72, 101, 108, 108, 111, 32, 72, 101};
+    inference::session ref(tm); auto want = greedy(ref, p, 40);
+    inference::session t(tm); sampler g; speculative_stats st;
+    CHECK(lookup_generate(t, p, 40, g, 0, 3, {}, &st) == want);
+    sampler_config sc{.temperature = 0.8f, .top_k = 20, .seed = 11};
+    sampler a(sc), b(sc); inference::session r2(tm), t2(tm);
+    auto plain = r2.generate(p, 30, a);
+    CHECK(lookup_generate(t2, p, 30, b, 4, 3) == plain);
+    auto hm = model::open(model_h());
+    inference::session hr(hm), ht(hm); auto hw = greedy(hr, p, 30);
+    sampler g2; speculative_stats hs;
+    CHECK(lookup_generate(ht, p, 30, g2, 0, 3, {}, &hs) == hw);
+}
 TEST(presence_frequency_penalties) {
     std::vector<float> l = {1.f, 1.f, 1.f, 0.5f};
     std::vector<int> h = {0, 0, 0, 1};
