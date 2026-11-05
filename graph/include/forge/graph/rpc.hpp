@@ -165,6 +165,9 @@ public:
     struct script_result { bool ok = false; std::string error_type, error, output; };
     // Runs a remote script; set by the host (apps/forge.cpp wires forge::script). Null = scripts unsupported.
     std::function<script_result(const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t timeout_ms)> script_handler;
+    // Security log (optional): authentications with the principal and its permissions, refusals, permission denials.
+    // Called from connection threads.
+    std::function<void(const std::string&)> log;
     server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1", server_security sec = {}) : reg_(reg ? reg : &registry::cpu()), sec_(std::move(sec)) {
         detail::wsa();
         if (!sec_.tls.client_ca_file.empty() && sec_.tls.cert_file.empty()) raise(errc::invalid_argument, "rpc: client certificates (mTLS) need TLS (a server certificate and key)");
@@ -175,7 +178,8 @@ public:
             raise(errc::unsupported, "rpc: TLS requested but this build has no TLS (rebuild with OpenSSL)");
 #endif
         }
-        if (sec_.allow_scripts && !sec_.auth_required()) raise(errc::invalid_argument, "rpc: remote scripts need authentication (tokens or authorized keys)");
+        if (!sec_.client_map.empty() && sec_.tls.client_ca_file.empty()) raise(errc::invalid_argument, "rpc: a client certificate map needs client certificates (mTLS: a client CA)");
+        if (sec_.allow_scripts && !sec_.has_credentials()) raise(errc::invalid_argument, "rpc: remote scripts need authentication (tokens or authorized keys)");
         auto l = os::socket::listen(bind, port, 8);
         if (!l) raise(errc::io_error, "rpc: cannot listen on {}:{}: {}", bind, port, l.err.what);
         ls_ = std::move(l.value); port_ = ls_.local_port();
@@ -218,7 +222,8 @@ private:
 #ifdef FORGE_HAVE_TLS
         if (tls_) { s.sock().set_timeout_ms(15000); if (!s.accept_tls(tls_, nullptr)) return; s.sock().set_timeout_ms(0); }
 #endif
-        peer_info peer; bool first = true;
+        peer_info peer; bool first = true; auto conn_id = ++conn_seq_;
+        auto say = [&](const std::string& m) { if (log) log("conn " + std::to_string(conn_id) + ": " + m); };
         for (;;) {
 #if defined(_WIN32)
             // Winsock: shutdown() from stop() does not reliably wake a blocked recv(), so idle between requests in slices.
@@ -230,10 +235,13 @@ private:
             if (!r.ok) return;
             if (first) {
                 first = false;
-                if (!server_auth(s, sec_, magic, peer)) return;
-                if (peer.authed) continue;   // handshake consumed; next frame
+                std::string why;
+                if (!server_auth(s, sec_, magic, peer, &why)) { say("refused: " + (why.empty() ? std::string("connection lost during authentication") : why)); return; }
+                if (peer.authed) say("authenticated " + peer.who + " allow=" + perms_string(peer.perms));
+                else say("unauthenticated (no auth configured)");
+                if (peer.handshake) continue;   // handshake consumed; next frame
             }
-            if (std::memcmp(magic, "FRPS", 4) == 0) { if (!serve_script(s, r, peer)) return; continue; }
+            if (std::memcmp(magic, "FRPS", 4) == 0) { if (!serve_script(s, r, peer, say)) return; continue; }
             if (std::memcmp(magic, "FRPC", 4) != 0) return;
             auto name = r.str(256); auto a = detail::get_attrs(r);
             auto n = r.u32(); if (n > 64) return;
@@ -247,7 +255,7 @@ private:
             detail::writer w;
             int oi = detail::op_index(name);
             try {
-                if (!(peer.perms & perm_device)) raise(errc::unsupported,"permission denied: this key may not run device ops (authorized_keys allow=)");
+                if (!(peer.perms & perm_device)) { say("denied device op " + name + " for " + peer.who); raise(errc::unsupported, "permission denied: {} may not run device ops (allow=)", peer.who); }
                 if (oi < 0) raise(errc::unsupported, "unknown op '{}'", name);
                 tensor out(os);
                 auto& l = reg_->select(ops::op(oi), shapes, os, a);
@@ -261,16 +269,16 @@ private:
             if (!detail::send_all(s, w.b.data(), w.b.size())) return;
         }
     }
-    bool serve_script(channel& s, detail::reader& r, const peer_info& peer) {
+    template <class Log> bool serve_script(channel& s, detail::reader& r, const peer_info& peer, Log& say) {
         auto src = r.str(16u << 20); auto name = r.str(4096); auto n = r.u32(); if (!r.ok || n > 4096) return false;
         std::vector<std::string> argv; for (std::uint32_t i = 0; i < n && r.ok; ++i) argv.push_back(r.str(1 << 20));
         auto tmo = r.u32(); if (!r.ok) return false;
         detail::writer w;
         if (!sec_.allow_scripts || !peer.authed) { w.u32(1); w.str("remote scripts are disabled on this server"); }
-        else if (!(peer.perms & perm_scripts)) { w.u32(1); w.str("permission denied: this key may not run scripts (authorized_keys allow=)"); }
+        else if (!(peer.perms & perm_scripts)) { say("denied script for " + peer.who); w.u32(1); w.str("permission denied: " + peer.who + " may not run scripts (allow=)"); }
         else if (!script_handler) { w.u32(1); w.str("this server has no script runtime"); }
         else {
-            script_result res;
+            script_result res; say("script '" + name + "' for " + peer.who);
             try { res = script_handler(src, name, argv, tmo); } catch (const std::exception& e) { res.ok = false; res.error_type = "RuntimeError"; res.error = e.what(); }
             w.u32(0); w.u32(res.ok ? 1 : 0); w.str(res.error_type); w.str(res.error); w.str(res.output); ++scripts_;
         }
@@ -290,7 +298,7 @@ private:
 #ifdef FORGE_HAVE_TLS
     std::shared_ptr<SSL_CTX> tls_;
 #endif
-    std::atomic<bool> stop_{false}; std::atomic<std::uint64_t> ops_{0};
+    std::atomic<bool> stop_{false}; std::atomic<std::uint64_t> ops_{0}, conn_seq_{0};
     std::thread th_; std::mutex m_, dev_m_; struct conn { std::shared_ptr<channel> ch; std::shared_ptr<std::atomic<bool>> done; std::thread th; };
     std::vector<conn> conns_;
 };

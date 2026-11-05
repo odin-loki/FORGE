@@ -17,7 +17,9 @@
 // runs scripts. Tokens are compared in constant time; nonces come from the OS CSPRNG (os::entropy).
 // authorized_keys lines may carry an ssh-style options prefix limiting what the key may do:
 //   [allow=PERM[,PERM...]] <64-hex public key> [comment]        PERM: device | scripts | all
-// A line without options grants everything (the format before options existed).
+// A line without options grants everything (the format before options existed). Token files use the same options
+// ("[allow=...] <token> [name]"), and an mTLS client map ("[allow=...] sha256:<hex>|cn:<name> [comment]") limits
+// what each client certificate may do; a request must be allowed by both its token/key and its certificate.
 #include <forge/os/os.hpp>
 #include <array>
 #include <cstring>
@@ -46,7 +48,8 @@ inline constexpr std::string_view auth_context = "forge-rpc-auth-v1";
 inline constexpr std::string_view auth_context_bound = "forge-rpc-auth-v2";
 inline constexpr std::string_view token_context_bound = "forge-rpc-token-v2";
 
-// What an authenticated peer may do (authorized_keys "allow=" option). Tokens and unauthenticated legacy peers get all.
+// What an authenticated peer may do ("allow=" option of authorized_keys, token files and client maps). Bare tokens,
+// keys without options and unauthenticated legacy peers get all.
 enum perm : unsigned { perm_none = 0, perm_device = 1, perm_scripts = 2, perm_all = perm_device | perm_scripts };
 
 namespace sec {
@@ -123,36 +126,115 @@ inline std::string perms_string(unsigned p) {
     if (p == perm_none) return "none";
     return p & perm_device ? "device" : "scripts";
 }
-// authorized_keys text: one key per line, '#' comments, optional options before the key (see the header comment).
-// Unknown options or permissions are errors (fail closed).
-inline std::vector<authorized_key> parse_authorized_keys(std::string_view text) {
-    std::vector<authorized_key> out; std::size_t lineno = 0;
-    auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+namespace sec {
+// Config text (authorized_keys, token files, client-certificate maps): one entry per line, fields separated by
+// blanks, blank lines and lines starting with '#' ignored. fn(lineno, fields).
+template <class F> void for_each_config_line(std::string_view text, F&& fn) {
+    std::size_t lineno = 0; auto is_ws = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
     while (!text.empty()) {
         ++lineno; auto nl = text.find('\n'); auto line = text.substr(0, nl); text = nl == std::string_view::npos ? std::string_view{} : text.substr(nl + 1);
         std::vector<std::string_view> f;
         for (std::size_t i = 0; i < line.size();) { while (i < line.size() && is_ws(line[i])) ++i; auto j = i; while (j < line.size() && !is_ws(line[j])) ++j; if (j > i) f.push_back(line.substr(i, j - i)); i = j; }
         if (f.empty() || f[0][0] == '#') continue;
+        fn(lineno, f);
+    }
+}
+// One "allow=PERM[,PERM...]" option; repeated options add up. Anything else is an error (fail closed).
+inline void apply_option(std::string_view what, std::size_t lineno, std::string_view f, unsigned& p, bool& have_allow) {
+    auto eq = f.find('=');
+    if (f.substr(0, eq) != "allow" || eq == std::string_view::npos) raise(errc::parse_error, "{} line {}: unknown option '{}'", what, lineno, f.substr(0, eq));
+    unsigned v;
+    try { v = parse_perms(f.substr(eq + 1)); }
+    catch (const std::exception& e) { std::string_view m = e.what(); if (m.starts_with("rpc: ")) m.remove_prefix(5); raise(errc::parse_error, "{} line {}: {}", what, lineno, m); }
+    p = have_allow ? (p | v) : v; have_allow = true;
+}
+inline std::string join_from(const std::vector<std::string_view>& f, std::size_t i) { std::string s; for (; i < f.size(); ++i) { if (!s.empty()) s += ' '; s += f[i]; } return s; }
+} // namespace sec
+
+// authorized_keys text: one key per line, '#' comments, optional options before the key (see the header comment).
+// Unknown options or permissions are errors (fail closed).
+inline std::vector<authorized_key> parse_authorized_keys(std::string_view text) {
+    std::vector<authorized_key> out;
+    sec::for_each_config_line(text, [&](std::size_t lineno, const std::vector<std::string_view>& f) {
         std::uint8_t tmp[32]; std::size_t k = 0; unsigned p = perm_all; bool have_allow = false;
         for (; k < f.size() && !sec::unhex(f[k], tmp, 32); ++k) {
-            auto eq = f[k].find('=');
-            if (eq == std::string_view::npos) raise(errc::parse_error, "authorized_keys line {}: '{}' is neither a 64-hex key nor an option", lineno, f[k]);
-            if (f[k].substr(0, eq) != "allow") raise(errc::parse_error, "authorized_keys line {}: unknown option '{}'", lineno, f[k].substr(0, eq));
-            auto v = parse_perms(f[k].substr(eq + 1)); p = have_allow ? (p | v) : v; have_allow = true;
+            if (f[k].find('=') == std::string_view::npos) raise(errc::parse_error, "authorized_keys line {}: '{}' is neither a 64-hex key nor an option", lineno, f[k]);
+            sec::apply_option("authorized_keys", lineno, f[k], p, have_allow);
         }
         if (k == f.size()) raise(errc::parse_error, "authorized_keys line {}: no 64-hex public key", lineno);
-        std::string comment; for (auto i = k + 1; i < f.size(); ++i) { if (!comment.empty()) comment += ' '; comment += f[i]; }
-        out.emplace_back(std::string(f[k]), p, std::move(comment));
-    }
+        out.emplace_back(std::string(f[k]), p, sec::join_from(f, k + 1));
+    });
+    return out;
+}
+
+// One accepted bearer token and what it may do. Constructible from a bare token (full access), as before scopes.
+struct token_entry {
+    std::string token;
+    unsigned perms = perm_all;
+    std::string name;                           // comment from the token file; used in logs instead of the token
+    token_entry() = default;
+    token_entry(std::string t, unsigned p = perm_all, std::string n = {}) : token(std::move(t)), perms(p), name(std::move(n)) {}
+    token_entry(const char* t) : token_entry(std::string(t)) {}
+};
+// Token file (`--token-file`): one token per line, as authorized_keys but with a token instead of a key:
+//   [allow=PERM[,PERM...]] <token> [name]
+// A line without options grants everything (a file holding just a token keeps working). Leading fields that start
+// with "allow=" are options, so a token may contain '=' (base64) but may not itself start with "allow=".
+inline std::vector<token_entry> parse_tokens(std::string_view text, std::string_view what = "token file") {
+    std::vector<token_entry> out;
+    sec::for_each_config_line(text, [&](std::size_t lineno, const std::vector<std::string_view>& f) {
+        std::size_t k = 0; unsigned p = perm_all; bool have_allow = false;
+        for (; k < f.size() && f[k].starts_with("allow="); ++k) sec::apply_option(what, lineno, f[k], p, have_allow);
+        if (k == f.size()) raise(errc::parse_error, "{} line {}: no token", what, lineno);
+        out.emplace_back(std::string(f[k]), p, sec::join_from(f, k + 1));
+    });
+    return out;
+}
+
+// mTLS client-certificate map (`--tls-client-map`): which verified client certificates are accepted and what each
+// may do. One rule per line:
+//   [allow=PERM[,PERM...]] sha256:<64 hex, ':' separators allowed> [comment]
+//   [allow=PERM[,PERM...]] cn:<subject common name, no blanks>     [comment]
+// A certificate matches its fingerprint rule first, else the rule for its (single) subject CN. With a map, a
+// certificate that matches no rule is refused.
+struct cert_rule {
+    enum kind_t { sha256, cn } kind = sha256;
+    std::string value;                          // lower-case hex fingerprint, or the CN
+    unsigned perms = perm_all;
+    std::string comment;
+};
+inline std::vector<cert_rule> parse_client_map(std::string_view text, std::string_view what = "client map") {
+    std::vector<cert_rule> out;
+    sec::for_each_config_line(text, [&](std::size_t lineno, const std::vector<std::string_view>& f) {
+        std::size_t k = 0; unsigned p = perm_all; bool have_allow = false;
+        for (; k < f.size() && !f[k].starts_with("sha256:") && !f[k].starts_with("cn:"); ++k) sec::apply_option(what, lineno, f[k], p, have_allow);
+        if (k == f.size()) raise(errc::parse_error, "{} line {}: no certificate identity (want sha256:<hex> or cn:<name>)", what, lineno);
+        cert_rule r; r.perms = p; r.comment = sec::join_from(f, k + 1);
+        if (f[k].starts_with("cn:")) {
+            r.kind = cert_rule::cn; r.value = std::string(f[k].substr(3));
+            if (r.value.empty()) raise(errc::parse_error, "{} line {}: empty cn:", what, lineno);
+        } else {
+            std::string h; for (char c : f[k].substr(7)) if (c != ':') h += char(std::tolower(static_cast<unsigned char>(c)));
+            std::uint8_t tmp[32];
+            if (!sec::unhex(h, tmp, 32)) raise(errc::parse_error, "{} line {}: sha256: wants a 64-hex certificate fingerprint", what, lineno);
+            r.value = h;
+        }
+        for (auto& o : out) if (o.kind == r.kind && o.value == r.value) raise(errc::parse_error, "{} line {}: duplicate rule for {}", what, lineno, f[k]);
+        out.push_back(std::move(r));
+    });
     return out;
 }
 
 struct server_security {
-    std::vector<std::string> tokens;            // accepted bearer tokens (full access)
+    std::vector<token_entry> tokens;            // accepted bearer tokens and what each may do
     std::vector<authorized_key> authorized_keys;// accepted ed25519 public keys and what each may do
     tls_server_config tls;                      // cert+key set = TLS required; client_ca_file = mTLS
-    bool allow_scripts = false;                 // FRPS frames (remote script execution); requires auth
-    bool auth_required() const { return !tokens.empty() || !authorized_keys.empty(); }
+    std::vector<cert_rule> client_map;          // mTLS identities -> permissions (needs tls.client_ca_file)
+    bool allow_scripts = false;                 // FRPS frames (remote script execution); requires tokens or keys
+    // Tokens or keys configured: every peer must present one (a client certificate alone is not enough).
+    bool has_credentials() const { return !tokens.empty() || !authorized_keys.empty(); }
+    // Some proof of identity is required: credentials, or (with only a client map) a mapped client certificate.
+    bool auth_required() const { return has_credentials() || !client_map.empty(); }
 };
 struct client_security {
     std::string token;                          // method 1
@@ -238,6 +320,34 @@ public:
         if (!ssl_) return {};
         X509* c = SSL_get1_peer_certificate(ssl_.get()); if (!c) return {};
         char b[256] = {}; X509_NAME_oneline(X509_get_subject_name(c), b, sizeof b); X509_free(c); return b;
+#else
+        return {};
+#endif
+    }
+    // mTLS: SHA-256 of the client certificate (DER), lower-case hex ("" when there is none).
+    std::string peer_cert_sha256() const {
+#ifdef FORGE_HAVE_TLS
+        if (!ssl_) return {};
+        X509* c = SSL_get1_peer_certificate(ssl_.get()); if (!c) return {};
+        unsigned char md[EVP_MAX_MD_SIZE]; unsigned n = 0; bool ok = X509_digest(c, EVP_sha256(), md, &n) == 1; X509_free(c);
+        return ok ? sec::hex(md, n) : std::string{};
+#else
+        return {};
+#endif
+    }
+    // mTLS: the subject common name, UTF-8 ("" when there is no certificate, no CN, more than one CN, or a CN with NUL).
+    std::string peer_cert_cn() const {
+#ifdef FORGE_HAVE_TLS
+        if (!ssl_) return {};
+        X509* c = SSL_get1_peer_certificate(ssl_.get()); if (!c) return {};
+        std::string out; X509_NAME* nm = X509_get_subject_name(c);
+        int i = X509_NAME_get_index_by_NID(nm, NID_commonName, -1);
+        if (i >= 0 && X509_NAME_get_index_by_NID(nm, NID_commonName, i) < 0) {
+            unsigned char* u = nullptr; int n = ASN1_STRING_to_UTF8(&u, X509_NAME_ENTRY_get_data(X509_NAME_get_entry(nm, i)));
+            if (n > 0 && std::memchr(u, 0, std::size_t(n)) == nullptr) out.assign(reinterpret_cast<char*>(u), std::size_t(n));
+            OPENSSL_free(u);
+        }
+        X509_free(c); return out;
 #else
         return {};
 #endif
@@ -344,28 +454,58 @@ inline bool client_auth(channel& c, const client_security& s, std::string* why) 
     return sec::status(c, why);
 }
 
-// The peer of one connection: whether it proved an identity, who, and what it may do.
-struct peer_info { bool authed = false; unsigned perms = perm_all; std::string who; };
+// The peer of one connection: whether it proved an identity, who (for logs: "token#2 (ci)", "key:d75a9801 (alice)",
+// "cert:cn=forge-client", or both credential and certificate), and what it may do. handshake = an FRPH hello was
+// consumed (the frame that came with it is done).
+struct peer_info { bool authed = false; unsigned perms = perm_all; std::string who; bool handshake = false; };
+
+// mTLS client map lookup: the rule for this connection's client certificate (fingerprint rules first, then CN), or
+// null. `who` names the certificate either way.
+inline const cert_rule* match_client_cert(const channel& c, const std::vector<cert_rule>& map, std::string& who) {
+    auto fp = c.peer_cert_sha256(), cn = c.peer_cert_cn();
+    who = fp.empty() ? "cert:none" : "cert:sha256:" + fp.substr(0, 16) + (cn.empty() ? "" : " cn=" + cn);
+    if (fp.empty()) return nullptr;
+    for (auto& r : map) if (r.kind == cert_rule::sha256 && sec::ct_equal(r.value, fp)) { who = "cert:sha256:" + fp.substr(0, 16) + (r.comment.empty() ? "" : " (" + r.comment + ")"); return &r; }
+    if (!cn.empty()) for (auto& r : map) if (r.kind == cert_rule::cn && r.value == cn) { who = "cert:cn=" + cn + (r.comment.empty() ? "" : " (" + r.comment + ")"); return &r; }
+    return nullptr;
+}
 
 // Server half. `first4` is the frame magic already read. Returns true when the peer may proceed; `peer` gets its
-// identity and permissions (an unauthenticated peer of a no-auth server: authed = false, perms = all).
-inline bool server_auth(channel& c, const server_security& s, const char first4[4], peer_info& peer) {
+// identity and permissions (an unauthenticated peer of a no-auth server: authed = false, perms = all). On refusal
+// `why` (if given) gets a description for the server log.
+// With a client map (mTLS): the certificate must match a rule. Its permissions are intersected with those of the
+// token or key; when the server has no tokens or keys, the mapped certificate alone authenticates, for device ops
+// only (remote scripts always need a token or key).
+inline bool server_auth(channel& c, const server_security& s, const char first4[4], peer_info& peer, std::string* why = nullptr) {
     peer = {};
-    if (std::memcmp(first4, "FRPH", 4) != 0) { if (s.auth_required()) { sec::reject(c, "authentication required"); return false; } return true; }
+    auto refuse = [&](std::string_view to_client, std::string log = {}) {
+        sec::reject(c, to_client); if (why) *why = log.empty() ? std::string(to_client) : std::move(log); return false; };
+    const cert_rule* cert = nullptr; std::string cert_who;
+    bool mapped = !s.client_map.empty();
+    if (mapped) cert = match_client_cert(c, s.client_map, cert_who);
+    if (std::memcmp(first4, "FRPH", 4) != 0) {
+        if (mapped && !cert) return refuse("permission denied: client certificate not authorized", cert_who + " is not in the client map");
+        if (s.has_credentials()) return refuse("authentication required");
+        if (cert) { peer.authed = true; peer.perms = cert->perms & perm_device; peer.who = cert_who; }
+        return true;
+    }
+    peer.handshake = true;
     std::uint32_t method; if (!sec::get_u32(c, method)) return false;
     bool tls = c.tls(); auto cb = c.channel_binding();
-    if (tls && cb.empty()) { sec::reject(c, "cannot derive the TLS channel binding"); return false; }
-    if (tls && (method == 1 || method == 2)) { sec::reject(c, "TLS connections need channel-bound authentication (client too old?)"); return false; }
-    if (!tls && (method == 3 || method == 4)) { sec::reject(c, "channel-bound authentication needs TLS"); return false; }
+    if (tls && cb.empty()) return refuse("cannot derive the TLS channel binding");
+    if (tls && (method == 1 || method == 2)) return refuse("TLS connections need channel-bound authentication (client too old?)");
+    if (!tls && (method == 3 || method == 4)) return refuse("channel-bound authentication needs TLS");
     if (method == 1 || method == 3) {
-        bool ok = false;
-        if (method == 1) { std::string tok; if (!sec::get_str(c, tok, 4096)) return false; for (auto& t : s.tokens) ok |= sec::ct_equal(t, tok); }
-        else {
+        const token_entry* hit = nullptr; std::size_t idx = 0;
+        if (method == 1) {
+            std::string tok; if (!sec::get_str(c, tok, 4096)) return false;
+            for (std::size_t i = 0; i < s.tokens.size(); ++i) if (sec::ct_equal(s.tokens[i].token, tok)) { hit = &s.tokens[i]; idx = i; }
+        } else {
             std::uint8_t mac[64]; if (!c.recv_all(mac, 64)) return false;
-            for (auto& t : s.tokens) { auto want = sec::token_mac(t, cb); ok |= sec::ct_equal_bytes(want.data(), mac, 64); }
+            for (std::size_t i = 0; i < s.tokens.size(); ++i) { auto want = sec::token_mac(s.tokens[i].token, cb); if (sec::ct_equal_bytes(want.data(), mac, 64)) { hit = &s.tokens[i]; idx = i; } }
         }
-        if (!ok) { sec::reject(c, "bad token"); return false; }
-        peer.who = "token"; peer.perms = perm_all;
+        if (!hit) return refuse("bad token");
+        peer.who = "token#" + std::to_string(idx + 1) + (hit->name.empty() ? "" : " (" + hit->name + ")"); peer.perms = hit->perms;
     } else if (method == 2 || method == 4) {
         std::uint8_t pub[32]; if (!c.recv_all(pub, 32)) return false;
         auto ph = sec::hex(pub, 32); const authorized_key* known = nullptr;
@@ -374,9 +514,13 @@ inline bool server_auth(channel& c, const server_security& s, const char first4[
         if (!c.send_all(nonce, 32)) return false;
         std::uint8_t sig[64]; if (!c.recv_all(sig, 64)) return false;
         auto m = method == 4 ? sec::auth_message_bound(nonce, pub, cb) : sec::auth_message(nonce, pub);
-        if (!known || crypto_ed25519_check(sig, pub, m.data(), m.size()) != 0) { sec::reject(c, "key not authorized"); return false; }
-        peer.who = "key:" + ph.substr(0, 8); peer.perms = known->perms;
-    } else { sec::reject(c, "unknown auth method"); return false; }
+        if (!known || crypto_ed25519_check(sig, pub, m.data(), m.size()) != 0) return refuse("key not authorized", "key not authorized: " + ph.substr(0, 16));
+        peer.who = "key:" + ph.substr(0, 8) + (known->comment.empty() ? "" : " (" + known->comment + ")"); peer.perms = known->perms;
+    } else return refuse("unknown auth method");
+    if (mapped) {
+        if (!cert) return refuse("permission denied: client certificate not authorized", peer.who + " with " + cert_who + " not in the client map");
+        peer.perms &= cert->perms; peer.who += " " + cert_who;
+    }
     peer.authed = true;
     return sec::put_u32(c, 0);
 }
