@@ -550,7 +550,7 @@ else()
     list(APPEND _qi8_defs FORGE_QI8_HAVE_AVXVNNI=1 FORGE_QI8_HAVE_AVX512VNNI=1)
   else()
     include(CheckCXXSourceCompiles)
-    set(_qi8_v3 "-mavx2;-mfma;-mf16c;-mbmi2")
+    set(_qi8_v3 "-mavx2;-mfma;-mf16c;-mbmi2;-ffp-contract=off")   # no fused multiply-adds: every path gives the scalar reference's bits
     set_source_files_properties(simd/src/qi8_avx2.cpp PROPERTIES COMPILE_OPTIONS "${_qi8_v3}")
     set(CMAKE_REQUIRED_FLAGS "-mavx2 -mfma -mf16c -mavxvnni")
     check_cxx_source_compiles("#include <immintrin.h>\nint main(){__m256i a=_mm256_setzero_si256();a=_mm256_dpbusd_avx_epi32(a,a,a);return _mm256_extract_epi32(a,0);}" FORGE_CAN_AVXVNNI)

@@ -8,6 +8,7 @@
 // reduce16 (16 vectors -> one vector of their 16 sums) with that same tree per vector, so all backends agree
 // bit for bit.
 #include <forge/simd/seq.hpp>
+#include <forge/core/fma.hpp>   // MinGW's fmaf rounds twice: the scalar table must fuse exactly like the vector ones
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -30,16 +31,16 @@ inline float exp_s(float x) {
     float t = x * 1.44269504088896341f;
     float n = t + 12582912.0f;
     n = n - 12582912.0f;
-    float r = std::fma(n, -0.693359375f, x);
-    r = std::fma(n, 2.12194440e-4f, r);
+    float r = forge::fmaf_exact(n, -0.693359375f, x);
+    r = forge::fmaf_exact(n, 2.12194440e-4f, r);
     float p = 1.9875691500e-4f;
-    p = std::fma(p, r, 1.3981999507e-3f);
-    p = std::fma(p, r, 8.3334519073e-3f);
-    p = std::fma(p, r, 4.1665795894e-2f);
-    p = std::fma(p, r, 1.6666665459e-1f);
-    p = std::fma(p, r, 5.0000001201e-1f);
+    p = forge::fmaf_exact(p, r, 1.3981999507e-3f);
+    p = forge::fmaf_exact(p, r, 8.3334519073e-3f);
+    p = forge::fmaf_exact(p, r, 4.1665795894e-2f);
+    p = forge::fmaf_exact(p, r, 1.6666665459e-1f);
+    p = forge::fmaf_exact(p, r, 5.0000001201e-1f);
     float r2 = r * r;
-    float y = std::fma(p, r2, r);
+    float y = forge::fmaf_exact(p, r2, r);
     y = y + 1.0f;
     std::uint32_t bits = std::uint32_t(int(n) + 127) << 23;
     float s; std::memcpy(&s, &bits, 4);
@@ -187,7 +188,7 @@ inline V load_i8n(const std::int8_t* p, std::size_t n) { V r = zero(); for (std:
 inline V add(V a, V b) { for (int i = 0; i < 16; ++i) a.v[i] = a.v[i] + b.v[i]; return a; }
 inline V sub(V a, V b) { for (int i = 0; i < 16; ++i) a.v[i] = a.v[i] - b.v[i]; return a; }
 inline V mul(V a, V b) { for (int i = 0; i < 16; ++i) a.v[i] = a.v[i] * b.v[i]; return a; }
-inline V fma(V a, V b, V c) { for (int i = 0; i < 16; ++i) c.v[i] = std::fma(a.v[i], b.v[i], c.v[i]); return c; }
+inline V fma(V a, V b, V c) { for (int i = 0; i < 16; ++i) c.v[i] = forge::fmaf_exact(a.v[i], b.v[i], c.v[i]); return c; }
 inline V vmax(V a, V b) { for (int i = 0; i < 16; ++i) a.v[i] = std::max(a.v[i], b.v[i]); return a; }
 inline float hmax(V a) { float m = a.v[0]; for (int i = 1; i < 16; ++i) m = std::max(m, a.v[i]); return m; }
 inline float hsum(V a) {
@@ -330,7 +331,7 @@ inline void attn_merge(float* M, float* L, float* A, float m, float l, const flo
     float Mn = std::max(*M, m);
     float a = exp_s(*M - Mn), b = exp_s(m - Mn);
     float lb = l * b;
-    *L = std::fma(*L, a, lb);
+    *L = forge::fmaf_exact(*L, a, lb);
     *M = Mn;
     V va = splat(a), vb = splat(b);
     std::size_t e = 0;

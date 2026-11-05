@@ -14,6 +14,7 @@
 // qi8_kernels is a dispatch table separate from simd::kernels: it is chosen once from the CPU's integer
 // dot-product support (avx512vnni > avxvnni > avx2 > scalar), FORGE_QI8_TARGET overrides.
 #include <forge/simd/qdot.hpp>
+#include <forge/core/fma.hpp>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -46,7 +47,7 @@ inline std::size_t block_bytes(int fmt) {
 
 // ---- scalar reference: the definition every SIMD path must match bit for bit ----
 inline float h2f(const u8* p) { std::uint16_t b; std::memcpy(&b, p, 2); return float(f16::from_bits(b)); }
-inline float fmac(float a, float b, float c) { return std::fma(a, b, c); }   // never contracted differently per TU
+inline float fmac(float a, float b, float c) { return forge::fmaf_exact(a, b, c); }   // one rounding on every compiler (MinGW's std::fma rounds twice)
 // round-to-nearest-even of x*id, clamped to [-127, 127] (NaN -> -127, the value cvtps2dq+packs gives)
 inline i8 q8_round(float v) {
     float r = std::nearbyint(v);
