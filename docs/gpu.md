@@ -145,6 +145,7 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | `FORGE_MMVQ` | on | CUDA/HIP | `0`: no q8_1/dp4a decode matmul |
 | `FORGE_MMVQ_CPB` | per shape | CUDA/HIP | `1`, `2` or `4`: output columns per decode-matmul block (default 2 for q4_k with k ≤ 6144, else 1) |
 | `FORGE_MMVQ_Q8V` | on | CUDA/HIP | `0`: q8_0 decode matmul uses the older 4-bytes-per-lane loop |
+| `FORGE_MMVQ_NC` | off | CUDA | `1`: decode-matmul weight loads use `ld.global.nc.L1::no_allocate` (no faster on an RTX 3090) |
 | `FORGE_MMQ_MIN_ROWS` | 16 | CUDA/HIP | Rows at which the tiled MMA / MMQ kernels are used; `0` disables them |
 | `FORGE_MMA` | on | CUDA | `0`: no int8 tensor-core prefill matmul (and no q6_k/q8_0 repacking); MMQ is used instead |
 | `FORGE_MMA_BT` | per codec | CUDA | `64` or `128`: tokens per MMA block |

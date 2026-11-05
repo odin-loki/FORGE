@@ -47,6 +47,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_MMVQ=0` | CUDA, HIP | Disable the q8_1/dp4a decode matmul kernels |
 | `FORGE_MMVQ_CPB` | CUDA, HIP | `1`, `2` or `4`: output columns per decode-matmul block (default: 2 for q4_k with k ≤ 6144, else 1) |
 | `FORGE_MMVQ_Q8V=0` | CUDA, HIP | q8_0 decode matmul uses the older 4-bytes-per-lane loop |
+| `FORGE_MMVQ_NC=1` | CUDA | Decode-matmul weight loads bypass L1 (`ld.global.nc.L1::no_allocate`); measured no faster on an RTX 3090 |
 | `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMA / MMQ kernels (default 16; 0 disables both) |
 | `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
 | `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernels (including the tiled `sm_80` ones) |

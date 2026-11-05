@@ -539,6 +539,8 @@ public:
     }
     // q8_0 decode (regrouped weights): 16-byte loads per lane; $FORGE_MMVQ_Q8V=0 keeps the 4-byte-per-lane loop
     static bool mmvq_q8v() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_Q8V"); return !(e && std::string(e) == "0"); }(); return on; }
+    // decode matvec weight loads through ld.global.nc.L1::no_allocate ($FORGE_MMVQ_NC=1; measured no faster on a 3090)
+    static bool mmvq_nc() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_NC"); return e && std::string(e) == "1"; }(); return on; }
     static bool fuse_q81() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q81"); return !(e && std::string(e) == "0"); }(); return on; }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
@@ -657,7 +659,7 @@ public:
                     ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                     q81_src_ = xd; q81_n_ = nb;
                 } else ++dispatches_["quant_q81_reused"];
-                const std::uint32_t cpb = mmvq_cpb(fmt, k); std::uint32_t fc = fmt | (cpb << 8) | (fmt == 6 && !mmvq_q8v() ? 0x800u : 0u);
+                const std::uint32_t cpb = mmvq_cpb(fmt, k); std::uint32_t fc = fmt | (cpb << 8) | (fmt == 6 && !mmvq_q8v() ? 0x800u : 0u) | (mmvq_nc() ? 0x1000u : 0u);
                 void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fc, &rb32};
                 unsigned grid = (cols + cpb - 1) / cpb * ((rows + 3) / 4);   // a 4-warp block per cpb columns (and 4 activation rows)
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");

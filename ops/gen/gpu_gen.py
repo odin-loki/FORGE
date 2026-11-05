@@ -444,17 +444,24 @@ FORGE_GLOBAL void forge_attention_comb(const float* part, float* y, unsigned nro
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 typedef float f32x4v __attribute__((ext_vector_type(4)));
+// A streamed 16-byte weight load: with nc, through the read-only path without allocating in L1 (the weights are
+// read once; L1 is left to the q8_1 activations every block re-reads).
+FORGE_DEV u32x4 ldw16(const unsigned char* p, unsigned nc) {
+  if (!nc) return *(const u32x4*)p;
+  unsigned a, b, c, d;
+  asm("{ .reg .u64 g; cvta.to.global.u64 g, %4; ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [g]; }" : "=r"(a), "=r"(b), "=r"(c), "=r"(d) : "l"(p));
+  return (u32x4){a, b, c, d}; }
 // y[rows, cols] = xq . W^T for q8_0 (fmt 1, or 6 = regrouped), q4_k (fmt 2) and q6_k (fmt 3, or 5 = padded to 224-byte
 // blocks). A 128-thread block per output column (and up to 4 activation rows), its 4 warps splitting k by interleaved
 // super-blocks; each warp reduces with shuffles and the 4 partial sums meet in shared memory, as in llama.cpp's
 // mul_mat_vec_q. q4_k lanes take 16 weight bytes in one 128-bit load (8 lanes per super-block, 4
 // super-blocks per warp step); q6_k (210-byte blocks, 2-aligned) a whole super-block per warp step; q8_0 (34-byte
 // blocks) 8 lanes per block, 4 blocks per step.
-// fmt bit 11: q8_0 (fmt 6) with the older 4-byte-per-lane loop. fmt bits 8..10 (cpb = 1, 2 or 4): output columns per block; the block's 4 warps then split into cpb groups of
+// fmt bit 11: q8_0 (fmt 6) with the older 4-byte-per-lane loop; bit 12: streamed weight loads (ldw16). fmt bits 8..10 (cpb = 1, 2 or 4): output columns per block; the block's 4 warps then split into cpb groups of
 // wpc = 4 / cpb warps, one group per column (grid: ceil(cols / cpb) per 4 activation rows).
 FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
   __attribute__((shared)) float red[4][4];
-  const unsigned cpb = (fmt >> 8) & 7u ? (fmt >> 8) & 7u : 1u, wpc = 4u / cpb, ncb = (cols + cpb - 1u) / cpb, old8 = (fmt >> 11) & 1u; fmt &= 255u;
+  const unsigned cpb = (fmt >> 8) & 7u ? (fmt >> 8) & 7u : 1u, wpc = 4u / cpb, ncb = (cols + cpb - 1u) / cpb, old8 = (fmt >> 11) & 1u, nc = (fmt >> 12) & 1u; fmt &= 255u;
   unsigned t = tid_(), l = t & 31u, wq = t >> 5, bi = bid_(), ww = wq % wpc, c = (bi % ncb) * cpb + wq / wpc, r0 = (bi / ncb) * 4u, nbk = k / 32u;
   const unsigned char* row = w + (unsigned long long)(c < cols ? c : 0u) * rb;
   float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -464,7 +471,7 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
     unsigned j = (l & 7u) >> 1, o = (l & 1u) * 16u;
     for (unsigned sb = (l >> 3) + 4u * ww; sb < k / 256u; sb += 4u * wpc) {
       const unsigned char* b = row + sb * 144u;
-      u32x4 q = *(const u32x4*)(b + 16u + j * 32u + o), hd = *(const u32x4*)b;   // quants and the 16-byte header
+      u32x4 q = ldw16(b + 16u + j * 32u + o, nc), hd = ldw16(b, nc);   // quants and the 16-byte header
       float d = h2f(hd[0] & 0xFFFFu), dm = h2f(hd[0] >> 16); unsigned s0, m0, s1, m1;
       scmin_w(2u * j, hd[1], hd[2], hd[3], &s0, &m0); scmin_w(2u * j + 1u, hd[1], hd[2], hd[3], &s1, &m1);
       float d0 = d * (float)s0, n0 = dm * (float)m0, d1 = d * (float)s1, n1 = dm * (float)m1;
@@ -488,7 +495,7 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
     unsigned li = l & 7u, h = li >> 2, l0 = (li & 1u) * 16u, qa = (li >> 1) & 1u;
     for (unsigned sb = (l >> 3) + 4u * ww; sb < k / 256u; sb += 4u * wpc) {
       const unsigned char* b = row + sb * 224u;
-      u32x4 ql = *(const u32x4*)(b + 16u * li), qh = *(const u32x4*)(b + 128u + 32u * h + l0);
+      u32x4 ql = ldw16(b + 16u * li, nc), qh = ldw16(b + 128u + 32u * h + l0, nc);
       unsigned long long sc8 = *(const unsigned long long*)(b + 192u + 8u * h);
       float d = h2f(ld16(b + 208u));
       float dlo = d * (float)(signed char)(sc8 >> (8u * (2u * qa + (l0 >> 4)))), dhi = d * (float)(signed char)(sc8 >> (8u * (2u * (qa + 2u) + (l0 >> 4))));
@@ -530,7 +537,7 @@ FORGE_GLOBAL void forge_qmatmul_q81(const unsigned char* xq, const unsigned char
     unsigned li = l & 15u, jb = li >> 1, o = (li & 1u) * 16u;
     for (unsigned gp = (l >> 4) + 2u * ww; gp < nbk / 8u; gp += 2u * wpc) {
       const unsigned char* b = row + gp * 272u;
-      u32x4 wv = *(const u32x4*)(b + 16u + 32u * jb + o); float dw = h2f(ld16(b + 2u * jb));
+      u32x4 wv = ldw16(b + 16u + 32u * jb + o, nc); float dw = h2f(ld16(b + 2u * jb));
       unsigned g = gp * 8u + jb;
 #pragma unroll
       for (unsigned rr = 0; rr < 4u; ++rr) {
