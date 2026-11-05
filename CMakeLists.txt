@@ -403,6 +403,11 @@ add_library(forge_modelfile INTERFACE)
 target_include_directories(forge_modelfile INTERFACE modelfile/include)
 target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust)
 
+# forge::security: FORGE Security Standard policy, enforce, audit, lockdown, check (docs/security-api.md). Header-only.
+add_library(forge_security INTERFACE)
+target_include_directories(forge_security INTERFACE security/include support/include)
+target_link_libraries(forge_security INTERFACE forge_core)
+
 add_library(forge_inference INTERFACE)
 target_include_directories(forge_inference INTERFACE inference/include)
 target_link_libraries(forge_inference INTERFACE forge_modelfile)
@@ -582,6 +587,7 @@ endif()
 if(FORGE_BUILD_APPS)
   add_executable(forge apps/forge.cpp)
   target_link_libraries(forge PRIVATE forge_inference forge_verify forge_simd_mv forge_script)
+  target_link_libraries(forge PRIVATE forge_security)   # forge security check
   add_executable(forge-serve apps/forge_serve.cpp)
   target_link_libraries(forge-serve PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
 endif()
@@ -680,6 +686,10 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(test_rpc_tls PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "FORGE_TEST_ONLY=rpc_tls")
     endif()
   endforeach()
+  if(TARGET test_security)   # forge::security (re-runs itself for the lockdown child cases)
+    target_link_libraries(test_security PRIVATE forge_security)
+    set_tests_properties(test_security PROPERTIES LABELS "security")
+  endif()
   set_tests_properties(test_log PROPERTIES SKIP_RETURN_CODE 77)   # skips when built with FORGE_LOG_MIN_LEVEL
   add_test(NAME log_min_level_cmake COMMAND ${CMAKE_COMMAND} -P ${PROJECT_SOURCE_DIR}/tests/log_min_level.cmake)
   # Scalable vectors at many lengths under qemu: the sve/rvv lane must be active at every VL, including the
