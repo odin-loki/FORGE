@@ -457,13 +457,29 @@ inline report evaluate(const policy& p, bool apply) {
 #if defined(__linux__)
         if (landlock_writes) {
             std::string skipped;
-            auto s = landlock_write_roots(expand_roots(p.fs.write), &skipped);
+            // The audit file stays writable (a file rule: append to it, nothing else there): child processes
+            // inherit these rules and reopen it, e.g. rpc-serve's script children running their own lockdown.
+            auto roots = expand_roots(p.fs.write);
+            if (!p.audit.file.empty()) roots.push_back(os::absolute(p.audit.file));
+            auto s = landlock_write_roots(roots, &skipped);
             fsw.state = s ? "active" : "failed";
             if (!s) fsw.detail = s.err.what; else if (!skipped.empty()) fsw.detail = "skipped (missing): " + skipped;
+            if (s) fsw.detail += (fsw.detail.empty() ? "" : "; ") + std::string("Landlock binds this thread and threads started after lockdown (earlier threads: enforce() only)");
         }
 #endif
         if (sp.deny_exec || sp.deny_network || sp.deny_fs_write) {
             auto s = os::apply_sandbox(sp);
+#if defined(__linux__) && defined(__NR_seccomp)
+            // seccomp and Landlock confine the calling thread and the threads it starts later. A server has threads
+            // already (schedulers, pools, watchers): SECCOMP_FILTER_FLAG_TSYNC puts the same filter on every thread of
+            // the process. Landlock has no equivalent on the kernels FORGE targets (see fs write confinement below).
+            if (s && os::detail::audit_arch) {
+                auto f = os::detail::seccomp_filter(sp);
+                sock_fprog prog{static_cast<unsigned short>(f.size()), f.data()};
+                if (::syscall(__NR_seccomp, 1 /*SECCOMP_SET_MODE_FILTER*/, 1u /*SECCOMP_FILTER_FLAG_TSYNC*/, &prog) != 0)
+                    for (auto* c : {&ex, &net}) if (c->state == "available") c->detail += (c->detail.empty() ? "" : "; ") + std::string("seccomp TSYNC failed: threads started before lockdown are not filtered");
+            }
+#endif
             for (auto* c : {&fsw, &ex, &net}) {
                 if (c->state != "available") continue;
                 c->state = s ? "active" : "failed";
@@ -501,7 +517,7 @@ inline report evaluate(const policy& p, bool apply) {
 
     // ---- INT
     {
-        auto& m = add("INT-1", "integrity: models", "n/a", "inference::model via FORGE_REQUIRE_SIGNED / FORGE_TRUSTED_KEYS", L);
+        auto& m = add("INT-1", "integrity: models", "n/a", "inference::model (active policy; FORGE_REQUIRE_SIGNED / FORGE_TRUSTED_KEYS)", L);
         if (on && p.integrity.models == requirement::required) {
             m.state = apply || lds().applied ? "active" : "available";
             m.detail = p.integrity.trusted_keys.empty() ? "no trusted_keys: any valid signature passes (integrity, not provenance)"
@@ -512,15 +528,15 @@ inline report evaluate(const policy& p, bool apply) {
                 if (!keys.empty()) os::setenv("FORGE_TRUSTED_KEYS", keys);
             }
         } else if (on && p.integrity.models == requirement::optional) {
-            m.state = "missing"; m.level = p.prof == profile::strict ? "should" : "info";
-            m.detail = "signatures are checked only with --verify; unsigned models are not audited at load";
+            m.state = apply || lds().applied ? "active" : "available"; m.level = p.prof == profile::strict ? "should" : "info";
+            m.detail = "signed models are verified at load, unsigned ones audited (inference::model under the active policy)";
         }
         auto& pl = add("INT-1", "integrity: native plugins", "n/a", "", L);
         if (on && p.integrity.plugins == requirement::required) { pl.state = "emulated"; pl.backend = "enforce(plugin_load) refuses"; pl.detail = "no plugin signature verifier yet: loads are refused"; }
         else if (on && p.integrity.plugins == requirement::optional) { pl.state = "missing"; pl.level = "info"; pl.detail = "plugins are not verified"; }
         auto& sc2 = add("INT-1", "integrity: scripts", "n/a", "", L);
-        if (on && p.integrity.scripts == requirement::required) { sc2.state = "missing"; sc2.detail = "script signatures exist only for the .fsc cache"; }
-        else if (on && p.integrity.scripts == requirement::optional) { sc2.state = "missing"; sc2.level = "info"; sc2.detail = "scripts are not verified"; }
+        if (on && p.integrity.scripts == requirement::required) { sc2.state = "emulated"; sc2.backend = "forge script refuses to run"; sc2.detail = "no script signature verifier (script signatures exist only for the .fsc cache): scripts are refused"; }
+        else if (on && p.integrity.scripts == requirement::optional) { sc2.state = "missing"; sc2.level = "info"; sc2.detail = "scripts are not verified; forge script audits running an unsigned one"; }
         auto& cs = add("INT-3", "OS code signing (plugins)", "n/a", "", L);
         if (on && p.integrity.os_code_signing) {
             if (p.integrity.plugins == requirement::required) { cs.state = "emulated"; cs.backend = "plugins refused (see above)"; }

@@ -15,7 +15,8 @@
 ```
 forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx 0]
             [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0] [--kv-spill]
-forge-serve proxy --backend HOST:PORT [...]        # see loadbalancer.md
+            [--policy FILE]
+forge-serve proxy --backend HOST:PORT [...] [--policy FILE]   # see loadbalancer.md
 ```
 
 | Flag | Default | Effect |
@@ -30,6 +31,7 @@ forge-serve proxy --backend HOST:PORT [...]        # see loadbalancer.md
 | `--watch` | off | Watches the model path. On change: waits 0.5 s, sends systemd `RELOADING=1`, closes the listener and re-execs itself with the same arguments. POSIX only; on Windows it logs that a restart is needed |
 | `--no-pin` | pinning on | On hybrid CPUs forge-serve pins itself (and the threads it starts) to performance cores. This turns that off |
 | `--numa-node N` | none | Binds to NUMA node N before loading, so weights and KV are first-touched there |
+| `--policy FILE` | `load_policy()` search | FORGE Security Standard policy; see Security policy below |
 
 Fixed behaviour (no flag):
 - The prefix cache keeps 4 finished sequences; prompts are prefilled in chunks of 256 tokens.
@@ -37,6 +39,16 @@ Fixed behaviour (no flag):
 - After the socket listens, forge-serve calls `service::ready()` (systemd `READY=1`; a no-op without `NOTIFY_SOCKET`).
 - `FORGE_HUGEPAGES=1` advises huge pages on weight mappings ≥ 2 MiB (see [configuration.md](configuration.md)).
 - `FORGE_DEVICE` picks the device, as for every model.
+
+### Security policy
+With a policy (`--policy FILE`, `$FORGE_SECURITY_POLICY`, `./forge-security.json`, the config dir or `$FORGE_SECURITY_PROFILE`; see [security-api.md](security-api.md)); with none of them nothing below happens:
+
+- The policy is active before the model is loaded: the model path must be readable under `fs.read`, and `integrity.models` decides (`required`: a valid signature, by one of `integrity.trusted_keys` if set, else exit 1 with an integrity error; `optional`: signed files are verified, unsigned ones audited).
+- `--host`/`--port` must pass `enforce(net_listen)` (loopback, or any address with `net.mode` `any`). `--watch` needs `exec` (it re-executes forge-serve); a policy that denies exec stops forge-serve at startup.
+- After the socket is bound and the model loaded, forge-serve calls `security::lockdown(policy)` (SBX-1) before it accepts the first request, prints controls that are not `ok` to stderr, and audits the lockdown. Linux: seccomp is synchronised to every thread (TSYNC); Landlock write rules bind the main thread and the request threads started after it, not the scheduler thread started before (it is covered by `enforce()` only). `--kv-spill` needs its spill directory under `fs.write`.
+- `forge-serve proxy --policy` checks the listen address and every `--backend` / `--route` target (`net_connect`; `net.mode` `none` refuses them all), then locks down after the listener starts.
+
+Test: `tests/security_cli_test.py` (strict policy with a signed model serves on loopback; an unsigned model and a non-loopback `--host` are refused).
 
 ### Endpoints
 

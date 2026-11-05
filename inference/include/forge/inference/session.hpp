@@ -10,6 +10,7 @@
 #include <forge/modelfile/fpk.hpp>
 #include <forge/modelfile/sign.hpp>
 #include <forge/modelfile/tokenizer.hpp>
+#include <forge/security/enforce.hpp>
 #include <chrono>
 #include <cstddef>
 #include <cstring>
@@ -32,8 +33,14 @@ struct session_options {
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
 
 class model {
+    // FSS CAP-1 (docs/security-api.md): with an active forge::security policy the model file must be readable under
+    // policy fs.read before it is opened. No active policy: nothing is checked (and nothing changes).
+    static const std::string& admit(const std::string& path) {
+        if (auto p = security::active_policy(); p->active()) security::enforce(*p, security::capability::fs_read, path);
+        return path;
+    }
 public:
-    explicit model(const std::string& fpk_path, bool verify = false) : r_(fpk_path) {
+    explicit model(const std::string& fpk_path, bool verify = false) : r_(admit(fpk_path)) {
         // Strict mode (FORGE_PLAN: "verify before load; refuse unsigned files"): FORGE_REQUIRE_SIGNED=1
         // and/or FORGE_TRUSTED_KEYS=<hex pubkey>[,<hex pubkey>...] require a valid (trusted) signature.
         std::vector<std::string> trusted;
@@ -42,11 +49,31 @@ public:
             for (std::size_t p = 0, q; p < s.size(); p = q + 1) { q = s.find(',', p); if (q == std::string::npos) q = s.size(); if (q > p) trusted.push_back(s.substr(p, q - p)); }
         }
         bool strict = !trusted.empty() || (std::getenv("FORGE_REQUIRE_SIGNED") && std::string(std::getenv("FORGE_REQUIRE_SIGNED")) == "1");
-        if (verify || strict) {
+        // FSS INT-1 / INT-4: an active policy with integrity.models "required" or "optional" decides here, before the
+        // blueprint is parsed or any tensor is decoded (the file is only mapped and hashed). Its trusted_keys join
+        // FORGE_TRUSTED_KEYS (which lockdown() also sets); failures are security::integrity_error, audited.
+        const auto pol = security::active_policy();
+        const bool fss = pol->active() && pol->integrity.models != security::requirement::off;
+        if (fss) {
+            for (auto k : pol->integrity.trusted_keys) { for (auto& c : k) c = char(std::tolower(static_cast<unsigned char>(c))); trusted.push_back(std::move(k)); }
+            if (pol->integrity.models == security::requirement::required) strict = true;
+            const bool check = strict || r_.has_section("signature");
+            auto fail = [&](const std::string& why) {
+                security::audit("integrity", security::decision::fail, "INT-4", fpk_path, why);
+                throw security::integrity_error(fpk_path + ": " + why, "INT-4");
+            };
+            if (check || verify) if (auto bad = r_.verify(); !bad.empty()) fail("hash mismatch in " + bad.front());
+            if (check) {
+                auto rep = modelfile::verify_signature(r_, trusted);
+                if (!rep.trusted) fail("signature check failed (integrity.models " + std::string(security::name(pol->integrity.models)) + "): " + rep.message);
+                security::audit("integrity", security::decision::allow, "INT-1", fpk_path, "model signature verified (key " + rep.valid_keys.front() + ")");
+            } else security::audit("integrity", security::decision::weaken, "INT-1", fpk_path, "unsigned model loaded (integrity.models optional)");
+        }
+        if (!fss && (verify || strict)) {
             auto bad = r_.verify();
             if (!bad.empty()) raise(errc::integrity_error, "{}: hash mismatch in {}", fpk_path, bad.front());
         }
-        if (strict || (verify && r_.has_section("signature"))) {
+        if (!fss && (strict || (verify && r_.has_section("signature")))) {
             auto rep = modelfile::verify_signature(r_, trusted);
             if (!rep.trusted && (strict || rep.signed_)) raise(errc::integrity_error, "{}: signature check failed: {}", fpk_path, rep.message);
         }

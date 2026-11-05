@@ -589,7 +589,7 @@ void install_cpp_std(Shared& sh) {
     def("forge::host_shell", 0, 0, [](Interp&, Args&) -> Value { return sv(host_shell()); });
     def("std::getenv", 1, 1, [](Interp& in, Args& a) -> Value {
         if (!in.caps.env) in.raise("PermissionError", "environment access is disabled in this sandbox");   // same gate as os.env
-        auto k = in.str(a[0]); if (!os::has_env(k)) return Nil{}; return sv(os::getenv(k)); });
+        auto k = in.str(a[0]); enforce_scope(in, SecScope::env, k); if (!os::has_env(k)) return Nil{}; return sv(os::getenv(k)); });
     def("forge::shells", 0, 0, [](Interp&, Args&) -> Value {
         auto l = make<List>();
         for (auto& b : shells().all()) {

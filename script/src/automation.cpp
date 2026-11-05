@@ -340,6 +340,7 @@ void install(Shared& sh) {
             if (g.find_first_of("*?[") == std::string::npos) { auto st = os::stat(g); root = st.is_dir ? g : (cut ? g.substr(0, cut) : "."); if (!st.is_dir) pats[0] = g.substr(cut ? cut + 1 : 0); else pats[0] = "**"; }
             else if (cut) { root = g.substr(0, cut); for (auto& p : pats) if (p.compare(0, cut + 1, g.substr(0, cut + 1)) == 0) p = p.substr(cut + 1); }
         }
+        enforce_scope(in, SecScope::fs_read, root);
         os::tree_watch_opts o; o.debounce_ms = 100;
         if (auto* v = opt(a, 2, "debounce_ms")) o.debounce_ms = int(i_of(in, *v, "debounce_ms"));
         if (auto* v = opt(a, 2, "polling")) o.force_polling = Interp::truthy(*v);

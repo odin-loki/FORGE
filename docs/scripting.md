@@ -31,6 +31,7 @@ syntax error, a script refused by the static checks, a failed `--emit`, or a bad
 | `--timeout MS`, `--max-steps N`, `--heap BYTES` | whole-run wall clock, step count, managed-heap cap |
 | `--no-fs`, `--no-net`, `--no-proc` | turn a capability off (see *Capabilities and sandboxing*) |
 | `--os-sandbox off\|best-effort\|require` | OS enforcement of the `--no-*` flags (default `best-effort`) |
+| `--policy FILE` | FORGE Security Standard policy (see *Security policy*); without it `$FORGE_SECURITY_POLICY`, `./forge-security.json`, the config dir or `$FORGE_SECURITY_PROFILE` is used, and with none of them nothing changes |
 | `--check [--json] [--module-dir DIR]` | static checks only, nothing runs; exit 2 on errors |
 | `--no-check`, `--strict-check` | skip the static checks before a run / refuse on warnings too |
 | `--emit TARGET [-o FILE]`, `--emit-targets` | translate to a shell script instead of running (see *Write once, emit anywhere*) |
@@ -141,11 +142,15 @@ derive from `Error` or from the `std::` exception names.
 | general | `IOError`, `OSError`, `TypeError`, `ValueError`, `IndexError`, `KeyError`, `NameError`, `AttributeError`, `ArithmeticError` (also `ZeroDivisionError`), `OverflowError`, `SyntaxError`, `ImportError`, `RuntimeError`, `LogicError`, `RecursionError`, `SystemExit` |
 | runtime safety | `BorrowError`, `NullPointerError`, `FrozenError`, `AccessError`, `ObjectDisposedError`, `RaceError` |
 | features | `ShellError`, `LimitExceededError`, `PipelineError`, `PluginError`, `AIError`, `HostError` |
-| under `OSError` | `PermissionError` (subclass `SandboxViolationError`), `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError`, `FileNotFoundError`, `FileExistsError`, `NotADirectoryError`, `IsADirectoryError`, `NotSupportedError`, `InterruptedError`, `BlockingIOError`, `ProcessLookupError`, `NoSpaceError`, `TooManyFilesError`, `BusyError`, `ReadOnlyFileSystemError`, `SignalError`, `ConnectionError` (subclasses `ConnectionRefusedError`, `ConnectionResetError`, `BrokenPipeError`) |
+| under `OSError` | `PermissionError` (subclass `SandboxViolationError`), `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError`, `FileNotFoundError`, `FileExistsError`, `NotADirectoryError`, `IsADirectoryError`, `NotSupportedError`, `InterruptedError`, `BlockingIOError`, `ProcessLookupError`, `NoSpaceError`, `TooManyFilesError`, `BusyError`, `ReadOnlyFileSystemError`, `SignalError`, `ConnectionError` (subclasses `ConnectionRefusedError`, `ConnectionResetError`, `BrokenPipeError`), `SecurityError` (subclasses `IntegrityError`, `PolicyViolation`) |
 
 - `catch (const OSError& e)` catches every OS-level error. OS error codes (errno, GetLastError, WSA, NTSTATUS,
   Mach) map to these classes in `forge/os/oserror.hpp`. `EPERM` becomes `SandboxViolationError` only when the active
   OS sandbox policy denies that kind of operation; `EACCES` stays `PermissionError`.
+- `forge::security` errors (FSS-ERR-1, [security-api.md](security-api.md)) arriving from C++: `integrity_error` ->
+  `IntegrityError`, `policy_violation` -> `PolicyViolation` (both `SecurityError`, an `OSError`), `permission_denied`
+  -> `PermissionError`, `sandbox_error` -> `SandboxViolationError`. The last two keep their existing classes, which
+  are not under `SecurityError`.
 - `SignalError` is a fault caught by `fault_guard` or a crashed `ProcessPool` worker.
 - SIGINT/SIGTERM (Windows: Ctrl-C, Ctrl-Break, console close) raise `CancelledError` during a top-level run
   (`options::cancel_signals`, default on; the old handlers are restored afterwards). `engine::interrupt()` does the
@@ -345,11 +350,39 @@ any exception (with its type) come back. The child works on a copy of the heap, 
 not seen afterwards. On Windows and iOS it raises `PermissionError` without running the block. Forking copies only
 the calling thread: avoid it while other tasks hold locks the block needs. **Untested.**
 
-**Plugins** run native code, so they are refused unless all of `fs`, `net`, `proc` and `env` are on.
+**Plugins** run native code, so they are refused unless all of `fs`, `net`, `proc` and `env` are on. Under a
+security policy they also need `plugin_load`: `integrity.plugins` `"required"` refuses every plugin (FORGE has no
+plugin signature verifier yet), `"optional"` / `"off"` allow it (audited).
+
+**Security policy (FSS).** `forge script --policy FILE` (or a policy found by `security::load_policy`, see
+[security-api.md](security-api.md#policy)) runs the script under the FORGE Security Standard; with no policy and no
+`FORGE_SECURITY_PROFILE` (profile `none`) nothing in this paragraph applies. With a policy:
+
+- The capabilities come from the policy (default deny, P1): `net` only when `net.mode` is not `none`, `proc` only
+  with `exec`, `env` only with `env`, `fs` unless both `fs.read` and `fs.write` are empty. The `--no-*` flags narrow
+  the policy further. Profile `strict` (scripts are unsigned) therefore runs with no net, proc or env and the file
+  system confined to its roots.
+- File operations are **path-scoped**: each built-in passes the path it touches to `security::enforce` (reads:
+  `fs.read`, `fs.list`, `fs.exists`, `fs.stat`, `fs.walk`, `fs.glob` (its base and the pattern's literal directory),
+  `fs.open(p, "r")`, `fs.copy` source, imports, `forge::watch`, locale catalogs; writes: `fs.write`, `fs.append`,
+  `fs.open` for writing, `fs.mkdir`, `fs.remove`, `fs.rename`, `fs.move`, `fs.copy` target, `fs.touch`, `fs.chmod`,
+  `fs.lock`, `fs.temp_file`, ...). The canonical path (symlinks resolved, `..` folded) must lie under a root. Network
+  calls pass `host:port` (`net.http`, `net.port_open`, `net.resolve`, `forge::remote*`, the AI endpoint), process
+  calls the program (`run`, `proc.start`, shell blocks, `ProcessPool`), `os.env` / `std::getenv` the variable. A
+  denial raises `PermissionError` and is audited (FSS-AUD). The `Caps` flags are still checked first.
+- `integrity.scripts` `"required"` refuses to run the script (`IntegrityError` on the C++ side, exit 2): scripts are
+  not signed. `"optional"` runs it and audits the decision.
+- `security::lockdown(policy)` is applied before any script code runs (it replaces `--os-sandbox`): resource limits,
+  no-new-privs, Landlock write roots, seccomp / pledge / sandbox_init / job object, Windows mitigations.
+
+Embedders get the path scoping too: the runtime checks against `security::active_policy()`, so a host that calls
+`security::lockdown` or `set_active_policy` confines the scripts it runs. Tests: `tests/test_script_security.cpp`,
+`tests/security_cli_test.py`.
 
 **Remote scripts** under `forge rpc-serve --allow-scripts` each run in a child process (`forge script --rpc-child`)
 with `--script-timeout` (default 60000 ms), a `--script-mem-mb` memory cap (default 2048) and the `--script-no-*`
-flags. With any `--script-no-*` flag the child uses `--os-sandbox require` (`best-effort` on Windows). See
+flags. With any `--script-no-*` flag the child uses `--os-sandbox require` (`best-effort` on Windows). Under a
+security policy the child loads the same policy and locks itself down before running the script. See
 [rpc.md](rpc.md).
 
 ## Process pools

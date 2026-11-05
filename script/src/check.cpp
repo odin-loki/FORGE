@@ -31,6 +31,8 @@ const std::map<std::string, std::string>& err_parent() {
                        "ReadOnlyFileSystemError"}) p[n] = "OSError";
         for (auto n : {"ConnectionRefusedError", "ConnectionResetError", "BrokenPipeError"}) p[n] = "ConnectionError";
         p["SandboxViolationError"] = "PermissionError";
+        p["SecurityError"] = "OSError";
+        p["IntegrityError"] = "SecurityError"; p["PolicyViolation"] = "SecurityError";
         p["ZeroDivisionError"] = "ArithmeticError";
         return p;
     }();
