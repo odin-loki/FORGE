@@ -54,6 +54,11 @@ if(WIN32)
                         $<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<CONFIG:Release,RelWithDebInfo,MinSizeRel>>:/O2>)
   else()
     add_link_options(-Wl,--stack,8388608)
+    # Win64 GCC cannot align the stack past 16 bytes, so its aligned AVX/AVX-512 spills can fault (seen on a VNNI
+    # runner); the assembler then emits unaligned moves, which cost nothing on aligned data.
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-Wa,-muse-unaligned-vector-move>)
+    endif()
   endif()
   add_compile_definitions(_USE_MATH_DEFINES NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
