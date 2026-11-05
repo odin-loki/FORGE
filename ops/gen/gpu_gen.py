@@ -859,21 +859,55 @@ FORGE_DEV unsigned smem_addr(const void* p) { unsigned long long a; asm("cvta.to
 FORGE_DEV void cpa16(void* d, const void* s, unsigned n) { asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(smem_addr(d)), "l"(s), "r"(n) : "memory"); }
 FORGE_DEV void cpa8(void* d, const void* s, unsigned n) { asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;" :: "r"(smem_addr(d)), "l"(s), "r"(n) : "memory"); }
 FORGE_DEV void cpa_wait() { asm volatile("cp.async.commit_group;\n\tcp.async.wait_group 0;" ::: "memory"); }
+FORGE_DEV unsigned gdim_() { return __nvvm_read_ptx_sreg_nctaid_x(); }
+FORGE_DEV unsigned ld_acq(const unsigned* p) { unsigned v; asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory"); return v; }
+FORGE_DEV void st_rel(unsigned* p, unsigned v) { asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(p), "r"(v) : "memory"); }
+FORGE_DEV void fence_gpu() { asm volatile("fence.acq_rel.gpu;" ::: "memory"); }
+FORGE_DEV void stcg4(float* p, float a, float b, float c, float d) { asm volatile("st.global.cg.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(p), "f"(a), "f"(b), "f"(c), "f"(d) : "memory"); }
+FORGE_DEV f32x4v ldcg4(const float* p) { f32x4v v; asm volatile("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];" : "=f"(v.x), "=f"(v.y), "=f"(v.z), "=f"(v.w) : "l"(p) : "memory"); return v; }
 // BT tokens per block (64 or 128; warp tile 16 weight rows x BT); NS shared-memory stages (2: chunk kb + 256 is copied
 // with cp.async while chunk kb is computed). Shared: NS x [Xq BT x 272 | Xs 8 x BT x 2 floats | Wr 128 x stride] | Wm 8 KB.
+// Persistent stream-K (sk != 0; after llama.cpp's mul_mat_q stream-k and CUTLASS's data-parallel + stream-K hybrid):
+// the grid is the number of resident blocks G and tiles (128 weight rows x BT tokens) are numbered token tile fastest.
+// Block b first takes whole tiles b, b + G, ... below dp (data-parallel waves, in the classic order: concurrent blocks
+// share weight rows in L2), then an equal share [beg, end) of the remaining (tile, 256-value k chunk) iterations.
+// A range splits at most two tiles: its last piece, if it ends mid-tile, is a partial product that goes to the block's
+// fixup slot fx[b] (BT x 128 floats in fragment order) and raises flag fl[b]; its first piece, if it starts mid-tile
+// and reaches the tile's end, finishes the tile: computed last (after the block's own partial was published, so no
+// block waits on one that is waiting), it then waits for the flags of the earlier blocks that hold the rest of the
+// tile, adds their partials in a fixed order (b - 1, b - 2, ...: deterministic), clears the flags (so the next launch,
+// or a graph replay, starts from zero) and runs the epilogue. Every block is resident (G <= resident slots), and a
+// block only waits on lower-numbered blocks, which publish before they wait.
 static __attribute__((device, always_inline)) inline void mma_body(const signed char* xq, const float* xds, const unsigned char* w, float* y,
                                     unsigned rows, unsigned cols, unsigned k, const unsigned fmt, unsigned rb, const unsigned BT, const unsigned NS,
-                                    unsigned ksplit, const unsigned GLU = 0u, signed char* gq = 0, float* gds = 0) {
+                                    unsigned ksplit, const unsigned GLU = 0u, signed char* gq = 0, float* gds = 0,
+                                    float* fx = 0, unsigned* fl = 0, unsigned sk = 0u, unsigned dp = 0u) {
   const unsigned SB = BT * 336u + 128u * mma_wstride(fmt);   // bytes per stage
   float* Wm = (float*)(forge_dsm + NS * SB);
   unsigned* Xq = (unsigned*)forge_dsm; float* Xs = (float*)(forge_dsm + BT * 272u); unsigned char* Wr = forge_dsm + BT * 336u;
   unsigned t = tid_(), wp = t >> 5, l = t & 31u, gid = l >> 2, tig = l & 3u;
-  unsigned ntb = (rows + BT - 1u) / BT, bi = bid_(), t0 = (bi % ntb) * BT, c0 = (bi / ntb) * 128u, nbk = k / 32u;
+  unsigned ntb = (rows + BT - 1u) / BT, bi = bid_(), nbk = k / 32u;
   unsigned wsb = mma_wstride(fmt), bsz = fmt == 2u ? 144u : fmt == 5u ? 224u : 272u, nch = bsz / 16u;
   // Split-K (ksplit > 0): grid row y takes 256-value chunks [y*ksplit, (y+1)*ksplit) of k and writes its partial
   // product to slice y of y[] (rows x cols each); forge_sum_splits adds the slices in order (deterministic).
-  const unsigned ky = ksplit ? bidy_() : 0u, kbeg = ky * ksplit * 256u, kend = ksplit ? (kbeg + ksplit * 256u < k ? kbeg + ksplit * 256u : k) : k;
+  const unsigned ky = ksplit ? bidy_() : 0u;
   y += (unsigned long long)ky * rows * cols;
+  // Pieces (tile ti, chunks [ks, ke) of k): without stream-K one, tile bi; with it the data-parallel tiles, then the
+  // pieces of [beg, end) after the first, then the first.
+  const unsigned nck = k / 256u, G = sk ? gdim_() : 1u, ntl = ntb * ((cols + 127u) / 128u);
+  const unsigned long long sktot = sk ? (unsigned long long)(ntl - dp) * nck : 0ull;
+  unsigned beg, end;
+  if (sk) { beg = dp * nck + (unsigned)(bi * sktot / G); end = dp * nck + (unsigned)((bi + 1ull) * sktot / G); }
+  else { beg = bi * nck + ky * ksplit; end = ksplit ? (beg + ksplit < (bi + 1u) * nck ? beg + ksplit : (bi + 1u) * nck) : (bi + 1u) * nck; }
+  const unsigned fend = end < (beg / nck + 1u) * nck ? end : (beg / nck + 1u) * nck;   // end of the first piece
+  unsigned pos = fend < end ? fend : beg, dpi = bi;
+  bool indp = sk && dpi < dp;
+  for (;;) {
+  unsigned ti, ks, ke;
+  if (indp) { ti = dpi; ks = 0u; ke = nck; }
+  else { if (beg >= end) break;
+    ti = pos / nck; ks = pos - ti * nck; ke = pos == beg ? fend - ti * nck : (end - ti * nck < nck ? end - ti * nck : nck); }
+  const unsigned t0 = (ti % ntb) * BT, c0 = (ti / ntb) * 128u, kbeg = ks * 256u, kend = ke * 256u;
   float acc[16][4];
 #pragma unroll
   for (unsigned n = 0; n < BT / 8u; ++n)
@@ -959,6 +993,26 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
             acc[n][2] = fma_(-sb1, xm0, acc[n][2]); acc[n][3] = fma_(-sb1, xm1, acc[n][3]); }
         } } }
     bar_(); }
+  if (sk && ke < nck) {   // stream-K: a partial product (the range ends mid-tile) -> fixup slot bi, then its flag
+    float* f = fx + (unsigned long long)bi * (BT * 128u);
+#pragma unroll
+    for (unsigned n = 0; n < BT / 8u; ++n) stcg4(f + (n * 256u + t) * 4u, acc[n][0], acc[n][1], acc[n][2], acc[n][3]);
+    fence_gpu(); bar_();
+    if (t == 0u) st_rel(fl + bi, 1u);
+  } else {
+  if (sk && ks > 0u) {   // stream-K: this piece finishes a tile that earlier blocks started; add their partials
+    const unsigned ts = ti * nck;
+    for (unsigned c = bi; c-- > 0u;) {
+      const unsigned bc = dp * nck + (unsigned)(c * sktot / G), ec = dp * nck + (unsigned)((c + 1ull) * sktot / G);
+      if (ec > bc) {
+        if (t == 0u) while (ld_acq(fl + c) != 1u) {}
+        bar_();
+        const float* f = fx + (unsigned long long)c * (BT * 128u);
+#pragma unroll
+        for (unsigned n = 0; n < BT / 8u; ++n) { const f32x4v v = ldcg4(f + (n * 256u + t) * 4u);
+          acc[n][0] += v.x; acc[n][1] += v.y; acc[n][2] += v.z; acc[n][3] += v.w; }
+        if (t == 0u) fl[c] = 0u; }
+      if (bc <= ts) break; } }
   if (GLU) {
     // FFN gate/up fused (forge_qmatmul_glu_*): W interleaves gate and up rows in groups of 16, so warp wp's rows ra and
     // ra + 8 are the gate and up rows of output column (c0 / 2) + 8 wp + gid, and acc[n][0..1] / acc[n][2..3] pair up.
@@ -979,18 +1033,23 @@ static __attribute__((device, always_inline)) inline void mma_body(const signed 
       unsigned long long ig = (unsigned long long)tok * nbo + (o0 >> 5) + hf;
       gq[ig * 32u + pos] = (signed char)q; float sm = wsum_((float)q);
       if (l == 0u) { gds[2ull * ig] = d; gds[2ull * ig + 1u] = d * sm; } }
-    return; }
+    bar_();   // S overlaps the next piece's stages
+  } else {
   const unsigned ra = wp * 16u + gid;
 #pragma unroll
   for (unsigned n = 0; n < BT / 8u; ++n)
 #pragma unroll
     for (unsigned e = 0; e < 4u; ++e) {
       unsigned col = c0 + ra + 8u * (e >> 1), tok = t0 + n * 8u + tig * 2u + (e & 1u);
-      if (tok < rows && col < cols) y[(unsigned long long)tok * cols + col] = acc[n][e]; } }
+      if (tok < rows && col < cols) y[(unsigned long long)tok * cols + col] = acc[n][e]; } } }
+  if (indp) { dpi += G; indp = dpi < dp; continue; }
+  if (pos == beg) break;
+  const unsigned nx = ti * nck + ke; pos = nx < end ? nx : beg; } }
 #undef FORGE_MMA_STAGE
 // One kernel per format, so the format checks fold away at compile time.
 #define FORGE_MMA_KERNEL(name, f, bt, nb, ns) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
-    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb, unsigned ksplit) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, ns, ksplit); }
+    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb, unsigned ksplit, \
+    float* fx, unsigned* fl, unsigned sk, unsigned dp) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, ns, ksplit, 0u, 0, 0, fx, fl, sk, dp); }
 FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0, 1u, 64u, 2, 1u)
 FORGE_MMA_KERNEL(forge_qmatmul_mma_q8_0g, 6u, 64u, 2, 1u)
 FORGE_MMA_KERNEL(forge_qmatmul_mma_q4_k, 2u, 64u, 2, 1u)
@@ -1003,8 +1062,8 @@ FORGE_MMA_KERNEL(forge_qmatmul_mma2_q4_k, 2u, 64u, 1, 2u)   // q4_k, 64 tokens, 
 #undef FORGE_MMA_KERNEL
 // FFN gate/up/SiLU in one launch (mma_body with GLU): cols = 2n interleaved rows, y [rows, n], gq / gds its q8r form.
 #define FORGE_GLU_KERNEL(name, f, bt, nb) FORGE_GLOBAL __attribute__((launch_bounds(256, nb))) void name(const signed char* xq, const float* xds, \
-    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb, signed char* gq, float* gds) { \
-    (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, 1u, 0u, 1u, gq, gds); }
+    const unsigned char* w, float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb, signed char* gq, float* gds, \
+    float* fx, unsigned* fl, unsigned sk, unsigned dp) { (void)fmt; mma_body(xq, xds, w, y, rows, cols, k, f, rb, bt, 1u, 0u, 1u, gq, gds, fx, fl, sk, dp); }
 FORGE_GLU_KERNEL(forge_qmatmul_glu_q8_0g, 6u, 64u, 2)
 FORGE_GLU_KERNEL(forge_qmatmul_glu_q4_k, 2u, 64u, 2)
 FORGE_GLU_KERNEL(forge_qmatmul_glu_q6_k, 5u, 64u, 2)
