@@ -24,8 +24,17 @@
 #include <string_view>
 #include <vector>
 #if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN   // no <rpc.h>: its <rpcndr.h> defines `small` as char, breaking unrelated code
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #include <sddl.h>
+#ifdef small
+#undef small
+#endif
 #if defined(_MSC_VER)
 #pragma comment(lib, "advapi32.lib")
 #endif

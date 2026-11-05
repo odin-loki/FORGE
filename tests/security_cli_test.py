@@ -67,11 +67,12 @@ print("forge run integrity: ok")
 # ---- forge script under strict: fs path-scoped, no net / proc / env; lockdown applied
 out_file = os.path.join(outside, "x.txt").replace("\\", "/")
 r = script(strict, 'fs.write("in.txt", "x"); std::println("{}", fs.read("in.txt"));\n'
-                   f'try {{ fs.write("{out_file}", "y"); std::println("wrote"); }} catch (const PermissionError& e) {{ std::println("denied"); }}\n'
-                   'try { net.port_open("127.0.0.1", 9, 100); } catch (const PermissionError& e) { std::println("no net"); }\n'
-                   'try { run("echo hi"); } catch (const PermissionError& e) { std::println("no proc"); }\n'
-                   'try { os.env("PATH"); } catch (const PermissionError& e) { std::println("no env"); }\n')
-assert r.stdout == "x\ndenied\nno net\nno proc\nno env\n", r.stdout + r.stderr
+                   f'try {{ fs.write("{out_file}", "y"); std::println("wrote"); }} catch (const PermissionError& e) {{ std::println("denied"); }}\n')
+assert r.stdout == "x\ndenied\n", r.stdout + r.stderr
+# net / proc / env are denied outright, so the static checker refuses scripts that use them before they run.
+for cap, use in (("net", 'net.port_open("127.0.0.1", 9, 100);'), ("proc", 'run("echo hi");'), ("env", 'os.env("PATH");')):
+    rr = script(strict, use, ok=False)
+    assert f"needs the '{cap}' capability" in rr.stderr, cap + ": " + rr.stderr
 assert not os.path.exists(out_file)
 ev = audit("strict.json")
 assert any(e["control"] == "SBX-1" and e["decision"] == "allow" for e in ev), ev
