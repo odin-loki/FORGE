@@ -97,6 +97,38 @@ FORGE_MODEL_KEY_FILE=k.mkey forge inspect sealed.fpk --verify
 
 Strict loading in inference sessions: `FORGE_REQUIRE_SIGNED=1` refuses unsigned files; `FORGE_TRUSTED_KEYS=<hex>[,<hex>]` also requires a signature from one of those keys.
 
+### Detached signatures
+
+Files that are not `.fpk` (native plugins, scripts, anything else) are signed with a detached signature next to them, `<file>.sig` (FSS INT-2, `security/include/forge/security/integrity.hpp`). The same keys as for models (`forge keygen`):
+
+```sh
+forge sign libmyplugin.so --key dk.key          # -> libmyplugin.so.sig (the plugin is not modified)
+forge sign job.fs --key dk.key                  # -> job.fs.sig
+forge verify job.fs --pubkey dk.pub             # job.fs: VERIFIED; exit 1 on failure
+```
+
+`<file>.sig` is one JSON object:
+
+```json
+{"format":"forge-detached-sig","version":1,"alg":"ed25519","hash":"blake3-256",
+ "file":"job.fs","size":31,"blake3":"<64 hex>",
+ "signatures":[{"key_id":"<8 hex>","public_key":"<64 hex>","sig":"<128 hex>"}]}
+```
+
+Each signature is Ed25519 (RFC 8032, Monocypher) over the 32-byte digest
+
+```
+BLAKE3( "forge-detached-sig-v1" || 0x00 || u64le(len(name)) || name || u64le(size) || BLAKE3(file bytes) )
+```
+
+- The base name is signed, so a signed file cannot be swapped for another file signed by the same key (putting `b.so` and `b.so.sig` in place of `a.so` fails: "signature is for 'b.so', not 'a.so'"). The cost: a renamed file must be signed again (or signed with `--name`). Names compare exactly on Linux / BSD and ASCII-case-insensitively on Windows and macOS.
+- Verification recomputes the BLAKE3 digest and size from the bytes being loaded and the name from the path being loaded; the `file`, `size` and `blake3` fields are informative.
+- Several signers: signing again with another key appends to `signatures` (only while the name and content match); signing again with the same key replaces its entry.
+- `key_id` is the first 4 bytes of BLAKE3(public key), as for `.fpk`.
+- A `.sig` larger than 64 KiB is rejected.
+
+Under a security policy, `integrity.plugins` and `integrity.scripts` decide whether these signatures are required ([security-api.md](security-api.md#integration)).
+
 ## Platform notes and limits
 - `FORGE_HUGEPAGES=1` asks for transparent huge pages on mappings of 2 MiB or more.
 - In encrypted files only `data` is sealed. The manifest, blueprint, tokenizer, tensor index and section table stay readable, which is why `inspect`, section-hash and signature checks work without the key.

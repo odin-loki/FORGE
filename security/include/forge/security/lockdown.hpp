@@ -531,16 +531,34 @@ inline report evaluate(const policy& p, bool apply) {
             m.state = apply || lds().applied ? "active" : "available"; m.level = p.prof == profile::strict ? "should" : "info";
             m.detail = "signed models are verified at load, unsigned ones audited (inference::model under the active policy)";
         }
+        const std::string keys = p.integrity.trusted_keys.empty() ? "no trusted_keys: any valid signature passes (integrity, not provenance)"
+                                                                  : std::to_string(p.integrity.trusted_keys.size()) + " trusted key(s)";
+        const std::string st_on = apply || lds().applied ? "active" : "available";
         auto& pl = add("INT-1", "integrity: native plugins", "n/a", "", L);
-        if (on && p.integrity.plugins == requirement::required) { pl.state = "emulated"; pl.backend = "enforce(plugin_load) refuses"; pl.detail = "no plugin signature verifier yet: loads are refused"; }
-        else if (on && p.integrity.plugins == requirement::optional) { pl.state = "missing"; pl.level = "info"; pl.detail = "plugins are not verified"; }
+        if (on && p.integrity.plugins != requirement::off) {
+            pl.state = st_on; pl.backend = "detached <plugin>.sig (security::open_plugin, INT-2)";
+            if (p.integrity.plugins == requirement::optional) { pl.level = p.prof == profile::strict ? "should" : "info"; pl.detail = "signed plugins verified, unsigned ones audited; " + keys; }
+            else pl.detail = keys;
+        }
         auto& sc2 = add("INT-1", "integrity: scripts", "n/a", "", L);
-        if (on && p.integrity.scripts == requirement::required) { sc2.state = "emulated"; sc2.backend = "forge script refuses to run"; sc2.detail = "no script signature verifier (script signatures exist only for the .fsc cache): scripts are refused"; }
-        else if (on && p.integrity.scripts == requirement::optional) { sc2.state = "missing"; sc2.level = "info"; sc2.detail = "scripts are not verified; forge script audits running an unsigned one"; }
+        if (on && p.integrity.scripts != requirement::off) {
+            sc2.state = st_on; sc2.backend = "detached <script>.sig (engine::run_file, imports, rpc --rpc-sig; INT-2)";
+            if (p.integrity.scripts == requirement::optional) { sc2.level = p.prof == profile::strict ? "should" : "info"; sc2.detail = "signed scripts verified, unsigned ones audited; " + keys; }
+            else sc2.detail = keys + "; -e / REPL code is refused";
+        }
         auto& cs = add("INT-3", "OS code signing (plugins)", "n/a", "", L);
-        if (on && p.integrity.os_code_signing) {
-            if (p.integrity.plugins == requirement::required) { cs.state = "emulated"; cs.backend = "plugins refused (see above)"; }
-            else { cs.state = "missing"; cs.detail = "Authenticode / SecStaticCodeCheckValidity / IMA checks are not implemented"; }
+        {
+            // the running executable's own signature, as a sample of what the OS mechanism reports here
+            auto self = os::exe_path();
+            auto sig = self.empty() ? code_signature{} : os_code_signature(self);
+            cs.backend = sig.backend;
+            const std::string me = self.empty() ? std::string() : signed_name(self) + ": " + name(sig.st) + (sig.signer.empty() ? "" : " (" + sig.signer + ")");
+            if (!on || !p.integrity.os_code_signing) cs.detail = me;
+            else if (sig.st == code_signature::state::not_applicable) {
+                // no OS mechanism for shared objects: reported, not failed; plugins rely on detached signatures
+                cs.state = "missing"; cs.level = "info"; cs.detail = sig.detail;
+            } else if (sig.st == code_signature::state::error) { cs.state = "failed"; cs.detail = sig.detail; }
+            else { cs.state = st_on; cs.detail = "plugins must be OS-signed; " + me; }
         }
     }
 

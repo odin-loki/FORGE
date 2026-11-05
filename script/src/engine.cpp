@@ -19,6 +19,8 @@
 #include <forge/os/os.hpp>
 #include <forge/os/sandbox.hpp>
 #include <forge/os/oserror.hpp>
+#include <forge/security/enforce.hpp>
+#include <forge/security/integrity.hpp>
 #include <csignal>
 #include <filesystem>
 #include <format>
@@ -158,6 +160,10 @@ engine::~engine() { { std::lock_guard g(p_->sh->cb_m); p_->sh->callbacks.clear()
 result engine::run_file(const std::string& path) {
     auto src = os::read_file(path);
     if (!src) { result r; r.ok = false; r.error_type = "IOError"; r.error = "IOError: " + src.err.what; return r; }
+    // FSS INT-1/INT-2: under an active policy integrity.scripts decides, on exactly the bytes that get parsed
+    // (<path>.sig, detached signature; integrity_error is reported as IntegrityError)
+    try { security::verify_artefact(*security::active_policy(), security::artefact::script, path, {reinterpret_cast<const std::uint8_t*>(src.value.data()), src.value.size()}); }
+    catch (const security::integrity_error& e) { result r; r.ok = false; r.error_type = "IntegrityError"; r.error = std::string("IntegrityError: ") + e.what(); r.exit_code = 1; return r; }
     std::error_code ec;
     auto abs = std::filesystem::weakly_canonical(path, ec);
     p_->sh->base_dir = (ec ? std::filesystem::path(path) : abs).parent_path().string();

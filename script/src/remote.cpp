@@ -34,7 +34,7 @@ const Value* kv(const Args& a, std::size_t i, const std::string& k) {
 }
 
 // ---- connection from (addr, opts)
-struct Conn { std::shared_ptr<graph::rpc::client> c; std::vector<std::string> argv; std::uint32_t tmo = 0; std::string name = "<remote>"; };
+struct Conn { std::shared_ptr<graph::rpc::client> c; std::vector<std::string> argv; std::uint32_t tmo = 0; std::string name = "<remote>", sig; };
 Conn connect(Interp& in, const std::string& what, std::string addr, const Args& a, std::size_t oi) {
     if (!in.caps.net) in.raise("PermissionError", "network access is disabled in this sandbox");
     if (addr.starts_with("rpc:")) addr = addr.substr(4);
@@ -57,13 +57,14 @@ Conn connect(Interp& in, const std::string& what, std::string addr, const Args& 
     if (auto* v = kv(a, oi, "args")) if (auto* l = as<List>(*v)) for (auto& x : l->items) c.argv.push_back(in.str(x));
     if (auto* v = kv(a, oi, "timeout_ms")) if (auto* i = std::get_if<std::int64_t>(v)) c.tmo = std::uint32_t(std::max<std::int64_t>(0, *i));
     if (auto* v = kv(a, oi, "name")) c.name = in.str(*v);
+    if (auto* v = kv(a, oi, "signature")) c.sig = in.str(*v);   // detached .sig text for `name` (FSS INT-2)
     std::string why;
     c.c = graph::rpc::client::connect(host, port, &why, sec);
     if (!c.c) in.raise(why.find("auth") != std::string::npos ? "PermissionError" : "IOError", why);
     return c;
 }
 graph::rpc::client::script_reply run_remote(Interp& in, Conn& c, const std::string& src) {
-    try { return c.c->run_script(src, c.name, c.argv, c.tmo); }
+    try { return c.c->run_script(src, c.name, c.argv, c.tmo, c.sig); }
     catch (const std::exception& e) { std::string m = e.what(); in.raise(m.find("disabled") != std::string::npos || m.find("permission denied") != std::string::npos ? "PermissionError" : "IOError", m); }
 }
 

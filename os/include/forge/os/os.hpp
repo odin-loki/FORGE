@@ -741,6 +741,8 @@ public:
 #endif
         l.self_ = name.empty(); return {std::move(l), {}};
     }
+    // Takes ownership of a handle from LoadLibrary / dlopen (closed by the library).
+    static library adopt(void* native) { library l; l.h_ = native; return l; }
     void* symbol(const char* s) const {
         if (!h_) return nullptr;
 #if defined(FORGE_OS_WINDOWS)

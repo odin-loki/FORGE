@@ -7,6 +7,8 @@
 // Not optimised: weights travel with every op (no remote residency yet).
 // Security (rpc_secure.hpp, docs/rpc.md): optional TLS + token / Ed25519 key auth before the first frame.
 // Remote scripts:  request  = "FRPS" str source, str name, u32 argc {str}, u32 timeout_ms
+//                  or "FRPZ" (signed) with the same fields then str signature (the script's detached .sig text, FSS
+//                  INT-2; servers older than FRPZ close the connection)
 //                  response = u32 status(0 ok / 1 refused + str error) then u32 ok, str error_type, str error, str output
 #include <forge/graph/kernels.hpp>
 #include <forge/graph/rpc_secure.hpp>
@@ -106,9 +108,13 @@ public:
     }
     struct script_reply { bool ok = false; std::string error_type, error, output; };
     // Run a FORGE script on the server (needs an authenticated connection to a server started with scripts allowed).
-    script_reply run_script(std::string_view source, std::string_view name = "<remote>", const std::vector<std::string>& argv = {}, std::uint32_t timeout_ms = 0) {
+    // `signature`: the script's detached signature (`forge sign script.fs` -> script.fs.sig text; `name` must be the
+    // signed file name), checked by servers whose policy has integrity.scripts.
+    script_reply run_script(std::string_view source, std::string_view name = "<remote>", const std::vector<std::string>& argv = {}, std::uint32_t timeout_ms = 0,
+                            std::string_view signature = {}) {
         std::lock_guard g(m_);
-        detail::writer w; w.raw("FRPS", 4); w.str(source); w.str(name); w.u32(std::uint32_t(argv.size())); for (auto& a : argv) w.str(a); w.u32(timeout_ms);
+        detail::writer w; w.raw(signature.empty() ? "FRPS" : "FRPZ", 4); w.str(source); w.str(name); w.u32(std::uint32_t(argv.size())); for (auto& a : argv) w.str(a); w.u32(timeout_ms);
+        if (!signature.empty()) w.str(signature);
         if (!detail::send_all(s_, w.b.data(), w.b.size())) raise(errc::io_error, "rpc: send failed");
         detail::reader r{s_};
         auto st = r.u32(); if (!r.ok) raise(errc::io_error, "rpc: connection lost");
@@ -165,6 +171,9 @@ public:
     struct script_result { bool ok = false; std::string error_type, error, output; };
     // Runs a remote script; set by the host (apps/forge.cpp wires forge::script). Null = scripts unsupported.
     std::function<script_result(const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t timeout_ms)> script_handler;
+    // Same, with the client's detached signature ("" for an unsigned FRPS request). Preferred over script_handler when set.
+    std::function<script_result(const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t timeout_ms,
+                                const std::string& signature)> signed_script_handler;
     // Security log (optional): authentications with the principal and its permissions, refusals, permission denials.
     // Called from connection threads.
     std::function<void(const std::string&)> log;
@@ -241,7 +250,7 @@ private:
                 else say("unauthenticated (no auth configured)");
                 if (peer.handshake) continue;   // handshake consumed; next frame
             }
-            if (std::memcmp(magic, "FRPS", 4) == 0) { if (!serve_script(s, r, peer, say)) return; continue; }
+            if (std::memcmp(magic, "FRPS", 4) == 0 || std::memcmp(magic, "FRPZ", 4) == 0) { if (!serve_script(s, r, peer, say, magic[3] == 'Z')) return; continue; }
             if (std::memcmp(magic, "FRPC", 4) != 0) return;
             auto name = r.str(256); auto a = detail::get_attrs(r);
             auto n = r.u32(); if (n > 64) return;
@@ -269,17 +278,18 @@ private:
             if (!detail::send_all(s, w.b.data(), w.b.size())) return;
         }
     }
-    template <class Log> bool serve_script(channel& s, detail::reader& r, const peer_info& peer, Log& say) {
+    template <class Log> bool serve_script(channel& s, detail::reader& r, const peer_info& peer, Log& say, bool with_sig = false) {
         auto src = r.str(16u << 20); auto name = r.str(4096); auto n = r.u32(); if (!r.ok || n > 4096) return false;
         std::vector<std::string> argv; for (std::uint32_t i = 0; i < n && r.ok; ++i) argv.push_back(r.str(1 << 20));
         auto tmo = r.u32(); if (!r.ok) return false;
+        std::string sig; if (with_sig) { sig = r.str(64u << 10); if (!r.ok) return false; }
         detail::writer w;
         if (!sec_.allow_scripts || !peer.authed) { w.u32(1); w.str("remote scripts are disabled on this server"); }
         else if (!(peer.perms & perm_scripts)) { say("denied script for " + peer.who); w.u32(1); w.str("permission denied: " + peer.who + " may not run scripts (allow=)"); }
-        else if (!script_handler) { w.u32(1); w.str("this server has no script runtime"); }
+        else if (!script_handler && !signed_script_handler) { w.u32(1); w.str("this server has no script runtime"); }
         else {
-            script_result res; say("script '" + name + "' for " + peer.who);
-            try { res = script_handler(src, name, argv, tmo); } catch (const std::exception& e) { res.ok = false; res.error_type = "RuntimeError"; res.error = e.what(); }
+            script_result res; say("script '" + name + "' for " + peer.who + (sig.empty() ? "" : " (signed)"));
+            try { res = signed_script_handler ? signed_script_handler(src, name, argv, tmo, sig) : script_handler(src, name, argv, tmo); } catch (const std::exception& e) { res.ok = false; res.error_type = "RuntimeError"; res.error = e.what(); }
             w.u32(0); w.u32(res.ok ? 1 : 0); w.str(res.error_type); w.str(res.error); w.str(res.output); ++scripts_;
         }
         return detail::send_all(s, w.b.data(), w.b.size());

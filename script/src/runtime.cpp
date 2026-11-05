@@ -11,6 +11,8 @@
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
 #include <forge/security/errors.hpp>
+#include <forge/security/enforce.hpp>
+#include <forge/security/integrity.hpp>
 #include <cmath>
 #include <filesystem>
 #include <format>
@@ -1091,7 +1093,10 @@ Value Interp::import_module(const std::string& path) {
         sh->modules[key] = Ref<Globals>();
     }
     auto src = os::read_file(key);
-    if (!src) raise("IOError", src.err.what);
+    if (!src) { std::lock_guard lk(sh->mod_m); sh->modules.erase(key); raise("IOError", src.err.what); }
+    // FSS INT-1/INT-2: integrity.scripts applies to imported modules too, checked on the buffer that gets parsed
+    try { security::verify_artefact(*security::active_policy(), security::artefact::script, key, {reinterpret_cast<const std::uint8_t*>(src.value.data()), src.value.size()}); }
+    catch (...) { std::lock_guard lk(sh->mod_m); sh->modules.erase(key); throw; }
     std::shared_ptr<const FnDecl> top;
     try { top = parse_program(src.value, key); }
     catch (const syntax_error& e) { std::lock_guard g(sh->mod_m); sh->modules.erase(key); raise("SyntaxError", e.what()); }
