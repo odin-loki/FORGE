@@ -194,7 +194,7 @@ public:
     mem_info memory() { mem_info m; if (f_.mem_info) { bind(); f_.mem_info(&m.free, &m.total); } return m; }
     // pooled_bytes: freed buffers kept for reuse; evictions / evicted_bytes: buffers dropped to fit the device budget
     struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0, qweight_bytes = 0,
-                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0; };
+                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0, zero_fills = 0; };   // zero_fills: uploads of all-zero data done as device clears
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); s.pooled_bytes = pool_bytes_; return s; }
     // The device memory pool this runtime charges ("cuda:0", ...) and the bytes it has charged to it.
     mem::budget* memory_pool() { return dm_.pool(); }
@@ -321,7 +321,7 @@ public:
         each_overlap(p, n, [&](entry& e) {
             auto el = reinterpret_cast<std::uintptr_t>(e.host), eh = el + e.count * 4;
             auto a = std::max(lo, el), b = std::min(hi, eh);
-            ck(htod_s(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
+            ck(htod_or_zero(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
         });
         // No sync: the copy is stream-ordered before later kernels, and a pageable source may be reused once the
         // call returns (the driver has staged it). Only launch any recorded kernels so ordering is kept.
@@ -824,6 +824,7 @@ private:
         int (*htod)(std::uint64_t, const void*, std::size_t) = nullptr;
         int (*dtoh)(void*, std::uint64_t, std::size_t) = nullptr;
         int (*htod_a)(std::uint64_t, const void*, std::size_t, void*) = nullptr;
+        int (*memset32)(std::uint64_t, unsigned, std::size_t, void*) = nullptr;   // cuMemsetD32Async / hipMemsetD32Async
         int (*dtoh_a)(void*, std::uint64_t, std::size_t, void*) = nullptr;
         int (*dtod_a)(std::uint64_t, std::uint64_t, std::size_t, void*) = nullptr;
         int (*launch)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**, void**) = nullptr;
@@ -962,6 +963,17 @@ private:
         static const std::size_t v = [] { auto* e = std::getenv("FORGE_GRAPH_SEG"); std::size_t n = e ? std::strtoul(e, nullptr, 10) : 64; return n ? n : ~std::size_t(0); }();
         return v;
     }
+    // Upload, or clear on the device when the host bytes are all zero (a fresh KV slot or recurrent state): a large
+    // pageable upload of zeros costs far more than scanning it. Small copies go straight through.
+    static bool all_zero(const void* h, std::size_t n) {
+        auto* p = static_cast<const unsigned char*>(h); std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) { std::uint64_t w; std::memcpy(&w, p + i, 8); if (w) return false; }
+        for (; i < n; ++i) if (p[i]) return false;
+        return true; }
+    int htod_or_zero(std::uint64_t d, const void* h, std::size_t n, void* st) {
+        if (f_.memset32 && n >= (64u << 10) && n % 4 == 0 && all_zero(h, n)) {
+            flush(); q81_drop(); dirty_ |= in_run_; ++stats_.zero_fills; return f_.memset32(d, 0u, n / 4, st); }
+        return htod_s(d, h, n, st); }
     int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; cuda_hip::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return dfree(p); }
@@ -1145,7 +1157,7 @@ private:
         std::sort(olds.begin(), olds.end());
         if (!is_out) {   // upload only the gaps the resident pieces do not cover
             std::uintptr_t at = lo;
-            auto up = [&](std::uintptr_t x, std::uintptr_t y) { if (y > x) { ck(htod_s(e.d + (x - lo), reinterpret_cast<const void*>(x), y - x, stream_), "memcpy HtoD"); ++stats_.uploads; } };
+            auto up = [&](std::uintptr_t x, std::uintptr_t y) { if (y > x) { ck(htod_or_zero(e.d + (x - lo), reinterpret_cast<const void*>(x), y - x, stream_), "memcpy HtoD"); ++stats_.uploads; } };
             for (auto k : olds) { up(at, std::max(k, lo)); at = std::max(at, std::min(hi, k + res_[k].count * 4)); }
             up(at, lo + count * 4);
         }
@@ -1180,7 +1192,7 @@ private:
                  sym(f_.free_, "cuMemFree_v2") && sym(f_.htod, "cuMemcpyHtoD_v2") && sym(f_.dtoh, "cuMemcpyDtoH_v2") &&
                  sym(f_.launch, "cuLaunchKernel") && sym(f_.sync_, "cuCtxSynchronize");
             opt(f_.device_get, "cuDeviceGet"); opt(f_.ctx_set, "cuCtxSetCurrent"); opt(f_.dev_attr, "cuDeviceGetAttribute");
-            opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
+            opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.memset32, "cuMemsetD32Async"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
             opt(f_.stream_create, "cuStreamCreate"); opt(f_.stream_destroy, "cuStreamDestroy_v2"); opt(f_.stream_sync, "cuStreamSynchronize");
             opt(f_.capture_begin, "cuStreamBeginCapture_v2"); opt(f_.capture_end, "cuStreamEndCapture");
             opt(f_.graph_inst, "cuGraphInstantiateWithFlags"); opt(f_.exec_update, "cuGraphExecUpdate_v2");
@@ -1194,7 +1206,7 @@ private:
                  sym(f_.get_fn, "hipModuleGetFunction") && sym(f_.malloc_, "hipMalloc") && sym(f_.free_, "hipFree") &&
                  sym(f_.htod, "hipMemcpyHtoD") && sym(f_.dtoh, "hipMemcpyDtoH") && sym(f_.launch, "hipModuleLaunchKernel") &&
                  sym(f_.sync_, "hipDeviceSynchronize");
-            opt(f_.htod_a, "hipMemcpyHtoDAsync"); opt(f_.dtoh_a, "hipMemcpyDtoHAsync"); opt(f_.dtod_a, "hipMemcpyDtoDAsync");
+            opt(f_.htod_a, "hipMemcpyHtoDAsync"); opt(f_.memset32, "hipMemsetD32Async"); opt(f_.dtoh_a, "hipMemcpyDtoHAsync"); opt(f_.dtod_a, "hipMemcpyDtoDAsync");
             opt(f_.stream_create, "hipStreamCreateWithFlags"); opt(f_.stream_destroy, "hipStreamDestroy"); opt(f_.stream_sync, "hipStreamSynchronize");
             opt(f_.capture_begin, "hipStreamBeginCapture"); opt(f_.capture_end, "hipStreamEndCapture");
             opt(f_.graph_inst, "hipGraphInstantiateWithFlags"); opt(f_.graph_launch, "hipGraphLaunch");
