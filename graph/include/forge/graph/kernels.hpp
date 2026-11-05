@@ -59,6 +59,10 @@ struct device_hooks {
     // optional: index of the largest element of a device-resident buffer (ties: the lowest index), read back as one
     // integer instead of the whole buffer; -1 when the buffer is not resident or the backend cannot (greedy decode)
     std::function<long long(const float*, std::size_t)> argmax;
+    // optional: two adjacent steps as one device kernel (compile() marks the pairs, see plan.hpp fuse_steps):
+    // "add_rms_norm" in {a, b, w} out {a + b, rms_norm(a + b, w)}; "rms_rope" in {x, w, pos} out {rope(rms_norm(x, w), pos)}.
+    // attrs: the rms_norm's eps (rms_rope: plus the rope's). false = not handled; the executor then runs both steps.
+    std::function<bool(const std::string& kind, std::span<const tensor_view> in, std::span<const tensor_view> out, const ops::attrs& a)> fused;
 };
 
 inline kernel_fn reference_kernel(ops::op o) {
@@ -97,6 +101,10 @@ public:
     std::optional<lowering> device_qgemm;
     std::vector<std::string> device_qgemm_codecs;
     std::optional<lowering> device_qgather;   // gather (embedding lookup) over an encoded table on the device
+    // FFN gate/up/SiLU fused on the device (plan.hpp's GLU pass): op silu_mul, inputs (x, Wg, Wu, gate, up) where Wg/Wu
+    // are encoded weights of one codec in device_qglu_codecs and gate/up the unfused products' buffers (its fallback).
+    std::optional<lowering> device_qglu;
+    std::vector<std::string> device_qglu_codecs;
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);

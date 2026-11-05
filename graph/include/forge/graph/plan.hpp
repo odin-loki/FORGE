@@ -190,6 +190,10 @@ struct step {
     value_id out;
     const ops::attrs* attrs;
     int kind; // 0 op, 1 state_append, 2 state_op
+    // device runs: this step and the next may run as one kernel (device_hooks::fused): 1 "add_rms_norm", 2 "rms_rope";
+    // fattrs are the fused kernel's attributes (see fuse_steps)
+    int fuse = 0;
+    const ops::attrs* fattrs = nullptr;
 };
 
 class plan {
@@ -233,6 +237,35 @@ public:
         return s;
     }
 };
+
+inline void fuse_steps(plan& p);
+// FFN gate/up fusion ($FORGE_FUSE_GLU=0 off): silu_mul(matmul_t(x, Wg), matmul_t(x, Wu)) whose two device quantised
+// matmuls are the two steps right before it (so x is still live there), read the same x, have weights of one codec
+// (registry::device_qglu_codecs) and shape, and feed nothing else, becomes one registry::device_qglu step with inputs
+// (x, Wg, Wu, gate, up). The gate/up buffers stay planned: the step's fallback writes them as the unfused steps did.
+inline void fuse_glu(plan& p, registry& reg) {
+    if (!reg.device_qglu || !reg.device_qgemm || !p.hooks || !reg.stages.empty()) return;
+    if (auto* e = std::getenv("FORGE_FUSE_GLU"); e && std::string(e) == "0") return;
+    auto& G = p.g;
+    std::vector<int> uses(G.size(), 0);
+    for (auto& n : G.nodes()) for (auto in : n.inputs) ++uses[in];
+    for (auto& [nm, v] : G.outputs()) uses[v] += 2;
+    const lowering* qg = &*reg.device_qgemm;
+    for (std::size_t i = 2; i < p.steps.size(); ++i) {
+        const step s = p.steps[i], a = p.steps[i - 2], b = p.steps[i - 1];
+        if (s.kind || a.kind || b.kind || a.low != qg || b.low != qg || s.in.size() != 2 || G.at(s.out).kind != node_kind::op || G.at(s.out).op != ops::op::silu_mul) continue;
+        const step* gs = a.out == s.in[0] ? &a : b.out == s.in[0] ? &b : nullptr;
+        const step* us = a.out == s.in[1] ? &a : b.out == s.in[1] ? &b : nullptr;
+        if (!gs || !us || gs == us || gs->in.size() != 2 || us->in.size() != 2 || gs->in[0] != us->in[0]) continue;
+        const auto &wg = G.at(gs->in[1]), &wu = G.at(us->in[1]);
+        if (wg.qcodec != wu.qcodec || wg.shape != wu.shape || wg.shape.size() != 2 || !p.views[gs->in[1]].qdata || !p.views[us->in[1]].qdata ||
+            std::find(reg.device_qglu_codecs.begin(), reg.device_qglu_codecs.end(), wg.qcodec) == reg.device_qglu_codecs.end()) continue;
+        if (uses[s.in[0]] != 1 || uses[s.in[1]] != 1 || G.at(s.in[0]).shape != G.at(s.out).shape || G.at(s.in[1]).shape != G.at(s.out).shape) continue;
+        p.steps[i - 2] = step{&*reg.device_qglu, {gs->in[0], gs->in[1], us->in[1], s.in[0], s.in[1]}, s.out, s.attrs, 0};
+        // the steps now at i - 1 and i have the fused step among their two predecessors, so the scan goes on at i + 1
+        p.steps.erase(p.steps.begin() + std::ptrdiff_t(i) - 1, p.steps.begin() + std::ptrdiff_t(i) + 1);
+    }
+}
 
 inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, const pass_options& po = {}) {
     auto p = std::make_unique<plan>();
@@ -369,7 +402,34 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
             else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
         }
     }
+    fuse_glu(*p, reg);   // first: it removes steps; fuse_steps then pairs adjacent steps of the final list
+    fuse_steps(*p);
     return p;
+}
+
+// Elementwise fusions for device runs: mark adjacent device step pairs that the backend may run as one kernel
+// (device_hooks::fused); the executor falls back to the two steps whenever the hook declines. The memory plan is
+// untouched, so the unfused path always has its buffers.
+//   add -> rms_norm of the sum (residual add + the next norm)                 fuse 1, "add_rms_norm"
+//   rms_norm -> rope of the norm, when the rope is its only consumer (QK-norm)  fuse 2, "rms_rope"
+inline void fuse_steps(plan& p) {
+    if (!p.hooks || !p.hooks->fused) return;
+    auto& G = p.g;
+    std::vector<int> uses(G.size(), 0);
+    for (auto& n : G.nodes()) for (auto in : n.inputs) ++uses[in];
+    for (auto& [nm, v] : G.outputs()) uses[v] += 2;
+    auto dev_op = [&](const step& s, ops::op o) { return s.kind == 0 && s.low && s.low->on_device && G.at(s.out).kind == node_kind::op && G.at(s.out).op == o; };
+    for (std::size_t i = 0; i + 1 < p.steps.size(); ++i) {
+        auto& a = p.steps[i]; auto& b = p.steps[i + 1];
+        if (b.in.size() != 2 || a.in.size() != 2 || b.in[0] != a.out) continue;
+        const i64 n = numel(G.at(a.out).shape);
+        if (dev_op(a, ops::op::add) && dev_op(b, ops::op::rms_norm) && numel(G.at(a.in[0]).shape) == n && numel(G.at(a.in[1]).shape) == n) {
+            a.fuse = 1; a.fattrs = b.attrs; ++i;
+        } else if (dev_op(a, ops::op::rms_norm) && dev_op(b, ops::op::rope) && uses[a.out] == 1) {
+            auto& at = p.attr_store.emplace_back(*b.attrs); at.v["eps"] = a.attrs->num("eps", 1e-6);
+            a.fuse = 2; a.fattrs = &at; ++i;
+        }
+    }
 }
 
 class executor {
@@ -460,10 +520,18 @@ private:
     }
     void run_steps(device_hooks* h) {
         std::vector<tensor_view> ins;
-        for (auto& s : p_.steps) {
+        for (std::size_t si = 0; si < p_.steps.size(); ++si) {
+            auto& s = p_.steps[si];
             ins.clear();
             for (auto v : s.in) ins.push_back(p_.views[v]);
             auto& out = p_.views[s.out];
+            if (s.fuse && h && h->fused && si + 1 < p_.steps.size()) {   // this step and the next as one kernel (fuse_steps)
+                auto& nx = p_.steps[si + 1];
+                const tensor_view fin[] = {ins[0], ins[1], p_.views[nx.in[1]]}, fo2[] = {out, p_.views[nx.out]};
+                bool done = s.fuse == 1 ? h->fused("add_rms_norm", fin, fo2, *s.fattrs)
+                                        : h->fused("rms_rope", fin, std::span<const tensor_view>(fo2 + 1, 1), *s.fattrs);
+                if (done) { ++si; continue; }
+            }
             if (s.kind == 2) {   // fixed-size state op: state is host memory, updated in place
                 auto& node = p_.g.at(s.out);
                 auto fn = s.attrs->str("fn");

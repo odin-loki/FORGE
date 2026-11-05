@@ -10,6 +10,7 @@
 #include <vector>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <format>
 #include <functional>
 #include <string>
@@ -32,7 +33,7 @@ static int images() {
         const bool sm80 = arch == "ptx sm_80";   // the sm_80 image adds the int8 tensor-core prefill matmul
         bool ok = has(img, ".version") && has(img, sm80 ? ".target sm_80" : ".target sm_70");
         for (auto op : kernel_ops) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
-        if (sm80) for (auto op : {"qmatmul_mma_q8_0", "qmatmul_mma_q4_k", "qmatmul_mma_q6_k", "quant_q8r"}) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
+        if (sm80) for (auto op : {"qmatmul_mma_q8_0", "qmatmul_mma_q4_k", "qmatmul_mma_q6_k", "quant_q8r", "qmatmul_glu_q4_k", "qmatmul_glu128_q6_k", "glu_q81"}) if (!has(img, std::string(".entry forge_") + op + "(")) { std::printf("FAIL %s: no entry forge_%s\n", arch.c_str(), op); ok = false; }
         std::printf("%s %s: %zu bytes, %zu kernels\n", ok ? "ok  " : "FAIL", arch.c_str(), img.size(), std::size(kernel_ops)); fails += !ok;
     }
     for (auto& [arch, img] : hip) {
@@ -177,6 +178,204 @@ template<class RT> static int attention_dec_check(RT& rt, const std::string& api
     return fails;
 }
 
+// Elementwise fusions (cuda.hpp run_fused, the rms_norm q8r output): bit-identical to the unfused kernels inside a run,
+// and through the executor (plan.hpp fuse_steps) within the oracle tolerance of the CPU.
+template<class RT> static int fusion_check(RT& rt, const std::string& api) {
+    if constexpr (!requires { rt.run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); }) return 0;
+    else {
+    auto off = [](const char* v) { auto* e = std::getenv(v); return e && std::string(e) == "0"; };
+    if (off("FORGE_FUSE_ADD_NORM") || off("FORGE_FUSE_QK_ROPE")) { std::printf("note %s: elementwise fusions switched off\n", api.c_str()); return 0; }
+    int fails = 0, n = 0;
+    auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.613f + ph) * (1.f + float(i % 7) / 3.f); return v; };
+    auto disp = [&](const char* k) -> std::size_t { auto d = rt.dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; };
+    // add + rms_norm: decode rows (q8_1 reduction; 1024 threads for one wide row), prefill rows (tree; q8r output when
+    // cols % 256 == 0), in place (s = a) and out of place
+    struct an { i64 rows, cols; bool inplace; };
+    for (auto c : {an{1, 4096, true}, an{3, 256, false}, an{2, 96, false}, an{40, 512, true}, an{20, 160, false}, an{70, 1024, false}, an{33, 2048, true}}) {
+        const std::size_t N = std::size_t(c.rows * c.cols);
+        auto a = rnd(N, 1), b = rnd(N, 2), w = rnd(std::size_t(c.cols), 3);
+        std::vector<float> a2 = a, s1(N), y1(N), s2(N), y2(N);
+        shape_t sh{c.rows, c.cols}, ws{c.cols};
+        ops::attrs at{{"eps", 1e-5}};
+        rt.begin_run();   // unfused: add, rms_norm
+        float* sp = c.inplace ? a.data() : s1.data();
+        rt.run_op("add", {{a.data(), sh}, {b.data(), sh}}, {}, {sp, sh});
+        rt.run_op("rms_norm", {{sp, sh}, {w.data(), ws}}, at, {y1.data(), sh});
+        rt.to_host(sp, N); rt.to_host(y1.data(), N); rt.end_run();
+        if (c.inplace) s1 = a;
+        rt.begin_run();
+        const std::size_t f0 = disp("fused_add_rms_norm");
+        float* sp2 = c.inplace ? a2.data() : s2.data();
+        bool ok = rt.run_fused("add_rms_norm", {{a2.data(), sh}, {b.data(), sh}, {w.data(), ws}}, {{sp2, sh}, {y2.data(), sh}}, at);
+        rt.to_host(sp2, N); rt.to_host(y2.data(), N); rt.end_run();
+        if (c.inplace) s2 = a2;
+        ++n;
+        if (!ok || disp("fused_add_rms_norm") != f0 + 1 || s1 != s2 || y1 != y2) {
+            std::printf("FAIL %s add_rms_norm rows %lld cols %lld: %s\n", api.c_str(), (long long)c.rows, (long long)c.cols, ok ? "differs from add + rms_norm" : "refused"); ++fails; }
+    }
+    // rms_norm + rope (QK-norm): decode (64 heads: tree; 8 heads: q8_1 reduction), prefill, neox and interleaved, in place
+    struct rr { i64 s, h, d; int neox; bool inplace; };
+    for (auto c : {rr{1, 64, 128, 1, false}, rr{1, 8, 128, 1, true}, rr{37, 4, 64, 0, false}, rr{5, 3, 256, 1, false}, rr{40, 64, 128, 1, true}, rr{3, 5, 32, 0, true}}) {
+        const std::size_t N = std::size_t(c.s * c.h * c.d);
+        auto x = rnd(N, 4), w = rnd(std::size_t(c.d), 5); std::vector<float> pos(std::size_t(c.s)), x2 = x, t1(N), y1(N), y2(N);
+        for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i * 37 + 3);
+        shape_t sh{c.s, c.h, c.d}, ws{c.d}, ps{c.s};
+        ops::attrs ar{{"base", 1000000.0}, {"neox", double(c.neox)}}, an_{{"eps", 1e-6}}, af = ar; af.v["eps"] = 1e-6;
+        rt.begin_run();
+        rt.run_op("rms_norm", {{x.data(), sh}, {w.data(), ws}}, an_, {t1.data(), sh});
+        rt.run_op("rope", {{t1.data(), sh}, {pos.data(), ps}}, ar, {y1.data(), sh});
+        rt.to_host(y1.data(), N); rt.end_run();
+        rt.begin_run();
+        float* yp = c.inplace ? x2.data() : y2.data();
+        bool ok = rt.run_fused("rms_rope", {{x2.data(), sh}, {w.data(), ws}, {pos.data(), ps}}, {{yp, sh}}, af);
+        rt.to_host(yp, N); rt.end_run();
+        if (c.inplace) y2 = x2;
+        ++n;
+        double worst = 0; for (std::size_t i = 0; i < N; ++i) worst = std::max(worst, std::fabs(double(y1[i]) - y2[i]));
+        if (!ok || y1 != y2) { std::printf("FAIL %s rms_rope s %lld heads %lld d %lld: %s (worst %.3g)\n", api.c_str(), (long long)c.s, (long long)c.h, (long long)c.d,
+                                           ok ? "differs from rms_norm + rope" : "refused", worst); ++fails; }
+    }
+    // a prefill rms_norm writes its q8r rows; the next two matmuls on its output reuse them (no forge_quant_q8r) and give
+    // the same bits as a matmul that quantises the same input itself
+    if (std::getenv("FORGE_FUSE_Q8R") == nullptr && rt.has_function("forge_quant_q8r")) {
+        const auto* c4 = graph::codecs::find("q4_k");
+        const std::size_t R = 48, K = 1024, C = 40, rb = c4->bytes(K);
+        auto x = rnd(R * K, 6), w = rnd(K, 7), wf = rnd(C * K, 8); std::vector<float> h(R * K), o1(R * C), o2(R * C), o3(R * C);
+        std::vector<std::uint8_t> enc(C * rb); for (std::size_t j = 0; j < C; ++j) c4->encode(wf.data() + j * K, K, enc.data() + j * rb);
+        rt.begin_run();   // uploads the weight (an upload drops the q8r tracking)
+        rt.run_qmatmul({x.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o1.data(), {i64(R), i64(C)}});
+        rt.end_run();
+        const std::size_t r0 = disp("quant_q8r_reused"), q0 = disp("fused_q8r");
+        rt.begin_run();
+        rt.run_op("rms_norm", {{x.data(), {i64(R), i64(K)}}, {w.data(), {i64(K)}}}, {{"eps", 1e-6}}, {h.data(), {i64(R), i64(K)}});
+        rt.run_qmatmul({h.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o1.data(), {i64(R), i64(C)}});
+        rt.run_qmatmul({h.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o2.data(), {i64(R), i64(C)}});
+        rt.to_host(h.data(), h.size()); rt.to_host(o1.data(), o1.size()); rt.to_host(o2.data(), o2.size()); rt.end_run();
+        std::vector<float> hc = h;
+        rt.begin_run(); rt.run_qmatmul({hc.data(), {i64(R), i64(K)}}, enc.data(), rb, std::uint32_t(C), 2, {o3.data(), {i64(R), i64(C)}}); rt.to_host(o3.data(), o3.size()); rt.end_run();
+        const bool used = disp("fused_q8r") == q0 + 1, reused = disp("quant_q8r_reused") == r0 + 2;
+        ++n;
+        if (disp("qmatmul_mma") && (!used || !reused || o1 != o3 || o2 != o3)) {
+            std::printf("FAIL %s rms_norm q8r output: emitted %d reused %d same %d\n", api.c_str(), int(used), int(reused), int(o1 == o3 && o2 == o3)); ++fails; }
+    }
+    // decode attention: forge_attention_comb_q81 writes the output projection's q8_1 input; the matmul reuses it
+    {
+        const i64 T = 37, HQ = 4, HK = 2, D = 128; const std::size_t K = std::size_t(HQ * D), C = 24;
+        const auto* c8 = graph::codecs::find("q8_0"); const std::size_t rb = c8->bytes(K);
+        auto q = rnd(std::size_t(HQ * D), 9), k = rnd(std::size_t(T * HK * D), 10), v = rnd(std::size_t(T * HK * D), 11), wf = rnd(C * K, 12);
+        std::vector<float> y1(K), y2(K), o1(C), o2(C);
+        std::vector<std::uint8_t> enc(C * rb); for (std::size_t j = 0; j < C; ++j) c8->encode(wf.data() + j * K, K, enc.data() + j * rb);
+        ops::attrs at{{"causal", 1.0}};
+        auto attn = [&](std::vector<float>& y) { return rt.run_op("attention", {{q.data(), {1, HQ, D}}, {k.data(), {T, HK, D}}, {v.data(), {T, HK, D}}}, at, {y.data(), {1, HQ, D}}); };
+        attn(y2);   // outside a run: no fusion
+        rt.begin_run(); rt.run_qmatmul({y2.data(), {1, i64(K)}}, enc.data(), rb, std::uint32_t(C), 1, {o2.data(), {1, i64(C)}}); rt.to_host(o2.data(), C); rt.end_run();
+        const std::size_t r0 = disp("quant_q81_reused");
+        rt.begin_run(); attn(y1); rt.run_qmatmul({y1.data(), {1, i64(K)}}, enc.data(), rb, std::uint32_t(C), 1, {o1.data(), {1, i64(C)}});
+        rt.to_host(y1.data(), K); rt.to_host(o1.data(), C); rt.end_run();
+        ++n;
+        if (disp("attention_dec") && (y1 != y2 || o1 != o2 || disp("quant_q81_reused") != r0 + 1)) {
+            std::printf("FAIL %s attention_comb_q81: y same %d, matmul same %d, reused %d\n", api.c_str(), int(y1 == y2), int(o1 == o2), int(disp("quant_q81_reused") - r0)); ++fails; }
+    }
+    std::printf("%s %d/%d %s elementwise fusions match the unfused kernels\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+    }
+}
+
+// The executor's fused step pairs (plan.hpp fuse_steps): residual add + rms_norm and QK-norm + rope on the device
+// against the CPU executor.
+static int fusion_plan_check(graph::registry& reg, const std::string& api, const std::function<std::size_t(const char*)>& disp) {
+    if (!reg.hooks || !reg.hooks->fused) return 0;
+    for (auto v : {"FORGE_FUSE_ADD_NORM", "FORGE_FUSE_QK_ROPE"}) if (auto* e = std::getenv(v); e && std::string(e) == "0") return 0;
+    using namespace graph; using ops::op;
+    const i64 S = 20, D = 256, H = 4, d = 64;
+    auto build = [&] {
+        tensor_graph g;
+        auto a = g.input("a", {S, D}), b = g.input("b", {S, D}), w = g.input("w", {D}), q = g.input("q", {S, H, d}), qw = g.input("qw", {d}), pos = g.input("pos", {S});
+        auto s = g.add(a, b);
+        auto hn = g.apply(op::rms_norm, {s, w}, {{"eps", 1e-5}});
+        auto r = g.apply(op::rope, {g.apply(op::rms_norm, {q, qw}, {{"eps", 1e-6}}), pos}, {{"base", 10000.0}, {"neox", 1.0}});
+        g.output("s", s); g.output("h", hn); g.output("r", r);
+        return g;
+    };
+    auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.37f + ph); return v; };
+    std::vector<float> pos(S); for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i);
+    auto run = [&](registry* r) {
+        pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po); executor e(*p);
+        e.set_input("a", rnd(S * D, 1)); e.set_input("b", rnd(S * D, 2)); e.set_input("w", rnd(D, 3)); e.set_input("q", rnd(S * H * d, 4));
+        e.set_input("qw", rnd(d, 5)); e.set_input("pos", pos); e.run();
+        std::vector<float> out; for (auto nm : {"s", "h", "r"}) { auto t = e.output(nm); out.insert(out.end(), t.data.begin(), t.data.end()); }
+        return out;
+    };
+    const std::size_t f1 = disp("fused_add_rms_norm"), f2 = disp("fused_rms_rope");
+    auto dev = run(&reg), cpu = run(nullptr);
+    double worst = dev.size() == cpu.size() ? 0 : 1e9;
+    for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) worst = std::max(worst, std::fabs(double(dev[i]) - cpu[i]) / (1.0 + std::fabs(double(cpu[i]))));
+    const bool fused = disp("fused_add_rms_norm") > f1 && disp("fused_rms_rope") > f2, ok = fused && worst < 1e-4;
+    std::printf("%s %s executor runs add+rms_norm and rms_norm+rope fused (%d) and matches the CPU (worst rel %.3g)\n", ok ? "ok  " : "FAIL", api.c_str(), int(fused), worst);
+    return ok ? 0 : 1;
+}
+
+static void set_env(const char* k, const std::string& v);
+// FFN gate/up/SiLU fusion (plan.hpp fuse_glu + run_qglu): y = (silu(x Wg^T) * (x Wu^T)) Wd^T as a compiled plan on the
+// device, fused vs compiled with FORGE_FUSE_GLU=0 vs the CPU executor. Rows < 16: decode (forge_qmatmul_q81 over the
+// interleaved weight + forge_glu_q81, whose q8_1 the down projection reuses); >= 16: forge_qmatmul_glu_* (tensor cores),
+// whose q8r output the down projection reuses. q5_k has no fused kernel: the plan must stay unfused.
+template<class RT> static int glu_check(graph::registry& reg, RT& rt, const std::string& api) {
+    if (!reg.device_qglu) { std::printf("note %s: no fused FFN gate/up\n", api.c_str()); return 0; }
+    using namespace graph;
+    int fails = 0, n = 0;
+    std::deque<std::vector<std::uint8_t>> keep;
+    auto disp = [&](const char* key) -> std::size_t { auto d = rt.dispatches(); auto it = d.find(key); return it == d.end() ? 0 : it->second; };
+    for (std::string cn : {"q8_0", "q4_k", "q6_k", "q5_k"}) for (i64 rows : {1, 3, 16, 70, 130}) {
+        const auto* c = codecs::find(cn);
+        const i64 k = 512, ff = 256, od = 40;
+        auto enc = [&](i64 r, i64 kk, float ph) {
+            std::vector<float> w(std::size_t(r * kk)); std::vector<std::uint8_t> e(std::size_t(r) * c->bytes(std::size_t(kk)));
+            for (std::size_t i = 0; i < w.size(); ++i) w[i] = std::sin(float(i) * 0.731f + ph) * (0.05f + float(i % 89) / 900.f);
+            for (i64 j = 0; j < r; ++j) c->encode(w.data() + j * kk, std::size_t(kk), e.data() + std::size_t(j) * c->bytes(std::size_t(kk)));
+            return e; };
+        // kept alive for the whole check: device weights are cached by host address, so a freed buffer's address must
+        // not come back with other contents
+        auto& eg = keep.emplace_back(enc(ff, k, 1.f)); auto& eu = keep.emplace_back(enc(ff, k, 2.f)); auto& ed = keep.emplace_back(enc(od, ff, 3.f));
+        std::vector<float> x(std::size_t(rows * k)); for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+        auto build = [&] {
+            tensor_graph g; auto xi = g.input("x", {rows, k});
+            auto gt = g.apply(ops::op::matmul_t, {xi, g.qweight("wg", {ff, k}, eg.data(), cn)});
+            auto up = g.apply(ops::op::matmul_t, {xi, g.qweight("wu", {ff, k}, eu.data(), cn)});
+            g.output("y", g.apply(ops::op::matmul_t, {g.mul(g.apply(ops::op::silu, {gt}), up), g.qweight("wd", {od, ff}, ed.data(), cn)}));
+            return g; };
+        int fused_steps = 0;
+        auto run = [&](registry* r) {
+            pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po);
+            for (auto& s : p->steps) if (s.low && s.low->name.ends_with(".qglu")) ++fused_steps;
+            executor e(*p); e.set_input("x", x); e.run(); return e.output("y").data; };
+        run(&reg);   // warm-up: the first run uploads the weights (an upload drops the quantised-activation reuse)
+        fused_steps = 0;
+        const std::size_t glu0 = disp("qmatmul_glu"), re0 = disp("quant_q8r_reused") + disp("quant_q81_reused");
+        auto fused = run(&reg);
+        const int fs = fused_steps;
+        const bool took = disp("qmatmul_glu") > glu0, reused = disp("quant_q8r_reused") + disp("quant_q81_reused") > re0;
+        set_env("FORGE_FUSE_GLU", "0"); fused_steps = 0;
+        auto plain = run(&reg);
+        set_env("FORGE_FUSE_GLU", "");
+        const int ps = fused_steps;
+        auto cpu = run(nullptr);
+        double mx = 0, dp = 0, dc = 0;
+        for (auto v : cpu) mx = std::max(mx, double(std::fabs(v)));
+        for (std::size_t i = 0; i < cpu.size() && fused.size() == cpu.size() && plain.size() == cpu.size(); ++i) {
+            dp = std::max(dp, std::fabs(double(fused[i]) - plain[i])); dc = std::max(dc, std::fabs(double(fused[i]) - cpu[i])); }
+        const bool want = cn != "q5_k";
+        bool ok = fused.size() == cpu.size() && dp <= 2e-3 * (1 + mx) && dc <= 2e-2 * (1 + mx) && ps == 0 && fs == (want ? 1 : 0);
+        // where the runtime takes it (sm_80 image / mock), the fused kernel ran and the down projection reused its quantised output
+        if (want && took && !reused) ok = false;
+        ++n;
+        if (!ok) { std::printf("FAIL %s.qglu %s rows %lld: fused steps %d/%d, ran %d, reused %d, |fused-unfused| %.3g, |fused-cpu| %.3g (max %.3g)\n", api.c_str(),
+                               cn.c_str(), (long long)rows, fs, ps, int(took), int(reused), dp, dc, mx); ++fails; }
+    }
+    std::printf("%s %d/%d %s fused FFN gate/up cases match the unfused plan and the CPU\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
@@ -185,7 +384,7 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s device: %s (image %s)\n", api.c_str(), rt->device_name().c_str(), rt->image_arch().c_str());
     int dec_fails = 0;
     if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); })
-        if (api == "cuda" || api == "hip") dec_fails = attention_dec_check(*rt, api);
+        if (api == "cuda" || api == "hip") { dec_fails = attention_dec_check(*rt, api); dec_fails += fusion_check(*rt, api); }
     auto shared = std::shared_ptr<RT>(std::move(rt));
     auto reg = graph::gpu_registry(shared);
     auto mma_runs = [&]() -> std::size_t { auto d = shared->dispatches(); auto it = d.find("qmatmul_mma"); return it == d.end() ? 0 : it->second; };
@@ -198,7 +397,10 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     fails += dec_fails;
     fails += qmatmul_check<RT>(*reg, api, mma_runs);
+    if constexpr (requires { shared->run_qglu(tensor_view{}, nullptr, nullptr, std::size_t(0), 0u, 0u, tensor_view{}); }) fails += glu_check(*reg, *shared, api);
     fails += state_ops_check(*reg, api);
+    if constexpr (requires { shared->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
+        fails += fusion_plan_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     return fails ? 1 : 0;
 }
 
@@ -394,10 +596,82 @@ static int bench_qmm(int argc, char** argv) {
     return 0;
 }
 
+// test_cuda_hip benchfuse: time the elementwise fusions against the unfused kernels inside a run (Goedel/Qwen3-32B
+// shapes: decode and 512-token prefill). Not part of ctest.
+static int bench_fuse() {
+    std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
+    if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    auto time = [&](auto&& f) {
+        std::vector<double> ts;
+        for (int b = 0; b < 7; ++b) { auto t0 = std::chrono::steady_clock::now(); for (int i = 0; i < 50; ++i) f(); rt->wait();
+            ts.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 50); }
+        std::sort(ts.begin(), ts.end()); return ts.front(); };
+    for (i64 rows : {1, 512}) {
+        const i64 D = 5120; const std::size_t N = std::size_t(rows * D);
+        std::vector<float> a(N, 0.5f), b(N, 0.25f), s(N), y(N), w(std::size_t(D), 1.f);
+        shape_t sh{rows, D}, ws{D}; ops::attrs at{{"eps", 1e-6}};
+        rt->begin_run();
+        double u = time([&] { rt->run_op("add", {{a.data(), sh}, {b.data(), sh}}, {}, {s.data(), sh}); rt->run_op("rms_norm", {{s.data(), sh}, {w.data(), ws}}, at, {y.data(), sh}); });
+        double f = time([&] { rt->run_fused("add_rms_norm", {{a.data(), sh}, {b.data(), sh}, {w.data(), ws}}, {{s.data(), sh}, {y.data(), sh}}, at); });
+        rt->end_run();
+        std::printf("add+rms_norm rows %lld cols %lld: unfused %.1f us, fused %.1f us\n", (long long)rows, (long long)D, u, f);
+    }
+    for (auto [s_, h] : {std::pair<i64, i64>{1, 64}, {1, 8}, {512, 64}, {512, 8}}) {
+        const i64 d = 128; const std::size_t N = std::size_t(s_ * h * d);
+        std::vector<float> x(N, 0.3f), t(N), y(N), w(static_cast<std::size_t>(d), 1.f), pos(static_cast<std::size_t>(s_));
+        for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i + 100);
+        shape_t sh{s_, h, d}, ws{d}, ps{s_}; ops::attrs ar{{"base", 1000000.0}, {"neox", 1.0}}, an{{"eps", 1e-6}}, af = ar; af.v["eps"] = 1e-6;
+        rt->begin_run();
+        double u = time([&] { rt->run_op("rms_norm", {{x.data(), sh}, {w.data(), ws}}, an, {t.data(), sh}); rt->run_op("rope", {{t.data(), sh}, {pos.data(), ps}}, ar, {y.data(), sh}); });
+        double f = time([&] { rt->run_fused("rms_rope", {{x.data(), sh}, {w.data(), ws}, {pos.data(), ps}}, {{y.data(), sh}}, af); });
+        rt->end_run();
+        std::printf("rms_norm+rope s %lld heads %lld d %lld: unfused %.1f us, fused %.1f us\n", (long long)s_, (long long)h, (long long)d, u, f);
+    }
+    return 0;
+}
+
+// test_cuda_hip benchglu <codec> <rows> <n> <k> [reps]: the FFN gate/up/SiLU step, fused (run_qglu) against the two
+// matmuls + silu_mul it replaces, each followed by the down projection's activation quantisation path (a [rows, n] x
+// [64, n] matmul, so the fused q8r hand-off is counted). Interleaved batches; the fastest of each is kept.
+static int bench_glu(int argc, char** argv) {
+    if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip benchglu <codec> <rows> <n> <k> [reps]\n"); return 2; }
+    std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
+    if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    const auto* c = graph::codecs::find(argv[2]);
+    if (!c) { std::fprintf(stderr, "unknown codec %s\n", argv[2]); return 2; }
+    const std::size_t rows = std::stoul(argv[3]), n = std::stoul(argv[4]), k = std::stoul(argv[5]), rb = c->bytes(k), rbd = c->bytes(n);
+    const int reps = argc > 6 ? std::stoi(argv[6]) : 10;
+    auto enc = [&](std::size_t r, std::size_t kk, std::size_t b, float ph) {
+        std::vector<float> w(kk); std::vector<std::uint8_t> e(r * b);
+        for (std::size_t j = 0; j < r; ++j) { for (std::size_t i = 0; i < kk; ++i) w[i] = std::sin(float(j * kk + i) * 0.731f + ph) * 0.05f; c->encode(w.data(), kk, e.data() + j * b); }
+        return e; };
+    auto eg = enc(n, k, rb, 1), eu = enc(n, k, rb, 2), ed = enc(64, n, rbd, 3);
+    std::vector<float> x(rows * k), g(rows * n), u(rows * n), h(rows * n), y(rows * 64);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+    std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : 4;
+    tensor_view xv{x.data(), {i64(rows), i64(k)}}, gv{g.data(), {i64(rows), i64(n)}}, uv{u.data(), {i64(rows), i64(n)}}, hv{h.data(), {i64(rows), i64(n)}}, yv{y.data(), {i64(rows), 64}};
+    auto unfused = [&] { rt->run_qmatmul(xv, eg.data(), rb, std::uint32_t(n), fmt, gv); rt->run_qmatmul(xv, eu.data(), rb, std::uint32_t(n), fmt, uv);
+                         rt->run_op("silu_mul", {gv, uv}, {}, hv); rt->run_qmatmul(hv, ed.data(), rbd, 64, fmt, yv); };
+    auto fused = [&] { if (!rt->run_qglu(xv, eg.data(), eu.data(), rb, std::uint32_t(n), fmt, hv)) std::abort(); rt->run_qmatmul(hv, ed.data(), rbd, 64, fmt, yv); };
+    rt->begin_run(); unfused(); fused(); rt->wait();
+    double best[2] = {1e30, 1e30};
+    for (int b = 0; b < 7; ++b) for (int f = 0; f < 2; ++f) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) { if (f) fused(); else unfused(); }
+        rt->wait();
+        best[f] = std::min(best[f], std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
+    }
+    rt->end_run();
+    std::printf("%s rows %zu n %zu k %zu (+ down to 64): unfused %.1f us, fused %.1f us (%.1f%%)\n", argv[2], rows, n, k, best[0], best[1], 100.0 * (best[0] - best[1]) / best[0]);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
     if (mode == "bench") return bench_qmm(argc, argv);
+    if (mode == "benchfuse") return bench_fuse();
+    if (mode == "benchglu") return bench_glu(argc, argv);
     auto cu = [](cuda_hip::api a) { return [a](std::string* w, int o) { return cuda_hip::runtime::open(a, w, o); }; };
     auto cl = [](std::string* w, int o) { return forge::gpu::ocl::runtime::open(w, o); };
     auto ze = [](std::string* w, int o) { return forge::gpu::ze::runtime::open(w, o); };
