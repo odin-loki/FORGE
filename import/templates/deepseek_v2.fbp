@@ -58,11 +58,8 @@ graph {
     x = x + linear(merge(a, n_heads * v_dim), W.layer[l].wo)
     h = rms_norm(x, W.layer[l].ffn_norm, eps)
     x = x + linear(silu(linear(h, W.layer[l].shared.w_gate)) * linear(h, W.layer[l].shared.w_up), W.layer[l].shared.w_down)
-    g = scale(moe_gate(linear(h, W.layer[l].router), k: n_active, norm: norm_topk), alpha: routed_scale)
-    repeat e in 0..n_experts {
-      y = linear(silu(linear(h, W.layer[l].expert[e].w_gate)) * linear(h, W.layer[l].expert[e].w_up), W.layer[l].expert[e].w_down)
-      x = x + slice(g, axis: 1, start: e, end: e + 1) * y
-    }
+    x = x + moe_ffn(h, linear(h, W.layer[l].router), W.layer[l].experts.w_gate, W.layer[l].experts.w_up, W.layer[l].experts.w_down,
+                    k: n_active, norm: norm_topk, scale: routed_scale)
   }
   logits = linear(rms_norm(last(x, seq), W.out_norm, eps), W.lm_head)
 }

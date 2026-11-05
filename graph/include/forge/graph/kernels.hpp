@@ -106,6 +106,9 @@ public:
     // are encoded weights of one codec in device_qglu_codecs and gate/up the unfused products' buffers (its fallback).
     std::optional<lowering> device_qglu;
     std::vector<std::string> device_qglu_codecs;
+    // moe_ffn with all three stacked expert weights encoded on the device (grouped expert kernels), for these codecs
+    std::optional<lowering> device_moe;
+    std::vector<std::string> device_moe_codecs;
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);
