@@ -34,9 +34,10 @@ public final class ForgeModel {
     public func reset() { forge_reset(m) }
     public func rewind(to p: Int64) throws { if forge_rewind(m, p) != 0 { throw ForgeError.last("forge_rewind") } }
 
-    public func tokenize(_ text: String, addBOS: Bool = true) throws -> [Int32] {
+    /// addBOS nil: the model's default (no BOS for Qwen-family models).
+    public func tokenize(_ text: String, addBOS: Bool? = nil) throws -> [Int32] {
         var out = [Int32](repeating: 0, count: text.utf8.count + 8)
-        let n = forge_tokenize(m, text, addBOS ? 1 : 0, &out, Int64(out.count))
+        let n = forge_tokenize(m, text, addBOS.map { $0 ? 1 : 0 } ?? -1, &out, Int64(out.count))
         if n < 0 { throw ForgeError.last("forge_tokenize") }
         return Array(out.prefix(Int(n)))
     }
