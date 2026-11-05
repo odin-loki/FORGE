@@ -340,7 +340,7 @@ public:
 #ifdef FORGE_HAVE_TLS
         if (!ssl_) return {};
         X509* c = SSL_get1_peer_certificate(ssl_.get()); if (!c) return {};
-        std::string out; X509_NAME* nm = X509_get_subject_name(c);
+        std::string out; auto* nm = const_cast<X509_NAME*>(X509_get_subject_name(c));   // const in OpenSSL 3, not 1.1
         int i = X509_NAME_get_index_by_NID(nm, NID_commonName, -1);
         if (i >= 0 && X509_NAME_get_index_by_NID(nm, NID_commonName, i) < 0) {
             unsigned char* u = nullptr; int n = ASN1_STRING_to_UTF8(&u, X509_NAME_ENTRY_get_data(X509_NAME_get_entry(nm, i)));
