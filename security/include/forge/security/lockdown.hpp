@@ -24,7 +24,11 @@
 #include <forge/security/audit.hpp>
 #include <forge/security/enforce.hpp>
 #include <forge/security/errors.hpp>
+#include <forge/security/files.hpp>
 #include <forge/security/policy.hpp>
+#include <forge/security/secure_buffer.hpp>
+#include <forge/os/fs.hpp>
+#include <forge/os/keystore.hpp>
 #include <forge/os/oserror.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
@@ -538,6 +542,64 @@ inline report evaluate(const policy& p, bool apply) {
             if (p.integrity.plugins == requirement::required) { cs.state = "emulated"; cs.backend = "plugins refused (see above)"; }
             else { cs.state = "missing"; cs.detail = "Authenticode / SecStaticCodeCheckValidity / IMA checks are not implemented"; }
         }
+    }
+
+    // ---- FIO-1 / FIO-2
+    {
+#if defined(_WIN32)
+        const char* tb = "CREATE_NEW / CreateDirectoryW with an owner + SYSTEM + Administrators DACL";
+#else
+        const char* tb = "O_CREAT|O_EXCL|O_NOFOLLOW 0600, mkdir 0700";
+#endif
+        add("FIO-1", "temp files", "active", tb, "info", "os::fs::make_temp_file / make_temp_dir / write_new_private_file");
+        // The audit file's directory: whoever can write it can replace the audit file between runs.
+        auto& ad = add("FIO-2", "private files: audit directory", "n/a", "check_private_dir (trusted)", L);
+        if (on && !p.audit.file.empty()) {
+            auto dir = os::fs::u8str(os::fs::u8path(os::absolute(p.audit.file)).parent_path());
+            ad.detail = dir;
+            if (!os::fs::is_dir(dir)) ad.state = "missing";
+            else if (auto s = check_private_dir(dir, file_kind::trusted); s) ad.state = "active";
+            else { ad.state = "failed"; ad.detail = s.err.what; }
+        }
+        // The file keystore (os::keystore file / DPAPI backends): its directory and every file in it are secret.
+        auto& ks = add("FIO-2", "private files: keystore", "n/a", "check_private_dir / check_private_file (secret)", L);
+        if (on) {
+            auto d = os::keystore::directory();
+            if (!d || !os::fs::is_dir(d.value)) { ks.detail = d ? d.value + " (absent)" : d.err.what; }
+            else {
+                ks.detail = d.value; ks.state = "active";
+                auto s = check_private_dir(d.value, file_kind::secret);
+                if (s) if (auto l = os::list_dir(d.value))
+                    for (auto& e : l.value) {
+                        if (e.name == "." || e.name == "..") continue;
+                        if (!(s = check_private_file(os::join(d.value, e.name), file_kind::secret))) break;
+                    }
+                if (!s) { ks.state = "failed"; ks.detail = s.err.what; }
+            }
+        }
+        // Policy file: checked by load_policy() (a strict policy that fails it is not loaded at all).
+        add("FIO-2", "private files: policy, keys, tokens", on ? "active" : "n/a", "load_policy; require_private_file", "info",
+            "the policy file (load_policy), forge sign / rpc keys and token files, rpc --tls-key, --authorized-keys");
+    }
+
+    // ---- CRY-2
+    {
+        auto& c = add("CRY-2", "key memory", "missing", "os::locked_buffer", on && p.prof == profile::strict ? "should" : "info");
+        try {
+            secure_buffer probe(32);
+            c.state = probe.locked() ? "active" : "missing";
+            c.detail = memory_state(probe);
+#if defined(_WIN32)
+            c.backend = "VirtualLock + WerRegisterExcludedMemoryBlock";
+#elif defined(__linux__)
+            c.backend = "mlock + MADV_DONTDUMP + MADV_WIPEONFORK";
+#elif defined(__FreeBSD__)
+            c.backend = "mlock + MADV_NOCORE";
+#else
+            c.backend = "mlock (no per-range dump exclusion: set limits.core = 0)";
+#endif
+            if (!probe.locked()) c.detail += "; raise RLIMIT_MEMLOCK / the working-set quota";
+        } catch (...) { c.state = "failed"; c.detail = "allocation failed"; }
     }
 
     // ---- CRY-1

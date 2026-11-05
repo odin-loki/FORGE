@@ -25,6 +25,7 @@
 #include <forge/security/audit.hpp>
 #include <forge/security/errors.hpp>
 #include <forge/json/json.hpp>
+#include <forge/os/fs.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/users.hpp>
 #include <cstdint>
@@ -323,13 +324,26 @@ inline policy load_policy(std::string_view cli_path = {}) {
         return r.value;
     };
     std::optional<policy> out;
-    if (!cli_path.empty()) out = parse_policy(read_named(std::string(cli_path), "--policy"), cli_path, env_profile);
-    else if (!env_f.empty()) out = parse_policy(read_named(env_f, "FORGE_SECURITY_POLICY"), env_f, env_profile);
+    std::string file;
+    if (!cli_path.empty()) out = parse_policy(read_named(file = std::string(cli_path), "--policy"), cli_path, env_profile);
+    else if (!env_f.empty()) out = parse_policy(read_named(file = env_f, "FORGE_SECURITY_POLICY"), env_f, env_profile);
     else {
         auto search = policy_search_path();
         for (std::size_t i = 0; i < search.size() && !out; ++i) {
             if (!os::exists(search[i])) continue;
-            out = parse_policy(read_named(search[i], "policy"), search[i], env_profile);
+            out = parse_policy(read_named(file = search[i], "policy"), search[i], env_profile);
+        }
+    }
+    // FIO-2: the policy decides everything else, so nobody but its owner (or root / Administrators) may change it.
+    // Profile strict refuses a file that fails the check; other profiles use it and audit a warning.
+    if (out && !file.empty()) {
+        if (auto s = os::fs::check_private(file, os::fs::private_kind::trusted); !s) {
+            std::string msg = "policy " + s.err.what;
+            if (out->prof == profile::strict) {
+                audit("policy", decision::deny, "FIO-2", file, msg, "strict");
+                throw policy_violation(msg + " (FIO-2: a strict policy must not be a symlink or writable by others)", "FIO-2");
+            }
+            audit("policy", decision::weaken, "FIO-2", file, msg + "; used anyway", name(out->prof));
         }
     }
     if (!out) {
