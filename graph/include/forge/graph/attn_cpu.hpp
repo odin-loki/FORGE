@@ -22,12 +22,17 @@
 
 namespace forge::graph::attn_cpu {
 
-inline bool enabled() {
-    static const bool on = [] { const char* e = std::getenv("FORGE_CPU_ATTN"); return !(e && std::string(e) == "old"); }();
-    return on;
+// FORGE_CPU_ATTN: unset = this kernel for an int8 KV cache only (where it measured faster); "new" = also for
+// f32 KV (its f32 prefill measured slower than the old kernel on one noisy run, not yet explained); "old" = never.
+inline int mode() {
+    static const int m = [] { const char* e = std::getenv("FORGE_CPU_ATTN");
+        return !e ? 1 : std::string(e) == "old" ? 0 : std::string(e) == "new" ? 2 : 1; }();
+    return m;
 }
+inline bool enabled() { return mode() != 0; }
 inline bool supports(kv_codec kc, kv_codec vc) {
-    return (kc == kv_codec::f32 || kc == kv_codec::int8) && (vc == kv_codec::f32 || vc == kv_codec::int8);
+    const bool ok = (kc == kv_codec::f32 || kc == kv_codec::int8) && (vc == kv_codec::f32 || vc == kv_codec::int8);
+    return ok && (mode() == 2 || kc == kv_codec::int8 || vc == kv_codec::int8);
 }
 
 // q [s, hq, d]; k/v hold t positions of [hk, row] (row = d / dv floats, or kv_head_words for int8);

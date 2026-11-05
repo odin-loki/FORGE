@@ -37,7 +37,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_MMA_BT` | CUDA | `64` or `128`: tokens per tensor-core matmul block (default: 64 for q4_k, 128 for q6_k/q8_0 when rows ≥ 128) |
 | `FORGE_MMA_SPLITK=0` | CUDA | Turns off split-K for tensor-core matmuls whose grid cannot fill the GPU (k/v projections, DeltaNet a/b); on by default |
 | `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
-| `FORGE_CPU_ATTN` | CPU | `old` selects the previous per-(token, head) attention kernel instead of the chunked GQA-shared one (`graph/attn_cpu.hpp`; f32 and int8 KV) |
+| `FORGE_CPU_ATTN` | CPU | Chunked GQA-shared attention (`graph/attn_cpu.hpp`): by default used with an int8 KV cache only; `new` uses it for f32 KV too (its f32 prefill has not yet been shown faster), `old` never |
 | `FORGE_CPU_DELTA` | CPU | `old` selects the previous two-pass delta_rule instead of the column-blocked one-pass kernel |
 | `FORGE_OP_TIME` | CPU executor | `1`: wall time per op kind (attention split by KV codec, state ops by fn), printed at exit |
 | `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
