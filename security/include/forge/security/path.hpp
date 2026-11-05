@@ -119,7 +119,7 @@ inline std::optional<std::string> canonical_within(std::string_view path, const 
     auto cp = canon(path); if (!cp) return std::nullopt;
     auto parts = [](const sfs::path& p) {
         std::vector<std::string> v;
-        for (auto& x : p) { auto s = detail::lower_if_windows(os::fs::u8str(x)); if (!s.empty()) v.push_back(s); }
+        for (const auto& x : p) { auto s = detail::lower_if_windows(os::fs::u8str(x)); if (!s.empty()) v.push_back(s); }
         return v;
     };
     auto pp = parts(*cp);
