@@ -89,6 +89,12 @@ if(FORGE_TSAN)
   add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
   add_link_options(-fsanitize=thread)
 endif()
+# ---- build hardening (FSS-BLD-1, docs/security-standard.md) ----
+# Each flag is probed and skipped when the toolchain rejects it; the result is reported by
+# forge::build_hardening() (core/include/forge/core/build_info.hpp). Must stay after the sanitizer options.
+option(FORGE_HARDENING "Hardening compile/link flags: stack protector, FORTIFY_SOURCE, PIE, RELRO/BIND_NOW, CET/BTI, /guard:cf" ON)
+include(cmake/forge_hardening.cmake)
+# ---- end build hardening ----
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
