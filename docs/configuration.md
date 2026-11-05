@@ -50,6 +50,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_FUSE_ADD_NORM=0` | CUDA | Do not run a residual `add` and the `rms_norm` of its result as one kernel (`forge_rms_norm_f`) |
 | `FORGE_FUSE_QK_ROPE=0` | CUDA | Do not run a per-head `rms_norm` and the `rope` that consumes it (Qwen3 QK-norm) as one kernel (`forge_rms_rope`) |
 | `FORGE_ROPE_HPB` | CUDA | Heads per block of `forge_rms_rope` (default: 16 at 32+ tokens, else 256 / head dim); tuning only |
+| `FORGE_FUSE_GLU=0` | CUDA | Do not fuse the FFN gate and up projections and their SiLU product into one step (`silu_mul(linear(h, gate), linear(h, up))`); each gate/up weight pair is then uploaded as two weights instead of one interleaved one. Read when a plan is compiled |
 | `FORGE_PLAN_TRACE` | all devices | If set, print at exit the ops (with shapes and counts) that ran on the host during device runs |
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
 | `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |

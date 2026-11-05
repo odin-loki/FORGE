@@ -149,7 +149,8 @@ static int mock_qmma(const signed char* xq, const float* xds, const unsigned cha
     for (i = 0; i < rows * k; ++i) a[i] = xds[2u * (i / 32u)] * (float)xq[i];
     mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
-    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 10; if (!strcmp(op, "sum_splits")) return 4; if (!strcmp(op, "argmax")) return 3;
+    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 10; if (!strncmp(op, "qmatmul_glu", 11)) return 11;
+    if (!strcmp(op, "glu_q81")) return 5; if (!strcmp(op, "sum_splits")) return 4; if (!strcmp(op, "argmax")) return 3;
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "rms_norm_f")) return 11; if (!strcmp(op, "rms_rope")) return 12;
@@ -284,6 +285,22 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
           /* split-K: the whole product goes to slice 0 and the other slices are zero, so forge_sum_splits gives it back */
           for (j = 1; j < s; ++j) memset(y + (size_t)j * rows * cols, 0, sizeof(float) * rows * cols);
           return mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), y, rows, cols, k, fmt, rb); } }
+    /* FFN GLU: w interleaves gate/up rows in groups of 16 (8 gate, 8 up); y = silu(gate) * up, plus its q8r form */
+    if (!strncmp(op, "qmatmul_glu", 11)) {   /* qmatmul_glu_* (64 tokens per block) / qmatmul_glu128_* (128) */
+        unsigned bt = op[11] == '1' ? 128u : 64u; unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned), n = cols / 2u, r, o;
+        float *y = P(ARG(3, dptr)), *h;
+        if (gx < (cols / 128u) * ((rows + bt - 1) / bt) || bx != 256 || k % 256u || cols % 128u || !(fmt == 2u || fmt == 5u || fmt == 6u)) return 1;
+        h = malloc(sizeof(float) * rows * cols);
+        mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), h, rows, cols, k, fmt, rb);
+        for (r = 0; r < rows; ++r) for (o = 0; o < n; ++o) { const float* hr = h + (size_t)r * cols + (o >> 3) * 16u + (o & 7u);
+            y[(size_t)r * n + o] = hr[0] / (1.0f + expf(-hr[0])) * hr[8]; }
+        free(h);
+        mock_q8r(y, (signed char*)(uintptr_t)ARG(9, dptr), P(ARG(10, dptr)), rows * (n / 32u)); return 0; }
+    if (!strcmp(op, "glu_q81")) { const float* h = P(ARG(0, dptr)); float* y = P(ARG(1, dptr)); unsigned rows = ARG(2, unsigned), n = ARG(3, unsigned), r, o;
+        if (n % 32u || gx * 8u < rows * n / 32u || bx != 256) return 1;
+        for (r = 0; r < rows; ++r) for (o = 0; o < n; ++o) { const float* hr = h + (size_t)r * 2u * n + (o >> 3) * 16u + (o & 7u);
+            y[(size_t)r * n + o] = hr[0] / (1.0f + expf(-hr[0])) * hr[8]; }
+        mock_q81(y, (unsigned char*)(uintptr_t)ARG(4, dptr), rows * n / 32u); return 0; }
     if (!strcmp(op, "argmax")) { const float* x = P(ARG(0, dptr)); unsigned n = ARG(1, unsigned), i, b = 0; int* o = (int*)(uintptr_t)ARG(2, dptr);
         if (bx != 256) return 1;
         for (i = 1; i < n; ++i) if (x[i] > x[b]) b = i;
