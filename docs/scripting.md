@@ -351,8 +351,14 @@ not seen afterwards. On Windows and iOS it raises `PermissionError` without runn
 the calling thread: avoid it while other tasks hold locks the block needs. **Untested.**
 
 **Plugins** run native code, so they are refused unless all of `fs`, `net`, `proc` and `env` are on. Under a
-security policy they also need `plugin_load`: `integrity.plugins` `"required"` refuses every plugin (FORGE has no
-plugin signature verifier yet), `"optional"` / `"off"` allow it (audited).
+security policy they are loaded through `security::open_plugin`: `plugin_load` must be allowed, and
+`integrity.plugins` `"required"` needs a detached signature `<plugin>.sig` (`forge sign libx.so --key k.key`) by one
+of `integrity.trusted_keys` (any valid signature when the list is empty). `"optional"` verifies signed plugins and
+loads unsigned ones (audited `weaken`); `"off"` does not check. With `integrity.os_code_signing` the plugin must
+also be OS code signed (Authenticode on Windows, a valid non-ad-hoc code signature on macOS; on Linux / BSD there is
+no such mechanism and the load is audited instead). The signature binds the file name: renaming a signed plugin
+breaks it. The bytes that were verified are the bytes loaded (see [security-api.md](security-api.md#integration));
+a failure raises `IntegrityError`.
 
 **Security policy (FSS).** `forge script --policy FILE` (or a policy found by `security::load_policy`, see
 [security-api.md](security-api.md#policy)) runs the script under the FORGE Security Standard; with no policy and no
@@ -360,8 +366,8 @@ plugin signature verifier yet), `"optional"` / `"off"` allow it (audited).
 
 - The capabilities come from the policy (default deny, P1): `net` only when `net.mode` is not `none`, `proc` only
   with `exec`, `env` only with `env`, `fs` unless both `fs.read` and `fs.write` are empty. The `--no-*` flags narrow
-  the policy further. Profile `strict` (scripts are unsigned) therefore runs with no net, proc or env and the file
-  system confined to its roots.
+  the policy further. Profile `strict` therefore runs with no net, proc or env and the file system confined to its
+  roots; a signature does not add capabilities.
 - File operations are **path-scoped**: each built-in passes the path it touches to `security::enforce` (reads:
   `fs.read`, `fs.list`, `fs.exists`, `fs.stat`, `fs.walk`, `fs.glob` (its base and the pattern's literal directory),
   `fs.open(p, "r")`, `fs.copy` source, imports, `forge::watch`, locale catalogs; writes: `fs.write`, `fs.append`,
@@ -370,20 +376,29 @@ plugin signature verifier yet), `"optional"` / `"off"` allow it (audited).
   calls pass `host:port` (`net.http`, `net.port_open`, `net.resolve`, `forge::remote*`, the AI endpoint), process
   calls the program (`run`, `proc.start`, shell blocks, `ProcessPool`), `os.env` / `std::getenv` the variable. A
   denial raises `PermissionError` and is audited (FSS-AUD). The `Caps` flags are still checked first.
-- `integrity.scripts` `"required"` refuses to run the script (`IntegrityError` on the C++ side, exit 2): scripts are
-  not signed. `"optional"` runs it and audits the decision.
+- **Signed scripts** (`integrity.scripts`). Sign with `forge sign job.fs --key k.key`, which writes the detached
+  signature `job.fs.sig` next to it (Ed25519 over BLAKE3, bound to the file name; [modelfile.md](modelfile.md#detached-signatures)).
+  `"required"`: the script file and every module it imports (`import`, `#include`, `forge::import`) must have a
+  `.sig` signed by one of `integrity.trusted_keys` (any valid signature when the list is empty); each is checked on
+  the exact bytes that are parsed. An unsigned, modified or untrusted file raises `IntegrityError` (the main file
+  fails before any code runs, exit 1; an import fails at the import). `-e` code and the REPL cannot carry a signature
+  and are refused (exit 2). `"optional"`: signed files are verified (a bad signature still fails), unsigned files run
+  and are audited (`weaken`). The `.fsc` parse cache is separate: it caches parses of verified sources.
 - `security::lockdown(policy)` is applied before any script code runs (it replaces `--os-sandbox`): resource limits,
   no-new-privs, Landlock write roots, seccomp / pledge / sandbox_init / job object, Windows mitigations.
 
 Embedders get the path scoping too: the runtime checks against `security::active_policy()`, so a host that calls
-`security::lockdown` or `set_active_policy` confines the scripts it runs. Tests: `tests/test_script_security.cpp`,
-`tests/security_cli_test.py`.
+`security::lockdown` or `set_active_policy` confines the scripts it runs, and `engine::run_file` and imports check
+`integrity.scripts`. Tests: `tests/test_script_security.cpp`, `tests/test_signing_detached.cpp`,
+`tests/security_cli_test.py`, `tests/signing_cli_test.py`.
 
 **Remote scripts** under `forge rpc-serve --allow-scripts` each run in a child process (`forge script --rpc-child`)
 with `--script-timeout` (default 60000 ms), a `--script-mem-mb` memory cap (default 2048) and the `--script-no-*`
 flags. With any `--script-no-*` flag the child uses `--os-sandbox require` (`best-effort` on Windows). Under a
-security policy the child loads the same policy and locks itself down before running the script. See
-[rpc.md](rpc.md).
+security policy the child loads the same policy and locks itself down before running the script. When the policy
+has `integrity.scripts`, send the script's signature with it: `forge::remote(node, src, {{"name", "job.fs"},
+{"signature", fs.read("job.fs.sig")}})` (`name` must be the signed file name); the child verifies the source it
+received against it. See [rpc.md](rpc.md).
 
 ## Process pools
 
@@ -421,7 +436,9 @@ pp.shutdown();                                              // also pp.size(), p
 `script/src/remote.cpp`. Both calls go to a `forge rpc-serve --allow-scripts` node ([rpc.md](rpc.md)) and need the
 `net` capability. Address `host:port` (or `rpc:host:port`, `[v6]:port`). Options: `token`, `key` (secret-key file),
 `tls`, `ca`, `fingerprint` (SHA-256 hex), `server_name`, `tls_cert`/`tls_key` (mTLS client certificate),
-`timeout_ms`, `name`, `args` (list). Credentials default to the `FORGE_RPC_*` environment.
+`timeout_ms`, `name`, `args` (list), `signature` (the script's detached `.sig` text, sent with the source for nodes
+whose policy has `integrity.scripts`; `name` must then be the signed file name). Credentials default to the
+`FORGE_RPC_*` environment.
 
 ```cpp
 auto r = forge::remote("box2:7000", "std::println(\"hi\");", {{"token", tok}});   // {ok, output, error_type, error}

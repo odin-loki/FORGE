@@ -6,6 +6,9 @@
 #include "fsc.hpp"
 #include "parser.hpp"
 #include <forge/os/fs.hpp>
+#include <forge/security/enforce.hpp>
+#include <forge/security/secure_buffer.hpp>
+#include "monocypher-ed25519.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -449,4 +452,32 @@ TEST(write_fuzz_corpus) {
     put("rich_signed.fsc", rich_src, "rich.fs", true);
     put("tiny.fsc", "int x = 1; std::cout << x;", "t.fs", false);
     for (std::string g : {"arithmetic", "classes", "functions"}) put(g + ".fsc", slurp(fs::path("tests/script") / (g + ".fs")), g + ".fs", false);
+}
+
+// FSS CAP-1: under an active policy the cache directory goes through enforce(fs_read / fs_write); outside the
+// policy's roots nothing is stored or loaded (audited), inside it works as before. The signing seed lives in a
+// security::secure_bytes.
+TEST(cache_dir_enforced_by_policy) {
+    tmpdir in, out;
+    auto src = std::string("int x = 1;");
+    auto top = script::parse_program(src, "p.fs");
+    auto key = fsc::key_of(src, "p.fs");
+    security::secure_bytes<32> seed; std::memset(seed.data(), 0x11, 32);
+    auto enc = fsc::encode(*top, key, seed);
+    std::array<std::uint8_t, 32> raw{}; raw.fill(0x11);
+    CHECK(enc == fsc::encode(*top, key, &raw));   // same signature from the locked seed
+    fsc::trust t; { std::uint8_t sk[64], pub[32], s2[32]; std::memcpy(s2, raw.data(), 32); crypto_ed25519_key_pair(sk, pub, s2); std::array<std::uint8_t, 32> pk; std::memcpy(pk.data(), pub, 32); t.pubkeys.push_back(pk); }
+    auto p = security::profile_defaults(security::profile::strict);
+    p.fs.read = {in.p.string()}; p.fs.write = {in.p.string()}; p.audit.os = false; p.audit.file.clear();
+    security::set_active_policy(p);
+    std::string why;
+    auto outside = (out.p / "c").string(), inside = (in.p / "c").string();
+    CHECK(!fsc::store(outside, key, bytes_of(enc), true, &why));
+    CHECK_MSG(why.find("denied by the security policy") != std::string::npos, "%s", why.c_str());
+    CHECK(!fs::exists(outside));
+    CHECK(!fsc::load(outside, key, t, &why) && why.find("denied") != std::string::npos);
+    CHECK_MSG(fsc::store(inside, key, bytes_of(enc), true, &why), "%s", why.c_str());
+    CHECK_MSG(fsc::load(inside, key, t, &why).has_value(), "%s", why.c_str());
+    security::set_active_policy(security::profile_defaults(security::profile::none));
+    CHECK_MSG(fsc::store(outside, key, bytes_of(enc), true, &why), "%s", why.c_str());   // no policy: unchanged
 }

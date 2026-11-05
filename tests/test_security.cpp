@@ -3,21 +3,31 @@
 // (dispatched from a static initializer before the test runner starts).
 #include "check.hpp"
 #include <forge/security/security.hpp>
+#include <forge/core/memory.hpp>
+#include <forge/graph/rpc_secure.hpp>
+#include <forge/import/gguf.hpp>
+#include <forge/import/onnx.hpp>
+#include <forge/modelfile/sign.hpp>
 #include <forge/json/json.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/fs.hpp>
 #include <atomic>
 #include <mutex>
+#include <type_traits>
 #if !defined(_WIN32)
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 using namespace forge;
 namespace sec = forge::security;
 
 static std::string scratch(const char* tag) {
     auto d = os::join(os::temp_dir(), std::string("forge_sec_") + tag + "_" + std::to_string(os::pid()));
-    os::remove_all(d); os::mkdirs(d);
+    os::remove_all(d);
+    // FIO-2: a strict policy's audit directory must be private (0700; owner + SYSTEM + Administrators on Windows,
+    // where a temp dir can inherit a DACL that lets every user write, as on the MSYS2 CI runner).
+    if (auto s = os::ensure_private_dir(d); !s) std::printf("  scratch %s: %s\n", d.c_str(), s.err.what.c_str());
     return os::absolute(d);
 }
 template <class E, class F> static std::string throws_msg(F&& f) {
@@ -464,4 +474,241 @@ TEST(lockdown_refuses_before_applying) {
 TEST(lockdown_sets_model_integrity) {
     int rc = run_child("models", "");
     CHECK_MSG(rc == 0, "models child exit %d", rc);
+}
+
+// ---------------------------------------------------------------- CRY-2: secure_buffer
+static std::atomic<int> g_released{-1};   // OR of every byte handed to the release hook (after the wipe); -1 = not called
+static void on_release(const std::uint8_t* p, std::size_t n) { int v = 0; for (std::size_t i = 0; i < n; ++i) v |= p[i]; g_released = v; }
+
+TEST(secure_buffer_wipes_and_reports_state) {
+    static_assert(!std::is_copy_constructible_v<sec::secure_buffer> && std::is_nothrow_move_constructible_v<sec::secure_buffer>);
+    static_assert(!std::is_copy_constructible_v<sec::secure_bytes<32>>);
+    os::locked_buffer::set_release_hook(&on_release);
+    {
+        sec::secure_buffer b(64);
+        CHECK(b.size() == 64 && b.data() != nullptr);
+        bool zero = true; for (std::size_t i = 0; i < b.size(); ++i) zero = zero && b[i] == 0; CHECK(zero);
+        std::memset(b.data(), 0xA5, b.size());
+        std::printf("  secure_buffer: %s\n", sec::memory_state(b).c_str());
+#if defined(__linux__)
+        CHECK(b.dump_excluded());   // MADV_DONTDUMP
+        struct rlimit ml{};
+        if (::getrlimit(RLIMIT_MEMLOCK, &ml) == 0 && (ml.rlim_cur == RLIM_INFINITY || ml.rlim_cur >= 64 * 1024)) CHECK(b.locked());
+#elif defined(_WIN32)
+        CHECK(b.locked());          // VirtualLock of one page fits the default working set
+#endif
+        g_released = -1;
+    }
+    CHECK_MSG(g_released == 0, "released bytes not wiped (%d)", g_released.load());
+    {   // a move leaves the source empty; the moved-to buffer is wiped when it goes
+        sec::secure_buffer a(16); std::memset(a.data(), 0x5A, 16);
+        sec::secure_buffer b(std::move(a));
+        CHECK(a.empty() && a.data() == nullptr && b[0] == 0x5A);
+        g_released = -1;
+        sec::secure_buffer c(8); std::memset(c.data(), 0x33, 8);
+        c = std::move(b);           // c's old bytes are wiped first
+        CHECK(g_released == 0 && c.size() == 16 && c[15] == 0x5A);
+        g_released = -1;
+    }
+    CHECK(g_released == 0);
+    {
+        sec::secure_buffer g(8, true);
+        std::memset(g.data(), 1, 8);
+        std::printf("  guarded: %s\n", sec::memory_state(g).c_str());
+        CHECK(g.guarded());
+    }
+    {
+        sec::secure_bytes<32> k; CHECK(k.size() == 32 && k[0] == 0);
+        k[0] = 7; auto c = k.clone(); CHECK(c[0] == 7 && c.data() != k.data());
+        sec::secure_string s = "tok", t = s;
+        CHECK(t == "tok" && s.view() == "tok" && t.data() != s.data());
+        s = std::string("x"); CHECK(s == "x" && t == "tok");
+        sec::secure_string e; CHECK(e.empty() && e.view().empty());
+        std::string_view v = t; CHECK(v == "tok");
+    }
+    {   // keys loaded for signing / rpc live in it
+        std::uint8_t seed[32] = {9};
+        auto kp = modelfile::keypair_from_seed(seed);
+        CHECK(kp.seed[0] == 9 && kp.seed.buffer().size() == 32);
+        auto id = graph::rpc::identity_from_seed_hex(graph::rpc::sec::hex(seed, 32));
+        CHECK(id.seed[0] == 9 && std::memcmp(id.pub.data(), kp.pub.data(), 32) == 0);
+        graph::rpc::token_entry te("s3cret"); CHECK(te.token == "s3cret");
+    }
+    os::locked_buffer::set_release_hook(nullptr);
+}
+
+// ---------------------------------------------------------------- FIO-1 / FIO-2
+#if defined(_WIN32)
+// Adds an access-allowed ACE for Everyone (read) to `path`'s DACL.
+static bool grant_everyone(const std::string& path) {
+    auto w = os::widen(path);
+    PACL old = nullptr; PSECURITY_DESCRIPTOR sd = nullptr;
+    if (GetNamedSecurityInfoW(w.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &old, nullptr, &sd)) return false;
+    BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD n = sizeof sid;
+    CreateWellKnownSid(WinWorldSid, nullptr, sid, &n);
+    EXPLICIT_ACCESSW ea{}; ea.grfAccessPermissions = GENERIC_READ; ea.grfAccessMode = GRANT_ACCESS; ea.grfInheritance = NO_INHERITANCE;
+    ea.Trustee.TrusteeForm = TRUSTEE_IS_SID; ea.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP; ea.Trustee.ptstrName = reinterpret_cast<LPWSTR>(sid);
+    PACL nw = nullptr;
+    bool ok = SetEntriesInAclW(1, &ea, old, &nw) == ERROR_SUCCESS &&
+              SetNamedSecurityInfoW(w.data(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, nw, nullptr) == ERROR_SUCCESS;
+    if (nw) LocalFree(nw);
+    LocalFree(sd); return ok;
+}
+#endif
+
+TEST(temp_files_are_private) {
+    auto d = os::fs::make_temp_dir("forge_sec_tmp_");
+    CHECK(d);
+    if (!d) return;
+    CHECK_MSG(sec::check_private_dir(d.value, sec::file_kind::secret), "%s", sec::check_private_dir(d.value, sec::file_kind::secret).err.what.c_str());
+    auto f = os::fs::make_temp_file("k", ".bin", d.value);
+    CHECK(f);
+    if (f) CHECK_MSG(sec::check_private_file(f.value), "%s", sec::check_private_file(f.value).err.what.c_str());
+    auto g = os::join(d.value, "spill.bin");
+    CHECK(os::fs::write_new_private_file(g, "abc"));
+    CHECK(sec::check_private_file(g));
+    CHECK(!os::fs::write_new_private_file(g, "again"));   // exclusive: never an existing file
+#if !defined(_WIN32)
+    auto l = os::join(d.value, "link.bin");
+    CHECK(::symlink(g.c_str(), l.c_str()) == 0);
+    CHECK(!os::fs::write_new_private_file(l, "x"));      // never through a symlink
+#endif
+    os::remove_all(d.value);
+}
+
+TEST(check_private_file_rules) {
+    auto d = scratch("priv");
+    auto f = os::join(d, "k.key");
+#if !defined(_WIN32)
+    os::write_file(f, "secret");
+    ::chmod(f.c_str(), 0644);
+    auto s = sec::check_private_file(f);
+    CHECK_MSG(!s && s.err.what.find("0644") != std::string::npos, "%s", s.err.what.c_str());
+    CHECK(sec::check_private_file(f, sec::file_kind::trusted));        // readable by others is fine for a trusted file
+    ::chmod(f.c_str(), 0600);
+    CHECK(sec::check_private_file(f));
+    ::chmod(f.c_str(), 0620);
+    CHECK(!sec::check_private_file(f, sec::file_kind::trusted));       // group-writable
+    ::chmod(f.c_str(), 0600);
+    auto l = os::join(d, "link.key");
+    CHECK(::symlink(f.c_str(), l.c_str()) == 0);
+    s = sec::check_private_file(l);
+    CHECK_MSG(!s && s.err.what.find("symbolic link") != std::string::npos, "%s", s.err.what.c_str());
+    CHECK(!sec::check_private_file(l, sec::file_kind::trusted));
+    CHECK(!sec::check_private_file(d));                                  // a directory is not a regular file
+    CHECK(sec::check_private_dir(d, sec::file_kind::secret));            // scratch() made it 0700
+    ::chmod(d.c_str(), 0777);
+    CHECK(!sec::check_private_dir(d));
+    ::chmod(d.c_str(), 0700);
+    if (::geteuid() == 0) {
+        CHECK(::chown(f.c_str(), 65534, 65534) == 0);
+        CHECK(!sec::check_private_file(f));
+        CHECK(!sec::check_private_file(f, sec::file_kind::trusted));
+    } else std::printf("  (other-owner case skipped: needs root to chown)\n");
+#else
+    CHECK(os::fs::write_new_private_file(f, "secret"));
+    auto s = sec::check_private_file(f);
+    CHECK_MSG(s, "%s", s.err.what.c_str());
+    CHECK(grant_everyone(f));
+    s = sec::check_private_file(f);
+    CHECK_MSG(!s && s.err.what.find("S-1-1-0") != std::string::npos, "%s", s.err.what.c_str());
+    CHECK(sec::check_private_file(f, sec::file_kind::trusted));        // Everyone may read, not write
+    CHECK(!sec::check_private_file(d));
+#endif
+    os::remove_all(d);
+}
+
+TEST(strict_policy_refuses_world_readable_key) {
+    auto d = scratch("fio2");
+    auto k = os::join(d, "id.key");
+    const std::string hex = "0909090909090909090909090909090909090909090909090909090909090909";
+#if !defined(_WIN32)
+    os::write_file(k, hex + "\n");
+    ::chmod(k.c_str(), 0644);
+#else
+    CHECK(os::fs::write_new_private_file(k, hex + "\n"));
+    CHECK(grant_everyone(k));
+#endif
+    capture cap;
+    auto strict = sec::profile_defaults(sec::profile::strict);
+    auto m = throws_msg<sec::permission_denied>([&] { sec::require_private_file(strict, "--tls-key", k); });
+    CHECK_MSG(m.size() > 1 && m[0] == '!' && m.find("FIO-2") != std::string::npos, "%s", m.c_str());
+    CHECK(cap.has("fs", sec::decision::deny, "id.key"));
+    auto standard = sec::profile_defaults(sec::profile::standard);
+    CHECK(throws_msg<sec::permission_denied>([&] { sec::require_private_file(standard, "--tls-key", k); }).empty());
+    CHECK(cap.has("fs", sec::decision::weaken, "id.key"));
+    CHECK(throws_msg<sec::permission_denied>([&] { sec::require_private_file("--tls-key", k); }).empty());   // profile none: warn only
+    // the forge sign / rpc key loaders under an active strict policy
+    auto p = strict; p.audit.os = false; p.audit.file.clear();
+    sec::set_active_policy(p);
+    CHECK(throws_msg<sec::permission_denied>([&] { (void)modelfile::load_secret_key(k); })[0] == '!');
+    CHECK(throws_msg<sec::permission_denied>([&] { (void)graph::rpc::read_key_file(k); })[0] == '!');
+    sec::set_active_policy(sec::profile_defaults(sec::profile::none));
+    CHECK(modelfile::load_secret_key(k).seed[0] == 9);   // profile none: loads (with a warning)
+#if !defined(_WIN32)
+    ::chmod(k.c_str(), 0600);
+    sec::set_active_policy(p);
+    CHECK(modelfile::load_secret_key(k).seed[0] == 9);
+    sec::set_active_policy(sec::profile_defaults(sec::profile::none));
+    // a strict policy file that others can write is not loaded
+    auto pf = os::join(d, "forge-security.json");
+    os::write_file(pf, R"({"profile":"strict"})");
+    ::chmod(pf.c_str(), 0666);
+    m = throws_msg<sec::policy_violation>([&] { sec::load_policy(pf); });
+    CHECK_MSG(m.size() > 1 && m[0] == '!' && m.find("FIO-2") != std::string::npos, "%s", m.c_str());
+    ::chmod(pf.c_str(), 0644);
+    CHECK(sec::load_policy(pf).prof == sec::profile::strict);
+    os::write_file(pf, R"({"profile":"standard"})");
+    ::chmod(pf.c_str(), 0666);
+    CHECK(sec::load_policy(pf).prof == sec::profile::standard);           // standard: used, audited as weaken
+    CHECK(cap.has("policy", sec::decision::weaken, "forge-security.json"));
+#endif
+    os::remove_all(d);
+}
+
+// ---------------------------------------------------------------- CAP-1 routes: importers, .fpk reader, KV spill
+TEST(enforce_routes_importers_reader_spill) {
+    auto in = scratch("routes_in"), out = scratch("routes_out");
+    auto p = sec::profile_defaults(sec::profile::strict);
+    p.fs.read = {in}; p.fs.write = {in}; p.audit.os = false; p.audit.file.clear();
+    os::write_file(os::join(in, "m.safetensors"), "x");
+    os::write_file(os::join(out, "m.safetensors"), "x");
+    os::write_file(os::join(out, "m.gguf"), "x");
+    os::write_file(os::join(out, "m.fpk"), "x");
+    sec::set_active_policy(p);
+    auto denied = [](auto&& f) { auto m = throws_msg<sec::permission_denied>(f); return m.size() > 1 && m[0] == '!'; };
+    CHECK(denied([&] { import::safetensors s(os::join(out, "m.safetensors")); }));
+    CHECK(denied([&] { import::gguf_file g(os::join(out, "m.gguf")); }));
+    CHECK(denied([&] { import::import_onnx(os::join(out, "m.onnx"), os::join(in, "o.fpk")); }));   // input outside
+    CHECK(denied([&] { import::import_onnx(os::join(in, "m.onnx"), os::join(out, "o.fpk")); }));   // output outside
+    CHECK(denied([&] { import::import_hf(out, os::join(in, "o.fpk")); }));
+    CHECK(denied([&] { modelfile::reader r(os::join(out, "m.fpk")); }));
+    // inside the roots the policy lets them through to their own errors (a 1-byte file is no safetensors)
+    auto m = throws_msg<sec::permission_denied>([&] { import::safetensors s(os::join(in, "m.safetensors")); });
+    CHECK_MSG(m.size() > 1 && m[0] == '?', "%s", m.c_str());
+    // KV spill directory: fs_write, private
+    CHECK_THROWS(mem::spill_store(std::filesystem::path(os::join(out, "spill"))));
+    CHECK(!os::exists(os::join(out, "spill")));
+    {
+        mem::spill_store s(std::filesystem::path(os::join(in, "spill")));
+        int v[4] = {1, 2, 3, 4};
+        auto key = s.put(v, sizeof v); CHECK(key);
+        auto dir = os::fs::u8str(s.dir());
+        CHECK_MSG(sec::check_private_dir(dir, sec::file_kind::secret), "%s", sec::check_private_dir(dir, sec::file_kind::secret).err.what.c_str());
+        auto f = os::join(dir, std::to_string(key) + ".bin");
+        CHECK_MSG(sec::check_private_file(f), "%s", sec::check_private_file(f).err.what.c_str());
+        auto back = s.take(key); CHECK(back && back->size() == sizeof v);
+    }
+    sec::set_active_policy(sec::profile_defaults(sec::profile::none));
+    {   // profile none: unchanged (anywhere), still private
+        mem::spill_store s(std::filesystem::path(os::join(out, "spill")));
+        CHECK(s.put("ab", 2));
+        CHECK(sec::check_private_dir(os::fs::u8str(s.dir()), sec::file_kind::secret));
+    }
+    {   // default directory: a fresh private one under temp, removed afterwards
+        std::string dir;
+        { mem::spill_store s; dir = os::fs::u8str(s.dir()); CHECK(sec::check_private_dir(dir, sec::file_kind::secret)); }
+        CHECK(!os::exists(dir));
+    }
+    os::remove_all(in); os::remove_all(out);
 }

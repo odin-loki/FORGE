@@ -19,6 +19,8 @@
 #include <forge/os/os.hpp>
 #include <forge/os/sandbox.hpp>
 #include <forge/os/oserror.hpp>
+#include <forge/security/enforce.hpp>
+#include <forge/security/integrity.hpp>
 #include <csignal>
 #include <filesystem>
 #include <format>
@@ -34,7 +36,7 @@ struct engine::impl {
     bool cancel_signals = true;
     std::string fsc_dir, cache = "off";
     fsc::trust fsc_trust;
-    std::optional<std::array<std::uint8_t, 32>> fsc_seed;
+    std::optional<security::secure_bytes<32>> fsc_seed;   // .fsc signing key: locked, non-dumpable, wiped (FSS-CRY-2)
     void fresh() { in = std::make_unique<Interp>(sh); in->file = "<repl>"; }
     result fail(std::exception_ptr ep) {
         result r; r.ok = false;
@@ -59,7 +61,7 @@ struct engine::impl {
         if (auto f = fsc::load(fsc_dir, key, fsc_trust, &why)) { cache = "hit"; return *f; }
         std::shared_ptr<const FnDecl> top;
         try { top = parse_program(src, name); } catch (...) { cache = "miss: syntax error"; return nullptr; }
-        auto enc = fsc::encode(*top, key, fsc_seed ? &*fsc_seed : nullptr);
+        auto enc = fsc_seed ? fsc::encode(*top, key, *fsc_seed) : fsc::encode(*top, key);
         std::string err;
         cache = fsc::store(fsc_dir, key, enc, fsc_seed.has_value(), &err) ? "miss (stored): " + why : "miss: " + why + "; not stored: " + err;
         return top;
@@ -126,7 +128,8 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
         std::string seed = o.fsc_sign_seed;
         if (seed.empty()) if (const char* e = std::getenv("FORGE_SCRIPT_CACHE_SIGN_SEED")) seed = e;
         if (!seed.empty()) {
-            p_->fsc_seed = hex32(seed, "fsc_sign_seed"); crypto_wipe(seed.data(), seed.size());
+            auto raw = hex32(seed, "fsc_sign_seed"); crypto_wipe(seed.data(), seed.size());
+            p_->fsc_seed.emplace(); std::memcpy(p_->fsc_seed->data(), raw.data(), 32); crypto_wipe(raw.data(), raw.size());
             std::uint8_t sk[64], pub[32], s2[32]; std::memcpy(s2, p_->fsc_seed->data(), 32);
             crypto_ed25519_key_pair(sk, pub, s2); crypto_wipe(sk, 64);
             std::array<std::uint8_t, 32> pk; std::memcpy(pk.data(), pub, 32); p_->fsc_trust.pubkeys.push_back(pk);   // trust our own signatures
@@ -158,6 +161,10 @@ engine::~engine() { { std::lock_guard g(p_->sh->cb_m); p_->sh->callbacks.clear()
 result engine::run_file(const std::string& path) {
     auto src = os::read_file(path);
     if (!src) { result r; r.ok = false; r.error_type = "IOError"; r.error = "IOError: " + src.err.what; return r; }
+    // FSS INT-1/INT-2: under an active policy integrity.scripts decides, on exactly the bytes that get parsed
+    // (<path>.sig, detached signature; integrity_error is reported as IntegrityError)
+    try { security::verify_artefact(*security::active_policy(), security::artefact::script, path, {reinterpret_cast<const std::uint8_t*>(src.value.data()), src.value.size()}); }
+    catch (const security::integrity_error& e) { result r; r.ok = false; r.error_type = "IntegrityError"; r.error = std::string("IntegrityError: ") + e.what(); r.exit_code = 1; return r; }
     std::error_code ec;
     auto abs = std::filesystem::weakly_canonical(path, ec);
     p_->sh->base_dir = (ec ? std::filesystem::path(path) : abs).parent_path().string();

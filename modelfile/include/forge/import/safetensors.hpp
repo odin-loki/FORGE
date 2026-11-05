@@ -4,6 +4,7 @@
 #include <forge/core/dtypes.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/json/json.hpp>
+#include <forge/security/enforce.hpp>
 #include <cstring>
 #include <map>
 
@@ -13,6 +14,7 @@ class safetensors {
 public:
     struct entry { std::string dtype; shape_t shape; std::uint64_t begin = 0, end = 0; };
     explicit safetensors(const std::string& path) : path_(path) {
+        security::enforce(security::capability::fs_read, path);   // FSS CAP-1 under an active policy (no-op otherwise)
         map_ = forge::map_readonly(path, size_);
         try {
             if (!map_) raise(errc::format_error, "{}: empty file", path);

@@ -648,6 +648,16 @@ private:
     void* p_ = nullptr; std::size_t n_ = 0;
 };
 
+// ---------------------------------------------------------------- access gate (FSS CAP-1 below forge::security)
+// forge::security installs a gate while a policy is active (set_active_policy), so code that cannot depend on it
+// (forge::core's spill store) can still ask before it opens a file on a user's behalf. No gate: everything is allowed.
+//   if (auto s = os::check_access(os::access_kind::write, dir); !s) ...   // s.err: the policy's denial
+enum class access_kind { read, write };
+using access_gate = status (*)(access_kind, std::string_view path);
+inline std::atomic<access_gate>& access_gate_slot() { static std::atomic<access_gate> g{nullptr}; return g; }
+inline void set_access_gate(access_gate g) { access_gate_slot().store(g); }
+inline status check_access(access_kind k, std::string_view path) { auto g = access_gate_slot().load(); return g ? g(k, path) : status{}; }
+
 // ---------------------------------------------------------------- memory
 inline std::size_t page_size() {
 #if defined(FORGE_OS_WINDOWS)
@@ -741,6 +751,8 @@ public:
 #endif
         l.self_ = name.empty(); return {std::move(l), {}};
     }
+    // Takes ownership of a handle from LoadLibrary / dlopen (closed by the library).
+    static library adopt(void* native) { library l; l.h_ = native; return l; }
     void* symbol(const char* s) const {
         if (!h_) return nullptr;
 #if defined(FORGE_OS_WINDOWS)

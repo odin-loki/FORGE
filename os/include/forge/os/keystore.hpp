@@ -31,8 +31,11 @@
 //     with an unsupported error (tpm_available() says why); disable_tpm() unseals and removes the TPM copy.
 //   backend() reports the wrapping in force: "file", "file+argon2id", "file+tpm", "file+tpm+argon2id".
 //   The unwrapped store key is cached in memory per (directory, key files, passphrase); clear_passphrase() wipes it.
+//   The cache and the Argon2id key-encryption keys are os::locked_buffer (locked, excluded from core dumps where
+//   the OS can, wiped on release: FSS-CRY-2); short-lived copies made while a call runs are crypto_wipe'd.
 // Link: the file backend needs Monocypher (forge_os links forge_trust in CMake).
 #include <forge/os/detail.hpp>
+#include <forge/os/locked_memory.hpp>
 #include <monocypher.h>
 #include <cstdlib>
 #include <functional>
@@ -87,6 +90,9 @@ public:
         std::lock_guard<std::mutex> g(m_()); ps_().kdf = k; return {};
     }
     static keystore_kdf kdf() { std::lock_guard<std::mutex> g(m_()); return ps_().kdf; }
+    // Where the file backend (and the Windows DPAPI backend) keeps its files: FORGE_KEYSTORE_DIR, else the
+    // per-user default. It may not exist yet. forge::security checks it is private (FSS-FIO-2).
+    static result<std::string> directory() { return dir_(); }
     // Re-wraps the file backend's store key: unlocks with old_pass ("" = not passphrase-wrapped, or unlock
     // through the TPM copy) and wraps with new_pass ("" = remove the passphrase layer). Secrets are not touched.
     // On success new_pass becomes the process passphrase (set_passphrase). The TPM copy, if any, is kept.
@@ -282,9 +288,10 @@ private:
     // ---- store key wrapping
     static void wipe_(std::string& s) { if (!s.empty()) crypto_wipe(s.data(), s.size()); }
     static std::string hex_(std::uint32_t v) { char b[16]; std::snprintf(b, sizeof b, "0x%08x", unsigned(v)); return b; }
-    struct pass_state { std::string pass; std::function<std::string()> provider; std::map<std::string, std::string> cache; keystore_kdf kdf; };
+    struct pass_state { std::string pass; std::function<std::string()> provider; std::map<std::string, locked_buffer> cache; keystore_kdf kdf; };
     static pass_state& ps_() { static pass_state s; return s; }
-    static void wipe_cache_() { for (auto& [k, v] : ps_().cache) wipe_(v); ps_().cache.clear(); }   // caller holds m_()
+    // The unwrapped store keys live in locked, non-dumpable pages (FSS-CRY-2), wiped when dropped.
+    static void wipe_cache_() { ps_().cache.clear(); }   // caller holds m_()
     static bool tpm_requested_() { return getenv("FORGE_KEYSTORE_TPM") == "1"; }
     // API passphrase, else FORGE_KEYSTORE_PASSPHRASE (the provider is asked only when a key must be unwrapped/wrapped).
     static std::string passphrase_() { { std::lock_guard<std::mutex> g(m_()); if (!ps_().pass.empty()) return ps_().pass; } return getenv("FORGE_KEYSTORE_PASSPHRASE"); }
@@ -304,19 +311,23 @@ private:
         for (auto* s : {&d, &m, &t, &pass}) { std::uint64_t n = s->size(); crypto_blake2b_update(&c, reinterpret_cast<const std::uint8_t*>(&n), 8); crypto_blake2b_update(&c, reinterpret_cast<const std::uint8_t*>(s->data()), s->size()); }
         crypto_blake2b_final(&c, h); return std::string(reinterpret_cast<char*>(h), 32);
     }
-    static std::string cache_get_(const std::string& tag) { std::lock_guard<std::mutex> g(m_()); auto it = ps_().cache.find(tag); return it == ps_().cache.end() ? std::string() : it->second; }
+    static std::string cache_get_(const std::string& tag) {
+        std::lock_guard<std::mutex> g(m_()); auto it = ps_().cache.find(tag);
+        return it == ps_().cache.end() ? std::string() : std::string(reinterpret_cast<const char*>(it->second.data()), it->second.size());
+    }
     static void cache_put_(const std::string& tag, const std::string& key) {
-        std::lock_guard<std::mutex> g(m_()); auto& c = ps_().cache; if (c.size() >= 16) wipe_cache_(); c[tag] = key;
+        std::lock_guard<std::mutex> g(m_()); auto& c = ps_().cache; if (c.size() >= 16) wipe_cache_(); c[tag] = locked_buffer(key.data(), key.size());
     }
     static void put_u32_(char* p, std::uint32_t v) { for (int i = 0; i < 4; ++i) p[i] = char(v >> (8 * i)); }
     static std::uint32_t get_u32_(const char* p) { std::uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= std::uint32_t(std::uint8_t(p[i])) << (8 * i); return v; }
-    static result<std::string> argon2id_(std::string_view pass, const std::uint8_t* salt, const keystore_kdf& k) {
+    // The passphrase-derived key encryption key, in locked memory.
+    static result<locked_buffer> argon2id_(std::string_view pass, const std::uint8_t* salt, const keystore_kdf& k) {
         if (!k.valid()) return {{}, {EINVAL, "keystore: Argon2 parameters out of range"}};
         std::size_t bytes = std::size_t(k.memory_kib) * 1024; void* wa = std::malloc(bytes);
         if (!wa) return {{}, {ENOMEM, "keystore: no memory for Argon2 (" + std::to_string(k.memory_kib) + " KiB)"}};
         crypto_argon2_config cfg{CRYPTO_ARGON2_ID, k.memory_kib, k.passes, k.lanes};
         crypto_argon2_inputs in{reinterpret_cast<const std::uint8_t*>(pass.data()), salt, std::uint32_t(pass.size()), 16};
-        std::string out(32, '\0'); crypto_argon2(reinterpret_cast<std::uint8_t*>(out.data()), 32, wa, cfg, in, crypto_argon2_no_extras);
+        locked_buffer out(32); crypto_argon2(out.data(), 32, wa, cfg, in, crypto_argon2_no_extras);
         crypto_wipe(wa, bytes); std::free(wa); return {std::move(out), {}};
     }
     // Passphrase-wrapped store key: "FKKP" | m_kib t lanes (u32 LE) | salt[16] | nonce[24] | mac[16] | key[32],
@@ -327,19 +338,19 @@ private:
         put_u32_(&out[4], k.memory_kib); put_u32_(&out[8], k.passes); put_u32_(&out[12], k.lanes);
         auto* u = reinterpret_cast<std::uint8_t*>(out.data());
         if (!entropy(u + 16, 16 + 24)) return {{}, {EIO, "keystore: no entropy"}};
-        auto kek = argon2id_(pass, u + 16, k); if (!kek) return kek;
-        crypto_aead_lock(u + 72, u + 56, reinterpret_cast<const std::uint8_t*>(kek.value.data()), u + 32, u, 32, reinterpret_cast<const std::uint8_t*>(key.data()), 32);
-        wipe_(kek.value); return {std::move(out), {}};
+        auto kek = argon2id_(pass, u + 16, k); if (!kek) return {{}, kek.err};
+        crypto_aead_lock(u + 72, u + 56, kek.value.data(), u + 32, u, 32, reinterpret_cast<const std::uint8_t*>(key.data()), 32);
+        kek.value.reset(); return {std::move(out), {}};
     }
     static result<std::string> fkkp_unlock_(const std::string& blob, std::string_view pass) {
         if (pass.empty()) return {{}, {EACCES, "keystore: the store key is passphrase-protected; set FORGE_KEYSTORE_PASSPHRASE or call keystore::set_passphrase()"}};
         keystore_kdf k; k.memory_kib = get_u32_(&blob[4]); k.passes = get_u32_(&blob[8]); k.lanes = get_u32_(&blob[12]);
         if (!k.valid()) return {{}, {EACCES, "keystore: store key header has out-of-range Argon2 parameters (tampered)"}};
         auto* u = reinterpret_cast<const std::uint8_t*>(blob.data());
-        auto kek = argon2id_(pass, u + 16, k); if (!kek) return kek;
+        auto kek = argon2id_(pass, u + 16, k); if (!kek) return {{}, kek.err};
         std::string key(32, '\0');
-        int bad = crypto_aead_unlock(reinterpret_cast<std::uint8_t*>(key.data()), u + 56, reinterpret_cast<const std::uint8_t*>(kek.value.data()), u + 32, u, 32, u + 72, 32);
-        wipe_(kek.value);
+        int bad = crypto_aead_unlock(reinterpret_cast<std::uint8_t*>(key.data()), u + 56, kek.value.data(), u + 32, u, 32, u + 72, 32);
+        kek.value.reset();
         if (bad) return {{}, {EACCES, "keystore: wrong passphrase or tampered store key (authentication failed)"}};
         return {std::move(key), {}};
     }

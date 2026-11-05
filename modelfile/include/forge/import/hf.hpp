@@ -4,13 +4,21 @@
 #include <forge/import/quant_recipe.hpp>
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
+#include <forge/security/enforce.hpp>
+#include <forge/os/fs.hpp>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 
 namespace forge::import {
 
+// FSS CAP-1: under an active forge::security policy every importer input must pass enforce(fs_read) and the output
+// enforce(fs_write) (permission_denied, audited). No policy (profile none): no check.
+inline void check_read(const std::filesystem::path& p) { security::enforce(security::capability::fs_read, os::fs::u8str(p)); }
+inline void check_write(const std::string& p) { security::enforce(security::capability::fs_write, p); }
+
 inline std::string read_file(const std::filesystem::path& p) {
+    check_read(p);
     std::ifstream f(p, std::ios::binary);
     if (!f) raise(errc::io_error, "cannot read {}", p.string());
     std::stringstream ss; ss << f.rdbuf(); return ss.str();
@@ -50,6 +58,7 @@ struct import_options {
 struct import_report { std::string arch, template_name; std::size_t tensors = 0, bytes = 0; };
 
 inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt = {}) {
+    check_read(dir); check_write(out);
     auto cfg = json::parse(read_file(dir / "config.json"));
     std::string arch0 = cfg.find("architectures") ? cfg["architectures"][0].str() : "";
     if (cfg.find("text_config") && cfg["text_config"].is_obj()) {   // multimodal wrapper (Qwen3.5): import the text model

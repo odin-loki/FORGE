@@ -4,6 +4,7 @@
 #include "monocypher.h"
 #include "monocypher-ed25519.h"
 #include <forge/os/fs.hpp>
+#include <forge/security/enforce.hpp>
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -178,18 +179,25 @@ key_t key_of(std::string_view src, const std::string& file) {
 std::string key_hex(const key_t& k) { hash::blake3::digest d; std::memcpy(d.data(), k.data(), 32); return hash::blake3::hex(d); }
 std::string path_for(const std::string& dir, const key_t& k) { return os::fs::u8str(os::fs::u8path(dir) / (key_hex(k) + ".fsc")); }
 
-std::vector<std::uint8_t> encode(const FnDecl& top, const key_t& key, const std::array<std::uint8_t, 32>* seed) {
+namespace {
+std::vector<std::uint8_t> encode_(const FnDecl& top, const key_t& key, const std::uint8_t* seed);
+}
+std::vector<std::uint8_t> encode(const FnDecl& top, const key_t& key, const std::array<std::uint8_t, 32>* seed) { return encode_(top, key, seed ? seed->data() : nullptr); }
+std::vector<std::uint8_t> encode(const FnDecl& top, const key_t& key, const security::secure_bytes<32>& seed) { return encode_(top, key, seed.data()); }
+namespace {
+std::vector<std::uint8_t> encode_(const FnDecl& top, const key_t& key, const std::uint8_t* seed) {
     W pw; pw.u8(1); pw.ids.emplace(&top, 1u); pw.fn_val(top);
     W w; w.b.insert(w.b.end(), magic, magic + 4); w.u32(vm_version); w.b.insert(w.b.end(), key.begin(), key.end());
     w.u64(pw.b.size()); w.b.insert(w.b.end(), pw.b.begin(), pw.b.end());
     auto pd = hash::blake3::of(std::span<const std::uint8_t>(pw.b)); w.b.insert(w.b.end(), pd.begin(), pd.end());
     if (!seed) { w.u8(0); return w.b; }
     std::uint8_t msg[76]; sig_digest(key, pd.data(), msg);
-    std::uint8_t sk[64], pub[32], sig[64], s2[32]; std::memcpy(s2, seed->data(), 32);
+    std::uint8_t sk[64], pub[32], sig[64], s2[32]; std::memcpy(s2, seed, 32);
     crypto_ed25519_key_pair(sk, pub, s2); crypto_ed25519_sign(sig, sk, msg, sizeof msg); crypto_wipe(sk, 64); crypto_wipe(s2, 32);
     w.u8(1); w.b.insert(w.b.end(), pub, pub + 32); w.b.insert(w.b.end(), sig, sig + 64);
     return w.b;
 }
+} // namespace
 
 std::shared_ptr<const FnDecl> decode_payload(std::span<const std::uint8_t> payload, std::string* why) {
     try {
@@ -239,6 +247,9 @@ bool dir_private(const std::string& d) {
 
 std::optional<std::shared_ptr<const FnDecl>> load(const std::string& dir, const key_t& key, const trust& t, std::string* why) {
     auto fail = [&](const std::string& m) -> std::optional<std::shared_ptr<const FnDecl>> { if (why) *why = m; return std::nullopt; };
+    // FSS CAP-1: under an active policy the cache directory must be readable (fs.read / fs.write roots); a denied
+    // cache is not used (audited) and the source is parsed as if there were none.
+    if (auto s = security::try_enforce(security::capability::fs_read, dir); !s) return fail("cache directory denied by the security policy: " + s.err.what);
     std::string name = key_hex(key) + ".fsc", bytes;
     trust tt = t;
 #if defined(_WIN32)
@@ -303,6 +314,7 @@ std::optional<std::shared_ptr<const FnDecl>> load(const std::string& dir, const 
 
 bool store(const std::string& dir, const key_t& key, std::span<const std::uint8_t> bytes, bool is_signed, std::string* why) {
     auto fail = [&](const std::string& m) { if (why) *why = m; return false; };
+    if (auto s = security::try_enforce(security::capability::fs_write, dir); !s) return fail("cache directory denied by the security policy: " + s.err.what);
 #if defined(_WIN32)
     if (!is_signed) return fail("unsigned caches never load on Windows (set a signing seed)");
     std::error_code ec; std::filesystem::create_directories(os::fs::u8path(dir), ec);

@@ -24,7 +24,11 @@
 #include <forge/security/audit.hpp>
 #include <forge/security/enforce.hpp>
 #include <forge/security/errors.hpp>
+#include <forge/security/files.hpp>
 #include <forge/security/policy.hpp>
+#include <forge/security/secure_buffer.hpp>
+#include <forge/os/fs.hpp>
+#include <forge/os/keystore.hpp>
 #include <forge/os/oserror.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
@@ -531,17 +535,93 @@ inline report evaluate(const policy& p, bool apply) {
             m.state = apply || lds().applied ? "active" : "available"; m.level = p.prof == profile::strict ? "should" : "info";
             m.detail = "signed models are verified at load, unsigned ones audited (inference::model under the active policy)";
         }
+        const std::string keys = p.integrity.trusted_keys.empty() ? "no trusted_keys: any valid signature passes (integrity, not provenance)"
+                                                                  : std::to_string(p.integrity.trusted_keys.size()) + " trusted key(s)";
+        const std::string st_on = apply || lds().applied ? "active" : "available";
         auto& pl = add("INT-1", "integrity: native plugins", "n/a", "", L);
-        if (on && p.integrity.plugins == requirement::required) { pl.state = "emulated"; pl.backend = "enforce(plugin_load) refuses"; pl.detail = "no plugin signature verifier yet: loads are refused"; }
-        else if (on && p.integrity.plugins == requirement::optional) { pl.state = "missing"; pl.level = "info"; pl.detail = "plugins are not verified"; }
-        auto& sc2 = add("INT-1", "integrity: scripts", "n/a", "", L);
-        if (on && p.integrity.scripts == requirement::required) { sc2.state = "emulated"; sc2.backend = "forge script refuses to run"; sc2.detail = "no script signature verifier (script signatures exist only for the .fsc cache): scripts are refused"; }
-        else if (on && p.integrity.scripts == requirement::optional) { sc2.state = "missing"; sc2.level = "info"; sc2.detail = "scripts are not verified; forge script audits running an unsigned one"; }
-        auto& cs = add("INT-3", "OS code signing (plugins)", "n/a", "", L);
-        if (on && p.integrity.os_code_signing) {
-            if (p.integrity.plugins == requirement::required) { cs.state = "emulated"; cs.backend = "plugins refused (see above)"; }
-            else { cs.state = "missing"; cs.detail = "Authenticode / SecStaticCodeCheckValidity / IMA checks are not implemented"; }
+        if (on && p.integrity.plugins != requirement::off) {
+            pl.state = st_on; pl.backend = "detached <plugin>.sig (security::open_plugin, INT-2)";
+            if (p.integrity.plugins == requirement::optional) { pl.level = p.prof == profile::strict ? "should" : "info"; pl.detail = "signed plugins verified, unsigned ones audited; " + keys; }
+            else pl.detail = keys;
         }
+        auto& sc2 = add("INT-1", "integrity: scripts", "n/a", "", L);
+        if (on && p.integrity.scripts != requirement::off) {
+            sc2.state = st_on; sc2.backend = "detached <script>.sig (engine::run_file, imports, rpc --rpc-sig; INT-2)";
+            if (p.integrity.scripts == requirement::optional) { sc2.level = p.prof == profile::strict ? "should" : "info"; sc2.detail = "signed scripts verified, unsigned ones audited; " + keys; }
+            else sc2.detail = keys + "; -e / REPL code is refused";
+        }
+        auto& cs = add("INT-3", "OS code signing (plugins)", "n/a", "", L);
+        {
+            // the running executable's own signature, as a sample of what the OS mechanism reports here
+            auto self = os::exe_path();
+            auto sig = self.empty() ? code_signature{} : os_code_signature(self);
+            cs.backend = sig.backend;
+            const std::string me = self.empty() ? std::string() : signed_name(self) + ": " + name(sig.st) + (sig.signer.empty() ? "" : " (" + sig.signer + ")");
+            if (!on || !p.integrity.os_code_signing) cs.detail = me;
+            else if (sig.st == code_signature::state::not_applicable) {
+                // no OS mechanism for shared objects: reported, not failed; plugins rely on detached signatures
+                cs.state = "missing"; cs.level = "info"; cs.detail = sig.detail;
+            } else if (sig.st == code_signature::state::error) { cs.state = "failed"; cs.detail = sig.detail; }
+            else { cs.state = st_on; cs.detail = "plugins must be OS-signed; " + me; }
+        }
+    }
+
+    // ---- FIO-1 / FIO-2
+    {
+#if defined(_WIN32)
+        const char* tb = "CREATE_NEW / CreateDirectoryW with an owner + SYSTEM + Administrators DACL";
+#else
+        const char* tb = "O_CREAT|O_EXCL|O_NOFOLLOW 0600, mkdir 0700";
+#endif
+        add("FIO-1", "temp files", "active", tb, "info", "os::fs::make_temp_file / make_temp_dir / write_new_private_file");
+        // The audit file's directory: whoever can write it can replace the audit file between runs.
+        auto& ad = add("FIO-2", "private files: audit directory", "n/a", "check_private_dir (trusted)", L);
+        if (on && !p.audit.file.empty()) {
+            auto dir = os::fs::u8str(os::fs::u8path(os::absolute(p.audit.file)).parent_path());
+            ad.detail = dir;
+            if (!os::fs::is_dir(dir)) ad.state = "missing";
+            else if (auto s = check_private_dir(dir, file_kind::trusted); s) ad.state = "active";
+            else { ad.state = "failed"; ad.detail = s.err.what; }
+        }
+        // The file keystore (os::keystore file / DPAPI backends): its directory and every file in it are secret.
+        auto& ks = add("FIO-2", "private files: keystore", "n/a", "check_private_dir / check_private_file (secret)", L);
+        if (on) {
+            auto d = os::keystore::directory();
+            if (!d || !os::fs::is_dir(d.value)) { ks.detail = d ? d.value + " (absent)" : d.err.what; }
+            else {
+                ks.detail = d.value; ks.state = "active";
+                auto s = check_private_dir(d.value, file_kind::secret);
+                if (s) if (auto l = os::list_dir(d.value))
+                    for (auto& e : l.value) {
+                        if (e.name == "." || e.name == "..") continue;
+                        if (!(s = check_private_file(os::join(d.value, e.name), file_kind::secret))) break;
+                    }
+                if (!s) { ks.state = "failed"; ks.detail = s.err.what; }
+            }
+        }
+        // Policy file: checked by load_policy() (a strict policy that fails it is not loaded at all).
+        add("FIO-2", "private files: policy, keys, tokens", on ? "active" : "n/a", "load_policy; require_private_file", "info",
+            "the policy file (load_policy), forge sign / rpc keys and token files, rpc --tls-key, --authorized-keys");
+    }
+
+    // ---- CRY-2
+    {
+        auto& c = add("CRY-2", "key memory", "missing", "os::locked_buffer", on && p.prof == profile::strict ? "should" : "info");
+        try {
+            secure_buffer probe(32);
+            c.state = probe.locked() ? "active" : "missing";
+            c.detail = memory_state(probe);
+#if defined(_WIN32)
+            c.backend = "VirtualLock + WerRegisterExcludedMemoryBlock";
+#elif defined(__linux__)
+            c.backend = "mlock + MADV_DONTDUMP + MADV_WIPEONFORK";
+#elif defined(__FreeBSD__)
+            c.backend = "mlock + MADV_NOCORE";
+#else
+            c.backend = "mlock (no per-range dump exclusion: set limits.core = 0)";
+#endif
+            if (!probe.locked()) c.detail += "; raise RLIMIT_MEMLOCK / the working-set quota";
+        } catch (...) { c.state = "failed"; c.detail = "allocation failed"; }
     }
 
     // ---- CRY-1
