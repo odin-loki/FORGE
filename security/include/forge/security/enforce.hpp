@@ -14,13 +14,15 @@
 //   net_listen   bind address: any for mode any; loopback for every other mode ("none (loopback for servers)") and
 //                net.hosts matches in mode hosts
 //   exec, env, dynamic_code   the policy flag
-//   plugin_load  denied when integrity.plugins is "required": FORGE has no plugin signature verifier yet, so a
-//                required check cannot pass (P4 fail closed)
+//   plugin_load  integrity.plugins "required": denied unless `<path>.sig` verifies against integrity.trusted_keys
+//                (INT-2, checked on the file as it is now). Load plugins with security::open_plugin (plugin.hpp),
+//                which runs this gate and then verifies the bytes it actually loads.
 // Denials are audited (category, "CAP-1", target). exec and dynamic_code allowed by a non-strict profile are audited
 // as allow ("allowed, audited" in the profile table).
 // This is an in-process check: it covers code that calls it. lockdown() adds the kernel-level confinement.
 #include <forge/security/audit.hpp>
 #include <forge/security/errors.hpp>
+#include <forge/security/integrity.hpp>
 #include <forge/security/path.hpp>
 #include <forge/security/policy.hpp>
 #include <forge/os/os.hpp>
@@ -59,6 +61,13 @@ inline active_state& act() { static active_state s; return s; }
 } // namespace detail
 
 inline std::string expand_root(const std::string& e);
+inline os::status try_enforce(capability c, std::string_view target);
+namespace detail {
+// os::check_access (code below forge::security: core's KV spill store) asks the active policy through this gate.
+inline os::status access_gate(os::access_kind k, std::string_view path) {
+    return try_enforce(k == os::access_kind::write ? capability::fs_write : capability::fs_read, path);
+}
+} // namespace detail
 // The active policy's fs roots are made absolute when it becomes active ("." is the working directory at that moment),
 // so a later chdir() cannot move them.
 inline void set_active_policy(policy p) {
@@ -71,7 +80,9 @@ inline void set_active_policy(policy p) {
         if (!sp->audit.file.empty() && audit_file() != sp->audit.file) (void)open_audit_file(sp->audit.file);
         if (sp->audit.os) (void)set_audit_os(true);
     }
-    auto& s = detail::act(); std::lock_guard g(s.m); s.p = std::move(sp);
+    const bool on = sp->active();
+    { auto& s = detail::act(); std::lock_guard g(s.m); s.p = std::move(sp); }
+    os::set_access_gate(on ? &detail::access_gate : nullptr);
 }
 inline std::shared_ptr<const policy> active_policy() { auto& s = detail::act(); std::lock_guard g(s.m); return s.p; }
 
@@ -172,7 +183,11 @@ inline os::status try_enforce(const policy& p, capability c, std::string_view ta
     case capability::env: if (!p.env) why = "environment access denied by policy"; break;
     case capability::dynamic_code: if (!p.dynamic_code) why = "dynamic code denied by policy (W^X)"; break;
     case capability::plugin_load:
-        if (p.integrity.plugins == requirement::required) why = "integrity.plugins is required and FORGE has no plugin signature verifier yet";
+        if (p.integrity.plugins == requirement::required) {
+            const std::string f(target);
+            auto rep = detached_verify_file(f, p.integrity.trusted_keys);
+            if (!rep.trusted) why = "integrity.plugins is required and " + detached_sig_path(signed_name(f)) + " does not verify: " + rep.message;
+        }
         break;
     }
     if (!why.empty()) {

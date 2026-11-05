@@ -16,6 +16,7 @@
 // capabilities, limits and the sandbox are applied at run time, so options are deliberately not in the key.
 // Bytecode chunks are still compiled from the decoded tree and pass the VM verifier before running.
 #include "ast.hpp"
+#include <forge/security/secure_buffer.hpp>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -41,8 +42,10 @@ struct trust {
     bool require_signed = false;                         // reject unsigned caches
 };
 
-// Encode `top`. With a 32-byte seed the file is signed.
+// Encode `top`. With a 32-byte seed the file is signed. The engine keeps its signing seed in a
+// security::secure_bytes (locked, non-dumpable, wiped: FSS-CRY-2).
 std::vector<std::uint8_t> encode(const FnDecl& top, const key_t& key, const std::array<std::uint8_t, 32>* seed = nullptr);
+std::vector<std::uint8_t> encode(const FnDecl& top, const key_t& key, const security::secure_bytes<32>& seed);
 // Decode; nullopt + why on any mismatch, bound violation or failed signature.
 std::optional<std::shared_ptr<const FnDecl>> decode(std::span<const std::uint8_t> bytes, const key_t& expect, const trust& t, std::string* why = nullptr);
 // The payload decoder alone (no header, checksum or signature): for tests and the fuzzer.
@@ -54,6 +57,8 @@ std::string path_for(const std::string& dir, const key_t& k);
 // Always false on Windows (no cheap owner/ACL check there): Windows caches must be signed.
 bool dir_private(const std::string& dir);
 
+// load / store: under an active forge::security policy the directory must pass enforce(fs_read) / enforce(fs_write)
+// (CAP-1); a denial is audited and reported through `why` (the caller parses the source as on a miss).
 // Read <dir>/<key>.fsc and decode it. Signatures are required in addition to `t` when the directory is not
 // private or the file is not a regular file owned by us. POSIX: the directory is opened once and checked
 // through that descriptor, the file is opened relative to it with O_NOFOLLOW (no symlinks, no TOCTOU swap).

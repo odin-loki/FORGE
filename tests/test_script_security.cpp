@@ -205,9 +205,11 @@ TEST(plugins_follow_integrity_plugins) {
         CHECK(cap.has("plugin", sec::decision::allow, "hello_plugin", "CAP-1"));
     }
     {
-        auto p = sec::profile_defaults(sec::profile::standard); p.audit.os = false;   // plugins required: no verifier -> refused
+        auto p = sec::profile_defaults(sec::profile::standard); p.audit.os = false;   // plugins required: no .sig -> refused
         active a(p);
-        CHECK(run(src) == "!PermissionError");
+        CHECK(run(src) == "!IntegrityError");
+        CHECK(cap.has("integrity", sec::decision::fail, "hello_plugin", "INT-4"));
+        CHECK(!sec::try_enforce(sec::capability::plugin_load, plug));               // the gate alone refuses too (fail closed)
         CHECK(cap.has("plugin", sec::decision::deny, "hello_plugin", "CAP-1"));
     }
 }

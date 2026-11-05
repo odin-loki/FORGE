@@ -66,7 +66,10 @@ int usage() {
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
         "  sign <model.fpk> --key <name.key> [-o out.fpk]   add/extend the signature section\n"
+        "  sign <file> --key <name.key> [-o file.sig] [--name N] [--detached]   any other file (plugin, script):\n"
+        "      detached signature <file>.sig (Ed25519 over BLAKE3, binds the file name)\n"
         "  verify <model.fpk> [--pubkey <name.pub>]...      check hashes + signature (exit 1 on failure)\n"
+        "  verify <file> [--sig file.sig] [--pubkey <name.pub>]...   check a detached signature (exit 1 on failure)\n"
         "  encrypt <in.fpk> -o <out.fpk> --key k.mkey | --new-key k.mkey   seal tensor data (XChaCha20-Poly1305);\n"
         "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
@@ -162,6 +165,7 @@ int cmd_import(const args& a) {
         auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
         tt = c == std::string::npos ? "" : tt.substr(c + 1);
     }
+    activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     return 0;
@@ -200,15 +204,38 @@ int cmd_keygen(const args& a) {
     if (a.get("o").empty()) return usage();
     auto k = modelfile::generate_keypair();
     auto base = a.get("o");
-    { std::ofstream f(base + ".key"); f << modelfile::detail::to_hex(k.seed) << "\n"; }
-    std::filesystem::permissions(base + ".key", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    {   // FSS-FIO-1: the secret is 0600 from its first byte (exclusive temp file + rename), never world-readable
+        auto hex = modelfile::detail::to_hex(k.seed) + "\n";
+        auto w = os::fs::write_file_atomic(base + ".key", hex, 0600); crypto_wipe(hex.data(), hex.size());
+        if (!w) throw std::runtime_error("cannot write " + base + ".key: " + w.err.what);
+    }
     { std::ofstream f(base + ".pub"); f << modelfile::detail::to_hex(k.pub) << "\n"; }
     std::printf("key id %s\npublic %s\nwrote %s.key (keep secret) and %s.pub\n", modelfile::key_id(k.pub).c_str(), modelfile::detail::to_hex(k.pub).c_str(), base.c_str(), base.c_str());
     return 0;
 }
+// .fpk files carry an embedded signature; anything else (plugins, scripts, ...) or --detached gets `<file>.sig`
+// (FSS INT-2, security/integrity.hpp).
+bool is_fpk(const std::string& f) {
+    std::ifstream s(f, std::ios::binary); char m[8] = {};
+    return s.read(m, 8) && std::memcmp(m, modelfile::magic, 8) == 0;
+}
 int cmd_sign(const args& a) {
     if (a.pos.empty() || a.get("key").empty()) return usage();
     auto k = modelfile::load_secret_key(a.get("key"));
+    if (a.has("detached") || !is_fpk(a.pos[0])) {   // forge sign FILE --key K [-o FILE.sig] [--name NAME]
+        const std::string& f = a.pos[0];
+        auto bytes = os::read_file(f);
+        if (!bytes) throw std::runtime_error("cannot read " + f + ": " + bytes.err.what);
+        auto out = a.get("o").empty() ? security::detached_sig_path(f) : a.get("o");
+        std::string old; if (auto e = os::read_file(out)) old = e.value;   // extend an existing .sig (another signer)
+        auto nm = a.get("name").empty() ? security::signed_name(f) : a.get("name");
+        auto text = security::detached_sign({reinterpret_cast<const std::uint8_t*>(bytes.value.data()), bytes.value.size()}, nm, k.seed, old);
+        auto tmp = out + ".tmp";
+        if (auto w = os::write_file(tmp, text); !w) throw std::runtime_error("cannot write " + tmp + ": " + w.err.what);
+        if (auto rs = os::rename(tmp, out); !rs) { os::remove(tmp); throw std::runtime_error("cannot replace " + out + ": " + rs.err.what); }
+        std::printf("signed %s (as '%s') with key %s -> %s\n", f.c_str(), nm.c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
+        return 0;
+    }
     auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
     modelfile::sign_file(a.pos[0], out, k);
     std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
@@ -219,10 +246,12 @@ int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key
     modelfile::model_key k;
     if (!a.get("new-key").empty()) {
         k = modelfile::generate_model_key();
-        std::ofstream f(a.get("new-key")); f << modelfile::detail::hex(k.data(), 32) << "\n";
-        if (!f) throw std::runtime_error("cannot write " + a.get("new-key"));
-        ::chmod(a.get("new-key").c_str(), 0600);
+        auto hex = modelfile::detail::hex(k.data(), 32) + "\n";   // FSS-FIO-1: 0600 from the first byte
+        auto st = os::fs::write_file_atomic(a.get("new-key"), hex, 0600); crypto_wipe(hex.data(), hex.size());
+        if (!st) throw std::runtime_error("cannot write " + a.get("new-key") + ": " + st.err.what);
     } else {
+        activate_policy(a.get("policy"));
+        security::require_private_file("model key", a.get("key"), security::file_kind::secret);   // FSS-FIO-2
         std::ifstream f(a.get("key")); std::string h, w; while (f >> w) h += w;
         auto b = modelfile::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
         std::memcpy(k.data(), b.data(), 32);
@@ -233,11 +262,18 @@ int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key
 }
 int cmd_verify(const args& a) {
     if (a.pos.empty()) return usage();
+    std::vector<std::string> trusted;
+    for (auto& p : a.all("pubkey")) trusted.push_back(modelfile::load_public_key(p));
+    if (a.has("detached") || !a.get("sig").empty() || !is_fpk(a.pos[0])) {   // forge verify FILE [--sig FILE.sig] [--pubkey K]...
+        auto rep = security::detached_verify_file(a.pos[0], trusted, a.get("sig"));
+        for (auto& k : rep.valid_keys) std::printf("signature ok   key %s\n", k.c_str());
+        for (auto& k : rep.invalid_keys) std::printf("signature BAD  key %s\n", k.c_str());
+        std::printf("%s: %s\n", a.pos[0].c_str(), rep.trusted ? "VERIFIED" : rep.message.c_str());
+        return rep.trusted ? 0 : 1;
+    }
     modelfile::reader r(a.pos[0]);
     auto bad = r.verify();
     for (auto& b : bad) std::printf("hash MISMATCH %s\n", b.c_str());
-    std::vector<std::string> trusted;
-    for (auto& p : a.all("pubkey")) trusted.push_back(modelfile::load_public_key(p));
     auto rep = modelfile::verify_signature(r, trusted);
     for (auto& k : rep.valid_keys) std::printf("signature ok   key %s\n", k.c_str());
     for (auto& k : rep.invalid_keys) std::printf("signature BAD  key %s\n", k.c_str());
@@ -410,14 +446,19 @@ int cmd_rpc_serve(const args& a) {
         for (auto& e : graph::rpc::parse_tokens(t, "--token")) sec.tokens.push_back(std::move(e));
     }
     auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
+    // FSS-FIO-2: secrets (token files, the TLS key) must be owner-only and trusted lists (authorized keys, client
+    // maps) writable only by their owner; profile strict refuses otherwise, other profiles warn (audit).
+    for (auto& f : files) security::require_private_file(pol, "--token-file", f, security::file_kind::secret);
     for (auto& f : files) {   // "[allow=device,scripts] <token> [name]" per line (graph/rpc_secure.hpp)
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
+        struct wipe_on_exit { std::string& s; ~wipe_on_exit() { if (!s.empty()) crypto_wipe(s.data(), s.size()); } } w{r.value};
         auto ts = graph::rpc::parse_tokens(r.value, f);
         if (ts.empty()) throw std::runtime_error(f + ": no tokens");
         for (auto& e : ts) sec.tokens.push_back(std::move(e));
     }
     auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
     for (auto& f : keyfiles) {   // "[allow=device,scripts] <hex> [comment]" per line (graph/rpc_secure.hpp)
+        security::require_private_file(pol, "--authorized-keys", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         try { for (auto& k : graph::rpc::parse_authorized_keys(r.value)) sec.authorized_keys.push_back(std::move(k)); }
         catch (const std::exception& e) { throw std::runtime_error(f + ": " + e.what()); }
@@ -426,9 +467,11 @@ int cmd_rpc_serve(const args& a) {
     for (auto& p : pubs) sec.authorized_keys.push_back(p.size() == 64 && p.find('/') == std::string::npos && !std::filesystem::exists(p) ? p : modelfile::load_public_key(p));
     sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key"); sec.tls.client_ca_file = a.get("tls-client-ca");
     if (sec.tls.cert_file.empty() != sec.tls.key_file.empty()) throw std::runtime_error("--tls-cert and --tls-key go together");
+    security::require_private_file(pol, "--tls-key", sec.tls.key_file, security::file_kind::secret);
     if (!sec.tls.client_ca_file.empty() && sec.tls.cert_file.empty()) throw std::runtime_error("--tls-client-ca needs --tls-cert and --tls-key");
     auto maps = a.all("tls-client-map"); if (maps.empty() && a.has("tls-client-map")) maps.push_back(a.get("tls-client-map"));
     for (auto& f : maps) {   // "[allow=...] sha256:<hex>|cn:<name> [comment]" per line (graph/rpc_secure.hpp)
+        security::require_private_file(pol, "--tls-client-map", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         auto rs = graph::rpc::parse_client_map(r.value, f);
         if (rs.empty()) throw std::runtime_error(f + ": no rules (an empty client map would accept no certificate)");
@@ -458,7 +501,8 @@ int cmd_rpc_serve(const args& a) {
         // Each remote script runs in its own child process (`forge script --rpc-child`), so ForgeScript's OS sandbox
         // (seccomp / Capsicum / pledge / sandbox_init / restricted token) applies to the script without touching the
         // server's own sockets, and a crash, leak or runaway loop dies with the child. The source goes over stdin.
-        srv.script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
+        srv.signed_script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo,
+                                                                                                const std::string& signature) {
             auto t = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
             os::spawn_spec sp;
             sp.argv = {self, "script", "--rpc-child", name.empty() ? "<remote>" : name, "--timeout", std::to_string(t)};
@@ -466,6 +510,8 @@ int cmd_rpc_serve(const args& a) {
             if (no_fs) sp.argv.push_back("--no-fs");
             if (no_net) sp.argv.push_back("--no-net");
             if (!child_policy.empty()) { sp.argv.push_back("--policy"); sp.argv.push_back(child_policy); }
+            // the client's detached signature (FSS INT-2), hex so it survives the command line; the child verifies it
+            if (!signature.empty()) { sp.argv.push_back("--rpc-sig"); sp.argv.push_back(security::detail::hex({reinterpret_cast<const std::uint8_t*>(signature.data()), signature.size()})); }
             // Windows cannot deny fs/net inside a running process (only run_sandboxed's AppContainer can), so there the
             // child applies what it can (job object) and the interpreter checks the rest.
 #if defined(_WIN32)
@@ -507,15 +553,17 @@ int cmd_rpc_serve(const args& a) {
 // FSS for `forge script` (docs/scripting.md "Security policy"). With an active policy (--policy F or the load_policy()
 // search) the capabilities come from the policy (P1: net only if net.mode is not none, proc only with exec, env only
 // with env) and the --no-* flags narrow the policy in turn; fs operations are path-scoped by the policy's fs.read /
-// fs.write roots (enforce_scope in the runtime). Scripts are unsigned, so integrity.scripts "required" refuses to run
-// them (no script verifier yet; INT-1). Then lockdown(policy) confines the process before any script code runs; it
-// replaces options::os_sandbox. No active policy: nothing here changes anything.
-void script_policy(forge::script::options& o, const std::string& cli_path, const std::string& what) {
+// fs.write roots (enforce_scope in the runtime). integrity.scripts (INT-1/INT-2) is checked where the source is read:
+// engine::run_file and imports verify `<file>.sig` on the bytes they parse, an rpc child verifies the source it got
+// on stdin against the signature the client sent (--rpc-sig). Source without a file or signature (-e, the REPL)
+// cannot pass "required" and is refused here. Then lockdown(policy) confines the process before any script code runs;
+// it replaces options::os_sandbox. No active policy: nothing here changes anything.
+void script_policy(forge::script::options& o, const std::string& cli_path, const std::string& what, bool verifiable) {
     auto p = security::load_policy(cli_path);
     if (!p.active()) return;
-    if (p.integrity.scripts == security::requirement::required) {
-        security::audit("integrity", security::decision::fail, "INT-1", what, "integrity.scripts is required and FORGE cannot verify script signatures");
-        throw security::integrity_error(what + ": integrity.scripts is required in " + p.source + ", and scripts are unsigned (FORGE has no script signature verifier yet)", "INT-1");
+    if (p.integrity.scripts == security::requirement::required && !verifiable) {
+        security::audit("integrity", security::decision::fail, "INT-4", what, "script: integrity.scripts is required and this source has no detached signature");
+        throw security::integrity_error(what + ": integrity.scripts is required in " + p.source + ", and code given with -e, typed into the REPL or sent without a signature cannot be verified (run a signed file)", "INT-4");
     }
     if (!o.allow_fs) { p.fs.read.clear(); p.fs.write.clear(); }
     if (!o.allow_net) p.net.mode = security::net_mode::none;
@@ -526,8 +574,8 @@ void script_policy(forge::script::options& o, const std::string& cli_path, const
     o.allow_proc = p.exec;
     o.allow_env = p.env;
     o.os_sandbox = forge::script::options::os_sandbox_mode::off;   // lockdown() below applies the OS confinement
-    security::audit("script", p.integrity.scripts == security::requirement::off ? security::decision::allow : security::decision::weaken, "INT-1", what,
-                    std::string("unsigned script runs with fs=") + (o.allow_fs ? "scoped" : "off") + " net=" + security::name(p.net.mode) +
+    security::audit("script", security::decision::allow, "CAP-1", what,
+                    std::string("script runs with fs=") + (o.allow_fs ? "scoped" : "off") + " net=" + security::name(p.net.mode) +
                     " proc=" + (o.allow_proc ? "on" : "off") + " env=" + (o.allow_env ? "on" : "off") + " (profile " + security::name(p.prof) + ")");
     security::lockdown(p);
 }
@@ -536,13 +584,14 @@ void script_policy(forge::script::options& o, const std::string& cli_path, const
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
     std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
-    std::string rpc_child, policy_path;
+    std::string rpc_child, policy_path, rpc_sig_hex;
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
         auto val = [&](const char* what) -> std::string { if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + what); return argv[++i]; };
         if (s == "-e") { code = val("-e"); have_code = true; ++i; break; }
         else if (s == "--rpc-child") { rpc_child = val("--rpc-child"); have_code = true; }   // rpc-serve: source on stdin
+        else if (s == "--rpc-sig") rpc_sig_hex = val("--rpc-sig");   // rpc-serve: the client's detached signature (hex of the .sig text)
         else if (s == "--args") { ++i; break; }
         else if (s == "--emit") emit_target = val("--emit");
         else if (s == "-o") emit_out = val("-o");
@@ -598,7 +647,8 @@ int cmd_script(int argc, char** argv) {
             return 0;
         } catch (const forge::script::emit_error& ex) { std::fprintf(stderr, "%s:%d: emit %s: %s\n", file.empty() ? "<-e>" : file.c_str(), ex.line, emit_target.c_str(), ex.what()); return 2; }
     }
-    try { script_policy(o, policy_path, !rpc_child.empty() ? rpc_child : have_code ? std::string("<-e>") : file.empty() ? std::string("<repl>") : file); }
+    try { script_policy(o, policy_path, !rpc_child.empty() ? rpc_child : have_code ? std::string("<-e>") : file.empty() ? std::string("<repl>") : file,
+                        !rpc_child.empty() ? !rpc_sig_hex.empty() : !have_code && !file.empty()); }
     catch (const security::security_error& e) {
         if (rpc_child.empty()) throw;
         // rpc-serve child protocol: stderr = "<ErrorType>\n<message>" (script classes, FSS-ERR-1)
@@ -610,6 +660,12 @@ int cmd_script(int argc, char** argv) {
     if (!rpc_child.empty()) {
         code.assign(std::istreambuf_iterator<char>(std::cin), {});
         o.confirm = nullptr;   // no terminal: AI-drafted code never runs remotely
+        try {   // INT-1/INT-2: the source as received, against the client's signature for the script's name
+            std::vector<std::uint8_t> sig;
+            if (!rpc_sig_hex.empty() && !security::detail::unhex(rpc_sig_hex, sig)) throw security::integrity_error(rpc_child + ": malformed --rpc-sig", "INT-4");
+            security::verify_artefact(*security::active_policy(), security::artefact::script, rpc_child,
+                                      {reinterpret_cast<const std::uint8_t*>(code.data()), code.size()}, std::string(sig.begin(), sig.end()), security::signed_name(rpc_child));
+        } catch (const security::integrity_error& e) { std::fprintf(stderr, "IntegrityError\n%s", e.what()); return 1; }
         forge::script::engine e(o);
         auto r = e.run(code, rpc_child);
         std::fflush(stdout);
@@ -634,7 +690,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached"});
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
@@ -642,7 +698,7 @@ int main(int argc, char** argv) {
         if (c == "bench") return cmd_bench(a);
         if (c == "dump") return cmd_dump(a);
         if (c == "keygen") return cmd_keygen(a);
-        if (c == "sign") return cmd_sign(a);
+        if (c == "sign") { activate_policy(a.get("policy")); return cmd_sign(a); }   // FIO-2 on the secret key under a policy
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);

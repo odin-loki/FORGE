@@ -4,6 +4,7 @@
 // temp files/dirs and atomic writes. std::filesystem underneath where it is portable; native calls for the
 // rest. Nothing throws: every call returns os::result / os::status. Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
+#include <forge/os/private_files.hpp>
 #include <chrono>
 #include <algorithm>
 #include <filesystem>
@@ -360,28 +361,53 @@ inline result<std::vector<mount_info>> mounts() {
 #endif
 }
 
+// ---------------------------------------------------------------- private files and directories (FSS FIO-1 / FIO-2)
+// check_private, ensure_private_dir, write_new_private_file, private_kind: <forge/os/private_files.hpp> (namespace
+// forge::os, so headers below os::fs can use them), available here too.
+using os::private_kind;
+using os::check_private;
+using os::ensure_private_dir;
+using os::write_new_private_file;
+
 // ---------------------------------------------------------------- temp files and atomic writes
+// FIO-1. Names: prefix + 10 characters from std::random_device + suffix; a name that exists is never reused.
+//   make_temp_dir   POSIX mkdir(2) 0700 (exclusive); Windows CreateDirectoryW with the private DACL (the user, SYSTEM,
+//                   Administrators; not inherited), so the directory is private wherever temp_dir() points.
+//   make_temp_file  POSIX O_CREAT|O_EXCL|O_NOFOLLOW, 0600; Windows CREATE_NEW with the private DACL. In a shared
+//                   sticky /tmp the file itself is private and cannot be pre-created or redirected by a symlink;
+//                   for a private directory as well, pass dir = a make_temp_dir() / ensure_private_dir() result.
+// `dir` (default temp_dir()) is where they are created.
 inline std::string random_suffix(std::size_t n = 10) {
     static const char a[] = "abcdefghijklmnopqrstuvwxyz0123456789";
     std::random_device rd; std::string s; for (std::size_t i = 0; i < n; ++i) s += a[rd() % (sizeof a - 1)];
     return s;
 }
-inline result<std::string> make_temp_dir(const std::string& prefix = "forge-") {
+inline result<std::string> make_temp_dir(const std::string& prefix = "forge-", const std::string& dir = "") {
+    const std::string base = dir.empty() ? temp_dir() : dir;
     for (int i = 0; i < 16; ++i) {
-        auto p = u8path(temp_dir()) / u8path(prefix + random_suffix());
-        std::error_code ec; if (stdfs::create_directory(p, ec) && !ec) return {u8str(p), {}};
+        auto p = u8str(u8path(base) / u8path(prefix + random_suffix()));
+#if defined(FORGE_OS_POSIX)
+        if (::mkdir(p.c_str(), 0700) == 0) return {p, {}};
+        if (errno != EEXIST) return {{}, last_error("make_temp_dir " + p)};
+#else
+        detail_priv::private_sa sa(true);
+        if (CreateDirectoryW(widen(p).c_str(), sa.get())) return {p, {}};
+        if (GetLastError() != ERROR_ALREADY_EXISTS) return {{}, last_error("make_temp_dir " + p)};
+#endif
     }
     return {{}, error{-1, "make_temp_dir: could not create a unique directory"}};
 }
-inline result<std::string> make_temp_file(const std::string& prefix = "forge-", const std::string& suffix = "") {
+inline result<std::string> make_temp_file(const std::string& prefix = "forge-", const std::string& suffix = "", const std::string& dir = "") {
+    const std::string base = dir.empty() ? temp_dir() : dir;
     for (int i = 0; i < 16; ++i) {
-        auto p = u8str(u8path(temp_dir()) / u8path(prefix + random_suffix() + suffix));
+        auto p = u8str(u8path(base) / u8path(prefix + random_suffix() + suffix));
 #if defined(FORGE_OS_POSIX)
-        int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (fd >= 0) { ::close(fd); return {p, {}}; }
         if (errno != EEXIST) return {{}, last_error("make_temp_file")};
 #else   // CREATE_NEW: exclusive like O_EXCL, so a name that appears between choosing and creating is never reused
-        HANDLE h = CreateFileW(widen(p).c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+        detail_priv::private_sa sa(false);
+        HANDLE h = CreateFileW(widen(p).c_str(), GENERIC_READ | GENERIC_WRITE, 0, sa.get(), CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return {p, {}}; }
         if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return {{}, last_error("make_temp_file")};
 #endif

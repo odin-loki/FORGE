@@ -27,6 +27,7 @@
 #include <forge/os/process_pool.hpp>
 #include <forge/script/script.hpp>
 #include <forge/security/enforce.hpp>
+#include <forge/security/plugin.hpp>
 #if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1172,14 +1173,14 @@ void install_builtins(Shared& sh) {
     // ------------------------------------------------ native plugins (script/include/forge/script/plugin.h) and modules
     sh.load_plugin = [](Interp& in, const std::string& path) -> Value {
         if (!(in.caps.fs && in.caps.net && in.caps.proc && in.caps.env)) in.raise("PermissionError", "native plugins are refused in sandboxed runs");
-        // FSS INT-1 / CAP-1: an active policy decides (integrity.plugins "required" refuses: no plugin verifier yet)
+        // FSS CAP-1 / INT-1..3: fs.read here; security::open_plugin checks plugin_load, then integrity.plugins (the
+        // detached <path>.sig) and os_code_signing on the bytes it loads (security_error -> PermissionError / IntegrityError)
         enforce_scope(in, SecScope::fs_read, path);
-        enforce_scope(in, SecScope::plugin_load, path);
         {
             std::lock_guard g(in.sh->mod_m);
             if (auto it = in.sh->plugins.find(path); it != in.sh->plugins.end()) return it->second;
         }
-        auto lib = os::library::open(path);
+        auto lib = security::open_plugin(path);
         if (!lib) in.raise("PluginError", "cannot load '" + path + "': " + lib.err.what);
         auto L = std::make_shared<os::library>(std::move(lib.value));
         using init_t = int (*)(const forge_plugin_api*);
