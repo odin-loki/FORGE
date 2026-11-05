@@ -191,8 +191,60 @@ TEST(signals) {
     CHECK(os::send_signal(c->pid(), os::signal_id::terminate));
     CHECK(c->wait() == 128 + SIGTERM);
 }
+TEST(concurrent_child_start_reads_to_eof) {
+    // Every pipe end is close-on-exec from creation: a long-lived child started on another thread must not
+    // inherit this child's stdout write end, or read() would wait for that sibling (1.5 s) instead of seeing EOF.
+    std::atomic<int> slow{0}, bad{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; ++t)
+        ts.emplace_back([&] {
+            for (int i = 0; i < 15; ++i) {
+                auto sib = os::child::start({"sleep", "1.5"});
+                auto c = os::child::start({"sh", "-c", "echo x"});
+                if (!sib || !c) { bad.fetch_add(1); continue; }
+                auto t0 = os::monotonic_ns(); std::string out, part;
+                while (!(part = c->read()).empty()) out += part;
+                if (os::monotonic_ns() - t0 > 1'000'000'000ull) slow.fetch_add(1);
+                if (out != "x\n" || c->wait() != 0) bad.fetch_add(1);
+                sib->kill();
+            }
+        });
+    for (auto& t : ts) t.join();
+    CHECK(bad.load() == 0); CHECK(slow.load() == 0);
+    // spawn_wait under the same load: each one's pipes reach EOF with the direct child
+    std::vector<std::thread> sw;
+    for (int t = 0; t < 4; ++t)
+        sw.emplace_back([&] {
+            for (int i = 0; i < 10; ++i) {
+                auto sib = os::child::start({"sleep", "1.5"});
+                os::spawn_spec s; s.argv = {"sh", "-c", "echo y"}; s.stdin_data = "in";
+                auto r = os::spawn_wait(s);
+                if (!r || r->out != "y\n" || r->wall_ms > 1000) bad.fetch_add(1);
+                if (sib) sib->kill();
+            }
+        });
+    for (auto& t : sw) t.join();
+    CHECK(bad.load() == 0);
+}
+TEST(make_pipe_is_cloexec) {
+    auto p = os::make_pipe(); CHECK(p);
+    if (p) { CHECK((::fcntl(p->read.native(), F_GETFD) & FD_CLOEXEC) != 0); CHECK((::fcntl(p->write.native(), F_GETFD) & FD_CLOEXEC) != 0); }
+}
 #endif
 TEST(find_exe) { CHECK(os::find_executable("no-such-command-forge-xyz").empty()); CHECK(!os::process_caps().empty() || true); }
+TEST(send_signal_rejects_invalid_pids) {
+    // pid 0 would signal our own group, group + pid 1 would be kill(-1), 2^32+pid would truncate to another pid.
+    // (A failure of these checks would kill the test runner, or worse, so they come first in send_signal.)
+    CHECK(!os::send_signal(0, os::signal_id::terminate));
+    CHECK(!os::send_signal(0, os::signal_id::terminate, true));
+    CHECK(!os::send_signal(1, os::signal_id::terminate, true));
+    CHECK(!os::send_signal((1ull << 32) + os::pid(), os::signal_id::terminate));
+    CHECK(!os::send_signal(~0ull, os::signal_id::kill));
+#if defined(FORGE_OS_POSIX)
+    CHECK(os::send_signal(0, os::signal_id::terminate).err.code == EINVAL);
+    CHECK(!os::kill_group(0)); CHECK(!os::kill_group(1)); CHECK(!os::kill_group((1ull << 32) + 1));
+#endif
+}
 
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 TEST(child_start_spec_env_cwd_and_exec_error) {
@@ -327,5 +379,69 @@ TEST(win_wait_any_and_wait_all) {
     os::child d = mk(5, 0); os::child* one[] = {&d};
     auto t0 = os::monotonic_ns(); CHECK(!os::wait_all(one, 50)); CHECK(os::monotonic_ns() - t0 < 2000000000ull);
     d.kill(); CHECK(d.wait() == 128 + 9);
+}
+TEST(win_spawn_large_stdin_to_child_that_ignores_it) {
+    // 1 MB of stdin to a child that never reads it: the writer runs on its own thread, so the timeout still
+    // fires (the old synchronous WriteFile blocked forever once the pipe buffer filled).
+    os::spawn_spec s; s.argv = {"ping", "-n", "30", "127.0.0.1"}; s.stdin_data = std::string(1 << 20, 'x'); s.timeout_ms = 500;
+    auto t0 = os::monotonic_ns(); auto r = os::spawn_wait(s);
+    CHECK(r); if (r) { CHECK(r->timed_out); CHECK(r->exit_code == 124); }
+    CHECK(os::monotonic_ns() - t0 < 10'000'000'000ull);
+    // without a timeout: the child exits without reading, the blocked writer is cancelled
+    os::spawn_spec q; q.argv = {"cmd", "/d", "/c", "exit 4"}; q.stdin_data = std::string(1 << 20, 'x');
+    t0 = os::monotonic_ns(); auto rq = os::spawn_wait(q);
+    CHECK(rq); if (rq) CHECK(rq->exit_code == 4); CHECK(os::monotonic_ns() - t0 < 10'000'000'000ull);
+    // and a child that reads everything gets all of it
+    std::string lines; for (int i = 0; i < 16384; ++i) lines += std::string(63, 'x') + "\n";   // 1 MiB of short lines
+    os::spawn_spec f; f.argv = {sysroot() + "\\System32\\findstr.exe", "/c:x"}; f.stdin_data = lines;
+    auto rf = os::spawn_wait(f); CHECK(rf); if (rf) { CHECK(rf->exit_code == 0); CHECK(rf->out.size() >= 16384u * 64u); }
+}
+TEST(win_spawn_background_grandchild_holding_pipes) {
+    // cmd exits at once; the ping it started in the background inherits stdout/stderr. spawn_wait returns when
+    // cmd exits (draining what is buffered) instead of waiting 30 s for ping to drop the pipes.
+    os::spawn_spec s; s.argv = {"cmd", "/d", "/c", "start /b ping -n 30 127.0.0.1& echo done"};
+    auto t0 = os::monotonic_ns(); auto r = os::spawn_wait(s);
+    CHECK(r); if (r) { CHECK(r->exit_code == 0); CHECK(r->out.find("done") != std::string::npos); CHECK(!r->timed_out); }
+    CHECK(os::monotonic_ns() - t0 < 10'000'000'000ull);
+}
+TEST(win_batch_arguments_are_not_commands) {
+    // BatBadBut: a .bat runs through cmd.exe, which ignores MSVCRT's \" escaping. Each argument must stay one
+    // literal argument: no "pwned" line, %PATH% not expanded.
+    std::string d = os::temp_dir() + "\\forge_bat_" + std::to_string(os::pid()) + ".bat";
+    CHECK(os::write_file(d, "@echo off\r\necho [%1]\r\necho [%2]\r\n"));
+    os::spawn_spec s; s.argv = {d, "\"&echo pwned&\"", "%PATH%"};
+    auto r = os::spawn_wait(s); CHECK(r);
+    if (r) {
+        CHECK(r->exit_code == 0);
+        CHECK(r->out.find("\npwned") == std::string::npos); CHECK(r->out.rfind("pwned", 0) != 0);
+        CHECK(r->out.find("&echo pwned&") != std::string::npos);
+        CHECK(r->out.find("%PATH%") != std::string::npos);
+        std::printf("  batch out [%s]\n", r->out.c_str());
+    }
+    auto c = os::child::start({d, "a&b"}); CHECK(c); if (c) { CHECK(drain(*c) == "[\"a&b\"]\r\n[]\r\n"); CHECK(c->wait() == 0); }
+    os::spawn_spec nl; nl.argv = {d, "a\nb"}; CHECK(!os::spawn_wait(nl));   // CR/LF would end cmd's line: refused
+    std::remove(d.c_str());
+}
+TEST(win_env_names_are_case_insensitive) {
+    auto count_path = [](const std::string& out, std::string& val) {
+        int n = 0; std::size_t i = 0;
+        while (i < out.size()) {
+            auto j = out.find('\n', i); if (j == std::string::npos) j = out.size();
+            std::string line = out.substr(i, j - i); if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size() > 5 && (line[0] | 32) == 'p' && (line[1] | 32) == 'a' && (line[2] | 32) == 't' && (line[3] | 32) == 'h' && line[4] == '=') { ++n; val = line.substr(5); }
+            i = j + 1;
+        }
+        return n;
+    };
+    os::spawn_spec s; s.argv = {sysroot() + "\\System32\\cmd.exe", "/d", "/c", "set"}; s.env_set["path"] = sysroot() + "\\System32;C:\\forge-x";
+    auto r = os::spawn_wait(s); CHECK(r);
+    std::string v; if (r) { CHECK(count_path(r->out, v) == 1); CHECK(v.find("forge-x") != std::string::npos); }
+    os::spawn_spec u; u.argv = s.argv; u.env_unset = {"pATH"};
+    auto ru = os::spawn_wait(u); CHECK(ru); if (ru) CHECK(count_path(ru->out, v) == 0);
+}
+TEST(win_no_core_and_job_limits) {
+    // no_core: DIE_ON_UNHANDLED_EXCEPTION in the job; the child still starts and exits normally
+    os::spawn_spec s; s.argv = {"cmd", "/d", "/c", "exit 6"}; s.limits.no_core = true;
+    auto r = os::spawn_wait(s); CHECK(r); if (r) CHECK(r->exit_code == 6);
 }
 #endif

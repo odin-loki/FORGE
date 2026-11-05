@@ -44,7 +44,10 @@ struct pexpr {
         }
     }
     std::uint64_t unary() {
-        if (peek("!") && !peek("!=")) { ++i; return !unary(); }
+        if (peek("!") && !peek("!=")) {   // "!!!!..." recurses here, not through cond(): same depth budget
+            ++i; if (++depth > 200) { bad = true; return 0; }
+            auto v = !unary(); --depth; return v;
+        }
         ws();
         if (eat("(")) { auto v = cond(); if (!eat(")")) bad = true; return v; }
         if (i < s.size() && s[i] == 'n') { ++i; return n; }

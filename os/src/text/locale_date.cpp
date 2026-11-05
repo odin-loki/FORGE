@@ -55,14 +55,14 @@ std::string name_lookup(std::string_view b, std::string_view kind, std::string_v
 }  // namespace
 std::string month_name(int m, std::string_view locale, std::string_view width, bool standalone) {
     if (m < 1 || m > 12) return {};
-    return name_lookup(resolve(locale), "months", std::to_string(m), width, standalone);
+    return name_lookup(resolve(locale, category::time), "months", std::to_string(m), width, standalone);
 }
 std::string weekday_name(int wd, std::string_view locale, std::string_view width, bool standalone) {
     if (wd < 0 || wd > 6) return {};
-    return name_lookup(resolve(locale), "days", day_keys[wd], width, standalone);
+    return name_lookup(resolve(locale, category::time), "days", day_keys[wd], width, standalone);
 }
 std::string day_period(int hour, std::string_view locale, std::string_view width) {
-    auto b = resolve(locale);
+    auto b = resolve(locale, category::time);
     return std::string(get(b, "cal/dayPeriods/" + std::string(width) + (hour < 12 ? "/am" : "/pm")));
 }
 
@@ -70,7 +70,7 @@ std::string day_period(int hour, std::string_view locale, std::string_view width
 namespace {
 struct ctx { std::string b; std::string tagstr; std::string nu; calendar cal = calendar::gregorian; };
 ctx make_ctx(std::string_view locale) {
-    ctx c; c.tagstr = locale.empty() ? current() : std::string(locale); c.b = resolve(c.tagstr);
+    ctx c; c.tagstr = locale.empty() ? current(category::time) : std::string(locale); c.b = resolve(c.tagstr);
     c.nu = numbering_for(c.b, {}, c.tagstr);
     auto t = parse_tag(c.tagstr);
     if (auto ca = t.keyword("ca"); !ca.empty()) if (auto k = calendar_from_name(ca)) c.cal = *k;
@@ -316,7 +316,7 @@ std::string pattern_for_skeleton(std::string_view skeleton, std::string_view loc
     return sub(get(c.b, std::string("cal/datetime/") + st), tp, dp);
 }
 std::string format_skeleton(const datetime& d, std::string_view skeleton, std::string_view locale) {
-    std::string tag = locale.empty() ? current() : std::string(locale);
+    std::string tag = locale.empty() ? current(category::time) : std::string(locale);
     return format_pattern(d, pattern_for_skeleton(skeleton, tag), tag);
 }
 
@@ -491,7 +491,7 @@ std::string format_iso8601(const datetime& d, bool with_offset) {
 // ---------------------------------------------------------------- relative time and durations
 std::string format_relative(double v, rel_unit u, std::string_view locale, rel_width w, bool numeric) {
     static const char* names[] = {"second", "minute", "hour", "day", "week", "month", "quarter", "year"};
-    auto b = resolve(locale);
+    auto b = resolve(locale, category::time);
     std::string f = std::string("rel/") + names[int(u)] + (w == rel_width::short_ ? "-short" : w == rel_width::narrow ? "-narrow" : "");
     auto look = [&](const std::string& k) { if (auto x = find(b, f + k)) return std::optional<std::string_view>(x); auto base = std::string("rel/") + names[int(u)]; return find(b, base + k); };
     if (!numeric && v == std::floor(v) && std::fabs(v) <= 3) if (auto x = look("/rel/" + std::to_string(int(v)))) return std::string(*x);

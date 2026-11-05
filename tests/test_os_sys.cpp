@@ -4,7 +4,10 @@
 #include <forge/os/time.hpp>
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/console.hpp>
+#include <forge/os/oserror.hpp>
+#include <forge/os/pipe.hpp>
 #include <atomic>
+#include <thread>
 #include <vector>
 #include "check.hpp"
 using namespace forge;
@@ -67,6 +70,33 @@ TEST(users_dirs) {
     CHECK(u.sid.empty());
 #endif
     CHECK(!os::config_dir().empty()); CHECK(!os::cache_dir().empty());
+#if defined(FORGE_OS_WINDOWS)
+    std::printf("  full name '%s', %zu groups\n", u.full_name.c_str(), u.groups.size()); CHECK(!u.groups.empty());
+    {   // Known Folders, as the shell resolves them (OneDrive / GPO redirection included)
+        auto r = os::run({"powershell", "-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; foreach ($f in 'Desktop','MyDocuments','ApplicationData','LocalApplicationData') { [Environment]::GetFolderPath($f) }"});
+        CHECK(r); std::vector<std::string> want; std::string cur;
+        if (r) for (char c : r->out) { if (c == '\n') { if (!cur.empty()) want.push_back(cur); cur.clear(); } else if (c != '\r') cur += c; }
+        CHECK(want.size() == 4);
+        if (want.size() == 4) {
+            CHECK_MSG(os::user_directory(os::user_dir::desktop) == want[0], "%s vs %s", os::user_directory(os::user_dir::desktop).c_str(), want[0].c_str());
+            CHECK(os::user_directory(os::user_dir::documents) == want[1]); CHECK(os::config_dir() == want[2]); CHECK(os::user_directory(os::user_dir::state) == want[3]);
+        }
+    }
+#elif !defined(__APPLE__)
+    {   // user-dirs.dirs wins over the environment and the defaults
+        auto cfg = os::join(os::temp_dir(), "forge_userdirs_" + std::to_string(os::pid())); os::mkdirs(cfg);
+        CHECK(os::write_file(os::join(cfg, "user-dirs.dirs"), "# written by xdg-user-dirs-update\nXDG_DESKTOP_DIR=\"$HOME/Schreibtisch\"\n  XDG_DOWNLOAD_DIR=\"/srv/dl\"\nXDG_DOCUMENTS_DIR=\"$HOME/My \\\"Docs\\\"\"\nXDG_MUSIC_DIR=relative\n"));
+        auto old = os::getenv("XDG_CONFIG_HOME"); bool had = os::has_env("XDG_CONFIG_HOME"); auto oldd = os::getenv("XDG_DESKTOP_DIR"); bool hadd = os::has_env("XDG_DESKTOP_DIR");
+        os::setenv("XDG_CONFIG_HOME", cfg); os::setenv("XDG_DESKTOP_DIR", "/env/desktop");
+        auto h = os::home_dir();
+        CHECK(os::user_directory(os::user_dir::desktop) == h + "/Schreibtisch"); CHECK(os::user_directory(os::user_dir::downloads) == "/srv/dl");
+        CHECK(os::user_directory(os::user_dir::documents) == h + "/My \"Docs\"");
+        CHECK(os::write_file(os::join(cfg, "user-dirs.dirs"), "XDG_DOWNLOAD_DIR=\"/srv/dl\"\n")); CHECK(os::user_directory(os::user_dir::desktop) == "/env/desktop");
+        if (had) os::setenv("XDG_CONFIG_HOME", old); else os::unsetenv("XDG_CONFIG_HOME");
+        if (hadd) os::setenv("XDG_DESKTOP_DIR", oldd); else os::unsetenv("XDG_DESKTOP_DIR");
+        os::remove_all(cfg);
+    }
+#endif
 }
 TEST(time_civil_and_iso) {
     CHECK(os::format_iso8601(0) == "1970-01-01T00:00:00.000Z");
@@ -95,7 +125,18 @@ TEST(timer_queue_runs) {
 TEST(sysinfo_ext) {
     auto r = os::release_info(); CHECK(!r.name.empty());
     auto m = os::memory(); CHECK(m.total > 0);
+    std::printf("  %s (%s %s) mem total %llu MiB avail %llu free %llu swap %llu/%llu cgroup %llu/%llu\n", r.pretty.c_str(), r.kernel.c_str(), r.kernel_version.c_str(),
+                (unsigned long long)(m.total >> 20), (unsigned long long)(m.available >> 20), (unsigned long long)(m.free >> 20), (unsigned long long)(m.swap_free >> 20),
+                (unsigned long long)(m.swap_total >> 20), (unsigned long long)(m.cgroup_usage >> 20), (unsigned long long)(m.cgroup_limit >> 20));
+    CHECK(m.free > 0); CHECK(m.free <= m.total); CHECK(m.swap_free <= m.swap_total);
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(r.version == "10" || r.version == "11"); CHECK(m.free <= m.available);
+    CHECK(m.swap_total > 0);   // the page file
+#elif defined(__linux__)
+    if (os::stat("/sys/fs/cgroup/cgroup.controllers").exists) { auto d = os::detail::cgroup2_dir(); CHECK(!d.empty()); CHECK(os::stat(d).is_dir); }
+#endif
     auto u = os::self_usage(); CHECK(u);
+    CHECK(u->max_rss > 0); CHECK(u->minor_faults + u->major_faults > 0);
     {   // current_rss grows with touched memory, on every OS
         std::uint64_t r0 = os::current_rss(); CHECK(r0 > 0);
         std::vector<char> big(64u << 20); volatile char* vp = big.data(); for (std::size_t i = 0; i < big.size(); i += 4096) vp[i] = char(i | 1);
@@ -117,6 +158,71 @@ TEST(sysinfo_ext) {
         double busy1 = 0, all1 = 0; for (auto& t : *b) { busy1 += t.total() - t.idle; all1 += t.total(); }
         CHECK(all1 > all0); CHECK(busy1 > busy0);
     }
+}
+// ---------------------------------------------------------------- audit W1-B regressions
+TEST(fs_non_ascii_paths) {
+    auto d = fs::make_temp_dir("forge-\xC3\xA9-\xE6\x97\xA5-"); CHECK(d); if (!d) return;   // "é", "日"
+    CHECK(os::stat(*d).is_dir);
+    auto p = *d + "/\xE6\x97\xA5\xE6\x9C\xAC-caf\xC3\xA9.txt";
+    CHECK(fs::write_file_atomic(p, "one")); CHECK(fs::write_file_atomic(p, "two")); CHECK(os::read_file(p).value == "two");
+    auto l = os::list_dir(*d); CHECK(l && l->size() == 1 && (*l)[0].name == "\xE6\x97\xA5\xE6\x9C\xAC-caf\xC3\xA9.txt");   // no stray temp file
+    { auto k = fs::file_lock::acquire(*d + "/l\xC3\xA9.lock"); CHECK(k); }
+    CHECK(fs::exists(*d + "/l\xC3\xA9.lock"));   // created under its real (UTF-8) name, not a byte-widened one
+    auto t = fs::make_temp_file("t\xC3\xA9-", ".tmp"); CHECK(t); if (t) { CHECK(os::stat(*t).is_file); CHECK(t->find("t\xC3\xA9-") != std::string::npos); fs::remove_all(*t); }
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0444)); CHECK(!os::file::open(*d + "/ro.txt", os::wr));
+    SetFileAttributesW(os::widen(*d + "/ro.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
+#else
+    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0600)); CHECK((*fs::mode(*d + "/ro.txt") & 0077) == 0);
+#endif
+    CHECK(fs::remove_all(*d)); CHECK(!fs::exists(*d));
+}
+TEST(mount_unescape_is_safe) {
+    CHECK(fs::mount_unescape("/mnt/with\\040space") == "/mnt/with space");
+    CHECK(fs::mount_unescape("a\\134b") == "a\\b");
+    CHECK(fs::mount_unescape("bad\\9zz") == "bad\\9zz"); CHECK(fs::mount_unescape("end\\04") == "end\\04"); CHECK(fs::mount_unescape("\\") == "\\");
+}
+TEST(classify_by_domain) {
+    CHECK(os::classify(os::errno_error(ENOENT, "x")) == os::os_errc::not_found);
+    CHECK(os::classify(os::errno_error(EEXIST, "x")) == os::os_errc::already_exists);   // 17 = ERROR_NOT_SAME_DEVICE as Win32
+    CHECK(os::classify(os::errno_error(EINVAL, "x")) == os::os_errc::invalid_argument);
+#if defined(EAI_NONAME)
+    CHECK(os::classify(os::error{EAI_NONAME, "x", os::err_domain::gai}) == os::os_errc::not_found);
+    CHECK(os::classify_gai(EAI_AGAIN) == os::os_errc::would_block);
+#endif
+    auto missing = fs::file_size("definitely/not/here-forge"); CHECK(!missing); CHECK(os::classify(missing.err) == os::os_errc::not_found);
+    auto parse = os::parse_iso8601("nope"); CHECK(os::classify(parse.err) == os::os_errc::invalid_argument);
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(os::classify(os::error{int(ERROR_FILE_NOT_FOUND), "x"}) == os::os_errc::not_found);
+    CHECK(os::classify(os::error{int(ERROR_FILE_NOT_FOUND), "x", os::err_domain::win32}) == os::os_errc::not_found);
+    struct { unsigned long code; os::os_errc k; } t[] = {
+        {ERROR_HANDLE_EOF, os::os_errc::io}, {11001, os::os_errc::not_found}, {11002, os::os_errc::would_block}, {ERROR_SEM_TIMEOUT, os::os_errc::timed_out},
+        {ERROR_PIPE_BUSY, os::os_errc::busy}, {ERROR_NOT_FOUND, os::os_errc::not_found}, {10052, os::os_errc::connection_reset},
+        {ERROR_NETWORK_UNREACHABLE, os::os_errc::network_unreachable}, {ERROR_CANT_RESOLVE_FILENAME, os::os_errc::too_many_links},
+        {10047, os::os_errc::not_supported}, {ERROR_COMMITMENT_LIMIT, os::os_errc::out_of_memory}, {ERROR_ALREADY_EXISTS, os::os_errc::already_exists}};
+    for (auto& e : t) CHECK_MSG(os::classify_win32(e.code) == e.k, "%lu -> %s", e.code, os::name(os::classify_win32(e.code)));
+#else
+    CHECK(os::classify(os::error{ENOENT, "x"}) == os::os_errc::not_found);
+    CHECK(os::classify(os::error{2, "x", os::err_domain::win32}) == os::os_errc::other);
+#endif
+}
+TEST(timezone_and_offsets) {
+    auto tz = os::timezone_name(); std::printf("  timezone_name: '%s'\n", tz.c_str());
+#if defined(FORGE_OS_WINDOWS) || defined(__APPLE__) || defined(FORGE_OS_ANDROID) || defined(FORGE_OS_FREEBSD)
+    CHECK(!tz.empty());
+#endif
+#if defined(FORGE_OS_WINDOWS)
+    CHECK(std::string(os::windows_zone_to_iana("W. Europe Standard Time")) == "Europe/Berlin"); CHECK(!os::windows_zone_to_iana("No Such Zone"));
+#endif
+    int o = os::utc_offset_seconds(-86400LL * 365 * 300); CHECK(o >= -16 * 3600 && o <= 16 * 3600);   // year 1670: 0 or a sane offset, no garbage
+}
+TEST(pipe_read_timeout) {
+    auto p = os::make_pipe(); CHECK(p); if (!p) return;
+    auto t0 = os::monotonic_ns(); CHECK(p->read.read_some(100, 50).empty()); CHECK(os::monotonic_ns() - t0 >= 40'000'000ull);
+    CHECK(p->write.write_all("hello")); CHECK(p->read.read_some(100, 2000) == "hello");
+    std::thread w([&] { os::sleep_ns(30'000'000); p->write.write_all(" world"); p->write.close(); });
+    std::string all; for (std::string c; !(c = p->read.read_some(100, 5000)).empty();) all += c;
+    w.join(); CHECK(all == " world");
 }
 TEST(console_bits) {
     CHECK(os::console::paint("x", os::console::color::red, false) == "x");

@@ -21,6 +21,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <fstream>
+#include <linux/videodev2.h>
 #include <map>
 #include <forge/os/process.hpp>
 
@@ -31,6 +32,22 @@ namespace {
 std::string slurp(const std::string& p) { std::ifstream f(p); if (!f) return {}; std::string s((std::istreambuf_iterator<char>(f)), {}); while (!s.empty() && (s.back() == '\n' || s.back() == ' ')) s.pop_back(); return s; }
 bool exists(const std::string& p) { struct stat st; return ::stat(p.c_str(), &st) == 0; }
 std::vector<std::string> ls(const std::string& d) { std::vector<std::string> v; if (auto l = list_dir(d)) for (auto& e : l.value) v.push_back(e.name); std::sort(v.begin(), v.end()); return v; }
+// sysfs attribute write; the value only lands when write() succeeds (an ofstream reports failure at flush, if ever).
+status write_attr(const std::string& p, const std::string& v) {
+    int fd = ::open(p.c_str(), O_WRONLY | O_CLOEXEC); if (fd < 0) return {{}, last_error("open " + p)};
+    ssize_t n = ::write(fd, v.data(), v.size()); auto e = n == ssize_t(v.size()) ? error{} : last_error("write " + p);
+    ::close(fd); return {{}, e};
+}
+// nmcli -t -e yes: fields separated by ':', with ':' and '\' inside values escaped by a backslash.
+std::vector<std::string> nm_fields(const std::string& line) {
+    std::vector<std::string> f(1);
+    for (std::size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '\\' && i + 1 < line.size()) f.back() += line[++i];
+        else if (line[i] == ':') f.emplace_back();
+        else f.back() += line[i];
+    }
+    return f;
+}
 bool num(const std::string& p, double& out) { auto s = slurp(p); if (s.empty()) return false; char* e = nullptr; out = std::strtod(s.c_str(), &e); return e != s.c_str(); }
 
 // Bit test on a sysfs capability mask ("hex words, most significant first").
@@ -116,24 +133,34 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         return {{}, unsupported(std::string("sensor ") + sensor_name(k) + " (no IIO device)")};
     }
 
-    // ---- touch
+    // ---- touch: every direct-touch node (touchscreens, not touchpads), positions in display pixels
     std::vector<std::string> touch_nodes() const {
         std::vector<std::string> v;
         for (auto& n : ls(input)) {
             if (n.rfind("event", 0)) continue;
-            std::string abs = slurp(sys + "/class/input/" + n + "/device/capabilities/abs"), key = slurp(sys + "/class/input/" + n + "/device/capabilities/key");
+            std::string dev = sys + "/class/input/" + n + "/device";
+            std::string abs = slurp(dev + "/capabilities/abs"), key = slurp(dev + "/capabilities/key");
             if (abs.empty()) continue;
-            if (cap_bit(abs, ABS_MT_POSITION_X) || (cap_bit(abs, ABS_X) && !key.empty() && cap_bit(key, BTN_TOUCH))) v.push_back(input + "/" + n);
+            if (!cap_bit(abs, ABS_MT_POSITION_X) && !(cap_bit(abs, ABS_X) && !key.empty() && cap_bit(key, BTN_TOUCH))) continue;
+            if (auto props = slurp(dev + "/properties"); !props.empty()) { if (!cap_bit(props, INPUT_PROP_DIRECT)) continue; }
+            else { int fd = ::open((input + "/" + n).c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC); bool direct = fd >= 0 && evdev_is_direct(fd); if (fd >= 0) ::close(fd); if (!direct) continue; }
+            v.push_back(input + "/" + n);
         }
         return v;
     }
     result<touch_stream> open_touch() override {
-        auto nodes = touch_nodes(); if (nodes.empty()) return {{}, unsupported("touch input (no evdev touchscreen)")};
-        int fd = ::open(nodes[0].c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-        if (fd < 0) return {{}, last_error("open " + nodes[0])};
+        auto paths = touch_nodes(); if (paths.empty()) return {{}, unsupported("touch input (no evdev touchscreen)")};
+        int w_px = 0, h_px = 0; if (auto d = display()) { w_px = d.value.width_px; h_px = d.value.height_px; }
+        std::vector<evdev_node> nodes; error first_err{};
+        for (auto& p : paths) {
+            int fd = ::open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+            if (fd < 0) { if (!first_err) first_err = last_error("open " + p); continue; }
+            nodes.push_back(evdev_setup(fd, w_px, h_px));
+        }
+        if (nodes.empty()) return {{}, first_err};
         auto q = std::make_shared<queue>(); bridge::get().add_touch(q);
         auto w = std::make_shared<worker>();
-        w->start([fd, q, wp = w.get()] { evdev_loop(fd, *q, *wp); ::close(fd); });
+        w->start([nodes = std::move(nodes), q, wp = w.get()]() mutable { evdev_loop(std::move(nodes), *q, *wp); });
         return {make_touch(q, w), {}};
     }
     // ---- haptics via evdev force feedback
@@ -181,9 +208,28 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
         if (auto o = accel_orientation(); o != orientation::unknown) return {o, {}};
         auto d = display(); if (!d) return {{}, d.err}; return {d.value.orient, {}};
     }
+    // Capture nodes only: UVC also registers a metadata node per camera, codecs register m2m nodes. VIDIOC_QUERYCAP on
+    // the device node decides; without access to it (fake trees, permissions) the sysfs "index" (0 = the capture
+    // interface of a multi-node device) does.
     result<std::vector<camera_info>> cameras() override {
         std::vector<camera_info> v; std::string r = sys + "/class/video4linux";
-        for (auto& c : ls(r)) { auto nm = slurp(r + "/" + c + "/name"); auto lc = nm; for (auto& ch : lc) ch = char(std::tolower(ch)); v.push_back({c, nm, lc.find("front") != std::string::npos}); }
+        std::string devdir = input.substr(0, input.rfind('/'));   // /dev/input -> /dev
+        for (auto& c : ls(r)) {
+            int capture = -1;
+            int fd = ::open((devdir + "/" + c).c_str(), O_RDWR | O_NONBLOCK | O_CLOEXEC);
+            if (fd >= 0) {
+                v4l2_capability cap{};
+                if (::ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+                    std::uint32_t caps = (cap.capabilities & V4L2_CAP_DEVICE_CAPS) ? cap.device_caps : cap.capabilities;
+                    capture = (caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) && !(caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)) ? 1 : 0;
+                }
+                ::close(fd);
+            }
+            if (capture < 0) { auto idx = slurp(r + "/" + c + "/index"); capture = idx.empty() || idx == "0"; }
+            if (!capture) continue;
+            auto nm = slurp(r + "/" + c + "/name"); auto lc = nm; for (auto& ch : lc) ch = char(std::tolower(ch));
+            v.push_back({c, nm, lc.find("front") != std::string::npos});
+        }
         return {v, {}};
     }
     // ---- services
@@ -199,48 +245,77 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
     }
     status set_brightness(double l) override {
         auto d = first_class("backlight"); double m; if (d.empty() || !num(d + "/max_brightness", m)) return {{}, unsupported("screen brightness (no backlight)")};
-        std::ofstream f(d + "/brightness"); if (!f) return {{}, last_error("write " + d + "/brightness")};
-        f << long(std::lround(l * m)) << "\n"; return f ? status{} : status{{}, last_error("write brightness")};
+        return write_attr(d + "/brightness", std::to_string(std::lround(l * m)) + "\n");
     }
     status torch(bool on) override {
         auto d = first_class("leds", "flash"); if (d.empty()) d = first_class("leds", "torch");
         if (d.empty()) return {{}, unsupported("torch (no flash LED)")};
         double m = 1; num(d + "/max_brightness", m);
-        std::ofstream f(d + "/brightness"); if (!f) return {{}, last_error("write " + d + "/brightness")};
-        f << (on ? long(m) : 0) << "\n"; return {};
+        return write_attr(d + "/brightness", std::to_string(on ? long(m) : 0L) + "\n");
     }
     result<bool> nfc_available() override { return {!ls(sys + "/class/nfc").empty(), {}}; }
     result<connectivity_info> connectivity() override {
         auto c = backend::connectivity(); if (!c) return c;
         std::string out;   // NetworkManager over its CLI (D-Bus underneath); optional
-        if (run_tool({"nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"}, &out, 5000) == 0) {
+        if (run_tool({"nmcli", "-t", "-e", "yes", "-f", "ACTIVE,SSID,SIGNAL", "dev", "wifi"}, &out, 5000) == 0) {
             std::size_t i = 0;
             while (i < out.size()) { auto j = out.find('\n', i); auto line = out.substr(i, j - i); i = j == std::string::npos ? out.size() : j + 1;
-                if (line.rfind("yes:", 0) == 0) { auto k = line.rfind(':'); c.value.ssid = line.substr(4, k - 4); c.value.signal_percent = std::atoi(line.c_str() + k + 1); break; } }
+                auto f = nm_fields(line);
+                if (f.size() == 3 && f[0] == "yes") { c.value.ssid = f[1]; c.value.signal_percent = std::atoi(f[2].c_str()); break; } }
         }
         if (c.value.transport == "cellular" || run_tool({"mmcli", "-L"}, &out, 5000) == 0 && out.find("/Modem/") != std::string::npos) {
             if (c.value.transport == "unknown") c.value.transport = "cellular";
         }
         return c;
     }
+    // BlueZ through bluetoothctl (D-Bus underneath). Only devices heard during this scan are returned ("[NEW] Device"
+    // / "[CHG] Device ... RSSI:" lines), not BlueZ's cache of paired or earlier devices; rssi is 0 when the
+    // advertisement carried none.
     result<std::vector<ble_device>> bluetooth_scan(int ms) override {
-        std::string out;   // BlueZ through bluetoothctl (D-Bus underneath)
-        if (run_tool({"bluetoothctl", "--timeout", std::to_string(std::max(1, ms / 1000)), "scan", "on"}, &out, ms + 5000) < 0) return {{}, unsupported("bluetooth scan (no bluetoothctl/BlueZ)")};
-        if (run_tool({"bluetoothctl", "devices"}, &out, 5000) != 0) return {{}, {-1, "bluetoothctl devices failed"}};
+        std::string out;
+        int rc = run_tool({"bluetoothctl", "--timeout", std::to_string(std::max(1, ms / 1000)), "scan", "on"}, &out, ms + 5000);
+        if (rc < 0) return {{}, unsupported("bluetooth scan (no bluetoothctl/BlueZ)")};
+        if (rc != 0) return {{}, {rc, "bluetoothctl scan failed"}};
         std::vector<ble_device> v; std::size_t i = 0;
-        while (i < out.size()) { auto j = out.find('\n', i); auto line = out.substr(i, j - i); i = j == std::string::npos ? out.size() : j + 1;
-            if (line.rfind("Device ", 0) == 0 && line.size() >= 24) v.push_back({line.substr(7, 17), line.size() > 25 ? line.substr(25) : "", 0}); }
+        auto find = [&](const std::string& a) -> ble_device& { for (auto& d : v) if (d.address == a) return d; v.push_back({a, "", 0}); return v.back(); };
+        while (i < out.size()) {
+            auto j = out.find('\n', i); auto line = out.substr(i, j - i); i = j == std::string::npos ? out.size() : j + 1;
+            for (std::size_t k; (k = line.find('\x1b')) != std::string::npos;) { auto e = line.find('m', k); line.erase(k, e == std::string::npos ? std::string::npos : e - k + 1); }   // colours
+            auto at = line.find("Device "); if (at == std::string::npos || line.size() < at + 24) continue;
+            bool is_new = line.find("[NEW]") != std::string::npos, is_chg = line.find("[CHG]") != std::string::npos;
+            if (!is_new && !is_chg) continue;
+            auto addr = line.substr(at + 7, 17); auto rest = line.size() > at + 25 ? line.substr(at + 25) : std::string();
+            if (is_new) { auto& d = find(addr); if (rest != addr && rest.find(':') == std::string::npos) d.name = rest; }
+            else if (auto r = rest.find("RSSI: "); r != std::string::npos) {
+                auto val = rest.substr(r + 6); auto paren = val.find('(');   // "-60" or "0xffffffc4 (-60)"
+                find(addr).rssi = std::atoi((paren != std::string::npos ? val.substr(paren + 1) : val).c_str());
+            }
+        }
         return {v, {}};
     }
     result<biometric_info> biometrics() override {
-        std::string out; int rc = run_tool({"fprintd-list", os::getenv("USER")}, &out, 5000);
-        if (rc < 0) return {biometric_info{false, false, ""}, {}};
-        return {biometric_info{true, out.find("finger") != std::string::npos && out.find("no fingers") == std::string::npos, "fingerprint"}, {}};
+        auto user = os::getenv("USER"); if (user.empty() || user[0] == '-') return {biometric_info{false, false, ""}, {}};
+        std::string out; int rc = run_tool({"fprintd-list", user}, &out, 5000);
+        // Not installed, no reader ("No devices available", exit 1) or fprintd not running: nothing usable.
+        if (rc != 0 || out.find("No devices") != std::string::npos) return {biometric_info{false, false, ""}, {}};
+        bool enrolled = out.find("Fingerprints for user") != std::string::npos && out.find("has no fingers enrolled") == std::string::npos;
+        return {biometric_info{true, enrolled, "fingerprint"}, {}};
     }
     result<device_info> info() override {
         auto d = backend::info(); if (!d) return d;
-        std::string model = slurp("/proc/device-tree/model");
-        if (!model.empty()) { while (!model.empty() && model.back() == '\0') model.pop_back(); d.value.model = model; d.value.form = form_factor::phone; }
+        // Device tree (ARM boards, phones): model, and the form factor from chassis-type where the DT has it. A DT
+        // alone does not make a phone (Raspberry Pi, routers): without chassis-type only a battery-powered device with
+        // a touchscreen is taken for a phone, a battery alone for a laptop.
+        auto dt = sys + "/firmware/devicetree/base";
+        auto strip = [](std::string v) { while (!v.empty() && v.back() == '\0') v.pop_back(); return v; };
+        std::string model = strip(slurp(dt + "/model"));
+        if (!model.empty()) {
+            d.value.model = model; auto ct = strip(slurp(dt + "/chassis-type"));
+            d.value.form = ct == "handset" ? form_factor::phone : ct == "tablet" ? form_factor::tablet : ct == "watch" ? form_factor::watch
+                         : ct == "laptop" || ct == "convertible" ? form_factor::laptop : ct == "desktop" || ct == "all-in-one" ? form_factor::desktop
+                         : ct == "television" ? form_factor::tv : ct == "embedded" ? form_factor::unknown
+                         : !battery_dir().empty() ? (touch_nodes().empty() ? form_factor::laptop : form_factor::phone) : form_factor::unknown;
+        }
         auto dmi = sys + "/class/dmi/id";
         if (auto v = slurp(dmi + "/sys_vendor"); !v.empty()) d.value.manufacturer = v;
         if (auto v = slurp(dmi + "/product_name"); !v.empty() && model.empty()) d.value.model = v;
@@ -268,7 +343,7 @@ struct linux_backend final : backend, std::enable_shared_from_this<linux_backend
     status request_permission(permission) override { return {}; }
     status notify(std::string_view t, std::string_view b) override {
         if (auto h = backend::notify(t, b); !is_unsupported(h.err)) return h;
-        std::string ts(t), bs(b); char* argv[] = {const_cast<char*>("notify-send"), const_cast<char*>("--app-name=forge"), ts.data(), bs.data(), nullptr};
+        std::string ts(t), bs(b); char* argv[] = {const_cast<char*>("notify-send"), const_cast<char*>("--app-name=forge"), const_cast<char*>("--"), ts.data(), bs.data(), nullptr};
         pid_t pid; if (posix_spawnp(&pid, "notify-send", nullptr, nullptr, argv, environ) != 0) return {{}, unsupported("notifications (no notify-send)")};
         int st = 0; ::waitpid(pid, &st, 0);
         return WIFEXITED(st) && WEXITSTATUS(st) == 0 ? status{} : status{{}, {-1, "notify-send failed"}};

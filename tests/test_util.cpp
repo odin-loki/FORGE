@@ -66,3 +66,25 @@ TEST(settings_registry) {
     CHECK(md.find("FORGE_TST_TYPO") == std::string::npos);
     for (auto* k : {"FORGE_TST_INT", "FORGE_TST_SIZE", "FORGE_TST_FLAG", "FORGE_TST_NAME", "FORGE_TST_REAL", "FORGE_TST_TYPO"}) forge_test::set_env(k, nullptr);
 }
+TEST(settings_integers_and_unicode) {
+    static const auto kInt = S::define<std::int64_t>("FORGE_TST2_INT", 7, "An int");
+    static const auto kI32 = S::define<std::int32_t>("FORGE_TST2_I32", 3, "A 32-bit int");
+    static const auto kName = S::define("FORGE_TST2_NAME", "dflt", "A string");
+#if defined(_WIN32)   // the process (UTF-16) environment, as a parent or any wide API would set it
+    auto put = [](const char* k, const char* v) { SetEnvironmentVariableW(os::widen(k).c_str(), v ? os::widen(v).c_str() : nullptr); };
+#else
+    auto put = [](const char* k, const char* v) { if (v) os::setenv(k, v); else os::unsetenv(k); };
+#endif
+    put("FORGE_TST2_INT", "010"); S::reload(); CHECK(kInt.get() == 10);   // decimal, not octal
+    put("FORGE_TST2_INT", "-0x10"); CHECK(kInt.get() == -16); put("FORGE_TST2_INT", "+12"); CHECK(kInt.get() == 12);
+    put("FORGE_TST2_INT", "08"); CHECK(kInt.get() == 8); put("FORGE_TST2_INT", " 9"); CHECK(kInt.get() == 9);
+    for (auto* bad : {"0x", "12 ", "1e3", "0b101", "x1", "99999999999999999999"}) { put("FORGE_TST2_INT", bad); S::reload(); CHECK_MSG(kInt.get() == 7, "'%s'", bad); CHECK(S::problems().size() == 1); }
+    put("FORGE_TST2_I32", "5000000000"); S::reload(); CHECK(kI32.get() == 3); CHECK(S::problems().size() == 1);
+    put("FORGE_TST2_I32", "-2147483648"); CHECK(kI32.get() == INT32_MIN);
+    // UTF-8 values and names round-trip through the (UTF-16 on Windows) environment
+    put("FORGE_TST2_NAME", "caf\xc3\xa9 \xe2\x9c\x93"); CHECK(kName.is_set()); CHECK(kName.get() == "caf\xc3\xa9 \xe2\x9c\x93");
+    CHECK(S::get_raw("FORGE_TST2_NAME").value_or("") == "caf\xc3\xa9 \xe2\x9c\x93");
+    put("FORGE_TST2_\xc3\x9c" "BER", "1"); auto u = S::undocumented("FORGE_TST2_"); CHECK(u.size() == 1 && u[0] == "FORGE_TST2_\xc3\x9c" "BER");
+    for (auto* k : {"FORGE_TST2_INT", "FORGE_TST2_I32", "FORGE_TST2_NAME", "FORGE_TST2_\xc3\x9c" "BER"}) put(k, nullptr);
+    CHECK(!kName.is_set()); CHECK(S::undocumented("FORGE_TST2_").empty());
+}

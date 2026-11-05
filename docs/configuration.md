@@ -120,7 +120,7 @@ Read by `rpc:host:port` devices and `forge::remote` (see [rpc.md](rpc.md)).
 |----------|--------|
 | `FORGE_AIO=threads` | Force the thread-pool backend for async file I/O instead of io_uring, IOCP or kqueue |
 | `FORGE_KEYSTORE=file` | Force the file keystore |
-| `FORGE_KEYSTORE_DIR` | File keystore directory (default `$XDG_DATA_HOME/forge/keys`, `%LOCALAPPDATA%\forge\keys` on Windows) |
+| `FORGE_KEYSTORE_DIR` | File keystore directory (default `$XDG_DATA_HOME/forge/keys`, `%LOCALAPPDATA%\forge\keys` on Windows; required on Android) |
 | `FORGE_MOBILE_TRACE` | Replay a JSON trace file instead of opening the real device in `os::mobile` |
 | `FORGE_MOBILE_SYSFS`, `FORGE_MOBILE_INPUT` | Linux `os::mobile`: roots used instead of `/sys` and `/dev/input` |
 | `NOTIFY_SOCKET`, `WATCHDOG_USEC`, `INVOCATION_ID`, `JOURNAL_STREAM` | Standard systemd variables, used by `os::service` |

@@ -3,6 +3,7 @@
 // FORGE_OS_EXT_CHILD=<mode> and are dispatched from a static initializer before the test runner starts.
 #include "check.hpp"
 #include <forge/os/all.hpp>
+#include <forge/os/oserror.hpp>
 #include <atomic>
 using namespace forge;
 
@@ -12,6 +13,27 @@ static void skip(const char* what, const std::string& why) { std::printf("  skip
 // ---------------------------------------------------------------- child modes
 static int child_main(const std::string& mode) {
     auto arg = mode.substr(mode.find(':') == std::string::npos ? mode.size() : mode.find(':') + 1);
+    if (mode.rfind("crash_chain", 0) == 0) {   // a handler installed first must still run (exit 42) after the report
+#if defined(_WIN32)
+        SetUnhandledExceptionFilter([](EXCEPTION_POINTERS*) -> LONG { ExitProcess(42); });
+#else
+        struct sigaction sa{}; sa.sa_handler = [](int) { ::_exit(42); }; sigemptyset(&sa.sa_mask); ::sigaction(SIGSEGV, &sa, nullptr);
+#endif
+        os::crash_handler::config c; c.dir = arg; c.app = "osx"; if (!os::crash_handler::install(c)) return 2;
+        volatile int* p = nullptr; *p = 42; return 3;
+    }
+    if (mode.rfind("crash_default", 0) == 0) {   // no dir: the private per-user directory
+        os::crash_handler::config c; c.app = arg; if (!os::crash_handler::install(c)) return 2;
+        volatile int* p = nullptr; *p = 42; return 3;
+    }
+    if (mode.rfind("abort", 0) == 0) {
+        os::crash_handler::config c; c.dir = arg; c.app = "osx"; if (!os::crash_handler::install(c)) return 2;
+        std::abort();
+    }
+#if defined(_WIN32)
+    if (mode == "argv")   // run_sandboxed quoting: exactly these arguments
+        return __argc == 4 && std::string(__argv[1]) == "a \"b\" c\\" && std::string(__argv[2]).empty() && std::string(__argv[3]) == "x\\\"y" ? 0 : 5;
+#endif
     if (mode.rfind("crash", 0) == 0) {
         os::crash_handler::config c; c.dir = arg; c.app = "osx"; if (!os::crash_handler::install(c)) return 2;
         volatile int* p = nullptr; *p = 42; return 3;
@@ -19,6 +41,11 @@ static int child_main(const std::string& mode) {
     if (mode.rfind("shm", 0) == 0) {
         auto s = os::shared_memory::open(arg); if (!s) return 2;
         std::memcpy(s->data() + 64, "child-was-here", 15); return 0;
+    }
+    if (mode.rfind("ks:", 0) == 0) {   // keystore store-key creation race: wait for the go file, then put + get
+        auto d = os::getenv("FORGE_KEYSTORE_DIR"); for (int i = 0; i < 1000 && !os::exists(os::join(d, "go")); ++i) os::sleep_ns(5000000);
+        if (auto p = os::keystore::put("race", arg, "v" + arg); !p) { std::printf("put: %s\n", p.err.what.c_str()); return 2; }
+        auto g = os::keystore::get("race", arg); if (!g) std::printf("get: %s\n", g.err.what.c_str()); return g && g.value == "v" + arg ? 0 : 3;
     }
     os::sandbox_policy p;
     if (mode == "noop") return 0;
@@ -58,21 +85,37 @@ static int run_child(const std::string& mode) {
 // ---------------------------------------------------------------- 1 NUMA
 TEST(numa) {
     auto ns = os::numa_nodes(); CHECK(!ns.empty());
-    for (auto& n : ns) std::printf("  node %u: %zu cpus, %llu MiB\n", n.id, n.cpus.size(), (unsigned long long)(n.total_bytes >> 20));
+    for (auto& n : ns) std::printf("  node %u: %zu cpus, %llu MiB, %llu MiB free\n", n.id, n.cpus.size(), (unsigned long long)(n.total_bytes >> 20), (unsigned long long)(n.free_bytes >> 20));
     CHECK(!ns[0].cpus.empty());
     auto a = os::numa_alloc(1 << 20, ns[0].id); CHECK(a);
-    if (a) { std::memset(a.value, 7, 1 << 20); int nd = os::numa_node_of_address(a.value); CHECK(nd == -1 || nd == int(ns[0].id)); os::numa_free(a.value, 1 << 20); }
+    if (a) {
+        std::memset(a.value, 7, 1 << 20); int nd = os::numa_node_of_address(a.value); std::printf("  numa_alloc(node %u) -> page on node %d\n", ns[0].id, nd);
+#if defined(_WIN32)
+        CHECK(nd >= 0 && nd < int(ns.size() + 64));   // VirtualAllocExNuma's node is a preference: a short node spills to another
+#else
+        CHECK(nd == -1 || nd == int(ns[0].id));
+#endif
+        os::numa_free(a.value, 1 << 20);
+    }
     std::thread t([&] { CHECK(os::bind_thread_to_node(ns[0].id)); int c = os::current_numa_node(); CHECK(c == -1 || c == int(ns[0].id)); }); t.join();
     CHECK(!os::bind_thread_to_node(9999));
+    int cpu = os::current_cpu();   // numbered like cpu_topology (Windows: group * 64 + number)
+    if (cpu >= 0) { bool known = false; for (auto& c : os::cpu_topology_query().cpus) known |= int(c.id) == cpu; CHECK_MSG(known, "current_cpu %d not in the topology", cpu); }
+#if defined(__linux__) || defined(_WIN32) || defined(__FreeBSD__)
+    CHECK(cpu >= 0);
+#endif
 }
 // ---------------------------------------------------------------- 2 huge pages
 TEST(huge_pages) {
     auto sz = os::huge_page_sizes(); std::printf("  sizes:"); for (auto s : sz) std::printf(" %s", os::detail::format_size(s).c_str()); std::printf(" thp=%d\n", int(os::thp_enabled()));
     auto r = os::huge_alloc(3 << 20, os::page_kind::huge_2m); CHECK(r); CHECK(r->size >= (3u << 20));
     if (r) { std::printf("  2M request -> %s\n", os::page_kind_name(r->kind)); std::memset(r->ptr, 1, r->size); os::huge_free(r.value); CHECK(!r->ptr); }
-    auto g = os::huge_alloc(1 << 20, os::page_kind::huge_1g, false);   // strict: may legitimately fail
+    auto g = os::huge_alloc(1 << 20, os::page_kind::huge_1g, false);   // strict: may legitimately fail, never degrades
     std::printf("  strict 1G -> %s\n", g ? os::page_kind_name(g->kind) : g.err.what.c_str());
-    if (g) os::huge_free(g.value);
+    if (g) { CHECK(g->kind == os::page_kind::huge_1g); std::memset(g->ptr, 1, 1 << 20); os::huge_free(g.value); }
+    auto s2 = os::huge_alloc(3 << 20, os::page_kind::huge_2m, false);
+    std::printf("  strict 2M -> %s\n", s2 ? os::page_kind_name(s2->kind) : s2.err.what.c_str());
+    if (s2) { CHECK(s2->kind == os::page_kind::huge_2m); CHECK(s2->size >= (3u << 20)); std::memset(s2->ptr, 2, s2->size); os::huge_free(s2.value); }
     auto m = os::mapping::anonymous(4 << 20); CHECK(m);
     auto a = os::advise_huge(m->data(), m->size()); if (!a) std::printf("  advise_huge: %s\n", a.err.what.c_str());
 }
@@ -93,6 +136,12 @@ static void aio_roundtrip(os::async_file_io& io, const std::string& path) {
 TEST(async_file_io) {
     auto d = scratch("aio");
     { os::async_file_io io; std::printf("  backend %s\n", io.backend_name()); aio_roundtrip(io, os::join(d, "a.bin")); }
+    {   // a failing request completes with its own user value and a negative result; nothing stays in flight
+        os::async_file_io io; auto f = os::file::open(os::join(d, "a.bin"), os::wr); CHECK(f); char b[16];
+        auto st = io.read(f.value, b, sizeof b, 0, 4242);
+        if (st) { auto c = io.wait(1, 5000); CHECK(c.size() == 1); if (!c.empty()) { CHECK(c[0].user == 4242); CHECK(c[0].result < 0); } }
+        CHECK(io.in_flight() == 0); io.forget(f.value);
+    }
     os::setenv("FORGE_AIO", "threads");
     { os::async_file_io io; CHECK(io.backend() == os::aio_backend::threads); aio_roundtrip(io, os::join(d, "b.bin")); }
     os::unsetenv("FORGE_AIO"); os::remove_all(d);
@@ -120,6 +169,9 @@ TEST(cpu_topology) {
 #endif
     }); th2.join();
     CHECK(!os::pin_thread_to({}));
+    std::thread th3([] {   // ids past CPU_SETSIZE / any processor group: an error, never a stack overwrite
+        CHECK(!os::pin_thread_to({5000})); CHECK(!os::pin_thread_to({1u << 20}));
+    }); th3.join();
     CHECK(os::detail::parse_cpulist("0-2,5,7-8") == (std::vector<unsigned>{0, 1, 2, 5, 7, 8}));
 }
 // ---------------------------------------------------------------- 5 power / thermal
@@ -145,7 +197,14 @@ TEST(memory_pressure) {
     os::memory_pressure::on_trim_memory(5); CHECK(last == int(os::pressure_level::moderate));
     os::memory_pressure::on_trim_memory(20); CHECK(last == int(os::pressure_level::normal));
     mp.unsubscribe(id); int s1 = seen; mp.notify(os::pressure_level::critical); CHECK(seen == s1);
-    mp.stop();
+    CHECK(mp.monitoring());
+    mp.stop(); CHECK(!mp.monitoring());
+    // A second subscription after stop() gets a live monitor again (the wake byte of the first stop is gone).
+    for (int round = 0; round < 3; ++round) {
+        int id2 = mp.subscribe([](os::pressure_level) {}); os::sleep_ns(100000000);
+        CHECK_MSG(mp.monitoring(), "monitor dead after restart %d (source %s)", round, mp.source().c_str());
+        mp.unsubscribe(id2); mp.stop(); CHECK(!mp.monitoring());
+    }
 }
 // ---------------------------------------------------------------- 7 shared memory
 TEST(shared_memory) {
@@ -158,7 +217,17 @@ TEST(shared_memory) {
     int rc = run_child("shm:" + name); CHECK(rc == 0);
     CHECK(std::string(reinterpret_cast<char*>(a->data() + 64)) == "child-was-here");
 #endif
+    CHECK(!os::shared_memory::create(name, 1 << 16));   // taken: never silently reopened / truncated
     a->close(); CHECK(!os::shared_memory::open("osx-missing-" + std::to_string(os::pid())));
+    CHECK(!os::shared_memory::create("osx-zero-" + std::to_string(os::pid()), 0));
+    // Long names that share a prefix stay distinct (Apple truncated them to 26 chars before).
+    std::string base = "osx-long-name-shared-prefix-" + std::to_string(os::pid()) + "-abcdefghijklmnop-";
+    auto x = os::shared_memory::create(base + "one", 4096), y = os::shared_memory::create(base + "two", 4096);
+    CHECK_MSG(x && y, "%s %s", x.err.what.c_str(), y.err.what.c_str());
+    if (x && y) { x->data()[0] = 1; y->data()[0] = 2; CHECK(x->data()[0] == 1); }
+#if defined(__APPLE__)
+    CHECK(os::shared_memory::os_name(base + "one").size() <= 31); CHECK(os::shared_memory::os_name(base + "one") != os::shared_memory::os_name(base + "two"));
+#endif
 }
 // ---------------------------------------------------------------- 8 GPU discovery
 TEST(gpu_discovery) {
@@ -167,6 +236,16 @@ TEST(gpu_discovery) {
                                   (unsigned long long)(d.dedicated_memory >> 20), d.integrated ? " (integrated)" : "");
     if (g.empty()) std::printf("  no GPUs visible\n");
     for (auto& d : g) CHECK(!d.name.empty());
+#if defined(_WIN32)
+    for (auto& d : g) {   // DXCore answers integrated/discrete for every hardware adapter on Windows 10 2004+
+        unsigned long hi = 0, lo = 0; if (std::sscanf(d.bus.c_str(), "luid:%8lx%8lx", &hi, &lo) != 2) continue;
+        LUID l{}; l.HighPart = LONG(hi); l.LowPart = DWORD(lo);
+        int v = os::detail::dxcore_is_integrated(l); std::printf("  %s: dxcore integrated=%d\n", d.name.c_str(), v);
+        CHECK(v == -1 || v == int(d.integrated));
+    }
+#endif
+    CHECK(!os::intel_discrete_id(0x9a49)); CHECK(os::intel_discrete_id(0x56a0)); CHECK(os::intel_discrete_id(0xe20b));   // Iris Xe (TGL) / Arc A770 / Arc B580
+    CHECK(os::gpu_integrated_guess(0x8086, 0x9a49, 0, 2, 0)); CHECK(!os::gpu_integrated_guess(0x8086, 0x56a0, 3, 0, 0)); CHECK(!os::gpu_integrated_guess(0x10de, 0x2204, 1, 0, 0));
     CHECK(std::string(os::gpu_vendor_name(0x10de)) == "NVIDIA");
 }
 // ---------------------------------------------------------------- 9 local IPC
@@ -178,11 +257,44 @@ TEST(local_ipc) {
         CHECK(c->write_all("ping", 4)); char b[5] = {}; CHECK(c->read_exact(b, 4)); CHECK(std::string(b) == "pong");
     });
     auto s = l->accept(5000); CHECK_MSG(s, "%s", s.err.what.c_str());
-    if (s) { char b[5] = {}; CHECK(s->read_exact(b, 4)); CHECK(std::string(b) == "ping"); CHECK(s->write_all("pong", 4)); }
+    if (s) {
+        char b[5] = {}; CHECK(s->read_exact(b, 4)); CHECK(std::string(b) == "ping"); CHECK(s->write_all("pong", 4));
+        auto pc = s->peer(); CHECK_MSG(pc, "%s", pc.err.what.c_str());
+        if (pc) {
+            std::printf("  peer pid=%lld uid=%lld sid=%s\n", (long long)pc->pid, (long long)pc->uid, pc->sid.c_str());
+#if defined(_WIN32)
+            CHECK(pc->pid == std::int64_t(os::pid())); CHECK(pc->sid.rfind("S-1-", 0) == 0);
+#else
+            CHECK(pc->uid == std::int64_t(::getuid()));
+#if defined(__linux__) || defined(__APPLE__)
+            CHECK(pc->pid == std::int64_t(os::pid()));
+#endif
+#endif
+        }
+    }
     cl.join();
-    auto t = l->accept(50); CHECK(!t);   // timeout
+    // Repeated timeouts (Windows: each cancels an overlapped ConnectNamedPipe whose OVERLAPPED is on the stack),
+    // then a real client still gets through.
+    for (int i = 0; i < 5; ++i) { auto t = l->accept(20); CHECK(!t); if (!t) CHECK(os::classify(t.err) == os::os_errc::timed_out); }
+    std::thread cl2([&] { auto c = os::local_stream::connect(ep); CHECK(c); if (c) CHECK(c->write_all("x", 1)); });
+    { auto s2 = l->accept(5000); CHECK_MSG(s2, "%s", s2.err.what.c_str()); char b = 0; if (s2) { CHECK(s2->read_exact(&b, 1)); CHECK(b == 'x'); } }
+    cl2.join();
 #if defined(__linux__)
     auto ab = os::local_listener::listen("@forge-osx-" + std::to_string(os::pid())); CHECK(ab);
+#endif
+#if defined(FORGE_OS_POSIX)
+    {   // listen() on a path holding a regular file fails and leaves the file alone
+        auto d = scratch("ipc"); auto f = os::join(d, "not-a-socket"); CHECK(os::write_file(f, "keep me"));
+        auto bad = os::local_listener::listen(f); CHECK(!bad);
+        CHECK(os::read_file(f).value == "keep me");
+        // a stale socket from a dead listener is replaced
+        auto sp = os::join(d, "s.sock");
+        { sockaddr_un a{}; socklen_t len = 0; CHECK(!os::local_stream::addr_(sp, a, len)); int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+          CHECK(fd >= 0 && ::bind(fd, reinterpret_cast<sockaddr*>(&a), len) == 0); ::close(fd); }   // left behind, as by a crash
+        auto l2 = os::local_listener::listen(sp); CHECK_MSG(l2, "%s", l2.err.what.c_str());
+        if (l2) { l2->close(); CHECK(!os::exists(sp)); }
+        os::remove_all(d);
+    }
 #endif
 }
 // ---------------------------------------------------------------- 10 crash handling
@@ -232,21 +344,129 @@ TEST(sandboxing) {
     os::remove_all(d);
 #endif
 }
+// run_sandboxed on every desktop platform: exit codes pass through (FreeBSD: capability mode + fexecve of the
+// run-time linker, which used to exit 127), writes are refused under deny_fs_write, arguments arrive intact.
+TEST(run_sandboxed_child) {
+#if defined(_WIN32)
+    os::sandbox_policy x; x.deny_exec = true;
+    auto r = os::run_sandboxed({"cmd", "/d", "/c", "exit 3"}, x); CHECK_MSG(r, "%s", r.err.what.c_str()); if (r) CHECK(r.value == 3);
+    // exec denied: the nested cmd cannot start (ActiveProcessLimit 1)
+    auto n = os::run_sandboxed({"cmd", "/d", "/c", "cmd /d /c exit 0 || exit 9"}, x); CHECK(n); if (n) CHECK(n.value == 9);
+    // quoting goes through the spawn_wait command-line builder: quotes, spaces, trailing backslash, empty
+    os::setenv("FORGE_OS_EXT_CHILD", "argv");
+    auto a = os::run_sandboxed({os::exe_path(), "a \"b\" c\\", "", "x\\\"y"}, x);
+    os::unsetenv("FORGE_OS_EXT_CHILD");
+    CHECK_MSG(a, "%s", a.err.what.c_str()); if (a) CHECK_MSG(a.value == 0, "argv child rc=%d", a.value);
+    os::sandbox_policy net; net.deny_network = true;   // AppContainer: may be unavailable (e.g. some CI images)
+    auto c = os::run_sandboxed({"cmd", "/d", "/c", "exit 4"}, net);
+    if (!c) skip("AppContainer run_sandboxed", c.err.what); else CHECK(c.value == 4);
+    CHECK(!os::run_sandboxed({"no-such-forge-cmd-xyz"}, x));
+#elif !defined(__APPLE__) || !TARGET_OS_IPHONE
+    os::sandbox_policy none, net, w, x; net.deny_network = true; w.deny_fs_write = true; x.deny_exec = true;
+    auto r0 = os::run_sandboxed({"sh", "-c", "exit 5"}, none); CHECK(r0); if (r0) CHECK(r0.value == 5);
+    auto r = os::run_sandboxed({"sh", "-c", "exit 3"}, net); CHECK_MSG(r, "%s", r.err.what.c_str()); if (r) CHECK_MSG(r.value == 3, "rc=%d", r.value);
+    auto d = scratch("rsb"); std::string f = os::join(d, "w.txt");
+    auto rw = os::run_sandboxed({"sh", "-c", "echo x > " + f}, w); CHECK(rw); if (rw) CHECK(rw.value != 0);
+    CHECK(!os::read_file(f));
+    auto ok = os::run_sandboxed({"sh", "-c", "echo x > " + f}, none); CHECK(ok); if (ok) CHECK(ok.value == 0);
+    CHECK(os::read_file(f));
+    auto rx = os::run_sandboxed({"sh", "-c", "exit 7"}, x); CHECK(rx); if (rx) CHECK(rx.value == 7);
+#if defined(__FreeBSD__)
+    auto ex = os::run_sandboxed({"sh", "-c", "/bin/echo hi"}, x); CHECK(ex); if (ex) CHECK(ex.value != 0);   // capability mode: no exec by path
+#endif
+    CHECK(!os::run_sandboxed({"no-such-forge-cmd-xyz"}, net));
+    os::remove_all(d);
+#endif
+}
+// The crash handler chains to a handler installed before it (after writing its report), reports abort(), and
+// by default writes into a private per-user directory.
+TEST(crash_handler_chain_abort_private_dir) {
+#if !defined(__APPLE__) || !TARGET_OS_IPHONE
+    auto find_report = [](const std::string& dir, const std::string& prefix, const char* needle) {
+        auto l = os::list_dir(dir); bool found = false;
+        if (l) for (auto& e : l.value)
+            if (e.name.rfind(prefix, 0) == 0 && e.name.size() > 6 && e.name.substr(e.name.size() - 6) == ".crash") {
+                auto t = os::read_file(os::join(dir, e.name));
+                if (t && t->find(needle) != std::string::npos && t->find("backtrace") != std::string::npos) found = true;
+            }
+        return found;
+    };
+    auto d = scratch("crashc");
+    int rc = run_child("crash_chain:" + d); CHECK_MSG(rc == 42, "rc=%d", rc);
+    CHECK(find_report(d, "osx-", "pid "));
+    auto d2 = scratch("crasha");
+    rc = run_child("abort:" + d2); CHECK(rc != 0);
+    CHECK(find_report(d2, "osx-", "abort") || find_report(d2, "osx-", "SIGABRT"));
+    os::remove_all(d); os::remove_all(d2);
+#if !defined(_WIN32)
+    const std::string app = "osxd" + std::to_string(os::pid());
+    rc = run_child("crash_default:" + app); CHECK(rc != 0);
+    const std::string pd = os::join(os::temp_dir(), "forge-crash-" + std::to_string(::geteuid()));
+    struct stat sb{}; CHECK(::lstat(pd.c_str(), &sb) == 0); CHECK(S_ISDIR(sb.st_mode)); CHECK((sb.st_mode & 077) == 0);
+    CHECK(find_report(pd, app + "-", "SIGSEGV"));
+    if (auto l = os::list_dir(pd)) for (auto& e : l.value) if (e.name.rfind(app, 0) == 0) std::remove(os::join(pd, e.name).c_str());
+#endif
+#endif
+}
 // ---------------------------------------------------------------- 12 secure key storage
 TEST(key_storage) {
     auto d = scratch("keys"); os::setenv("FORGE_KEYSTORE_DIR", d);
     std::printf("  default backend %s\n", os::keystore::backend().c_str());
     std::string svc = "forge-test-" + std::to_string(os::pid()), secret = std::string("s3cr\0et\xff", 8);
-    auto p = os::keystore::put(svc, "alice", secret);
-    if (p) { auto g = os::keystore::get(svc, "alice"); CHECK(g); CHECK(g.value == secret); CHECK(os::keystore::remove(svc, "alice")); CHECK(!os::keystore::get(svc, "alice")); }
-    else skip("default keystore", p.err.what);
+    // The platform backend must work: a failing put is a test failure, not a skip.
+    auto p = os::keystore::put(svc, "alice", secret); CHECK_MSG(p, "default keystore put: %s", p.err.what.c_str());
+    { auto g = os::keystore::get(svc, "alice"); CHECK(g); CHECK(g.value == secret); CHECK(os::keystore::remove(svc, "alice")); CHECK(!os::keystore::get(svc, "alice")); CHECK(os::keystore::remove(svc, "alice")); }
     os::setenv("FORGE_KEYSTORE", "file"); CHECK(os::keystore::backend() == "file");
-    CHECK(os::keystore::put(svc, "bob", secret)); CHECK(os::keystore::put(svc, "bob", "v2"));
-    auto g = os::keystore::get(svc, "bob"); CHECK(g && g.value == "v2");
-    auto raw = os::list_dir(d); bool plain = false;
-    if (raw) for (auto& e : raw.value) { auto t = os::read_file(os::join(d, e.name)); if (t && t->find("v2") != std::string::npos && e.name != ".pad") plain = true; }
-    CHECK(!plain);
-    CHECK(os::keystore::remove(svc, "bob")); CHECK(!os::keystore::get(svc, "bob"));
+    CHECK(os::keystore::put(svc, "bob", secret)); CHECK(os::keystore::put(svc, "bob", "v2-plaintext-marker"));
+    auto g = os::keystore::get(svc, "bob"); CHECK(g && g.value == "v2-plaintext-marker");
+    CHECK(os::keystore::put(svc, "carol", secret)); CHECK(os::keystore::get(svc, "carol").value == secret);
+    auto fnv = [&](const std::string& s, const std::string& a) { std::uint64_t h = 1469598103934665603ull; for (char c : s + '\x1f' + a) { h ^= std::uint8_t(c); h *= 1099511628211ull; }
+        char b[24]; std::snprintf(b, sizeof b, "%016llx.key", (unsigned long long)h); return os::join(d, b); };
+    auto raw = os::list_dir(d); bool plain = false, tmp_left = false;
+    if (raw) for (auto& e : raw.value) { auto t = os::read_file(os::join(d, e.name)); plain |= t && t->find("plaintext-marker") != std::string::npos; tmp_left |= e.name.find(".tmp") != std::string::npos; }
+    CHECK(!plain); CHECK(!tmp_left); CHECK(os::exists(os::join(d, ".master")));
+#if defined(FORGE_OS_POSIX)
+    { struct stat st{}; CHECK(::stat(os::join(d, ".master").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600); CHECK(::stat(fnv(svc, "bob").c_str(), &st) == 0 && (st.st_mode & 0777) == 0600); }
+#endif
+    {   // tamper: any flipped byte (header, nonce, tag or ciphertext) fails authentication
+        auto f = fnv(svc, "bob"); auto orig = os::read_file(f); CHECK(orig && orig->size() > 44);
+        for (std::size_t i : {std::size_t(5), std::size_t(30), orig->size() - 1}) { auto t = *orig; t[i] = char(t[i] ^ 1); CHECK(os::write_file(f, t)); auto r = os::keystore::get(svc, "bob"); CHECK(!r); CHECK(r.err.code != 2); }
+        CHECK(os::write_file(f, orig->substr(0, 40))); CHECK(!os::keystore::get(svc, "bob"));
+        CHECK(os::write_file(f, os::read_file(fnv(svc, "carol")).value)); CHECK(!os::keystore::get(svc, "bob"));   // swapped entries: AD binds (service, account)
+        CHECK(os::write_file(f, *orig)); CHECK(os::keystore::get(svc, "bob").value == "v2-plaintext-marker");
+    }
+    {   // old XOR-pad format: read once, migrated to the encrypted format, pad removed when no old file remains
+        std::string pad(64, '\0'); for (int i = 0; i < 64; ++i) pad[std::size_t(i)] = char(i * 37 + 11);
+        CHECK(os::write_file(os::join(d, ".pad"), pad));
+        std::string old = std::string("legacy\0sec", 10); for (std::size_t i = 0; i < old.size(); ++i) old[i] = char(old[i] ^ pad[i % 64]);
+        CHECK(os::write_file(fnv(svc, "old1"), old)); CHECK(os::write_file(fnv(svc, "old2"), old));
+        auto r = os::keystore::get(svc, "old1"); CHECK(r && r.value == std::string("legacy\0sec", 10));
+        CHECK(os::read_file(fnv(svc, "old1"))->rfind("FKS1", 0) == 0); CHECK(os::exists(os::join(d, ".pad")));   // old2 still needs it
+        r = os::keystore::get(svc, "old2"); CHECK(r && r.value == std::string("legacy\0sec", 10)); CHECK(!os::exists(os::join(d, ".pad")));
+        CHECK(os::keystore::get(svc, "old1").value == std::string("legacy\0sec", 10));
+        CHECK(os::keystore::remove(svc, "old1")); CHECK(os::keystore::remove(svc, "old2"));
+    }
+    {   // replaced store key: existing secrets fail loudly instead of decoding to garbage
+        auto mk = os::read_file(os::join(d, ".master")).value; auto bad = mk; bad.back() = char(bad.back() ^ 1);
+        CHECK(os::write_file(os::join(d, ".master"), bad)); CHECK(!os::keystore::get(svc, "bob"));
+        CHECK(os::write_file(os::join(d, ".master"), mk)); CHECK(os::keystore::get(svc, "bob"));
+    }
+    CHECK(os::keystore::remove(svc, "bob")); CHECK(!os::keystore::get(svc, "bob")); CHECK(os::keystore::remove(svc, "carol"));
+#if !defined(FORGE_OS_IOS)
+    {   // several processes create the store key at once: all must end up with the same key
+        auto rd = scratch("keys_race"); std::vector<os::child> kids;
+        for (int i = 0; i < 6; ++i) {
+            os::spawn_spec sp; sp.argv = {os::exe_path()}; sp.capture_stdout = sp.capture_stderr = false;
+            sp.env_set = {{"FORGE_OS_EXT_CHILD", "ks:" + std::to_string(i)}, {"FORGE_KEYSTORE", "file"}, {"FORGE_KEYSTORE_DIR", rd}};
+            auto c = os::child::start(sp); CHECK(c); if (c) kids.push_back(std::move(c.value));
+        }
+        os::sleep_ns(100000000); CHECK(os::write_file(os::join(rd, "go"), "1"));
+        for (auto& k : kids) CHECK(k.wait(60000) == 0);
+        os::setenv("FORGE_KEYSTORE_DIR", rd);
+        for (int i = 0; i < 6; ++i) { auto r = os::keystore::get("race", std::to_string(i)); CHECK_MSG(r && r.value == "v" + std::to_string(i), "race %d: %s", i, r.err.what.c_str()); }
+        os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(rd);
+    }
+#endif
     os::unsetenv("FORGE_KEYSTORE");
     std::map<std::string, std::string> mem;
     os::keystore::set_backend({"mem", [&](auto& s, auto& a, auto& v) { mem[s + "/" + a] = v; return os::status{}; },
@@ -298,7 +518,7 @@ TEST(timers_and_perf) {
     if (!o) { skip("hw counters", o.err.what); o = pc.open({os::perf_event::cycles}); }
     if (o) {
         pc.start(); for (int i = 0; i < 1000000; ++i) x = x * 1.0000001 + 1e-9; auto r = pc.stop();
-        for (auto& v : r) std::printf("  [%s] %s = %llu%s\n", pc.backend(), os::perf_event_name(v.event), (unsigned long long)v.value, v.valid ? "" : " (invalid)");
+        for (auto& v : r) std::printf("  [%s] %s = %llu%s%s\n", pc.backend(), os::perf_event_name(v.event), (unsigned long long)v.value, v.valid ? "" : " (invalid)", v.scaled ? " (scaled)" : "");
         CHECK(!r.empty() && r[0].valid && r[0].value > 0);
     } else skip("cycle counter", o.err.what);
 }
@@ -306,7 +526,19 @@ TEST(timers_and_perf) {
 TEST(background_execution) {
     auto t = os::background::begin("forge-test");
     if (!t) { skip("background", t.err.what); CHECK(os::is_unsupported(t.err)); }
-    else { std::printf("  kind %s\n", os::background::kind(t.value).c_str()); CHECK(os::background::active() == 1); CHECK(os::background::end(t.value)); CHECK(os::background::active() == 0); CHECK(!os::background::end(t.value)); }
+    else {
+        auto k = os::background::kind(t.value); std::printf("  kind %s\n", k.c_str());
+#if defined(_WIN32)
+        CHECK(k == "power-request");
+#elif defined(FORGE_OS_LINUX)
+        CHECK(k == "logind-inhibit" || k == "not_required");
+#endif
+        CHECK(os::background::active() == 1);
+        auto t2 = os::background::begin("forge-test-2"); CHECK(t2); CHECK(os::background::active() == 2);
+        std::thread other([&] { CHECK(os::background::end(t.value)); });   // tokens are per process, not per thread
+        other.join(); CHECK(os::background::active() == 1); CHECK(!os::background::end(t.value));
+        if (t2) CHECK(os::background::end(t2.value)); CHECK(os::background::active() == 0);
+    }
     bool began = false, ended = false;
     os::background::set_hooks({[&](auto&, auto&, auto&) { began = true; return true; }, [&](auto&) { ended = true; }});
 #if defined(__ANDROID__)
@@ -332,6 +564,13 @@ TEST(service_integration) {
 #endif
     auto l = os::service::log(os::log_level::info, "forge test_os_ext service log line");
     if (!l) skip("service log", l.err.what);
+#if !defined(_WIN32)
+    {   // concurrent idents: openlog must never see a freed ident string
+        std::vector<std::thread> ts; std::atomic<int> bad{0};
+        for (int t = 0; t < 4; ++t) ts.emplace_back([t, &bad] { for (int i = 0; i < 25; ++i) if (!os::service::log(os::log_level::debug, "forge concurrent log", "forge-test-" + std::to_string(t) + "-" + std::to_string(i % 3))) ++bad; });
+        for (auto& t : ts) t.join(); CHECK(bad == 0 || !l);
+    }
+#endif
     int ran = 0; auto r = os::service::run_as_service("forge-test", [&] { ++ran; return 0; }, [] {});
     CHECK(r); CHECK(ran == 1);
 }

@@ -45,19 +45,19 @@ API: `sandbox_policy { deny_network, deny_exec, deny_fs_write }`, `apply_sandbox
 
 | Platform | `apply_sandbox` (current process) | `run_sandboxed` (child) |
 |---|---|---|
-| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls; `unsupported` on architectures with no audit arch | fork, apply, exec (see note) |
-| FreeBSD | Capsicum `cap_enter()` (all-or-nothing, coarser than asked) | fork, apply, exec |
+| Linux, Android | `no_new_privs` + seccomp-BPF, EPERM for denied syscalls (io_uring, x32 and i386 `socketcall` closed; the `*at` file-write calls and `*setxattr` denied); `unsupported` on architectures with no audit arch | fork, apply, exec (see note) |
+| FreeBSD | Capsicum `cap_enter()` (all-or-nothing, coarser than asked) | fork, open the binary, `cap_enter`, then `fexecve` (static) or `ld-elf.so.1 -f` with `LD_LIBRARY_PATH_FDS` (dynamic; libraries from the system dirs and `/usr/local/lib` only); scripts refused |
 | OpenBSD | `pledge()` | fork, apply, exec |
 | macOS | `sandbox_init` named profiles, found with `dlsym` | fork, apply, exec |
 | iOS | no-op; the app sandbox already applies | unsupported |
-| Windows | exec denial only (job object, one active process); net/fs denial returns `unsupported` | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job |
+| Windows | exec denial only (job object, one active process); net/fs denial returns `unsupported` | AppContainer (net/fs) or restricted token (exec only), in a kill-on-close job; arguments quoted like `spawn_wait` |
 
 On POSIX, `run_sandboxed` applies the network and file-write parts in the child before `execvp`, and drops
 `deny_exec` so the target can start; the target itself may still exec.
 
 Tests: the `sandboxing` case of `tests/test_os_ext.cpp` runs in CI on Linux, macOS, Windows and FreeBSD
 (sub-cases that report `unsupported` skip; FreeBSD skips when Capsicum refuses a partial policy).
-`run_sandboxed` has no test.
+`run_sandboxed` is tested on Linux, FreeBSD and Windows (AppContainer included) in `tests/test_os_process.cpp`. `process_pool` workers that cannot apply a requested sandbox (Windows net/fs) fail instead of running unsandboxed.
 
 ## Native plugins
 
@@ -103,9 +103,20 @@ on Linux, macOS and FreeBSD CI; it skips on Windows CI because its `openssl` CLI
 
 ## Secrets at rest (`os/include/forge/os/keystore.hpp`)
 
-Keychain on Apple, DPAPI on Windows, libsecret on Linux when a session keyring exists, an app-installed backend on
-Android. The fallback is one 0600 file per secret in a 0700 directory, **not encrypted** beyond a per-store XOR
-pad; it only protects against other users. `keystore::backend()` reports which one is in use.
+Keychain on Apple (items `AfterFirstUnlockThisDeviceOnly`, updated in place), DPAPI on Windows, libsecret on Linux
+and FreeBSD when the session bus has a Secret Service provider, an app-installed backend on Android. libsecret
+failures (locked keyring, refused prompt) are returned as errors; the file backend is used only when there is no
+bus or provider, or with `FORGE_KEYSTORE=file`, and `keystore::backend()` reports which one is in use. Android has
+no default directory: the JNI glue sets `FORGE_KEYSTORE_DIR` or installs a backend.
+
+The file backend seals each secret with XChaCha20-Poly1305 (Monocypher) under a random 32-byte store key, with a
+random nonce and the (service, account) pair as associated data, so a modified, truncated or swapped file fails
+`get()` instead of returning garbage. Files are created 0600 from the start (`O_EXCL`, no symlink following) and
+replaced atomically; the store key file `.master` is created exclusively, so concurrent processes agree on one key,
+and is DPAPI-wrapped on Windows. A directory FORGE creates is 0700; an existing `FORGE_KEYSTORE_DIR` keeps its mode.
+The key sits beside the secrets, so this protects against other users and against copies of single files, not
+against code running as the same user. TPM or passphrase key wrapping is planned (os-audit W2-4). Old XOR-pad
+files are re-encrypted on first read and the pad is deleted once none remain.
 
 ## Exceptions
 
@@ -116,12 +127,12 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 
 - RPC: tokens always have full access. Client-certificate identities are not mapped to permissions.
 - Windows: no in-process network or file-write denial; scripts there get only the job object plus the
-  interpreter checks. `run_sandboxed` (AppContainer) is untested.
-- POSIX `run_sandboxed` does not apply `deny_exec` to the target.
+  interpreter checks.
+- POSIX `run_sandboxed` does not apply `deny_exec` to the target (Linux Landlock is planned, `docs/os-audit.md` W2-3).
 - `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
 - Nested non-isolated `sandbox` blocks are interpreter-checked only.
 - Static capability checks miss indirect calls.
-- Keystore file fallback is not encrypted.
+- Keystore file backend: the store key is not wrapped (TPM / passphrase planned), so same-user code can read it.
 - `.fsc` script cache has no tests.
 - `forge-serve --kv-spill` writes KV-cache data (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
   (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is

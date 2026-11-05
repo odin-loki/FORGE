@@ -24,6 +24,28 @@ struct block_device { std::string name, model, vendor, serial; std::uint64_t siz
 struct pci_device { std::string address, vendor_id, device_id, class_id, driver; };
 struct usb_device { std::string path, vendor_id, product_id, manufacturer, product, serial; int bus = 0, devnum = 0; };
 
+// FreeBSD GEOM naming: is `part` a partition of `disk`? The name continues with 'p' (GPT: ada0p1) or 's' (MBR
+// slice: da0s1, da0s1a), then a digit - so ada1 does not claim ada10p1.
+inline bool geom_partition_of(const std::string& disk, const std::string& part) {
+    return part.size() > disk.size() + 1 && part.compare(0, disk.size(), disk) == 0 && (part[disk.size()] == 'p' || part[disk.size()] == 's') &&
+           std::isdigit(static_cast<unsigned char>(part[disk.size() + 1]));
+}
+// Disks and their partitions out of kern.geom.conftxt ("<depth> <class> <name> <mediasize> <sectorsize> ...").
+inline std::vector<block_device> geom_conftxt_disks(const std::string& txt) {
+    std::vector<block_device> out; std::vector<std::string> parts;
+    for (std::size_t p = 0; p < txt.size();) {
+        auto e = txt.find('\n', p); std::string line = txt.substr(p, e == std::string::npos ? std::string::npos : e - p); p = e == std::string::npos ? txt.size() : e + 1;
+        char cls[32] = {}, nm[256] = {}; unsigned long long sz = 0; int depth = 0;
+        if (std::sscanf(line.c_str(), "%d %31s %255s %llu", &depth, cls, nm, &sz) < 3) continue;
+        if (!std::strcmp(cls, "DISK")) { block_device d; d.name = nm; d.size_bytes = sz; out.push_back(std::move(d)); }
+        else if (!std::strcmp(cls, "PART")) parts.push_back(nm);
+    }
+    for (auto& d : out) {
+        for (auto& s : parts) if (geom_partition_of(d.name, s)) d.partitions.push_back(s);
+        std::sort(d.partitions.begin(), d.partitions.end());
+    }
+    return out;
+}
 inline std::string hex_(unsigned v, int digits, bool prefix) { char b[16]; std::snprintf(b, sizeof b, prefix ? "0x%0*x" : "%0*x", digits, v); return b; }
 inline std::string pci_addr_(unsigned dom, unsigned bus, unsigned dev, unsigned fn) { char b[32]; std::snprintf(b, sizeof b, "%04x:%02x:%02x.%x", dom, bus, dev, fn); return b; }
 
@@ -52,7 +74,7 @@ struct setupapi_ {
     BOOL (WINAPI* destroy)(HANDLE) = nullptr;
     static const setupapi_& api() {
         static setupapi_ a = [] {
-            setupapi_ s; HMODULE h = LoadLibraryW(L"setupapi.dll"); if (!h) return s;
+            setupapi_ s; HMODULE h = LoadLibraryExW(L"setupapi.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); if (!h) return s;
             auto f = [&](auto& p, const char* n) { p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(reinterpret_cast<void*>(GetProcAddress(h, n))); };
             f(s.classdevs, "SetupDiGetClassDevsW"); f(s.enum_info, "SetupDiEnumDeviceInfo"); f(s.reg_prop, "SetupDiGetDeviceRegistryPropertyW");
             f(s.instance_id, "SetupDiGetDeviceInstanceIdW"); f(s.dev_prop, "SetupDiGetDevicePropertyW"); f(s.destroy, "SetupDiDestroyDeviceInfoList");
@@ -235,19 +257,10 @@ inline result<std::vector<block_device>> block() {
 #elif defined(FORGE_OS_FREEBSD)
     // conftxt: "<depth> <class> <name> <mediasize> <sectorsize> ..." per geom; confxml adds the DISK descr/ident/rotationrate.
     auto txt = detail::sysctl_str("kern.geom.conftxt"); if (txt.empty()) return {{}, last_error("sysctl kern.geom.conftxt")};
-    std::vector<block_device> out; std::vector<std::string> parts;
-    for (std::size_t p = 0; p < txt.size();) {
-        auto e = txt.find('\n', p); std::string line = txt.substr(p, e == std::string::npos ? std::string::npos : e - p); p = e == std::string::npos ? txt.size() : e + 1;
-        char cls[32] = {}, nm[256] = {}; unsigned long long sz = 0; int depth = 0;
-        if (std::sscanf(line.c_str(), "%d %31s %255s %llu", &depth, cls, nm, &sz) < 3) continue;
-        if (!std::strcmp(cls, "DISK")) { block_device d; d.name = nm; d.size_bytes = sz; out.push_back(std::move(d)); }
-        else if (!std::strcmp(cls, "PART")) parts.push_back(nm);
-    }
+    auto out = geom_conftxt_disks(txt);
     auto xml = detail::sysctl_str("kern.geom.confxml");
     std::string disk; if (auto a = xml.find("<name>DISK</name>"); a != std::string::npos) disk = xml.substr(a, xml.find("<class id=", a) - a);
     for (auto& d : out) {
-        for (auto& s : parts) if (s.size() > d.name.size() && s.rfind(d.name, 0) == 0) d.partitions.push_back(s);
-        std::sort(d.partitions.begin(), d.partitions.end());
         if (auto g = disk.find("<name>" + d.name + "</name>"); g != std::string::npos) {
             auto end = disk.find("<geom id=", g); std::string gx = disk.substr(g, end == std::string::npos ? std::string::npos : end - g);
             d.model = xml_tag_(gx, "descr"); d.serial = xml_tag_(gx, "ident");

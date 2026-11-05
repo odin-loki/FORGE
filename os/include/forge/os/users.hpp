@@ -1,7 +1,7 @@
 #pragma once
 // forge::os users and standard directories: the current user, user lookup by name or id, elevation, and the
-// per-user config / cache / data / state / runtime directories (XDG on Linux/FreeBSD, ~/Library on Apple,
-// Known Folders on Windows). Guide: docs/os-wrapper.md.
+// per-user config / cache / data / state / runtime directories (XDG base dirs and user-dirs.dirs on Linux/FreeBSD,
+// ~/Library on Apple, Known Folders via SHGetKnownFolderPath on Windows, so OneDrive/GPO redirection is followed). Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
 #if defined(FORGE_OS_POSIX)
 #include <grp.h>
@@ -54,17 +54,42 @@ inline std::vector<BYTE> token_sid_(TOKEN_INFORMATION_CLASS c) {
 // Full name, primary group and local groups from netapi32 (loaded at run time, no link library). Filled for
 // local accounts; left empty for domain accounts, whose database lives on a domain controller.
 inline void user_netinfo_(user_info& u) {
-    static HMODULE h = LoadLibraryW(L"netapi32.dll"); if (!h) return;
+    static HMODULE h = LoadLibraryExW(L"netapi32.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/); if (!h) return;
     auto get = reinterpret_cast<decltype(&NetUserGetInfo)>(reinterpret_cast<void*>(GetProcAddress(h, "NetUserGetInfo")));
     auto grp = reinterpret_cast<decltype(&NetUserGetLocalGroups)>(reinterpret_cast<void*>(GetProcAddress(h, "NetUserGetLocalGroups")));
     auto fre = reinterpret_cast<decltype(&NetApiBufferFree)>(reinterpret_cast<void*>(GetProcAddress(h, "NetApiBufferFree")));
     if (!get || !grp || !fre) return;
     std::wstring w = widen(u.name); LPBYTE b = nullptr;
     if (get(nullptr, w.c_str(), 3, &b) == NERR_Success && b) { auto* i = reinterpret_cast<USER_INFO_3*>(b); if (i->usri3_full_name) u.full_name = narrow(i->usri3_full_name); u.gid = long(i->usri3_primary_group_id); }
+    else if (b) { fre(b); b = nullptr; }
+    if (!b && get(nullptr, w.c_str(), 10, &b) == NERR_Success && b) { auto* i = reinterpret_cast<USER_INFO_10*>(b); if (i->usri10_full_name) u.full_name = narrow(i->usri10_full_name); }   // level 10: any caller
     if (b) fre(b);
     b = nullptr; DWORD n = 0, tot = 0;
     if (grp(nullptr, w.c_str(), 0, 0, &b, MAX_PREFERRED_LENGTH, &n, &tot) == NERR_Success && b) { auto* g = reinterpret_cast<LOCALGROUP_USERS_INFO_0*>(b); for (DWORD i = 0; i < n; ++i) u.groups.push_back(narrow(g[i].lgrui0_name)); }
     if (b) fre(b);
+}
+// The process token's groups (enabled and deny-only; not the logon session or integrity label), local and domain.
+inline std::vector<std::string> token_groups_() {
+    std::vector<std::string> out; HANDLE t = nullptr; if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return out;
+    DWORD n = 0; GetTokenInformation(t, TokenGroups, nullptr, 0, &n); std::vector<BYTE> b(n ? n : 1);
+    if (n && GetTokenInformation(t, TokenGroups, b.data(), n, &n)) {
+        auto* g = reinterpret_cast<TOKEN_GROUPS*>(b.data());
+        for (DWORD i = 0; i < g->GroupCount; ++i) {
+            if ((g->Groups[i].Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID) continue;
+            wchar_t nm[256], dom[256]; DWORD nn = 256, dn = 256; SID_NAME_USE use{};
+            if (!LookupAccountSidW(nullptr, g->Groups[i].Sid, nm, &nn, dom, &dn, &use)) continue;
+            if (use != SidTypeGroup && use != SidTypeAlias && use != SidTypeWellKnownGroup) continue;
+            auto s = narrow(nm); bool dup = false; for (auto& x : out) dup |= x == s; if (!dup) out.push_back(s);
+        }
+    }
+    CloseHandle(t); return out;
+}
+// Display name of the logged-on user (domain and Microsoft accounts too; secur32 loaded at run time).
+inline std::string display_name_() {
+    using fn = BOOLEAN(WINAPI*)(int, LPWSTR, PULONG);
+    static HMODULE h = LoadLibraryExW(L"secur32.dll", nullptr, 0x00000800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/);
+    static fn f = h ? reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(h, "GetUserNameExW"))) : nullptr;
+    wchar_t b[512]; ULONG n = 512; return f && f(3 /*NameDisplay*/, b, &n) ? narrow(b) : std::string();
 }
 // The user account a SID names. home comes from the ProfileList registry key (empty if it never logged on).
 inline result<user_info> user_from_sid_(PSID sid, const std::string& what) {
@@ -127,6 +152,9 @@ inline user_info current_user() {
     u.home = home_dir(); u.shell = getenv("COMSPEC");
     if (auto s = token_sid_(TokenUser); !s.empty()) { u.uid = sid_rid_(s.data()); u.sid = sid_string_(s.data()); }
     if (auto g = token_sid_(TokenPrimaryGroup); !g.empty()) u.gid = sid_rid_(g.data());
+    { user_info a; a.name = u.name; user_netinfo_(a); u.full_name = a.full_name; }
+    if (u.full_name.empty()) u.full_name = display_name_();
+    u.groups = token_groups_();
     return u;
 #endif
 }
@@ -143,18 +171,56 @@ inline bool is_elevated() {
 
 // ---------------------------------------------------------------- standard per-user directories
 enum class user_dir { config, cache, data, state, runtime, documents, downloads, desktop };
+#if defined(FORGE_OS_WINDOWS)
+// SHGetKnownFolderPath (shell32/ole32 loaded at run time): follows folder redirection (OneDrive, Group Policy).
+inline std::string known_folder_(const GUID& id) {
+    using get_fn = HRESULT(WINAPI*)(const GUID&, DWORD, HANDLE, PWSTR*); using free_fn = void(WINAPI*)(LPVOID);
+    static HMODULE sh = LoadLibraryExW(L"shell32.dll", nullptr, 0x00000800), ole = LoadLibraryExW(L"ole32.dll", nullptr, 0x00000800);
+    static get_fn get = sh ? reinterpret_cast<get_fn>(reinterpret_cast<void*>(GetProcAddress(sh, "SHGetKnownFolderPath"))) : nullptr;
+    static free_fn fre = ole ? reinterpret_cast<free_fn>(reinterpret_cast<void*>(GetProcAddress(ole, "CoTaskMemFree"))) : nullptr;
+    if (!get || !fre) return {};
+    PWSTR p = nullptr; HRESULT hr = get(id, 0, nullptr, &p);
+    std::string r; if (SUCCEEDED(hr) && p) r = narrow(p); if (p) fre(p); return r;
+}
+#elif !defined(__APPLE__)
+// XDG user directory from user-dirs.dirs (lines like XDG_DESKTOP_DIR="$HOME/Desktop"); "" when not set there.
+inline std::string xdg_user_dir_(const std::string& key, const std::string& home, const std::string& config) {
+    auto f = read_file(config + "/user-dirs.dirs"); if (!f) return {};
+    std::string out; std::size_t i = 0; const std::string& t = f.value;
+    while (i < t.size()) {
+        auto e = t.find('\n', i); std::string line = t.substr(i, e == std::string::npos ? std::string::npos : e - i); i = e == std::string::npos ? t.size() : e + 1;
+        std::size_t k = 0; while (k < line.size() && (line[k] == ' ' || line[k] == '\t')) ++k;
+        if (line.compare(k, key.size() + 2, key + "=\"") != 0) continue;
+        std::string v; bool closed = false;
+        for (std::size_t j = k + key.size() + 2; j < line.size(); ++j) {
+            if (line[j] == '\\' && j + 1 < line.size()) { v += line[++j]; continue; }
+            if (line[j] == '"') { closed = true; break; }
+            v += line[j];
+        }
+        if (!closed) continue;
+        if (v.rfind("$HOME", 0) == 0 && (v.size() == 5 || v[5] == '/')) out = home + v.substr(5);
+        else if (!v.empty() && v[0] == '/') out = v;
+    }
+    return out;
+}
+#endif
 inline std::string user_directory(user_dir d) {
     std::string h = home_dir();
 #if defined(FORGE_OS_WINDOWS)
-    std::string ad = getenv("APPDATA", h + "\\AppData\\Roaming"), lad = getenv("LOCALAPPDATA", h + "\\AppData\\Local");
+    auto kf = [&](const GUID& id, const std::string& dflt) { auto p = known_folder_(id); return p.empty() ? dflt : p; };
+    static const GUID roaming{0x3EB685DB, 0x65F9, 0x4CF6, {0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D}}, local{0xF1B32785, 0x6FBA, 0x4FCF, {0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91}},
+        docs{0xFDD39AD0, 0x238F, 0x46AF, {0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7}}, downloads{0x374DE290, 0x123F, 0x4565, {0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B}},
+        desktop{0xB4BFCC3A, 0xDB2C, 0x424C, {0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41}};
+    auto ad = [&] { return kf(roaming, getenv("APPDATA", h + "\\AppData\\Roaming")); };
+    auto lad = [&] { return kf(local, getenv("LOCALAPPDATA", h + "\\AppData\\Local")); };
     switch (d) {
-        case user_dir::config: case user_dir::data: return ad;
-        case user_dir::cache: return lad + "\\Cache";
-        case user_dir::state: return lad;
+        case user_dir::config: case user_dir::data: return ad();
+        case user_dir::cache: return lad() + "\\Cache";
+        case user_dir::state: return lad();
         case user_dir::runtime: return temp_dir();
-        case user_dir::documents: return h + "\\Documents";
-        case user_dir::downloads: return h + "\\Downloads";
-        case user_dir::desktop: return h + "\\Desktop";
+        case user_dir::documents: return kf(docs, h + "\\Documents");
+        case user_dir::downloads: return kf(downloads, h + "\\Downloads");
+        case user_dir::desktop: return kf(desktop, h + "\\Desktop");
     }
 #elif defined(__APPLE__)
     switch (d) {
@@ -167,15 +233,17 @@ inline std::string user_directory(user_dir d) {
     }
 #else
     auto x = [&](const char* var, const std::string& dflt) { auto v = getenv(var); return v.empty() || v[0] != '/' ? dflt : v; };
+    // user-dirs.dirs (what xdg-user-dir reads), then the environment variable, then the default
+    auto u = [&](const char* var, const std::string& dflt) { auto v = xdg_user_dir_(var, h, x("XDG_CONFIG_HOME", h + "/.config")); return v.empty() ? x(var, dflt) : v; };
     switch (d) {
         case user_dir::config: return x("XDG_CONFIG_HOME", h + "/.config");
         case user_dir::cache: return x("XDG_CACHE_HOME", h + "/.cache");
         case user_dir::data: return x("XDG_DATA_HOME", h + "/.local/share");
         case user_dir::state: return x("XDG_STATE_HOME", h + "/.local/state");
         case user_dir::runtime: return x("XDG_RUNTIME_DIR", temp_dir());
-        case user_dir::documents: return x("XDG_DOCUMENTS_DIR", h + "/Documents");
-        case user_dir::downloads: return x("XDG_DOWNLOAD_DIR", h + "/Downloads");
-        case user_dir::desktop: return x("XDG_DESKTOP_DIR", h + "/Desktop");
+        case user_dir::documents: return u("XDG_DOCUMENTS_DIR", h + "/Documents");
+        case user_dir::downloads: return u("XDG_DOWNLOAD_DIR", h + "/Downloads");
+        case user_dir::desktop: return u("XDG_DESKTOP_DIR", h + "/Desktop");
     }
 #endif
     return h;

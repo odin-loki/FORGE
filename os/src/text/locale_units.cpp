@@ -11,7 +11,7 @@ using namespace detail;
 std::string format_list(std::span<const std::string> items, std::string_view locale, list_type t, list_width w) {
     if (items.empty()) return {};
     if (items.size() == 1) return items[0];
-    auto b = resolve(locale);
+    auto b = resolve(locale, category::numeric);
     std::string type = t == list_type::and_ ? "standard" : t == list_type::or_ ? "or" : "unit";
     if (w == list_width::short_) type += "-short"; else if (w == list_width::narrow) type += "-narrow";
     auto pat = [&](const char* part) {
@@ -46,12 +46,12 @@ std::string strip_category(std::string_view u) {
 }
 }  // namespace
 std::string unit_display_name(std::string_view unit, std::string_view locale, unit_width w) {
-    auto b = resolve(locale); auto u = strip_category(unit);
+    auto b = resolve(locale, category::numeric); auto u = strip_category(unit);
     if (auto v = find(b, std::string("unit/") + widths[int(w)] + "/" + u + "/displayName")) return std::string(*v);
     return u;
 }
 std::string format_unit(double v, std::string_view unit, std::string_view locale, unit_width w, const number_options& o) {
-    auto b = resolve(locale); auto u = strip_category(unit);
+    auto b = resolve(locale, category::numeric); auto u = strip_category(unit);
     auto num = format_number(v, locale, o);
     // Plural category from the visible digits.
     std::string plain; { number_options x = o; x.grouping = false; x.numbering = "latn"; plain = format_number(std::fabs(v), "en", x); plain = replace_all(plain, ",", ""); }
