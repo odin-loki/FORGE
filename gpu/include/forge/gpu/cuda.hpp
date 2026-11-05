@@ -526,7 +526,6 @@ public:
         q81_drop(); if (q81_) free_s(q81_); q81_ = 0; q81_cap_ = 0;
         q81_ = dmalloc(std::max<std::size_t>(need, 1 << 20), "scratch"); q81_cap_ = std::max<std::size_t>(need, 1 << 20);
     }
-    // Decode rms_norm / silu_mul also emit the q8_1 form of their output for the next matmul ($FORGE_FUSE_Q81=0 off).
     // decode matvec: output columns per 128-thread block (1, 2 or 4; the block's warps split between them).
     // $FORGE_MMVQ_CPB forces one for every shape.
     static std::uint32_t mmvq_cpb(std::uint32_t fmt, std::uint32_t k) {
@@ -541,6 +540,7 @@ public:
     static bool mmvq_q8v() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_Q8V"); return !(e && std::string(e) == "0"); }(); return on; }
     // decode matvec weight loads through ld.global.nc.L1::no_allocate ($FORGE_MMVQ_NC=1; measured no faster on a 3090)
     static bool mmvq_nc() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_NC"); return e && std::string(e) == "1"; }(); return on; }
+    // Decode rms_norm / silu_mul also emit the q8_1 form of their output for the next matmul ($FORGE_FUSE_Q81=0 off).
     static bool fuse_q81() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q81"); return !(e && std::string(e) == "0"); }(); return on; }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
         if (x.shape.empty() || !q || fmt < 1 || fmt > 4) return false;
