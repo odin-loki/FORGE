@@ -646,10 +646,12 @@ public:
             u[3] = std::uint32_t(in[2].shape[1]); u[4] = std::uint32_t(in[2].shape[2]); u[5] = a.num("l2norm", 1) != 0;
             if (u[2] > 256u || !u[1] || u[3] % u[1]) return false;
             sc = float(a.num("scale", 1.0 / std::sqrt(double(u[2])))); grid = u[3];
-            // state in registers: a block per (value head, 32 columns), dk = 8 * {8, 16, 32}
-            if ((u[2] == 64 || u[2] == 128 || u[2] == 256) && u[4] % 32 == 0 && !std::getenv("FORGE_DELTA_RULE_OLD")) {
-                std::string rn = "forge_delta_rule_r" + std::to_string(u[2] / 8);
-                if (has_fn_locked(rn)) { kfn = rn; grid = u[3] * (u[4] / 32); block = 256; } }
+            // state in registers, dk = 8 * {8, 16, 32}: by default the staged kernels (a 64-thread block per
+            // (value head, 8 columns)); FORGE_DELTA_RULE_R the earlier ones (a 256-thread block per (head, 32 columns))
+            if ((u[2] == 64 || u[2] == 128 || u[2] == 256) && !std::getenv("FORGE_DELTA_RULE_OLD")) {
+                bool rk = std::getenv("FORGE_DELTA_RULE_R") != nullptr; unsigned cols = rk ? 32u : 8u;
+                std::string rn = std::string(rk ? "forge_delta_rule_r" : "forge_delta_rule_p") + std::to_string(u[2] / 8);
+                if (u[4] % cols == 0 && has_fn_locked(rn)) { kfn = rn; grid = u[3] * (u[4] / cols); block = rk ? 256 : 64; } }
         } else if (fn == "causal_conv" && in.size() == 2) {
             u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[1].shape[1]);
             if (u[2] < 1u || u[2] > 9u) return false;

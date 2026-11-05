@@ -153,7 +153,7 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
-    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32 */ if (!strcmp(op, "causal_conv")) return 7;
+    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32, _p8/16/32 */ if (!strcmp(op, "causal_conv")) return 7;
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13)) return 12; if (!strcmp(op, "attention_dec")) return 13;
     if (!strcmp(op, "attention_comb")) return 5; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
@@ -271,11 +271,11 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < ((cols + 63) / 64) * ((rows + 63) / 64) || bx != 256) return 1;   /* MMQ 64x64-tile launch shape */
         return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
-    if (!strncmp(op, "delta_rule", 10)) {   /* flow/state_ops.hpp delta_rule; delta_rule: a block per value head, _rN: per (head, 32 columns) */
+    if (!strncmp(op, "delta_rule", 10)) {   /* flow/state_ops.hpp delta_rule; delta_rule: a block per value head, _rN: per (head, 32 columns), _pN: per (head, 8 columns) */
         float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *g = P(ARG(3, dptr)), *be = P(ARG(4, dptr)), *S = P(ARG(5, dptr)), *o = P(ARG(6, dptr));
         unsigned s = ARG(7, unsigned), hk = ARG(8, unsigned), dk = ARG(9, unsigned), hv = ARG(10, unsigned), dv = ARG(11, unsigned), l2 = ARG(12, unsigned); float sc = ARG(13, float);
-        unsigned h, t, a, j; int rv = op[10] == '_';
-        if ((!rv && (gx < hv || bx != 128)) || (rv && (gx < hv * (dv / 32u) || bx != 256 || dv % 32u || dk != 8u * (unsigned)atoi(op + 12))) || dk > 256) return 1;
+        unsigned h, t, a, j; int rv = op[10] == '_'; unsigned cols = rv && op[11] == 'p' ? 8u : 32u, nb = cols == 8u ? 64u : 256u;
+        if ((!rv && (gx < hv || bx != 128)) || (rv && (gx < hv * (dv / cols) || bx != nb || dv % cols || dk != 8u * (unsigned)atoi(op + 12))) || dk > 256) return 1;
         for (h = 0; h < hv; ++h) { float* Sh = S + (size_t)h * dk * dv; unsigned kh = h / (hv / hk);
             for (t = 0; t < s; ++t) { const float *qt = q + ((size_t)t * hk + kh) * dk, *kt = k + ((size_t)t * hk + kh) * dk, *vt = v + ((size_t)t * hv + h) * dv;
                 float qs = 0, ks = 0, qf, kf, dec = expf(g[t * hv + h]), bt = be[t * hv + h]; float* ot = o + ((size_t)t * hv + h) * dv;

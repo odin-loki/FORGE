@@ -103,7 +103,7 @@ static int state_ops_check(graph::registry& reg, const std::string& api) {
     return fails;
 }
 // One shape: dk 40 / dv 136 takes the per-head kernel (dv > 128 and C > 128: multi-column threads / blocks); dk = dv = 128
-// (Qwen3.5) and dk 64 / dv 32 take the register-state kernels forge_delta_rule_r16 / _r8.
+// (Qwen3.5) and dk 64 / dv 32 take the register-state kernels forge_delta_rule_p16 / _p8 (_r16 / _r8 with FORGE_DELTA_RULE_R).
 static int state_ops_check_one(graph::registry& reg, const std::string& api, const i64 dk, const i64 dv) {
     using namespace graph;
     const i64 S = 7, Hk = 2, Hv = 4, C = 150, K = 4;
