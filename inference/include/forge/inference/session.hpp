@@ -32,6 +32,14 @@ struct session_options {
 
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
 
+// Whether prompts start with BOS: the manifest's "add_bos" (recorded by importers from GGUF
+// tokenizer.ggml.add_bos_token / HF tokenizer_config.json). Files imported before that key existed: Qwen-family
+// models never add BOS (their bos_token_id is <|endoftext|>, which derails generation); others keep BOS.
+inline bool add_bos_default(const json::value& man) {
+    if (auto* ab = man.find("add_bos"); ab && ab->is_bool()) return ab->b();
+    return man.str_or("architecture", "").rfind("qwen", 0) != 0;
+}
+
 class model {
     // FSS CAP-1 (docs/security-api.md): with an active forge::security policy the model file must be readable under
     // policy fs.read before it is opened. No active policy: nothing is checked (and nothing changes).
@@ -82,6 +90,7 @@ public:
         if (r_.has_section("tokenizer")) {
             tok_.emplace(r_.section_text("tokenizer"));
             tok_->set_special(int(man_.num_or("bos_token_id", -1)), int(man_.num_or("eos_token_id", -1)));
+            tok_->set_add_bos(add_bos_default(man_));
         }
         vocab_ = i64(bp_.param_or("vocab", 0));
         if (auto* d = std::getenv("FORGE_DEVICE")) set_device(d);

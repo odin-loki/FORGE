@@ -101,10 +101,10 @@ class Model:
     def reset(self): _reset(self._h)
     def rewind(self, position): _check(_rew(self._h, position) == 0)
 
-    def tokenize(self, text, add_bos=True):
-        b = text.encode()
-        n = _tok(self._h, b, int(add_bos), None, 0); _check(n >= 0)
-        out = (c_int32 * max(n, 1))(); _tok(self._h, b, int(add_bos), out, n)
+    def tokenize(self, text, add_bos=None):   # None: the model's default (no BOS for Qwen-family models)
+        b = text.encode(); ab = -1 if add_bos is None else int(bool(add_bos))
+        n = _tok(self._h, b, ab, None, 0); _check(n >= 0)
+        out = (c_int32 * max(n, 1))(); _tok(self._h, b, ab, out, n)
         return list(out[:n])
 
     def detokenize(self, ids):

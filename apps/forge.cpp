@@ -284,7 +284,7 @@ int cmd_run(const args& a) {
     else if (a.kv.count("prompt")) {
         if (!s.tokenizer()) raise(errc::not_found, "model has no tokenizer; use --tokens");
         prompt = s.tokenizer()->encode(a.get("prompt"));
-        if (s.tokenizer()->bos() >= 0 && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
+        if (s.tokenizer()->add_bos() && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
     } else return usage();
     inference::sampler_config sc;
     sc.temperature = float(a.num("temp", 0)); sc.top_k = int(a.num("top-k", 0)); sc.top_p = float(a.num("top-p", 1));

@@ -161,14 +161,14 @@ private:
             for (auto& msg : j["messages"].arr()) text += msg.str_or("role", "user") + ": " + msg.str_or("content", "") + "\n";
             text += "assistant:";
             prompt = tok->encode(text);
-            if (tok->bos() >= 0) prompt.insert(prompt.begin(), tok->bos());
+            if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
         } else {
             auto& p = j["prompt"];
             if (p.is_arr()) for (auto& x : p.arr()) prompt.push_back(int(x.num()));
             else {
                 if (!tok) raise(errc::unsupported, "text prompts need a tokenizer; send token ids");
                 prompt = tok->encode(p.str());
-                if (tok->bos() >= 0 && !j.find("add_bos")) prompt.insert(prompt.begin(), tok->bos());
+                if (tok->add_bos() && !j.find("add_bos")) prompt.insert(prompt.begin(), tok->bos());
                 else if (auto* ab = j.find("add_bos"); ab && ab->is_bool() && ab->b() && tok->bos() >= 0) prompt.insert(prompt.begin(), tok->bos());
             }
         }

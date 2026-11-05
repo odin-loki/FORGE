@@ -17,6 +17,20 @@ static const std::string& model_q() { static std::string p = forge_test::make_ti
 static std::vector<int> greedy(inference::session& s, std::vector<int> prompt, int n) { sampler g; s.reset(); return s.generate(prompt, n, g); }
 static float maxdiff(const std::vector<float>& a, const std::vector<float>& b) { float m = 0; for (std::size_t i = 0; i < a.size(); ++i) m = std::max(m, std::abs(a[i] - b[i])); return m; }
 
+// Whether prompts start with BOS: the manifest's add_bos wins; files without it give Qwen-family models no BOS
+// (their bos_token_id is <|endoftext|>: Goedel-Prover-V2-32B repeated one token with it) and keep BOS elsewhere.
+TEST(add_bos_from_manifest) {
+    using forge::inference::add_bos_default;
+    CHECK(!add_bos_default(json::parse(R"({"architecture":"qwen3","bos_token_id":151643})")));
+    CHECK(!add_bos_default(json::parse(R"({"architecture":"qwen3_5"})")));
+    CHECK(add_bos_default(json::parse(R"({"architecture":"llama","bos_token_id":1})")));
+    CHECK(add_bos_default(json::parse(R"({"architecture":"qwen3","add_bos":true})")));
+    CHECK(!add_bos_default(json::parse(R"({"architecture":"llama","add_bos":false})")));
+    forge::modelfile::bpe_tokenizer t(R"({"model":{"type":"BPE","vocab":{"a":0},"merges":[]}})");
+    t.set_special(-1, -1); CHECK(!t.add_bos());   // no BOS id: never added
+    t.set_special(0, -1); CHECK(t.add_bos()); t.set_add_bos(false); CHECK(!t.add_bos());
+}
+
 TEST(paged_kv_matches_preallocated) {
     auto m = model::open(model_a());
     inference::session flat(m, {.page_rows = 0}), paged(m, {.page_rows = 4});

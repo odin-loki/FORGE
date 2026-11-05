@@ -15,7 +15,7 @@ Readers find sections through the table, so section order on disk does not matte
 
 | Name | Required | Contents |
 |------|----------|----------|
-| `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`. GGUF imports add `source: "gguf"`, `template` and the same token/position fields. ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
+| `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`. GGUF imports add `source: "gguf"`, `template` and the same token/position fields. Both add `add_bos` (bool) when the source says whether prompts start with BOS (GGUF `tokenizer.ggml.add_bos_token`, HF `tokenizer_config.json` `add_bos_token`); without it, Qwen-family models get no BOS and others do. ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
 | `blueprint` | yes | Graph text (`modelfile/blueprint.hpp`): name, opset, params, states, inputs, graph, outputs and session kind (e.g. `generative_sequence`) |
 | `tokenizer` | text models | Hugging Face style `tokenizer.json`. HF imports copy it; GGUF imports synthesise one from the GGUF vocabulary |
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |

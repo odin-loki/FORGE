@@ -229,6 +229,8 @@ inline import_report import_gguf(const std::string& path, const std::string& out
                      {"source", "gguf"}, {"template", tname}, {"session", bp.session},
                      {"bos_token_id", num_or("tokenizer.ggml.bos_token_id", -1)}, {"eos_token_id", num_or("tokenizer.ggml.eos_token_id", -1)},
                      {"max_position_embeddings", Kor("context_length", 2048)}};
+    // Whether prompts start with BOS: GGUF says so explicitly (Qwen-family files set it to false).
+    if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     w.write(out);

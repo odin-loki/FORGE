@@ -254,6 +254,11 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
                      {"template", tname}, {"codec", opt.codec}, {"session", bp.session},
                      {"bos_token_id", cfg.num_or("bos_token_id", -1)}, {"eos_token_id", cfg.num_or("eos_token_id", -1)},
                      {"max_position_embeddings", cfg.num_or("max_position_embeddings", 2048)}};
+    // tokenizer_config.json's add_bos_token decides whether prompts start with BOS (absent: the old default, BOS added).
+    if (std::filesystem::exists(dir / "tokenizer_config.json")) {
+        auto tc = json::parse(read_file(dir / "tokenizer_config.json"));
+        if (auto* ab = tc.find("add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
+    }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     if (std::filesystem::exists(dir / "tokenizer.json")) w.set_section("tokenizer", read_file(dir / "tokenizer.json"));
