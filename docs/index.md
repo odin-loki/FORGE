@@ -36,7 +36,8 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 
 ## Security
 - [security.md](security.md): what is enforced today: script capabilities, OS sandbox, plugins, AI confirmation, RPC auth, signing, known gaps
-- [security-standard.md](security-standard.md): draft security standard (target design, mostly not implemented; there is no `forge::security` API yet)
+- [security-standard.md](security-standard.md): draft security standard and the state of each control
+- [security-api.md](security-api.md): `forge::security`: policy file and profiles, `enforce`, `safe_join`, audit, `lockdown`, `check`, `forge security check`
 - [../SECURITY.md](../SECURITY.md): how to report a vulnerability, threat model
 
 ## Reference and project
