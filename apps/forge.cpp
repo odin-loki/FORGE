@@ -66,7 +66,10 @@ int usage() {
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
         "  sign <model.fpk> --key <name.key> [-o out.fpk]   add/extend the signature section\n"
+        "  sign <file> --key <name.key> [-o file.sig] [--name N] [--detached]   any other file (plugin, script):\n"
+        "      detached signature <file>.sig (Ed25519 over BLAKE3, binds the file name)\n"
         "  verify <model.fpk> [--pubkey <name.pub>]...      check hashes + signature (exit 1 on failure)\n"
+        "  verify <file> [--sig file.sig] [--pubkey <name.pub>]...   check a detached signature (exit 1 on failure)\n"
         "  encrypt <in.fpk> -o <out.fpk> --key k.mkey | --new-key k.mkey   seal tensor data (XChaCha20-Poly1305);\n"
         "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
@@ -206,9 +209,29 @@ int cmd_keygen(const args& a) {
     std::printf("key id %s\npublic %s\nwrote %s.key (keep secret) and %s.pub\n", modelfile::key_id(k.pub).c_str(), modelfile::detail::to_hex(k.pub).c_str(), base.c_str(), base.c_str());
     return 0;
 }
+// .fpk files carry an embedded signature; anything else (plugins, scripts, ...) or --detached gets `<file>.sig`
+// (FSS INT-2, security/integrity.hpp).
+bool is_fpk(const std::string& f) {
+    std::ifstream s(f, std::ios::binary); char m[8] = {};
+    return s.read(m, 8) && std::memcmp(m, modelfile::magic, 8) == 0;
+}
 int cmd_sign(const args& a) {
     if (a.pos.empty() || a.get("key").empty()) return usage();
     auto k = modelfile::load_secret_key(a.get("key"));
+    if (a.has("detached") || !is_fpk(a.pos[0])) {   // forge sign FILE --key K [-o FILE.sig] [--name NAME]
+        const std::string& f = a.pos[0];
+        auto bytes = os::read_file(f);
+        if (!bytes) throw std::runtime_error("cannot read " + f + ": " + bytes.err.what);
+        auto out = a.get("o").empty() ? security::detached_sig_path(f) : a.get("o");
+        std::string old; if (auto e = os::read_file(out)) old = e.value;   // extend an existing .sig (another signer)
+        auto nm = a.get("name").empty() ? security::signed_name(f) : a.get("name");
+        auto text = security::detached_sign({reinterpret_cast<const std::uint8_t*>(bytes.value.data()), bytes.value.size()}, nm, k.seed, old);
+        auto tmp = out + ".tmp";
+        if (auto w = os::write_file(tmp, text); !w) throw std::runtime_error("cannot write " + tmp + ": " + w.err.what);
+        if (auto rs = os::rename(tmp, out); !rs) { os::remove(tmp); throw std::runtime_error("cannot replace " + out + ": " + rs.err.what); }
+        std::printf("signed %s (as '%s') with key %s -> %s\n", f.c_str(), nm.c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
+        return 0;
+    }
     auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
     modelfile::sign_file(a.pos[0], out, k);
     std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
@@ -233,11 +256,18 @@ int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key
 }
 int cmd_verify(const args& a) {
     if (a.pos.empty()) return usage();
+    std::vector<std::string> trusted;
+    for (auto& p : a.all("pubkey")) trusted.push_back(modelfile::load_public_key(p));
+    if (a.has("detached") || !a.get("sig").empty() || !is_fpk(a.pos[0])) {   // forge verify FILE [--sig FILE.sig] [--pubkey K]...
+        auto rep = security::detached_verify_file(a.pos[0], trusted, a.get("sig"));
+        for (auto& k : rep.valid_keys) std::printf("signature ok   key %s\n", k.c_str());
+        for (auto& k : rep.invalid_keys) std::printf("signature BAD  key %s\n", k.c_str());
+        std::printf("%s: %s\n", a.pos[0].c_str(), rep.trusted ? "VERIFIED" : rep.message.c_str());
+        return rep.trusted ? 0 : 1;
+    }
     modelfile::reader r(a.pos[0]);
     auto bad = r.verify();
     for (auto& b : bad) std::printf("hash MISMATCH %s\n", b.c_str());
-    std::vector<std::string> trusted;
-    for (auto& p : a.all("pubkey")) trusted.push_back(modelfile::load_public_key(p));
     auto rep = modelfile::verify_signature(r, trusted);
     for (auto& k : rep.valid_keys) std::printf("signature ok   key %s\n", k.c_str());
     for (auto& k : rep.invalid_keys) std::printf("signature BAD  key %s\n", k.c_str());
@@ -458,7 +488,8 @@ int cmd_rpc_serve(const args& a) {
         // Each remote script runs in its own child process (`forge script --rpc-child`), so ForgeScript's OS sandbox
         // (seccomp / Capsicum / pledge / sandbox_init / restricted token) applies to the script without touching the
         // server's own sockets, and a crash, leak or runaway loop dies with the child. The source goes over stdin.
-        srv.script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
+        srv.signed_script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo,
+                                                                                                const std::string& signature) {
             auto t = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
             os::spawn_spec sp;
             sp.argv = {self, "script", "--rpc-child", name.empty() ? "<remote>" : name, "--timeout", std::to_string(t)};
@@ -466,6 +497,8 @@ int cmd_rpc_serve(const args& a) {
             if (no_fs) sp.argv.push_back("--no-fs");
             if (no_net) sp.argv.push_back("--no-net");
             if (!child_policy.empty()) { sp.argv.push_back("--policy"); sp.argv.push_back(child_policy); }
+            // the client's detached signature (FSS INT-2), hex so it survives the command line; the child verifies it
+            if (!signature.empty()) { sp.argv.push_back("--rpc-sig"); sp.argv.push_back(security::detail::hex({reinterpret_cast<const std::uint8_t*>(signature.data()), signature.size()})); }
             // Windows cannot deny fs/net inside a running process (only run_sandboxed's AppContainer can), so there the
             // child applies what it can (job object) and the interpreter checks the rest.
 #if defined(_WIN32)
@@ -483,8 +516,11 @@ int cmd_rpc_serve(const args& a) {
             if (pr.timed_out) return graph::rpc::server::script_result{false, "TimeoutError", "script exceeded " + std::to_string(t) + " ms", pr.out};
             if (pr.exit_code == 0) return graph::rpc::server::script_result{true, "", "", pr.out};
             // child protocol: stderr = "<ErrorType>\n<message>"; a signal death or sandbox failure has none.
+            // Log lines ("[forge:security E] ..." for audit events written before the error) come first: skip them.
+            std::string err = pr.err;
+            while (err.rfind("[forge:", 0) == 0) { auto nl = err.find('\n'); err = nl == std::string::npos ? std::string() : err.substr(nl + 1); }
             std::string et = "RuntimeError", em = pr.err;
-            if (auto nl = pr.err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && pr.err.find(' ') > nl) { et = pr.err.substr(0, nl); em = pr.err.substr(nl + 1); }
+            if (auto nl = err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && err.find(' ') > nl) { et = err.substr(0, nl); em = err.substr(nl + 1); }
             if (pr.term_signal) { et = "RuntimeError"; em = "script child killed by signal " + std::to_string(pr.term_signal) + (pr.err.empty() ? "" : ": " + pr.err); }
             while (!em.empty() && em.back() == '\n') em.pop_back();
             return graph::rpc::server::script_result{false, et, em, pr.out};
@@ -504,15 +540,17 @@ int cmd_rpc_serve(const args& a) {
 // FSS for `forge script` (docs/scripting.md "Security policy"). With an active policy (--policy F or the load_policy()
 // search) the capabilities come from the policy (P1: net only if net.mode is not none, proc only with exec, env only
 // with env) and the --no-* flags narrow the policy in turn; fs operations are path-scoped by the policy's fs.read /
-// fs.write roots (enforce_scope in the runtime). Scripts are unsigned, so integrity.scripts "required" refuses to run
-// them (no script verifier yet; INT-1). Then lockdown(policy) confines the process before any script code runs; it
-// replaces options::os_sandbox. No active policy: nothing here changes anything.
-void script_policy(forge::script::options& o, const std::string& cli_path, const std::string& what) {
+// fs.write roots (enforce_scope in the runtime). integrity.scripts (INT-1/INT-2) is checked where the source is read:
+// engine::run_file and imports verify `<file>.sig` on the bytes they parse, an rpc child verifies the source it got
+// on stdin against the signature the client sent (--rpc-sig). Source without a file or signature (-e, the REPL)
+// cannot pass "required" and is refused here. Then lockdown(policy) confines the process before any script code runs;
+// it replaces options::os_sandbox. No active policy: nothing here changes anything.
+void script_policy(forge::script::options& o, const std::string& cli_path, const std::string& what, bool verifiable) {
     auto p = security::load_policy(cli_path);
     if (!p.active()) return;
-    if (p.integrity.scripts == security::requirement::required) {
-        security::audit("integrity", security::decision::fail, "INT-1", what, "integrity.scripts is required and FORGE cannot verify script signatures");
-        throw security::integrity_error(what + ": integrity.scripts is required in " + p.source + ", and scripts are unsigned (FORGE has no script signature verifier yet)", "INT-1");
+    if (p.integrity.scripts == security::requirement::required && !verifiable) {
+        security::audit("integrity", security::decision::fail, "INT-4", what, "script: integrity.scripts is required and this source has no detached signature");
+        throw security::integrity_error(what + ": integrity.scripts is required in " + p.source + ", and code given with -e, typed into the REPL or sent without a signature cannot be verified (run a signed file)", "INT-4");
     }
     if (!o.allow_fs) { p.fs.read.clear(); p.fs.write.clear(); }
     if (!o.allow_net) p.net.mode = security::net_mode::none;
@@ -523,8 +561,8 @@ void script_policy(forge::script::options& o, const std::string& cli_path, const
     o.allow_proc = p.exec;
     o.allow_env = p.env;
     o.os_sandbox = forge::script::options::os_sandbox_mode::off;   // lockdown() below applies the OS confinement
-    security::audit("script", p.integrity.scripts == security::requirement::off ? security::decision::allow : security::decision::weaken, "INT-1", what,
-                    std::string("unsigned script runs with fs=") + (o.allow_fs ? "scoped" : "off") + " net=" + security::name(p.net.mode) +
+    security::audit("script", security::decision::allow, "CAP-1", what,
+                    std::string("script runs with fs=") + (o.allow_fs ? "scoped" : "off") + " net=" + security::name(p.net.mode) +
                     " proc=" + (o.allow_proc ? "on" : "off") + " env=" + (o.allow_env ? "on" : "off") + " (profile " + security::name(p.prof) + ")");
     security::lockdown(p);
 }
@@ -533,13 +571,14 @@ void script_policy(forge::script::options& o, const std::string& cli_path, const
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
     std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
-    std::string rpc_child, policy_path;
+    std::string rpc_child, policy_path, rpc_sig_hex;
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
         auto val = [&](const char* what) -> std::string { if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + what); return argv[++i]; };
         if (s == "-e") { code = val("-e"); have_code = true; ++i; break; }
         else if (s == "--rpc-child") { rpc_child = val("--rpc-child"); have_code = true; }   // rpc-serve: source on stdin
+        else if (s == "--rpc-sig") rpc_sig_hex = val("--rpc-sig");   // rpc-serve: the client's detached signature (hex of the .sig text)
         else if (s == "--args") { ++i; break; }
         else if (s == "--emit") emit_target = val("--emit");
         else if (s == "-o") emit_out = val("-o");
@@ -595,7 +634,8 @@ int cmd_script(int argc, char** argv) {
             return 0;
         } catch (const forge::script::emit_error& ex) { std::fprintf(stderr, "%s:%d: emit %s: %s\n", file.empty() ? "<-e>" : file.c_str(), ex.line, emit_target.c_str(), ex.what()); return 2; }
     }
-    try { script_policy(o, policy_path, !rpc_child.empty() ? rpc_child : have_code ? std::string("<-e>") : file.empty() ? std::string("<repl>") : file); }
+    try { script_policy(o, policy_path, !rpc_child.empty() ? rpc_child : have_code ? std::string("<-e>") : file.empty() ? std::string("<repl>") : file,
+                        !rpc_child.empty() ? !rpc_sig_hex.empty() : !have_code && !file.empty()); }
     catch (const security::security_error& e) {
         if (rpc_child.empty()) throw;
         // rpc-serve child protocol: stderr = "<ErrorType>\n<message>" (script classes, FSS-ERR-1)
@@ -607,6 +647,12 @@ int cmd_script(int argc, char** argv) {
     if (!rpc_child.empty()) {
         code.assign(std::istreambuf_iterator<char>(std::cin), {});
         o.confirm = nullptr;   // no terminal: AI-drafted code never runs remotely
+        try {   // INT-1/INT-2: the source as received, against the client's signature for the script's name
+            std::vector<std::uint8_t> sig;
+            if (!rpc_sig_hex.empty() && !security::detail::unhex(rpc_sig_hex, sig)) throw security::integrity_error(rpc_child + ": malformed --rpc-sig", "INT-4");
+            security::verify_artefact(*security::active_policy(), security::artefact::script, rpc_child,
+                                      {reinterpret_cast<const std::uint8_t*>(code.data()), code.size()}, std::string(sig.begin(), sig.end()), security::signed_name(rpc_child));
+        } catch (const security::integrity_error& e) { std::fprintf(stderr, "IntegrityError\n%s", e.what()); return 1; }
         forge::script::engine e(o);
         auto r = e.run(code, rpc_child);
         std::fflush(stdout);
@@ -631,7 +677,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached"});
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
