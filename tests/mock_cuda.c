@@ -149,11 +149,11 @@ static int mock_qmma(const signed char* xq, const float* xds, const unsigned cha
     for (i = 0; i < rows * k; ++i) a[i] = xds[2u * (i / 32u)] * (float)xq[i];
     mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
-    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 9;
+    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 10; if (!strcmp(op, "sum_splits")) return 4; if (!strcmp(op, "argmax")) return 3;
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
-    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32 */ if (!strcmp(op, "causal_conv")) return 7;
+    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32, _p8/16/32 */ if (!strncmp(op, "causal_conv", 11)) return 7;   /* causal_conv, causal_conv_t */
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13)) return 12; if (!strcmp(op, "attention_dec")) return 13;
     if (!strcmp(op, "attention_comb")) return 5; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
@@ -217,7 +217,7 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         float* part = y; if (dec) { y = (float*)malloc((size_t)dn * ddv * 4 + 4); threads = dn; }
         unsigned s = ARG(4, unsigned), hq = ARG(5, unsigned), d = ARG(6, unsigned), t = ARG(7, unsigned), hk = ARG(8, unsigned), dv = ARG(9, unsigned), fl = ARG(10, unsigned);
         float sc = ARG(11, float);
-        unsigned causal = fl & 1, kc = (fl >> 1) & 3, vc = (fl >> 3) & 3, window = fl >> 5;
+        unsigned causal = fl & 1, kc = (fl >> 1) & 7, vc = (fl >> 4) & 7, window = fl >> 7;   /* as cuda.hpp packs them */
         unsigned kw = kc ? 1 + (d + 3) / 4 : d, vw = vc ? 1 + (dv + 3) / 4 : dv;
         for (unsigned id = 0; id < s * hq && id < threads; ++id) {
             unsigned qi = id / hq, h = id % hq, kh = h / (hq / hk); int pos = (int)t - (int)s + (int)qi;
@@ -253,7 +253,17 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     if (!strncmp(op, "qmatmul_mma", 11)) {   /* qmatmul_mma_* (64 tokens per block) / qmatmul_mma128_* (128) */
         unsigned bt = op[11] == '1' ? 128u : 64u; unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned);
         if (gx < ((cols + 127) / 128) * ((rows + bt - 1) / bt) || bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u || fmt == 6u)) return 1;   /* 64x64 tiles, 128 threads */
-        return mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), P(ARG(3, dptr)), rows, cols, k, fmt, rb); }
+        { unsigned ks = ARG(9, unsigned), s = ks ? (k / 256u + ks - 1u) / ks : 1u, j; float* y = P(ARG(3, dptr));
+          /* split-K: the whole product goes to slice 0 and the other slices are zero, so forge_sum_splits gives it back */
+          for (j = 1; j < s; ++j) memset(y + (size_t)j * rows * cols, 0, sizeof(float) * rows * cols);
+          return mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), y, rows, cols, k, fmt, rb); } }
+    if (!strcmp(op, "argmax")) { const float* x = P(ARG(0, dptr)); unsigned n = ARG(1, unsigned), i, b = 0; int* o = (int*)(uintptr_t)ARG(2, dptr);
+        if (bx != 256) return 1;
+        for (i = 1; i < n; ++i) if (x[i] > x[b]) b = i;
+        o[0] = (int)b; return 0; }
+    if (!strcmp(op, "sum_splits")) { const float* p = P(ARG(0, dptr)); float* y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned), s = ARG(3, unsigned), i, j;
+        if (gx * bx < n) return 1;
+        for (i = 0; i < n; ++i) { float a = p[i]; for (j = 1; j < s; ++j) a += p[(size_t)j * n + i]; y[i] = a; } return 0; }
     if (!strcmp(op, "quant_q81")) { mock_q81(P(ARG(0, dptr)), (unsigned char*)(uintptr_t)ARG(1, dptr), ARG(2, unsigned)); return 0; }
     if (!strcmp(op, "qmatmul_q81")) { const unsigned char* xq = (const unsigned char*)(uintptr_t)ARG(0, dptr); float* y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
         return mock_qmm81(xq, w, y, ARG(3, unsigned), ARG(4, unsigned), ARG(5, unsigned), ARG(6, unsigned), ARG(7, unsigned)); }
@@ -261,11 +271,11 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned), fmt = ARG(6, unsigned), rb = ARG(7, unsigned);
         if (gx < ((cols + 63) / 64) * ((rows + 63) / 64) || bx != 256) return 1;   /* MMQ 64x64-tile launch shape */
         return mock_qmm(a, w, y, rows, cols, k, fmt, rb); }
-    if (!strncmp(op, "delta_rule", 10)) {   /* flow/state_ops.hpp delta_rule; delta_rule: a block per value head, _rN: per (head, 32 columns) */
+    if (!strncmp(op, "delta_rule", 10)) {   /* flow/state_ops.hpp delta_rule; delta_rule: a block per value head, _rN: per (head, 32 columns), _pN: per (head, 8 columns) */
         float *q = P(ARG(0, dptr)), *k = P(ARG(1, dptr)), *v = P(ARG(2, dptr)), *g = P(ARG(3, dptr)), *be = P(ARG(4, dptr)), *S = P(ARG(5, dptr)), *o = P(ARG(6, dptr));
         unsigned s = ARG(7, unsigned), hk = ARG(8, unsigned), dk = ARG(9, unsigned), hv = ARG(10, unsigned), dv = ARG(11, unsigned), l2 = ARG(12, unsigned); float sc = ARG(13, float);
-        unsigned h, t, a, j; int rv = op[10] == '_';
-        if ((!rv && (gx < hv || bx != 128)) || (rv && (gx < hv * (dv / 32u) || bx != 256 || dv % 32u || dk != 8u * (unsigned)atoi(op + 12))) || dk > 256) return 1;
+        unsigned h, t, a, j; int rv = op[10] == '_'; unsigned cols = rv && op[11] == 'p' ? 8u : 32u, nb = cols == 8u ? 64u : 256u;
+        if ((!rv && (gx < hv || bx != 128)) || (rv && (gx < hv * (dv / cols) || bx != nb || dv % cols || dk != 8u * (unsigned)atoi(op + 12))) || dk > 256) return 1;
         for (h = 0; h < hv; ++h) { float* Sh = S + (size_t)h * dk * dv; unsigned kh = h / (hv / hk);
             for (t = 0; t < s; ++t) { const float *qt = q + ((size_t)t * hk + kh) * dk, *kt = k + ((size_t)t * hk + kh) * dk, *vt = v + ((size_t)t * hv + h) * dv;
                 float qs = 0, ks = 0, qf, kf, dec = expf(g[t * hv + h]), bt = be[t * hv + h]; float* ot = o + ((size_t)t * hv + h) * dv;
@@ -277,10 +287,10 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
                     for (a = 0; a < dk; ++a) { Sh[a * dv + j] = fmaf(kt[a] * kf, d, Sh[a * dv + j]); acc = fmaf(Sh[a * dv + j], qt[a] * qf, acc); }
                     ot[j] = acc; } } }
         return 0; }
-    if (!strcmp(op, "causal_conv")) {
+    if (!strncmp(op, "causal_conv", 11)) {   /* causal_conv: a thread per channel; causal_conv_t: per (channel, 8 tokens) */
         float *x = P(ARG(0, dptr)), *w = P(ARG(1, dptr)), *st = P(ARG(2, dptr)), *o = P(ARG(3, dptr));
         unsigned s = ARG(4, unsigned), C = ARG(5, unsigned), K = ARG(6, unsigned), c, t, j, P_ = K - 1; float nw[8];
-        if (gx * bx < C || K > 9) return 1;
+        if (gx * bx < C || K > 9 || (op[11] == '_' && (bx != 128 || gx < ((C + 127) / 128) * ((s + 7) / 8)))) return 1;
         for (c = 0; c < C; ++c) {
             for (t = 0; t < s; ++t) { float acc = 0; for (j = 0; j < K; ++j) { unsigned p = t + j; acc = fmaf(w[c * K + j], p < P_ ? st[p * C + c] : x[(size_t)(p - P_) * C + c], acc); } o[(size_t)t * C + c] = acc; }
             for (j = 0; j < P_; ++j) { unsigned p = s + j; nw[j] = p < P_ ? st[p * C + c] : x[(size_t)(p - P_) * C + c]; }

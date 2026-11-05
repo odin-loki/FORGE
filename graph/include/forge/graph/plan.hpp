@@ -414,10 +414,16 @@ public:
                 if (h->ran) h->ran(key, !host_ops_);
             }
         } catch (...) { h->end_run(); throw; }
+        argmax_ = -1;
         if (!h->end_run_discard) return h->end_run();
         // only outputs and persistent state outlive the run: fetch those, drop the device intermediates unread
         try {
-            for (auto& [nm, v] : p_.g.outputs()) if (p_.views[v].data) h->to_host(p_.views[v].data, p_.views[v].size());
+            // greedy decode: the first output's argmax on the device replaces fetching that output (see want_argmax)
+            if (want_argmax_ && h->argmax && !p_.g.outputs().empty()) {
+                auto v = p_.g.outputs().front().second;
+                if (p_.views[v].data) argmax_ = h->argmax(p_.views[v].data, p_.views[v].size());
+            }
+            for (auto& [nm, v] : p_.g.outputs()) if (p_.views[v].data && !(argmax_ >= 0 && v == p_.g.outputs().front().second)) h->to_host(p_.views[v].data, p_.views[v].size());
             if (st_) for (auto& [k, sl] : st_->slots) if (!sl.buf.data.empty()) {
                 if (h->keep) { st_->hooks = h; h->keep(sl.buf.data.data(), sl.buf.data.size()); }
                 else h->to_host(sl.buf.data.data(), sl.buf.data.size());
@@ -576,6 +582,10 @@ public:
         }
         raise(errc::not_found, "no output {}", name);
     }
+    // want_argmax(true): run() leaves the first output on the device and records its argmax (last_argmax() >= 0)
+    // when the backend can; the output's host view is then stale until the next run without it.
+    void want_argmax(bool on) { want_argmax_ = on; }
+    long long last_argmax() const { return argmax_; }
     tensor_view output_view(const std::string& name) const {
         for (auto& [nm, v] : p_.g.outputs()) if (nm == name) return p_.views[v];
         raise(errc::not_found, "no output {}", name);
@@ -583,6 +593,8 @@ public:
 private:
     plan& p_;
     state_store* st_;
+    bool want_argmax_ = false;
+    long long argmax_ = -1;
 };
 
 // Shape-bucket plan cache: key = caller-provided bucket string (e.g. "prefill:64/past:0").

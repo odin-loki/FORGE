@@ -10,6 +10,7 @@
 #include <forge/modelfile/fpk.hpp>
 #include <forge/modelfile/sign.hpp>
 #include <forge/modelfile/tokenizer.hpp>
+#include <algorithm>
 #include <forge/security/enforce.hpp>
 #include <chrono>
 #include <cstddef>
@@ -351,16 +352,19 @@ public:
         std::vector<int> hist(prompt.begin(), prompt.end()), out;
         using clk = std::chrono::steady_clock;
         auto t0 = clk::now();
-        auto logits = run_view(prompt, false);   // the executor's output buffer, valid until the next run
+        // Plain greedy: the device picks the token and only its index comes back (no logits download per token).
+        const bool greedy = s.plain_greedy();
+        std::span<const float> logits; int next = -1;
+        if (greedy) next = run_greedy(prompt); else logits = run_view(prompt, false);   // logits: the executor's output buffer, valid until the next run
         auto t1 = clk::now();
         int eos = tokenizer() ? tokenizer()->eos() : -1;
         for (int i = 0; i < max_new; ++i) {
-            int t = s.sample(logits, hist);
+            int t = greedy ? next : s.sample(logits, hist);
             out.push_back(t); hist.push_back(t);
             if (on_token && !on_token(t)) break;
             if (stop_at_eos && t == eos) break;
             if (i + 1 == max_new || pos_ >= st_.capacity) break;
-            logits = run_view(std::span<const int>(&t, 1), false);
+            if (greedy) next = run_greedy(std::span<const int>(&t, 1)); else logits = run_view(std::span<const int>(&t, 1), false);
         }
         auto t2 = clk::now();
         if (stats) *stats = {prompt.size(), out.size(), std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count()};
@@ -387,6 +391,15 @@ public:
     }
 private:
     std::vector<float> run(std::span<const int> ids, bool all) { auto v = run_view(ids, all); return {v.begin(), v.end()}; }
+    // Runs like run_view and returns the argmax of the last position's logits: on the device when the backend can
+    // (one integer read back), else over the host view (ties: the lowest index, as std::max_element).
+    int run_greedy(std::span<const int> ids) {
+        greedy_next_ = true;
+        auto v = run_view(ids, false);
+        greedy_next_ = false;
+        if (last_argmax_ >= 0) return int(last_argmax_);
+        return int(std::max_element(v.begin(), v.end()) - v.begin());
+    }
     std::span<const float> run_view(std::span<const int> ids, bool all) {
         if (ids.empty()) raise(errc::invalid_argument, "forward: no tokens");
         if (pos_ + i64(ids.size()) > st_.capacity) raise(errc::out_of_memory, "context {} exceeded", st_.capacity);
@@ -400,7 +413,9 @@ private:
         for (i64 i = 0; i < n; ++i) ps[std::size_t(i)] = float(pos_ + i);
         ex.set_input("tokens", tk);
         ex.set_input("positions", ps);
+        ex.want_argmax(greedy_next_);
         ex.run();
+        last_argmax_ = greedy_next_ ? ex.last_argmax() : -1;
         pos_ += n;
         auto v = ex.output_view(blueprint().outputs.front().name);
         return {v.data, v.size()};
@@ -411,6 +426,7 @@ private:
     std::map<graph::plan*, std::unique_ptr<graph::executor>> execs_;
     i64 pos_ = 0;
     std::string adapter_;
+    bool greedy_next_ = false; long long last_argmax_ = -1;
 };
 
 } // namespace forge::inference

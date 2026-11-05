@@ -88,6 +88,8 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
             if (!std::getenv("FORGE_GPU_NO_STATE_OPS"))
                 h->state = [raw](const std::string& fn, std::span<const tensor_view> in, float* S, std::size_t sn, tensor_view out, const ops::attrs& a) {
                     return raw->run_state(fn, std::vector<tensor_view>(in.begin(), in.end()), S, sn, out, a); };
+        if constexpr (requires { raw->argmax_resident((const float*)nullptr, std::size_t(0)); })
+            h->argmax = [raw](const float* p, std::size_t n) { return raw->argmax_resident(p, n); };
         r->hooks = h;
     }
     for (std::size_t i = 0; i < ops::op_count; ++i) {

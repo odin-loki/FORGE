@@ -174,7 +174,7 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (att_) f_.free_(att_); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
@@ -194,7 +194,7 @@ public:
     mem_info memory() { mem_info m; if (f_.mem_info) { bind(); f_.mem_info(&m.free, &m.total); } return m; }
     // pooled_bytes: freed buffers kept for reuse; evictions / evicted_bytes: buffers dropped to fit the device budget
     struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0, qweight_bytes = 0,
-                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0; };
+                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0, zero_fills = 0; };   // zero_fills: uploads of all-zero data done as device clears
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); s.pooled_bytes = pool_bytes_; return s; }
     // The device memory pool this runtime charges ("cuda:0", ...) and the bytes it has charged to it.
     mem::budget* memory_pool() { return dm_.pool(); }
@@ -297,13 +297,31 @@ public:
         });
         if (any) sync();
     }
+    // Greedy decode: the argmax of a buffer whose newest copy is on the device, read back as one int (instead of the
+    // whole buffer). -1 when it is not wholly inside one device-newer entry, or the image has no forge_argmax.
+    long long argmax_resident(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_); bind();
+        if (!n || n > 0xFFFFFFFFull || !has_fn_locked("forge_argmax")) return -1;
+        const auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
+        std::uint64_t dp = 0;
+        each_overlap(p, n, [&](entry& e) {
+            auto el = reinterpret_cast<std::uintptr_t>(e.host);
+            if (!e.host_valid && el <= lo && el + e.count * 4 >= hi) dp = e.d + (lo - el); });
+        if (!dp) return -1;
+        if (!am_) am_ = dmalloc(256, "scratch");
+        std::uint32_t n32 = std::uint32_t(n); void* args[] = {&dp, &n32, &am_};
+        ck(launch_s(function("forge_argmax"), 1, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        ++dispatches_["argmax"];
+        int r = -1; ck(dtoh_s(&r, am_, 4, stream_), "memcpy DtoH"); sync();
+        return r;
+    }
     void host_wrote(const float* p, std::size_t n) {
         std::lock_guard lk(mu_); bind();
         auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
         each_overlap(p, n, [&](entry& e) {
             auto el = reinterpret_cast<std::uintptr_t>(e.host), eh = el + e.count * 4;
             auto a = std::max(lo, el), b = std::min(hi, eh);
-            ck(htod_s(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
+            ck(htod_or_zero(e.d + (a - el), reinterpret_cast<const void*>(a), b - a, stream_), "memcpy HtoD");
         });
         // No sync: the copy is stream-ordered before later kernels, and a pageable source may be reused once the
         // call returns (the driver has staged it). Only launch any recorded kernels so ordering is kept.
@@ -343,7 +361,10 @@ public:
         if (!has_fn_locked("forge_copy2d")) return false;
         if (!rows || !w) return true;
         ++dispatches_["copy2d"];
-        auto d = acquire(dst_base, dst_count, false);
+        // A write that covers the whole destination (a first prefill filling a KV slot) needs none of its old contents:
+        // allocate without uploading the host copy.
+        const bool whole = off == 0 && ds == w && rows * w >= dst_count;
+        auto d = acquire(dst_base, dst_count, whole);
         auto s = acquire(src, sn, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
@@ -356,7 +377,7 @@ public:
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); bind(); begin_op();
         if (!n) return;
-        auto d = acquire(dst_base, dst_count, false);
+        auto d = acquire(dst_base, dst_count, off == 0 && n >= dst_count);   // whole destination overwritten: no upload
         auto s = acquire(src, n, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
@@ -446,6 +467,7 @@ public:
     static bool use_mma() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA"); return !(e && std::string(e) == "0"); }(); return on; }
     static bool use_mmvq() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ"); return !(e && std::string(e) == "0"); }(); return on; }
     // Split-K decode attention ($FORGE_ATTN_DEC=0 off) and its partials scratch.
+    static bool fa_tc() { static const bool on = [] { auto* e = std::getenv("FORGE_FA_TC"); return !(e && std::string(e) == "0"); }(); return on; }
     static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on; }
     std::uint64_t att_ = 0; std::size_t att_cap_ = 0;
     std::set<void*> mma_attr_;   // kernels (qmatmul_mma_*, attention_fa2_*) whose dynamic shared memory limit was raised
@@ -454,6 +476,14 @@ public:
     static unsigned mma_ns() { static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_STAGES"); return e && std::string(e) == "2" ? 2u : 1u; }(); return v; }   // $FORGE_MMA_STAGES=2: double-buffered q4_k (opt-in; no gain on an RTX 3090)
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
         static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
+    static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
+    std::uint64_t am_ = 0;   // forge_argmax result (one int)
+    std::uint64_t sk_ = 0; std::size_t sk_cap_ = 0;   // split-K partial products (stream-ordered reuse)
+    void sk_reserve(std::size_t need) {
+        if (sk_cap_ >= need) return;
+        if (sk_) free_s(sk_); sk_ = 0; sk_cap_ = 0;
+        std::size_t n = std::max<std::size_t>(need, 4 << 20); sk_ = dmalloc(n, "scratch"); sk_cap_ = n;
+    }
     std::uint64_t q8r_ = 0; std::size_t q8r_cap_ = 0;   // int8 activation rows + per-group (d, d*sum) for the mma path
     void q8r_reserve(std::size_t need) {
         if (q8r_cap_ >= need) return;
@@ -537,7 +567,8 @@ public:
                 std::uint64_t xq = q8r_, xds = q8r_ + xbytes;
                 void* qa[] = {&xd, &xq, &xds, &nb};
                 ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
-                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
+                std::uint32_t ksplit = 0;
+                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit};
                 // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
                 // q4_k keeps 64 tokens (47 KB of shared memory: two blocks per SM); q6_k / q8_0 use one block per SM anyway,
                 // so 128 tokens give each warp twice the work per weight fragment ($FORGE_MMA_BT=64|128 forces one)
@@ -549,7 +580,36 @@ public:
                 void* mf = function(ns2 ? std::string("forge_qmatmul_mma2_q4_k") : mma_fn(fmt, bt));
                 if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
                 unsigned grid = ((rows + bt - 1) / bt) * ((cols + 127) / 128);
-                if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                // Split-K when the grid cannot fill the device (k/v projections, DeltaNet a/b): S slices of k, each
+                // written to a partial buffer, then summed in order ($FORGE_MMA_SPLITK=0 off).
+                // S is chosen by wave efficiency: the time of S slices is ~ ceil(grid*S / slots) waves of 1/S the work,
+                // so pick the S (up to 8, each slice >= 2 chunks of k) with the fewest waves per unit of work; ties go
+                // to the smaller S (less partial traffic). slots: blocks resident at once (64-token kernels fit 2 per SM).
+                const unsigned nch = k / 256, slots = sms() * (bt == 64 && !ns2 ? 2u : 1u);
+                unsigned splits = 1;
+                // Grids of a few waves with a ragged last one (e.g. 256 blocks on 164 slots) also split, when that saves
+                // >= 10% of the waves; past 4 waves the tail costs little.
+                if (grid && grid < 4 * slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
+                    double best = double((grid + slots - 1) / slots); const double need = grid < slots ? 0.97 : 0.9;
+                    // a grid that already fills the device only splits long k (>= 16 chunks per slice): shorter slices
+                    // lose more to the partial sums than the ragged wave costs (512x8192x4096 q4_k: 528 -> 638 us)
+                    const unsigned min_ch = grid < slots ? 2u : 16u;
+                    for (unsigned s = 2; s <= 8 && s <= nch / min_ch; ++s) {
+                        double t = double((grid * s + slots - 1) / slots) / s;
+                        if (t < best * need) { best = t; splits = s; }
+                    }
+                }
+                if (grid && splits >= 2) {
+                    ksplit = (nch + splits - 1) / splits;
+                    const unsigned s = (nch + ksplit - 1) / ksplit;   // slices actually used
+                    const std::size_t n = std::size_t(rows) * cols;
+                    sk_reserve(n * s * 4);
+                    std::uint64_t part = sk_; void* a3[] = {&xq, &xds, &wd, &part, &rows, &cols, &k, &fmt, &rb32, &ksplit};
+                    ck(launch_s(mf, grid, s, 1, 256, 1, 1, smem, stream_, a3, nullptr), "launch");
+                    std::uint32_t n32 = std::uint32_t(n), s32 = s; void* a4[] = {&part, &yd, &n32, &s32};
+                    ck(launch_s(function("forge_sum_splits"), (n32 + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, a4, nullptr), "launch");
+                    ++dispatches_["qmatmul_mma_splitk"];
+                } else if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
             } else if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
                 ++dispatches_["qmatmul_mmq"];
                 unsigned grid = ((cols + 63) / 64) * ((rows + 63) / 64);
@@ -591,14 +651,18 @@ public:
             u[3] = std::uint32_t(in[2].shape[1]); u[4] = std::uint32_t(in[2].shape[2]); u[5] = a.num("l2norm", 1) != 0;
             if (u[2] > 256u || !u[1] || u[3] % u[1]) return false;
             sc = float(a.num("scale", 1.0 / std::sqrt(double(u[2])))); grid = u[3];
-            // state in registers: a block per (value head, 32 columns), dk = 8 * {8, 16, 32}
-            if ((u[2] == 64 || u[2] == 128 || u[2] == 256) && u[4] % 32 == 0 && !std::getenv("FORGE_DELTA_RULE_OLD")) {
-                std::string rn = "forge_delta_rule_r" + std::to_string(u[2] / 8);
-                if (has_fn_locked(rn)) { kfn = rn; grid = u[3] * (u[4] / 32); block = 256; } }
+            // state in registers, dk = 8 * {8, 16, 32}: by default the staged kernels (a 64-thread block per
+            // (value head, 8 columns)); FORGE_DELTA_RULE_R the earlier ones (a 256-thread block per (head, 32 columns))
+            if ((u[2] == 64 || u[2] == 128 || u[2] == 256) && !std::getenv("FORGE_DELTA_RULE_OLD")) {
+                bool rk = std::getenv("FORGE_DELTA_RULE_R") != nullptr; unsigned cols = rk ? 32u : 8u;
+                std::string rn = std::string(rk ? "forge_delta_rule_r" : "forge_delta_rule_p") + std::to_string(u[2] / 8);
+                if (u[4] % cols == 0 && has_fn_locked(rn)) { kfn = rn; grid = u[3] * (u[4] / cols); block = rk ? 256 : 64; } }
         } else if (fn == "causal_conv" && in.size() == 2) {
             u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[1].shape[1]);
             if (u[2] < 1u || u[2] > 9u) return false;
             grid = (u[1] + 127u) / 128u;
+            // token-parallel: a thread per (channel, 8 tokens); FORGE_CAUSAL_CONV_OLD the per-channel kernel
+            if (!std::getenv("FORGE_CAUSAL_CONV_OLD") && has_fn_locked("forge_causal_conv_t")) { kfn = "forge_causal_conv_t"; grid *= (u[0] + 7u) / 8u; }
         } else return false;
         bool known = false; for (auto& [p, n] : pinned_) if (p == S && n == sn) known = true;
         if (!known) pinned_.push_back({S, sn});
@@ -717,11 +781,18 @@ public:
             // prefill: tiled attention (forge_attention_fa2_*, sm_80 image); K/V tiles shared by 64 (32) query rows
             if (s == sig::attention && !dec && rows >= 16 && (u7 & 0x7Eu) == 0 && k % 4 == 0 && u6 % 4 == 0 && k <= 256 && u6 <= 256 &&
                 ptrs.size() == 4 && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked(k <= 128 && u6 <= 128 ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256")) {
-                const bool d128 = k <= 128 && u6 <= 128; const unsigned bq = d128 ? 64 : 32;
-                fn = function(d128 ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256");
-                smem = d128 ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4;
+                const bool d128 = k <= 128 && u6 <= 128; unsigned bq = d128 ? 64 : 32;
+                // fp16 tensor-core variant (forge_attention_fa2tc_*): 64 query rows per 128-thread block, K/V tiles in fp16
+                const unsigned tcd = k <= 64 && u6 <= 64 ? 64 : d128 ? 128 : 256;
+                const std::string tcn = "forge_attention_fa2tc_d" + std::to_string(tcd);
+                if (fa_tc() && has_fn_locked(tcn)) {
+                    fn = function(tcn); bq = 64; block = 128; smem = (tcd == 64 ? 128 : 64) * (tcd + 8) * 2;   // max(2 BK, 64) rows (BK 64, 32, 16)
+                    ++dispatches_["attention_fa2tc"];
+                } else {
+                    fn = function(d128 ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256"); block = 256;
+                    smem = d128 ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4; }
                 if (!mma_attr_.count(fn) && f_.func_attr) { ck(f_.func_attr(fn, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(fn); }
-                block = 256; grid = ((rows + bq - 1) / bq) * cols; ++dispatches_["attention_fa2"]; }
+                grid = ((rows + bq - 1) / bq) * cols; ++dispatches_["attention_fa2"]; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
             std::uint32_t fnb = 0; std::uint64_t qx = 0;
             if (in_run_ && fuse_q81() && use_mmvq() && rows < mmq_min_rows()) {
@@ -749,6 +820,7 @@ private:
         int (*count)(int*) = nullptr;
         int (*name)(char*, int, int) = nullptr;
         int (*device_get)(int*, int) = nullptr;               // CUDA
+        int (*dev_attr)(int*, int, int) = nullptr;             // cuDeviceGetAttribute (multiprocessor count)
         int (*ctx_create)(void**, unsigned, int) = nullptr;   // CUDA
         int (*ctx_destroy)(void*) = nullptr;
         int (*ctx_set)(void*) = nullptr;                      // CUDA
@@ -761,6 +833,7 @@ private:
         int (*htod)(std::uint64_t, const void*, std::size_t) = nullptr;
         int (*dtoh)(void*, std::uint64_t, std::size_t) = nullptr;
         int (*htod_a)(std::uint64_t, const void*, std::size_t, void*) = nullptr;
+        int (*memset32)(std::uint64_t, unsigned, std::size_t, void*) = nullptr;   // cuMemsetD32Async / hipMemsetD32Async
         int (*dtoh_a)(void*, std::uint64_t, std::size_t, void*) = nullptr;
         int (*dtod_a)(std::uint64_t, std::uint64_t, std::size_t, void*) = nullptr;
         int (*launch)(void*, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, unsigned, void*, void**, void**) = nullptr;
@@ -899,6 +972,17 @@ private:
         static const std::size_t v = [] { auto* e = std::getenv("FORGE_GRAPH_SEG"); std::size_t n = e ? std::strtoul(e, nullptr, 10) : 64; return n ? n : ~std::size_t(0); }();
         return v;
     }
+    // Upload, or clear on the device when the host bytes are all zero (a fresh KV slot or recurrent state): a large
+    // pageable upload of zeros costs far more than scanning it. Small copies go straight through.
+    static bool all_zero(const void* h, std::size_t n) {
+        auto* p = static_cast<const unsigned char*>(h); std::size_t i = 0;
+        for (; i + 8 <= n; i += 8) { std::uint64_t w; std::memcpy(&w, p + i, 8); if (w) return false; }
+        for (; i < n; ++i) if (p[i]) return false;
+        return true; }
+    int htod_or_zero(std::uint64_t d, const void* h, std::size_t n, void* st) {
+        if (f_.memset32 && n >= (64u << 10) && n % 4 == 0 && all_zero(h, n)) {
+            flush(); q81_drop(); dirty_ |= in_run_; ++stats_.zero_fills; return f_.memset32(d, 0u, n / 4, st); }
+        return htod_s(d, h, n, st); }
     int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; cuda_hip::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return dfree(p); }
@@ -1082,7 +1166,7 @@ private:
         std::sort(olds.begin(), olds.end());
         if (!is_out) {   // upload only the gaps the resident pieces do not cover
             std::uintptr_t at = lo;
-            auto up = [&](std::uintptr_t x, std::uintptr_t y) { if (y > x) { ck(htod_s(e.d + (x - lo), reinterpret_cast<const void*>(x), y - x, stream_), "memcpy HtoD"); ++stats_.uploads; } };
+            auto up = [&](std::uintptr_t x, std::uintptr_t y) { if (y > x) { ck(htod_or_zero(e.d + (x - lo), reinterpret_cast<const void*>(x), y - x, stream_), "memcpy HtoD"); ++stats_.uploads; } };
             for (auto k : olds) { up(at, std::max(k, lo)); at = std::max(at, std::min(hi, k + res_[k].count * 4)); }
             up(at, lo + count * 4);
         }
@@ -1116,8 +1200,8 @@ private:
                  sym(f_.unload, "cuModuleUnload") && sym(f_.get_fn, "cuModuleGetFunction") && sym(f_.malloc_, "cuMemAlloc_v2") &&
                  sym(f_.free_, "cuMemFree_v2") && sym(f_.htod, "cuMemcpyHtoD_v2") && sym(f_.dtoh, "cuMemcpyDtoH_v2") &&
                  sym(f_.launch, "cuLaunchKernel") && sym(f_.sync_, "cuCtxSynchronize");
-            opt(f_.device_get, "cuDeviceGet"); opt(f_.ctx_set, "cuCtxSetCurrent");
-            opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
+            opt(f_.device_get, "cuDeviceGet"); opt(f_.ctx_set, "cuCtxSetCurrent"); opt(f_.dev_attr, "cuDeviceGetAttribute");
+            opt(f_.htod_a, "cuMemcpyHtoDAsync_v2"); opt(f_.memset32, "cuMemsetD32Async"); opt(f_.dtoh_a, "cuMemcpyDtoHAsync_v2"); opt(f_.dtod_a, "cuMemcpyDtoDAsync_v2");
             opt(f_.stream_create, "cuStreamCreate"); opt(f_.stream_destroy, "cuStreamDestroy_v2"); opt(f_.stream_sync, "cuStreamSynchronize");
             opt(f_.capture_begin, "cuStreamBeginCapture_v2"); opt(f_.capture_end, "cuStreamEndCapture");
             opt(f_.graph_inst, "cuGraphInstantiateWithFlags"); opt(f_.exec_update, "cuGraphExecUpdate_v2");
@@ -1131,7 +1215,7 @@ private:
                  sym(f_.get_fn, "hipModuleGetFunction") && sym(f_.malloc_, "hipMalloc") && sym(f_.free_, "hipFree") &&
                  sym(f_.htod, "hipMemcpyHtoD") && sym(f_.dtoh, "hipMemcpyDtoH") && sym(f_.launch, "hipModuleLaunchKernel") &&
                  sym(f_.sync_, "hipDeviceSynchronize");
-            opt(f_.htod_a, "hipMemcpyHtoDAsync"); opt(f_.dtoh_a, "hipMemcpyDtoHAsync"); opt(f_.dtod_a, "hipMemcpyDtoDAsync");
+            opt(f_.htod_a, "hipMemcpyHtoDAsync"); opt(f_.memset32, "hipMemsetD32Async"); opt(f_.dtoh_a, "hipMemcpyDtoHAsync"); opt(f_.dtod_a, "hipMemcpyDtoDAsync");
             opt(f_.stream_create, "hipStreamCreateWithFlags"); opt(f_.stream_destroy, "hipStreamDestroy"); opt(f_.stream_sync, "hipStreamSynchronize");
             opt(f_.capture_begin, "hipStreamBeginCapture"); opt(f_.capture_end, "hipStreamEndCapture");
             opt(f_.graph_inst, "hipGraphInstantiateWithFlags"); opt(f_.graph_launch, "hipGraphLaunch");
@@ -1150,6 +1234,7 @@ private:
         int dev = ordinal_;
         if (api_ == api::cuda && f_.device_get && f_.device_get(&dev, ordinal_) != 0) return "cuDeviceGet failed";
         char buf[256] = {}; f_.name(buf, sizeof buf, dev); name_ = buf;
+        if (int v = 0; api_ == api::cuda && f_.dev_attr && f_.dev_attr(&v, 16 /* MULTIPROCESSOR_COUNT */, dev) == 0 && v > 0) sms_ = unsigned(v);
         if (api_ == api::cuda) { if (f_.ctx_create(&ctx_, 0, dev) != 0) return "context creation failed"; }
         else if (f_.set_device(ordinal_) != 0) return "hipSetDevice failed";
         if (f_.stream_create && f_.stream_create(&stream_, 1 /* non-blocking */) != 0) stream_ = nullptr;
@@ -1165,6 +1250,8 @@ private:
         return "module load failed (no embedded PTX/code object is accepted by this device)";
     }
     api api_;
+    unsigned sms_ = 80;   // streaming multiprocessors (sizes split-K); 80 when the driver cannot say
+    unsigned sms() const { return sms_; }
     int ordinal_ = 0;
     void* lib_ = nullptr; void* ctx_ = nullptr; void* mod_ = nullptr; void* stream_ = nullptr;
     fns f_;
