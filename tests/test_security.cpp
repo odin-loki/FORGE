@@ -24,10 +24,10 @@ namespace sec = forge::security;
 
 static std::string scratch(const char* tag) {
     auto d = os::join(os::temp_dir(), std::string("forge_sec_") + tag + "_" + std::to_string(os::pid()));
-    os::remove_all(d); os::mkdirs(d);
-#if !defined(_WIN32)
-    ::chmod(d.c_str(), 0700);   // FIO-2: a strict policy's audit directory must not be group/other-writable (umask 002)
-#endif
+    os::remove_all(d);
+    // FIO-2: a strict policy's audit directory must be private (0700; owner + SYSTEM + Administrators on Windows,
+    // where a temp dir can inherit a DACL that lets every user write, as on the MSYS2 CI runner).
+    if (auto s = os::ensure_private_dir(d); !s) std::printf("  scratch %s: %s\n", d.c_str(), s.err.what.c_str());
     return os::absolute(d);
 }
 template <class E, class F> static std::string throws_msg(F&& f) {
