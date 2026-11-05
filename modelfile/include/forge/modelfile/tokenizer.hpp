@@ -32,6 +32,9 @@ public:
     int bos() const { return bos_; }
     int eos() const { return eos_; }
     void set_special(int bos, int eos) { bos_ = bos; eos_ = eos; }
+    // Whether a prompt starts with BOS (when the model has one): set from the manifest's "add_bos".
+    bool add_bos() const { return add_bos_ && bos_ >= 0; }
+    void set_add_bos(bool on) { add_bos_ = on; }
 
     std::vector<int> encode(std::string_view text) const {
         std::vector<int> out;
@@ -134,7 +137,7 @@ private:
     std::vector<std::string> id_to_tok_;
     std::unordered_map<std::string, int> ranks_;
     std::vector<std::string> special_;
-    int bos_ = -1, eos_ = -1;
+    int bos_ = -1, eos_ = -1; bool add_bos_ = true;
 };
 
 } // namespace forge::modelfile

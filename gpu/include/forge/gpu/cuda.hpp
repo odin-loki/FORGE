@@ -772,16 +772,16 @@ public:
             // prefill: tiled attention (forge_attention_fa2_*, sm_80 image); K/V tiles shared by 64 (32) query rows
             if (s == sig::attention && !dec && rows >= 16 && (u7 & 0x7Eu) == 0 && k % 4 == 0 && u6 % 4 == 0 && k <= 256 && u6 <= 256 &&
                 ptrs.size() == 4 && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked(k <= 128 && u6 <= 128 ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256")) {
-                const bool small = k <= 128 && u6 <= 128; unsigned bq = small ? 64 : 32;
+                const bool d128 = k <= 128 && u6 <= 128; unsigned bq = d128 ? 64 : 32;
                 // fp16 tensor-core variant (forge_attention_fa2tc_*): 64 query rows per 128-thread block, K/V tiles in fp16
-                const unsigned tcd = k <= 64 && u6 <= 64 ? 64 : small ? 128 : 256;
+                const unsigned tcd = k <= 64 && u6 <= 64 ? 64 : d128 ? 128 : 256;
                 const std::string tcn = "forge_attention_fa2tc_d" + std::to_string(tcd);
                 if (fa_tc() && has_fn_locked(tcn)) {
                     fn = function(tcn); bq = 64; block = 128; smem = (tcd == 64 ? 128 : 64) * (tcd + 8) * 2;   // max(2 BK, 64) rows (BK 64, 32, 16)
                     ++dispatches_["attention_fa2tc"];
                 } else {
-                    fn = function(small ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256"); block = 256;
-                    smem = small ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4; }
+                    fn = function(d128 ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256"); block = 256;
+                    smem = d128 ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4; }
                 if (!mma_attr_.count(fn) && f_.func_attr) { ck(f_.func_attr(fn, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(fn); }
                 grid = ((rows + bq - 1) / bq) * cols; ++dispatches_["attention_fa2"]; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }

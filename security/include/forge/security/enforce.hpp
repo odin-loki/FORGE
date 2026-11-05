@@ -58,9 +58,19 @@ struct active_state { std::mutex m; std::shared_ptr<const policy> p = std::make_
 inline active_state& act() { static active_state s; return s; }
 } // namespace detail
 
+inline std::string expand_root(const std::string& e);
+// The active policy's fs roots are made absolute when it becomes active ("." is the working directory at that moment),
+// so a later chdir() cannot move them.
 inline void set_active_policy(policy p) {
+    for (auto* v : {&p.fs.read, &p.fs.write}) for (auto& e : *v) if (e != "*") e = expand_root(e);
     auto sp = std::make_shared<const policy>(std::move(p));
     set_audit_profile(name(sp->prof));
+    // The policy's audit sinks start with the policy, not only at lockdown(): programs that never lock down
+    // (forge run) still record integrity failures. A sink that cannot open is reported by check()/lockdown().
+    if (sp->active()) {
+        if (!sp->audit.file.empty() && audit_file() != sp->audit.file) (void)open_audit_file(sp->audit.file);
+        if (sp->audit.os) (void)set_audit_os(true);
+    }
     auto& s = detail::act(); std::lock_guard g(s.m); s.p = std::move(sp);
 }
 inline std::shared_ptr<const policy> active_policy() { auto& s = detail::act(); std::lock_guard g(s.m); return s.p; }

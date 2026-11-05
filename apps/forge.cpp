@@ -72,7 +72,10 @@ int usage() {
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
+        "      [--policy F]  FSS policy: capabilities from the policy, lockdown() before the script runs\n"
         "  security check [--policy F] [--json]   FSS controls: state, backend, verdict (exit 1 if a required one cannot be met)\n"
+        "  run, bench, script and rpc-serve take --policy F (else $FORGE_SECURITY_POLICY, ./forge-security.json, the config\n"
+        "      dir, $FORGE_SECURITY_PROFILE; with none of them no FSS profile is active and nothing changes; docs/security-api.md)\n"
         "  (strict loading: FORGE_REQUIRE_SIGNED=1 and/or FORGE_TRUSTED_KEYS=<hex>[,<hex>])");
     return 2;
 }
@@ -119,6 +122,24 @@ int cmd_security(const args& a) {
     auto r = security::check(p);
     std::fputs(a.has("json") ? (r.json() + "\n").c_str() : r.text().c_str(), stdout);
     return r.ok ? 0 : 1;
+}
+
+// The FSS policy for a command (--policy F, else the load_policy() search). An active one becomes the process's policy
+// for enforce() (model loads check fs.read and integrity.models through it); profile none changes nothing.
+security::policy activate_policy(const std::string& cli_path) {
+    auto p = security::load_policy(cli_path);
+    if (p.active()) security::set_active_policy(p);
+    return p;
+}
+
+// SBX-1 for a server: the listen address must be allowed (net_listen), then lockdown() once the sockets are bound and
+// everything is loaded, before the first request. Audited; throws permission_denied / sandbox_error.
+void server_lockdown(const security::policy& p, const char* who, const std::string& listen) {
+    if (!p.active()) return;
+    auto r = security::lockdown(p);
+    for (auto& c : r.controls)
+        if (c.verdict != "ok") std::fprintf(stderr, "%s: security %s %s: %s%s\n", who, c.id.c_str(), c.name.c_str(), c.state.c_str(), c.detail.empty() ? "" : (" (" + c.detail + ")").c_str());
+    security::audit("sandbox", security::decision::allow, "SBX-1", listen, std::string(who) + ": locked down (profile " + security::name(p.prof) + ", " + p.source + ") before serving");
 }
 
 int cmd_info() {
@@ -254,6 +275,7 @@ int run_one_shot(inference::session& s, const args& a) {
 
 int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
     inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
@@ -262,7 +284,7 @@ int cmd_run(const args& a) {
     else if (a.kv.count("prompt")) {
         if (!s.tokenizer()) raise(errc::not_found, "model has no tokenizer; use --tokens");
         prompt = s.tokenizer()->encode(a.get("prompt"));
-        if (s.tokenizer()->bos() >= 0 && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
+        if (s.tokenizer()->add_bos() && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
     } else return usage();
     inference::sampler_config sc;
     sc.temperature = float(a.num("temp", 0)); sc.top_k = int(a.num("top-k", 0)); sc.top_p = float(a.num("top-p", 1));
@@ -328,6 +350,7 @@ int cmd_bench_gemm(int n) {
 int cmd_bench(const args& a) {
     if (a.kv.count("gemm")) return cmd_bench_gemm(int(a.num("gemm", 512)));
     if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
     inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")));
     int p = int(a.num("p", 32)), n = int(a.num("n", 32));
     std::vector<int> prompt(std::size_t(p), 1);
@@ -374,6 +397,9 @@ int cmd_bench(const args& a) {
 //   [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
 // Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
+    // FSS (docs/rpc.md "Security policy"): with an active policy the listen address must be allowed, script children
+    // need exec, and the server locks itself down after binding, before it accepts a request.
+    const auto pol = activate_policy(a.get("policy"));
     std::string why, dev = a.get("device", "cpu");
     auto reg = graph::device_registry(dev, &why, false);
     if (!reg && dev != "cpu") std::fprintf(stderr, "forge: %s; serving on cpu\n", why.c_str());
@@ -411,6 +437,11 @@ int cmd_rpc_serve(const args& a) {
     if (!sec.client_map.empty() && sec.tls.client_ca_file.empty()) throw std::runtime_error("--tls-client-map needs --tls-client-ca");
     sec.allow_scripts = a.has("allow-scripts");
     std::string bind = a.get("bind", "127.0.0.1");
+    if (pol.active()) {
+        security::enforce(pol, security::capability::net_listen, (bind.find(':') != std::string::npos ? "[" + bind + "]" : bind) + ":" + std::to_string(int(a.num("port", 7000))));
+        if (sec.allow_scripts && !security::try_enforce(pol, security::capability::exec, os::exe_path()))
+            throw security::policy_violation("rpc-serve --allow-scripts starts a `forge script` child per script, but the security policy (" + pol.source + ") denies exec", "SBX-1");
+    }
     if (!sec.auth_required() && sec.tls.client_ca_file.empty() && bind != "127.0.0.1" && bind != "::1" && bind != "localhost")
         std::fprintf(stderr, "forge rpc: WARNING: no authentication and bound to %s; anyone who can reach it can use it\n", bind.c_str());
     graph::rpc::server srv(reg.get(), int(a.num("port", 7000)), bind, sec);
@@ -421,16 +452,20 @@ int cmd_rpc_serve(const args& a) {
         bool no_proc = a.has("script-no-proc"), no_fs = a.has("script-no-fs"), no_net = a.has("script-no-net");
         std::string self = os::exe_path();
         if (self.empty()) throw std::runtime_error("rpc-serve --allow-scripts: cannot find this executable to start script children");
+        // children load the same policy (an explicit --policy is passed on as an absolute path; otherwise they find it
+        // the way this process did) and lock themselves down before running the script
+        const std::string child_policy = a.get("policy").empty() ? std::string() : os::absolute(a.get("policy"));
         // Each remote script runs in its own child process (`forge script --rpc-child`), so ForgeScript's OS sandbox
         // (seccomp / Capsicum / pledge / sandbox_init / restricted token) applies to the script without touching the
         // server's own sockets, and a crash, leak or runaway loop dies with the child. The source goes over stdin.
-        srv.script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
+        srv.script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo) {
             auto t = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
             os::spawn_spec sp;
             sp.argv = {self, "script", "--rpc-child", name.empty() ? "<remote>" : name, "--timeout", std::to_string(t)};
             if (no_proc) sp.argv.push_back("--no-proc");
             if (no_fs) sp.argv.push_back("--no-fs");
             if (no_net) sp.argv.push_back("--no-net");
+            if (!child_policy.empty()) { sp.argv.push_back("--policy"); sp.argv.push_back(child_policy); }
             // Windows cannot deny fs/net inside a running process (only run_sandboxed's AppContainer can), so there the
             // child applies what it can (job object) and the interpreter checks the rest.
 #if defined(_WIN32)
@@ -448,13 +483,17 @@ int cmd_rpc_serve(const args& a) {
             if (pr.timed_out) return graph::rpc::server::script_result{false, "TimeoutError", "script exceeded " + std::to_string(t) + " ms", pr.out};
             if (pr.exit_code == 0) return graph::rpc::server::script_result{true, "", "", pr.out};
             // child protocol: stderr = "<ErrorType>\n<message>"; a signal death or sandbox failure has none.
-            std::string et = "RuntimeError", em = pr.err;
-            if (auto nl = pr.err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && pr.err.find(' ') > nl) { et = pr.err.substr(0, nl); em = pr.err.substr(nl + 1); }
+            // Log lines ("[forge:security W] ...", from the child's policy and lockdown) precede the protocol: skip them.
+            std::string err = pr.err;
+            while (err.rfind("[forge:", 0) == 0) { auto nl = err.find('\n'); err = nl == std::string::npos ? std::string() : err.substr(nl + 1); }
+            std::string et = "RuntimeError", em = err.empty() ? pr.err : err;
+            if (auto nl = err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && err.find(' ') > nl) { et = err.substr(0, nl); em = err.substr(nl + 1); if (!et.empty() && et.back() == '\r') et.pop_back(); }   // CRLF on Windows
             if (pr.term_signal) { et = "RuntimeError"; em = "script child killed by signal " + std::to_string(pr.term_signal) + (pr.err.empty() ? "" : ": " + pr.err); }
             while (!em.empty() && em.back() == '\n') em.pop_back();
             return graph::rpc::server::script_result{false, et, em, pr.out};
         };
     }
+    server_lockdown(pol, "forge rpc", bind + ":" + std::to_string(srv.port()));
     std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
                 srv.tls() ? " tls" : "", sec.tls.client_ca_file.empty() ? "" : " mtls", sec.client_map.empty() ? "" : " cert-map",
                 sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
@@ -465,11 +504,39 @@ int cmd_rpc_serve(const args& a) {
 
 } // namespace
 
+// FSS for `forge script` (docs/scripting.md "Security policy"). With an active policy (--policy F or the load_policy()
+// search) the capabilities come from the policy (P1: net only if net.mode is not none, proc only with exec, env only
+// with env) and the --no-* flags narrow the policy in turn; fs operations are path-scoped by the policy's fs.read /
+// fs.write roots (enforce_scope in the runtime). Scripts are unsigned, so integrity.scripts "required" refuses to run
+// them (no script verifier yet; INT-1). Then lockdown(policy) confines the process before any script code runs; it
+// replaces options::os_sandbox. No active policy: nothing here changes anything.
+void script_policy(forge::script::options& o, const std::string& cli_path, const std::string& what) {
+    auto p = security::load_policy(cli_path);
+    if (!p.active()) return;
+    if (p.integrity.scripts == security::requirement::required) {
+        security::audit("integrity", security::decision::fail, "INT-1", what, "integrity.scripts is required and FORGE cannot verify script signatures");
+        throw security::integrity_error(what + ": integrity.scripts is required in " + p.source + ", and scripts are unsigned (FORGE has no script signature verifier yet)", "INT-1");
+    }
+    if (!o.allow_fs) { p.fs.read.clear(); p.fs.write.clear(); }
+    if (!o.allow_net) p.net.mode = security::net_mode::none;
+    if (!o.allow_proc) p.exec = false;
+    if (!o.allow_env) p.env = false;
+    o.allow_fs = !(p.fs.read.empty() && p.fs.write.empty());
+    o.allow_net = p.net.mode != security::net_mode::none;
+    o.allow_proc = p.exec;
+    o.allow_env = p.env;
+    o.os_sandbox = forge::script::options::os_sandbox_mode::off;   // lockdown() below applies the OS confinement
+    security::audit("script", p.integrity.scripts == security::requirement::off ? security::decision::allow : security::decision::weaken, "INT-1", what,
+                    std::string("unsigned script runs with fs=") + (o.allow_fs ? "scoped" : "off") + " net=" + security::name(p.net.mode) +
+                    " proc=" + (o.allow_proc ? "on" : "off") + " env=" + (o.allow_env ? "on" : "off") + " (profile " + security::name(p.prof) + ")");
+    security::lockdown(p);
+}
+
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
     std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
-    std::string rpc_child;
+    std::string rpc_child, policy_path;
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
@@ -497,6 +564,7 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--cache-trust") o.fsc_trusted_keys.push_back(val("--cache-trust"));
         else if (s == "--cache-require-signed") o.fsc_require_signed = true;
         else if (s == "--cache-sign-seed") o.fsc_sign_seed = val("--cache-sign-seed");
+        else if (s == "--policy") policy_path = val("--policy");
         else if (s == "--no-fs") o.allow_fs = false;
         else if (s == "--no-net") o.allow_net = false;
         else if (s == "--os-sandbox") { os_sandbox_set = true; auto m = val("--os-sandbox"); o.os_sandbox = m == "off" ? forge::script::options::os_sandbox_mode::off : m == "require" ? forge::script::options::os_sandbox_mode::require : m == "best-effort" ? forge::script::options::os_sandbox_mode::best_effort : throw std::runtime_error("--os-sandbox takes off|best-effort|require"); }
@@ -529,6 +597,15 @@ int cmd_script(int argc, char** argv) {
             else { std::ofstream f(emit_out, std::ios::binary); f << text; f.close(); std::filesystem::permissions(emit_out, std::filesystem::perms::owner_exec | std::filesystem::perms::group_exec | std::filesystem::perms::others_exec, std::filesystem::perm_options::add); }
             return 0;
         } catch (const forge::script::emit_error& ex) { std::fprintf(stderr, "%s:%d: emit %s: %s\n", file.empty() ? "<-e>" : file.c_str(), ex.line, emit_target.c_str(), ex.what()); return 2; }
+    }
+    try { script_policy(o, policy_path, !rpc_child.empty() ? rpc_child : have_code ? std::string("<-e>") : file.empty() ? std::string("<repl>") : file); }
+    catch (const security::security_error& e) {
+        if (rpc_child.empty()) throw;
+        // rpc-serve child protocol: stderr = "<ErrorType>\n<message>" (script classes, FSS-ERR-1)
+        const char* t = e.sc == security::sec_code::integrity ? "IntegrityError" : e.sc == security::sec_code::policy ? "PolicyViolation"
+                      : e.sc == security::sec_code::permission ? "PermissionError" : "SandboxViolationError";
+        std::fprintf(stderr, "%s\n%s", t, e.what());
+        return 1;
     }
     if (!rpc_child.empty()) {
         code.assign(std::istreambuf_iterator<char>(std::cin), {});

@@ -37,7 +37,7 @@ inline std::string local_ai_generate(const local_ai_request& r) {
     if (!r.system.empty()) text += "system: " + r.system + "\n";
     text += "user: " + r.prompt + "\nassistant:";
     std::vector<int> prompt = tok->encode(text);
-    if (tok->bos() >= 0) prompt.insert(prompt.begin(), tok->bos());
+    if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
     int max_new = r.max_tokens > 0 ? r.max_tokens : 256;
     inference::session_options so;
     so.context = std::min<i64>(m->max_context(), i64(prompt.size()) + max_new + 1);

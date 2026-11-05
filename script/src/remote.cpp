@@ -41,6 +41,7 @@ Conn connect(Interp& in, const std::string& what, std::string addr, const Args& 
     auto colon = addr.rfind(':'); if (colon == std::string::npos) in.raise("ValueError", what + ": want host:port");
     auto host = addr.substr(0, colon), port = addr.substr(colon + 1);
     if (host.size() > 1 && host.front() == '[') host = host.substr(1, host.size() - 2);
+    enforce_scope(in, SecScope::net_connect, (host.find(':') != std::string::npos ? "[" + host + "]" : host) + ":" + port);
     graph::rpc::client_security sec;
     try { sec = graph::rpc::client::env_security(); } catch (const std::exception& e) { in.raise("ValueError", what + ": " + e.what()); }
     if (auto* v = kv(a, oi, "token")) sec.token = in.str(*v);

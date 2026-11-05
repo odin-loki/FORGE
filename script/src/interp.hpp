@@ -16,6 +16,13 @@ struct Limits {
     std::uint64_t max_output = 64ull << 20;   // per child-process stream
 };
 struct Caps { bool fs = true, net = true, proc = true, env = true, reflect = true; };   // reflect: reflect::set/invoke/call/construct
+// FSS CAP-1 scope (docs/security-api.md): built-ins pass the path / host:port / program they act on to
+// enforce_scope(), which checks it with forge::security::try_enforce against the process's active policy
+// (security::lockdown / set_active_policy) and raises PermissionError when the policy denies it (audited). The Caps
+// flags are still checked first. No active policy (profile none): enforce_scope does nothing.
+enum class SecScope { fs_read, fs_write, net_connect, net_listen, exec, env, plugin_load };
+struct Interp;
+void enforce_scope(Interp& in, SecScope s, std::string_view target);
 
 // A script-level exception travelling through C++ frames. `v` is the thrown value (usually an Error object).
 struct ScriptError : std::exception {

@@ -10,6 +10,7 @@
 #include <forge/core/error.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
+#include <forge/security/errors.hpp>
 #include <cmath>
 #include <filesystem>
 #include <format>
@@ -236,6 +237,15 @@ ScriptError Interp::from_cpp(std::exception_ptr ep) {
     catch (const heap_exhausted& e) { return mk("OutOfMemoryError", e.what()); }
     catch (const std::bad_alloc&) { return mk("OutOfMemoryError", "out of memory"); }
     catch (const syntax_error& e) { return mk("SyntaxError", e.what()); }
+    catch (const security::security_error& e) {   // FSS-ERR-1
+        switch (e.sc) {
+        case security::sec_code::integrity: return mk("IntegrityError", e.what());
+        case security::sec_code::policy: return mk("PolicyViolation", e.what());
+        case security::sec_code::permission: return mk("PermissionError", e.what());
+        case security::sec_code::sandbox: return mk("SandboxViolationError", e.what());
+        }
+        return mk("SecurityError", e.what());
+    }
     catch (const os::os_exception& e) { return mk(e.script_type(), e.what()); }   // typed OS errors, faults, crashed workers
     catch (const forge_exception& e) {
         switch (e.code) {
@@ -900,6 +910,7 @@ Value Interp::shell(const Node& n, const std::vector<Value>& parts) {
     std::string exe = shell_exe(*be);
     if (exe.empty()) raise("ShellError", kind + " is not installed (looked for " + [&] { std::string l; for (auto& e : be->exes) l += (l.empty() ? "'" : ", '") + e + "'"; return l; }() + " on PATH)");
     std::vector<std::string> argv = be->argv(exe, script);
+    enforce_scope(*this, SecScope::exec, exe);
     charge_process(kind);
     os::spawn_spec sp; sp.argv = argv; sp.max_output = sh->limits.max_output;
     sp.limits.memory_bytes = child_mem; sp.limits.cpu_seconds = child_cpu_s;
@@ -1066,6 +1077,7 @@ Value Interp::import_module(const std::string& path) {
     for (auto& c : cand) { std::error_code ec; if (fs::is_regular_file(c, ec)) { found = fs::weakly_canonical(c, ec); break; } }
     if (found.empty()) raise("ImportError", "module '" + path + "' not found (search path: FORGE_SCRIPT_PATH, script dir, ~/.forge/modules, cwd)");
     std::string key = found.string();
+    enforce_scope(*this, SecScope::fs_read, key);
     if (is_native_module(key)) {
         if (!sh->load_plugin) raise("ImportError", "native plugins are not available in this build");
         return sh->load_plugin(*this, key);

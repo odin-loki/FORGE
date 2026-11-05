@@ -26,6 +26,7 @@
 #include <forge/os/sandbox.hpp>
 #include <forge/os/process_pool.hpp>
 #include <forge/script/script.hpp>
+#include <forge/security/enforce.hpp>
 #if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
@@ -44,6 +45,19 @@
 namespace forge::script {
 Value make_range(std::int64_t a, std::int64_t b, std::int64_t s);
 
+void enforce_scope(Interp& in, SecScope s, std::string_view target) {
+    auto p = security::active_policy();
+    if (!p->active()) return;   // no FSS profile: unchanged behaviour
+    using C = security::capability;
+    C c = C::fs_read;
+    switch (s) {
+    case SecScope::fs_read: c = C::fs_read; break; case SecScope::fs_write: c = C::fs_write; break;
+    case SecScope::net_connect: c = C::net_connect; break; case SecScope::net_listen: c = C::net_listen; break;
+    case SecScope::exec: c = C::exec; break; case SecScope::env: c = C::env; break; case SecScope::plugin_load: c = C::plugin_load; break;
+    }
+    if (auto st = security::try_enforce(*p, c, target); !st) in.raise("PermissionError", st.err.what);
+}
+
 namespace {
 
 using Args = std::vector<Value>;
@@ -61,6 +75,9 @@ struct Lib {
 };
 
 std::string& s_of(Interp& in, const Value& v, const char* what) { auto* s = as<String>(v); if (!s) in.raise("TypeError", std::string(what) + " expects a string, got " + Interp::type_of(v)); return s->s; }
+// A path argument checked against the active security policy (fs.read / fs.write roots; see enforce_scope).
+const std::string& p_rd(Interp& in, const Value& v, const char* what) { auto& s = s_of(in, v, what); enforce_scope(in, SecScope::fs_read, s); return s; }
+const std::string& p_wr(Interp& in, const Value& v, const char* what) { auto& s = s_of(in, v, what); enforce_scope(in, SecScope::fs_write, s); return s; }
 std::int64_t i_of(Interp& in, const Value& v, const char* what) {
     if (auto* i = std::get_if<std::int64_t>(&v)) return *i;
     if (auto* d = std::get_if<double>(&v); d && *d == std::floor(*d)) return std::int64_t(*d);
@@ -168,6 +185,7 @@ Value run_process(Interp& in, Args& a) {
         if (!cur.empty()) sp.argv.push_back(cur);
     }
     if (sp.argv.empty()) in.raise("ValueError", "proc.run: empty command");
+    enforce_scope(in, SecScope::exec, sp.argv[0]);
     in.charge_process(sp.argv[0]);
     sp.max_output = in.sh->limits.max_output;
     sp.limits.memory_bytes = in.child_mem; sp.limits.cpu_seconds = in.child_cpu_s; sp.timeout_ms = in.child_timeout_ms;
@@ -349,6 +367,10 @@ void install_builtins(Shared& sh) {
         if (!sh.errors.count(n)) mkclass(n, sh.errors["OSError"]);
     for (auto n : {"ConnectionRefusedError", "ConnectionResetError", "BrokenPipeError"}) mkclass(n, sh.errors["ConnectionError"]);
     mkclass("SandboxViolationError", sh.errors["PermissionError"]);   // denied by the OS sandbox, not the interpreter
+    // FSS-ERR-1 (forge::security): security::integrity_error / policy_violation. permission_denied and sandbox_error keep
+    // the existing PermissionError / SandboxViolationError classes.
+    mkclass("SecurityError", sh.errors["OSError"]);
+    for (auto n : {"IntegrityError", "PolicyViolation"}) mkclass(n, sh.errors["SecurityError"]);
     sh.errors["ZeroDivisionError"] = sh.errors["ArithmeticError"];
 
     // ------------------------------------------------ ProcResult
@@ -606,70 +628,77 @@ void install_builtins(Shared& sh) {
 
     // ------------------------------------------------ fs (forge::os)
     B["fs"] = Lib("fs")
-        .def("read", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::read_file(s_of(in, a[0], "fs.read")))); })
-        .def("write", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); auto d = in.str(a[1]); ok(in, os::write_file(s_of(in, a[0], "fs.write"), d)); return std::int64_t(d.size()); })
+        .def("read", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::read_file(p_rd(in, a[0], "fs.read")))); })
+        .def("write", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); auto d = in.str(a[1]); ok(in, os::write_file(p_wr(in, a[0], "fs.write"), d)); return std::int64_t(d.size()); })
         .def("append", 2, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access"); auto d = in.str(a[1]);
-            auto f = ok(in, os::file::open(s_of(in, a[0], "fs.append"), os::wr | os::create | os::append)); ok(in, f.write_all(d.data(), d.size())); return std::int64_t(d.size());
+            auto f = ok(in, os::file::open(p_wr(in, a[0], "fs.append"), os::wr | os::create | os::append)); ok(in, f.write_all(d.data(), d.size())); return std::int64_t(d.size());
         })
-        .def("exists", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return os::exists(s_of(in, a[0], "fs.exists")); })
-        .def("is_dir", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return os::stat(s_of(in, a[0], "fs.is_dir")).is_dir; })
+        .def("exists", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return os::exists(p_rd(in, a[0], "fs.exists")); })
+        .def("is_dir", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return os::stat(p_rd(in, a[0], "fs.is_dir")).is_dir; })
         .def("stat", 1, 1, [](Interp& in, Args& a) -> Value {
-            need(in, in.caps.fs, "file access"); auto st = os::stat(s_of(in, a[0], "fs.stat")); auto m = make<Map>();
+            need(in, in.caps.fs, "file access"); auto st = os::stat(p_rd(in, a[0], "fs.stat")); auto m = make<Map>();
             m->set_str("exists", st.exists); m->set_str("is_dir", st.is_dir); m->set_str("is_file", st.is_file); m->set_str("is_link", st.is_link);
             m->set_str("size", std::int64_t(st.size)); m->set_str("mtime", double(st.mtime_ns) / 1e9); return obj(m);
         })
         .def("list", 0, 1, [](Interp& in, Args& a) -> Value {
-            need(in, in.caps.fs, "file access"); auto es = ok(in, os::list_dir(a.empty() ? "." : s_of(in, a[0], "fs.list")));
+            need(in, in.caps.fs, "file access"); auto es = ok(in, os::list_dir(a.empty() ? (enforce_scope(in, SecScope::fs_read, "."), std::string(".")) : p_rd(in, a[0], "fs.list")));
             std::sort(es.begin(), es.end(), [](auto& x, auto& y) { return x.name < y.name; });
             auto l = make<List>(); for (auto& e : es) l->push(strv(e.name + (e.is_dir ? "/" : ""))); return obj(l);
         })
-        .def("mkdir", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::mkdirs(s_of(in, a[0], "fs.mkdir"))); return Nil{}; })
-        .def("remove", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::remove_all(s_of(in, a[0], "fs.remove"))); return Nil{}; })
-        .def("rename", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::rename(s_of(in, a[0], "fs.rename"), s_of(in, a[1], "fs.rename"))); return Nil{}; })
+        .def("mkdir", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::mkdirs(p_wr(in, a[0], "fs.mkdir"))); return Nil{}; })
+        .def("remove", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::remove_all(p_wr(in, a[0], "fs.remove"))); return Nil{}; })
+        .def("rename", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::rename(p_wr(in, a[0], "fs.rename"), p_wr(in, a[1], "fs.rename"))); return Nil{}; })
         .def("temp_dir", 0, 0, [](Interp&, Args&) -> Value { return strv(os::temp_dir()); })
         .def("open", 1, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access");
             std::string mode = a.size() > 1 ? s_of(in, a[1], "fs.open mode") : "r";
             unsigned fl = mode == "r" ? os::rd : mode == "w" ? (os::wr | os::create | os::truncate) : mode == "a" ? (os::wr | os::create | os::append) : mode == "rw" ? (os::rdwr | os::create) : 0u;
             if (!fl) in.raise("ValueError", "fs.open mode must be r, w, a or rw");
-            auto f = std::make_shared<os::file>(ok(in, os::file::open(s_of(in, a[0], "fs.open"), fl)));
+            auto f = std::make_shared<os::file>(ok(in, os::file::open(mode == "r" ? p_rd(in, a[0], "fs.open") : p_wr(in, a[0], "fs.open"), fl)));
             Value h = make_handle(in, "file", f, [f]() { *f = os::file(); });
             as<Handle>(h)->props["path"] = a[0];
             return h;
         })
         .def("copy", 2, 3, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access"); bool ow = a.size() > 2 && in.truthy(a[2]);
-            ok(in, os::fs::copy(s_of(in, a[0], "fs.copy"), s_of(in, a[1], "fs.copy"), {ow, true, false, !ow})); return Nil{};
+            ok(in, os::fs::copy(p_rd(in, a[0], "fs.copy"), p_wr(in, a[1], "fs.copy"), {ow, true, false, !ow})); return Nil{};
         })
-        .def("move", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::move(s_of(in, a[0], "fs.move"), s_of(in, a[1], "fs.move"))); return Nil{}; })
+        .def("move", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::move(p_wr(in, a[0], "fs.move"), p_wr(in, a[1], "fs.move"))); return Nil{}; })
         .def("glob", 1, 2, [](Interp& in, Args& a) -> Value {
-            need(in, in.caps.fs, "file access"); auto r = ok(in, os::fs::glob(s_of(in, a[0], "fs.glob"), a.size() > 1 ? s_of(in, a[1], "fs.glob base") : "."));
+            need(in, in.caps.fs, "file access");
+            const std::string& pat = s_of(in, a[0], "fs.glob"); std::string base = a.size() > 1 ? p_rd(in, a[1], "fs.glob base") : std::string(".");
+            if (a.size() <= 1) enforce_scope(in, SecScope::fs_read, base);
+            // the pattern's literal directory prefix ("/etc/x*" or "../../*") must lie inside the read roots too
+            std::size_t cut = std::string::npos;
+            for (std::size_t i = 0; i < pat.size() && pat[i] != '*' && pat[i] != '?' && pat[i] != '['; ++i) if (pat[i] == '/' || pat[i] == '\\') cut = i;
+            if (cut != std::string::npos) { auto d = pat.substr(0, cut ? cut : 1); enforce_scope(in, SecScope::fs_read, std::filesystem::path(d).is_absolute() || d.front() == '/' ? d : os::join(base, d)); }
+            auto r = ok(in, os::fs::glob(pat, base));
             auto l = make<List>(); for (auto& p : r) l->push(strv(p)); return obj(l);
         })
         .def("walk", 1, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access"); os::fs::walk_opts o; if (a.size() > 1) o.max_depth = int(i_of(in, a[1], "fs.walk depth"));
-            auto r = ok(in, os::fs::walk(s_of(in, a[0], "fs.walk"), o)); auto l = make<List>();
+            auto r = ok(in, os::fs::walk(p_rd(in, a[0], "fs.walk"), o)); auto l = make<List>();
             for (auto& e : r) { auto m = make<Map>(); m->set_str("path", strv(e.path)); m->set_str("is_dir", e.is_dir); m->set_str("is_link", e.is_link); m->set_str("size", std::int64_t(e.size)); m->set_str("depth", std::int64_t(e.depth)); l->push(obj(m)); }
             return obj(l);
         })
         .def("match", 2, 2, [](Interp& in, Args& a) -> Value { return os::fs::glob_match(s_of(in, a[0], "fs.match"), s_of(in, a[1], "fs.match")); })
-        .def("symlink", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::symlink(s_of(in, a[0], "fs.symlink"), s_of(in, a[1], "fs.symlink"))); return Nil{}; })
-        .def("readlink", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::read_link(s_of(in, a[0], "fs.readlink")))); })
-        .def("chmod", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::chmod(s_of(in, a[0], "fs.chmod"), unsigned(i_of(in, a[1], "fs.chmod mode")))); return Nil{}; })
-        .def("mode", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return std::int64_t(ok(in, os::fs::mode(s_of(in, a[0], "fs.mode")))); })
-        .def("touch", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::touch(s_of(in, a[0], "fs.touch"))); return Nil{}; })
-        .def("set_mtime", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::set_mtime_ns(s_of(in, a[0], "fs.set_mtime"), std::int64_t(f_of(in, a[1], "mtime") * 1e9))); return Nil{}; })
-        .def("write_atomic", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); auto d = in.str(a[1]); ok(in, os::fs::write_file_atomic(s_of(in, a[0], "fs.write_atomic"), d)); return std::int64_t(d.size()); })
-        .def("temp_file", 0, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::make_temp_file(a.empty() ? "forge-" : s_of(in, a[0], "fs.temp_file")))); })
-        .def("make_temp_dir", 0, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::make_temp_dir(a.empty() ? "forge-" : s_of(in, a[0], "fs.make_temp_dir")))); })
+        .def("symlink", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::symlink(p_rd(in, a[0], "fs.symlink"), p_wr(in, a[1], "fs.symlink"))); return Nil{}; })
+        .def("readlink", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return strv(ok(in, os::fs::read_link(p_rd(in, a[0], "fs.readlink")))); })
+        .def("chmod", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::chmod(p_wr(in, a[0], "fs.chmod"), unsigned(i_of(in, a[1], "fs.chmod mode")))); return Nil{}; })
+        .def("mode", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); return std::int64_t(ok(in, os::fs::mode(p_rd(in, a[0], "fs.mode")))); })
+        .def("touch", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::touch(p_wr(in, a[0], "fs.touch"))); return Nil{}; })
+        .def("set_mtime", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::fs::set_mtime_ns(p_wr(in, a[0], "fs.set_mtime"), std::int64_t(f_of(in, a[1], "mtime") * 1e9))); return Nil{}; })
+        .def("write_atomic", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); auto d = in.str(a[1]); ok(in, os::fs::write_file_atomic(p_wr(in, a[0], "fs.write_atomic"), d)); return std::int64_t(d.size()); })
+        .def("temp_file", 0, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); enforce_scope(in, SecScope::fs_write, os::temp_dir()); return strv(ok(in, os::fs::make_temp_file(a.empty() ? "forge-" : s_of(in, a[0], "fs.temp_file")))); })
+        .def("make_temp_dir", 0, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); enforce_scope(in, SecScope::fs_write, os::temp_dir()); return strv(ok(in, os::fs::make_temp_dir(a.empty() ? "forge-" : s_of(in, a[0], "fs.make_temp_dir")))); })
         .def("disk_usage", 1, 1, [](Interp& in, Args& a) -> Value {
-            need(in, in.caps.fs, "file access"); auto d = ok(in, os::fs::disk_usage(s_of(in, a[0], "fs.disk_usage"))); auto m = make<Map>();
+            need(in, in.caps.fs, "file access"); auto d = ok(in, os::fs::disk_usage(p_rd(in, a[0], "fs.disk_usage"))); auto m = make<Map>();
             m->set_str("total", std::int64_t(d.total)); m->set_str("free", std::int64_t(d.free)); m->set_str("available", std::int64_t(d.available)); return obj(m);
         })
         .def("lock", 1, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access"); bool wait = a.size() < 2 || in.truthy(a[1]);
-            auto r = os::fs::file_lock::acquire(s_of(in, a[0], "fs.lock"), true, wait);
+            auto r = os::fs::file_lock::acquire(p_wr(in, a[0], "fs.lock"), true, wait);
             if (!r) { if (!wait) return Nil{}; in.raise("IOError", r.err.what); }
             auto l = std::make_shared<os::fs::file_lock>(std::move(r.value));
             return make_handle(in, "lock", l, [l]() { l->unlock(); });
@@ -681,14 +710,14 @@ void install_builtins(Shared& sh) {
             if (auto* v = opt_key(a, 1, "polling")) o.force_polling = Interp::truthy(*v);
             if (auto* v = opt_key(a, 1, "hidden")) o.include_hidden = Interp::truthy(*v);
             if (auto* v = opt_key(a, 1, "ignore")) if (auto* l = as<List>(*v)) for (auto& x : l->items) o.ignore.push_back(in.str(x));
-            auto w = ok(in, os::tree_watcher::open(s_of(in, a[0], "fs.watch_tree"), o));
+            auto w = ok(in, os::tree_watcher::open(p_rd(in, a[0], "fs.watch_tree"), o));
             std::shared_ptr<os::tree_watcher> sp(std::move(w));
             return make_handle(in, "treewatcher", sp, {});
         })
         .def("watch", 1, 1, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.fs, "file access");
             auto w = std::make_shared<os::file_watcher>();
-            if (auto* l = as<List>(a[0])) { for (auto& x : l->items) ok(in, w->add(in.str(x))); } else ok(in, w->add(s_of(in, a[0], "fs.watch")));
+            if (auto* l = as<List>(a[0])) { for (auto& x : l->items) { auto px = in.str(x); enforce_scope(in, SecScope::fs_read, px); ok(in, w->add(px)); } } else ok(in, w->add(p_rd(in, a[0], "fs.watch")));
             return make_handle(in, "watcher", w, {});
         }).done();
     M["handle:file"]["read"] = native("file.read", 1, 2, [](Interp& in, Args& a) -> Value {
@@ -736,13 +765,13 @@ void install_builtins(Shared& sh) {
         .val("platform", strv(os::platform_name()))
         .def("pid", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::pid()); })
         .def("cwd", 0, 0, [](Interp&, Args&) -> Value { return strv(os::cwd()); })
-        .def("chdir", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::chdir(s_of(in, a[0], "os.chdir"))); return Nil{}; })
+        .def("chdir", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.fs, "file access"); ok(in, os::chdir(p_rd(in, a[0], "os.chdir"))); return Nil{}; })
         .def("env", 1, 2, [](Interp& in, Args& a) -> Value {
-            need(in, in.caps.env, "environment access"); auto k = s_of(in, a[0], "os.env");
+            need(in, in.caps.env, "environment access"); auto k = s_of(in, a[0], "os.env"); enforce_scope(in, SecScope::env, k);
             if (!os::has_env(k)) return a.size() > 1 ? a[1] : Value(Nil{});
             return strv(os::getenv(k));
         })
-        .def("setenv", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.env, "environment access"); return os::setenv(s_of(in, a[0], "os.setenv"), in.str(a[1])); })
+        .def("setenv", 2, 2, [](Interp& in, Args& a) -> Value { need(in, in.caps.env, "environment access"); enforce_scope(in, SecScope::env, s_of(in, a[0], "os.setenv")); return os::setenv(s_of(in, a[0], "os.setenv"), in.str(a[1])); })
         .def("cpu_count", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::cpu_count()); })
         .def("total_memory", 0, 0, [](Interp&, Args&) -> Value { return std::int64_t(os::total_memory()); })
         .def("home", 0, 0, [](Interp&, Args&) -> Value { return strv(os::home_dir()); })
@@ -824,16 +853,21 @@ void install_builtins(Shared& sh) {
 
     // ------------------------------------------------ net (forge::os::net) and service (forge::os::service)
     B["net"] = Lib("net")
-        .def("resolve", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.net, "network access"); auto r = ok(in, os::net::resolve(s_of(in, a[0], "net.resolve")), "NetError"); auto l = make<List>(); for (auto& x : r) l->push(strv(x.ip)); return obj(l); })
+        .def("resolve", 1, 1, [](Interp& in, Args& a) -> Value { need(in, in.caps.net, "network access"); enforce_scope(in, SecScope::net_connect, s_of(in, a[0], "net.resolve")); auto r = ok(in, os::net::resolve(s_of(in, a[0], "net.resolve")), "NetError"); auto l = make<List>(); for (auto& x : r) l->push(strv(x.ip)); return obj(l); })
         .def("interfaces", 0, 0, [](Interp& in, Args&) -> Value {
             need(in, in.caps.net, "network access"); auto r = ok(in, os::net::interfaces(), "NetError"); auto l = make<List>();
             for (auto& i : r) { auto m = make<Map>(); m->set_str("name", strv(i.name)); m->set_str("up", i.up); m->set_str("loopback", i.loopback); auto ad = make<List>(); for (auto& x : i.addresses) ad->push(strv(x.ip)); m->set_str("addresses", obj(ad)); l->push(obj(m)); }
             return obj(l);
         })
-        .def("port_open", 2, 3, [](Interp& in, Args& a) -> Value { need(in, in.caps.net, "network access"); return os::net::port_open(s_of(in, a[0], "net.port_open"), int(i_of(in, a[1], "port")), a.size() > 2 ? int(i_of(in, a[2], "timeout")) : 1000); })
+        .def("port_open", 2, 3, [](Interp& in, Args& a) -> Value { need(in, in.caps.net, "network access");
+            auto h = s_of(in, a[0], "net.port_open"); int port = int(i_of(in, a[1], "port"));
+            enforce_scope(in, SecScope::net_connect, (h.find(':') != std::string::npos ? "[" + h + "]" : h) + ":" + std::to_string(port));
+            return os::net::port_open(h, port, a.size() > 2 ? int(i_of(in, a[2], "timeout")) : 1000);
+        })
         .def("http", 1, 2, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.net, "network access");
             os::net::http_request rq; rq.url = s_of(in, a[0], "net.http");
+            if (auto u = os::net::parse_url(rq.url)) enforce_scope(in, SecScope::net_connect, (u->host.find(':') != std::string::npos ? "[" + u->host + "]" : u->host) + ":" + std::to_string(u->port ? u->port : u->scheme == "https" ? 443 : 80));
             if (auto* v = opt_key(a, 1, "method")) rq.method = in.str(*v);
             if (auto* v = opt_key(a, 1, "body")) rq.body = in.str(*v);
             if (auto* v = opt_key(a, 1, "timeout")) rq.timeout_ms = int(i_of(in, *v, "timeout"));
@@ -883,6 +917,7 @@ void install_builtins(Shared& sh) {
         .def("start", 1, 1, [](Interp& in, Args& a) -> Value {
             need(in, in.caps.proc, "running processes");
             std::vector<std::string> argv; for (auto& x : l_of(in, a[0], "proc.start").items) argv.push_back(in.str(x));
+            enforce_scope(in, SecScope::exec, argv.empty() ? std::string() : argv[0]);
             in.charge_process(argv.empty() ? std::string("proc.start") : argv[0]);
             auto c = std::make_shared<os::child>(ok(in, os::child::start(argv, true), "OSError"));
             Value h = make_handle(in, "process", c, [c]() { if (c->running()) { c->kill(); c->wait(1000); } });
@@ -900,6 +935,7 @@ void install_builtins(Shared& sh) {
     //   std::vector<int> xs = {1, 2, 3}; pp.map(src, xs); pp.size(); pp.shutdown();
     B["ProcessPool"] = native("ProcessPool", 0, 2, [](Interp& in, Args& a) -> Value {
         register_script_process_task();
+        enforce_scope(in, SecScope::exec, "ProcessPool workers");
         auto box = std::make_shared<PoolBox>();
         // a worker never gets a capability its parent script lacks
         auto cap = [&](const char* k, bool parent) { auto* v = opt_key(a, 1, k); return parent && v && Interp::truthy(*v); };
@@ -1136,6 +1172,9 @@ void install_builtins(Shared& sh) {
     // ------------------------------------------------ native plugins (script/include/forge/script/plugin.h) and modules
     sh.load_plugin = [](Interp& in, const std::string& path) -> Value {
         if (!(in.caps.fs && in.caps.net && in.caps.proc && in.caps.env)) in.raise("PermissionError", "native plugins are refused in sandboxed runs");
+        // FSS INT-1 / CAP-1: an active policy decides (integrity.plugins "required" refuses: no plugin verifier yet)
+        enforce_scope(in, SecScope::fs_read, path);
+        enforce_scope(in, SecScope::plugin_load, path);
         {
             std::lock_guard g(in.sh->mod_m);
             if (auto it = in.sh->plugins.find(path); it != in.sh->plugins.end()) return it->second;

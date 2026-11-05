@@ -1,12 +1,16 @@
 # FORGE Security Standard (FSS) v1 — draft
 
-**Status: draft; the core API exists, FORGE itself does not use it yet.** As of 2026-11-05 the `forge::security`
-module ([security-api.md](security-api.md)) provides the policy file and profiles, `enforce()`, `safe_join` /
-`canonical_within`, the audit stream, `lockdown()`, `check()`, the `security_error` family and
-`forge security check`. No FORGE program calls `lockdown()` or routes its operations through `enforce()` yet (script
-built-ins, `forge-serve`, `rpc-serve` and loaders keep their own checks), and there is no `FORGE_HARDENING` CMake
-option in this module. What FORGE enforces outside the module is in [security.md](security.md). The "Today" column
-says what exists for each control; everything else is a requirement for future work.
+**Status: draft; the core API exists and FORGE's own programs use it when a policy is active.** As of 2026-11-05 the
+`forge::security` module ([security-api.md](security-api.md)) provides the policy file and profiles, `enforce()`,
+`safe_join` / `canonical_within`, the audit stream, `lockdown()`, `check()`, the `security_error` family and
+`forge security check`. With an active policy, `forge script` derives its capabilities from it, scopes the script
+built-ins' file, network, process and environment operations through `enforce()` and calls `lockdown()` before
+running; `forge-serve` and `forge rpc-serve` (and its script children) call `lockdown()` after binding and loading;
+model loads check `fs.read` and `integrity.models`; native plugin loads go through `enforce(plugin_load)`
+([security-api.md, "Integration"](security-api.md#integration)). With no policy (profile `none`) all of this is
+skipped. There is no `FORGE_HARDENING` CMake option in this module. What FORGE enforces outside the module is in
+[security.md](security.md). The "Today" column says what exists for each control; everything else is a requirement
+for future work.
 
 **Deviation from this draft: no policy means no profile.** Without a policy file and without `FORGE_SECURITY_PROFILE`,
 `load_policy()` returns profile `none` ("no FSS profile active", FORGE's behaviour before the standard), not `strict`.
@@ -28,10 +32,11 @@ SEI CERT C++, NIST SP 800-218 (SSDF) and the CIS Benchmarks.
 | P6 | Auditability | Denials, weakenings and integrity failures go to the OS audit facility. |
 
 Today: `forge::security` implements P1 (profiles deny by default), P4 (`lockdown` refuses a required control it
-cannot apply, `plugin_load` is refused when a required check cannot run) and P6 (`audit`) for code that uses it. No
-profile is active unless a policy file or `FORGE_SECURITY_PROFILE` says so, and script capabilities are still default
-**allow** (all `Caps` flags start on) and narrowed by flags or `forge::sandbox`. P1 and P3 are not met for FORGE's
-own programs.
+cannot apply, `plugin_load` is refused when a required check cannot run, a model failing `integrity.models:
+required` is not loaded) and P6 (`audit`). FORGE's programs follow P1 when a policy is active: `forge script` turns
+net / proc / env off unless the policy grants them and confines file operations to its roots. No profile is active
+unless a policy file or `FORGE_SECURITY_PROFILE` says so; without one, script capabilities are default **allow** (all
+`Caps` flags start on) as before. P3 (strict by default) is not met.
 
 ## Profiles
 
@@ -51,6 +56,8 @@ own programs.
 Today: the three profiles exist as policy defaults (`security::profile_defaults`, table in
 [security-api.md](security-api.md#policy)) and are applied by `lockdown()` / `enforce()` for programs that call them.
 "strict (default)" is not the default yet (see the status note). The credentials row is not part of the policy.
+The scripts row: `forge script` under a policy runs unsigned scripts with the policy's capabilities, so `strict` gives
+no net / proc / env and a confined file system; `standard` and `permissive` give what their policy grants, audited.
 
 ## Controls
 
@@ -58,7 +65,7 @@ Today: the three profiles exist as policy defaults (`security::profile_defaults`
 
 | ID | Requirement | Today |
 |----|-------------|-------|
-| SBX-1 | Servers and script hosts call `lockdown(policy)` before handling untrusted input. | `security::lockdown` exists; no FORGE program calls it yet. `forge script` applies `os::apply_sandbox` when `--no-fs/--no-net/--no-proc` is given; `rpc-serve` script children do the same. `forge-serve` applies none. |
+| SBX-1 | Servers and script hosts call `lockdown(policy)` before handling untrusted input. | With an active policy: `forge script` (and `rpc-serve` script children) lock down before running the script; `forge rpc-serve`, `forge-serve` and `forge-serve proxy` after binding the listener and loading, before the first request (audited; controls that are not `ok` are printed). Linux: the seccomp filter is synchronised to threads that already exist (TSYNC); Landlock write rules bind only the locking thread and threads started after it. Without a policy: `forge script` applies `os::apply_sandbox` for `--no-fs/--no-net/--no-proc` as before, `rpc-serve` script children likewise; `forge-serve` applies none. |
 | SBX-2 | Order: rlimits → no-new-privs → privilege drop → fs confinement → syscall confinement; each irreversible. | `lockdown` follows this order: `setrlimit` / job object limits, `PR_SET_NO_NEW_PRIVS` (FreeBSD `procctl`), a root check instead of a privilege drop (FORGE never changes uid), Landlock write rules, `os::apply_sandbox`. Child rlimits exist in `os::spawn_spec`. |
 | SBX-3 | Backends: Linux seccomp + Landlock + caps; FreeBSD Capsicum; OpenBSD pledge/unveil; macOS sandbox_init; Windows mitigation policies, job object, AppContainer; iOS/Android app sandbox. | seccomp + Landlock (write / exec / TCP denial in `os::apply_sandbox`; per-root write rules in `lockdown`), Capsicum `cap_enter`, `pledge` (no `unveil`), `sandbox_init`, Windows job object / AppContainer / restricted token (`os/sandbox.hpp`); `lockdown` adds Windows mitigation policies (ACG, extension points, image load; strict handle checks in strict). No capability dropping. `lockdown` does not use Capsicum (all-or-nothing) on the current process. |
 | SBX-4 | Missing mechanism in `strict` ⇒ `SandboxError` unless emulated. | `lockdown` throws `sandbox_error` (before applying anything) when a required control is missing, or emulated with `"emulation": "deny"`. The emulation layer is `enforce()`, which covers only its callers. `--os-sandbox require` aborts a script if the sandbox cannot be applied. |
@@ -69,18 +76,18 @@ Today: the three profiles exist as policy defaults (`security::profile_defaults`
 
 | ID | Requirement | Today |
 |----|-------------|-------|
-| CAP-1 | Every privileged operation goes through `enforce(capability, target)`. | `security::enforce` / `try_enforce` exist (path-, host- and port-scoped, audited). FORGE's own operations do not call them yet: script built-ins check `Caps` flags (fs, net, proc, env, reflect), not path- or host-scoped. |
+| CAP-1 | Every privileged operation goes through `enforce(capability, target)`. | `security::enforce` / `try_enforce` (path-, host- and port-scoped, audited). Script built-ins call it through the runtime hook `enforce_scope` against the active policy: file reads, writes and listings (path), `net.http`, `net.port_open`, `net.resolve`, `forge::remote*` and the AI endpoint (`host:port`), `run`, `proc.start`, shell blocks and `ProcessPool` (exec), `os.env` / `std::getenv` (env), imports and native plugins. Model loads check `fs_read`; the servers check `net_listen` (the proxy also `net_connect`). Not routed through it: the C++ API used directly, importers, the `.fsc` cache, KV spill files, open file handles. |
 | CAP-2 | Canonicalise paths, resolve symlinks, reject `..`, NUL, device namespaces. | `security::canonical_within` and `check_relative` (also used by `enforce`). Bundle manifests keep their own `safe_rel_path`. |
-| CAP-3 | `safe_join(root, rel)` for untrusted relative paths. | `security::safe_join` / `try_safe_join`; not yet used by FORGE's loaders. |
+| CAP-3 | `safe_join(root, rel)` for untrusted relative paths. | `security::safe_join` / `try_safe_join`; not yet used by FORGE's loaders (script paths go through `canonical_within` in `enforce`). |
 
 ### Integrity (FSS-INT)
 
 | ID | Requirement | Today |
 |----|-------------|-------|
-| INT-1 | Verify models, plugins and scripts before load; policy decides if a signature is required. | `.fpk` signatures are checked on request (`forge verify`, `verify_signature`) or at load with `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS`, which `lockdown` sets when `integrity.models` is required. `.fsc` cache entries can require signatures. Plugins and scripts are not verified; `enforce(plugin_load)` refuses plugins when `integrity.plugins` is required. |
+| INT-1 | Verify models, plugins and scripts before load; policy decides if a signature is required. | Models: `inference::model` reads the active policy. `integrity.models` `required` verifies the hashes and the embedded Ed25519 signature against `integrity.trusted_keys` (any valid signature when the list is empty) before the blueprint or any tensor is used; `optional` verifies signed files and audits unsigned ones. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` (also set by `lockdown`) still apply and add keys. `forge verify` / `verify_signature` on request; `.fsc` cache entries can require signatures. Plugins: `enforce(plugin_load)` refuses them when `integrity.plugins` is required (there is no verifier), audited. Scripts are not signed: `integrity.scripts` `required` makes `forge script` refuse to run; `optional` runs and audits. |
 | INT-2 | Ed25519 over BLAKE3 digests; `.fpk` embedded section, detached `.sig` elsewhere. | `.fpk` embedded signature: yes. Directories: signed bundles with `FORGE-SIGNATURE.json`. No detached `.sig` format. |
 | INT-3 | Plugins also pass OS code signing (Authenticode, `SecStaticCodeCheckValidity`, IMA). | Not implemented. |
-| INT-4 | Integrity failure ⇒ `IntegrityError`, audited, artefact not mapped. | `security::integrity_error` exists; the loaders still raise `forge_exception` (`errc::integrity_error`) and do not audit. |
+| INT-4 | Integrity failure ⇒ `IntegrityError`, audited, artefact not mapped. | Under an active policy with `integrity.models` not `off`, a failed check throws `security::integrity_error` (script class `IntegrityError`) and is audited (`INT-4`, `fail`). The file is mapped read-only and hashed before the check, but no blueprint, tokenizer or tensor is read from it. Without a policy the environment path still raises `forge_exception` (`errc::integrity_error`), unaudited. |
 
 ### Cryptography and secrets (FSS-CRY)
 
@@ -95,7 +102,7 @@ Today: the three profiles exist as policy defaults (`security::profile_defaults`
 
 | ID | Requirement | Today |
 |----|-------------|-------|
-| ERR-1 | `SecurityError` ⊃ `PolicyViolation`, `IntegrityError`, `PermissionDenied`, `SandboxError`, also as script classes. | C++: `security_error` ⊃ `policy_violation`, `integrity_error`, `permission_denied`, `sandbox_error`, derived from `os::os_exception`. Scripts: `permission_denied` maps to `PermissionError`, `sandbox_error` to `SandboxViolationError`; the other script classes do not exist yet. |
+| ERR-1 | `SecurityError` ⊃ `PolicyViolation`, `IntegrityError`, `PermissionDenied`, `SandboxError`, also as script classes. | C++: `security_error` ⊃ `policy_violation`, `integrity_error`, `permission_denied`, `sandbox_error`, derived from `os::os_exception`. Scripts: `SecurityError` (under `OSError`) ⊃ `IntegrityError`, `PolicyViolation`; `permission_denied` maps to the existing `PermissionError` and `sandbox_error` to `SandboxViolationError`, which keep their place under `OSError` (not under `SecurityError`). |
 | ERR-2 | `os::error` codes in a `0x5EC0x` range. | `0x5EC01`-`0x5EC04` (`security::sec_code`); `security::classify` maps them, plain `os::classify` reports `other`. |
 | ERR-3 | Security errors are never swallowed. | Not audited. |
 | ERR-4 | No secrets in messages. | Not audited. |
@@ -104,7 +111,7 @@ Today: the three profiles exist as policy defaults (`security::profile_defaults`
 
 | ID | Requirement | Today |
 |----|-------------|-------|
-| AUD-1 | Events to journald/syslog, `os_log`, Windows Event Log, logcat, plus a JSON-lines file. | `security::audit` writes to syslog (POSIX; journald) or the Windows event log, the FORGE logger (module `security`), callbacks and a 0600 JSON-lines file. No `os_log` or logcat sink. Only `forge::security` itself emits events so far. |
+| AUD-1 | Events to journald/syslog, `os_log`, Windows Event Log, logcat, plus a JSON-lines file. | `security::audit` writes to syslog (POSIX; journald) or the Windows event log, the FORGE logger (module `security`), callbacks and a 0600 JSON-lines file. No `os_log` or logcat sink. Events come from `forge::security` itself and, under a policy, from model loads (INT-1 / INT-4), `forge script` (the unsigned-script decision), script built-in denials (CAP-1) and the servers (SBX-1). |
 | AUD-2 | Each event: UTC time, pid, profile, category, decision, control ID, target. | Yes (`audit_record`). |
 | AUD-3 | Audit sink failure never unblocks a denial. | `audit()` never throws; sink failures are counted (`audit_failures()`). |
 

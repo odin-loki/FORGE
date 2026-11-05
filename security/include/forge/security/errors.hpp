@@ -10,8 +10,8 @@
 // The codes live in the 0x5EC00-0x5EC0F range of os::error::code (like os::unsupported_code, they cannot clash with
 // errno or Win32 values). os_exception::kind is permission_denied for permission_denied and sandbox_violation for
 // sandbox_error, so os_exception::script_type() keeps giving the existing script classes PermissionError and
-// SandboxViolationError; policy_violation and integrity_error report "OSError" there until the script classes
-// SecurityError / PolicyViolation / IntegrityError exist (fss_class() gives the FSS name).
+// SandboxViolationError; policy_violation and integrity_error report "OSError" there. The script interpreter maps
+// them by code to its classes PolicyViolation / IntegrityError (under SecurityError) (fss_class() gives the FSS name).
 #include <forge/os/oserror.hpp>
 #include <string>
 

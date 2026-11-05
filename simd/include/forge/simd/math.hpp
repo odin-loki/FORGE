@@ -159,8 +159,8 @@ template <Policy P = precise, Target Tg> inline vec<float, Tg> tanh(vec<float, T
     p = fma(p, z, splat<Tg>(-5.37397155531e-2f));
     p = fma(p, z, splat<Tg>(1.33314422036e-1f));
     p = fma(p, z, splat<Tg>(-3.33332819422e-1f));
-    V small = fma(p * z, x, x);
-    return select(lt(ax, splat<Tg>(0.625f)), small, big);
+    V lo = fma(p * z, x, x);   // not "small": <rpcndr.h> defines small as char
+    return select(lt(ax, splat<Tg>(0.625f)), lo, big);
 }
 
 template <Policy P = precise, Target Tg> inline vec<float, Tg> gelu(vec<float, Tg> x) {
@@ -216,9 +216,9 @@ template <Policy P = precise, Target Tg> inline vec<float, Tg> expm1(vec<float, 
     p = fma(p, x, splat<Tg>(4.16666667e-2f));
     p = fma(p, x, splat<Tg>(1.66666667e-1f));
     p = fma(p, x, splat<Tg>(0.5f));
-    V small = fma(p * x, x, x);
+    V lo = fma(p * x, x, x);
     V big = exp<P>(x) - splat<Tg>(1.0f);
-    return select(lt(abs(x), splat<Tg>(0.75f)), small, big);
+    return select(lt(abs(x), splat<Tg>(0.75f)), lo, big);
 }
 
 template <Policy P = precise, Target Tg> inline vec<float, Tg> log2(vec<float, Tg> x) { return log<P>(x) * splat<Tg>(1.44269504088896341f); }
@@ -434,10 +434,10 @@ template <Policy P = precise, Target Tg> inline vec<float, Tg> sinh(vec<float, T
     using V = vec<float, Tg>;
     V a = abs(x);
     V em = expm1<P>(a);
-    V small = splat<Tg>(0.5f) * (em + em / (em + splat<Tg>(1.0f)));
+    V lo = splat<Tg>(0.5f) * (em + em / (em + splat<Tg>(1.0f)));
     V e = detail::half_exp<P>(a);
     V big = e - splat<Tg>(0.25f) / e;
-    V y = select(lt(a, splat<Tg>(1.0f)), small, big);
+    V y = select(lt(a, splat<Tg>(1.0f)), lo, big);
     return select(lt(x, splat<Tg>(0.0f)), -y, y);
 }
 template <Policy P = precise, Target Tg> inline vec<float, Tg> cosh(vec<float, Tg> x) {
@@ -456,8 +456,8 @@ template <Policy P = precise, Target Tg> inline vec<float, Tg> erfc(vec<float, T
           select(lt(a, splat<Tg>(6.0f)), detail::horner(coeffs::erfc_2, a - splat<Tg>(4.75f)),
                                          detail::horner(coeffs::erfc_3, a - splat<Tg>(8.0f)))));
     V tail = g * r;
-    V small = splat<Tg>(1.0f) - a * detail::horner(coeffs::erf_small, a2);
-    V y = select(lt(a, splat<Tg>(0.5f)), small, tail);
+    V lo = splat<Tg>(1.0f) - a * detail::horner(coeffs::erf_small, a2);
+    V y = select(lt(a, splat<Tg>(0.5f)), lo, tail);
     y = select(lt(splat<Tg>(10.1f), a), splat<Tg>(0.0f), y);
     y = select(lt(x, splat<Tg>(0.0f)), splat<Tg>(2.0f) - y, y);
     return select(isnan(x), x, y);
@@ -465,8 +465,8 @@ template <Policy P = precise, Target Tg> inline vec<float, Tg> erfc(vec<float, T
 template <Policy P = precise, Target Tg> inline vec<float, Tg> erf(vec<float, Tg> x) {
     using V = vec<float, Tg>;
     V a = abs(x);
-    V small = a * detail::horner(coeffs::erf_small, a * a);
-    V y = select(lt(a, splat<Tg>(1.0f)), small, splat<Tg>(1.0f) - erfc<P>(a));
+    V lo = a * detail::horner(coeffs::erf_small, a * a);
+    V y = select(lt(a, splat<Tg>(1.0f)), lo, splat<Tg>(1.0f) - erfc<P>(a));
     y = select(isnan(x), x, y);
     return select(lt(x, splat<Tg>(0.0f)), -y, y);
 }

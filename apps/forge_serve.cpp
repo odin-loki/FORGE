@@ -1,6 +1,6 @@
 // forge-serve — OpenAI-compatible HTTP server over the continuous-batching scheduler.
 //
-//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill]   (see docs/serve.md)
+//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill] [--policy F]   (see docs/serve.md)
 //
 //   GET  /health                 -> {"status":"ok"}
 //   GET  /v1/models              -> model list
@@ -19,6 +19,7 @@
 #include <forge/os/memory_pressure.hpp>
 #include <forge/os/numa.hpp>
 #include <forge/os/service.hpp>
+#include <forge/security/security.hpp>
 #include <signal.h>
 #include <atomic>
 #include <cstdio>
@@ -160,14 +161,14 @@ private:
             for (auto& msg : j["messages"].arr()) text += msg.str_or("role", "user") + ": " + msg.str_or("content", "") + "\n";
             text += "assistant:";
             prompt = tok->encode(text);
-            if (tok->bos() >= 0) prompt.insert(prompt.begin(), tok->bos());
+            if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
         } else {
             auto& p = j["prompt"];
             if (p.is_arr()) for (auto& x : p.arr()) prompt.push_back(int(x.num()));
             else {
                 if (!tok) raise(errc::unsupported, "text prompts need a tokenizer; send token ids");
                 prompt = tok->encode(p.str());
-                if (tok->bos() >= 0 && !j.find("add_bos")) prompt.insert(prompt.begin(), tok->bos());
+                if (tok->add_bos() && !j.find("add_bos")) prompt.insert(prompt.begin(), tok->bos());
                 else if (auto* ab = j.find("add_bos"); ab && ab->is_bool() && ab->b() && tok->bos() >= 0) prompt.insert(prompt.begin(), tok->bos());
             }
         }
@@ -267,8 +268,25 @@ std::string arg(int argc, char** argv, const std::string& k, const std::string& 
     return d;
 }
 
+// FSS (docs/serve.md "Security policy"): --policy F, else the load_policy() search. An active policy becomes the
+// process's policy for enforce() (model loads check fs.read and integrity.models through it); profile none: nothing.
+security::policy activate_policy(int argc, char** argv) {
+    auto p = security::load_policy(arg(argc, argv, "policy", ""));
+    if (p.active()) security::set_active_policy(p);
+    return p;
+}
+std::string host_port(const std::string& h, int port) { return (h.find(':') != std::string::npos ? "[" + h + "]" : h) + ":" + std::to_string(port); }
+// SBX-1: after the socket is bound and the model loaded, before the first request.
+void server_lockdown(const security::policy& p, const char* who, const std::string& listen) {
+    if (!p.active()) return;
+    auto r = security::lockdown(p);
+    for (auto& c : r.controls)
+        if (c.verdict != "ok") std::fprintf(stderr, "%s: security %s %s: %s%s\n", who, c.id.c_str(), c.name.c_str(), c.state.c_str(), c.detail.empty() ? "" : (" (" + c.detail + ")").c_str());
+    security::audit("sandbox", security::decision::allow, "SBX-1", listen, std::string(who) + ": locked down (profile " + security::name(p.prof) + ", " + p.source + ") before serving");
+}
+
 // forge-serve proxy --backend host:port [--backend ...] [--mode l4|l7] [--strategy p2c] [--host] [--port]
-//   [--health-ms 2000] [--retries 3] [--route /prefix=host:port,host:port]
+//   [--health-ms 2000] [--retries 3] [--route /prefix=host:port,host:port] [--policy F]
 int run_proxy(int argc, char** argv) {
     using namespace forge::loadbalancer;
     config c; auto st = parse_strategy(arg(argc, argv, "strategy", "p2c"));
@@ -276,13 +294,14 @@ int run_proxy(int argc, char** argv) {
     c.strat = *st;
     auto p = std::make_shared<pool>(c);
     proxy_config pc;
+    std::vector<std::string> targets;   // every backend, for the policy's net_connect check
     for (int i = 2; i + 1 < argc; ++i) {
         std::string k = argv[i], v = argv[i + 1];
-        if (k == "--backend") p->add({v, v});
+        if (k == "--backend") { p->add({v, v}); targets.push_back(v); }
         else if (k == "--route") {
             auto eq = v.find('='); if (eq == std::string::npos) continue;
             auto rp = std::make_shared<pool>(c); std::string list = v.substr(eq + 1);
-            for (std::size_t a = 0; a <= list.size();) { auto b = list.find(',', a); if (b == std::string::npos) b = list.size(); if (b > a) rp->add({list.substr(a, b - a), list.substr(a, b - a)}); a = b + 1; }
+            for (std::size_t a = 0; a <= list.size();) { auto b = list.find(',', a); if (b == std::string::npos) b = list.size(); if (b > a) { rp->add({list.substr(a, b - a), list.substr(a, b - a)}); targets.push_back(list.substr(a, b - a)); } a = b + 1; }
             rp->set_health_check(tcp_probe());
             pc.routes.push_back({v.substr(0, eq), rp});
         }
@@ -292,8 +311,18 @@ int run_proxy(int argc, char** argv) {
     pc.listen_host = arg(argc, argv, "host", "127.0.0.1"); pc.listen_port = std::stoi(arg(argc, argv, "port", "8080"));
     pc.retries = unsigned(std::stoi(arg(argc, argv, "retries", "3")));
     p->set_health_check(tcp_probe());
+    security::policy pol;
+    try {
+        pol = activate_policy(argc, argv);
+        if (pol.active()) {
+            security::enforce(pol, security::capability::net_listen, host_port(pc.listen_host, pc.listen_port));
+            for (auto& t : targets) security::enforce(pol, security::capability::net_connect, t);
+        }
+    } catch (const std::exception& e) { std::fprintf(stderr, "forge-serve proxy: %s\n", e.what()); return 1; }
     proxy px(p, pc);
     if (auto s = px.start(); !s) { std::fprintf(stderr, "forge-serve proxy: %s\n", s.err.what.c_str()); return 1; }
+    try { server_lockdown(pol, "forge-serve proxy", host_port(pc.listen_host, px.port())); }
+    catch (const std::exception& e) { px.stop(); std::fprintf(stderr, "forge-serve proxy: %s\n", e.what()); return 1; }
     std::printf("forge-serve proxy (%s, %s) on %s:%d, %zu backends\n", pc.mode == proxy_config::l4 ? "l4" : "l7", strategy_name(c.strat), pc.listen_host.c_str(), px.port(), p->size());
     std::fflush(stdout);
     static std::atomic<bool> quit{false};
@@ -312,7 +341,7 @@ int run_proxy(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill] [--policy F]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)
@@ -320,6 +349,15 @@ int main(int argc, char** argv) {
 #endif
     forge::net_init();
     try {
+        // FSS: the policy is active before anything is loaded (model fs.read / integrity checks), the listen address
+        // must be allowed, and lockdown() runs once the socket is bound and the model loaded (SBX-1).
+        const auto pol = activate_policy(argc, argv);
+        const std::string listen_host = arg(argc, argv, "host", "127.0.0.1");
+        if (pol.active()) {
+            security::enforce(pol, security::capability::net_listen, host_port(listen_host, std::stoi(arg(argc, argv, "port", "8080"))));
+            if (has_flag(argc, argv, "watch") && !security::try_enforce(pol, security::capability::exec, forge::os::exe_path()))
+                throw security::policy_violation("--watch reloads by re-executing forge-serve, but the security policy (" + pol.source + ") denies exec", "SBX-1");
+        }
         std::string path = argv[1];
         namespace fs = std::filesystem;
         if (fs::is_directory(path) || path.ends_with(".gguf")) {   // import into a temp .fpk
@@ -372,6 +410,7 @@ int main(int argc, char** argv) {
         if (::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof a) < 0) raise(errc::io_error, "bind failed: {}", std::strerror(errno));
         ::listen(s, 64);
         socklen_t al = sizeof a; getsockname(s, reinterpret_cast<sockaddr*>(&a), &al);
+        server_lockdown(pol, "forge-serve", host_port(listen_host, ntohs(a.sin_port)));
         std::printf("forge-serve: %s on http://%s:%d (max_active %d, memory budget %s)\n", path.c_str(), arg(argc, argv, "host", "127.0.0.1").c_str(), ntohs(a.sin_port), bo.max_active,
                     host.limit() ? mem::format_size(host.limit()).c_str() : "off");
         std::fflush(stdout);

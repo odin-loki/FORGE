@@ -416,7 +416,7 @@ target_link_libraries(forge_security INTERFACE forge_core)
 
 add_library(forge_inference INTERFACE)
 target_include_directories(forge_inference INTERFACE inference/include)
-target_link_libraries(forge_inference INTERFACE forge_modelfile)
+target_link_libraries(forge_inference INTERFACE forge_modelfile forge_security)   # FSS model integrity / fs scope at load
 target_include_directories(forge_inference INTERFACE inference/include)
 # forge::script managed scripting runtime (docs/scripting.md). Safe C++23; libc++ hardening when available.
 # Shell backends: one file each in script/src/shells/ defining forge_shell_register_<stem>(); the registry TU is generated.
@@ -433,7 +433,7 @@ file(CONFIGURE OUTPUT ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp CONTEN
 add_library(forge_script STATIC ${FORGE_SHELL_SRCS} ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp script/src/heap.cpp script/src/parser.cpp script/src/runtime.cpp script/src/tree.cpp
   script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/ai.cpp script/src/remote.cpp script/src/mobile.cpp script/src/text.cpp script/src/reflect.cpp script/src/emit.cpp script/src/debug.cpp script/src/engine.cpp script/src/fsc.cpp script/src/check.cpp)
 target_include_directories(forge_script PUBLIC script/include PRIVATE script/src)
-target_link_libraries(forge_script PUBLIC forge_modelfile forge_mobile forge_text PRIVATE forge_verify forge_trust)
+target_link_libraries(forge_script PUBLIC forge_modelfile forge_mobile forge_text PRIVATE forge_verify forge_trust forge_security)
 if(TARGET forge_rpc_tls)
   target_link_libraries(forge_script PUBLIC forge_rpc_tls)
 endif()
@@ -1014,6 +1014,9 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      add_test(NAME security_cli COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/security_cli_test.py
+               $<TARGET_FILE:forge> $<TARGET_FILE:forge-serve> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
+      set_tests_properties(security_cli PROPERTIES DEPENDS golden_tiny_llama LABELS security)
     endif()
     # Python-module prerequisites, probed once at configure time: a test whose modules are missing is
     # reported by ctest as "Not Run (Disabled)" instead of failing (install them to run it; see docs/building.md).
@@ -1032,7 +1035,7 @@ if(FORGE_BUILD_TESTS)
     forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_inference_generate doc_example_capi_generate
-      capi_smoke python_bindings serve_http modelfile_signing)
+      capi_smoke python_bindings serve_http security_cli modelfile_signing)
     forge_py_needs("cryptography" modelfile_signing)
     forge_py_needs("numpy;onnx" onnx_import)
     if(Python3_EXECUTABLE)

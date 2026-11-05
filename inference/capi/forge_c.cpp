@@ -26,7 +26,7 @@ int64_t forge_tokenize(const forge_model* m, const char* text, int add_bos, int3
         auto* t = m->s.tokenizer();
         if (!t) { g_err = "model has no tokenizer"; return -1; }
         auto ids = t->encode(text);
-        if (add_bos && t->bos() >= 0) ids.insert(ids.begin(), t->bos());
+        if (add_bos < 0 ? t->add_bos() : (add_bos && t->bos() >= 0)) ids.insert(ids.begin(), t->bos());   // -1: the model's default
         for (int64_t i = 0; i < int64_t(ids.size()) && i < cap; ++i) out[i] = ids[std::size_t(i)];
         return int64_t(ids.size());
     } FORGE_TRY(-1)

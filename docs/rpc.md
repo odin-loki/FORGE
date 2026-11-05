@@ -14,6 +14,7 @@ forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0|...
     [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]...
     [--tls-cert C --tls-key K [--tls-client-ca CA [--tls-client-map FILE]...]] [--quiet]
     [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
+    [--policy FILE]
 ```
 
 | Flag | Default | Effect |
@@ -32,8 +33,19 @@ forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0|...
 | `--script-timeout MS` | 60000 | Per-script limit; a client may ask for less, not more |
 | `--script-mem-mb N` | 2048 | Memory limit of the script child |
 | `--script-no-proc`, `--script-no-fs`, `--script-no-net` | off | Deny those capabilities in the child (see Remote scripts) |
+| `--policy FILE` | `load_policy()` search | FORGE Security Standard policy (see Security policy) |
 
 With no tokens, keys or client map the server accepts anyone (legacy mode). It then warns if bound to anything other than `127.0.0.1`, `::1` or `localhost`, unless it requires client certificates.
+
+### Security policy
+With a policy (`--policy FILE`, `$FORGE_SECURITY_POLICY`, `./forge-security.json`, the config dir or `$FORGE_SECURITY_PROFILE`; see [security-api.md](security-api.md)), before serving:
+
+1. `--bind`/`--port` must pass `enforce(net_listen)`: loopback always, any address only with `net.mode` `any` (or a `net.hosts` match in mode `hosts`). Otherwise the server does not start (`permission_denied`, exit 1).
+2. `--allow-scripts` needs `exec` (each script runs in a `forge script` child). A policy that denies it (`strict`) stops the server at startup with "denies exec".
+3. After the socket is bound and TLS material is loaded, the server calls `security::lockdown(policy)` (SBX-1): limits, no-new-privs, Landlock write roots, seccomp (`net.mode` `none` denies new sockets but the bound listener keeps accepting), job object / mitigations on Windows. Controls that are not `ok` are printed to stderr; the lockdown and every weakened control are audited.
+4. Script children are started with `--policy <absolute path>` when one was given (otherwise they find the policy the way the server did), and lock themselves down before running the script ([scripting.md](scripting.md), "Security policy").
+
+No policy (profile `none`): none of this happens. Test: `tests/security_cli_test.py` (strict rpc-serve on loopback, refusals, a remote script confined to the policy's roots).
 
 ## Authentication
 Client and server exchange an `FRPH` hello naming a method:

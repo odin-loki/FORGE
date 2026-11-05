@@ -20,7 +20,7 @@ CMake target `forge_c` builds the shared library from `inference/capi/forge_c.cp
 | `forge_close(m)` | 1 | Free the handle |
 | `forge_reset(m)` | 1 | Clear the KV state (position 0) |
 | `forge_vocab_size(m)` | 1 | Vocabulary size |
-| `forge_tokenize(m, text, add_bos, out, cap)` | 1 | Returns the full token count (writes at most `cap`), or -1. Call with `cap` 0 to size the buffer |
+| `forge_tokenize(m, text, add_bos, out, cap)` | 1 | Returns the full token count (writes at most `cap`), or -1. Call with `cap` 0 to size the buffer. `add_bos`: 1 prepend BOS, 0 not, -1 the model's default (the manifest's `add_bos`; Qwen-family models never add BOS) |
 | `forge_detokenize(m, ids, n, out, cap)` | 1 | Writes NUL-terminated text (truncated to `cap - 1` bytes); returns the bytes needed without the NUL, or -1. `out` may be `NULL` |
 | `forge_forward(m, ids, n, logits, cap)` | 1 | Runs `ids` from the current position; writes up to `cap` floats of the last row's logits. Returns 0 or -1 |
 | `forge_generate(m, prompt, n, max_new, &sampling, out, cap, cb, user)` | 1 | Prefill and decode. Returns the number of tokens generated (may exceed `cap`; only `cap` are written), or -1 |
