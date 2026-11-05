@@ -175,7 +175,9 @@ if(FORGE_HARDENING)
         add_compile_options($<$<COMPILE_LANGUAGE:${_fh_langs}>:-fcf-protection=full>)
         _fh_on(7 cf_protection)
       endif()
-    elseif(_fh_arm64)
+    elseif(_fh_arm64 AND NOT APPLE)
+      # Not on Apple: plain arm64 Darwin's unwinder does not follow PAC-signed return addresses, so C++
+      # exceptions stop being caught (pointer authentication there is the arm64e ABI instead).
       _fh_probe(FORGE_HARDEN_BTI "-mbranch-protection=standard" "")
       if(FORGE_HARDEN_BTI)
         add_compile_options($<$<COMPILE_LANGUAGE:${_fh_langs}>:-mbranch-protection=standard>)
