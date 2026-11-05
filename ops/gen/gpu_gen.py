@@ -578,6 +578,109 @@ FORGE_GLOBAL void forge_delta_rule_r8(const float* q, const float* k, const floa
 FORGE_GLOBAL void forge_delta_rule_r32(const float* q, const float* k, const float* v, const float* g, const float* beta, float* S, float* out,
                                        unsigned s, unsigned hk, unsigned dk, unsigned hv, unsigned dv, unsigned l2, float scale) {
   dr_body(q, k, v, g, beta, S, out, s, hk, dk, hv, dv, l2, scale, 32u); }
+// delta_rule, staged (the default; same contract and arguments as forge_delta_rule): a 64-thread block per
+// (value head, 8 state columns), so Qwen3.5's 32 heads x 128 columns give 512 blocks (all resident at once on an
+// 82-SM 3090) instead of 128. Lane layout and per-token arithmetic are those of dr_body (lane = 4 * rg + cw; the 8
+// lanes rg = 0..7 sharing column j hold rows rg * R .. rg * R + R - 1 of S[h][:, j]), so the results are bitwise the
+// same; what changes is where the per-token inputs come from. The token loop is latency-bound, so tokens are taken in
+// chunks of 4: while chunk c is computed from shared memory, chunk c + 1's q/k rows (coalesced, warp 0 the q rows,
+// warp 1 the k rows), v (the block's 8 columns), g and beta are loaded into registers; then the q/k rows are
+// l2-normalised (dr_body's warp reduction, four rows at a time) and written with exp(g) and beta into the other
+// shared buffer, and one barrier per chunk hands it over. Per token a lane then only reads its 2R normalised q/k
+// values (16-byte shared loads) and does the state update: about half of dr_body's instructions, with no global
+// load latency or norm reduction on the token's dependency chain.
+// Requires dk == 8 * R and dv % 8 == 0. Grid: hv * (dv / 8) blocks of 64 threads. Registers are capped at 128 for
+// R <= 16 (launch_bounds 64 x 8) so 8 blocks fit per SM: at 6 per SM, 512 blocks would need a second wave.
+typedef float drf4_ __attribute__((ext_vector_type(4)));
+FORGE_DEV float drx_(float v, unsigned o) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); return w; }
+FORGE_DEV float dri_(float v, unsigned i) { float w; asm volatile("shfl.sync.idx.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(i)); return w; }
+static __attribute__((device, always_inline)) inline void drp_body(const float* q, const float* k, const float* v, const float* g, const float* beta,
+    float* S, float* out, unsigned s, unsigned hk, unsigned hv, unsigned dv, unsigned l2, float scale, float* sm, const unsigned R) {
+  const unsigned T = 4u, E = R / 4u, DK = 8u * R, VO = 2u * T * DK, BUF = VO + 10u * T;   // buffer: [T][q, k][DK], [T][8] v, [T] exp(g), [T] beta
+  unsigned t0 = tid_(), l = t0 & 31u, w = t0 >> 5, rg = l >> 2, cw = l & 3u, ncb = dv / 8u, bi = bid_(), h = bi / ncb, cb = bi % ncb;
+  unsigned j = cb * 8u + w * 4u + cw, kh = h / (hv / hk), i0 = rg * R;
+  float* Sh = S + (unsigned long long)h * DK * dv;
+  float st[32];
+#pragma unroll
+  for (unsigned r = 0; r < R; ++r) st[r] = Sh[(unsigned long long)(i0 + r) * dv + j];
+  const float* src = w == 0u ? q : k; float num = w == 0u ? scale : 1.0f;
+  float raw[32], rv = 0.0f, rgt = 0.0f, rbt = 0.0f;
+  auto fetch = [&](unsigned c) {
+#pragma unroll
+    for (unsigned tt = 0; tt < T; ++tt) {
+      unsigned t = c * T + tt; t = t < s ? t : s - 1u;
+      const float* p = src + ((unsigned long long)t * hk + kh) * DK + l;
+#pragma unroll
+      for (unsigned e = 0; e < E; ++e) raw[tt * E + e] = p[32u * e]; }
+    if (t0 < 8u * T) { unsigned t = c * T + (t0 >> 3); t = t < s ? t : s - 1u; rv = v[((unsigned long long)t * hv + h) * dv + cb * 8u + (t0 & 7u)]; }
+    if (w == 1u && l < T) { unsigned t = c * T + l; t = t < s ? t : s - 1u; rgt = g[t * hv + h]; rbt = beta[t * hv + h]; } };
+  // The T = 4 row sums are reduced together (a reduce-scatter: xor 16 and 8 halve the rows each lane carries, then
+  // xor 4, 2, 1), so lane 8 * tt ends with row tt's sum. Each sum is the same tree of the same additions as
+  // wsum_ (bitwise equal), for 10 shuffles and one divide per lane instead of 20 and 4.
+  auto stage = [&](float* B) {
+    float ss[4];
+#pragma unroll
+    for (unsigned tt = 0; tt < T; ++tt) {
+      ss[tt] = 0.0f;
+#pragma unroll
+      for (unsigned e = 0; e < E; ++e) ss[tt] = fma_(raw[tt * E + e], raw[tt * E + e], ss[tt]); }
+    bool b4 = (l & 16u) != 0u, b3 = (l & 8u) != 0u;
+    float a0 = (b4 ? ss[2] : ss[0]) + drx_(b4 ? ss[0] : ss[2], 16u), a1 = (b4 ? ss[3] : ss[1]) + drx_(b4 ? ss[1] : ss[3], 16u);
+    float x = (b3 ? a1 : a0) + drx_(b3 ? a0 : a1, 8u);
+    x += drx_(x, 4u); x += drx_(x, 2u); x += drx_(x, 1u);
+    float fl = l2 ? num / fsqrt(x + 1e-6f) : num;
+#pragma unroll
+    for (unsigned tt = 0; tt < T; ++tt) {
+      float f = dri_(fl, 8u * tt);
+#pragma unroll
+      for (unsigned e = 0; e < E; ++e) B[(tt * 2u + w) * DK + l + 32u * e] = raw[tt * E + e] * f; }
+    if (t0 < 8u * T) B[VO + t0] = rv;
+    if (w == 1u && l < T) { B[VO + 8u * T + l] = fexp(rgt); B[VO + 9u * T + l] = rbt; } };
+  // one token (all 8 lanes of a column store its output: same value, same address, no branch)
+  auto step = [&](const float* B, unsigned tt, unsigned t) {
+      const float* qp = B + tt * 2u * DK + i0; const float* kp = qp + DK;
+      float qr[32], kr[32];
+#pragma unroll
+      for (unsigned r = 0; r < R; r += 4u) {
+        drf4_ a = *(const drf4_*)(qp + r), b = *(const drf4_*)(kp + r);
+        qr[r] = a.x; qr[r + 1u] = a.y; qr[r + 2u] = a.z; qr[r + 3u] = a.w; kr[r] = b.x; kr[r + 1u] = b.y; kr[r + 2u] = b.z; kr[r + 3u] = b.w; }
+      float decay = B[VO + 8u * T + tt], bt = B[VO + 9u * T + tt], kv = 0.0f;
+#pragma unroll
+      for (unsigned r = 0; r < R; ++r) { st[r] *= decay; kv = fma_(st[r], kr[r], kv); }
+      kv = rgsum_(kv);
+      float d = (B[VO + tt * 8u + w * 4u + cw] - kv) * bt, o = 0.0f;
+#pragma unroll
+      for (unsigned r = 0; r < R; ++r) { st[r] = fma_(kr[r], d, st[r]); o = fma_(st[r], qr[r], o); }
+      o = rgsum_(o);
+      out[((unsigned long long)t * hv + h) * dv + j] = o; };
+  unsigned nch = (s + T - 1u) / T;
+  if (nch) { fetch(0u); stage(sm); }
+  bar_();
+  for (unsigned c = 0; c < nch; ++c) {
+    const float* B = sm + (c & 1u) * BUF;
+    if (c + 1u < nch) fetch(c + 1u);
+    if (c * T + T <= s) {   // a full chunk: straight-line code, so token t + 1's kv chain can overlap token t's o reduction
+#pragma unroll
+      for (unsigned tt = 0; tt < T; ++tt) step(B, tt, c * T + tt);
+    } else {
+      for (unsigned tt = 0; tt < T; ++tt) if (c * T + tt < s) step(B, tt, c * T + tt);
+    }
+    if (c + 1u < nch) stage(sm + ((c + 1u) & 1u) * BUF);
+    bar_(); }
+#pragma unroll
+  for (unsigned r = 0; r < R; ++r) Sh[(unsigned long long)(i0 + r) * dv + j] = st[r]; }
+FORGE_GLOBAL __attribute__((launch_bounds(64, 8))) void forge_delta_rule_p16(const float* q, const float* k, const float* v, const float* g, const float* beta, float* S, float* out,
+                                       unsigned s, unsigned hk, unsigned dk, unsigned hv, unsigned dv, unsigned l2, float scale) {
+  __attribute__((shared, aligned(16))) float sm[2 * (8 * 128 + 40)];
+  drp_body(q, k, v, g, beta, S, out, s, hk, hv, dv, l2, scale, sm, 16u); }
+FORGE_GLOBAL __attribute__((launch_bounds(64, 8))) void forge_delta_rule_p8(const float* q, const float* k, const float* v, const float* g, const float* beta, float* S, float* out,
+                                      unsigned s, unsigned hk, unsigned dk, unsigned hv, unsigned dv, unsigned l2, float scale) {
+  __attribute__((shared, aligned(16))) float sm[2 * (8 * 64 + 40)];
+  drp_body(q, k, v, g, beta, S, out, s, hk, hv, dv, l2, scale, sm, 8u); }
+FORGE_GLOBAL __attribute__((launch_bounds(64, 4))) void forge_delta_rule_p32(const float* q, const float* k, const float* v, const float* g, const float* beta, float* S, float* out,
+                                       unsigned s, unsigned hk, unsigned dk, unsigned hv, unsigned dv, unsigned l2, float scale) {
+  __attribute__((shared, aligned(16))) float sm[2 * (8 * 256 + 40)];
+  drp_body(q, k, v, g, beta, S, out, s, hk, hv, dv, l2, scale, sm, 32u); }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 // Batched (prefill) quantised matmul on int8 tensor cores (mma.sync s8, sm_80+; the sm_80 PTX image only), after
 // llama.cpp's MMQ (ggml-cuda/mmq.cuh, MIT, the ggml authors). Activations are quantised per 32 values
@@ -1080,6 +1183,34 @@ FORGE_GLOBAL void forge_delta_rule(const float* q, const float* k, const float* 
       for (unsigned i = 0; i < dk; ++i) { float r = fma_(kn[i] * kf, d, Sh[i * dv + j]); Sh[i * dv + j] = r; acc = fma_(r, qn[i] * qf, acc); }
       o[j] = acc; }
     bar_(); } }
+// causal_conv_t (the default; same arguments as forge_causal_conv): a thread per (channel, chunk of 8 tokens), so a
+// prefill launches ceil(C / 128) * ceil(s / 8) blocks of 128 instead of ceil(C / 128) threads walking every token in
+// turn (block b: channels (b % ncb) * 128 + tid, tokens (b / ncb) * 8 ..). A thread loads its 8 + K - 1 inputs and K
+// weights into registers once; each output is the same fma sequence as forge_causal_conv's. Only tokens t < K - 1
+// read the state, and with K <= 9 they all lie in chunk 0, so chunk 0's thread writes the new state after its reads.
+FORGE_GLOBAL void forge_causal_conv_t(const float* x, const float* w, float* st, float* out, unsigned s, unsigned C, unsigned K) {
+  unsigned ncb = (C + 127u) / 128u, bi = bid_(), c = (bi % ncb) * 128u + tid_(), t0 = (bi / ncb) * 8u;
+  if (c >= C || K > 9u) return;
+  unsigned P = K - 1u;
+  float wr[9], xv[16];
+#pragma unroll
+  for (unsigned j = 0; j < 9u; ++j) wr[j] = j < K ? w[c * K + j] : 0.0f;
+#pragma unroll
+  for (unsigned i = 0; i < 16u; ++i) { unsigned p = t0 + i;
+    xv[i] = i < 8u + P && p < s + P ? (p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]) : 0.0f; }
+#pragma unroll
+  for (unsigned tt = 0; tt < 8u; ++tt) {
+    unsigned t = t0 + tt; if (t >= s) break;
+    float acc = 0.0f;
+#pragma unroll
+    for (unsigned j = 0; j < 9u; ++j) if (j < K) acc = fma_(wr[j], xv[tt + j], acc);
+    out[(unsigned long long)t * C + c] = acc; }
+  if (t0 == 0u) {
+    float nw[8];
+#pragma unroll
+    for (unsigned i = 0; i < 8u; ++i) { unsigned p = s + i; nw[i] = i < P ? (p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]) : 0.0f; }
+#pragma unroll
+    for (unsigned i = 0; i < 8u; ++i) if (i < P) st[i * C + c] = nw[i]; } }
 // causal_conv: one thread per channel; state [K-1, C] is the previous K-1 inputs. Requires K <= 9.
 FORGE_GLOBAL void forge_causal_conv(const float* x, const float* w, float* st, float* out, unsigned s, unsigned C, unsigned K) {
   unsigned c = bid_() * 128u + tid_(); if (c >= C) return;

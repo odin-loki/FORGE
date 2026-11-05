@@ -38,6 +38,8 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_MMA_SPLITK=0` | CUDA | Turns off split-K for tensor-core matmuls whose grid cannot fill the GPU (k/v projections, DeltaNet a/b); on by default |
 | `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
 | `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
+| `FORGE_DELTA_RULE_R` | CUDA | If set, Gated DeltaNet uses the earlier register-state kernels `forge_delta_rule_r8/_r16/_r32` (a block per head and 32 columns) instead of the staged `_p8/_p16/_p32` |
+| `FORGE_CAUSAL_CONV_OLD` | CUDA, HIP | If set, the DeltaNet causal conv uses the per-channel `forge_causal_conv` kernel instead of the token-parallel `forge_causal_conv_t` |
 | `FORGE_MMVQ=0` | CUDA, HIP | Disable the q8_1/dp4a decode matmul kernels |
 | `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMA / MMQ kernels (default 16; 0 disables both) |
 | `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
