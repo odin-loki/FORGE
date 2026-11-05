@@ -26,6 +26,9 @@ int cuDeviceGet(int* d, int o) { *d = o; return 0; }
 int cuCtxCreate_v2(void** c, unsigned f, int d) { (void)f; *c = (void*)(uintptr_t)(d + 1); return 0; }
 int cuCtxDestroy_v2(void* c) { (void)c; return 0; }
 int cuCtxSetCurrent(void* c) { g_cur = (int)(uintptr_t)c - 1; return 0; }
+/* resident blocks per SM: the mma / glu kernels as on an RTX 3090 (64-token tiles 2, 128-token 1); MOCK_NO_OCC hides it */
+int cuOccupancyMaxActiveBlocksPerMultiprocessor(int* n, void* f, int bs, size_t sm) { (void)bs; (void)sm;
+    if (getenv("MOCK_NO_OCC")) return 1; *n = strstr((const char*)f, "128") ? 1 : 2; return 0; }
 #else
 int hipSetDevice(int d) { g_cur = d; return 0; }
 #endif
@@ -149,7 +152,7 @@ static int mock_qmma(const signed char* xq, const float* xds, const unsigned cha
     for (i = 0; i < rows * k; ++i) a[i] = xds[2u * (i / 32u)] * (float)xq[i];
     mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
-    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 10; if (!strncmp(op, "qmatmul_glu", 11)) return 11;
+    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 14; if (!strncmp(op, "qmatmul_glu", 11)) return 15;
     if (!strcmp(op, "glu_q81")) return 5; if (!strcmp(op, "sum_splits")) return 4; if (!strcmp(op, "argmax")) return 3;
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
@@ -253,7 +256,10 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         mock_q8r(P(ARG(0, dptr)), (signed char*)(uintptr_t)ARG(1, dptr), P(ARG(2, dptr)), nb); return 0; }
     if (!strncmp(op, "qmatmul_mma", 11)) {   /* qmatmul_mma_* (64 tokens per block) / qmatmul_mma128_* (128) */
         unsigned bt = op[11] == '1' ? 128u : 64u; unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned);
-        if (gx < ((cols + 127) / 128) * ((rows + bt - 1) / bt) || bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u || fmt == 6u)) return 1;   /* 64x64 tiles, 128 threads */
+        /* stream-K (arg 12): any grid up to the (tile, k chunk) count, with fixup slots and flags */
+        if (ARG(12, unsigned) ? (!gx || gx > ((cols + 127) / 128) * ((rows + bt - 1) / bt) * (k / 256u) || !ARG(10, dptr) || !ARG(11, dptr) || ARG(9, unsigned))
+                              : gx < ((cols + 127) / 128) * ((rows + bt - 1) / bt)) return 1;
+        if (bx != 256 || k % 256u || !(fmt == 1u || fmt == 2u || fmt == 5u || fmt == 6u)) return 1;   /* 64x64 tiles, 128 threads */
         { unsigned ks = ARG(9, unsigned), s = ks ? (k / 256u + ks - 1u) / ks : 1u, j; float* y = P(ARG(3, dptr));
           /* split-K: the whole product goes to slice 0 and the other slices are zero, so forge_sum_splits gives it back */
           for (j = 1; j < s; ++j) memset(y + (size_t)j * rows * cols, 0, sizeof(float) * rows * cols);
@@ -262,7 +268,8 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     if (!strncmp(op, "qmatmul_glu", 11)) {   /* qmatmul_glu_* (64 tokens per block) / qmatmul_glu128_* (128) */
         unsigned bt = op[11] == '1' ? 128u : 64u; unsigned rows = ARG(4, unsigned), cols = ARG(5, unsigned), k = ARG(6, unsigned), fmt = ARG(7, unsigned), rb = ARG(8, unsigned), n = cols / 2u, r, o;
         float *y = P(ARG(3, dptr)), *h;
-        if (gx < (cols / 128u) * ((rows + bt - 1) / bt) || bx != 256 || k % 256u || cols % 128u || !(fmt == 2u || fmt == 5u || fmt == 6u)) return 1;
+        if ((ARG(13, unsigned) ? (!gx || gx > (cols / 128u) * ((rows + bt - 1) / bt) * (k / 256u) || !ARG(11, dptr) || !ARG(12, dptr))
+                               : gx < (cols / 128u) * ((rows + bt - 1) / bt)) || bx != 256 || k % 256u || cols % 128u || !(fmt == 2u || fmt == 5u || fmt == 6u)) return 1;
         h = malloc(sizeof(float) * rows * cols);
         mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), h, rows, cols, k, fmt, rb);
         for (r = 0; r < rows; ++r) for (o = 0; o < n; ++o) { const float* hr = h + (size_t)r * cols + (o >> 3) * 16u + (o & 7u);

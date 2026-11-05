@@ -476,8 +476,40 @@ public:
         return std::string(bt == 128 ? "forge_qmatmul_mma128_" : "forge_qmatmul_mma_") + (fmt == 1 ? "q8_0" : fmt == 6 ? "q8_0g" : fmt == 2 ? "q4_k" : "q6_k"); }
     static unsigned mma_ns() { static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_STAGES"); return e && std::string(e) == "2" ? 2u : 1u; }(); return v; }   // $FORGE_MMA_STAGES=2: double-buffered q4_k (opt-in; no gain on an RTX 3090)
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
-        static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
+        auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }
     static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
+    // $FORGE_MMA_STREAMK: 0 off, 2 for every grid that does not fill whole waves (tests), else on for grids of 1/4 to 4
+    // waves (read per launch, so tests and benches compare the paths in one process)
+    static unsigned streamk_mode() { auto* e = std::getenv("FORGE_MMA_STREAMK"); return !e || !*e ? 1u : std::string(e) == "0" ? 0u : std::string(e) == "2" ? 2u : 1u; }
+    // Stream-K needs >= this many 256-value k chunks per block ($FORGE_MMA_SK_MIN, default 4): fewer blocks otherwise.
+    static unsigned sk_min() { auto* e = std::getenv("FORGE_MMA_SK_MIN"); int n = e && *e ? std::atoi(e) : 4; return unsigned(n < 1 ? 1 : n); }
+    std::uint64_t skfx_ = 0; std::size_t skfx_cap_ = 0;   // stream-K fixup slots (one bt x 128 float tile per block)
+    std::uint64_t skfl_ = 0; static constexpr unsigned skfl_n_ = 4096;   // stream-K flags, zero between launches (never reallocated)
+    std::map<void*, unsigned> occ_;   // resident blocks per SM of the mma kernels
+    // Persistent stream-K launch for the mma kernels (see mma_body): grid G (<= resident blocks), dp data-parallel
+    // tiles. false: the plain one-tile-per-block launch (tiles fill whole waves, stream-K off, or no occupancy figure).
+    bool streamk_plan(void* fn, unsigned smem, unsigned tiles, unsigned nck, unsigned bt, unsigned& G, unsigned& dp, std::uint64_t& fx, std::uint64_t& fl) {
+        const unsigned mode = streamk_mode();
+        if (!mode || !tiles || !has_fn_locked("forge_sum_splits")) return false;   // sum_splits: an sm_80 image of this revision
+        auto it = occ_.find(fn);
+        if (it == occ_.end()) { int nb = 0; if (!f_.occupancy || f_.occupancy(&nb, fn, 256, smem) != 0) nb = 0; it = occ_.emplace(fn, unsigned(std::max(nb, 0))).first; }
+        const unsigned slots = sms() * it->second;
+        if (!slots || tiles % slots == 0) return false;
+        // RTX 3090, 512 tokens: below 1/4 wave (e.g. 8 tiles, Qwen3.5's 32-column DeltaNet a/b) split-K's parallel sum
+        // beats the serial fixup (53.6 vs 63.6 us); from 4 waves on the ragged tail costs about what the stream-K
+        // share does (25600x5120 q4_k: 1847 vs 1896 us), so both keep the one-tile-per-block launch.
+        if (mode == 1 && (tiles * 4 < slots || tiles >= 4 * slots)) return false;
+        const std::uint64_t tot = std::uint64_t(tiles) * nck;
+        G = unsigned(std::min<std::uint64_t>(slots, std::max<std::uint64_t>(1, tot / sk_min())));
+        if (G > skfl_n_) return false;
+        // whole waves but the last one or two stay data-parallel; the rest (G..2G tiles) is shared out by k chunks
+        dp = tiles >= 2 * G ? (tiles / G - 1) * G : 0;
+        const std::size_t need = std::size_t(G) * bt * 128 * 4;
+        if (skfx_cap_ < need) { if (skfx_) free_s(skfx_); skfx_ = 0; skfx_cap_ = 0; std::size_t n = std::max<std::size_t>(need, std::size_t(sms()) << 16); skfx_ = dmalloc(n, "scratch"); skfx_cap_ = n; }
+        if (!skfl_) { skfl_ = dmalloc(skfl_n_ * 4, "scratch"); std::vector<std::uint32_t> z(skfl_n_, 0); ck(htod_s(skfl_, z.data(), z.size() * 4, stream_), "memcpy HtoD"); }
+        fx = skfx_; fl = skfl_;
+        return true;
+    }
     std::uint64_t am_ = 0;   // forge_argmax result (one int)
     std::uint64_t sk_ = 0; std::size_t sk_cap_ = 0;   // split-K partial products (stream-ordered reuse)
     void sk_reserve(std::size_t need) {
@@ -571,8 +603,8 @@ public:
                     void* qa[] = {&xd, &xq, &xds, &nb};
                     ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                 }
-                std::uint32_t ksplit = 0;
-                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit};
+                std::uint32_t ksplit = 0, sk = 0, dp = 0; std::uint64_t fx = 0, fl = 0;
+                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit, &fx, &fl, &sk, &dp};
                 // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
                 // q4_k keeps 64 tokens (47 KB of shared memory: two blocks per SM); q6_k / q8_0 use one block per SM anyway,
                 // so 128 tokens give each warp twice the work per weight fragment ($FORGE_MMA_BT=64|128 forces one)
@@ -590,10 +622,11 @@ public:
                 // so pick the S (up to 8, each slice >= 2 chunks of k) with the fewest waves per unit of work; ties go
                 // to the smaller S (less partial traffic). slots: blocks resident at once (64-token kernels fit 2 per SM).
                 const unsigned nch = k / 256, slots = sms() * (bt == 64 && !ns2 ? 2u : 1u);
-                unsigned splits = 1;
+                unsigned splits = 1, G = 0;
+                const bool skp = !ns2 && streamk_plan(mf, smem, grid, nch, bt, G, dp, fx, fl);
                 // Grids of a few waves with a ragged last one (e.g. 256 blocks on 164 slots) also split, when that saves
                 // >= 10% of the waves; past 4 waves the tail costs little.
-                if (grid && grid < 4 * slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
+                if (!skp && grid && grid < 4 * slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
                     double best = double((grid + slots - 1) / slots); const double need = grid < slots ? 0.97 : 0.9;
                     // a grid that already fills the device only splits long k (>= 16 chunks per slice): shorter slices
                     // lose more to the partial sums than the ragged wave costs (512x8192x4096 q4_k: 528 -> 638 us)
@@ -608,11 +641,14 @@ public:
                     const unsigned s = (nch + ksplit - 1) / ksplit;   // slices actually used
                     const std::size_t n = std::size_t(rows) * cols;
                     sk_reserve(n * s * 4);
-                    std::uint64_t part = sk_; void* a3[] = {&xq, &xds, &wd, &part, &rows, &cols, &k, &fmt, &rb32, &ksplit};
+                    std::uint64_t part = sk_; void* a3[] = {&xq, &xds, &wd, &part, &rows, &cols, &k, &fmt, &rb32, &ksplit, &fx, &fl, &sk, &dp};
                     ck(launch_s(mf, grid, s, 1, 256, 1, 1, smem, stream_, a3, nullptr), "launch");
                     std::uint32_t n32 = std::uint32_t(n), s32 = s; void* a4[] = {&part, &yd, &n32, &s32};
                     ck(launch_s(function("forge_sum_splits"), (n32 + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, a4, nullptr), "launch");
                     ++dispatches_["qmatmul_mma_splitk"];
+                } else if (skp) {
+                    sk = 1; ck(launch_s(mf, G, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                    ++dispatches_["qmatmul_mma_streamk"];
                 } else if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
             } else if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
                 ++dispatches_["qmatmul_mmq"];
@@ -714,9 +750,12 @@ public:
                 const unsigned smem = bt * 336 + (ef == 2 ? 144u : ef == 5 ? 240u : 272u) * 128 + 8192;
                 void* mf = function(glu_fn(ef, bt));
                 if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
-                void* a2[] = {&xq, &xds, &wd, &yd, &rr, &cc, &kk, &fm, &rb32, &gq, &gds};
+                std::uint32_t sk = 0, dp = 0; std::uint64_t fx = 0, fl = 0; unsigned G = 0;
+                const unsigned tiles = ((rows + bt - 1) / bt) * (cols / 128);
+                if (streamk_plan(mf, smem, tiles, k / 256, bt, G, dp, fx, fl)) { sk = 1; ++dispatches_["qmatmul_glu_streamk"]; }
+                void* a2[] = {&xq, &xds, &wd, &yd, &rr, &cc, &kk, &fm, &rb32, &gq, &gds, &fx, &fl, &sk, &dp};
                 writes(yd, out.size() * 4);
-                ck(launch_s(mf, ((rows + bt - 1) / bt) * (cols / 128), 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                ck(launch_s(mf, sk ? G : tiles, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
                 g8_src_ = yd; g8_n_ = nbo; g8_stamp_ = launch_stamp();
             } else {   // decode
                 std::uint32_t nb = rows * (k / 32), nbo = rows * (n / 32);
@@ -958,6 +997,7 @@ private:
         int (*peer)(std::uint64_t, std::uintptr_t, std::uint64_t, std::uintptr_t, std::size_t) = nullptr;
         int (*mem_info)(std::size_t*, std::size_t*) = nullptr;
         int (*func_attr)(void*, int, int) = nullptr;   // cuFuncSetAttribute (dynamic shared memory above 48 KB)
+        int (*occupancy)(int*, void*, int, std::size_t) = nullptr;   // cuOccupancyMaxActiveBlocksPerMultiprocessor
         // wrappers that fall back to the synchronous copies when the async ones are missing
         int htod_async(std::uint64_t d, const void* h, std::size_t n, void* s) const { return htod_a ? htod_a(d, h, n, s) : htod(d, h, n); }
         int dtoh_async(void* h, std::uint64_t d, std::size_t n, void* s) const { return dtoh_a ? dtoh_a(h, d, n, s) : dtoh(h, d, n); }
@@ -1310,7 +1350,7 @@ private:
             opt(f_.param_info, "cuFuncGetParamInfo"); opt(f_.kn_set, "cuGraphExecKernelNodeSetParams");
             opt(f_.g_roots, "cuGraphGetRootNodes"); opt(f_.g_deps, "cuGraphNodeGetDependentNodes"); opt(f_.g_type, "cuGraphNodeGetType"); opt(f_.graph_launch, "cuGraphLaunch");
             opt(f_.gexec_destroy, "cuGraphExecDestroy"); opt(f_.graph_destroy, "cuGraphDestroy");
-            opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2"); opt(f_.func_attr, "cuFuncSetAttribute");
+            opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2"); opt(f_.func_attr, "cuFuncSetAttribute"); opt(f_.occupancy, "cuOccupancyMaxActiveBlocksPerMultiprocessor");
         } else {
             ok = sym(f_.init, "hipInit") && sym(f_.count, "hipGetDeviceCount") && sym(f_.name, "hipDeviceGetName") &&
                  sym(f_.set_device, "hipSetDevice") && sym(f_.load, "hipModuleLoadData") && sym(f_.unload, "hipModuleUnload") &&

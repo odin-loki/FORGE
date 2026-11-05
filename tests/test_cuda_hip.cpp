@@ -94,6 +94,57 @@ template<class RT> static int qmatmul_check(graph::registry& reg, const std::str
     return fails;
 }
 
+static void set_env(const char* k, const std::string& v);
+// Persistent stream-K tensor-core matmul (FORGE_MMA_STREAMK) vs the one-tile-per-block launch on ragged shapes: tiles
+// split mid-k across blocks (fixup slots and flags), data-parallel waves before the stream-K share (small
+// FORGE_MMA_SK_MIN shrinks the grid), 64- and 128-token tiles; then the same shapes against the CPU kernel.
+template<class RT> static int streamk_check(graph::registry& reg, RT& rt, const std::string& api) {
+    if (!reg.device_qgemm) return 0;
+    auto disp = [&](const char* key) -> std::size_t { auto d = rt.dispatches(); auto it = d.find(key); return it == d.end() ? 0 : it->second; };
+    int fails = 0, n = 0, took = 0;
+    struct cs { const char* cn; std::size_t rows, cols, k; const char* skmin; const char* bt; };
+    for (auto [cn, rows, cols, k, skmin, bt] : {cs{"q4_k", 130, 300, 2560, "4", "64"}, cs{"q4_k", 70, 1100, 1024, "8", "64"}, cs{"q6_k", 200, 520, 1536, "1", "128"},
+                                                 cs{"q8_0", 130, 1100, 1024, "8", "128"}, cs{"q6_k", 64, 1100, 768, "3", "64"}, cs{"q8_0", 17, 260, 2048, "2", "64"},
+                                                 cs{"q4_k", 16, 256, 512, "1", "64"}, cs{"q4_k", 130, 256, 512, "1", "64"}, cs{"q4_k", 130, 40, 256, "1", "64"}}) {
+        const auto* c = graph::codecs::find(cn);
+        const std::size_t rb = c->bytes(k);
+        std::vector<float> wf(cols * k), x(rows * k);
+        for (std::size_t i = 0; i < wf.size(); ++i) wf[i] = std::sin(float(i) * 0.731f + float(rows)) * (1.f + float(i % 97) / 50.f);
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+        // kept alive: device weights are cached by host address, so a freed buffer's address must not come back with other contents
+        static std::deque<std::vector<std::uint8_t>> keep;
+        auto& enc = keep.emplace_back(cols * rb);
+        for (std::size_t j = 0; j < cols; ++j) c->encode(wf.data() + j * k, k, enc.data() + j * rb);
+        tensor_view xv; xv.data = x.data(); xv.shape = {i64(rows), i64(k)};
+        tensor_view wv; wv.shape = {i64(cols), i64(k)}; wv.qdata = enc.data(); wv.qcodec = c;
+        std::vector<float> ys(rows * cols, -1.f), yp(rows * cols, -2.f), yc(rows * cols);
+        auto run = [&](std::vector<float>& y) { tensor_view o; o.data = y.data(); o.shape = {i64(rows), i64(cols)}; std::vector<tensor_view> ins{xv, wv}; reg.device_qgemm->fn(ins, o, {}); };
+        set_env("FORGE_MMA_SK_MIN", skmin); set_env("FORGE_MMA_BT", bt);
+        const std::size_t s0 = disp("qmatmul_mma_streamk");
+        set_env("FORGE_MMA_STREAMK", "2");   // every ragged grid, however small
+        run(ys); run(ys);   // twice: the flags must be back to zero after a launch
+        took += disp("qmatmul_mma_streamk") > s0;
+        set_env("FORGE_MMA_STREAMK", "0"); run(yp); set_env("FORGE_MMA_STREAMK", "");
+        set_env("FORGE_MMA_SK_MIN", ""); set_env("FORGE_MMA_BT", "");
+        std::vector<float> xr(x);
+        for (std::size_t b = 0; b < xr.size(); b += 32) {
+            float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xr[b + i]));
+            const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+            for (int i = 0; i < 32; ++i) xr[b + i] = d * float(int(std::nearbyint(xr[b + i] * id)));
+        }
+        std::vector<tensor_view> insr{xv, wv}; insr[0].data = xr.data();
+        tensor_view oc; oc.data = yc.data(); oc.shape = {i64(rows), i64(cols)};
+        graph::qweights::gemm_nt(insr, oc, {});
+        double wp = 0, wc = 0;
+        for (std::size_t i = 0; i < yc.size(); ++i) { wp = std::max(wp, std::fabs(double(ys[i]) - yp[i]) / (1.0 + std::fabs(double(yp[i]))));
+                                                     wc = std::max(wc, std::fabs(double(ys[i]) - yc[i]) / (1.0 + std::fabs(double(yc[i])))); }
+        // vs the CPU only as a sanity bound: its q4_k / q6_k kernels quantise x again (q8_K), which drifts with long k
+        ++n; if (wp > 1e-4 || wc > 5e-2) { std::printf("FAIL %s stream-K %s %zux%zux%zu: rel vs one-tile-per-block %.3g, vs CPU %.3g\n", api.c_str(), cn, rows, cols, k, wp, wc); ++fails; }
+    }
+    std::printf("%s %d/%d %s stream-K matmul cases match the one-tile-per-block launch and the CPU (%d took stream-K)\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str(), took);
+    return fails;
+}
+
 static int state_ops_check_one(graph::registry& reg, const std::string& api, const i64 dk, const i64 dv);
 // Gated DeltaNet state ops on the device (run_state) vs the CPU executor: 3-token prefill, then token by token,
 // then reset() and again (the resident state must restart from zeros).
@@ -187,7 +238,8 @@ template<class RT> static int glu_check(graph::registry& reg, RT& rt, const std:
     if (!reg.device_qglu) { std::printf("note %s: no fused FFN gate/up\n", api.c_str()); return 0; }
     using namespace graph;
     int fails = 0, n = 0;
-    std::deque<std::vector<std::uint8_t>> keep;
+    // static: device weights are cached by host address, and glu_check runs more than once per process
+    static std::deque<std::vector<std::uint8_t>> keep;
     auto disp = [&](const char* key) -> std::size_t { auto d = rt.dispatches(); auto it = d.find(key); return it == d.end() ? 0 : it->second; };
     for (std::string cn : {"q8_0", "q4_k", "q6_k", "q5_k"}) for (i64 rows : {1, 3, 16, 70, 130}) {
         const auto* c = codecs::find(cn);
@@ -260,7 +312,13 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     fails += dec_fails;
     fails += qmatmul_check<RT>(*reg, api, mma_runs);
-    if constexpr (requires { shared->run_qglu(tensor_view{}, nullptr, nullptr, std::size_t(0), 0u, 0u, tensor_view{}); }) fails += glu_check(*reg, *shared, api);
+    if constexpr (requires { shared->run_qglu(tensor_view{}, nullptr, nullptr, std::size_t(0), 0u, 0u, tensor_view{}); }) {
+        fails += glu_check(*reg, *shared, api);
+        fails += streamk_check(*reg, *shared, api);
+        // the fused GLU kernel with stream-K over single 256-value chunks (every tile split across blocks)
+        set_env("FORGE_MMA_SK_MIN", "1"); set_env("FORGE_MMA_STREAMK", "2"); fails += glu_check(*reg, *shared, api);
+        set_env("FORGE_MMA_SK_MIN", ""); set_env("FORGE_MMA_STREAMK", "");
+    }
     fails += state_ops_check(*reg, api);
     return fails ? 1 : 0;
 }
@@ -417,10 +475,12 @@ template<class Open> static int memory_t(Open open) {
     return fails ? 1 : 0;
 }
 
-// test_cuda_hip bench <codec> <rows> <cols> <k> [reps]: time one quantised matmul on the device (x and y stay resident
-// inside a run, so only the kernels are timed). Not part of ctest; for kernel work (e.g. q4_k 512 25600 5120).
+// test_cuda_hip bench <codec> <rows> <cols> <k> [reps] [VAR=a,b,...]: time one quantised matmul on the device (x and y stay
+// resident inside a run, so only the kernels are timed). Not part of ctest; for kernel work (e.g. q4_k 512 25600 5120).
+// With VAR=a,b,...: batches alternate between the values of environment variable VAR (read per launch, e.g.
+// FORGE_MMA_STREAMK=0,1 or FORGE_MMA_BT=64,128), one line each: an A/B on a shared GPU in one process.
 static int bench_qmm(int argc, char** argv) {
-    if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip bench <codec> <rows> <cols> <k> [reps]\n"); return 2; }
+    if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip bench <codec> <rows> <cols> <k> [reps] [VAR=a,b,...]\n"); return 2; }
     std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
     if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
     const auto* c = graph::codecs::find(argv[2]);
@@ -441,19 +501,30 @@ static int bench_qmm(int argc, char** argv) {
     rt->wait();
     // batches of `reps` back-to-back calls, one wait each; the fastest batch is kept (the GPU may be shared, and
     // the minimum best approximates an idle device). Per-call time = batch time / reps.
-    std::vector<double> ts;
-    for (int b = 0; b < 7; ++b) {
+    std::string var; std::vector<std::string> vals{""};
+    if (argc > 7) {
+        const std::string a = argv[7]; const auto eq = a.find('=');
+        if (eq == std::string::npos) { std::fprintf(stderr, "expected VAR=a,b,...\n"); return 2; }
+        var = a.substr(0, eq); vals.clear();
+        for (std::size_t p = eq + 1;;) { auto q = a.find(',', p); vals.push_back(a.substr(p, q == std::string::npos ? q : q - p)); if (q == std::string::npos) break; p = q + 1; }
+    }
+    std::vector<std::vector<double>> ts(vals.size());
+    for (int b = 0; b < 7; ++b) for (std::size_t v = 0; v < vals.size(); ++v) {
+        if (!var.empty()) { set_env(var.c_str(), vals[v]); rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv); rt->wait(); }
         auto t0 = std::chrono::steady_clock::now();
         for (int i = 0; i < reps; ++i) rt->run_qmatmul(xv, enc.data(), rb, std::uint32_t(cols), fmt, yv);
         rt->wait();
-        ts.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
+        ts[v].push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
     }
-    std::sort(ts.begin(), ts.end()); const double us = ts.front(), med = ts[ts.size() / 2];
     rt->end_run();
     auto d = rt->dispatches(); std::string path;
     for (const char* p : {"qmatmul_mma", "qmatmul_mmq", "qmatmul_q81"}) if (d.count(p)) path = p;
-    std::printf("%s rows %zu cols %zu k %zu: min %.1f us (median %.1f), %.1f TOPS, %.0f GB/s weights (%s)\n", argv[2], rows, cols, k, us, med,
-                2.0 * double(rows) * double(cols) * double(k) / us / 1e6, double(enc.size()) / us / 1e3, path.c_str());
+    for (std::size_t v = 0; v < vals.size(); ++v) {
+        std::sort(ts[v].begin(), ts[v].end()); const double us = ts[v].front(), med = ts[v][ts[v].size() / 2];
+        std::printf("%s rows %zu cols %zu k %zu%s%s%s%s: min %.1f us (median %.1f), %.1f TOPS, %.0f GB/s weights (%s)\n", argv[2], rows, cols, k,
+                    var.empty() ? "" : " ", var.c_str(), var.empty() ? "" : "=", vals[v].c_str(), us, med,
+                    2.0 * double(rows) * double(cols) * double(k) / us / 1e6, double(enc.size()) / us / 1e3, path.c_str());
+    }
     return 0;
 }
 
