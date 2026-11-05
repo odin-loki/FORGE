@@ -457,7 +457,11 @@ inline report evaluate(const policy& p, bool apply) {
 #if defined(__linux__)
         if (landlock_writes) {
             std::string skipped;
-            auto s = landlock_write_roots(expand_roots(p.fs.write), &skipped);
+            // The audit file stays writable (a file rule: append to it, nothing else there): child processes
+            // inherit these rules and reopen it, e.g. rpc-serve's script children running their own lockdown.
+            auto roots = expand_roots(p.fs.write);
+            if (!p.audit.file.empty()) roots.push_back(os::absolute(p.audit.file));
+            auto s = landlock_write_roots(roots, &skipped);
             fsw.state = s ? "active" : "failed";
             if (!s) fsw.detail = s.err.what; else if (!skipped.empty()) fsw.detail = "skipped (missing): " + skipped;
             if (s) fsw.detail += (fsw.detail.empty() ? "" : "; ") + std::string("Landlock binds this thread and threads started after lockdown (earlier threads: enforce() only)");

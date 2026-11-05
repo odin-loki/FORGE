@@ -483,8 +483,11 @@ int cmd_rpc_serve(const args& a) {
             if (pr.timed_out) return graph::rpc::server::script_result{false, "TimeoutError", "script exceeded " + std::to_string(t) + " ms", pr.out};
             if (pr.exit_code == 0) return graph::rpc::server::script_result{true, "", "", pr.out};
             // child protocol: stderr = "<ErrorType>\n<message>"; a signal death or sandbox failure has none.
-            std::string et = "RuntimeError", em = pr.err;
-            if (auto nl = pr.err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && pr.err.find(' ') > nl) { et = pr.err.substr(0, nl); em = pr.err.substr(nl + 1); }
+            // Log lines ("[forge:security W] ...", from the child's policy and lockdown) precede the protocol: skip them.
+            std::string err = pr.err;
+            while (err.rfind("[forge:", 0) == 0) { auto nl = err.find('\n'); err = nl == std::string::npos ? std::string() : err.substr(nl + 1); }
+            std::string et = "RuntimeError", em = err.empty() ? pr.err : err;
+            if (auto nl = err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && err.find(' ') > nl) { et = err.substr(0, nl); em = err.substr(nl + 1); }
             if (pr.term_signal) { et = "RuntimeError"; em = "script child killed by signal " + std::to_string(pr.term_signal) + (pr.err.empty() ? "" : ": " + pr.err); }
             while (!em.empty() && em.back() == '\n') em.pop_back();
             return graph::rpc::server::script_result{false, et, em, pr.out};
