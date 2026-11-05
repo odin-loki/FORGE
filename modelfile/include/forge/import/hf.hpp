@@ -57,6 +57,25 @@ struct import_options {
 
 struct import_report { std::string arch, template_name; std::size_t tensors = 0, bytes = 0; };
 
+// The .fpk "experts" section (format minor 1): one entry per stacked expert tensor [n_experts, rows, k] (moe_ffn
+// gate/up/down). Expert e of a tensor occupies bytes [offset + e * expert_bytes, + expert_bytes) of the data section
+// (file offset = 64 + offset for stream_writer files); "aligned" says every expert slice starts on a 4 KiB file offset,
+// so an expert can be read with one direct (O_DIRECT / unbuffered) read. Groundwork for streaming experts from disk.
+struct expert_index {
+    json::array ents;
+    void add(const modelfile::tensor_entry& e, i64 layer, const char* proj) {
+        if (e.shape.size() != 3 || e.shape[0] < 1) raise(errc::shape_mismatch, "expert tensor {} has shape {}", e.name, shape_str(e.shape));
+        std::uint64_t ne = std::uint64_t(e.shape[0]), per = e.bytes / ne, foff = 64 + e.offset;
+        ents.push_back(json::object{{"layer", double(layer)}, {"proj", std::string(proj)}, {"name", e.name}, {"codec", e.codec},
+                                    {"n_experts", double(ne)}, {"offset", double(e.offset)}, {"file_offset", double(foff)},
+                                    {"expert_bytes", double(per)}, {"aligned", foff % modelfile::expert_alignment == 0 && per % modelfile::expert_alignment == 0}});
+    }
+    bool empty() const { return ents.empty(); }
+    std::string dump() const {
+        return json::dump(json::value(json::object{{"version", 1.0}, {"align", double(modelfile::expert_alignment)}, {"tensors", ents}}));
+    }
+};
+
 inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt = {}) {
     check_read(dir); check_write(out);
     auto cfg = json::parse(read_file(dir / "config.json"));
@@ -81,6 +100,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         else if (cfg.str_or("model_type", "") == "qwen3_5_text") tname = "qwen3_5";
         else if (arch == "MixtralForCausalLM" || cfg.str_or("model_type", "") == "mixtral") tname = "mixtral";
         else if (arch == "DeepseekV2ForCausalLM" || arch == "DeepseekV3ForCausalLM" || cfg.str_or("model_type", "") == "deepseek_v2") tname = "deepseek_v2";
+        else if (arch == "Qwen3MoeForCausalLM" || cfg.str_or("model_type", "") == "qwen3_moe") tname = "qwen3_moe";
         else raise(errc::unsupported, "no blueprint template for architecture {} (pass --template)", arch);
     }
     // normalise config with defaults the template needs
@@ -111,6 +131,12 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         set("norm_topk_prob", cfg.find("norm_topk_prob") && cfg["norm_topk_prob"].is_bool() ? json::value(cfg["norm_topk_prob"].b() ? 1.0 : 0.0) : json::value(0.0));
         set("routed_scaling_factor", num("routed_scaling_factor", 1.0));
         if (num("n_group", 1) > 1 && cfg.str_or("topk_method", "greedy") != "greedy") raise(errc::unsupported, "deepseek_v2: group-limited routing");
+    }
+    if (tname == "qwen3_moe") {
+        if (num("decoder_sparse_step", 1) != 1) raise(errc::unsupported, "qwen3_moe: decoder_sparse_step != 1 (dense layers in between)");
+        if (const auto* ml = cfg.find("mlp_only_layers"); ml && ml->is_arr() && !ml->arr().empty()) raise(errc::unsupported, "qwen3_moe: mlp_only_layers");
+        set("norm_topk_prob", cfg.find("norm_topk_prob") && cfg["norm_topk_prob"].is_bool() ? json::value(cfg["norm_topk_prob"].b() ? 1.0 : 0.0) : json::value(0.0));
+        set("routed_scaling_factor", 1.0);
     }
     if (tname == "qwen3_5") {
         const json::value* rp = cfg.find("rope_parameters");
@@ -166,7 +192,8 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     for (i64 l = 0; l < L; ++l)
         if (has(std::format("{}layers.{}.self_attn.v_proj.weight", mp, l))) v_index[std::size_t(l)] = rc.n_attn_v++;
     bool in_deltanet = false;
-    auto put = [&](const std::string& n, const tensor& t, bool quantisable) {
+    expert_index xi;
+    auto put = [&](const std::string& n, const tensor& t, bool quantisable, std::size_t align = modelfile::alignment) {
         std::string c = "f32";
         if (quantisable) {
             if (opt.mixed()) {
@@ -175,7 +202,25 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
                 if (c == "q4_k_m" || c == "q5_k_m") c = mix_base(c);
             } else c = opt.codec;
         }
-        w.add_tensor(n, t.shape, t.data, c); ++rep.tensors;
+        w.add_tensor(n, t.shape, t.data, c, align); ++rep.tensors;
+    };
+    // routed experts of one layer, stacked into [n_experts, rows, k] per projection (moe_ffn's layout), each tensor
+    // starting on a 4 KiB file offset and listed in the "experts" section
+    auto experts = [&](i64 l, const std::string& Pfmt, const std::string& Q, const char* g, const char* u, const char* d) {
+        i64 ne = i64(bp.param("n_experts"));
+        const char* src[3] = {g, u, d}; const char* proj[3] = {"gate", "up", "down"};
+        for (int j = 0; j < 3; ++j) {
+            tensor st;
+            for (i64 e = 0; e < ne; ++e) {
+                auto t = find(std::vformat(Pfmt, std::make_format_args(e)) + src[j] + ".weight");
+                if (t.shape.size() != 2) raise(errc::shape_mismatch, "expert weight {} has shape {}", src[j], shape_str(t.shape));
+                if (e == 0) { st = tensor(shape_t{ne, t.shape[0], t.shape[1]}); }
+                else if (t.shape[0] != st.shape[1] || t.shape[1] != st.shape[2]) raise(errc::shape_mismatch, "experts of layer {} differ in shape", l);
+                std::copy(t.data.begin(), t.data.end(), st.data.begin() + e * t.shape[0] * t.shape[1]);
+            }
+            put(Q + "experts.w_" + proj[j], st, true, modelfile::expert_alignment);
+            xi.add(w.last(), l, proj[j]);
+        }
     };
     {   // quantised embeddings: the runtime gathers rows straight from q8_0/q4_k blocks
         std::string ec = opt.emb_codec.empty() ? (opt.codec == "f32" || opt.codec == "f16" || opt.codec == "bf16" ? opt.codec : std::string("q8_0")) : opt.emb_codec;
@@ -238,22 +283,23 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
             else {
                 put(Q + "router", find(P + "mlp.gate.weight"), false);
                 mlp(P + "mlp.shared_experts.", Q + "shared.", "gate_proj", "up_proj", "down_proj");
-                for (i64 e = 0; e < i64(bp.param("n_experts")); ++e)
-                    mlp(std::format("{}mlp.experts.{}.", P, e), std::format("{}expert.{}.", Q, e), "gate_proj", "up_proj", "down_proj");
+                experts(l, P + "mlp.experts.{}.", Q, "gate_proj", "up_proj", "down_proj");
             }
             continue;
         }
         put(Q + "wq", find(P + "self_attn.q_proj.weight"), true);
         put(Q + "wk", find(P + "self_attn.k_proj.weight"), true);
         put(Q + "wv", find(P + "self_attn.v_proj.weight"), true);
-        if (tname == "qwen3" || q35) {
+        if (tname == "qwen3" || tname == "qwen3_moe" || q35) {
             put(Q + "q_norm", plus1(find(P + "self_attn.q_norm.weight")), false);
             put(Q + "k_norm", plus1(find(P + "self_attn.k_norm.weight")), false);
         }
         if (tname == "mixtral") {
             put(Q + "router", find(P + "block_sparse_moe.gate.weight"), false);
-            for (i64 e = 0; e < i64(bp.param("n_experts")); ++e)
-                mlp(std::format("{}block_sparse_moe.experts.{}.", P, e), std::format("{}expert.{}.", Q, e), "w1", "w3", "w2");
+            experts(l, P + "block_sparse_moe.experts.{}.", Q, "w1", "w3", "w2");
+        } else if (tname == "qwen3_moe") {
+            put(Q + "router", find(P + "mlp.gate.weight"), false);
+            experts(l, P + "mlp.experts.{}.", Q, "gate_proj", "up_proj", "down_proj");
         } else mlp(P + "mlp.", Q, "gate_proj", "up_proj", "down_proj");
     }
     put("out_norm", plus1(find(mp + "norm.weight")), false);
@@ -268,6 +314,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         auto tc = json::parse(read_file(dir / "tokenizer_config.json"));
         if (auto* ab = tc.find("add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
     }
+    if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     if (std::filesystem::exists(dir / "tokenizer.json")) w.set_section("tokenizer", read_file(dir / "tokenizer.json"));

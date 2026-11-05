@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,6 +64,52 @@ TEST(parallel_for_still_works_alongside_tasks) {
     p.parallel_for(10000, 64, [&](std::size_t b, std::size_t e) { long s = 0; for (auto i = b; i < e; ++i) s += long(i); sum += s; });
     CHECK(sum == 10000L * 9999 / 2); CHECK(t.get() == 1);
     CHECK(task::submit([] { return 3; }).get() == 3);
+}
+
+TEST(parallel_for_claims_cover_every_item_once) {
+    task::pool p(6);
+    for (std::size_t n : {std::size_t(1), std::size_t(7), std::size_t(1000), std::size_t(100003)}) {
+        for (auto [lo, hi] : {std::pair<std::size_t, std::size_t>{1, std::size_t(-1)}, {16, 256}, {16, 16}, {1000, 1000}}) {
+            std::vector<std::atomic<int>> hit(n);
+            std::atomic<std::size_t> maxc{0};
+            for (int rep = 0; rep < 3; ++rep)
+                p.parallel_for(n, lo, hi, [&](std::size_t b, std::size_t e) {
+                    std::size_t c = e - b, m = maxc.load(); while (c > m && !maxc.compare_exchange_weak(m, c)) {}
+                    for (auto i = b; i < e; ++i) ++hit[i];
+                });
+            bool ok = true; for (auto& h : hit) ok &= h == 3;
+            CHECK_MSG(ok, "n=%zu lo=%zu hi=%zu", n, lo, hi);
+            CHECK(n <= lo || maxc <= hi);
+        }
+    }
+}
+
+TEST(parallel_for_nested_and_concurrent_and_throwing) {
+    task::pool p(4);
+    std::atomic<long> sum{0};
+    p.parallel_for(64, 1, [&](std::size_t b, std::size_t e) {   // nested calls run inline: no deadlock
+        for (auto i = b; i < e; ++i) p.parallel_for(100, 1, [&](std::size_t b2, std::size_t e2) { sum += long(e2 - b2); });
+    });
+    CHECK(sum == 6400);
+    std::vector<std::thread> ts; std::atomic<long> tot{0};   // several callers at once queue for the pool
+    for (int t = 0; t < 4; ++t) ts.emplace_back([&] { for (int i = 0; i < 200; ++i) p.parallel_for(1000, 8, [&](std::size_t b, std::size_t e) { tot += long(e - b); }); });
+    for (auto& t : ts) t.join();
+    CHECK(tot == 4L * 200 * 1000);
+    bool threw = false;
+    try { p.parallel_for(10000, 1, [&](std::size_t b, std::size_t) { if (b > 5000) throw std::runtime_error("x"); }); }
+    catch (const std::runtime_error&) { threw = true; }
+    CHECK(threw);
+    sum = 0; p.parallel_for(10000, 1, [&](std::size_t b, std::size_t e) { sum += long(e - b); });   // still usable
+    CHECK(sum == 10000);
+}
+
+TEST(parallel_for_wakes_sleeping_workers) {
+    task::pool p(4);
+    std::this_thread::sleep_for(20ms);   // well past the spin time (FORGE_SPIN_US, 200 us): the workers are asleep
+    std::mutex m; std::set<std::thread::id> ids;
+    for (int i = 0; i < 50 && ids.size() < 2; ++i)
+        p.parallel_for(4000, 1, [&](std::size_t, std::size_t) { std::this_thread::sleep_for(100us); std::lock_guard l(m); ids.insert(std::this_thread::get_id()); });
+    CHECK(ids.size() >= 2);
 }
 
 TEST(destructor_drains_queue) {

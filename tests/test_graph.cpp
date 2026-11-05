@@ -202,6 +202,58 @@ TEST(state_ops_conv_and_delta_rule_streaming) {
     CHECK(eo < 1e-4); CHECK(ec < 1e-4);
 }
 
+// Chunked CPU attention (attn_cpu.hpp): GQA, f32 and int8 KV, contexts spanning several 256-position chunks.
+// Against a float64 reference over the same (decoded) KV; a prefill block gives the same bits as each token
+// alone; every seq kernel table (scalar / avx2 / avx512) gives the same bits.
+TEST(attn_cpu_chunked_long_context) {
+    std::mt19937 rng(5); std::normal_distribution<float> nd(0.f, 1.f);
+    for (int codec = 0; codec < 2; ++codec)
+    for (auto [t, s, hq, hk, d, window] : std::vector<std::array<std::size_t, 6>>{{700, 40, 8, 2, 64, 0}, {1300, 3, 16, 4, 80, 0}, {600, 9, 4, 4, 32, 300}}) {
+        auto kc = codec ? kv_codec::int8 : kv_codec::f32;
+        std::size_t dv = d, w = codec ? std::size_t(kv_head_words(i64(d))) : d;
+        std::vector<float> q(s * hq * d), kf(t * hk * d), vf(t * hk * dv), kq(t * hk * w), vq(t * hk * w), kd(t * hk * d), vd(t * hk * dv);
+        for (auto& x : q) x = nd(rng);
+        for (auto& x : kf) x = nd(rng);
+        for (auto& x : vf) x = nd(rng);
+        for (std::size_t r = 0; r < t * hk; ++r) {
+            if (codec) { kv_encode_head(kf.data() + r * d, i64(d), kc, kq.data() + r * w); kv_encode_head(vf.data() + r * dv, i64(dv), kc, vq.data() + r * w);
+                         kv_decode_head(kq.data() + r * w, i64(d), kc, kd.data() + r * d); kv_decode_head(vq.data() + r * w, i64(dv), kc, vd.data() + r * dv); }
+        }
+        if (!codec) { kq = kf; vq = vf; kd = kf; vd = vf; }
+        float sc = 1.f / std::sqrt(float(d));
+        std::vector<float> out(s * hq * dv), one(hq * dv);
+        attn_cpu::attention(q.data(), s, hq, d, kq.data(), vq.data(), t, hk, dv, kc, kc, true, window, sc, out.data());
+        double err = 0;
+        for (std::size_t i = 0; i < s; ++i) for (std::size_t h = 0; h < hq; ++h) {
+            std::size_t pos = t - s + i, lo = window && pos + 1 > window ? pos + 1 - window : 0, kh = h / (hq / hk);
+            std::vector<double> sco(pos + 1); double mx = -1e300, sum = 0;
+            for (std::size_t j = lo; j <= pos; ++j) { double a = 0; for (std::size_t e = 0; e < d; ++e) a += double(q[(i * hq + h) * d + e]) * kd[(j * hk + kh) * d + e]; sco[j] = a * sc; mx = std::max(mx, sco[j]); }
+            for (std::size_t j = lo; j <= pos; ++j) { sco[j] = std::exp(sco[j] - mx); sum += sco[j]; }
+            for (std::size_t e = 0; e < dv; ++e) { double a = 0; for (std::size_t j = lo; j <= pos; ++j) a += sco[j] * vd[(j * hk + kh) * dv + e]; err = std::max(err, std::fabs(a / sum - out[(i * hq + h) * dv + e])); }
+            // the same token alone (decode) gives identical bits
+            if (i == s - 1 || i == 0) {
+                attn_cpu::attention(q.data() + i * hq * d, 1, hq, d, kq.data(), vq.data(), pos + 1, hk, dv, kc, kc, true, window, sc, one.data());
+                CHECK(std::memcmp(one.data(), out.data() + i * hq * dv, hq * dv * 4) == 0);
+            }
+        }
+        CHECK_MSG(err < 2e-5, "attn_cpu err %g", err);
+        // every kernel table gives the same bits
+        const auto* ref = simd::seq_by_name("scalar");
+        for (const char* tg : {"avx2", "avx512"}) {
+            const auto* k = simd::seq_by_name(tg); if (!k) continue;
+            std::size_t ns = hq / hk;
+            std::vector<const float*> qp; std::vector<std::size_t> lo(ns, 0), hi(ns, t);
+            for (std::size_t h = 0; h < ns; ++h) qp.push_back(q.data() + h * d);
+            std::vector<float> m1(ns), l1(ns), a1(ns * dv), m2(ns), l2(ns), a2(ns * dv), sc1(ref->attn_scratch(ns, d, dv)), sc2(k->attn_scratch(ns, d, dv));
+            simd::seq_kv K{kq.data(), hk * w, codec}, V{vq.data(), hk * w, codec};
+            ref->attn_chunk(K, V, d, dv, sc, 256, std::min<std::size_t>(t, 512), ns, qp.data(), lo.data(), hi.data(), m1.data(), l1.data(), a1.data(), sc1.data());
+            k->attn_chunk(K, V, d, dv, sc, 256, std::min<std::size_t>(t, 512), ns, qp.data(), lo.data(), hi.data(), m2.data(), l2.data(), a2.data(), sc2.data());
+            CHECK(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0);
+            for (float x : {-0.f, -1.5f, -30.f, -79.f, 3.f}) CHECK(ref->exp1(x) == k->exp1(x));
+        }
+    }
+}
+
 TEST(codecs_exact_and_layout) {
     // values exactly representable in a codec survive the round trip bit-for-bit
     auto rt = [](std::string_view name, std::vector<float> x) {
@@ -268,6 +320,72 @@ TEST(qdot_matches_decode_exactly) {
             }
         }
         std::printf("  qdot: %s exact for q8_0 q4_k q6_k q5_k f16 q8_g32\n", tgt);
+    }
+}
+
+// Integer matvec (simd/qdot_i8.hpp): every ISA table this machine runs gives the scalar reference's bits, for
+// quantisation and products, and a vector's result does not depend on how many vectors ran with it. The
+// result stays close to the f32 product of the decoded weights (int8 activations: ~0.5% of sum |x*w|).
+TEST(qdot_i8_matches_reference_on_every_isa) {
+    std::mt19937 r(5);
+    const auto* ref = simd::qi8_by_name("scalar");
+    CHECK(ref != nullptr);
+    std::printf("  qi8 active: %s\n", simd::qi8_active().target);
+    for (const char* cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) {
+        const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
+        for (std::size_t k : {std::size_t(256), std::size_t(1280)}) {
+            const std::size_t rows = 37, nvmax = 13, rb = c->bytes(k), ab = simd::qi8::act_bytes(fmt, k);
+            CHECK(simd::qi8::supported(fmt, k));
+            auto W = verify::random_tensor({i64(rows), i64(k)}, r, -2, 2);
+            auto X = verify::random_tensor({i64(nvmax), i64(k)}, r, -1, 1);
+            for (std::size_t i = 0; i < X.data.size(); i += 7) X.data[i] *= 1e-3f;   // small values next to large ones
+            std::vector<u8> enc(rows * rb);
+            for (std::size_t j = 0; j < rows; ++j) c->encode(W.data.data() + j * k, k, enc.data() + j * rb);
+            std::vector<simd::qi8::act_k> abuf_ref((nvmax * ab) / sizeof(simd::qi8::act_k) + 1), abuf((nvmax * ab) / sizeof(simd::qi8::act_k) + 1);
+            auto* aref = reinterpret_cast<u8*>(abuf_ref.data()); auto* aq = reinterpret_cast<u8*>(abuf.data());
+            for (std::size_t v = 0; v < nvmax; ++v) ref->quantize(fmt, X.data.data() + v * k, k, aref + v * ab);
+            std::vector<float> yref(nvmax * rows), y(nvmax * rows), y1(rows);
+            ref->matvec(fmt, enc.data(), rb, rows, aref, ab, k, nvmax, yref.data(), rows);
+            // accuracy vs f32 decode + dot
+            std::vector<float> wd(k);
+            for (std::size_t j = 0; j < rows; ++j) {
+                c->decode(enc.data() + j * rb, k, wd.data());
+                for (std::size_t v = 0; v < nvmax; ++v) {
+                    double exact = 0, mag = 0;
+                    for (std::size_t i = 0; i < k; ++i) { exact += double(wd[i]) * X.data[v * k + i]; mag += std::fabs(double(wd[i]) * X.data[v * k + i]); }
+                    CHECK_MSG(std::fabs(yref[v * rows + j] - exact) <= 0.01 * mag + 1e-6, "%s k=%zu row %zu vec %zu: %g vs %g (|.|=%g)", cn, k, j, v,
+                              double(yref[v * rows + j]), exact, mag);
+                }
+            }
+            for (const char* tgt : {"scalar", "avx2", "avxvnni", "avx512vnni"}) {
+                const auto* ker = simd::qi8_by_name(tgt);
+                if (!ker) continue;
+                for (std::size_t v = 0; v < nvmax; ++v) ker->quantize(fmt, X.data.data() + v * k, k, aq + v * ab);
+                CHECK_MSG(std::memcmp(aq, aref, nvmax * ab) == 0, "%s/%s k=%zu: quantised activations differ", tgt, cn, k);
+                for (std::size_t nv : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(5), std::size_t(8), std::size_t(9), nvmax}) {
+                    std::fill(y.begin(), y.end(), -1.f);
+                    ker->matvec(fmt, enc.data(), rb, rows, aref, ab, k, nv, y.data(), rows);
+                    CHECK_MSG(std::memcmp(y.data(), yref.data(), nv * rows * 4) == 0, "%s/%s k=%zu nv=%zu: differs from the scalar reference", tgt, cn, k, nv);
+                }
+                for (std::size_t v = 0; v < nvmax; ++v) {   // one vector at a time, in odd row slices
+                    for (std::size_t r0 = 0; r0 < rows; r0 += 11) ker->matvec(fmt, enc.data() + r0 * rb, rb, std::min<std::size_t>(11, rows - r0), aref + v * ab, ab, k, 1, y1.data() + r0, rows);
+                    CHECK_MSG(std::memcmp(y1.data(), yref.data() + v * rows, rows * 4) == 0, "%s/%s k=%zu: vector %zu alone differs from the batch", tgt, cn, k, v);
+                }
+            }
+        }
+    }
+    // the whole graph path: a batch of activation rows gives each row's single-row bits
+    for (const char* cn : {"q4_k", "q6_k", "q8_0"}) {
+        const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
+        const std::size_t n = 300, k = 512, m = 21, rb = c->bytes(k);
+        auto W = verify::random_tensor({i64(n), i64(k)}, r, -1, 1); auto X = verify::random_tensor({i64(m), i64(k)}, r, -1, 1);
+        std::vector<u8> enc(n * rb); for (std::size_t j = 0; j < n; ++j) c->encode(W.data.data() + j * k, k, enc.data() + j * rb);
+        std::vector<float> yb(m * n), ys(n);
+        qweights::gemm_nt_i8(fmt, enc.data(), rb, n, X.data.data(), m, k, yb.data());
+        for (std::size_t i = 0; i < m; ++i) {
+            qweights::gemm_nt_i8(fmt, enc.data(), rb, n, X.data.data() + i * k, 1, k, ys.data());
+            CHECK_MSG(std::memcmp(ys.data(), yb.data() + i * n, n * 4) == 0, "%s: gemm_nt_i8 row %zu differs between m=%zu and m=1", cn, i, m);
+        }
     }
 }
 
@@ -357,6 +475,7 @@ TEST(resident_backend_quantised_weight_budget) {
     setb("");
     CHECK(q0);    // budget 0: the weight stays encoded (CPU quantised matmul)
     CHECK(!q1);   // ample budget: decoded to f32 for the device
-    auto cmp = verify::compare(y0, y1, {ops::tol_kind::rel, 1e-4});
+    // the encoded CPU path quantises activations to int8 (simd/qdot_i8.hpp) unless FORGE_CPU_INT8=0
+    auto cmp = verify::compare(y0, y1, {ops::tol_kind::rel, qweights::int8_enabled() ? 1e-2 : 1e-4});
     CHECK_MSG(cmp.ok, "%s", cmp.message.c_str());
 }

@@ -34,6 +34,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace forge::gpu::cuda_hip {
@@ -174,9 +175,11 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_);
+            if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
+        if (stage_ && f_.host_free) f_.host_free(stage_);
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
         if (ctx_ && f_.ctx_destroy) { f_.ctx_destroy(ctx_); ctx_epoch().fetch_add(1, std::memory_order_acq_rel); }
@@ -227,22 +230,37 @@ public:
         if (!(key == run_key_ && streak_ >= 2 && !replay_bad_.count(key) && replay_ok() && gmode() && nseg_ && nseg_ <= segc_.size())) return false;
         bind(); flush();
         std::vector<void*> ap;
-        for (std::size_t s = 0; s < nseg_; ++s) {   // patch everything first: a failure leaves nothing launched
+        for (std::size_t s = 0; s < nseg_; ++s) {
             auto& c = segc_[s];
             if (!c.replay || !c.exec || c.pred.size() != c.bytes.size()) { streak_ = 0; return false; }
+        }
+        // Patch and launch segment by segment, so the device starts on the first segment while the host patches the
+        // next. A failed patch before the first launch falls back to a real run; after it (work already queued that
+        // a real run would repeat) it is an error.
+        static const bool eager = [] { auto* e = std::getenv("FORGE_REPLAY_EAGER"); return !(e && std::string(e) == "0"); }();
+        auto patch = [&](std::size_t s) {
+            auto& c = segc_[s];
             for (std::size_t i = 0; i < c.recs.size(); ++i) {
                 auto& r = c.recs[i];
                 if (!std::memcmp(c.pred.data() + r.off, c.bytes.data() + r.off, r.len)) continue;
                 arg_ptrs(r, c.pred.data(), ap);
                 struct { void* fn; unsigned d[7]; void** kp; void** ex; } kp{r.fn, {r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6]}, ap.data(), nullptr};
-                if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) { for (std::size_t t = 0; t <= s; ++t) drop_seg(segc_[t]); streak_ = 0; return false; }
+                if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) return false;
                 cuda_hip::count(counters().node_updates);
             }
-        }
-        for (std::size_t s = 0; s < nseg_; ++s) {
+            return true;
+        };
+        auto launch = [&](std::size_t s) {
             auto& c = segc_[s];
             c.prev.swap(c.bytes); c.bytes.swap(c.pred); predict(c);
             cuda_hip::count(counters().graph_launches); ck(f_.graph_launch(c.exec, stream_), "graph launch");
+        };
+        const std::size_t first = eager ? 1 : nseg_;   // segments patched before anything is launched
+        for (std::size_t s = 0; s < first; ++s)
+            if (!patch(s)) { for (std::size_t t = 0; t <= s; ++t) drop_seg(segc_[t]); streak_ = 0; return false; }
+        for (std::size_t s = 0; s < nseg_; ++s) {
+            if (s >= first && !patch(s)) { streak_ = 0; replay_bad_.insert(key); throw std::runtime_error(std::string(api_name(api_)) + ": graph node update failed during replay"); }
+            launch(s);
         }
         cuda_hip::count(counters().replayed_runs); replayed_ = true;
         return true;
@@ -308,11 +326,15 @@ public:
             auto el = reinterpret_cast<std::uintptr_t>(e.host);
             if (!e.host_valid && el <= lo && el + e.count * 4 >= hi) dp = e.d + (lo - el); });
         if (!dp) return -1;
-        if (!am_) am_ = dmalloc(256, "scratch");
-        std::uint32_t n32 = std::uint32_t(n); void* args[] = {&dp, &n32, &am_};
-        ck(launch_s(function("forge_argmax"), 1, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        // up to 128 blocks of 256 threads (a lone block took ~30 us over a 248k vocabulary); the blocks leave partials
+        // in am_ and the last one merges them (am_[1] is its ticket counter, zero between launches)
+        if (!am_) { static const std::uint32_t zero[1024] = {}; am_ = dmalloc(sizeof zero, "scratch"); ck(htod_s(am_, zero, sizeof zero, stream_), "memcpy HtoD"); }
+        std::uint32_t n32 = std::uint32_t(n), nb = std::uint32_t(std::min<std::size_t>(128, (n + 2047) / 2048)); void* args[] = {&dp, &n32, &am_, &nb};
+        ck(launch_s(function("forge_argmax"), nb, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         ++dispatches_["argmax"];
-        int r = -1; ck(dtoh_s(&r, am_, 4, stream_), "memcpy DtoH"); sync();
+        int r = -1; void* pr = stage(4, true);   // page-locked: no driver staging on the read-back
+        ck(dtoh_s(pr ? pr : &r, am_, 4, stream_), "memcpy DtoH"); sync();
+        if (pr) std::memcpy(&r, pr, 4);
         return r;
     }
     void host_wrote(const float* p, std::size_t n) {
@@ -475,8 +497,41 @@ public:
         return std::string(bt == 128 ? "forge_qmatmul_mma128_" : "forge_qmatmul_mma_") + (fmt == 1 ? "q8_0" : fmt == 6 ? "q8_0g" : fmt == 2 ? "q4_k" : "q6_k"); }
     static unsigned mma_ns() { static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_STAGES"); return e && std::string(e) == "2" ? 2u : 1u; }(); return v; }   // $FORGE_MMA_STAGES=2: double-buffered q4_k (opt-in; no gain on an RTX 3090)
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
-        static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
+        auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }
     static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
+    // $FORGE_MMA_STREAMK: off by default (greedy output on Qwen3.5 not yet verified against the default path); 1 on for
+    // grids of 1/4 to 4 waves, 2 for every grid that does not fill whole waves (tests). Read per launch, so tests and
+    // benches compare the paths in one process.
+    static unsigned streamk_mode() { auto* e = std::getenv("FORGE_MMA_STREAMK"); return !e || !*e ? 0u : std::string(e) == "1" ? 1u : std::string(e) == "2" ? 2u : 0u; }
+    // Stream-K needs >= this many 256-value k chunks per block ($FORGE_MMA_SK_MIN, default 4): fewer blocks otherwise.
+    static unsigned sk_min() { auto* e = std::getenv("FORGE_MMA_SK_MIN"); int n = e && *e ? std::atoi(e) : 4; return unsigned(n < 1 ? 1 : n); }
+    std::uint64_t skfx_ = 0; std::size_t skfx_cap_ = 0;   // stream-K fixup slots (one bt x 128 float tile per block)
+    std::uint64_t skfl_ = 0; static constexpr unsigned skfl_n_ = 4096;   // stream-K flags, zero between launches (never reallocated)
+    std::map<void*, unsigned> occ_;   // resident blocks per SM of the mma kernels
+    // Persistent stream-K launch for the mma kernels (see mma_body): grid G (<= resident blocks), dp data-parallel
+    // tiles. false: the plain one-tile-per-block launch (tiles fill whole waves, stream-K off, or no occupancy figure).
+    bool streamk_plan(void* fn, unsigned smem, unsigned tiles, unsigned nck, unsigned bt, unsigned& G, unsigned& dp, std::uint64_t& fx, std::uint64_t& fl) {
+        const unsigned mode = streamk_mode();
+        if (!mode || !tiles || !has_fn_locked("forge_sum_splits")) return false;   // sum_splits: an sm_80 image of this revision
+        auto it = occ_.find(fn);
+        if (it == occ_.end()) { int nb = 0; if (!f_.occupancy || f_.occupancy(&nb, fn, 256, smem) != 0) nb = 0; it = occ_.emplace(fn, unsigned(std::max(nb, 0))).first; }
+        const unsigned slots = sms() * it->second;
+        if (!slots || tiles % slots == 0) return false;
+        // RTX 3090, 512 tokens: below 1/4 wave (e.g. 8 tiles, Qwen3.5's 32-column DeltaNet a/b) split-K's parallel sum
+        // beats the serial fixup (53.6 vs 63.6 us); from 4 waves on the ragged tail costs about what the stream-K
+        // share does (25600x5120 q4_k: 1847 vs 1896 us), so both keep the one-tile-per-block launch.
+        if (mode == 1 && (tiles * 4 < slots || tiles >= 4 * slots)) return false;
+        const std::uint64_t tot = std::uint64_t(tiles) * nck;
+        G = unsigned(std::min<std::uint64_t>(slots, std::max<std::uint64_t>(1, tot / sk_min())));
+        if (G > skfl_n_) return false;
+        // whole waves but the last one or two stay data-parallel; the rest (G..2G tiles) is shared out by k chunks
+        dp = tiles >= 2 * G ? (tiles / G - 1) * G : 0;
+        const std::size_t need = std::size_t(G) * bt * 128 * 4;
+        if (skfx_cap_ < need) { if (skfx_) free_s(skfx_); skfx_ = 0; skfx_cap_ = 0; std::size_t n = std::max<std::size_t>(need, std::size_t(sms()) << 16); skfx_ = dmalloc(n, "scratch"); skfx_cap_ = n; }
+        if (!skfl_) { skfl_ = dmalloc(skfl_n_ * 4, "scratch"); std::vector<std::uint32_t> z(skfl_n_, 0); ck(htod_s(skfl_, z.data(), z.size() * 4, stream_), "memcpy HtoD"); }
+        fx = skfx_; fl = skfl_;
+        return true;
+    }
     std::uint64_t am_ = 0;   // forge_argmax result (one int)
     std::uint64_t sk_ = 0; std::size_t sk_cap_ = 0;   // split-K partial products (stream-ordered reuse)
     void sk_reserve(std::size_t need) {
@@ -495,7 +550,13 @@ public:
     // read the same activation (qkv/z/a/b, gate/up) reuse it instead of re-quantising; any other kernel, copy or free
     // may change that buffer, so launch_s/htod_s/dtod/free_s drop it (q81_keep_ marks run_qmatmul's own launches).
     std::uint64_t q81_src_ = 0; std::uint32_t q81_n_ = 0; bool q81_keep_ = false;
-    void q81_drop() { q81_src_ = 0; }
+    // The q8r scratch (prefill MMA activations) likewise holds the int8 rows of device buffer q8r_src_ ([q8r_n_] floats,
+    // rows x k): written by forge_quant_q8r or by an rms_norm that emits it (forge_rms_norm_f), reused by the next
+    // matmuls on the same input (q/k/v, gate/up) and dropped by the same rules as q81_src_ ($FORGE_FUSE_Q8R=0 off).
+    // (run_qglu's own hand-off to the down projection, g8_*, is separate: see there.)
+    std::uint64_t q8r_src_ = 0; std::size_t q8r_n_ = 0;
+    static bool fuse_q8r() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q8R"); return !(e && std::string(e) == "0"); }(); return on; }
+    void q81_drop() { q81_src_ = 0; q8r_src_ = 0; g8_src_ = 0; }
     // Device ranges the next launch writes (set by callers that know them). launch_s keeps the q8_1 scratch when
     // none of them overlaps its source, so e.g. the a/b/z matmuls of a DeltaNet layer reuse the quantised input of
     // in_proj_qkv across the conv/slice kernels in between; a launch with no declared writes drops it.
@@ -506,6 +567,20 @@ public:
         q81_drop(); if (q81_) free_s(q81_); q81_ = 0; q81_cap_ = 0;
         q81_ = dmalloc(std::max<std::size_t>(need, 1 << 20), "scratch"); q81_cap_ = std::max<std::size_t>(need, 1 << 20);
     }
+    // decode matvec: output columns per 128-thread block (1, 2 or 4; the block's warps split between them).
+    // $FORGE_MMVQ_CPB forces one for every shape.
+    static std::uint32_t mmvq_cpb(std::uint32_t fmt, std::uint32_t k) {
+        static const std::uint32_t forced = [] { auto* e = std::getenv("FORGE_MMVQ_CPB"); unsigned v = e ? unsigned(std::atoi(e)) : 0u; return v == 1 || v == 2 || v == 4 ? v : 0u; }();
+        if (forced) return forced;
+        // q4_k with up to 24 super-blocks per column: a 4-warp block takes 16 per step, so k = 4096 / 5120 leave
+        // most lanes idle on the second step; two columns per block (2 warps each, 8 per step) balance it
+        // (25600x5120: 93 -> 87 us, 12288x4096: 39 -> 35.5 us). q6_k, q8_0 and longer k: no gain.
+        return fmt == 2 && k <= 6144 ? 2 : 1;
+    }
+    // q8_0 decode (regrouped weights): 16-byte loads per lane; $FORGE_MMVQ_Q8V=0 keeps the 4-byte-per-lane loop
+    static bool mmvq_q8v() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_Q8V"); return !(e && std::string(e) == "0"); }(); return on; }
+    // decode matvec weight loads through ld.global.nc.L1::no_allocate ($FORGE_MMVQ_NC=1; measured no faster on a 3090)
+    static bool mmvq_nc() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_NC"); return e && std::string(e) == "1"; }(); return on; }
     // Decode rms_norm / silu_mul also emit the q8_1 form of their output for the next matmul ($FORGE_FUSE_Q81=0 off).
     static bool fuse_q81() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q81"); return !(e && std::string(e) == "0"); }(); return on; }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
@@ -563,12 +638,26 @@ public:
                 ++dispatches_["qmatmul_mma"];   // batched prefill on int8 tensor cores
                 std::uint32_t nb = rows * (k / 32);
                 std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256;
-                q8r_reserve(xbytes + std::size_t(nb) * 8);
                 std::uint64_t xq = q8r_, xds = q8r_ + xbytes;
-                void* qa[] = {&xd, &xq, &xds, &nb};
-                ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
-                std::uint32_t ksplit = 0;
-                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit};
+                // [q8r reuse] skip the quantisation when x's q8r form is already on the device: run_qglu's epilogue
+                // wrote it (g8_, the down projection), or the q8r scratch holds it (an rms_norm emitted it, or the
+                // previous matmul read the same x); this matmul's own launches below keep the tracking (q81_keep_)
+                q81_keep_ = true;
+                if (g8_hit(xd, nb)) { xq = g8_; xds = g8_ + xbytes; ++dispatches_["quant_q8r_reused"]; }   // x came from run_qglu
+                else if (fuse_q8r() && q8r_src_ == xd && q8r_n_ == std::size_t(rows) * k && q8r_cap_ >= xbytes + std::size_t(nb) * 8) {
+                    xq = q8r_; xds = q8r_ + xbytes; ++dispatches_["quant_q8r_reused"]; }
+                else {
+                    q8r_reserve(xbytes + std::size_t(nb) * 8); xq = q8r_; xds = q8r_ + xbytes;
+                    void* qa[] = {&xd, &xq, &xds, &nb};
+                    ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                    if (fuse_q8r()) { q8r_src_ = xd; q8r_n_ = std::size_t(rows) * k; }
+                }
+                struct q8r_end { runtime* r; std::uint64_t y; std::size_t n; ~q8r_end() { r->q81_keep_ = false;   // y overwrote a tracked source
+                    auto ov = [&](std::uint64_t s, std::size_t b) { return s && y < s + b && s < y + n; };
+                    if (ov(r->q8r_src_, r->q8r_n_ * 4)) r->q8r_src_ = 0; if (ov(r->q81_src_, std::size_t(r->q81_n_) * 128)) r->q81_src_ = 0; } } q8r_guard{this, yd, out.size() * 4};
+                // [/q8r reuse]
+                std::uint32_t ksplit = 0, sk = 0, dp = 0; std::uint64_t fx = 0, fl = 0;
+                void* a2[] = {&xq, &xds, &wd, &yd, &rows, &cols, &k, &fmt, &rb32, &ksplit, &fx, &fl, &sk, &dp};
                 // 128 weight rows x bt tokens per 256-thread block (bt 128 for big batches); shared memory sized per format
                 // q4_k keeps 64 tokens (47 KB of shared memory: two blocks per SM); q6_k / q8_0 use one block per SM anyway,
                 // so 128 tokens give each warp twice the work per weight fragment ($FORGE_MMA_BT=64|128 forces one)
@@ -586,10 +675,11 @@ public:
                 // so pick the S (up to 8, each slice >= 2 chunks of k) with the fewest waves per unit of work; ties go
                 // to the smaller S (less partial traffic). slots: blocks resident at once (64-token kernels fit 2 per SM).
                 const unsigned nch = k / 256, slots = sms() * (bt == 64 && !ns2 ? 2u : 1u);
-                unsigned splits = 1;
+                unsigned splits = 1, G = 0;
+                const bool skp = !ns2 && streamk_plan(mf, smem, grid, nch, bt, G, dp, fx, fl);
                 // Grids of a few waves with a ragged last one (e.g. 256 blocks on 164 slots) also split, when that saves
                 // >= 10% of the waves; past 4 waves the tail costs little.
-                if (grid && grid < 4 * slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
+                if (!skp && grid && grid < 4 * slots && use_splitk() && has_fn_locked("forge_sum_splits")) {
                     double best = double((grid + slots - 1) / slots); const double need = grid < slots ? 0.97 : 0.9;
                     // a grid that already fills the device only splits long k (>= 16 chunks per slice): shorter slices
                     // lose more to the partial sums than the ragged wave costs (512x8192x4096 q4_k: 528 -> 638 us)
@@ -604,11 +694,14 @@ public:
                     const unsigned s = (nch + ksplit - 1) / ksplit;   // slices actually used
                     const std::size_t n = std::size_t(rows) * cols;
                     sk_reserve(n * s * 4);
-                    std::uint64_t part = sk_; void* a3[] = {&xq, &xds, &wd, &part, &rows, &cols, &k, &fmt, &rb32, &ksplit};
+                    std::uint64_t part = sk_; void* a3[] = {&xq, &xds, &wd, &part, &rows, &cols, &k, &fmt, &rb32, &ksplit, &fx, &fl, &sk, &dp};
                     ck(launch_s(mf, grid, s, 1, 256, 1, 1, smem, stream_, a3, nullptr), "launch");
                     std::uint32_t n32 = std::uint32_t(n), s32 = s; void* a4[] = {&part, &yd, &n32, &s32};
                     ck(launch_s(function("forge_sum_splits"), (n32 + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, a4, nullptr), "launch");
                     ++dispatches_["qmatmul_mma_splitk"];
+                } else if (skp) {
+                    sk = 1; ck(launch_s(mf, G, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                    ++dispatches_["qmatmul_mma_streamk"];
                 } else if (grid) ck(launch_s(mf, grid, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
             } else if (rows >= mmq_min_rows() && has_fn_locked("forge_qmatmul_mmq")) {   // batched prefill: 64x64 tiles
                 ++dispatches_["qmatmul_mmq"];
@@ -625,8 +718,9 @@ public:
                     ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                     q81_src_ = xd; q81_n_ = nb;
                 } else ++dispatches_["quant_q81_reused"];
-                void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-                unsigned grid = cols * ((rows + 3) / 4);   // a 4-warp block per column (and 4 activation rows)
+                const std::uint32_t cpb = mmvq_cpb(fmt, k); std::uint32_t fc = fmt | (cpb << 8) | (fmt == 6 && !mmvq_q8v() ? 0x800u : 0u) | (mmvq_nc() ? 0x1000u : 0u);
+                void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fc, &rb32};
+                unsigned grid = (cols + cpb - 1) / cpb * ((rows + 3) / 4);   // a 4-warp block per cpb columns (and 4 activation rows)
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
                 q81_keep_ = false;
                 if (yd < xd + std::uint64_t(nb) * 128 && xd < yd + std::uint64_t(out.size()) * 4) q81_drop();   // y overwrote the source
@@ -637,6 +731,112 @@ public:
             if (!in_run_) { ck(dtoh_s(out.data, yd, out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { q81_keep_ = false; q81_drop(); if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
+        return true;
+    }
+
+    // ---- FFN gate/up/SiLU fused (graph::compile's GLU pass; $FORGE_FUSE_GLU=0 off) ----
+    // y[rows, n] = silu(x . Wg^T) * (x . Wu^T). The two weights (same codec, [n, k] each) are uploaded once as one [2n, k]
+    // weight that interleaves them in groups of 16 rows (gate rows 8i..8i+7, then up rows 8i..8i+7), repacked like
+    // run_qmatmul's (q6_k padded, q8_0 regrouped), in place of the two separate copies. Prefill (rows >= the MMA
+    // threshold): forge_qmatmul_glu_* -- the int8 tensor-core kernel with a SiLU epilogue, whose block's 128 rows give 64
+    // whole output columns; it also writes the q8r form of y, which the down projection's run_qmatmul then uses instead
+    // of quantising y again (g8_*). Decode: forge_qmatmul_q81 over the 2n rows into scratch, then forge_glu_q81 (y and its
+    // q8_1 blocks for the down projection, like forge_silu_mul_q81). Only inside a run, k % 256 == 0, n % 64 == 0, and
+    // only where both the prefill and the decode kernels exist (so one process never holds both weight layouts).
+    // false: not taken; the caller runs the two matmuls and silu_mul instead.
+    static bool use_glu() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_GLU"); return !(e && std::string(e) == "0"); }(); return on; }
+    static std::string glu_fn(std::uint32_t efmt, unsigned bt) {
+        return std::string(bt == 128 ? "forge_qmatmul_glu128_" : "forge_qmatmul_glu_") + (efmt == 6 ? "q8_0g" : efmt == 2 ? "q4_k" : "q6_k"); }
+    std::uint64_t g8_ = 0; std::size_t g8_cap_ = 0;   // q8r form of the last forge_qmatmul_glu output (device buffer g8_src_)
+    std::uint64_t g8_src_ = 0, g8_stamp_ = 0; std::uint32_t g8_n_ = 0;
+    std::uint64_t gs_ = 0; std::size_t gs_cap_ = 0;   // decode GLU: the [rows, 2n] gate/up product
+    static std::uint64_t launch_stamp() { auto& c = counters(); return c.launches.load(std::memory_order_relaxed) + c.captured.load(std::memory_order_relaxed); }
+    // The q8r form in g8_ is that of x (device pointer, nb groups) when nothing was launched, copied or freed since.
+    bool g8_hit(std::uint64_t xd, std::uint32_t nb) const { return g8_src_ && g8_src_ == xd && g8_n_ == nb && g8_stamp_ == launch_stamp(); }
+    void scratch_reserve(std::uint64_t& p, std::size_t& cap, std::size_t need) {
+        if (cap >= need) return;
+        if (p) free_s(p); p = 0; cap = 0;
+        std::size_t n = std::max<std::size_t>(need, 1 << 20); p = dmalloc(n, "scratch"); cap = n;
+    }
+    bool run_qglu(const tensor_view& x, const std::uint8_t* qg, const std::uint8_t* qu, std::size_t rb, std::uint32_t n, std::uint32_t fmt, tensor_view out) {
+        if (x.shape.empty() || !qg || !qu || !use_glu() || (fmt != 1 && fmt != 2 && fmt != 3) || (reinterpret_cast<std::uintptr_t>(qg) & 3u)) return false;
+        const std::uint32_t k = std::uint32_t(x.shape.back()), rows = k ? std::uint32_t(x.size() / k) : 0;
+        if (!k || k % 256 || !n || n % 64 || !rows || out.size() != std::size_t(rows) * n) return false;
+        std::lock_guard lk(mu_); bind();
+        if (!in_run_ || !use_mma() || !use_mmvq()) return false;
+        const std::uint32_t ef = fmt == 1 ? 6 : fmt == 3 ? 5 : 2;   // the layouts run_qmatmul repacks to on this image
+        for (const char* f : {"forge_quant_q8r", "forge_quant_q81", "forge_qmatmul_q81", "forge_glu_q81"}) if (!has_fn_locked(f)) return false;
+        if (!has_fn_locked(glu_fn(ef, 64)) || !has_fn_locked(mma_fn(ef))) return false;
+        begin_op();
+        ++dispatches_["qmatmul_glu"];
+        const std::uint32_t cols = 2 * n;
+        const std::size_t drb = fmt == 3 ? rb / 210 * 224 : rb, qbytes = drb * cols;
+        auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(qg) | 2u, qbytes}]; qe.last = ++clock_;
+        if (!qe.d) {
+            std::uint64_t d = dmalloc(qbytes, "weights"); qe.d = d;
+            std::vector<std::uint8_t> tmp(qbytes, 0);
+            for (std::size_t c = 0; c < cols; ++c) {
+                const std::uint8_t* s = ((c & 8) ? qu : qg) + ((c >> 4) * 8 + (c & 7)) * rb;
+                std::uint8_t* o = tmp.data() + c * drb;
+                if (fmt == 3) for (std::size_t b = 0, nb = rb / 210; b < nb; ++b) std::memcpy(o + b * 224, s + b * 210, 210);
+                else if (fmt == 1) for (std::size_t g = 0, ng = rb / 272; g < ng; ++g)
+                    for (int j = 0; j < 8; ++j) { std::memcpy(o + g * 272 + 2 * j, s + g * 272 + 34 * j, 2); std::memcpy(o + g * 272 + 16 + 32 * j, s + g * 272 + 34 * j + 2, 32); }
+                else std::memcpy(o, s, rb);
+            }
+            ck(htod_s(qe.d, tmp.data(), qbytes, stream_), "memcpy HtoD");   // pageable: staged before the call returns
+            ++stats_.uploads; stats_.qweight_bytes += qbytes;
+        }
+        std::uint64_t wd = qe.d, xd = acquire(x.data, x.size(), false).ptr;
+        auto yb = acquire(out.data, out.size(), true); yb.e->host_valid = false; std::uint64_t yd = yb.ptr;
+        xd = acquire(x.data, x.size(), false).ptr;   // final once a pass hits the cache (out may have replaced an overlapping x)
+        std::uint32_t fm = ef, rb32 = std::uint32_t(drb), kk = k, nn = n, rr = rows, cc = cols;
+        try {
+            if (rows >= mmq_min_rows()) {
+                std::uint32_t nb = rows * (k / 32), nbo = rows * (n / 32);
+                std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256, obytes = (std::size_t(rows) * n + 255) / 256 * 256;
+                q8r_reserve(xbytes + std::size_t(nb) * 8);
+                scratch_reserve(g8_, g8_cap_, obytes + std::size_t(nbo) * 8);
+                std::uint64_t xq = q8r_, xds = q8r_ + xbytes, gq = g8_, gds = g8_ + obytes;
+                void* qa[] = {&xd, &xq, &xds, &nb};
+                // x is usually the ffn rms_norm's output, which already wrote its q8r form (FORGE_FUSE_Q8R)
+                if (fuse_q8r() && q8r_src_ == xd && q8r_n_ == std::size_t(rows) * k) ++dispatches_["quant_q8r_reused"];
+                else {
+                    ck(launch_s(function("forge_quant_q8r"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                    if (fuse_q8r()) { q8r_src_ = xd; q8r_n_ = std::size_t(rows) * k; }
+                }
+                const unsigned want = mma_bt() ? mma_bt() : ef == 2 ? 64u : 128u;
+                const unsigned bt = rows >= 128 && want == 128 && has_fn_locked(glu_fn(ef, 128)) ? 128u : 64u;
+                const unsigned smem = bt * 336 + (ef == 2 ? 144u : ef == 5 ? 240u : 272u) * 128 + 8192;
+                void* mf = function(glu_fn(ef, bt));
+                if (!mma_attr_.count(mf) && f_.func_attr) { ck(f_.func_attr(mf, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(mf); }
+                std::uint32_t sk = 0, dp = 0; std::uint64_t fx = 0, fl = 0; unsigned G = 0;
+                const unsigned tiles = ((rows + bt - 1) / bt) * (cols / 128);
+                if (streamk_plan(mf, smem, tiles, k / 256, bt, G, dp, fx, fl)) { sk = 1; ++dispatches_["qmatmul_glu_streamk"]; }
+                void* a2[] = {&xq, &xds, &wd, &yd, &rr, &cc, &kk, &fm, &rb32, &gq, &gds, &fx, &fl, &sk, &dp};
+                writes(yd, out.size() * 4);
+                ck(launch_s(mf, sk ? G : tiles, 1, 1, 256, 1, 1, smem, stream_, a2, nullptr), "launch");
+                g8_src_ = yd; g8_n_ = nbo; g8_stamp_ = launch_stamp();
+            } else {   // decode
+                std::uint32_t nb = rows * (k / 32), nbo = rows * (n / 32);
+                q81_reserve(std::size_t(std::max(nb, nbo)) * 40);
+                scratch_reserve(gs_, gs_cap_, std::size_t(rows) * cols * 4);
+                std::uint64_t qx = q81_, hs = gs_;
+                q81_keep_ = true;
+                if (q81_src_ != xd || q81_n_ != nb) {
+                    void* qa[] = {&xd, &qx, &nb};
+                    ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
+                    q81_src_ = xd; q81_n_ = nb;
+                } else ++dispatches_["quant_q81_reused"];
+                void* a2[] = {&qx, &wd, &hs, &rr, &cc, &kk, &fm, &rb32};
+                ck(launch_s(function("forge_qmatmul_q81"), cols * ((rows + 3) / 4), 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
+                q81_keep_ = false;
+                void* a3[] = {&hs, &yd, &rr, &nn, &qx};
+                writes(yd, out.size() * 4); writes(qx, std::size_t(nbo) * 40);
+                ck(launch_s(function("forge_glu_q81"), (nbo + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, a3, nullptr), "launch");
+                // the scratch now holds y's q8_1 blocks: the down projection reuses them ($FORGE_FUSE_Q81=0: not)
+                if (fuse_q81()) { q81_src_ = yd; q81_n_ = nbo; } else q81_drop();
+            }
+        } catch (...) { q81_keep_ = false; q81_drop(); throw; }
         return true;
     }
 
@@ -801,18 +1001,126 @@ public:
                     if (rows <= 4 && cols >= 2048) block = 1024; }   // one wide row: a 1024-thread block
                 else if (op == "silu_mul" && n % 32 == 0 && n <= (1u << 18) && has_fn_locked("forge_silu_mul_q81")) {
                     fn = function("forge_silu_mul_q81"); fnb = n / 32; block = 256; grid = (fnb + 7) / 8; }
+                else if (dec && u6 % 32 == 0 && has_fn_locked("forge_attention_comb_q81")) {   // the output projection's input
+                    fn = function("forge_attention_comb_q81"); fnb = nrow * (u6 / 32); }
                 if (fnb) { q81_reserve(std::size_t(fnb) * 40); qx = q81_; args.push_back(&qx); ++dispatches_["fused_q81"]; }
+            }
+            // prefill rms_norm also writes y's q8r rows for the next tensor-core matmul (forge_rms_norm_f, same reduction
+            // as forge_rms_norm_b), which then skips forge_quant_q8r ($FORGE_FUSE_Q8R=0 off)
+            std::uint64_t q8x = 0, q8d = 0, nul = 0; std::uint32_t q8m = 4; bool q8 = false;
+            if (s == sig::rms && !fnb && q8r_emit(rows, cols) && fn == function("forge_rms_norm_b")) {
+                auto [xq, xd2] = q8r_slot(rows, cols); q8x = xq; q8d = xd2; q8 = true;
+                fn = function("forge_rms_norm_f"); args = {&ptrs[0], &nul, &nul, &ptrs[1], &ptrs[2], &rows, &cols, &f0, &q8m, &q8x, &q8d};
+                ++dispatches_["fused_q8r"];
             }
             writes(ptrs.back(), out.size() * 4);
             if (grid) ck(launch_s(fn, grid, 1, 1, block, 1, 1, smem, stream_, args.data(), nullptr), "launch");
             if (fnb) { q81_src_ = ptrs.back(); q81_n_ = fnb; }
+            if (q8) { q8r_src_ = ptrs.back(); q8r_n_ = std::size_t(rows) * cols; }
             if (!in_run_) { ck(dtoh_s(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
     }
 
+    // ---- elementwise fusions (graph::device_hooks::fused): two adjacent plan steps as one kernel, inside a run ----
+    //   "add_rms_norm": in {a, b, w}, out {s = a + b, y = rms_norm(s, w)}            ($FORGE_FUSE_ADD_NORM=0 off)
+    //   "rms_rope":     in {x [s, heads, d], w [d], pos [s]}, out {rope(rms_norm(x, w), pos)}   ($FORGE_FUSE_QK_ROPE=0 off)
+    // attrs: the rms_norm's eps (and the rope's base / neox). The norm reduces as the kernel run_op would pick for the
+    // same rows (forge_rms_norm_b or forge_rms_norm_q81), and add_rms_norm also writes the q8_1 / q8r form of y when
+    // run_op's rms_norm would, so results are bit-identical to the two steps. false = not handled here (the executor
+    // runs the steps one by one): outside a run, a missing kernel, unsupported shapes, or outputs that partly overlap
+    // the inputs (in place is fine).
+    bool run_fused(const std::string& kind, const std::vector<tensor_view>& in, const std::vector<tensor_view>& out, const ops::attrs& a) {
+        auto on = [](const char* v) { auto* e = std::getenv(v); return !(e && std::string(e) == "0"); };
+        static const bool add_norm = on("FORGE_FUSE_ADD_NORM"), qk_rope = on("FORGE_FUSE_QK_ROPE");
+        auto ov = [](const tensor_view& p, const tensor_view& q) { return p.data < q.data + q.size() && q.data < p.data + p.size(); };
+        auto same_or_apart = [&](const tensor_view& p, const tensor_view& q) { return !ov(p, q) || (p.data == q.data && p.size() == q.size()); };
+        for (auto& v : in) if (!v.data) return false;
+        for (auto& v : out) if (!v.data) return false;
+        std::lock_guard lk(mu_); bind(); begin_op();
+        if (!in_run_ || !has_fn_locked("forge_rms_norm_b")) return false;
+        // device pointers: inputs, then outputs (acquired twice: a later acquire may replace an earlier overlapping one)
+        auto bind_all = [&](std::vector<std::uint64_t>& p) {
+            for (int pass = 0; pass < 2; ++pass) {
+                p.clear();
+                for (auto& v : in) p.push_back(acquire(v.data, v.size(), false).ptr);
+                for (auto& v : out) { auto b = acquire(v.data, v.size(), pass == 0); b.e->host_valid = false; p.push_back(b.ptr); }
+            } };
+        const float eps = float(a.num("eps", 1e-6));
+        if (kind == "add_rms_norm" && add_norm && in.size() == 3 && out.size() == 2 && has_fn_locked("forge_rms_norm_f")) {
+            const tensor_view &A = in[0], &B = in[1], &W = in[2], &S = out[0], &Y = out[1];
+            const std::size_t n = S.size(), c = W.size();
+            if (!c || c % 32 || A.size() != n || B.size() != n || Y.size() != n || n % c || n / c > 0xffffffffu || c > 0xffffffffu) return false;
+            if (!same_or_apart(S, A) || !same_or_apart(S, B) || ov(S, Y) || !same_or_apart(Y, A) || !same_or_apart(Y, B) || ov(W, S) || ov(W, Y)) return false;
+            std::uint32_t rows = std::uint32_t(n / c), cols = std::uint32_t(c); unsigned block = 256;
+            std::uint32_t mode = 8u | rms_mode(rows, cols, &block);
+            std::uint64_t xq = 0, xds = 0;
+            if (mode & 1u) { mode |= 2u; q81_reserve(std::size_t(rows) * (cols / 32) * 40); xq = q81_; }
+            else if (q8r_emit(rows, cols)) { mode |= 4u; std::tie(xq, xds) = q8r_slot(rows, cols); }
+            std::vector<std::uint64_t> p; bind_all(p);   // a, b, w, s, y
+            void* args[] = {&p[0], &p[1], &p[3], &p[2], &p[4], &rows, &cols, const_cast<float*>(&eps), &mode, &xq, &xds};
+            writes(p[3], n * 4); writes(p[4], n * 4);
+            if (rows) ck(launch_s(function("forge_rms_norm_f"), rows, 1, 1, block, 1, 1, 0, stream_, args, nullptr), "launch");
+            if (mode & 2u) { q81_src_ = p[4]; q81_n_ = rows * (cols / 32); }
+            if (mode & 4u) { q8r_src_ = p[4]; q8r_n_ = n; }
+            ++dispatches_["fused_add_rms_norm"];
+            return true;
+        }
+        if (kind == "rms_rope" && qk_rope && in.size() == 3 && out.size() == 1 && has_fn_locked("forge_rms_rope")) {
+            const tensor_view &X = in[0], &W = in[1], &Pp = in[2], &Y = out[0];
+            if (X.shape.size() != 3) return false;
+            const i64 s = X.shape[0], H = X.shape[1], d = X.shape[2];
+            if (s <= 0 || H <= 0 || d < 32 || d > 256 || (d & (d - 1)) || i64(W.size()) != d || i64(Pp.size()) != s || Y.size() != X.size() || s * H > 0xffffffffll) return false;
+            if (!same_or_apart(Y, X) || ov(Y, W) || ov(Y, Pp)) return false;
+            unsigned block = 256;
+            std::uint32_t mode = rms_mode(std::uint32_t(s * H), std::uint32_t(d), &block);
+            if (block != 256) return false;
+            std::vector<float> invf(std::size_t(d / 2)); const double base = a.num("base", 10000.0);
+            for (std::size_t j = 0; j < invf.size(); ++j) invf[j] = float(std::pow(base, -2.0 * double(j) / double(d)));   // as run_op's rope
+            auto& tb = rope_[invf];
+            if (!tb) { tb = dmalloc(invf.size() * 4, "scratch"); ck(htod_s(tb, invf.data(), invf.size() * 4, stream_), "memcpy HtoD"); }
+            std::uint64_t tbl = tb;
+            // heads per block: a prefill block takes up to 16 of a token's heads (its cos/sin computed once); decode spreads them
+            static const unsigned hpb_env = [] { auto* e = std::getenv("FORGE_ROPE_HPB"); return e ? unsigned(std::strtoul(e, nullptr, 10)) : 0u; }();
+            std::uint32_t hpb = hpb_env ? hpb_env : s >= 32 ? 16u : std::uint32_t(256 / d);   // 16: fastest for 512 x 64 x 128 on an RTX 3090
+            hpb = std::min<std::uint32_t>(hpb, std::uint32_t(H));
+            std::uint32_t su = std::uint32_t(s), hu = std::uint32_t(H), du = std::uint32_t(d), neox = a.num("neox", 1) != 0;
+            const unsigned grid = su * ((hu + hpb - 1) / hpb);
+            std::vector<std::uint64_t> p; bind_all(p);   // x, w, pos, y
+            void* args[] = {&p[0], &p[1], &p[2], &tbl, &p[3], &su, &hu, &du, const_cast<float*>(&eps), &neox, &hpb, &mode};
+            writes(p[3], Y.size() * 4);
+            ck(launch_s(function("forge_rms_rope"), grid, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+            ++dispatches_["fused_rms_rope"];
+            return true;
+        }
+        return false;
+    }
+
 private:
+    // How run_op's rms_norm reduces rows x cols inside a run: 1 = forge_rms_norm_q81 (warp shuffles; *block 256, or 1024
+    // for a few wide rows), 0 = forge_rms_norm_b (tree over 256 threads). The fused kernels follow the same choice.
+    unsigned rms_mode(std::uint32_t rows, std::uint32_t cols, unsigned* block) {
+        *block = 256;
+        if (fuse_q81() && use_mmvq() && rows < mmq_min_rows() && cols % 32 == 0 && has_fn_locked("forge_rms_norm_q81")) {
+            if (rows <= 4 && cols >= 2048) *block = 1024;
+            return 1;
+        }
+        return 0;
+    }
+    // a prefill rms_norm output that the next matmul quantises for the tensor cores (run_qmatmul's MMA conditions).
+    // Only model-width rows (>= 1024): per-head norms (QK-norm, head dim <= 256) feed rope/attention, not a matmul, and
+    // emitting for them would also evict the q/k/v projections' shared input from the scratch.
+    bool q8r_emit(std::uint32_t rows, std::uint32_t cols) {
+        return in_run_ && fuse_q8r() && use_mma() && rows >= mmq_min_rows() && cols % 256 == 0 && cols >= 1024 &&
+               has_fn_locked("forge_quant_q8r") && has_fn_locked("forge_rms_norm_f");
+    }
+    // the q8r scratch laid out as run_qmatmul's MMA path expects: int8 rows (padded to 256 bytes), then (d, d*sum) pairs
+    std::pair<std::uint64_t, std::uint64_t> q8r_slot(std::uint32_t rows, std::uint32_t k) {
+        const std::size_t xbytes = (std::size_t(rows) * k + 255) / 256 * 256, nb = std::size_t(rows) * (k / 32);
+        q8r_reserve(xbytes + nb * 8);
+        return {q8r_, q8r_ + xbytes};
+    }
     explicit runtime(api a) : api_(a) {}
     // Driver entry points, normalised: CUDA and HIP module APIs have the same shapes. Optional ones may be null.
     struct fns {
@@ -856,6 +1164,9 @@ private:
         int (*peer)(std::uint64_t, std::uintptr_t, std::uint64_t, std::uintptr_t, std::size_t) = nullptr;
         int (*mem_info)(std::size_t*, std::size_t*) = nullptr;
         int (*func_attr)(void*, int, int) = nullptr;   // cuFuncSetAttribute (dynamic shared memory above 48 KB)
+        int (*host_alloc)(void**, std::size_t) = nullptr;   // cuMemAllocHost_v2 (page-locked staging; CUDA only)
+        int (*host_free)(void*) = nullptr;                  // cuMemFreeHost
+        int (*occupancy)(int*, void*, int, std::size_t) = nullptr;   // cuOccupancyMaxActiveBlocksPerMultiprocessor
         // wrappers that fall back to the synchronous copies when the async ones are missing
         int htod_async(std::uint64_t d, const void* h, std::size_t n, void* s) const { return htod_a ? htod_a(d, h, n, s) : htod(d, h, n); }
         int dtoh_async(void* h, std::uint64_t d, std::size_t n, void* s) const { return dtoh_a ? dtoh_a(h, d, n, s) : dtoh(h, d, n); }
@@ -941,7 +1252,12 @@ private:
         if (!q81_keep_ && q81_src_) {
             bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q81_src_, hi = lo + std::uint64_t(q81_n_) * 128;
             for (unsigned i = 0; i < nwr_ && i < 3; ++i) if (wr_[i][0] < hi && lo < wr_[i][1]) hit = true;
-            if (hit) q81_drop();
+            if (hit) q81_src_ = 0;
+        }
+        if (!q81_keep_ && q8r_src_) {   // the same rule for the q8r scratch's source
+            bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q8r_src_, hi = lo + std::uint64_t(q8r_n_) * 4;
+            for (unsigned i = 0; i < nwr_ && i < 3; ++i) if (wr_[i][0] < hi && lo < wr_[i][1]) hit = true;
+            if (hit) q8r_src_ = 0;
         }
         nwr_ = 0;
         if (!(in_run_ && !user_cap_ && gmode() && st == stream_ && !ex)) {
@@ -964,10 +1280,18 @@ private:
                 reissue_captured();   // the segment changed shape: capture it after all
         } else r = f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
         // Split long segments so the GPU runs one while the host records the next ($FORGE_GRAPH_SEG kernels, 0 = off).
-        if (r == 0 && ++seg_kernels_ >= graph_seg()) flush();
+        // The first segments of a run are shorter ($FORGE_GRAPH_SEG0 kernels, doubling up to $FORGE_GRAPH_SEG): the
+        // device idles from the previous run's end until the first launch, so that one goes out early.
+        if (r == 0 && ++seg_kernels_ >= seg_limit()) flush();
         return r;
     }
     std::size_t seg_kernels_ = 0;
+    std::size_t seg_limit() const {
+        static const std::size_t s0 = [] { auto* e = std::getenv("FORGE_GRAPH_SEG0"); return std::size_t(e ? std::strtoul(e, nullptr, 10) : 8); }();
+        const std::size_t full = graph_seg();
+        if (!s0 || seg_ >= 16) return full;
+        return std::min(full, s0 << seg_);
+    }
     static std::size_t graph_seg() {
         static const std::size_t v = [] { auto* e = std::getenv("FORGE_GRAPH_SEG"); std::size_t n = e ? std::strtoul(e, nullptr, 10) : 64; return n ? n : ~std::size_t(0); }();
         return v;
@@ -981,9 +1305,33 @@ private:
         return true; }
     int htod_or_zero(std::uint64_t d, const void* h, std::size_t n, void* st) {
         if (f_.memset32 && n >= (64u << 10) && n % 4 == 0 && all_zero(h, n)) {
-            flush(); q81_drop(); dirty_ |= in_run_; ++stats_.zero_fills; return f_.memset32(d, 0u, n / 4, st); }
+            flush(); q_written(d, n); dirty_ |= in_run_; ++stats_.zero_fills; return f_.memset32(d, 0u, n / 4, st); }
         return htod_s(d, h, n, st); }
-    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
+    // a copy wrote device range [d, d + n): drop the quantised-activation scratches whose source it overlaps
+    void q_written(std::uint64_t d, std::size_t n) {
+        if (q81_src_ && d < q81_src_ + std::uint64_t(q81_n_) * 128 && q81_src_ < d + n) q81_src_ = 0;
+        if (q8r_src_ && d < q8r_src_ + q8r_n_ * 4 && q8r_src_ < d + n) q8r_src_ = 0;
+        if (g8_src_ && d < g8_src_ + std::uint64_t(g8_n_) * 128 && g8_src_ < d + n) g8_src_ = 0;
+    }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) {
+        flush(); q_written(d, n); dirty_ |= in_run_; cuda_hip::count(counters().htod);
+        if (void* p = st == stream_ ? stage(n) : nullptr) { std::memcpy(p, h, n); return f_.htod_async(d, p, n, st); }   // a real async copy
+        return f_.htod_async(d, h, n, st); }
+    // Small host-to-device copies (decode: the token id and position each run) go through a page-locked staging
+    // ring: from pageable memory the driver stages them itself, synchronously (tens of us each under WSL). A slot is
+    // reused only after the next sync(), which drains every copy issued before it; when the ring is full, or while a
+    // stream capture is open (a memcpy node would keep pointing at a reused slot), the pageable path is taken.
+    // $FORGE_GPU_STAGE=0 turns it off.
+    static constexpr std::size_t stage_cap = 64 << 10, stage_max = 4096;
+    void* stage_ = nullptr; std::size_t stage_off_ = 0; bool stage_tried_ = false;
+    static bool stage_on() { static const bool on = [] { auto* e = std::getenv("FORGE_GPU_STAGE"); return !(e && std::string(e) == "0"); }(); return on; }
+    void* stage(std::size_t n, bool reserve_tail = false) {
+        if (n > stage_max || capturing_ || user_cap_ || !stage_on() || !f_.host_alloc || !f_.htod_a) return nullptr;
+        if (!stage_tried_) { stage_tried_ = true; if (f_.host_alloc(&stage_, stage_cap) != 0) stage_ = nullptr; }
+        if (!stage_) return nullptr;
+        if (reserve_tail) return static_cast<char*>(stage_) + stage_cap - 64;   // the argmax read-back slot
+        if (stage_off_ + n > stage_cap - 64) return nullptr;
+        void* p = static_cast<char*>(stage_) + stage_off_; stage_off_ += (n + 63) & ~std::size_t(63); return p; }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; cuda_hip::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return dfree(p); }
     // ---- device memory accounting (gpu/device_memory.hpp) ----
@@ -1030,7 +1378,7 @@ private:
     // device-to-device copy on the stream; inside a graph-mode run it is a kernel (forge_copy_words), so segments hold
     // kernel nodes only and replay can patch them
     int dtod_s(std::uint64_t d, std::uint64_t s, std::size_t n) {
-        cuda_hip::count(counters().dtod); q81_drop();
+        cuda_hip::count(counters().dtod); q_written(d, n);
         if (in_run_ && gmode() && n % 4 == 0 && n / 4 < (1ull << 32) && has_fn_locked("forge_copy_words")) {
             std::uint32_t w = std::uint32_t(n / 4); void* args[] = {&s, &d, &w}; writes(d, n);
             return w ? launch_s(function("forge_copy_words"), (w + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr) : 0;
@@ -1113,7 +1461,7 @@ private:
         }
         else if (f_.set_device) f_.set_device(ordinal_);
     }
-    void sync() { flush(); dirty_ |= in_run_; cuda_hip::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
+    void sync() { flush(); dirty_ |= in_run_; cuda_hip::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); stage_off_ = 0; }
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
         void* f = nullptr; ck(f_.get_fn(&f, mod_, n.c_str()), ("get function " + n).c_str());
@@ -1121,7 +1469,12 @@ private:
     }
     template<class F> void each_overlap(const float* p, std::size_t n, F&& f) {
         auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + std::max<std::size_t>(n, 1) * 4;
-        for (auto& [k, e] : res_) { auto el = k, eh = k + e.count * 4; if (el < hi && lo < eh) f(e); }
+        // entries are disjoint host ranges (acquire splits or merges overlaps), so only the one starting before lo can
+        // reach into the range: a log-time seek instead of a scan of every resident buffer (decode calls this per state
+        // slot per token)
+        auto it = res_.upper_bound(lo);
+        if (it != res_.begin()) { auto pv = std::prev(it); if (pv->first + pv->second.count * 4 > lo) it = pv; }
+        for (; it != res_.end() && it->first < hi; ++it) { auto el = it->first, eh = el + it->second.count * 4; if (el < hi && lo < eh) f(it->second); }
     }
     void download(entry& e) { ck(dtoh_s(e.host, e.d, e.count * 4, stream_), "memcpy DtoH"); e.host_valid = true; ++stats_.downloads; }
     // freed device buffers are pooled by size and reused: decode runs the same shapes every token
@@ -1208,7 +1561,8 @@ private:
             opt(f_.param_info, "cuFuncGetParamInfo"); opt(f_.kn_set, "cuGraphExecKernelNodeSetParams");
             opt(f_.g_roots, "cuGraphGetRootNodes"); opt(f_.g_deps, "cuGraphNodeGetDependentNodes"); opt(f_.g_type, "cuGraphNodeGetType"); opt(f_.graph_launch, "cuGraphLaunch");
             opt(f_.gexec_destroy, "cuGraphExecDestroy"); opt(f_.graph_destroy, "cuGraphDestroy");
-            opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2"); opt(f_.func_attr, "cuFuncSetAttribute");
+            opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2"); opt(f_.func_attr, "cuFuncSetAttribute"); opt(f_.occupancy, "cuOccupancyMaxActiveBlocksPerMultiprocessor");
+            opt(f_.host_alloc, "cuMemAllocHost_v2"); opt(f_.host_free, "cuMemFreeHost"); if (!f_.host_free) f_.host_alloc = nullptr;
         } else {
             ok = sym(f_.init, "hipInit") && sym(f_.count, "hipGetDeviceCount") && sym(f_.name, "hipDeviceGetName") &&
                  sym(f_.set_device, "hipSetDevice") && sym(f_.load, "hipModuleLoadData") && sym(f_.unload, "hipModuleUnload") &&
@@ -1235,7 +1589,12 @@ private:
         if (api_ == api::cuda && f_.device_get && f_.device_get(&dev, ordinal_) != 0) return "cuDeviceGet failed";
         char buf[256] = {}; f_.name(buf, sizeof buf, dev); name_ = buf;
         if (int v = 0; api_ == api::cuda && f_.dev_attr && f_.dev_attr(&v, 16 /* MULTIPROCESSOR_COUNT */, dev) == 0 && v > 0) sms_ = unsigned(v);
-        if (api_ == api::cuda) { if (f_.ctx_create(&ctx_, 0, dev) != 0) return "context creation failed"; }
+        if (api_ == api::cuda) {
+            // $FORGE_CUDA_SCHED: how a host thread waits on the device (auto | spin | yield | block): CU_CTX_SCHED_*
+            const char* sc = std::getenv("FORGE_CUDA_SCHED"); const std::string s = sc ? sc : "";
+            const unsigned fl = s == "spin" ? 1u : s == "yield" ? 2u : s == "block" ? 4u : 0u;
+            if (f_.ctx_create(&ctx_, fl, dev) != 0) return "context creation failed";
+        }
         else if (f_.set_device(ordinal_) != 0) return "hipSetDevice failed";
         if (f_.stream_create && f_.stream_create(&stream_, 1 /* non-blocking */) != 0) stream_ = nullptr;
         for (auto& [arch, img] : imgs) {

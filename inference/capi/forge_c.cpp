@@ -83,7 +83,7 @@ int64_t forge_generate_ex2(forge_model* m, const int32_t* prompt, int64_t np, in
         if (o && o->grammar) {
             if (!tok) { g_err = "grammar needs a tokenizer"; return -1; }
             gc = std::make_unique<forge::inference::grammar_constraint>(std::make_shared<forge::inference::grammar>(o->grammar), *tok, int(m->s.vocab()), tok->eos());
-            smp.filter = [&](std::span<float> l) { gc->apply(l); };
+            smp.filter = [&](std::span<float> l) { gc->apply(l); }; smp.allow = [&](int t) { return gc->allows(t); };
         }
         std::vector<int> r;
         auto on = [&](int t) {

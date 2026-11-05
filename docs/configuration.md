@@ -9,8 +9,12 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 | `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
 | `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx2`, `avx512`, `neon`, `sve`, `rvv`. Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
 | `FORGE_SVE_KEEP_VL=1` | simd (aarch64 Linux) | Do not change the SVE vector length at start-up when there is no kernel table for the hardware length |
-| `FORGE_THREADS` | task pool | Worker thread count (default: hardware concurrency) |
+| `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
+| `FORGE_SPIN_US` | task pool | How long idle workers spin for the next `parallel_for` before sleeping (default 200; 0 = sleep at once) |
 | `FORGE_PROCESSES` | `os::process_pool` | Worker process count when the pool is created with 0 workers (default: hardware concurrency) |
+| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels (default: on when a SIMD integer table exists) |
+| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`, `avx2`, `avxvnni`, `avx512vnni` |
+| `FORGE_QI8_PF` | quantised matmul (CPU) | Software prefetch distance of the integer kernels in bytes (default 2048, 0 = off) |
 | `FORGE_QDOT=0` | quantised matmul (CPU) | Use the plain scalar decode + dot path instead of the SIMD one (benchmarking, bisecting) |
 
 ## GPU tuning and debugging
@@ -32,20 +36,37 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_GRAPHS=0` | CUDA | Do not capture decode kernel launches into CUDA graphs (capture and replay are on by default) |
 | `FORGE_GRAPH_REPLAY=0` | CUDA | With decode graphs on: always re-capture instead of patching kernel parameters in place |
 | `FORGE_GRAPH_SEG` | CUDA | With decode graphs on: kernels per captured segment (default 64; 0 = no splitting) |
+| `FORGE_GRAPH_SEG0` | CUDA | Kernels in a run's first captured segment, doubling per segment up to `FORGE_GRAPH_SEG` (default 8; 0 = off) |
+| `FORGE_REPLAY_EAGER=0` | CUDA | Whole-run replay patches every segment before launching any (default: patch and launch one at a time) |
+| `FORGE_GPU_STAGE=0` | CUDA | Small host-to-device copies (≤ 4 KB) go from pageable memory instead of a page-locked staging ring |
+| `FORGE_CUDA_SCHED` | CUDA | `spin`, `yield` or `block`: the context's host wait mode (default auto) |
 | `FORGE_CUDA_IMAGE` | CUDA | Load only this embedded PTX image: `ptx` (sm_70) or `ptx sm_80`. By default `sm_80` is tried first, then `sm_70` |
 | `FORGE_MMA=0` | CUDA | Disable the int8 tensor-core prefill matmul (`sm_80` image) and the q6_k/q8_0 weight repacking; prefill uses MMQ |
 | `FORGE_MMA_BT` | CUDA | `64` or `128`: tokens per tensor-core matmul block (default: 64 for q4_k, 128 for q6_k/q8_0 when rows ≥ 128) |
+| `FORGE_MMA_STREAMK` | CUDA | `1`: persistent stream-K tensor-core matmul for grids of 1/4 to 4 waves that do not fill whole waves (off by default); `2`: for every such grid, however small. Read per launch |
+| `FORGE_MMA_SK_MIN` | CUDA | Minimum 256-value k chunks per stream-K block (default 4) |
 | `FORGE_MMA_SPLITK=0` | CUDA | Turns off split-K for tensor-core matmuls whose grid cannot fill the GPU (k/v projections, DeltaNet a/b); on by default |
 | `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
+| `FORGE_CPU_ATTN` | CPU | Chunked GQA-shared attention (`graph/attn_cpu.hpp`): by default used with an int8 KV cache only; `new` uses it for f32 KV too (its f32 prefill has not yet been shown faster), `old` never |
+| `FORGE_CPU_DELTA` | CPU | `old` selects the previous two-pass delta_rule instead of the column-blocked one-pass kernel |
+| `FORGE_OP_TIME` | CPU executor | `1`: wall time per op kind (attention split by KV codec, state ops by fn), printed at exit |
 | `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
 | `FORGE_DELTA_RULE_R` | CUDA | If set, Gated DeltaNet uses the earlier register-state kernels `forge_delta_rule_r8/_r16/_r32` (a block per head and 32 columns) instead of the staged `_p8/_p16/_p32` |
 | `FORGE_CAUSAL_CONV_OLD` | CUDA, HIP | If set, the DeltaNet causal conv uses the per-channel `forge_causal_conv` kernel instead of the token-parallel `forge_causal_conv_t` |
 | `FORGE_MMVQ=0` | CUDA, HIP | Disable the q8_1/dp4a decode matmul kernels |
+| `FORGE_MMVQ_CPB` | CUDA, HIP | `1`, `2` or `4`: output columns per decode-matmul block (default: 2 for q4_k with k ≤ 6144, else 1) |
+| `FORGE_MMVQ_Q8V=0` | CUDA, HIP | q8_0 decode matmul uses the older 4-bytes-per-lane loop |
+| `FORGE_MMVQ_NC=1` | CUDA | Decode-matmul weight loads bypass L1 (`ld.global.nc.L1::no_allocate`); measured no faster on an RTX 3090 |
 | `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMA / MMQ kernels (default 16; 0 disables both) |
 | `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
 | `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernels (including the tiled `sm_80` ones) |
 | `FORGE_FA_TC=0` | CUDA | Prefill attention on the `sm_80` image uses the f32 tiled kernel instead of the fp16 tensor-core FlashAttention-2 kernel (`forge_attention_fa2tc_*`; Q/K/V/P rounded to fp16, f32 accumulation) |
-| `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` |
+| `FORGE_FUSE_Q81=0` | CUDA, HIP | Do not fuse q8_1 activation quantisation into decode `rms_norm` / `silu_mul` / the attention combine pass |
+| `FORGE_FUSE_Q8R=0` | CUDA | Prefill `rms_norm` does not write the int8 activation rows for the tensor-core matmul, and consecutive tensor-core matmuls on the same activation (q/k/v, gate/up) each quantise it again |
+| `FORGE_FUSE_ADD_NORM=0` | CUDA | Do not run a residual `add` and the `rms_norm` of its result as one kernel (`forge_rms_norm_f`) |
+| `FORGE_FUSE_QK_ROPE=0` | CUDA | Do not run a per-head `rms_norm` and the `rope` that consumes it (Qwen3 QK-norm) as one kernel (`forge_rms_rope`) |
+| `FORGE_ROPE_HPB` | CUDA | Heads per block of `forge_rms_rope` (default: 16 at 32+ tokens, else 256 / head dim); tuning only |
+| `FORGE_FUSE_GLU=0` | CUDA | Do not fuse the FFN gate and up projections and their SiLU product into one step (`silu_mul(linear(h, gate), linear(h, up))`); each gate/up weight pair is then uploaded as two weights instead of one interleaved one. Read when a plan is compiled |
 | `FORGE_PLAN_TRACE` | all devices | If set, print at exit the ops (with shapes and counts) that ran on the host during device runs |
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
 | `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |

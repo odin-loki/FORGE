@@ -5,6 +5,9 @@ import argparse, os, subprocess, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny_qwen3 as tq, tiny_llama as tl
+# The in-place path is checked against exact f32 activations: the CPU integer matvec (default) also rounds the
+# activations to int8, a second approximation on top of the weights. FORGE_CPU_INT8 set by the caller: kept.
+os.environ.setdefault("FORGE_CPU_INT8", "0")
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--forge", required=True); ap.add_argument("--work", default="build/golden_quant_inplace")

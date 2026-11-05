@@ -158,6 +158,7 @@ private:
             if (!tok) raise(errc::unsupported, "grammar constraints need a tokenizer");
             a->gc = std::make_unique<grammar_constraint>(a->r.grammar, *tok, int(m_->vocab()), tok->eos());
             a->smp->filter = [g = a->gc.get()](std::span<float> l) { g->apply(l); };
+            a->smp->allow = [g = a->gc.get()](int t) { return g->allows(t); };
         }
         if (a->r.prompt.empty()) raise(errc::invalid_argument, "request with empty prompt");
         a->hist = a->r.prompt;

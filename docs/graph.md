@@ -58,11 +58,13 @@ The attention kernels decode quantised slots on the fly. inference selects the c
 Device lowerings have priority 20, above the CPU ones. The backends themselves are described in [gpu.md](gpu.md).
 
 ## Device execution
-A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
+A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`, `argmax` and `fused`. With `fused`, `compile` marks adjacent step pairs the backend may run as one kernel (`fuse_steps`: a residual `add` followed by the `rms_norm` of its result; an `rms_norm` whose only consumer is the next step, a `rope`); the executor offers each pair to the hook and runs the two steps as usual when it declines. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
 
 Quantised weights on a device:
 - CUDA and HIP keep q8_0, q4_k, q5_k and q6_k weights encoded on the device and run them with their own kernels.
 - Other resident backends get an f32 copy, decoded on the host and mirrored on the device, up to `FORGE_GPU_WEIGHT_BUDGET` bytes (default `8G`; K/M/G suffixes). Weights beyond the budget stay encoded and their `matmul_t`/`gather` run on the CPU.
+
+Sparse MoE (`moe_ffn(h, router_logits, gate[e,f,d], up[e,f,d], down[e,d,f], k, norm, scale, gating)`): each token is routed to its top-k experts; the (token, slot) pairs are grouped by expert and only the selected experts' slices of the stacked (encoded) weights are read, with the same SIMD quantised dot / row-decode kernels as `matmul_t`; tokens are combined in slot order (deterministic). Expert weights always stay encoded. There is no device kernel yet: on a device run `moe_ffn` runs on the host (`registry::device_moe` is the hook for a grouped device kernel).
 
 On the CPU, `FORGE_QDOT=0` replaces the SIMD quantised-row kernels with plain decode + dot (for benchmarking and bisecting).
 

@@ -6,6 +6,7 @@
 #include <forge/core/log.hpp>
 #include <forge/graph/ir.hpp>
 #include <forge/graph/kv_codec.hpp>
+#include <forge/graph/attn_cpu.hpp>
 #include <forge/gpu/prims.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/verify/oracle.hpp>
@@ -59,6 +60,10 @@ struct device_hooks {
     // optional: index of the largest element of a device-resident buffer (ties: the lowest index), read back as one
     // integer instead of the whole buffer; -1 when the buffer is not resident or the backend cannot (greedy decode)
     std::function<long long(const float*, std::size_t)> argmax;
+    // optional: two adjacent steps as one device kernel (compile() marks the pairs, see plan.hpp fuse_steps):
+    // "add_rms_norm" in {a, b, w} out {a + b, rms_norm(a + b, w)}; "rms_rope" in {x, w, pos} out {rope(rms_norm(x, w), pos)}.
+    // attrs: the rms_norm's eps (rms_rope: plus the rope's). false = not handled; the executor then runs both steps.
+    std::function<bool(const std::string& kind, std::span<const tensor_view> in, std::span<const tensor_view> out, const ops::attrs& a)> fused;
 };
 
 inline kernel_fn reference_kernel(ops::op o) {
@@ -97,6 +102,13 @@ public:
     std::optional<lowering> device_qgemm;
     std::vector<std::string> device_qgemm_codecs;
     std::optional<lowering> device_qgather;   // gather (embedding lookup) over an encoded table on the device
+    // FFN gate/up/SiLU fused on the device (plan.hpp's GLU pass): op silu_mul, inputs (x, Wg, Wu, gate, up) where Wg/Wu
+    // are encoded weights of one codec in device_qglu_codecs and gate/up the unfused products' buffers (its fallback).
+    std::optional<lowering> device_qglu;
+    std::vector<std::string> device_qglu_codecs;
+    // moe_ffn with all three stacked expert weights encoded on the device (grouped expert kernels), for these codecs
+    std::optional<lowering> device_moe;
+    std::vector<std::string> device_moe_codecs;
     std::vector<double> stage_weight;
     bool ensure_verified(lowering& l) {
         std::lock_guard g(m_);
@@ -197,6 +209,10 @@ inline kernel_fn attention() {
         const auto& ker = simd::active();
         auto kc = kv_codec(int(a.num("kv_codec_k", 0))), vc = kv_codec(int(a.num("kv_codec_v", 0)));
         if (vc != kv_codec::f32) dv = std::size_t(a.num("kv_dv", 0));
+        if (attn_cpu::enabled() && attn_cpu::supports(kc, vc) && hk && hq % hk == 0) {   // chunked, GQA-shared (attn_cpu.hpp)
+            attn_cpu::attention(q.data, s, hq, d, k.data, v.data, t, hk, dv, kc, vc, causal, window, sc, out.data);
+            return;
+        }
         std::size_t kw = std::size_t(kv_head_words(i64(d), kc)), vw = std::size_t(kv_head_words(i64(dv), vc));
         if (kc != kv_codec::f32 || vc != kv_codec::f32) {   // quantised KV: decode each (row, head) on the fly
             task::parallel_for(s * hq, 1, [&](std::size_t b, std::size_t e) {

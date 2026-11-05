@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <functional>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <span>
@@ -59,12 +60,17 @@ public:
 
     // Plain greedy: the next token is the argmax of the raw logits (no penalties or filter), so a device can pick it.
     bool plain_greedy() const {
-        return c_.temperature <= 0.f && c_.repetition_penalty == 1.f && c_.presence_penalty == 0.f && c_.frequency_penalty == 0.f && !filter;
+        return c_.temperature <= 0.f && c_.repetition_penalty == 1.f && c_.presence_penalty == 0.f && c_.frequency_penalty == 0.f && !filter && !allow;
     }
+    // Optional per-token form of `filter` (grammar_constraint::allows): sample() then tests the likeliest candidates
+    // first and runs `filter` over the whole vocabulary only when they do not settle the draw (same result: the
+    // draw is over the allowed tokens either way). Grammars mostly allow what the model wants anyway.
+    std::function<bool(int)> allow;
     int sample(std::span<const float> logits_in, std::span<const int> history = {}) {
         // plain greedy: argmax over the logits as they are (no copy of a vocabulary-sized vector)
         if (plain_greedy() && !logits_in.empty())
             return int(std::max_element(logits_in.begin(), logits_in.end()) - logits_in.begin());
+        if (allow && c_.mirostat_tau <= 0.f && !logits_in.empty()) if (int t = sample_lazy(logits_in, history); t >= 0) return t;
         auto l = prepare(logits_in, history);
         if (c_.temperature <= 0.f) return int(std::max_element(l.begin(), l.end()) - l.begin());
         std::vector<int> idx; std::vector<double> p;
@@ -76,7 +82,47 @@ public:
         return idx.back();
     }
 private:
-    std::vector<float> prepare(std::span<const float> logits_in, std::span<const int> history) {
+    // sample() with `allow`: the allowed candidates in logit order, testing at most `budget` tokens; -1 = undecided
+    int sample_lazy(std::span<const float> logits_in, std::span<const int> history) {
+        constexpr std::size_t budget = 256;
+        auto l = prepare(logits_in, history, false);
+        auto by_logit = [&](int a, int b) { return l[std::size_t(a)] > l[std::size_t(b)] || (l[std::size_t(a)] == l[std::size_t(b)] && a < b); };
+        std::size_t tests = 0;
+        if (c_.temperature <= 0.f) {
+            std::vector<int> idx(l.size()); std::iota(idx.begin(), idx.end(), 0);
+            std::size_t m = std::min(budget, idx.size());
+            std::partial_sort(idx.begin(), idx.begin() + std::ptrdiff_t(m), idx.end(), by_logit);
+            for (std::size_t i = 0; i < m; ++i) if (std::isfinite(l[std::size_t(idx[i])]) && allow(idx[i])) return idx[i];
+            return -1;
+        }
+        std::vector<int> cand; candidates(l, cand, false);
+        std::vector<int> ok;
+        const std::size_t want = c_.top_k > 0 ? std::size_t(c_.top_k) : std::size_t(-1);
+        for (int t : cand) {
+            if (ok.size() >= want) break;
+            if (++tests > budget) return -1;
+            if (allow(t)) ok.push_back(t);
+        }
+        if (ok.empty()) return -1;
+        // the window is 40 nats below the best *allowed* token: add the tokens between the two floors
+        const float fa = l[std::size_t(ok[0])] - 40.f * c_.temperature, f1 = l[std::size_t(cand[0])] - 40.f * c_.temperature;
+        if (ok.size() < want && fa < f1) {
+            std::vector<int> more;
+            for (std::size_t i = 0; i < l.size(); ++i) if (l[i] >= fa && l[i] < f1) more.push_back(int(i));
+            std::sort(more.begin(), more.end(), by_logit);
+            for (int t : more) {
+                if (ok.size() >= want) break;
+                if (++tests > budget) return -1;
+                if (allow(t)) ok.push_back(t);
+            }
+        }
+        std::vector<double> p; shape(l, ok, p);
+        double tot = 0; for (auto x : p) tot += x;
+        double u = std::uniform_real_distribution<double>(0, tot)(rng_);
+        for (std::size_t i = 0; i < p.size(); ++i) { u -= p[i]; if (u <= 0) return ok[i]; }
+        return ok.back();
+    }
+    std::vector<float> prepare(std::span<const float> logits_in, std::span<const int> history, bool use_filter = true) {
         std::vector<float> l(logits_in.begin(), logits_in.end());
         if (c_.repetition_penalty != 1.f) {
             std::unordered_set<int> seen;
@@ -90,13 +136,30 @@ private:
             for (std::size_t i = from; i < history.size(); ++i) ++cnt[history[i]];
             for (auto [t, n] : cnt) if (t >= 0 && std::size_t(t) < l.size()) l[std::size_t(t)] -= c_.presence_penalty + c_.frequency_penalty * float(n);
         }
-        if (filter) filter(l);
+        if (filter && use_filter) filter(l);
         return l;
     }
     // sorted candidate indices + unnormalised probabilities after top-k / top-p / min-p
-    void truncate(const std::vector<float>& l, std::vector<int>& idx, std::vector<double>& p) {
-        idx.resize(l.size()); std::iota(idx.begin(), idx.end(), 0);
-        std::sort(idx.begin(), idx.end(), [&](int a, int b) { return l[std::size_t(a)] > l[std::size_t(b)] || (l[std::size_t(a)] == l[std::size_t(b)] && a < b); });
+    void truncate(const std::vector<float>& l, std::vector<int>& idx, std::vector<double>& p) { candidates(l, idx, true); shape(l, idx, p); }
+    // Candidates: tokens within 40 nats of the best (p / p_max >= e^-40 ~ 4e-18), sorted by logit (ties: lower id).
+    // The probability sum in shape() starts at 1 and runs in descending order, so every term left out is under half
+    // an ulp of it and would not have changed it: the result equals sorting the whole vocabulary, without sorting it
+    // (one scan, then a sort of the few hundred or thousand candidates, or nth_element + sort of top_k).
+    void candidates(const std::vector<float>& l, std::vector<int>& idx, bool cut_top_k) const {
+        float mxl = -std::numeric_limits<float>::infinity();
+        for (float x : l) if (x > mxl) mxl = x;
+        const bool fin = std::isfinite(mxl);
+        const float floor = fin ? mxl - 40.f * c_.temperature : 0.f;
+        idx.clear();
+        for (std::size_t i = 0; i < l.size(); ++i) if (!fin || l[i] >= floor) idx.push_back(int(i));
+        auto by_logit = [&](int a, int b) { return l[std::size_t(a)] > l[std::size_t(b)] || (l[std::size_t(a)] == l[std::size_t(b)] && a < b); };
+        if (cut_top_k && c_.top_k > 0 && idx.size() > std::size_t(c_.top_k)) {
+            std::nth_element(idx.begin(), idx.begin() + c_.top_k, idx.end(), by_logit);
+            idx.resize(std::size_t(c_.top_k));
+        }
+        std::sort(idx.begin(), idx.end(), by_logit);
+    }
+    void shape(const std::vector<float>& l, std::vector<int>& idx, std::vector<double>& p) {
         std::size_t keep = idx.size();
         if (c_.top_k > 0) keep = std::min(keep, std::size_t(c_.top_k));
         p.assign(keep, 0.0);

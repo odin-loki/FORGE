@@ -90,6 +90,9 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                     return raw->run_state(fn, std::vector<tensor_view>(in.begin(), in.end()), S, sn, out, a); };
         if constexpr (requires { raw->argmax_resident((const float*)nullptr, std::size_t(0)); })
             h->argmax = [raw](const float* p, std::size_t n) { return raw->argmax_resident(p, n); };
+        if constexpr (requires { raw->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
+            h->fused = [raw](const std::string& k, std::span<const tensor_view> in, std::span<const tensor_view> out, const ops::attrs& a) {
+                return raw->run_fused(k, std::vector<tensor_view>(in.begin(), in.end()), std::vector<tensor_view>(out.begin(), out.end()), a); };
         r->hooks = h;
     }
     for (std::size_t i = 0; i < ops::op_count; ++i) {
@@ -126,6 +129,25 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                         raise(errc::unsupported, "{}: qmatmul_t rejected a {} weight", rt->backend(), c->name); },
                 1, resident};
             r->device_qgemm_codecs = {"q8_0", "q4_k", "q5_k", "q6_k"};
+            // FFN gate/up/SiLU in one step (CUDA run_qglu; $FORGE_FUSE_GLU=0 off): inputs (x, Wg, Wu, gate, up). When the
+            // runtime does not take it, the two matmuls and silu_mul run as before, into the gate/up buffers.
+            if constexpr (requires(RT& t, const tensor_view& v, tensor_view o) { t.run_qglu(v, nullptr, nullptr, std::size_t(0), 0u, 0u, o); }) {
+                auto* fe = std::getenv("FORGE_FUSE_GLU");
+                if (resident && !(fe && std::string(fe) == "0")) {
+                    r->device_qglu = lowering{pre + ".qglu", ops::op::silu_mul, 30, [](auto, auto&, auto&) { return true; },
+                        [rt](std::span<const tensor_view> in, tensor_view out, const ops::attrs& a) {
+                            const auto* c = static_cast<const codecs::codec*>(in[1].qcodec);
+                            std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : c->name == "q5_k" ? 4 : 0;
+                            std::size_t rb = c->bytes(std::size_t(in[0].shape.back()));
+                            std::uint32_t n = std::uint32_t(in[1].shape[0]);
+                            if (rt->run_qglu(in[0], in[1].qdata, in[2].qdata, rb, n, fmt, out)) return;
+                            if (!rt->run_qmatmul(in[0], in[1].qdata, rb, n, fmt, in[3]) || !rt->run_qmatmul(in[0], in[2].qdata, rb, n, fmt, in[4]) ||
+                                !rt->run_op("silu_mul", {in[3], in[4]}, a, out))
+                                raise(errc::unsupported, "{}: qglu rejected a {} weight", rt->backend(), c->name); },
+                        1, true};
+                    r->device_qglu_codecs = {"q8_0", "q4_k", "q6_k"};
+                }
+            }
             if constexpr (requires(RT& t, const tensor_view& v, tensor_view o) { t.run_qgather(v, nullptr, std::size_t(0), 0u, 0u, 0u, o); }) {
                 auto* ge = std::getenv("FORGE_GPU_QGATHER");
                 if (!(ge && std::string(ge) == "0") && rt->has_function("forge_qgather"))
