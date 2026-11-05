@@ -76,9 +76,10 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     check_write(out);
     gguf_file g(path);
     auto arch = g.need("general.architecture").str();
-    if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral" && arch != "qwen35")
+    if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral" && arch != "qwen35" && arch != "qwen3moe" && arch != "qwen35moe")
         raise(errc::unsupported, "GGUF architecture '{}' has no template", arch);
-    bool q35 = arch == "qwen35";
+    bool q35 = arch == "qwen35" || arch == "qwen35moe";
+    bool moe = arch == "qwen3moe" || arch == "qwen35moe";   // sparse MoE FFNs (moe_ffn over stacked *_exps tensors)
     auto K = [&](const std::string& k) { return g.need(arch + "." + k).num(); };
     // per-layer keys (qwen35 head_count_kv: 0 on linear-attention layers) collapse to their largest entry
     auto Kor = [&](const std::string& k, double d) {
@@ -93,7 +94,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     const auto& toks = g.need("tokenizer.ggml.tokens").arr();
     json::object cfg{{"hidden_size", hidden}, {"num_hidden_layers", K("block_count")}, {"num_attention_heads", heads},
                      {"num_key_value_heads", Kor("attention.head_count_kv", heads)}, {"head_dim", Kor("attention.key_length", hidden / heads)},
-                     {"intermediate_size", K("feed_forward_length")}, {"vocab_size", double(toks.size())},
+                     {"intermediate_size", moe ? Kor("feed_forward_length", 0) : K("feed_forward_length")}, {"vocab_size", double(toks.size())},
                      {"rms_norm_eps", Kor("attention.layer_norm_rms_epsilon", 1e-6)}, {"rope_theta", Kor("rope.freq_base", 10000.0)},
                      // llama.cpp's converter permutes Q/K for llama so it can use interleaved (GPT-J) RoPE
                      {"rope_neox", arch == "llama" || arch == "mistral" ? 0.0 : 1.0}};
@@ -106,7 +107,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     if (q35) {
         double L0 = K("block_count"), iv = Kor("full_attention_interval", 4);
         if (iv < 1 || std::fmod(L0, iv) != 0) raise(errc::unsupported, "qwen35: {} layers is not a multiple of full_attention_interval {}", L0, iv);
-        if (g.get("qwen35.expert_count") && Kor("expert_count", 0) > 0) raise(errc::unsupported, "qwen35: MoE variants are not supported yet");
+        if (!moe && Kor("expert_count", 0) > 0) raise(errc::unsupported, "qwen35: expert_count set on a dense architecture (expected qwen35moe)");
         lk_heads = i64(K("ssm.group_count")); lk_dim = i64(K("ssm.state_size")); lv_heads = i64(K("ssm.time_step_rank"));
         if (lk_heads <= 0 || lv_heads <= 0 || lv_heads % lk_heads) raise(errc::format_error, "qwen35: bad ssm head counts {} / {}", lk_heads, lv_heads);
         lv_dim = i64(K("ssm.inner_size")) / lv_heads;
@@ -119,11 +120,22 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         cfg.emplace_back("linear_num_value_heads", double(lv_heads)); cfg.emplace_back("linear_value_head_dim", double(lv_dim));
         cfg.emplace_back("linear_conv_kernel_dim", Kor("ssm.conv_kernel", 4));
     }
-    std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : q35 ? "qwen3_5" : "llama";
+    if (moe) {   // llama.cpp's qwen3moe / qwen35moe: softmax gating, weights renormalised over the k (norm_w = true)
+        double ne = K("expert_count"), nk = K("expert_used_count"), ws = Kor("expert_weights_scale", 0);
+        if (ne < 1 || nk < 1 || nk > ne) raise(errc::format_error, "{}: bad expert counts {} / {}", arch, nk, ne);
+        if (Kor("expert_gating_func", 1) != 1) raise(errc::unsupported, "{}: only softmax expert gating is supported", arch);
+        cfg.emplace_back("num_experts", ne); cfg.emplace_back("num_experts_per_tok", nk);
+        cfg.emplace_back("moe_intermediate_size", K("expert_feed_forward_length"));
+        cfg.emplace_back("norm_topk_prob", 1.0); cfg.emplace_back("routed_scaling_factor", ws > 0 ? ws : 1.0);
+    }
+    std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : arch == "qwen3moe" ? "qwen3_moe"
+                      : arch == "qwen35moe" ? "qwen3_5_moe" : q35 ? "qwen3_5" : "llama";
     auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), json::value(cfg));
     auto bp = modelfile::parse_blueprint(bp_text);
 
-    modelfile::writer w;
+    // streamed: tensors go straight from the mapped GGUF to disk, so a 20 GB model never sits in memory twice
+    modelfile::stream_writer w(out);
+    expert_index xi;
     import_report rep{arch, tname, 0, 0};
     std::set<std::string> used;
     auto put = [&](const std::string& dst, const std::string& src) {
@@ -176,12 +188,34 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         std::string out_codec = c->block > 1 ? "q8_0" : std::string(codec);
         w.add_tensor(dst, t.shape, y, out_codec); ++rep.tensors;
     };
+    // MoE FFN: the stacked *_exps tensors ([n_experts, rows, k]; one expert = a contiguous run of whole rows) are copied
+    // verbatim, each starting on a 4 KiB file offset and listed in the "experts" section; plus the router and, for
+    // qwen35moe, the sigmoid-gated shared expert.
+    auto put_moe = [&](i64 l, const std::string& P, const std::string& Q) {
+        if (g.find(P + "ffn_gate_up_exps.weight")) raise(errc::unsupported, "{}: fused ffn_gate_up_exps tensors are not supported", path);
+        put(Q + "router", P + "ffn_gate_inp.weight");
+        const char* proj[3][2] = {{"gate", "ffn_gate_exps.weight"}, {"up", "ffn_up_exps.weight"}, {"down", "ffn_down_exps.weight"}};
+        for (auto& pj : proj) {
+            auto& t = need(P + pj[1]);
+            if (t.shape.size() != 3) raise(errc::format_error, "{}: {} has shape {}", path, t.name, shape_str(t.shape));
+            w.add_raw(Q + "experts.w_" + pj[0], t.shape, gguf_file::codec_of(t.type) ? gguf_file::codec_of(t.type) : "?", g.bytes(t), modelfile::expert_alignment);
+            xi.add(w.last(), l, pj[0]); ++rep.tensors;
+        }
+        if (g.find(P + "ffn_up_shexp.weight")) {
+            put(Q + "shared.w_gate", P + "ffn_gate_shexp.weight"); put(Q + "shared.w_up", P + "ffn_up_shexp.weight");
+            put(Q + "shared.w_down", P + "ffn_down_shexp.weight");
+            auto& gt = need(P + "ffn_gate_inp_shexp.weight");   // [d] -> a one-row linear [1, d]
+            shape_t gs = gt.shape; if (gs.size() == 1) gs = {1, gs[0]};
+            w.add_raw(Q + "shared.gate", gs, gguf_file::codec_of(gt.type) ? gguf_file::codec_of(gt.type) : "?", g.bytes(gt)); ++rep.tensors;
+        } else if (q35) raise(errc::not_found, "{}: layer {} has no shared expert (ffn_up_shexp)", path, l);
+    };
     put("tok_emb", "token_embd.weight");
     for (i64 l = 0, L = i64(bp.param("n_layers")); l < L; ++l) {
         auto P = std::format("blk.{}.", l), Q = std::format("layer.{}.", l);
         if (q35) {
             put(Q + "attn_norm", P + "attn_norm.weight"); put(Q + "ffn_norm", P + "post_attention_norm.weight");
-            put(Q + "w_gate", P + "ffn_gate.weight"); put(Q + "w_up", P + "ffn_up.weight"); put(Q + "w_down", P + "ffn_down.weight");
+            if (moe) put_moe(l, P, Q);
+            else { put(Q + "w_gate", P + "ffn_gate.weight"); put(Q + "w_up", P + "ffn_up.weight"); put(Q + "w_down", P + "ffn_down.weight"); }
             if (g.find(P + "attn_qkv.weight")) {   // Gated DeltaNet layer
                 put_vrows(Q + "w_qkv", P + "attn_qkv.weight", 2 * lk_heads * lk_dim, lv_dim);
                 put_vrows(Q + "w_z", P + "attn_gate.weight", 0, lv_dim);
@@ -201,8 +235,10 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         }
         put(Q + "attn_norm", P + "attn_norm.weight"); put(Q + "ffn_norm", P + "ffn_norm.weight");
         put(Q + "wq", P + "attn_q.weight"); put(Q + "wk", P + "attn_k.weight"); put(Q + "wv", P + "attn_v.weight");
-        if (tname == "qwen3") { put(Q + "q_norm", P + "attn_q_norm.weight"); put(Q + "k_norm", P + "attn_k_norm.weight"); }
-        put(Q + "wo", P + "attn_output.weight"); put(Q + "w_gate", P + "ffn_gate.weight");
+        if (tname == "qwen3" || arch == "qwen3moe") { put(Q + "q_norm", P + "attn_q_norm.weight"); put(Q + "k_norm", P + "attn_k_norm.weight"); }
+        put(Q + "wo", P + "attn_output.weight");
+        if (moe) { put_moe(l, P, Q); continue; }
+        put(Q + "w_gate", P + "ffn_gate.weight");
         put(Q + "w_up", P + "ffn_up.weight"); put(Q + "w_down", P + "ffn_down.weight");
     }
     put("out_norm", "output_norm.weight");
@@ -233,9 +269,10 @@ inline import_report import_gguf(const std::string& path, const std::string& out
                      {"max_position_embeddings", Kor("context_length", 2048)}};
     // Whether prompts start with BOS: GGUF says so explicitly (Qwen-family files set it to false).
     if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
+    if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
-    w.write(out);
+    w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;
 }

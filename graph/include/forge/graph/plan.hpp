@@ -93,6 +93,8 @@ inline double node_flops(const tensor_graph& g, const node& n) {
     const auto& inf = ops::info(n.op);
     double out = double(numel(n.shape));
     if (inf.cls == ops::op_class::contraction && !n.inputs.empty()) {
+        if (n.op == ops::op::moe_ffn && n.inputs.size() == 5)   // k experts x 3 projections of f x d per token
+            return 6.0 * double(numel(n.shape)) * n.attrs.num("k", 2) * double(g.at(n.inputs[2]).shape[1]);
         if (n.op == ops::op::attention) return 4.0 * out * double(g.at(n.inputs[1]).shape[0]);
         return 2.0 * out * double(g.at(n.inputs[0]).shape.back());
     }
@@ -170,6 +172,91 @@ inline const lowering& gather_lowering() {
 }
 inline const lowering& gemm_nt_lowering() {
     static const lowering l{"cpu.qgemm_nt", ops::op::matmul_t, 100, [](auto, auto&, auto&) { return true; }, gemm_nt, 1};
+    return l;
+}
+// ---- sparse mixture of experts (moe_ffn) ----
+// Inputs: h [t, d], router logits [t, e], stacked expert weights gate/up [e, f, d] and down [e, d, f], each f32 or
+// encoded (one expert = one contiguous slice of whole rows). Each token is routed to its top-k experts
+// (ops::ref::moe_route); the (token, slot) pairs are grouped by expert, so each selected expert's weight rows are read
+// once per layer however many tokens chose it, and only selected experts are touched. Work items are (expert, block of
+// output columns) across all active experts in one parallel_for per projection; the rows use the same SIMD quantised
+// dot / row-decode kernels as gemm_nt. Tokens are combined in slot order, so the result does not depend on threading.
+struct moe_plan {
+    i64 t = 0, k = 0, ne = 0;
+    std::vector<i64> ids; std::vector<float> w;          // [t * k] routed expert and weight per (token, slot) pair
+    std::vector<std::uint32_t> off, pair;                // expert e's rows are [off[e], off[e+1]); row -> pair index
+    std::vector<std::uint32_t> row_of;                   // pair -> row
+    void route(const float* logits, i64 t_, i64 ne_, const ops::attrs& a) {
+        t = t_; ne = ne_; k = std::min<i64>(i64(a.num("k", 2)), ne);
+        bool norm = a.num("norm", 1) != 0; double sc = a.num("scale", 1.0); int gating = int(a.num("gating", 0));
+        ids.resize(std::size_t(t * k)); w.resize(std::size_t(t * k));
+        for (i64 r = 0; r < t; ++r) ops::ref::moe_route(logits + r * ne, ne, k, norm, sc, gating, ids.data() + r * k, w.data() + r * k);
+        off.assign(std::size_t(ne + 1), 0);
+        for (auto e : ids) off[std::size_t(e) + 1]++;
+        for (i64 e = 0; e < ne; ++e) off[std::size_t(e) + 1] += off[std::size_t(e)];
+        pair.resize(ids.size()); row_of.resize(ids.size());
+        std::vector<std::uint32_t> fill(off.begin(), off.end() - 1);
+        for (std::size_t p = 0; p < ids.size(); ++p) { auto r = fill[std::size_t(ids[p])]++; pair[r] = std::uint32_t(p); row_of[p] = r; }
+    }
+};
+// rows [r0, r1) of x (row r at xrow(r)) dotted with weight rows [c0, c1) of one expert -> y[r * ldy + c]
+template <class XRow>
+inline void moe_rows(const tensor_view& w, std::size_t e, std::size_t c0, std::size_t c1, std::size_t kd, std::size_t r0, std::size_t r1,
+                     XRow xrow, float* y, std::size_t ldy, std::vector<float>& tmp) {
+    const auto& ker = simd::active();
+    std::size_t nrow = std::size_t(w.shape[1]);
+    if (!w.qdata) {
+        const float* W = w.data + (e * nrow) * kd;
+        for (std::size_t c = c0; c < c1; ++c) for (std::size_t r = r0; r < r1; ++r) y[r * ldy + c] = ker.dot(xrow(r), W + c * kd, kd);
+        return;
+    }
+    static const bool native = [] { auto* ev = std::getenv("FORGE_QDOT"); return !(ev && std::string(ev) == "0"); }();
+    const auto* cd = codec_of(w); std::size_t rb = cd->bytes(kd); int fmt = fmt_of(cd);
+    const std::uint8_t* W = w.qdata + e * nrow * rb;
+    bool fused = native && r1 - r0 <= 2 && cd->block <= 256 && 256 % cd->block == 0;
+    if (tmp.size() < kd) tmp.resize(kd);
+    for (std::size_t c = c0; c < c1; ++c) {
+        if (fused) { for (std::size_t r = r0; r < r1; ++r) y[r * ldy + c] = ker.qdot(fmt, W + c * rb, xrow(r), kd, cd->decode, cd->block, cd->block_bytes); continue; }
+        if (native) ker.qdecode(fmt, W + c * rb, kd, tmp.data(), cd->decode); else cd->decode(W + c * rb, kd, tmp.data());
+        for (std::size_t r = r0; r < r1; ++r) y[r * ldy + c] = ker.dot(xrow(r), tmp.data(), kd);
+    }
+}
+inline void moe_ffn(std::span<const tensor_view> in, tensor_view out, const ops::attrs& a) {
+    const auto& h = in[0]; const auto& lg = in[1]; const auto& wg = in[2]; const auto& wu = in[3]; const auto& wd = in[4];
+    std::size_t t = std::size_t(h.shape[0]), d = std::size_t(h.shape[1]), ne = std::size_t(wg.shape[0]), f = std::size_t(wg.shape[1]);
+    // per-thread scratch, named through references: worker lambdas must see the calling thread's buffers
+    static thread_local moe_plan mp_tls; static thread_local std::vector<float> g_tls, u_tls, d_tls;
+    auto& mp = mp_tls; auto& g = g_tls; auto& u = u_tls; auto& dn = d_tls;
+    mp.route(lg.data, i64(t), i64(ne), a);
+    std::size_t rows = mp.ids.size();
+    g.resize(rows * f); u.resize(rows * f); dn.resize(rows * d);
+    // work items: (active expert, block of 16 output columns)
+    std::vector<std::uint32_t> act; for (std::size_t e = 0; e < ne; ++e) if (mp.off[e + 1] > mp.off[e]) act.push_back(std::uint32_t(e));
+    auto run = [&](std::size_t ncol, auto&& body) {
+        std::size_t nb = (ncol + 15) / 16;
+        task::parallel_for(act.size() * nb, 1, [&](std::size_t b, std::size_t en) {
+            thread_local std::vector<float> tmp;
+            for (std::size_t i = b; i < en; ++i) { std::size_t e = act[i / nb], c0 = (i % nb) * 16; body(e, c0, std::min(ncol, c0 + 16), tmp); }
+        });
+    };
+    auto tok_row = [&](std::size_t r) { return h.data + std::size_t(mp.pair[r] / std::uint32_t(mp.k)) * d; };
+    run(f, [&](std::size_t e, std::size_t c0, std::size_t c1, std::vector<float>& tmp) {
+        moe_rows(wg, e, c0, c1, d, mp.off[e], mp.off[e + 1], tok_row, g.data(), f, tmp);
+        moe_rows(wu, e, c0, c1, d, mp.off[e], mp.off[e + 1], tok_row, u.data(), f, tmp);
+    });
+    simd::active().silu_mul(g.data(), u.data(), g.data(), rows * f);
+    run(d, [&](std::size_t e, std::size_t c0, std::size_t c1, std::vector<float>& tmp) {
+        moe_rows(wd, e, c0, c1, f, mp.off[e], mp.off[e + 1], [&](std::size_t r) { return g.data() + r * f; }, dn.data(), d, tmp);
+    });
+    for (std::size_t r = 0; r < t; ++r) {   // combine in slot order
+        float* o = out.data + r * d;
+        std::fill(o, o + d, 0.f);
+        for (std::size_t j = 0; j < std::size_t(mp.k); ++j) { std::size_t p = r * std::size_t(mp.k) + j;
+            simd::active().saxpy(mp.w[p], dn.data() + std::size_t(mp.row_of[p]) * d, o, d); }
+    }
+}
+inline const lowering& moe_lowering() {
+    static const lowering l{"cpu.moe_ffn", ops::op::moe_ffn, 100, [](auto, auto&, auto&) { return true; }, moe_ffn, 1};
     return l;
 }
 // f32 copies for quantised weights that something other than matmul_t consumes, shared across plans.
@@ -265,10 +352,14 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
             std::size_t s = 0; for (; s < k; ++s) if ((reg.stages[s] ? reg.stages[s].get() : &registry::cpu()) == stage_of[i]) break;
             p->stage_of_node[i] = int(s); }
     }
-    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t (weight operand) or gather (table)
-    for (auto& n : G.nodes()) for (std::size_t j = 0; j < n.inputs.size(); ++j)
-        if (!(n.kind == node_kind::op && ((n.op == ops::op::matmul_t && j == 1) || (n.op == ops::op::gather && j == 0))))
+    std::vector<bool> q_ok(G.size(), true);   // every consumer is matmul_t (weight operand), gather (table) or moe_ffn (experts)
+    std::vector<bool> moe_w(G.size(), false);  // stacked expert weights [e, rows, k] of a moe_ffn
+    for (auto& n : G.nodes()) for (std::size_t j = 0; j < n.inputs.size(); ++j) {
+        bool moe = n.kind == node_kind::op && n.op == ops::op::moe_ffn && j >= 2;
+        if (moe) moe_w[n.inputs[j]] = true;
+        if (!(n.kind == node_kind::op && ((n.op == ops::op::matmul_t && j == 1) || (n.op == ops::op::gather && j == 0) || moe)))
             q_ok[n.inputs[j]] = false;
+    }
     for (auto& [nm, v] : G.outputs()) q_ok[v] = false;
     bool q_direct = !p->hooks && reg.stages.empty();
     // Resident device backends have no quantised kernels, so a weight they consume is decoded to an f32 host copy
@@ -300,9 +391,10 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
         if (n.kind == node_kind::weight && n.qweight) {
             auto* c = codecs::find(n.qcodec);
             if (!c) raise(errc::unsupported, "weight {}: unknown codec {}", n.name, n.qcodec);
-            bool direct_ok = q_ok[i] && n.shape.size() == 2 && std::size_t(n.shape[1]) % c->block == 0;
+            bool direct_ok = q_ok[i] && n.shape.size() == (moe_w[i] ? 3u : 2u) && std::size_t(n.shape.back()) % c->block == 0;
             std::size_t f32_bytes = std::size_t(numel(n.shape)) * sizeof(float);
-            bool keep_q = direct_ok && (q_direct || dev_q(n.qcodec) || (q_spill && q_used + f32_bytes > q_budget));
+            // expert weights stay encoded on every path: the CPU and device moe_ffn kernels read them in place
+            bool keep_q = direct_ok && (moe_w[i] || q_direct || dev_q(n.qcodec) || (q_spill && q_used + f32_bytes > q_budget));
             if (direct_ok && q_spill && !keep_q) q_used += f32_bytes;
             if (keep_q) { v.qdata = n.qweight; v.qcodec = c; }
             else { auto t = qweights::decoded(n.qweight, c, n.shape); v.data = t->data.data(); p->decoded_weights.push_back(std::move(t)); }
@@ -361,7 +453,13 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
                     at = &a2;
                 }
             }
-            if (n.op == ops::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
+            if (n.op == ops::op::moe_ffn && n.inputs.size() == 5) {
+                bool dev = p->hooks && reg.device_moe;
+                for (std::size_t j = 2; j < 5; ++j) { auto& wn = G.at(n.inputs[j]);
+                    dev = dev && p->views[n.inputs[j]].qdata && std::find(reg.device_moe_codecs.begin(), reg.device_moe_codecs.end(), wn.qcodec) != reg.device_moe_codecs.end(); }
+                p->steps.push_back({dev ? &*reg.device_moe : &qweights::moe_lowering(), n.inputs, value_id(i), at, 0});
+            }
+            else if (n.op == ops::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
                 p->steps.push_back({dev_q(G.at(n.inputs[1]).qcodec) ? &*reg.device_qgemm : &qweights::gemm_nt_lowering(), n.inputs, value_id(i), at, 0});
             else if (n.op == ops::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
                 p->steps.push_back({dev_q(G.at(n.inputs[0]).qcodec) && reg.device_qgather && G.at(n.inputs[0]).shape.size() == 2 && G.at(n.inputs[0]).shape[1] % 32 == 0

@@ -1,7 +1,7 @@
 # Mixtral-style sparse MoE decoder (Mixtral 8x7B / 8x22B layout).
 # Router: softmax over experts, keep top-k, renormalise (HF MixtralSparseMoeBlock).
-# Experts are evaluated densely and weighted by the (mostly zero) gate column; a sparse
-# dispatch lowering is a scheduling optimisation over the same graph.
+# Sparse: moe_ffn evaluates only each token's k experts. Experts are stored stacked per layer:
+# W.layer[l].experts.w_gate / w_up [n_experts, ffn, d_model], w_down [n_experts, d_model, ffn].
 blueprint "decoder-lm-moe" opset 1
 
 params {
@@ -28,11 +28,8 @@ graph {
     a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv)
     x = x + linear(merge(a, n_heads * head_dim), W.layer[l].wo)
     h = rms_norm(x, W.layer[l].ffn_norm, eps)
-    g = moe_gate(linear(h, W.layer[l].router), k: n_active, norm: 1)
-    repeat e in 0..n_experts {
-      y = linear(silu(linear(h, W.layer[l].expert[e].w_gate)) * linear(h, W.layer[l].expert[e].w_up), W.layer[l].expert[e].w_down)
-      x = x + slice(g, axis: 1, start: e, end: e + 1) * y
-    }
+    x = x + moe_ffn(h, linear(h, W.layer[l].router), W.layer[l].experts.w_gate, W.layer[l].experts.w_up, W.layer[l].experts.w_down,
+                    k: n_active, norm: 1)
   }
   logits = linear(rms_norm(last(x, seq), W.out_norm, eps), W.lm_head)
 }

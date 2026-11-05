@@ -9,7 +9,7 @@ A `.fpk` file holds everything needed to run a model:
 
 Every section and every tensor has a BLAKE3 hash. Files can be **signed** (Ed25519) and their tensor data **encrypted** (XChaCha20-Poly1305), both with the vendored Monocypher. Readers memory-map the file. The byte layout is in [format.md](format.md).
 
-Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`. Language models get their blueprint from a template in `import/templates/` (`llama`, `qwen3`, `qwen3_5`, `mixtral`, `deepseek_v2`).
+Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`. Language models get their blueprint from a template in `import/templates/` (`llama`, `qwen3`, `qwen3_5`, `qwen3_moe`, `qwen3_5_moe`, `mixtral`, `deepseek_v2`). MoE templates use the sparse `moe_ffn` op over stacked expert tensors (`layer.N.experts.w_gate|w_up|w_down`, `[n_experts, rows, k]`), indexed in the `experts` section ([format.md](format.md)); HF Mixtral, DeepSeek-V2 and Qwen3-MoE experts are stacked at import.
 
 ## API
 ### `modelfile::writer` (`fpk.hpp`)
@@ -49,7 +49,7 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 | Source | Function, header | Architectures | Weights |
 |--------|------------------|---------------|---------|
 | Hugging Face directory (`config.json`, `*.safetensors`, `tokenizer.json`) | `import_hf`, `hf.hpp` (+ `safetensors.hpp`) | `llama` template: Llama, Mistral, Qwen2. `qwen3`: Qwen3 (QK-norm). `qwen3_5`: Qwen3.5 dense text models (Gated DeltaNet + gated full attention, partial RoPE). `mixtral`: Mixtral MoE. `deepseek_v2`: DeepSeek-V2/V3 (absorbed MLA) | Encoded with `--codec`; mixed precision with `q4_k_m` / `q5_k_m` |
-| GGUF v2/v3 | `import_gguf`, `gguf.hpp` | `llama`, `mistral`, `qwen2` → `llama`; `qwen3`; `qwen35` → `qwen3_5` | Copied verbatim: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. `--codec` is not applied |
+| GGUF v2/v3 | `import_gguf`, `gguf.hpp` | `llama`, `mistral`, `qwen2` → `llama`; `qwen3`; `qwen35` → `qwen3_5`; `qwen3moe` → `qwen3_moe`; `qwen35moe` → `qwen3_5_moe` (untested) | Copied verbatim: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. `--codec` is not applied |
 | ONNX | `import_onnx`, `onnx.hpp` | Static-shape inference graphs (MLPs, classifiers, encoder blocks) | Initializers become weights |
 
 Importer limits that raise an error:

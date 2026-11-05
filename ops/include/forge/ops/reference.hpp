@@ -229,6 +229,51 @@ inline tensor matmul_impl(const tv& in, bool trans) {
 }
 inline tensor matmul(const tv& in, const attrs&) { return matmul_impl(in, false); }
 inline tensor matmul_t(const tv& in, const attrs&) { return matmul_impl(in, true); }
+// Sparse MoE routing for one token (shared by the reference, the CPU lowering and the device tests): scores are
+// softmax (gating 0) or sigmoid (gating 1) of the router logits; the k largest are kept (ties -> lower index; softmax
+// and sigmoid are monotone, so the choice is made on the logits); weights = score / (sum of the k scores if norm,
+// else 1 for sigmoid / the softmax total), times scale. ids/w get k entries in descending-score order.
+inline void moe_route(const float* x, i64 n, i64 k, bool norm, double scale, int gating, i64* ids, float* w) {
+    k = std::min(k, n);
+    std::vector<i64> idx(static_cast<std::size_t>(n)); for (i64 i = 0; i < n; ++i) idx[std::size_t(i)] = i;
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](i64 a1, i64 b1) { return x[a1] != x[b1] ? x[a1] > x[b1] : a1 < b1; });
+    double m = -INFINITY; for (i64 i = 0; i < n; ++i) m = std::max(m, double(x[i]));
+    double tot = 0; if (gating == 0) for (i64 i = 0; i < n; ++i) tot += std::exp(double(x[i]) - m);
+    auto score = [&](i64 e) { return gating == 0 ? std::exp(double(x[e]) - m) : 1.0 / (1.0 + std::exp(-double(x[e]))); };
+    double ks = 0; for (i64 j = 0; j < k; ++j) ks += score(idx[std::size_t(j)]);
+    double den = norm ? ks : (gating == 0 ? tot : 1.0);
+    for (i64 j = 0; j < k; ++j) { ids[j] = idx[std::size_t(j)]; w[j] = float(score(idx[std::size_t(j)]) / den * scale); }
+}
+// Sparse mixture-of-experts SwiGLU FFN. in: h [t, d], router logits [t, e], gate [e, f, d], up [e, f, d], down [e, d, f].
+// Only the k routed experts of each token are evaluated: y = sum_j w_j * down_j(silu(gate_j h) * up_j h).
+inline tensor moe_ffn(const tv& in, const attrs& a) {
+    const auto& h = in.at(0); const auto& lg = in.at(1); const auto& wg = in.at(2); const auto& wu = in.at(3); const auto& wd = in.at(4);
+    if (h.shape.size() != 2 || lg.shape.size() != 2 || wg.shape.size() != 3 || wu.shape != wg.shape || wd.shape.size() != 3)
+        raise(errc::shape_mismatch, "moe_ffn: h [t,d], logits [t,e], gate/up [e,f,d], down [e,d,f]");
+    i64 t = h.shape[0], d = h.shape[1], ne = wg.shape[0], f = wg.shape[1];
+    if (lg.shape[0] != t || lg.shape[1] != ne || wg.shape[2] != d || wd.shape != shape_t{ne, d, f})
+        raise(errc::shape_mismatch, "moe_ffn: inconsistent shapes");
+    i64 k = std::min(i64(a.num("k", 2)), ne);
+    tensor o(h.shape);
+    std::vector<i64> ids(static_cast<std::size_t>(k)); std::vector<float> w(static_cast<std::size_t>(k)); std::vector<double> hid(static_cast<std::size_t>(f));
+    for (i64 r = 0; r < t; ++r) {
+        moe_route(lg.data.data() + r * ne, ne, k, a.num("norm", 1) != 0, a.num("scale", 1.0), int(a.num("gating", 0)), ids.data(), w.data());
+        const float* x = h.data.data() + r * d;
+        std::vector<double> acc(std::size_t(d), 0.0);
+        for (i64 j = 0; j < k; ++j) {
+            i64 e = ids[std::size_t(j)];
+            const float* G = wg.data.data() + e * f * d; const float* U = wu.data.data() + e * f * d; const float* D = wd.data.data() + e * d * f;
+            for (i64 c = 0; c < f; ++c) {
+                double g = 0, u = 0;
+                for (i64 p = 0; p < d; ++p) { g += double(x[p]) * G[c * d + p]; u += double(x[p]) * U[c * d + p]; }
+                hid[std::size_t(c)] = g / (1.0 + std::exp(-g)) * u;
+            }
+            for (i64 c = 0; c < d; ++c) { double s = 0; for (i64 p = 0; p < f; ++p) s += hid[std::size_t(p)] * D[c * f + p]; acc[std::size_t(c)] += double(w[std::size_t(j)]) * s; }
+        }
+        for (i64 c = 0; c < d; ++c) o.data[std::size_t(r * d + c)] = float(acc[std::size_t(c)]);
+    }
+    return o;
+}
 
 // q[s,hq,d], k/v[t,hk,d]. causal: query i (absolute position t - s + i) sees keys <= its position.
 inline tensor attention(const tv& in, const attrs& a) {

@@ -90,6 +90,12 @@ inline case_t make_case(ops::op o, std::mt19937& rng, i64 n = 37) {
             if (nm == "convert") c.a.set("to", std::string("bf16"));
             if (nm == "cumsum") c.a.set("axis", -1.0);
             if (nm == "moe_gate") { c.in = {rt({5, 8})}; c.a.set("k", 2.0); c.a.set("norm", 1.0); }
+            if (nm == "moe_ffn") {   // h [t,d], logits [t,e], gate/up [e,f,d], down [e,d,f]; small values keep the products O(1)
+                i64 t = n > 16 ? 5 : 3, d = 8, f = 6, e = 4;
+                c.in = {rt({t, d}), rt({t, e}), rt({e, f, d}), rt({e, f, d}), rt({e, d, f})};
+                for (std::size_t i = 2; i < 5; ++i) for (auto& x : c.in[i].data) x *= 0.1f;
+                c.a.set("k", 2.0); c.a.set("norm", 1.0);
+            }
         }
         break;
     case ops::shape_rule::reduce: c.in = {rt({4, n})}; c.a.set("axis", -1.0); break;

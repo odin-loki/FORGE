@@ -20,6 +20,7 @@ Readers find sections through the table, so section order on disk does not matte
 | `tokenizer` | text models | Hugging Face style `tokenizer.json`. HF imports copy it; GGUF imports synthesise one from the GGUF vocabulary |
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
 | `data` | yes | Tensor bytes, each tensor aligned to 64 B, in the codec's block layout (`graph/codecs.hpp`) |
+| `experts` | no | Minor revision 1 (manifest `forge_format_minor: 1`). JSON `{version, align: 4096, tensors: [{layer, proj (gate/up/down), name, codec, n_experts, offset, file_offset, expert_bytes, aligned}]}` indexing the stacked MoE expert tensors `[n_experts, rows, k]` read by `moe_ffn`. Expert e is bytes `[offset + e * expert_bytes, + expert_bytes)` of `data`; `aligned` means every expert slice starts on a 4 KiB file offset (one direct read per expert, groundwork for expert streaming). Older readers ignore the section |
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | `{alg, nonce, mac, key_id}`. `data` is sealed with XChaCha20-Poly1305; the `tensors` JSON is bound as associated data |
 

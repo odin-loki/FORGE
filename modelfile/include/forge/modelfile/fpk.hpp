@@ -34,7 +34,12 @@ namespace forge::modelfile {
 
 inline constexpr char magic[8] = {'F', 'O', 'R', 'G', 'E', 'P', 'K', '1'};
 inline constexpr std::uint32_t format_version = 1;
+// Minor revision of version 1 (manifest "forge_format_minor"): 1 adds the optional "experts" section (an index of
+// stacked MoE expert tensors whose per-expert slices start on expert_alignment file offsets). Readers that predate it
+// ignore the section; the tensors themselves are ordinary entries of "tensors".
+inline constexpr std::uint32_t format_minor = 1;
 inline constexpr std::size_t alignment = 64;
+inline constexpr std::size_t expert_alignment = 4096;
 
 struct tensor_entry {
     std::string name, codec;
@@ -141,22 +146,25 @@ public:
     ~stream_writer() { if (f_) { std::fclose(f_); std::remove(tmp_.c_str()); } }
     void set_section(std::string name, std::string bytes) { sections_[std::move(name)] = std::move(bytes); }
     void set_manifest(const json::value& m) { set_section("manifest", json::dump(m)); }
-    void add_tensor(std::string name, const shape_t& shape, std::span<const float> data, std::string_view codec = "f32") {
+    void add_tensor(std::string name, const shape_t& shape, std::span<const float> data, std::string_view codec = "f32", std::size_t align = alignment) {
         auto* c = graph::codecs::find(codec);
         if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
         if (std::size_t(numel(shape)) != data.size()) raise(errc::shape_mismatch, "tensor {}: shape/data mismatch", name);
         if (c->block > 1 && data.size() % std::size_t(c->block)) c = graph::codecs::find("f16");
         std::vector<std::uint8_t> buf(c->bytes(data.size()));
         c->encode(data.data(), data.size(), buf.data());
-        put_(std::move(name), std::string(c->name), shape, buf);
+        put_(std::move(name), std::string(c->name), shape, buf, align);
     }
-    void add_raw(std::string name, const shape_t& shape, std::string_view codec, std::span<const std::uint8_t> bytes) {
+    // `align` (a multiple of 64) applies to the tensor's file offset: expert_alignment for stacked MoE experts.
+    void add_raw(std::string name, const shape_t& shape, std::string_view codec, std::span<const std::uint8_t> bytes, std::size_t align = alignment) {
         auto* c = graph::codecs::find(codec);
         if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
         if (c->bytes(std::size_t(numel(shape))) != bytes.size()) raise(errc::format_error, "tensor {}: {} bytes do not match {} {}", name, bytes.size(), codec, shape_str(shape));
-        put_(std::move(name), std::string(c->name), shape, bytes);
+        put_(std::move(name), std::string(c->name), shape, bytes, align);
     }
     std::size_t tensor_bytes() const { return dlen_; }
+    // the most recently added tensor (offset relative to the data section, which starts at file offset 64)
+    const tensor_entry& last() const { if (tensors_.empty()) raise(errc::invalid_argument, "no tensor written"); return tensors_.back(); }
     void finish() {
         json::array idx;
         for (auto& t : tensors_) {
@@ -195,10 +203,12 @@ private:
         at_ += k;
     }
     void pad_() { static const std::uint8_t z[alignment] = {}; emit_(z, std::size_t((alignment - at_ % alignment) % alignment)); }
-    void put_(std::string name, std::string codec, const shape_t& shape, std::span<const std::uint8_t> b) {
+    void put_(std::string name, std::string codec, const shape_t& shape, std::span<const std::uint8_t> b, std::size_t align = alignment) {
         static const std::uint8_t z[alignment] = {};
-        std::size_t padn = (alignment - dlen_ % alignment) % alignment;   // data starts at 64, so data-relative == file alignment
-        emit_(z, padn); dhash_.update(z, padn); dlen_ += padn;
+        if (align < alignment || align % alignment) raise(errc::invalid_argument, "tensor alignment {} is not a multiple of {}", align, alignment);
+        std::size_t padn = (align - (64 + dlen_) % align) % align;   // data starts at file offset 64: align the file offset
+        for (std::size_t left = padn; left;) { std::size_t n = std::min(left, alignment); emit_(z, n); dhash_.update(z, n); left -= n; }
+        dlen_ += padn;
         tensor_entry e{std::move(name), std::move(codec), shape, dlen_, b.size(), hash::blake3::hex(hash::blake3::of(b))};
         emit_(b.data(), b.size()); dhash_.update(b.data(), b.size()); dlen_ += b.size();
         tensors_.push_back(std::move(e));
