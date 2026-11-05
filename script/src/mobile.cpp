@@ -87,7 +87,7 @@ void install(Shared& sh) {
         need_dev(in); std::shared_ptr<mob::device> d;
         if (!a.empty()) {
             if (auto* v = kv(a[0], "sim")) d = std::make_shared<mob::device>(okv(in, mob::device::simulated(in.str(*v))));
-            else if (auto* f = kv(a[0], "sim_file")) { if (!in.caps.fs) in.raise("PermissionError", "file access is disabled in this sandbox"); d = std::make_shared<mob::device>(okv(in, mob::device::simulated_file(in.str(*f)))); }
+            else if (auto* f = kv(a[0], "sim_file")) { if (!in.caps.fs) in.raise("PermissionError", "file access is disabled in this sandbox"); enforce_scope(in, SecScope::fs_read, in.str(*f)); d = std::make_shared<mob::device>(okv(in, mob::device::simulated_file(in.str(*f)))); }
             else if (auto* n = kv(a[0], "null"); n && Interp::truthy(*n)) d = std::make_shared<mob::device>(okv(in, mob::device::null_device()));
         }
         if (!d) d = platform(in);

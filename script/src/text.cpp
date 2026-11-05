@@ -296,6 +296,7 @@ void install(Shared& sh) {
     B["forge::locale::catalog"] = nat("forge::locale::catalog", 1, 3, [](Interp& in, Args& a) -> Value {
         if (!in.caps.fs) in.raise("PermissionError", "file access is disabled in this sandbox");
         std::shared_ptr<lc::catalog> c;
+        enforce_scope(in, SecScope::fs_read, s_of(in, a[0], a.size() >= 2 ? "dir" : "path"));
         if (a.size() >= 2) c = std::make_shared<lc::catalog>(okv(in, lc::catalog::find(s_of(in, a[0], "dir"), s_of(in, a[1], "domain"), opt_s(in, a, 2, "locale"))));
         else c = std::make_shared<lc::catalog>(okv(in, lc::catalog::load(s_of(in, a[0], "path"))));
         auto h = make<Handle>("catalog"); h->payload = c; return obj(h);

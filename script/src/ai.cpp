@@ -69,6 +69,7 @@ std::string complete(Interp& in, const std::string& system, const std::string& p
     if (!ep || !*ep) in.raise("AIError", "no AI backend: set FORGE_ASK_MODEL (a local .fpk), FORGE_AI_ENDPOINT (e.g. http://127.0.0.1:8080 from forge-serve) or options::ai");
     if (!in.caps.net) in.raise("PermissionError", "AI endpoint access needs network access, which is disabled in this sandbox");
     std::string url = ep; while (!url.empty() && url.back() == '/') url.pop_back();
+    if (auto u = os::net::parse_url(url)) enforce_scope(in, SecScope::net_connect, (u->host.find(':') != std::string::npos ? "[" + u->host + "]" : u->host) + ":" + std::to_string(u->port ? u->port : u->scheme == "https" ? 443 : 80));
     if (!url.ends_with("/chat/completions")) url += url.ends_with("/v1") ? "/chat/completions" : "/v1/chat/completions";
     const char* model = std::getenv("FORGE_AI_MODEL");
     json::object body{{"model", std::string(model ? model : "default")}, {"temperature", 0.0},
