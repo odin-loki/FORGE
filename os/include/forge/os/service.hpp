@@ -96,6 +96,7 @@ inline status log(log_level l, const std::string& msg, const std::string& ident 
 }
 
 // Windows: run `body` as a service named `name` (blocks until stopped). on_stop is called from the SCM thread.
+// When started by the SCM it first changes to $FORGE_SERVICE_DIR if set (service_spec::working_dir).
 // Elsewhere (or when not started by the SCM) body runs directly: daemons are managed by systemd/launchd/rc.d.
 inline status run_as_service(const std::string& name, std::function<int()> body, std::function<void()> on_stop) {
 #if defined(FORGE_OS_WINDOWS)
@@ -109,6 +110,9 @@ inline status run_as_service(const std::string& name, std::function<int()> body,
             if (ctl == SERVICE_CONTROL_STOP || ctl == SERVICE_CONTROL_SHUTDOWN) { setp(SERVICE_STOP_PENDING, 0); if (ctx->stop) ctx->stop(); return NO_ERROR; }
             return ctl == SERVICE_CONTROL_INTERROGATE ? NO_ERROR : ERROR_CALL_NOT_IMPLEMENTED; }, nullptr);
         if (!ctx->h) return;
+        // Services start in System32 and have no working directory setting: service_control passes it in
+        // FORGE_SERVICE_DIR (the service's registry Environment).
+        if (DWORD n = GetEnvironmentVariableW(L"FORGE_SERVICE_DIR", nullptr, 0)) { std::wstring d(n, L'\0'); d.resize(GetEnvironmentVariableW(L"FORGE_SERVICE_DIR", d.data(), n)); if (!d.empty()) SetCurrentDirectoryW(d.c_str()); }
         is_windows_service_ref_() = true; setp(SERVICE_RUNNING, 0); int rc = ctx->body(); setp(SERVICE_STOPPED, DWORD(rc)); }}, {nullptr, nullptr}};
     if (!StartServiceCtrlDispatcherW(tbl)) {
         if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) { int rc = c.body(); ctx = nullptr; return rc ? status{{}, {rc, "service body failed"}} : status{}; }

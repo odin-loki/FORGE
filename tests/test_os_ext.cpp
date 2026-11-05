@@ -47,6 +47,26 @@ static int child_main(const std::string& mode) {
         if (auto p = os::keystore::put("race", arg, "v" + arg); !p) { std::printf("put: %s\n", p.err.what.c_str()); return 2; }
         auto g = os::keystore::get("race", arg); if (!g) std::printf("get: %s\n", g.err.what.c_str()); return g && g.value == "v" + arg ? 0 : 3;
     }
+#if defined(__linux__)
+    if (mode.rfind("landlock", 0) == 0) {   // Landlock alone (no seccomp): its denials are EACCES, seccomp's EPERM
+        if (!os::sandbox_status().landlock_abi) return 77;
+        os::sandbox_policy lp; lp.deny_fs_write = mode.rfind("landlock_write", 0) == 0; lp.deny_exec = !lp.deny_fs_write;
+        int fd = os::detail::ll::ruleset(lp, {}, nullptr); if (fd < 0) return 2;
+        if (!os::detail::ll::restrict_self(fd)) return 3;
+        ::close(fd);
+        if (lp.deny_fs_write) {
+            int f = ::open((arg + "/ll.txt").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (f >= 0 || errno != EACCES) return 4;
+            if (::mkdir((arg + "/lld").c_str(), 0700) == 0) return 5;
+            int r = ::open("/etc/hostname", O_RDONLY); if (r < 0 && ::access("/etc/hostname", F_OK) == 0) return 6;   // reads still work
+            if (r >= 0) ::close(r);
+            return 0;
+        }
+        char* av[] = {const_cast<char*>("/bin/true"), nullptr};
+        ::execv("/bin/true", av);
+        return errno == EACCES ? 0 : 7;
+    }
+#endif
     os::sandbox_policy p;
     if (mode == "noop") return 0;
     if (mode == "sandbox_net") p.deny_network = true;
@@ -55,6 +75,13 @@ static int child_main(const std::string& mode) {
     else return 9;
     auto st = os::apply_sandbox(p);
     if (!st) { std::fprintf(stderr, "sandbox: %s\n", st.err.what.c_str()); return os::is_unsupported(st.err) ? 77 : 2; }
+#if defined(__linux__)
+    {   // Landlock is stacked on seccomp when the kernel has it (deny_network needs ABI 4)
+        auto s = os::sandbox_status(); const bool want = s.landlock_abi && (!p.deny_network || s.landlock_abi >= 4);
+        std::printf("  %s: %s (landlock abi %d)\n", mode.c_str(), s.mechanism.c_str(), s.landlock_abi);
+        if (want != (s.mechanism.find("landlock") != std::string::npos) || s.mechanism.rfind("seccomp-bpf", 0) != 0) return 8;
+    }
+#endif
     if (p.deny_network) {
         auto r = os::socket::listen("127.0.0.1", 0); if (r) return 4;   // must be refused
 #if !defined(_WIN32)
@@ -341,6 +368,10 @@ TEST(sandboxing) {
 #endif
         CHECK_MSG(rc == 0, "%s rc=%d", m.c_str(), rc);
     }
+#if defined(__linux__)
+    if (s.landlock_abi == 0) skip("landlock", "kernel has no Landlock (seccomp only)");
+    else for (std::string m : {"landlock_write:" + d, std::string("landlock_exec")}) { int rc = run_child(m); CHECK_MSG(rc == 0, "%s rc=%d", m.c_str(), rc); }
+#endif
     os::remove_all(d);
 #endif
 }
@@ -373,6 +404,16 @@ TEST(run_sandboxed_child) {
     auto rx = os::run_sandboxed({"sh", "-c", "exit 7"}, x); CHECK(rx); if (rx) CHECK(rx.value == 7);
 #if defined(__FreeBSD__)
     auto ex = os::run_sandboxed({"sh", "-c", "/bin/echo hi"}, x); CHECK(ex); if (ex) CHECK(ex.value != 0);   // capability mode: no exec by path
+#elif defined(__linux__)
+    // Landlock: the target (and its ld.so) may execute, nothing else; without Landlock the target may still exec.
+    auto ex = os::run_sandboxed({"sh", "-c", "/bin/echo hi"}, x); CHECK(ex);
+    auto tgt = os::run_sandboxed({"/bin/echo", "direct"}, x); CHECK(tgt); if (tgt) CHECK(tgt.value == 0);   // dynamic ELF target runs
+    std::string scr = os::join(d, "s.sh"); CHECK(os::write_file(scr, "#!/bin/sh\nexit 4\n")); ::chmod(scr.c_str(), 0755);
+    auto sr = os::run_sandboxed({scr}, x); CHECK(sr); if (sr) CHECK_MSG(sr.value == 4, "rc=%d", sr.value);   // #! interpreter allowed
+    os::sandbox_policy xw = x; xw.deny_fs_write = true;
+    auto exw = os::run_sandboxed({"sh", "-c", "exit 6"}, xw); CHECK(exw); if (exw) CHECK(exw.value == 6);
+    if (os::sandbox_status().landlock_abi) { if (ex) CHECK_MSG(ex.value != 0, "rc=%d", ex.value); }
+    else { skip("run_sandboxed deny_exec on the target", "no Landlock"); if (ex) CHECK(ex.value == 0); }
 #endif
     CHECK(!os::run_sandboxed({"no-such-forge-cmd-xyz"}, net));
     os::remove_all(d);
@@ -467,6 +508,82 @@ TEST(key_storage) {
         os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(rd);
     }
 #endif
+    {   // store key wrapped by an Argon2id passphrase (small Argon2 cost to keep the test fast)
+        auto wd = scratch("keys_wrap"); os::setenv("FORGE_KEYSTORE_DIR", wd); auto mp = os::join(wd, ".master"); auto old_kdf = os::keystore::kdf();
+        CHECK(!os::keystore::set_kdf({1024, 3, 1})); CHECK(!os::keystore::set_kdf({8192, 1, 1})); CHECK(!os::keystore::set_kdf({8192, 2, 0}));
+        CHECK(os::keystore::kdf().memory_kib == old_kdf.memory_kib); CHECK(os::keystore::set_kdf({8192, 2, 1}));
+        CHECK(os::keystore::put(svc, "w", secret)); CHECK(os::keystore::backend() == "file");   // plain store first
+#if !defined(FORGE_OS_WINDOWS)
+        CHECK(os::read_file(mp)->rfind("FKK1", 0) == 0);
+#endif
+        os::keystore::set_passphrase("correct horse"); CHECK(os::keystore::backend() == "file+argon2id");
+        { auto r = os::keystore::get(svc, "w"); CHECK(r && r.value == secret); }   // migration: wrapped on first use
+        auto wrapped = os::read_file(mp).value;
+#if !defined(FORGE_OS_WINDOWS)
+        CHECK(wrapped.size() == 104 && wrapped.rfind("FKKP", 0) == 0); CHECK(wrapped.find(secret) == std::string::npos);
+#else
+        CHECK(wrapped.rfind("FKKD", 0) == 0);
+#endif
+        os::keystore::clear_passphrase(); os::keystore::set_passphrase("correct horse");   // fresh cache: derives again
+        CHECK(os::keystore::put(svc, "w2", "two")); CHECK(os::keystore::get(svc, "w2").value == "two"); CHECK(os::keystore::get(svc, "w").value == secret);
+        os::keystore::set_passphrase("wrong horse"); { auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK_MSG(r.err.code == EACCES, "wrong passphrase: %s", r.err.what.c_str()); }
+        os::keystore::clear_passphrase(); { auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK(r.err.code == EACCES); CHECK(!os::keystore::put(svc, "w3", "x")); }
+        os::setenv("FORGE_KEYSTORE_PASSPHRASE", "correct horse"); CHECK(os::keystore::get(svc, "w").value == secret); os::unsetenv("FORGE_KEYSTORE_PASSPHRASE");
+        int asked = 0; os::keystore::set_passphrase_provider([&] { ++asked; return std::string("correct horse"); });
+        CHECK(os::keystore::get(svc, "w").value == secret); CHECK(os::keystore::get(svc, "w2").value == "two"); CHECK(asked == 1);   // asked once, then cached
+        os::keystore::clear_passphrase(); os::keystore::set_passphrase("correct horse");
+#if !defined(FORGE_OS_WINDOWS)
+        // header tamper: parameters, salt, nonce, tag and ciphertext are all authenticated
+        for (std::size_t i : {std::size_t(8), std::size_t(20), std::size_t(40), std::size_t(60), std::size_t(90)}) {
+            auto t = wrapped; t[i] = char(t[i] ^ 1); CHECK(os::write_file(mp, t)); auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK_MSG(r.err.code == EACCES, "tamper %zu: %s", i, r.err.what.c_str());
+        }
+        {   // Argon2 parameters below the minimum in a stored header are refused, not run
+            auto t = wrapped; t[4] = 0; t[5] = 4; t[6] = 0; t[7] = 0; CHECK(os::write_file(mp, t)); auto r = os::keystore::get(svc, "w"); CHECK(!r); CHECK(r.err.what.find("Argon2") != std::string::npos);
+        }
+        CHECK(os::write_file(mp, wrapped)); CHECK(os::keystore::get(svc, "w").value == secret);
+#else
+        { auto t = wrapped; t[t.size() / 2] = char(t[t.size() / 2] ^ 1); CHECK(os::write_file(mp, t)); CHECK(!os::keystore::get(svc, "w")); CHECK(os::write_file(mp, wrapped)); }
+#endif
+        // rewrap: change the passphrase, then remove it
+        { auto r = os::keystore::rewrap("bad", "new pass"); CHECK(!r); CHECK(r.err.code == EACCES); }
+        CHECK(os::keystore::rewrap("correct horse", "new pass")); CHECK(os::keystore::get(svc, "w").value == secret);
+        os::keystore::set_passphrase("correct horse"); CHECK(!os::keystore::get(svc, "w"));
+        os::keystore::set_passphrase("new pass"); CHECK(os::keystore::get(svc, "w2").value == "two");
+        CHECK(os::keystore::rewrap("new pass", "")); CHECK(os::keystore::backend() == "file");
+#if !defined(FORGE_OS_WINDOWS)
+        CHECK(os::read_file(mp)->rfind("FKK1", 0) == 0);
+#endif
+        CHECK(os::keystore::get(svc, "w").value == secret);
+        os::keystore::clear_passphrase(); CHECK(os::keystore::set_kdf(old_kdf)); os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(wd);
+    }
+    {   // TPM wrapping (opt-in): skipped where no TPM is usable, which must then fail cleanly as unsupported
+        auto ta = os::keystore::tpm_available(); std::printf("  TPM wrapping: %s\n", ta ? "available" : ta.err.what.c_str());
+        auto td = scratch("keys_tpm"); os::setenv("FORGE_KEYSTORE_DIR", td); os::setenv("FORGE_KEYSTORE_TPM", "1");
+        auto mp = os::join(td, ".master"), tp = os::join(td, ".master.tpm");
+        if (!ta) { auto r = os::keystore::put(svc, "t", "x"); CHECK(!r); CHECK(os::is_unsupported(r.err)); CHECK(os::keystore::backend() == "file"); }
+        else {
+            os::setenv("FORGE_KEYSTORE_TPM_KEY_PREFIX", "forge-test-"); CHECK(os::keystore::set_kdf({8192, 2, 1}));
+            CHECK(os::keystore::backend() == "file+tpm");
+            auto p = os::keystore::put(svc, "t", "tpm-secret"); CHECK_MSG(p, "TPM put: %s", p.err.what.c_str());
+            CHECK(os::read_file(mp).value == "FKKT"); CHECK(os::exists(tp));
+            os::keystore::clear_passphrase();   // drop the cached key: next get unseals
+            { auto g2 = os::keystore::get(svc, "t"); CHECK_MSG(g2 && g2.value == "tpm-secret", "TPM get: %s", g2.err.what.c_str()); }
+            auto tb = os::read_file(tp).value;
+            { auto t = tb; t.back() = char(t.back() ^ 1); CHECK(os::write_file(tp, t)); os::keystore::clear_passphrase(); CHECK(!os::keystore::get(svc, "t")); CHECK(os::write_file(tp, tb)); }
+            os::keystore::set_passphrase("rescue"); CHECK(os::keystore::backend() == "file+tpm+argon2id");
+            CHECK(os::keystore::get(svc, "t").value == "tpm-secret"); CHECK(os::read_file(mp).value != "FKKT"); CHECK(os::read_file(tp).value == tb);   // recovery copy added
+            // TPM copy lost (cleared TPM): the passphrase copy still opens the store
+            os::unsetenv("FORGE_KEYSTORE_TPM"); CHECK(os::remove(tp)); os::keystore::clear_passphrase(); os::keystore::set_passphrase("rescue");
+            CHECK(os::keystore::get(svc, "t").value == "tpm-secret");
+            CHECK(os::write_file(tp, tb)); os::setenv("FORGE_KEYSTORE_TPM", "1");
+            os::keystore::clear_passphrase(); CHECK(os::keystore::get(svc, "t").value == "tpm-secret");   // TPM first, no passphrase needed
+            os::keystore::set_passphrase("rescue"); CHECK(os::keystore::disable_tpm()); CHECK(!os::exists(tp));   // also deletes the NCrypt key
+            os::unsetenv("FORGE_KEYSTORE_TPM"); os::keystore::clear_passphrase(); CHECK(!os::keystore::get(svc, "t"));
+            os::keystore::set_passphrase("rescue"); CHECK(os::keystore::get(svc, "t").value == "tpm-secret");
+            os::keystore::clear_passphrase(); os::unsetenv("FORGE_KEYSTORE_TPM_KEY_PREFIX"); CHECK(os::keystore::set_kdf({}));
+        }
+        os::unsetenv("FORGE_KEYSTORE_TPM"); os::setenv("FORGE_KEYSTORE_DIR", d); os::remove_all(td);
+    }
     os::unsetenv("FORGE_KEYSTORE");
     std::map<std::string, std::string> mem;
     os::keystore::set_backend({"mem", [&](auto& s, auto& a, auto& v) { mem[s + "/" + a] = v; return os::status{}; },

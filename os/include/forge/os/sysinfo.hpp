@@ -12,6 +12,8 @@
 #endif
 #if defined(FORGE_OS_WINDOWS)
 #include <psapi.h>   // K32GetProcessMemoryInfo lives in kernel32 (no psapi.lib)
+#include <cmath>
+#include <thread>
 #endif
 #if defined(__APPLE__)
 #include <mach/mach.h>
@@ -83,6 +85,71 @@ inline result<double> uptime_seconds() {
 #endif
 }
 struct load_avg { double one = 0, five = 0, fifteen = 0; };
+#if defined(FORGE_OS_WINDOWS)
+namespace detail {
+// Windows keeps no run-queue average, so one is emulated like Linux's: every 5 s a background thread (started
+// by the first load_average() call, never stopped) samples "running + waiting" = busy CPUs (GetSystemTimes over
+// the tick x active processors) + "\System\Processor Queue Length" (PDH, pdh.dll loaded at run time; 0 if
+// unavailable), and folds it into exponentially decaying 1/5/15-minute averages with factors exp(-5/60),
+// exp(-5/300), exp(-5/900). The first call measures 100 ms and seeds all three averages with that instantaneous
+// value, so early values follow the current load rather than starting from 0. Blocked I/O waits (Linux D state)
+// are not counted. The sampler thread and its state are deliberately leaked (no join at exit).
+// The few PDH declarations used, written out here: <pdh.h> and <lm.h> (users.hpp) both define HLOG.
+struct pdh_ {
+    using query_t = void*; using counter_t = void*;
+    struct fmt_value { DWORD CStatus; union { LONG longValue; double doubleValue; LONGLONG largeValue; LPCWSTR WideStringValue; }; };
+    static constexpr DWORD fmt_double = 0x00000200;   // PDH_FMT_DOUBLE
+    using open_t = LONG(WINAPI*)(LPCWSTR, DWORD_PTR, query_t*);
+    using add_t = LONG(WINAPI*)(query_t, LPCWSTR, DWORD_PTR, counter_t*);
+    using collect_t = LONG(WINAPI*)(query_t);
+    using value_t = LONG(WINAPI*)(counter_t, DWORD, LPDWORD, fmt_value*);
+};
+struct win_load_ {
+    std::mutex mu; double avg[3] = {0, 0, 0};
+    pdh_::collect_t collect = nullptr; pdh_::value_t value = nullptr;
+    pdh_::query_t query = nullptr; pdh_::counter_t counter = nullptr;
+    ULONGLONG idle = 0, total = 0; double ncpu = 1;
+    static ULONGLONG ft_(const FILETIME& f) { return (ULONGLONG(f.dwHighDateTime) << 32) | f.dwLowDateTime; }
+    static void times_(ULONGLONG& i, ULONGLONG& t) { FILETIME a{}, k{}, u{}; if (GetSystemTimes(&a, &k, &u)) { i = ft_(a); t = ft_(k) + ft_(u); } }   // kernel includes idle
+    win_load_() {
+        DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); ncpu = n ? double(n) : 1.0;
+        if (HMODULE h = LoadLibraryExW(L"pdh.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/)) {
+            auto open = reinterpret_cast<pdh_::open_t>(reinterpret_cast<void*>(GetProcAddress(h, "PdhOpenQueryW")));
+            auto add = reinterpret_cast<pdh_::add_t>(reinterpret_cast<void*>(GetProcAddress(h, "PdhAddEnglishCounterW")));
+            collect = reinterpret_cast<decltype(collect)>(reinterpret_cast<void*>(GetProcAddress(h, "PdhCollectQueryData")));
+            value = reinterpret_cast<decltype(value)>(reinterpret_cast<void*>(GetProcAddress(h, "PdhGetFormattedCounterValue")));
+            if (!(open && add && collect && value && open(nullptr, 0, &query) == ERROR_SUCCESS && add(query, L"\\System\\Processor Queue Length", 0, &counter) == ERROR_SUCCESS)) counter = nullptr;
+        }
+        times_(idle, total);
+    }
+    double sample_() {   // busy CPUs since the previous sample + threads waiting for a CPU now
+        ULONGLONG i = idle, t = total; times_(idle, total);
+        double busy = total > t ? (1.0 - double(idle - i) / double(total - t)) * ncpu : 0.0;
+        double q = 0;
+        if (counter && collect(query) == ERROR_SUCCESS) { pdh_::fmt_value v{}; if (value(counter, pdh_::fmt_double, nullptr, &v) == ERROR_SUCCESS && v.CStatus == ERROR_SUCCESS) q = v.doubleValue; }
+        double x = busy + q; return x > 0 ? x : 0.0;
+    }
+};
+inline win_load_* win_load_state_() {
+    static win_load_* st = [] {
+        auto* p = new win_load_();
+        Sleep(100); double first = p->sample_(); { std::lock_guard<std::mutex> g(p->mu); p->avg[0] = p->avg[1] = p->avg[2] = first; }
+        std::thread([p] {
+            const double e[3] = {std::exp(-5.0 / 60), std::exp(-5.0 / 300), std::exp(-5.0 / 900)};
+            for (;;) {
+                Sleep(5000); double x = p->sample_();
+                std::lock_guard<std::mutex> g(p->mu); for (int k = 0; k < 3; ++k) p->avg[k] = p->avg[k] * e[k] + x * (1 - e[k]);
+            }
+        }).detach();
+        return p;
+    }();
+    return st;
+}
+inline result<load_avg> win_load_average_() {
+    auto* p = win_load_state_(); std::lock_guard<std::mutex> g(p->mu); return {{p->avg[0], p->avg[1], p->avg[2]}, {}};
+}
+} // namespace detail
+#endif
 inline result<load_avg> load_average() {
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_ANDROID)
     double l[3] = {}; if (::getloadavg(l, 3) != 3) return {{}, error{-1, "getloadavg failed"}};
@@ -90,7 +157,9 @@ inline result<load_avg> load_average() {
 #elif defined(FORGE_OS_ANDROID)
     std::ifstream f("/proc/loadavg"); load_avg a; if (f >> a.one >> a.five >> a.fifteen) return {a, {}};
     return {{}, last_error("/proc/loadavg")};
-#else   // Windows keeps no run-queue average; sampling one would need a background thread. Use per_cpu_times.
+#elif defined(FORGE_OS_WINDOWS)
+    return detail::win_load_average_();
+#else
     return {{}, unsupported("load_average")};
 #endif
 }

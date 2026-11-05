@@ -1,6 +1,8 @@
 #pragma once
 // forge::os recursive, debounced file watching. tree_watcher watches a whole directory tree: every directory is
-// registered with the native file_watcher (inotify / kqueue / ReadDirectoryChangesW), new directories are picked
+// registered with the native file_watcher (inotify / kqueue), or the whole tree with one recursive watch where the
+// backend has one (Windows ReadDirectoryChangesW on the root, macOS FSEvents: no descriptor per directory or file);
+// new directories are picked
 // up as they appear (their contents are reported as created, closing the mkdir-then-write race), and a
 // per-path snapshot turns coarse "directory changed" notifications (kqueue) into exact created / modified /
 // removed events. Where native watching is unavailable, or with force_polling, it rescans on each poll().
@@ -16,7 +18,10 @@
 
 namespace forge::os {
 // max_native_handles: kqueue descriptor cap for this watcher (0 = the backend default); past it, polling.
-struct tree_watch_opts { int debounce_ms = 50; bool force_polling = false, include_hidden = true; std::vector<std::string> ignore; std::size_t max_native_handles = 0; };
+// fsevents: macOS watches the tree through one FSEvents stream (coalesced, ~50 ms latency); false uses kqueue (one
+// descriptor per directory and file, immediate events). Ignored elsewhere.
+struct tree_watch_opts { int debounce_ms = 50; bool force_polling = false, include_hidden = true; std::vector<std::string> ignore; std::size_t max_native_handles = 0;
+                         bool fsevents = true; };
 
 class tree_watcher {
 public:
@@ -25,7 +30,11 @@ public:
         auto w = std::unique_ptr<tree_watcher>(new tree_watcher(root, std::move(o)));
         w->polling_ = w->opts_.force_polling;
         if (w->opts_.max_native_handles) w->native_.set_max_handles(w->opts_.max_native_handles);
-        if (!w->polling_) { w->subtree_ = w->native_.add_tree(w->root_); if (!w->subtree_ && !w->native_.add(w->root_)) w->polling_ = true; }
+        bool tree = true;
+#if defined(FORGE_OS_MACOS)
+        tree = w->opts_.fsevents;
+#endif
+        if (!w->polling_) { w->subtree_ = tree && w->native_.add_tree(w->root_); if (!w->subtree_ && !w->native_.add(w->root_)) w->polling_ = true; }
         w->scan_(w->root_, nullptr);
         return {std::move(w), {}};
     }
@@ -112,7 +121,7 @@ private:
         }
     }
     void watch_file_(const std::string& p, const std::string& dir) {   // kqueue per-file handle; its directory is polled when refused
-        if (polling_ || polled_.count(dir)) return;
+        if (polling_ || subtree_ || polled_.count(dir)) return;           // a recursive watch already sees in-place writes
         if (!native_.add_file(p)) polled_.insert(dir);
     }
     // Compare the snapshot of `dir`'s immediate children against the disk.
@@ -164,6 +173,13 @@ private:
         for (auto& e : native_.poll(timeout_ms)) {
             if (e.kind == watch_kind::overflow) { overflow = true; continue; }
             auto p = normalize_(e.path);
+#if defined(FORGE_OS_MACOS)
+            // FSEvents reports real paths; one the watcher could not map back below the root is unusable: rescan instead
+            if (subtree_ && p != root_) {
+                const std::string pre = root_ == "/" ? root_ : root_ + "/";
+                if (p.compare(0, pre.size(), pre) != 0) { overflow = true; continue; }
+            }
+#endif
             if (dirs_.count(p) && e.kind != watch_kind::removed) diff_dir_(p, out);   // coarse (kqueue) dir event
             else check_(p, out);
         }

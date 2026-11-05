@@ -136,4 +136,21 @@ struct worker {
 };
 inline std::uint64_t now_ns() { return monotonic_ns(); }
 
+// ---- pure helpers shared by the backends (mobile.cpp; unit-tested in tests/test_mobile.cpp) ---------------
+// Interleaved float PCM: channel mapping (average to mono, duplicate mono, else copy the first channels and
+// zero-fill) and linear-interpolation resampling.
+std::vector<float> remix(const float* in, std::size_t frames, int in_ch, int in_rate, int out_ch, int out_rate);
+// Motion-JPEG frames (UVC, V4L2 MJPEG) usually omit the Huffman tables; this inserts the standard ones (ITU T.81
+// K.3) before the first SOS when the frame has no DHT. Anything that is not a parseable JPEG comes back unchanged.
+std::vector<std::uint8_t> jpeg_with_dht(std::vector<std::uint8_t> frame);
+// IIO channels by attribute name: in_<type>[<index>][_<modifier>]_{raw,input} (accel/anglvel/magn/gravity need
+// x, y, z modifiers; temp prefers the "ambient" modifier; rot_quaternion is one 4-value attribute). One channel
+// per kind, lowest index first. `prefix` is the attribute stem ("in_accel", "in_illuminance0", "in_temp_ambient"),
+// `type_prefix` the shared-attribute stem ("in_accel"); value = (raw + offset) * scale * mul.
+struct iio_channel { sensor_kind kind{}; std::string prefix, type_prefix; int axes = 1; double mul = 1; };
+std::vector<iio_channel> iio_channels(std::vector<std::string> attrs);
+// `xset q` (X11 screen saver and DPMS state), for restoring what keep_awake changed. -1: not reported.
+struct xset_saver { int timeout = -1, cycle = -1, dpms = -1; };
+xset_saver parse_xset_q(std::string_view text);
+
 } // namespace forge::os::mobile::detail
