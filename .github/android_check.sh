@@ -16,10 +16,12 @@ adb push tests $d/ >/dev/null
 adb shell "mkdir -p $d/templates" && adb push import/templates/. $d/templates/ >/dev/null   # model templates (tiny model in ask_local_model)
 adb shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_TEMPLATES=$d/templates FORGE_TEST_PLUGIN_PATH=$d/libhello_plugin.so ./test_script; echo RC=\$?" | tr -d '\r' | tee out.txt
 grep -q '^RC=0$' out.txt || fail=1
-# forge_mobile (Android backend, bridge, services) and forge_text/locale (tzdata bundle, Bionic locale paths)
-adb push build/android-x86_64/test_mobile build/android-x86_64/test_locale build/android-x86_64/test_text $d/ >/dev/null
-for t in test_mobile test_locale test_text; do
-  adb shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d ./$t; echo RC=\$?" | tr -d '\r' | tee $t.txt
-  grep -q '^RC=0$' $t.txt || { echo "FAIL $t"; fail=1; }
+# forge_mobile (Android backend, bridge, services), forge_text/locale (tzdata bundle, Bionic locale paths),
+# forge::os (core, extension, system information), support utilities and the load balancer. 77 = skip.
+for t in test_mobile test_locale test_text test_os test_os_ext test_os_sys test_util test_loadbalancer; do
+  adb push build/android-x86_64/$t $d/ >/dev/null
+  adb shell "cd $d && LD_LIBRARY_PATH=$d TMPDIR=$d FORGE_THREADS=2 timeout 600 ./$t; echo RC=\$?" | tr -d '\r' | tee $t.txt
+  rc=$(sed -n 's/^RC=//p' $t.txt | tail -1)
+  case "$rc" in 0) echo "PASS $t";; 77) echo "SKIP $t";; *) echo "FAIL $t (rc=$rc)"; fail=1;; esac
 done
 exit $fail
