@@ -23,6 +23,8 @@ it entirely, so FORGE behaves exactly as before.
 | `policy.hpp` | `policy`, `profile`, `profile_defaults`, `parse_policy`, `load_policy`, `to_json` | Profiles, policy file |
 | `enforce.hpp` | `enforce`, `try_enforce`, `capability`, `set_active_policy`, `active_policy`, `expand_root` | CAP-1 |
 | `lockdown.hpp` | `lockdown`, `check`, `report`, `control`, `locked_down` | SBX-1..6, Verification, BLD-2 |
+| `secure_buffer.hpp` | `secure_buffer` (= `os::locked_buffer`), `secure_bytes<N>`, `secure_string`, `memory_state` | CRY-2 |
+| `files.hpp` | `check_private_file`, `check_private_dir`, `require_private_file`, `require_private_dir`, `file_kind` | FIO-2 |
 
 ## Example
 
@@ -147,6 +149,56 @@ working directory then), so a later `chdir` does not move the roots.
 
 `exec`, `dynamic_code` and `plugin_load` allowed under a non-strict profile are audited as `allow`.
 
+## Key memory
+
+```cpp
+security::secure_buffer b(64);             // os::locked_buffer (os/locked_memory.hpp)
+security::secure_bytes<32> seed;           // std::array-like: data(), size(), begin(), operator[]; clone()
+security::secure_string token = "s3cret";  // converts to std::string_view; == with strings
+security::memory_state(b);                 // "locked, excluded from dumps" / "unlocked (lock refused), ..."
+```
+
+Each buffer is its own anonymous mapping, rounded up to whole pages, zeroed. `secure_buffer` and `secure_bytes` are
+move-only; `secure_string` is copyable (the RPC config structs are copied) and every copy is a new mapping. Destruction,
+`reset()` and move-assignment over a live buffer `crypto_wipe` the whole mapping before it is unlocked and unmapped.
+`os::locked_buffer::set_release_hook(fn)` lets a test see the wiped bytes before they are released.
+
+| | Linux / Android | FreeBSD | macOS / iOS | Windows |
+|---|---|---|---|---|
+| lock (`locked()`) | `mlock` (RLIMIT_MEMLOCK) | `mlock` | `mlock` | `VirtualLock`; the minimum working set is raised once on `ERROR_WORKING_SET_QUOTA` |
+| dump exclusion (`dump_excluded()`) | `MADV_DONTDUMP`; `MADV_WIPEONFORK` too | `MADV_NOCORE` | none: set `limits.core = 0` | `WerRegisterExcludedMemoryBlock` (WER reports only; debuggers and `MiniDumpWriteDump` still see it): the job object's die-on-unhandled-exception (`limits.core = 0`) is the process-wide answer |
+| guard pages (`secure_buffer(n, true)`) | `PROT_NONE` page before and after | same | same | `PAGE_NOACCESS` |
+
+Locking is best effort: a refused lock is reported, not an error. `check()` reports it as `CRY-2 key memory` (level
+`should` in strict). Used for the Ed25519 seed in `modelfile::keypair` and `graph::rpc::identity`, RPC tokens
+(`token_entry::token`, `client_security::token`), the `.fsc` signing seed and the keystore's cached store keys and
+Argon2id key-encryption keys. Not covered: the TLS private key (OpenSSL's memory), the keystore passphrase string,
+`model_key` (`.fpk` encryption keys), and copies a caller makes.
+
+## Private files
+
+`check_private_file(path, kind)` / `check_private_dir(path, kind)` return `os::status` and never follow a symlink.
+
+| kind | POSIX | Windows |
+|---|---|---|
+| `secret` (default for files) | regular file / directory, not a symlink, owner = effective uid, `mode & 077 == 0` | not a reparse point, owner = the user (or Administrators for an elevated member), DACL allows only the owner, SYSTEM, Administrators (and CREATOR OWNER / OWNER RIGHTS); NULL DACL fails |
+| `trusted` (default for directories) | not a symlink, owner = effective uid or root, `mode & 022 == 0` | owner = the user, SYSTEM, Administrators or TrustedInstaller; no write-type right for any other SID |
+
+`require_private_file([policy,] what, path, kind)` applies it: profile strict throws `permission_denied` (control
+`FIO-2`, audited `deny`); every other profile, `none` included, audits `weaken` (a warning in the log) and goes on. A
+missing path is left to the caller's own open. Applied to: the policy file in `load_policy` (trusted; a strict policy
+that fails is a `policy_violation`), `modelfile::load_secret_key` (`forge sign`), `graph::rpc::read_key_file`
+(`FORGE_RPC_KEY`, `forge::remote` keys), `forge rpc-serve --token-file` / `--tls-key` (secret) and `--authorized-keys`
+/ `--tls-client-map` (trusted), `FORGE_MODEL_KEY_FILE` and `forge encrypt --key` (secret). `check()` / `lockdown()`
+add `FIO-2` rows for the audit file's directory (trusted) and the keystore directory and every file in it (secret,
+`os::keystore::directory()`); in strict they are required, so `lockdown` refuses a group-writable audit directory or a
+world-readable keystore.
+
+`os::fs` (FIO-1): `make_temp_file(prefix, suffix, dir)` and `make_temp_dir(prefix, dir)` create exclusively, 0600 /
+0700 (Windows: a protected owner + SYSTEM + Administrators DACL); `ensure_private_dir(path)` creates or tightens a
+directory (an existing one must be ours and no symlink); `write_new_private_file(path, data)` writes a new 0600 file,
+never an existing one, never through a symlink.
+
 ## lockdown and check
 
 `check(policy)` reports, per control, what this process could apply; it changes nothing. `lockdown(policy)` applies
@@ -183,7 +235,8 @@ States: `active`, `available`, `emulated` (FORGE's in-process `enforce()` stands
 | plugins required | emulated: `enforce(plugin_load)` refuses | same | same | same | same | same |
 | BLD-1 hardening | `forge::build_hardening()` when `core/build_info.hpp` exists, else the compiler's macros (`__SSP__`, `_FORTIFY_SOURCE`, `__PIE__`, `__CET__`) | same (MSVC: `/GS`) | same | same | same | same |
 
-Also reported: CAP-1/CAP-2 (in-process, `info`), CRY-1 (OS CSPRNG probe), AUD-1 (OS facility, audit file).
+Also reported: CAP-1/CAP-2 (in-process, `info`), CRY-1 (OS CSPRNG probe), CRY-2 (key memory lock state), FIO-1 (temp
+files, `info`), FIO-2 (audit directory and keystore, see [Private files](#private-files)), AUD-1 (OS facility, audit file).
 
 `forge security check [--policy F] [--json]` prints `check()` for `load_policy()` and exits 1 when `ok` is false (see
 [cli.md](cli.md)). A strict policy with `"emulation": "deny"` fails on every OS today, because file reads, W^X and
@@ -202,6 +255,12 @@ module. With an active policy:
 | native plugins (`forge::plugin`, `import "x.so"`) | `fs_read` and `plugin_load` on the path: `integrity.plugins` `required` refuses (no verifier); otherwise allowed and audited | INT-1, P4 |
 | `inference::model` (`forge run`, `forge bench`, `forge-serve`, `forge::ask`, the C API) | `fs_read` on the path before the file is opened. `integrity.models` `required`: BLAKE3 hashes, then the embedded Ed25519 signature against `trusted_keys` (any valid signature when empty) before the blueprint or a tensor is read; `optional`: signed files verified, unsigned audited (`weaken`). Failure: `integrity_error`, audited `INT-4`. `FORGE_REQUIRE_SIGNED` / `FORGE_TRUSTED_KEYS` keep working and add keys | INT-1, INT-4 |
 | `forge run`, `forge bench` | `set_active_policy(policy)` (no lockdown) so model loads follow it | INT-1 |
+| `forge import`, `forge sign`, `forge encrypt --key` | `set_active_policy(policy)`; importers check `fs_read` on every input and `fs_write` on the output; the secret key file must pass FIO-2 | CAP-1, FIO-2 |
+| `modelfile::reader` (every `.fpk` opened) | `fs_read` on the path | CAP-1 |
+| importers (`import::safetensors`, `gguf_file`, `import_hf`, `import_gguf`, `import_onnx`) | `fs_read` on inputs (`config.json`, each `.safetensors`, the `.gguf` / `.onnx`), `fs_write` on the output | CAP-1 |
+| `.fsc` script cache (`fsc::load` / `fsc::store`) | `fs_read` / `fs_write` on the cache directory; a denial is audited and the source is parsed as on a miss | CAP-1 |
+| KV spill (`mem::spill_store`, `forge-serve --kv-spill`) | `fs_write` on the directory through `os::check_access` (the gate `set_active_policy` installs; core cannot include `forge::security`); a denial throws. Always: a private directory (a fresh random one by default), 0600 files created exclusively | CAP-1, FIO-1 |
+| key and credential files | see [Private files](#private-files) | FIO-2 |
 | `forge rpc-serve` | `net_listen` on `--bind:--port`; `--allow-scripts` needs `exec` (`policy_violation` otherwise); `lockdown` after the listener is bound, before `run()`; children get `--policy <abs>` | SBX-1 |
 | `forge-serve` | policy active before the model loads; `net_listen` on `--host:--port`; `--watch` needs `exec`; `lockdown` after bind + load, before the first `accept` | SBX-1 |
 | `forge-serve proxy` | `net_listen`, `net_connect` for every backend; `lockdown` after the listener starts | SBX-1 |
@@ -223,6 +282,15 @@ attack strings for `check_relative` / `safe_join` / `canonical_within` (POSIX an
 Windows, the audit file), `refuse` (strict with `emulation: deny` is refused before anything is applied) and `models`.
 Run on Linux (WSL2, kernel Landlock ABI 3; also with `FORGE_LANDLOCK=0`) and Windows (MinGW). macOS, FreeBSD and MSVC:
 CI only.
+
+Also in `test_security`: `secure_buffer` (zeroed, wiped before release, observed through the release hook; move and
+move-assignment wipe; lock state and `MADV_DONTDUMP` reported; guard pages; `secure_bytes` / `secure_string`; the keys
+loaded by `modelfile` and rpc), private temp files and directories (exclusive, no symlink), `check_private_file` (POSIX:
+0644 fails, 0600 passes, group-writable trusted fails, symlink fails, other owner only as root; Windows: a DACL with
+Everyone fails), a strict policy refusing a world-readable key (`require_private_file`, `load_secret_key`,
+`read_key_file`) and a group/other-writable strict policy file, and importers, the `.fpk` reader and the KV spill
+store under a strict policy (denied outside the roots, private inside). `test_script_fsc` checks the `.fsc` cache under
+a strict policy.
 
 `tests/test_script_security.cpp` (ctest `test_script_security`): no policy is profile `none` and audits nothing; every
 `tests/script/*.fs` golden gives the same output with no policy and with an active `permissive` policy; a strict
