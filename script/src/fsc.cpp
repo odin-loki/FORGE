@@ -242,15 +242,34 @@ std::optional<std::shared_ptr<const FnDecl>> load(const std::string& dir, const 
     std::string name = key_hex(key) + ".fsc", bytes;
     trust tt = t;
 #if defined(_WIN32)
-    namespace sfs = std::filesystem;
-    std::error_code ec; auto p = os::fs::u8path(dir) / name;
-    auto st = sfs::symlink_status(p, ec);
-    if (ec || !sfs::exists(st)) return fail("no cache file");
-    if (!sfs::is_regular_file(st)) return fail("cache entry is not a regular file");
-    auto sz = sfs::file_size(p, ec); if (ec) return fail("no cache file");
-    if (sz > max_file_bytes) return fail("cache file too large");
-    std::ifstream f(p, std::ios::binary); if (!f) return fail("cache file unreadable");
-    bytes.resize(std::size_t(sz)); f.read(bytes.data(), std::streamsize(sz)); bytes.resize(std::size_t(f.gcount()));
+    // Share read/write/delete so a concurrent store can still rename over the entry while we read the old one;
+    // FILE_FLAG_OPEN_REPARSE_POINT opens a symlink itself (then rejected) instead of following it.
+    auto w = os::widen(path_for(dir, key));
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int i = 0; i < 20 && h == INVALID_HANDLE_VALUE; ++i) {
+        h = CreateFileW(w.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (h != INVALID_HANDLE_VALUE) break;
+        auto e = GetLastError();
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return fail("no cache file");
+        if (e != ERROR_SHARING_VIOLATION && e != ERROR_ACCESS_DENIED) return fail("cache file unreadable");
+        Sleep(1);   // a rename over the entry is in flight (delete pending): try again briefly
+    }
+    if (h == INVALID_HANDLE_VALUE) return fail("cache file busy");
+    BY_HANDLE_FILE_INFORMATION fi{};
+    if (!GetFileInformationByHandle(h, &fi) || (fi.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+        CloseHandle(h); return fail("cache entry is not a regular file");
+    }
+    std::uint64_t sz = (std::uint64_t(fi.nFileSizeHigh) << 32) | fi.nFileSizeLow;
+    if (sz > max_file_bytes) { CloseHandle(h); return fail("cache file too large"); }
+    bytes.resize(std::size_t(sz));
+    std::size_t off = 0;
+    while (off < bytes.size()) {
+        DWORD got = 0;
+        if (!ReadFile(h, bytes.data() + off, DWORD(bytes.size() - off), &got, nullptr) || got == 0) break;
+        off += got;
+    }
+    CloseHandle(h); bytes.resize(off);
     tt.require_signed = true;   // no owner/ACL check on Windows: only signed files load
 #else
     int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

@@ -402,7 +402,7 @@ TEST(concurrent_stores_and_loads) {
         for (int i = 0; writers > 0 || i < 20; ++i) {
             std::string why;
             if (fsc::load(dir, key, tr, &why)) ++hits;
-            else if (why != "no cache file" && why != "no cache directory") { ++bad; std::fprintf(stderr, "  torn/odd read: %s\n", why.c_str()); }
+            else if (why != "no cache file" && why != "no cache directory" && why != "cache file busy") { ++bad; std::fprintf(stderr, "  torn/odd read: %s\n", why.c_str()); }
         }
     });
     for (auto& x : th) x.join();
