@@ -57,6 +57,9 @@ Matrix tile units are separate (`tile.hpp`, namespace `forge::simd::tile`). They
 | `math1(fn, …)`, `math2(fn, …)` | Extended maths by id: `fn1` = exp2, expm1, log2, log10, log1p, sqrt, rsqrt, cbrt, sin, cos, tan, asin, acos, atan, sinh, cosh, erf, erfc, gelu_erf, softplus, lgamma; `fn2` = pow, atan2, hypot |
 | `qdecode`, `qdot` | Decode a quantised row (q8_0, q4_k, q6_k, q5_k; `simd::qfmt`) or dot it against f32 activations without materialising it. Other codecs use the scalar decoder passed in. Results are bit-identical to `dot(x, decode(row))` |
 
+## Integer matvec (`qdot_i8.hpp`)
+The CPU quantised matmul (`graph::qweights::gemm_nt`) quantises each activation row once to int8 (blocks of 256 with int16 sums of 16 and 32 for q4_k/q5_k/q6_k; blocks of 32 for q8_0) and forms exact int32 sums per weight block, the K-quant sub-scales folded in. Only one or two `fma`s per block are floating point, in the same order on every ISA, so the `scalar` reference, `avx2` (maddubs + madd), `avxvnni` and `avx512vnni` (vpdpwssd / vpdpbusd on ymm) tables give identical bits, and a row's result does not depend on how many rows ran with it (1..8 vectors share one pass over the weights). `qi8_active()` picks the table once (`FORGE_QI8_TARGET` overrides; `FORGE_SIMD_TARGET=scalar|avx2` also caps it); `FORGE_CPU_INT8=0` returns to the f32 path. Tests: `qdot_i8_matches_reference_on_every_isa` (memcmp of every table against the reference, batch vs single vector, error vs f32 below 1% of sum |x·w|). `avxvnni` is compiled but not run here (no hardware). `forge bench --kernels <MB>` prints GB/s per format.
+
 ## Example
 `docs/examples/simd_dispatch.cpp` (ctest `doc_example_simd_dispatch`):
 

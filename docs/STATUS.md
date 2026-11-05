@@ -72,6 +72,11 @@ decode, tok/s. llama.cpp is `llama-bench` at bc428e4 on the same GGUF file; FORG
 
 Greedy output is identical with CUDA graphs on and off.
 
+## CPU quantised matmul (2026-11-06, Xeon Gold 6242 x2, WSL2, 32 threads, machine shared with GPU jobs: noisy)
+- `forge bench --kernels 1024` (1 GB matrix, k=4096), int8 avx512vnni vs f32 decode+dot: q4_k 27.1 vs 17.9 GB/s, q5_k 28.9 vs 19.5, q6_k 30.3 vs 21.5, q8_0 24.8 vs 21.2. Two vectors cost the same as one; eight run at 19–25 GB/s of weights (8x the work).
+- q35 (Qwen3.5 9B Q4_K_M) `bench -p 16 -n 8`, same build and load: FORGE_CPU_INT8=0 prefill 4.4 / decode 0.6 tok/s, int8 8.0–8.2 / 1.1–1.4 tok/s. An earlier quiet-machine baseline (old build) was prefill 16.5 / decode 1.8 tok/s at -p 128; the load on the machine made later absolute numbers incomparable. Greedy tokens on the test prompt are identical to the f32 path.
+- Not done: §2 interleaved prefill tiles, multi-product dispatch, per-token serial work on the pool, NEON/SVE integer kernels (aarch64 keeps the f32 path by default).
+
 ## Known gaps
 
 - iOS: CI runs five test executables in the simulator only; never run on a device. The Swift package and XCTest have
