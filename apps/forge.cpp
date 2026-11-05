@@ -533,7 +533,7 @@ int cmd_rpc_serve(const args& a) {
             std::string err = pr.err;
             while (err.rfind("[forge:", 0) == 0) { auto nl = err.find('\n'); err = nl == std::string::npos ? std::string() : err.substr(nl + 1); }
             std::string et = "RuntimeError", em = err.empty() ? pr.err : err;
-            if (auto nl = err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && err.find(' ') > nl) { et = err.substr(0, nl); em = err.substr(nl + 1); }
+            if (auto nl = err.find('\n'); nl != std::string::npos && nl > 0 && nl < 64 && err.find(' ') > nl) { et = err.substr(0, nl); em = err.substr(nl + 1); if (!et.empty() && et.back() == '\r') et.pop_back(); }   // CRLF on Windows
             if (pr.term_signal) { et = "RuntimeError"; em = "script child killed by signal " + std::to_string(pr.term_signal) + (pr.err.empty() ? "" : ": " + pr.err); }
             while (!em.empty() && em.back() == '\n') em.pop_back();
             return graph::rpc::server::script_result{false, et, em, pr.out};
