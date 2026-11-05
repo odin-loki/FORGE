@@ -217,7 +217,7 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
         float* part = y; if (dec) { y = (float*)malloc((size_t)dn * ddv * 4 + 4); threads = dn; }
         unsigned s = ARG(4, unsigned), hq = ARG(5, unsigned), d = ARG(6, unsigned), t = ARG(7, unsigned), hk = ARG(8, unsigned), dv = ARG(9, unsigned), fl = ARG(10, unsigned);
         float sc = ARG(11, float);
-        unsigned causal = fl & 1, kc = (fl >> 1) & 3, vc = (fl >> 3) & 3, window = fl >> 5;
+        unsigned causal = fl & 1, kc = (fl >> 1) & 7, vc = (fl >> 4) & 7, window = fl >> 7;   /* as cuda.hpp packs them */
         unsigned kw = kc ? 1 + (d + 3) / 4 : d, vw = vc ? 1 + (dv + 3) / 4 : dv;
         for (unsigned id = 0; id < s * hq && id < threads; ++id) {
             unsigned qi = id / hq, h = id % hq, kh = h / (hq / hk); int pos = (int)t - (int)s + (int)qi;
