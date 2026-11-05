@@ -86,6 +86,7 @@ Freed device buffers are kept in a per-runtime pool for reuse, up to `FORGE_GPU_
 | `supports(op, shapes, attrs)` (free function), `run_op(op, in, attrs, out)` | One spec op; `false` = no kernel for this shape |
 | `run_qmatmul`, `run_qgather`, `run_state` | Quantised matmul_t, quantised gather, DeltaNet state ops |
 | `begin_run` … `end_run`, `pin`, `to_host`, `host_wrote`, `release` | Residency protocol |
+| `argmax_resident(p, n)` | Greedy decode: `forge_argmax` over a device-newer buffer, one `int` read back (ties: lowest index); `-1` when not resident. Wired as the `device_hooks::argmax` hook: with a plain greedy sampler, `session::generate` asks the executor for the logits' argmax instead of downloading them |
 | `capture_begin`, `capture_end`, `graph_launch` | User stream capture |
 | `copy_to_peer`, `device_alloc`, `device_free`, `upload`, `download` | Raw device memory and peer copies (host-staged when the APIs differ) |
 | `residency()`, `dispatches()`, `memory_pool()`, `charged_bytes()` | Statistics: uploads, downloads, resident and pooled bytes, evictions, per-kernel dispatch counts |

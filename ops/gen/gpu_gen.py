@@ -1004,6 +1004,18 @@ FORGE_GLOBAL void forge_copy_words(const unsigned* src, unsigned* dst, unsigned 
 FORGE_GLOBAL void forge_copy2d(const float* src, float* dst, unsigned rows, unsigned w, unsigned ds) {
   unsigned i = bid_() * 256u + tid_(); if (i >= rows * w) return;
   unsigned r = i / w, c = i - r * w; dst[(unsigned long long)r * ds + c] = src[i]; }
+// Greedy decode: out[0] = index of the largest x (ties and NaN: the lowest index, like std::max_element over x < y).
+// One 256-thread block; each thread scans a strided slice, then a shared-memory tree keeps (value, index).
+FORGE_GLOBAL void forge_argmax(const float* x, unsigned n, int* out) {
+  __attribute__((shared)) float bv[256]; __attribute__((shared)) unsigned bi[256];
+  unsigned t = tid_(); float v = -__builtin_inff(); unsigned ix = 0xFFFFFFFFu;
+  for (unsigned i = t; i < n; i += 256u) { float a = x[i]; if (ix == 0xFFFFFFFFu || a > v) { v = a; ix = i; } }
+  bv[t] = v; bi[t] = ix; bar_();
+  for (unsigned s = 128u; s > 0u; s >>= 1) {
+    if (t < s) { float a = bv[t + s]; unsigned j = bi[t + s];
+      if (j != 0xFFFFFFFFu && (bi[t] == 0xFFFFFFFFu || a > bv[t] || (a == bv[t] && j < bi[t]))) { bv[t] = a; bi[t] = j; } }
+    bar_(); }
+  if (t == 0u) out[0] = (int)bi[0]; }
 // RMS norm, one 256-thread block per row (the per-row-thread version in cuda() is serial over cols).
 FORGE_GLOBAL void forge_rms_norm_b(const float* x, const float* w, float* y, unsigned rows, unsigned cols, float eps) {
   __attribute__((shared)) float red[256];

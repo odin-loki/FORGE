@@ -174,7 +174,7 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
-            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (att_) f_.free_(att_); } catch (...) {}
+            for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
@@ -296,6 +296,24 @@ public:
             if (hi > lo) { ck(dtoh_s(reinterpret_cast<void*>(lo), e.d + (lo - el), hi - lo, stream_), "memcpy DtoH"); ++stats_.downloads; any = true; }
         });
         if (any) sync();
+    }
+    // Greedy decode: the argmax of a buffer whose newest copy is on the device, read back as one int (instead of the
+    // whole buffer). -1 when it is not wholly inside one device-newer entry, or the image has no forge_argmax.
+    long long argmax_resident(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_); bind();
+        if (!n || n > 0xFFFFFFFFull || !has_fn_locked("forge_argmax")) return -1;
+        const auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + n * 4;
+        std::uint64_t dp = 0;
+        each_overlap(p, n, [&](entry& e) {
+            auto el = reinterpret_cast<std::uintptr_t>(e.host);
+            if (!e.host_valid && el <= lo && el + e.count * 4 >= hi) dp = e.d + (lo - el); });
+        if (!dp) return -1;
+        if (!am_) am_ = dmalloc(256, "scratch");
+        std::uint32_t n32 = std::uint32_t(n); void* args[] = {&dp, &n32, &am_};
+        ck(launch_s(function("forge_argmax"), 1, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        ++dispatches_["argmax"];
+        int r = -1; ck(dtoh_s(&r, am_, 4, stream_), "memcpy DtoH"); sync();
+        return r;
     }
     void host_wrote(const float* p, std::size_t n) {
         std::lock_guard lk(mu_); bind();
@@ -459,6 +477,7 @@ public:
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
         static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }(); return v; }
     static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
+    std::uint64_t am_ = 0;   // forge_argmax result (one int)
     std::uint64_t sk_ = 0; std::size_t sk_cap_ = 0;   // split-K partial products (stream-ordered reuse)
     void sk_reserve(std::size_t need) {
         if (sk_cap_ >= need) return;

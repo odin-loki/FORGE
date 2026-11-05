@@ -57,9 +57,13 @@ public:
     double mirostat_mu() const { return mu_; }
     double uniform() { return std::uniform_real_distribution<double>(0, 1)(rng_); }
 
+    // Plain greedy: the next token is the argmax of the raw logits (no penalties or filter), so a device can pick it.
+    bool plain_greedy() const {
+        return c_.temperature <= 0.f && c_.repetition_penalty == 1.f && c_.presence_penalty == 0.f && c_.frequency_penalty == 0.f && !filter;
+    }
     int sample(std::span<const float> logits_in, std::span<const int> history = {}) {
         // plain greedy: argmax over the logits as they are (no copy of a vocabulary-sized vector)
-        if (c_.temperature <= 0.f && c_.repetition_penalty == 1.f && c_.presence_penalty == 0.f && c_.frequency_penalty == 0.f && !filter && !logits_in.empty())
+        if (plain_greedy() && !logits_in.empty())
             return int(std::max_element(logits_in.begin(), logits_in.end()) - logits_in.begin());
         auto l = prepare(logits_in, history);
         if (c_.temperature <= 0.f) return int(std::max_element(l.begin(), l.end()) - l.begin());

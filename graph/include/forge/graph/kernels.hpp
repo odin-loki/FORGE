@@ -56,6 +56,9 @@ struct device_hooks {
     // fixed-size state op (state_ops.hpp: delta_rule, causal_conv) run on the device with the slot `S` kept resident;
     // false when the backend has no kernel for it (the executor then runs the host version).
     std::function<bool(const std::string& fn, std::span<const tensor_view> in, float* S, std::size_t sn, tensor_view out, const ops::attrs& a)> state;
+    // optional: index of the largest element of a device-resident buffer (ties: the lowest index), read back as one
+    // integer instead of the whole buffer; -1 when the buffer is not resident or the backend cannot (greedy decode)
+    std::function<long long(const float*, std::size_t)> argmax;
 };
 
 inline kernel_fn reference_kernel(ops::op o) {

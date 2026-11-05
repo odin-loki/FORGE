@@ -149,7 +149,7 @@ static int mock_qmma(const signed char* xq, const float* xds, const unsigned cha
     for (i = 0; i < rows * k; ++i) a[i] = xds[2u * (i / 32u)] * (float)xq[i];
     mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
-    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 10; if (!strcmp(op, "sum_splits")) return 4;
+    if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 10; if (!strcmp(op, "sum_splits")) return 4; if (!strcmp(op, "argmax")) return 3;
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
@@ -257,6 +257,10 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
           /* split-K: the whole product goes to slice 0 and the other slices are zero, so forge_sum_splits gives it back */
           for (j = 1; j < s; ++j) memset(y + (size_t)j * rows * cols, 0, sizeof(float) * rows * cols);
           return mock_qmma((const signed char*)(uintptr_t)ARG(0, dptr), P(ARG(1, dptr)), (const unsigned char*)(uintptr_t)ARG(2, dptr), y, rows, cols, k, fmt, rb); } }
+    if (!strcmp(op, "argmax")) { const float* x = P(ARG(0, dptr)); unsigned n = ARG(1, unsigned), i, b = 0; int* o = (int*)(uintptr_t)ARG(2, dptr);
+        if (bx != 256) return 1;
+        for (i = 1; i < n; ++i) if (x[i] > x[b]) b = i;
+        o[0] = (int)b; return 0; }
     if (!strcmp(op, "sum_splits")) { const float* p = P(ARG(0, dptr)); float* y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned), s = ARG(3, unsigned), i, j;
         if (gx * bx < n) return 1;
         for (i = 0; i < n; ++i) { float a = p[i]; for (j = 1; j < s; ++j) a += p[(size_t)j * n + i]; y[i] = a; } return 0; }
