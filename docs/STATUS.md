@@ -81,11 +81,11 @@ Greedy output is identical with CUDA graphs on and off.
 - HIP, OpenCL and Level Zero have never run on real hardware. Vulkan has never run on a real GPU.
 - CUDA: one GPU model (RTX 3090). No multi-GPU or peer-copy test on hardware.
 - Vulkan is built and tested in CI only on lavapipe (`linux-vulkan`); every other job compiles it out.
-- `test_rpc_tls` skips on Windows CI: its `openssl` CLI probe redirects to `/dev/null`, which `cmd` does not have.
+- `test_rpc_tls` on Windows CI: the `openssl` CLI probe no longer uses a shell redirect, but it has not yet run there.
 - AMX/SME: AMX ran natively and under Intel SDE; SME only under qemu.
 - GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open;
   graphs recorded before an eviction must not be replayed after it.
-- RPC: tokens have full access; client-certificate identities are not mapped to permissions.
+- RPC: permissions are coarse (`device`, `scripts`); client-certificate rules match only the fingerprint or subject CN.
 - Not tested anywhere: hybrid P/E cores, multi-node NUMA, batteries and thermal sensors, running under
   systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox decode, CUDA graphics interop.
 - Security gaps: [security.md](security.md#known-gaps).

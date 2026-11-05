@@ -91,18 +91,18 @@ flags and child limits still apply.
 |---|---|
 | Auth | Tokens (`--token`, `--token-file`) and Ed25519 keys (`--authorized-keys`, `--pubkey`). Tokens are compared in constant time; nonces come from the OS CSPRNG. |
 | TLS | OpenSSL, when built with it (`--tls-cert`, `--tls-key`). |
-| mTLS | `--tls-client-ca`: every client must present a certificate that chains to the CA. Needs `--tls-cert/--tls-key`. |
+| mTLS | `--tls-client-ca`: every client must present a certificate that chains to the CA. Needs `--tls-cert/--tls-key`. `--tls-client-map` accepts only listed certificates (`sha256:` fingerprint or `cn:`), each with `allow=` permissions; unlisted certificates are refused. With tokens or keys configured a request needs both, and gets the intersection of their permissions; with only a map, a mapped certificate authenticates device ops by itself (never scripts). |
 | Channel binding | Over TLS only the bound methods are accepted. The binding is RFC 9266 tls-exporter on TLS 1.3 and on TLS 1.2 with extended master secret, else RFC 5929 tls-unique. A relayed or replayed auth exchange fails; a bound token never crosses the wire. |
-| Per-key permissions | authorized_keys lines may start with `allow=device`, `allow=scripts` or `allow=all`. Checked per request. Unknown options are errors. A line without options has full access. |
-| Remote scripts | `rpc-serve --allow-scripts`. The server refuses to start with it and no auth. Each script runs in its own child (`forge script --rpc-child`) with a timeout (`--script-timeout`, default 60000 ms), a memory cap (`--script-mem-mb`, default 2048) and optional `--script-no-proc/-fs/-net`. On POSIX the child requires the OS sandbox; on Windows it is best-effort. RPC secrets are removed from the child's environment. |
+| Per-key and per-token permissions | authorized_keys and `--token-file` lines may start with `allow=device`, `allow=scripts` or `allow=all`. Checked per request. Unknown options are errors (with file and line; the server does not start). A line without options, or a bare `--token`, has full access. The server logs each connection's principal (token number and name, key prefix, certificate) and every denial. |
+| Remote scripts | `rpc-serve --allow-scripts`. The server refuses to start with it and no tokens or keys. Each script runs in its own child (`forge script --rpc-child`) with a timeout (`--script-timeout`, default 60000 ms), a memory cap (`--script-mem-mb`, default 2048) and optional `--script-no-proc/-fs/-net`. On POSIX the child requires the OS sandbox; on Windows it is best-effort. RPC secrets are removed from the child's environment. |
 | No auth | Allowed for non-script RPC. On a non-loopback bind the server prints a warning. |
 
 `forge::remote_call` ships a function and its captured values as an ordinary remote script, so the same auth,
 child process, sandbox and limits apply. It refuses anything but plain data (nil, bool, numbers, strings,
 lists, maps, script functions) with a `TypeError` (`script/src/remote.cpp`).
 
-Tests: `test_rpc` (auth, `allow=`), `test_rpc_tls` (server verify, mTLS, channel binding). `test_rpc_tls` runs
-on Linux, macOS and FreeBSD CI; it skips on Windows CI because its `openssl` CLI probe uses a POSIX redirect.
+Tests: `test_rpc` (auth, `allow=` for keys and tokens, config errors), `test_rpc_tls` (server verify, mTLS, client-certificate
+map, channel binding). `test_rpc_tls` runs the `openssl` CLI without a shell, so it no longer depends on a POSIX redirect.
 
 ## Model files and signing
 
@@ -170,7 +170,8 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 
 ## Known gaps
 
-- RPC: tokens always have full access. Client-certificate identities are not mapped to permissions.
+- RPC: permissions are coarse (`device`, `scripts`); client-certificate rules match only the fingerprint or subject CN
+  (no SANs, no revocation list).
 - Windows: no in-process network or file-write denial; scripts there get only the job object plus the
   interpreter checks (script `ProcessPool` workers do get an AppContainer).
 - `run_sandboxed` does not apply `deny_exec` to the target on macOS, or on Linux without Landlock. With Landlock
