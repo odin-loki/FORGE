@@ -47,6 +47,7 @@ CUDA embeds two PTX images built from the same `kernels.cu`: `ptx sm_80` (`kerne
 
 | Work | Kernel | When | Disable |
 |------|--------|------|---------|
+| Attention, prefill (tensor cores) | `forge_attention_fa2tc_d64` / `_d128` / `_d256` (`sm_80` image): FlashAttention-2 on fp16 `mma.sync` m16n8k16 with f32 accumulation; Q, K, V (and P) rounded to fp16 in shared memory (the KV cache stays f32), online softmax in f32 (exp2). 64 query rows per 128-thread block (16 per warp), 64/32/32-key tiles, Q fragments in registers, `ldmatrix` (`.trans` for V); causal, sliding window and GQA as below. Agrees with the f32 kernel to ~1e-3 | same as the tiled row below | `FORGE_FA_TC=0` (uses the f32 tiled kernel) |
 | Attention, prefill (tiled) | `forge_attention_fa2_d128` / `_d256` (`sm_80` image): fp32 flash attention, 64 (head dim ≤ 128) or 32 (≤ 256) query rows per block, K/V tiles in shared memory | rows ≥ 16, plain f32 KV, head dims multiples of 4 and ≤ 256, split-K decode path not taken | `FORGE_GPU_NO_FA` (any value) |
 | Attention, prefill | `forge_attention_fa`: a block per (query row, head), tiled online softmax | otherwise | `FORGE_GPU_NO_FA` (any value) falls back to `forge_attention` |
 | Attention, decode | `forge_attention_dec` + `forge_attention_comb`: split-K over 16 key chunks, then a combine pass | rows × heads ≤ 256, f32 KV, head dims multiples of 32 and ≤ 256 | `FORGE_ATTN_DEC=0` |
@@ -133,7 +134,8 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | Variable | Default | Backend | Effect |
 |----------|---------|---------|--------|
 | `FORGE_CUDA_IMAGE` | unset | CUDA | `ptx` (sm_70) or `ptx sm_80`: load only that PTX image |
-| `FORGE_GPU_NO_FA` | unset | CUDA/HIP | Set: no flash-attention kernels (`forge_attention_fa`, `forge_attention_fa2_*`) |
+| `FORGE_GPU_NO_FA` | unset | CUDA/HIP | Set: no flash-attention kernels (`forge_attention_fa`, `forge_attention_fa2_*`, `forge_attention_fa2tc_*`) |
+| `FORGE_FA_TC` | on | CUDA | `0`: tiled prefill attention uses the f32 SIMT kernel (`forge_attention_fa2_*`) instead of the fp16 tensor-core one |
 | `FORGE_ATTN_DEC` | on | CUDA/HIP | `0`: no split-K decode attention |
 | `FORGE_MMVQ` | on | CUDA/HIP | `0`: no q8_1/dp4a decode matmul |
 | `FORGE_MMQ_MIN_ROWS` | 16 | CUDA/HIP | Rows at which the tiled MMA / MMQ kernels are used; `0` disables them |

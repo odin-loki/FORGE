@@ -446,6 +446,7 @@ public:
     static bool use_mma() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA"); return !(e && std::string(e) == "0"); }(); return on; }
     static bool use_mmvq() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ"); return !(e && std::string(e) == "0"); }(); return on; }
     // Split-K decode attention ($FORGE_ATTN_DEC=0 off) and its partials scratch.
+    static bool fa_tc() { static const bool on = [] { auto* e = std::getenv("FORGE_FA_TC"); return !(e && std::string(e) == "0"); }(); return on; }
     static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on; }
     std::uint64_t att_ = 0; std::size_t att_cap_ = 0;
     std::set<void*> mma_attr_;   // kernels (qmatmul_mma_*, attention_fa2_*) whose dynamic shared memory limit was raised
@@ -749,11 +750,17 @@ public:
             // prefill: tiled attention (forge_attention_fa2_*, sm_80 image); K/V tiles shared by 64 (32) query rows
             if (s == sig::attention && !dec && rows >= 16 && (u7 & 0x7Eu) == 0 && k % 4 == 0 && u6 % 4 == 0 && k <= 256 && u6 <= 256 &&
                 ptrs.size() == 4 && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked(k <= 128 && u6 <= 128 ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256")) {
-                const bool small = k <= 128 && u6 <= 128; const unsigned bq = small ? 64 : 32;
-                fn = function(small ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256");
-                smem = small ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4;
+                const bool small = k <= 128 && u6 <= 128; unsigned bq = small ? 64 : 32;
+                // fp16 tensor-core variant (forge_attention_fa2tc_*): 64 query rows per 128-thread block, K/V tiles in fp16
+                const unsigned tcd = k <= 64 && u6 <= 64 ? 64 : small ? 128 : 256;
+                const std::string tcn = "forge_attention_fa2tc_d" + std::to_string(tcd);
+                if (fa_tc() && has_fn_locked(tcn)) {
+                    fn = function(tcn); bq = 64; block = 128; smem = 2 * (tcd == 64 ? 64 : 32) * (tcd + 8) * 2; ++dispatches_["attention_fa2tc"];
+                } else {
+                    fn = function(small ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256"); block = 256;
+                    smem = small ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4; }
                 if (!mma_attr_.count(fn) && f_.func_attr) { ck(f_.func_attr(fn, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(fn); }
-                block = 256; grid = ((rows + bq - 1) / bq) * cols; ++dispatches_["attention_fa2"]; }
+                grid = ((rows + bq - 1) / bq) * cols; ++dispatches_["attention_fa2"]; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
             std::uint32_t fnb = 0; std::uint64_t qx = 0;
             if (in_run_ && fuse_q81() && use_mmvq() && rows < mmq_min_rows()) {

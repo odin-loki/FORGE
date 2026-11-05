@@ -853,6 +853,120 @@ FORGE_GLOBAL void forge_attention_fa2_d128(const float* q, const float* k, const
 FORGE_GLOBAL void forge_attention_fa2_d256(const float* q, const float* k, const float* v, float* y, unsigned s, unsigned hq, unsigned d,
                                            unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
   fa2_body(q, k, v, y, s, hq, d, t, hk, dv, flags, scale, 32u, 16u, 256u); }
+// Prefill attention on fp16 tensor cores (FlashAttention-2 style; sm_80 image): same contract as fa2_body. Q, K and V
+// are rounded to fp16 when staged in shared memory (the KV cache stays f32); Q.K^T and P.V run on
+// mma.sync m16n8k16 (f16 x f16 -> f32) and the online softmax is kept in f32 (log2 domain, exp2).
+// A 128-thread block takes 64 query rows of one head; warp w owns rows 16w..16w+15 for the whole head dim, so the
+// row max/sum reduce over the 4 lanes of a quad. Q's A fragments live in registers (ldmatrix from a staging copy in
+// the K/V tile space); K tiles feed the B fragments with ldmatrix, V tiles with ldmatrix.trans; P goes from the score
+// accumulators straight into A fragments (the C layout of two n8 tiles is the A layout of one k16 step).
+// Shared (halves): K BK x (D + 8) | V BK x (D + 8); the 8-half pad keeps ldmatrix rows on distinct banks.
+// Head dims past d (dv) are zero-filled, so any d, dv % 4 == 0 up to D works; k-steps past d (n-tiles past dv) are skipped.
+FORGE_DEV unsigned h2pack(float lo, float hi) { unsigned r; asm("cvt.rn.f16x2.f32 %0, %1, %2;" : "=r"(r) : "f"(hi), "f"(lo)); return r; }
+FORGE_DEV void ldsm4(unsigned* r, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p))); }
+FORGE_DEV void ldsm4t(unsigned* r, const void* p) {
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_addr(p))); }
+FORGE_DEV void mma_h(float* c, const unsigned* a, unsigned b0, unsigned b1) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1)); }
+FORGE_DEV void st_h4(unsigned short* p, f32x4 x) { unsigned lo = h2pack(x.x, x.y), hi = h2pack(x.z, x.w); asm volatile("st.shared.v2.u32 [%0], {%1, %2};" :: "r"(smem_addr(p)), "r"(lo), "r"(hi) : "memory"); }
+FORGE_DEV float qmax4_(float v) { for (unsigned o = 1u; o < 4u; o <<= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v = __builtin_fmaxf(v, w); } return v; }
+FORGE_DEV float qsum4_(float v) { for (unsigned o = 1u; o < 4u; o <<= 1) { float w; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(w) : "f"(v), "r"(o)); v += w; } return v; }
+template<unsigned D, unsigned BK> static __attribute__((device, always_inline)) inline void fa2tc_body(const float* q, const float* k, const float* v, float* y,
+    unsigned s, unsigned hq, unsigned d, unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
+  constexpr unsigned BQ = 64u, SD = D + 8u, NT = BK / 8u, DT = D / 8u, KS = D / 16u;
+  static_assert(2u * BK >= BQ, "Q is staged in the K and V tiles");
+  unsigned short* Ks = (unsigned short*)forge_dsm; unsigned short* Vs = Ks + BK * SD;
+  unsigned tid = tid_(), w = tid >> 5, l = tid & 31u, g = l >> 2, c = l & 3u;
+  unsigned bi = bid_(), h = bi % hq, q0 = (bi / hq) * BQ, kh = h / (hq / hk);
+  unsigned causal = flags & 1u, window = flags >> 7;
+#pragma unroll 4
+  for (unsigned j = 0; j < BQ * D / 512u; ++j) {   // Q tile (rows past s, columns past d are zero)
+    unsigned i = tid + 128u * j, r = i / (D / 4u), e = (i % (D / 4u)) * 4u; f32x4 x = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (q0 + r < s && e < d) x = *(const f32x4*)(q + ((unsigned long long)(q0 + r) * hq + h) * d + e);
+    st_h4(Ks + r * SD + e, x); }
+  bar_();
+  unsigned qf[KS][4];
+#pragma unroll
+  for (unsigned kk = 0; kk < KS; ++kk) ldsm4(qf[kk], Ks + (16u * w + (l & 7u) + ((l >> 3) & 1u) * 8u) * SD + kk * 16u + (l >> 4) * 8u);
+  float o[DT][4], m0 = -__builtin_inff(), m1 = -__builtin_inff(), l0 = 0.0f, l1 = 0.0f;
+#pragma unroll
+  for (unsigned n = 0; n < DT; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+  const int wpos = (int)t - (int)s + (int)(q0 + 16u * w), p0 = wpos + (int)g, p1 = p0 + 8;
+  const float sl2 = scale * 1.4426950408889634f;
+  int last = (int)t - (int)s + (int)(q0 + BQ - 1u), first = (int)t - (int)s + (int)q0;
+  unsigned jhi = t; if (causal) jhi = last + 1 < 0 ? 0u : ((unsigned)(last + 1) < t ? (unsigned)(last + 1) : t);
+  unsigned jlo = 0u; if (window && first - (int)window + 1 > 0) jlo = (unsigned)(first - (int)window + 1);
+  jlo = jlo / BK * BK;
+  for (unsigned j0 = jlo; j0 < jhi; j0 += BK) {
+    bar_();   // the previous tile's (or Q's) shared reads are done
+#pragma unroll 4
+    for (unsigned j = 0; j < BK * D / 512u; ++j) {
+      unsigned i = tid + 128u * j, r = i / (D / 4u), e = (i % (D / 4u)) * 4u; f32x4 x = {0.0f, 0.0f, 0.0f, 0.0f}, z = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (j0 + r < t && e < d) x = *(const f32x4*)(k + ((unsigned long long)(j0 + r) * hk + kh) * d + e);
+      if (j0 + r < t && e < dv) z = *(const f32x4*)(v + ((unsigned long long)(j0 + r) * hk + kh) * dv + e);
+      st_h4(Ks + r * SD + e, x); st_h4(Vs + r * SD + e, z); }
+    bar_();
+    // the whole tile is masked for all 16 of this warp's rows (past the causal diagonal, or before the window): skip
+    if ((causal && (int)j0 > wpos + 15) || (window && wpos - (int)(j0 + BK - 1u) >= (int)window)) continue;
+    float sc[NT][4];
+#pragma unroll
+    for (unsigned n = 0; n < NT; ++n) sc[n][0] = sc[n][1] = sc[n][2] = sc[n][3] = 0.0f;
+#pragma unroll
+    for (unsigned kk = 0; kk < KS; ++kk) {
+      if (kk * 16u >= d) break;
+#pragma unroll
+      for (unsigned np = 0; np < NT / 2u; ++np) {
+        unsigned b[4]; ldsm4(b, Ks + (np * 16u + (l & 7u) + (l >> 4) * 8u) * SD + kk * 16u + ((l >> 3) & 1u) * 8u);
+        mma_h(sc[2u * np], qf[kk], b[0], b[1]); mma_h(sc[2u * np + 1u], qf[kk], b[2], b[3]); } }
+    float x0 = -__builtin_inff(), x1 = -__builtin_inff();
+    const bool edge = j0 + BK > t || (causal && (int)(j0 + BK) - 1 > p0) || (window && p1 - (int)j0 >= (int)window);
+#pragma unroll
+    for (unsigned n = 0; n < NT; ++n)
+#pragma unroll
+      for (unsigned e = 0; e < 4u; ++e) {
+        int key = (int)(j0 + 8u * n + 2u * c + (e & 1u)), pos = e < 2u ? p0 : p1;
+        bool ok = !edge || (key < (int)t && (!causal || key <= pos) && (!window || pos - key < (int)window));
+        float z = ok ? sc[n][e] * sl2 : -__builtin_inff(); sc[n][e] = z;
+        if (e < 2u) x0 = __builtin_fmaxf(x0, z); else x1 = __builtin_fmaxf(x1, z); }
+    x0 = qmax4_(x0); x1 = qmax4_(x1);
+    float n0 = __builtin_fmaxf(m0, x0), n1 = __builtin_fmaxf(m1, x1);
+    float b0 = n0 == -__builtin_inff() ? 0.0f : n0, b1 = n1 == -__builtin_inff() ? 0.0f : n1;
+    float a0 = fexp2(m0 - b0), a1 = fexp2(m1 - b1);   // m = -inf: 0
+    m0 = n0; m1 = n1; l0 *= a0; l1 *= a1;
+#pragma unroll
+    for (unsigned n = 0; n < NT; ++n) {
+      sc[n][0] = fexp2(sc[n][0] - b0); sc[n][1] = fexp2(sc[n][1] - b0); sc[n][2] = fexp2(sc[n][2] - b1); sc[n][3] = fexp2(sc[n][3] - b1);
+      l0 += sc[n][0] + sc[n][1]; l1 += sc[n][2] + sc[n][3]; }
+#pragma unroll
+    for (unsigned n = 0; n < DT; ++n) { o[n][0] *= a0; o[n][1] *= a0; o[n][2] *= a1; o[n][3] *= a1; }
+#pragma unroll
+    for (unsigned kk = 0; kk < BK / 16u; ++kk) {
+      unsigned pa[4] = {h2pack(sc[2u * kk][0], sc[2u * kk][1]), h2pack(sc[2u * kk][2], sc[2u * kk][3]),
+                        h2pack(sc[2u * kk + 1u][0], sc[2u * kk + 1u][1]), h2pack(sc[2u * kk + 1u][2], sc[2u * kk + 1u][3])};
+#pragma unroll
+      for (unsigned np = 0; np < D / 16u; ++np) {
+        if (np * 16u >= dv) break;
+        unsigned b[4]; ldsm4t(b, Vs + (kk * 16u + (l & 7u) + ((l >> 3) & 1u) * 8u) * SD + np * 16u + (l >> 4) * 8u);
+        mma_h(o[2u * np], pa, b[0], b[1]); mma_h(o[2u * np + 1u], pa, b[2], b[3]); } } }
+  l0 = qsum4_(l0); l1 = qsum4_(l1);
+  float i0 = l0 > 0.0f ? 1.0f / l0 : 0.0f, i1 = l1 > 0.0f ? 1.0f / l1 : 0.0f;
+  unsigned r0 = q0 + 16u * w + g, r1 = r0 + 8u;
+  float* y0 = y + ((unsigned long long)r0 * hq + h) * dv; float* y1 = y + ((unsigned long long)r1 * hq + h) * dv;
+#pragma unroll
+  for (unsigned n = 0; n < DT; ++n) {
+    unsigned e = 8u * n + 2u * c; if (e >= dv) break;
+    if (r0 < s) { y0[e] = o[n][0] * i0; y0[e + 1u] = o[n][1] * i0; }
+    if (r1 < s) { y1[e] = o[n][2] * i1; y1[e + 1u] = o[n][3] * i1; } } }
+// Shared: 2 x BK x (D + 8) halves: d64 (BK 64) 18 KB, d128 (BK 32) 17 KB, d256 (BK 32) 33 KB; two or more blocks per SM.
+#define FORGE_FA2TC(name, D, BK, NB) FORGE_GLOBAL __attribute__((launch_bounds(128, NB))) void name(const float* q, const float* k, const float* v, float* y, \
+    unsigned s, unsigned hq, unsigned d, unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) { \
+  fa2tc_body<D, BK>(q, k, v, y, s, hq, d, t, hk, dv, flags, scale); }
+FORGE_FA2TC(forge_attention_fa2tc_d64, 64u, 64u, 3)
+FORGE_FA2TC(forge_attention_fa2tc_d128, 128u, 32u, 2)
+FORGE_FA2TC(forge_attention_fa2tc_d256, 256u, 32u, 2)
+#undef FORGE_FA2TC
 #endif
 #endif
 // Embedding lookup from encoded rows: one 256-thread block per index; out-of-range indices give zeros.

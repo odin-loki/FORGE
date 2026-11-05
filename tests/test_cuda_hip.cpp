@@ -147,23 +147,31 @@ static int state_ops_check_one(graph::registry& reg, const std::string& api, con
 // multiple of 32 up to 256, rows x heads <= 256) and prefill shapes for the tiled kernel; GQA, causal and not.
 template<class RT> static int attention_dec_check(RT& rt, const std::string& api) {
     int fails = 0, n = 0;
-    struct cfg { i64 s, t, hq, hk, d; bool causal; };
+    struct cfg { i64 s, t, hq, hk, d; bool causal; i64 window = 0; };
     for (auto c : {cfg{1, 1, 4, 2, 32, true}, cfg{1, 37, 4, 2, 32, true}, cfg{6, 6, 4, 2, 32, true}, cfg{5, 12, 8, 2, 64, true},
                    cfg{1, 300, 16, 4, 128, true}, cfg{3, 9, 4, 4, 32, false}, cfg{16, 16, 8, 8, 32, true},
                    // prefill shapes (rows x heads > 256: the tiled forge_attention_fa2_* kernels on the sm_80 image)
-                   cfg{100, 100, 8, 2, 128, true}, cfg{70, 90, 4, 4, 256, true}, cfg{40, 40, 8, 4, 64, false}, cfg{130, 130, 4, 1, 96, true}}) {
+                   cfg{100, 100, 8, 2, 128, true}, cfg{70, 90, 4, 4, 256, true}, cfg{40, 40, 8, 4, 64, false}, cfg{130, 130, 4, 1, 96, true},
+                   cfg{50, 120, 8, 2, 128, true}, cfg{150, 150, 4, 2, 128, true, 40}, cfg{90, 90, 4, 2, 256, true, 33}}) {
         auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.613f + ph); return v; };
         tensor q({c.s, c.hq, c.d}), k({c.t, c.hk, c.d}), v({c.t, c.hk, c.d}), y({c.s, c.hq, c.d});
         q.data = rnd(q.data.size(), 1); k.data = rnd(k.data.size(), 2); v.data = rnd(v.data.size(), 3);
-        ops::attrs a{{"causal", c.causal ? 1.0 : 0.0}};
+        ops::attrs a{{"causal", c.causal ? 1.0 : 0.0}, {"window", double(c.window)}};
         ++n;
+        auto tc_runs = [&]() -> std::size_t { auto dd = rt.dispatches(); auto it = dd.find("attention_fa2tc"); return it == dd.end() ? 0 : it->second; };
+        const std::size_t tc0 = tc_runs();
         if (!rt.run_op("attention", {{q.data.data(), q.shape}, {k.data.data(), k.shape}, {v.data.data(), v.shape}}, a, {y.data.data(), y.shape})) {
             std::printf("FAIL %s.attention s %lld t %lld d %lld: run_op refused the shape\n", api.c_str(), (long long)c.s, (long long)c.t, (long long)c.d); ++fails; continue;
         }
         auto want = ops::ref::attention({q, k, v}, a);
         double worst = 0; for (std::size_t i = 0; i < y.data.size(); ++i) worst = std::max(worst, std::fabs(double(y.data[i]) - want.data[i]));
-        if (!(worst < 1e-4)) { std::printf("FAIL %s.attention s %lld t %lld hq %lld hk %lld d %lld: worst abs error %.3g\n", api.c_str(),
+        // fp16 tensor-core kernel (forge_attention_fa2tc_*): Q, K, V and P are rounded to fp16 (relative 2^-11) before
+        // the f32-accumulated products; outputs here carry ~4e-4 absolute error (bound 2e-3).
+        const bool tc = tc_runs() > tc0; const double tol = tc ? 2e-3 : 1e-4;
+        if (!(worst < tol)) { std::printf("FAIL %s.attention s %lld t %lld hq %lld hk %lld d %lld: worst abs error %.3g\n", api.c_str(),
                                                 (long long)c.s, (long long)c.t, (long long)c.hq, (long long)c.hk, (long long)c.d, worst); ++fails; }
+        else if (tc) std::printf("ok   %s.attention s %lld t %lld d %lld on fp16 tensor cores: worst abs error %.3g\n", api.c_str(),
+                                 (long long)c.s, (long long)c.t, (long long)c.d, worst);
     }
     std::printf("%s %d/%d %s attention shapes match the reference\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails;
