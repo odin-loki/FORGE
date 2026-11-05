@@ -406,7 +406,7 @@ target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust)
 # forge::security: FORGE Security Standard policy, enforce, audit, lockdown, check (docs/security-api.md). Header-only.
 add_library(forge_security INTERFACE)
 target_include_directories(forge_security INTERFACE security/include support/include)
-target_link_libraries(forge_security INTERFACE forge_core)
+target_link_libraries(forge_security INTERFACE forge_core forge_trust)   # forge_trust: Ed25519 for detached signatures
 
 add_library(forge_inference INTERFACE)
 target_include_directories(forge_inference INTERFACE inference/include)
@@ -659,7 +659,7 @@ if(FORGE_BUILD_TESTS)
     if(n STREQUAL "test_rpc" AND TARGET forge_rpc_tls)
       target_link_libraries(${n} PRIVATE forge_rpc_tls)
     endif()
-    if(n MATCHES "^test_script")
+    if(n MATCHES "^test_script" OR n STREQUAL "test_signing_detached")   # test_signing_detached: scripts + the example plugin
       target_link_libraries(${n} PRIVATE forge_script)
       if(TARGET forge_script_example_plugin)
         add_dependencies(${n} forge_script_example_plugin)
@@ -689,6 +689,9 @@ if(FORGE_BUILD_TESTS)
   if(TARGET test_security)   # forge::security (re-runs itself for the lockdown child cases)
     target_link_libraries(test_security PRIVATE forge_security)
     set_tests_properties(test_security PROPERTIES LABELS "security")
+  endif()
+  if(TARGET test_signing_detached)   # FSS INT-2 / INT-3: detached signatures, plugin and script integrity
+    set_tests_properties(test_signing_detached PROPERTIES LABELS "security")
   endif()
   set_tests_properties(test_log PROPERTIES SKIP_RETURN_CODE 77)   # skips when built with FORGE_LOG_MIN_LEVEL
   add_test(NAME log_min_level_cmake COMMAND ${CMAKE_COMMAND} -P ${PROJECT_SOURCE_DIR}/tests/log_min_level.cmake)
@@ -967,6 +970,9 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME modelfile_signing COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/sign_test.py
              $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
     set_tests_properties(modelfile_signing PROPERTIES DEPENDS golden_tiny_llama)
+    # detached signatures (forge sign / verify on any file), forge script and rpc-serve under integrity.scripts
+    add_test(NAME signing_cli COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/signing_cli_test.py $<TARGET_FILE:forge>)
+    set_tests_properties(signing_cli PROPERTIES LABELS security)
     add_test(NAME onnx_import COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/onnx_test.py $<TARGET_FILE:forge>)
     add_test(NAME golden_moe_mla
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
@@ -997,7 +1003,7 @@ if(FORGE_BUILD_TESTS)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
-      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla modelfile_signing onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
       add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
