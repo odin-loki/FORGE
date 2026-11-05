@@ -6,6 +6,7 @@
 #include <forge/graph/codecs.hpp>
 #include <forge/graph/kernels.hpp>
 #include <forge/simd/qdot.hpp>
+#include <forge/simd/qdot_i8.hpp>
 #include <forge/graph/kv_codec.hpp>
 #include <forge/graph/memplan.hpp>
 #include <forge/graph/passes.hpp>
@@ -128,12 +129,41 @@ inline int fmt_of(const codec* c) {
     return int(c->name == "q8_0" ? qfmt::q8_0 : c->name == "q4_k" ? qfmt::q4_k : c->name == "q6_k" ? qfmt::q6_k
              : c->name == "q5_k" ? qfmt::q5_k : qfmt::generic);
 }
+// Integer path (simd/qdot_i8.hpp): FORGE_CPU_INT8=0 turns it off, =1 forces it even when only the scalar
+// reference kernels exist (it is on by default when the CPU has a SIMD integer table).
+inline bool int8_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("FORGE_CPU_INT8");
+        if (e && *e) return *e != '0';
+        return std::string_view(simd::qi8_active().target) != "scalar";
+    }();
+    return on;
+}
+// y[m, n] = x[m, k] . W[n, k]^T for q8_0 / q4_k / q5_k / q6_k rows, on int8 activations. Each activation row is
+// quantised once (on the pool when there are many); weights are read once per group of up to 8 activation rows.
+// The result for one activation row does not depend on m (or on which thread computed which weight rows).
+inline void gemm_nt_i8(int fmt, const std::uint8_t* w, std::size_t rb, std::size_t n, const float* x, std::size_t m,
+                       std::size_t k, float* y) {
+    const auto& qk = simd::qi8_active();
+    const std::size_t ab = simd::qi8::act_bytes(fmt, k);
+    thread_local std::vector<simd::qi8::act_k> act;   // reused across calls (caller thread); 32-byte aligned
+    if (act.size() * sizeof(simd::qi8::act_k) < m * ab) act.resize((m * ab + sizeof(simd::qi8::act_k) - 1) / sizeof(simd::qi8::act_k));
+    auto* a = reinterpret_cast<std::uint8_t*>(act.data());
+    if (m * k <= 32768) for (std::size_t i = 0; i < m; ++i) qk.quantize(fmt, x + i * k, k, a + i * ab);
+    else task::parallel_for(m, 1, [&](std::size_t b, std::size_t e) { for (std::size_t i = b; i < e; ++i) qk.quantize(fmt, x + i * k, k, a + i * ab); });
+    if (m <= 8) {   // decode / small batches: stream the weights once, long claims first, short ones last
+        task::parallel_for(n, 16, 256, [&](std::size_t b, std::size_t e) { qk.matvec(fmt, w + b * rb, rb, e - b, a, ab, k, m, y + b, n); });
+    } else {        // prefill: 16-row blocks stay in L2 while every group of 8 activation rows passes over them
+        task::parallel_for(n, 16, 16, [&](std::size_t b, std::size_t e) { qk.matvec(fmt, w + b * rb, rb, e - b, a, ab, k, m, y + b, n); });
+    }
+}
 // Few input rows (decode): fused tile decode + dot per (row, weight row). Many rows (prefill): decode each weight
 // row once (SIMD decoders) and reuse it. Both are bit-identical to dot(x, codec.decode(row)).
 inline void gemm_nt(std::span<const tensor_view> in, tensor_view out, const ops::attrs&) {
     const auto& x = in[0]; const auto& w = in[1];
     std::size_t k = std::size_t(x.shape.back()), m = x.size() / k, n = std::size_t(w.shape[0]);
     const auto* c = codec_of(w); std::size_t rb = c->bytes(k);
+    if (const int f = fmt_of(c); int8_enabled() && simd::qi8::supported(f, k)) return gemm_nt_i8(f, w.qdata, rb, n, x.data, m, k, out.data);
     // FORGE_QDOT=0: plain scalar codec decode + dot (the pre-SIMD path; benchmarking and bisecting)
     static const bool native = [] { auto* e = std::getenv("FORGE_QDOT"); return !(e && std::string(e) == "0"); }();
     int fmt = fmt_of(c);
