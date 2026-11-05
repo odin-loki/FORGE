@@ -36,8 +36,11 @@ set(_fh_probe_src [=[
 #include <cstring>
 int main(int argc, char** argv) {
     char buf[64];
-    std::strncpy(buf, argc > 1 ? argv[1] : "forge", sizeof buf);
-    buf[sizeof buf - 1] = 0;
+    const char* s = argc > 1 ? argv[1] : "forge";
+    std::size_t n = std::strlen(s);
+    if (n >= sizeof buf) n = sizeof buf - 1;
+    std::memcpy(buf, s, n);
+    buf[n] = 0;
     std::puts(buf);
     return 0;
 }
@@ -90,10 +93,9 @@ if(FORGE_HARDENING)
         _fh_on(11 cet_compat)
       endif()
     endif()
-    # /sdl is deliberately not used: it promotes a set of warnings (C4146 unary minus on unsigned, used on purpose
-    # in the hashing / crypto / bit-trick code, C4703, ...) to errors and adds per-allocation member
-    # zero-initialisation and deleted-pointer overwrites on every `new`/`delete`, a runtime cost on the
-    # graph/script allocators. Its security-relevant parts are covered by /GS, /guard:cf and the linker flags.
+    # /sdl is deliberately not used: it promotes C4996 (CRT "unsafe" deprecations: getenv, sscanf, fopen, ...) and
+    # other warnings to errors (MSVC 14.44: 763 errors in 76 files) and adds member zero-initialisation on every
+    # `new`, a runtime cost on the graph/script allocators. Its stack checks are /GS, kept below.
     _fh_probe(FORGE_HARDEN_PE_ASLR "" "/DYNAMICBASE;/NXCOMPAT")
     if(FORGE_HARDEN_PE_ASLR)
       add_link_options(/DYNAMICBASE /NXCOMPAT)

@@ -57,6 +57,7 @@ Build presets exist for every configure preset except `ios`. Test presets: `dev`
 | `FORGE_SANITIZE` | OFF | ASan + UBSan |
 | `FORGE_TSAN` | OFF | ThreadSanitizer. Cannot be combined with `FORGE_SANITIZE` |
 | `FORGE_REPRODUCIBLE` | ON | Map build paths out of artefacts (`-ffile-prefix-map`) and drop the build id, for bit-identical rebuilds. No prefix map with MSVC; no `--build-id=none` on Apple or MSVC |
+| `FORGE_HARDENING` | ON | Hardening flags, each probed and skipped if the toolchain rejects it (FSS-BLD-1, `cmake/forge_hardening.cmake`). GCC/Clang: `-fstack-protector-strong`, `-fstack-clash-protection`, `-D_GLIBCXX_ASSERTIONS` (libstdc++) or libc++ >= 18 hardening mode `fast` (not Apple/NDK), `-fcf-protection=full` (x86_64) or `-mbranch-protection=standard` (aarch64); `-D_FORTIFY_SOURCE=3` on Linux (not Android) in optimised configs, not with `FORGE_SANITIZE`/`FORGE_TSAN`; ELF: PIE (`CMAKE_POSITION_INDEPENDENT_CODE`, `-pie`), `-Wl,-z,relro,-z,now,-z,noexecstack`; MinGW: `--dynamicbase --nxcompat --high-entropy-va`. MSVC: `/GS /guard:cf`, link `/guard:cf /CETCOMPAT` (x64) `/DYNAMICBASE /NXCOMPAT /HIGHENTROPYVA`; no `/sdl` and no `/Qspectre` (security-standard.md BLD-1). clang-cl gets none. What was enabled: `forge::build_hardening()` in `core/include/forge/core/build_info.hpp` |
 | `FORGE_TLS` | ON | Use OpenSSL for `rpc-serve` TLS when found |
 | `FORGE_JNI` | OFF | Build `libforge_jni` for the Kotlin binding |
 | `FORGE_LIBFUZZER` | OFF | Link fuzz targets with libFuzzer (clang) instead of the built-in driver; they are then not ctest tests |
