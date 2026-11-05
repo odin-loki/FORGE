@@ -599,6 +599,21 @@ elseif(FORGE_ARCH STREQUAL "aarch64")
   endforeach()
 endif()
 message(STATUS "FORGE: tile units AMX=${FORGE_CAN_AMX} SME=${FORGE_CAN_SME}")
+# Sequence-mixing kernels (simd/seq.hpp: chunked attention, gated delta rule): scalar everywhere, AVX2 and
+# AVX-512 tables on x86_64. No contraction of a*b+c anywhere, so every table returns identical bits.
+target_sources(forge_simd_mv PRIVATE simd/src/seq_scalar.cpp simd/src/seq_dispatch.cpp)
+if(FORGE_ARCH STREQUAL "x86_64")
+  target_sources(forge_simd_mv PRIVATE simd/src/seq_avx2.cpp simd/src/seq_avx512.cpp)
+endif()
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set_source_files_properties(simd/src/seq_scalar.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  set_source_files_properties(simd/src/seq_avx2.cpp   PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+  set_source_files_properties(simd/src/seq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise")
+else()
+  set_source_files_properties(simd/src/seq_scalar.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  set_source_files_properties(simd/src/seq_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
+  set_source_files_properties(simd/src/seq_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma;-ffp-contract=off")
+endif()
 
 # Hardware video decode (vision/video.hpp): NVDEC when nvcuvid.h is available, VideoToolbox on Apple, MediaCodec on Android.
 add_library(forge_video STATIC support/src/video.cpp)
