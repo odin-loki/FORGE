@@ -478,9 +478,10 @@ public:
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
         auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }
     static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
-    // $FORGE_MMA_STREAMK: 0 off, 2 for every grid that does not fill whole waves (tests), else on for grids of 1/4 to 4
-    // waves (read per launch, so tests and benches compare the paths in one process)
-    static unsigned streamk_mode() { auto* e = std::getenv("FORGE_MMA_STREAMK"); return !e || !*e ? 1u : std::string(e) == "0" ? 0u : std::string(e) == "2" ? 2u : 1u; }
+    // $FORGE_MMA_STREAMK: off by default (greedy output on Qwen3.5 not yet verified against the default path); 1 on for
+    // grids of 1/4 to 4 waves, 2 for every grid that does not fill whole waves (tests). Read per launch, so tests and
+    // benches compare the paths in one process.
+    static unsigned streamk_mode() { auto* e = std::getenv("FORGE_MMA_STREAMK"); return !e || !*e ? 0u : std::string(e) == "1" ? 1u : std::string(e) == "2" ? 2u : 0u; }
     // Stream-K needs >= this many 256-value k chunks per block ($FORGE_MMA_SK_MIN, default 4): fewer blocks otherwise.
     static unsigned sk_min() { auto* e = std::getenv("FORGE_MMA_SK_MIN"); int n = e && *e ? std::atoi(e) : 4; return unsigned(n < 1 ? 1 : n); }
     std::uint64_t skfx_ = 0; std::size_t skfx_cap_ = 0;   // stream-K fixup slots (one bt x 128 float tile per block)
