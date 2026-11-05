@@ -898,9 +898,9 @@ public:
             auto& tb = rope_[invf];
             if (!tb) { tb = dmalloc(invf.size() * 4, "scratch"); ck(htod_s(tb, invf.data(), invf.size() * 4, stream_), "memcpy HtoD"); }
             std::uint64_t tbl = tb;
-            // heads per block: a prefill block takes all of a token's heads (its cos/sin computed once); decode spreads them
+            // heads per block: a prefill block takes up to 16 of a token's heads (its cos/sin computed once); decode spreads them
             static const unsigned hpb_env = [] { auto* e = std::getenv("FORGE_ROPE_HPB"); return e ? unsigned(std::strtoul(e, nullptr, 10)) : 0u; }();
-            std::uint32_t hpb = hpb_env ? hpb_env : s >= 32 ? std::uint32_t(H) : std::max<std::uint32_t>(8u, std::uint32_t(256 / d));
+            std::uint32_t hpb = hpb_env ? hpb_env : s >= 32 ? 16u : std::uint32_t(256 / d);   // 16: fastest for 512 x 64 x 128 on an RTX 3090
             hpb = std::min<std::uint32_t>(hpb, std::uint32_t(H));
             std::uint32_t su = std::uint32_t(s), hu = std::uint32_t(H), du = std::uint32_t(d), neox = a.num("neox", 1) != 0;
             const unsigned grid = su * ((hu + hpb - 1) / hpb);

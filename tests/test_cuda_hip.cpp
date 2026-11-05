@@ -533,10 +533,45 @@ static int bench_qmm(int argc, char** argv) {
     return 0;
 }
 
+// test_cuda_hip benchfuse: time the elementwise fusions against the unfused kernels inside a run (Goedel/Qwen3-32B
+// shapes: decode and 512-token prefill). Not part of ctest.
+static int bench_fuse() {
+    std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
+    if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    auto time = [&](auto&& f) {
+        std::vector<double> ts;
+        for (int b = 0; b < 7; ++b) { auto t0 = std::chrono::steady_clock::now(); for (int i = 0; i < 50; ++i) f(); rt->wait();
+            ts.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / 50); }
+        std::sort(ts.begin(), ts.end()); return ts.front(); };
+    for (i64 rows : {1, 512}) {
+        const i64 D = 5120; const std::size_t N = std::size_t(rows * D);
+        std::vector<float> a(N, 0.5f), b(N, 0.25f), s(N), y(N), w(std::size_t(D), 1.f);
+        shape_t sh{rows, D}, ws{D}; ops::attrs at{{"eps", 1e-6}};
+        rt->begin_run();
+        double u = time([&] { rt->run_op("add", {{a.data(), sh}, {b.data(), sh}}, {}, {s.data(), sh}); rt->run_op("rms_norm", {{s.data(), sh}, {w.data(), ws}}, at, {y.data(), sh}); });
+        double f = time([&] { rt->run_fused("add_rms_norm", {{a.data(), sh}, {b.data(), sh}, {w.data(), ws}}, {{s.data(), sh}, {y.data(), sh}}, at); });
+        rt->end_run();
+        std::printf("add+rms_norm rows %lld cols %lld: unfused %.1f us, fused %.1f us\n", (long long)rows, (long long)D, u, f);
+    }
+    for (auto [s_, h] : {std::pair<i64, i64>{1, 64}, {1, 8}, {512, 64}, {512, 8}}) {
+        const i64 d = 128; const std::size_t N = std::size_t(s_ * h * d);
+        std::vector<float> x(N, 0.3f), t(N), y(N), w(static_cast<std::size_t>(d), 1.f), pos(static_cast<std::size_t>(s_));
+        for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i + 100);
+        shape_t sh{s_, h, d}, ws{d}, ps{s_}; ops::attrs ar{{"base", 1000000.0}, {"neox", 1.0}}, an{{"eps", 1e-6}}, af = ar; af.v["eps"] = 1e-6;
+        rt->begin_run();
+        double u = time([&] { rt->run_op("rms_norm", {{x.data(), sh}, {w.data(), ws}}, an, {t.data(), sh}); rt->run_op("rope", {{t.data(), sh}, {pos.data(), ps}}, ar, {y.data(), sh}); });
+        double f = time([&] { rt->run_fused("rms_rope", {{x.data(), sh}, {w.data(), ws}, {pos.data(), ps}}, {{y.data(), sh}}, af); });
+        rt->end_run();
+        std::printf("rms_norm+rope s %lld heads %lld d %lld: unfused %.1f us, fused %.1f us\n", (long long)s_, (long long)h, (long long)d, u, f);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
     if (mode == "bench") return bench_qmm(argc, argv);
+    if (mode == "benchfuse") return bench_fuse();
     auto cu = [](cuda_hip::api a) { return [a](std::string* w, int o) { return cuda_hip::runtime::open(a, w, o); }; };
     auto cl = [](std::string* w, int o) { return forge::gpu::ocl::runtime::open(w, o); };
     auto ze = [](std::string* w, int o) { return forge::gpu::ze::runtime::open(w, o); };

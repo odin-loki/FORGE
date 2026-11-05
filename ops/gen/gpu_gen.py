@@ -417,13 +417,16 @@ FORGE_DEV void q8r_put(float v, unsigned l, signed char* xq, float* xds, unsigne
 //             forge_rms_norm_b (a tree over 256 threads), so y is bit-identical to the unfused kernel run_op would pick;
 //   mode & 2: also write y's q8_1 blocks to xq (as forge_rms_norm_q81); mode & 4: its q8r rows to xq / xds (as
 //             forge_quant_q8r). cols % 32 == 0. s may be a (in place): each thread reads back only what it wrote.
-FORGE_GLOBAL void forge_rms_norm_f(const float* a, const float* b, float* s, const float* w, float* y, unsigned rows, unsigned cols, float eps,
+FORGE_GLOBAL __attribute__((launch_bounds(1024))) void forge_rms_norm_f(const float* a, const float* b, float* s, const float* w, float* y, unsigned rows, unsigned cols, float eps,
                                    unsigned mode, unsigned char* xq, float* xds) {
   __attribute__((shared)) float red[256];
   unsigned nt = __nvvm_read_ptx_sreg_ntid_x(), t = tid_(), r = bid_(), l = t & 31u;
   const unsigned long long ro = (unsigned long long)r * cols;
-  float acc = 0.0f;
-  for (unsigned j = t; j < cols; j += nt) { float v = a[ro + j]; if (mode & 8u) { v = v + b[ro + j]; s[ro + j] = v; } acc = fma_(v, v, acc); }
+  float acc = 0.0f, rv[16];   // the first 16 values of each thread stay in registers for the second pass
+#pragma unroll
+  for (unsigned i = 0; i < 16u; ++i) { unsigned j = t + i * nt; if (j < cols) {
+    float v = a[ro + j]; if (mode & 8u) { v = v + b[ro + j]; s[ro + j] = v; } rv[i] = v; acc = fma_(v, v, acc); } }
+  for (unsigned j = t + 16u * nt; j < cols; j += nt) { float v = a[ro + j]; if (mode & 8u) { v = v + b[ro + j]; s[ro + j] = v; } acc = fma_(v, v, acc); }
   float tot = 0.0f;
   if (mode & 1u) {
     for (unsigned o = 16u; o > 0u; o >>= 1) { float v; asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 31, -1;" : "=f"(v) : "f"(acc), "r"(o)); acc += v; }
@@ -437,7 +440,12 @@ FORGE_GLOBAL void forge_rms_norm_f(const float* a, const float* b, float* s, con
   }
   float inv = 1.0f / fsqrt(tot / (float)cols + eps);
   const float* src = (mode & 8u) ? s : a;
-  for (unsigned j = t; j < cols; j += nt) {
+#pragma unroll
+  for (unsigned i = 0; i < 16u; ++i) { unsigned j = t + i * nt; if (j < cols) {
+    float v = rv[i] * inv * w[j]; y[ro + j] = v;
+    if (mode & 2u) q81_put(v, l, xq + ((ro + j) >> 5) * 40u);
+    if (mode & 4u) q8r_put(v, l, (signed char*)xq, xds, (ro + j) >> 5); } }
+  for (unsigned j = t + 16u * nt; j < cols; j += nt) {
     float v = src[ro + j] * inv * w[j]; y[ro + j] = v;
     if (mode & 2u) q81_put(v, l, xq + ((ro + j) >> 5) * 40u);
     if (mode & 4u) q8r_put(v, l, (signed char*)xq, xds, (ro + j) >> 5); } }
