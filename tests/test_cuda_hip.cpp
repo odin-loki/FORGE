@@ -457,10 +457,47 @@ static int bench_qmm(int argc, char** argv) {
     return 0;
 }
 
+// test_cuda_hip benchglu <codec> <rows> <n> <k> [reps]: the FFN gate/up/SiLU step, fused (run_qglu) against the two
+// matmuls + silu_mul it replaces, each followed by the down projection's activation quantisation path (a [rows, n] x
+// [64, n] matmul, so the fused q8r hand-off is counted). Interleaved batches; the fastest of each is kept.
+static int bench_glu(int argc, char** argv) {
+    if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip benchglu <codec> <rows> <n> <k> [reps]\n"); return 2; }
+    std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
+    if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    const auto* c = graph::codecs::find(argv[2]);
+    if (!c) { std::fprintf(stderr, "unknown codec %s\n", argv[2]); return 2; }
+    const std::size_t rows = std::stoul(argv[3]), n = std::stoul(argv[4]), k = std::stoul(argv[5]), rb = c->bytes(k), rbd = c->bytes(n);
+    const int reps = argc > 6 ? std::stoi(argv[6]) : 10;
+    auto enc = [&](std::size_t r, std::size_t kk, std::size_t b, float ph) {
+        std::vector<float> w(kk); std::vector<std::uint8_t> e(r * b);
+        for (std::size_t j = 0; j < r; ++j) { for (std::size_t i = 0; i < kk; ++i) w[i] = std::sin(float(j * kk + i) * 0.731f + ph) * 0.05f; c->encode(w.data(), kk, e.data() + j * b); }
+        return e; };
+    auto eg = enc(n, k, rb, 1), eu = enc(n, k, rb, 2), ed = enc(64, n, rbd, 3);
+    std::vector<float> x(rows * k), g(rows * n), u(rows * n), h(rows * n), y(rows * 64);
+    for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+    std::uint32_t fmt = c->name == "q8_0" ? 1 : c->name == "q4_k" ? 2 : c->name == "q6_k" ? 3 : 4;
+    tensor_view xv{x.data(), {i64(rows), i64(k)}}, gv{g.data(), {i64(rows), i64(n)}}, uv{u.data(), {i64(rows), i64(n)}}, hv{h.data(), {i64(rows), i64(n)}}, yv{y.data(), {i64(rows), 64}};
+    auto unfused = [&] { rt->run_qmatmul(xv, eg.data(), rb, std::uint32_t(n), fmt, gv); rt->run_qmatmul(xv, eu.data(), rb, std::uint32_t(n), fmt, uv);
+                         rt->run_op("silu_mul", {gv, uv}, {}, hv); rt->run_qmatmul(hv, ed.data(), rbd, 64, fmt, yv); };
+    auto fused = [&] { if (!rt->run_qglu(xv, eg.data(), eu.data(), rb, std::uint32_t(n), fmt, hv)) std::abort(); rt->run_qmatmul(hv, ed.data(), rbd, 64, fmt, yv); };
+    rt->begin_run(); unfused(); fused(); rt->wait();
+    double best[2] = {1e30, 1e30};
+    for (int b = 0; b < 7; ++b) for (int f = 0; f < 2; ++f) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) { if (f) fused(); else unfused(); }
+        rt->wait();
+        best[f] = std::min(best[f], std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps);
+    }
+    rt->end_run();
+    std::printf("%s rows %zu n %zu k %zu (+ down to 64): unfused %.1f us, fused %.1f us (%.1f%%)\n", argv[2], rows, n, k, best[0], best[1], 100.0 * (best[0] - best[1]) / best[0]);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string mode = argc > 1 ? argv[1] : "images";
     if (mode == "images") return images();
     if (mode == "bench") return bench_qmm(argc, argv);
+    if (mode == "benchglu") return bench_glu(argc, argv);
     auto cu = [](cuda_hip::api a) { return [a](std::string* w, int o) { return cuda_hip::runtime::open(a, w, o); }; };
     auto cl = [](std::string* w, int o) { return forge::gpu::ocl::runtime::open(w, o); };
     auto ze = [](std::string* w, int o) { return forge::gpu::ze::runtime::open(w, o); };
