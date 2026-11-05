@@ -179,6 +179,7 @@ public:
             if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
+        if (stage_ && f_.host_free) f_.host_free(stage_);
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
         if (ctx_ && f_.ctx_destroy) { f_.ctx_destroy(ctx_); ctx_epoch().fetch_add(1, std::memory_order_acq_rel); }
@@ -229,22 +230,37 @@ public:
         if (!(key == run_key_ && streak_ >= 2 && !replay_bad_.count(key) && replay_ok() && gmode() && nseg_ && nseg_ <= segc_.size())) return false;
         bind(); flush();
         std::vector<void*> ap;
-        for (std::size_t s = 0; s < nseg_; ++s) {   // patch everything first: a failure leaves nothing launched
+        for (std::size_t s = 0; s < nseg_; ++s) {
             auto& c = segc_[s];
             if (!c.replay || !c.exec || c.pred.size() != c.bytes.size()) { streak_ = 0; return false; }
+        }
+        // Patch and launch segment by segment, so the device starts on the first segment while the host patches the
+        // next. A failed patch before the first launch falls back to a real run; after it (work already queued that
+        // a real run would repeat) it is an error.
+        static const bool eager = [] { auto* e = std::getenv("FORGE_REPLAY_EAGER"); return !(e && std::string(e) == "0"); }();
+        auto patch = [&](std::size_t s) {
+            auto& c = segc_[s];
             for (std::size_t i = 0; i < c.recs.size(); ++i) {
                 auto& r = c.recs[i];
                 if (!std::memcmp(c.pred.data() + r.off, c.bytes.data() + r.off, r.len)) continue;
                 arg_ptrs(r, c.pred.data(), ap);
                 struct { void* fn; unsigned d[7]; void** kp; void** ex; } kp{r.fn, {r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6]}, ap.data(), nullptr};
-                if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) { for (std::size_t t = 0; t <= s; ++t) drop_seg(segc_[t]); streak_ = 0; return false; }
+                if (f_.kn_set(c.exec, c.nodes[i], &kp) != 0) return false;
                 cuda_hip::count(counters().node_updates);
             }
-        }
-        for (std::size_t s = 0; s < nseg_; ++s) {
+            return true;
+        };
+        auto launch = [&](std::size_t s) {
             auto& c = segc_[s];
             c.prev.swap(c.bytes); c.bytes.swap(c.pred); predict(c);
             cuda_hip::count(counters().graph_launches); ck(f_.graph_launch(c.exec, stream_), "graph launch");
+        };
+        const std::size_t first = eager ? 1 : nseg_;   // segments patched before anything is launched
+        for (std::size_t s = 0; s < first; ++s)
+            if (!patch(s)) { for (std::size_t t = 0; t <= s; ++t) drop_seg(segc_[t]); streak_ = 0; return false; }
+        for (std::size_t s = 0; s < nseg_; ++s) {
+            if (s >= first && !patch(s)) { streak_ = 0; replay_bad_.insert(key); throw std::runtime_error(std::string(api_name(api_)) + ": graph node update failed during replay"); }
+            launch(s);
         }
         cuda_hip::count(counters().replayed_runs); replayed_ = true;
         return true;
@@ -310,11 +326,15 @@ public:
             auto el = reinterpret_cast<std::uintptr_t>(e.host);
             if (!e.host_valid && el <= lo && el + e.count * 4 >= hi) dp = e.d + (lo - el); });
         if (!dp) return -1;
-        if (!am_) am_ = dmalloc(256, "scratch");
-        std::uint32_t n32 = std::uint32_t(n); void* args[] = {&dp, &n32, &am_};
-        ck(launch_s(function("forge_argmax"), 1, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
+        // up to 128 blocks of 256 threads (a lone block took ~30 us over a 248k vocabulary); the blocks leave partials
+        // in am_ and the last one merges them (am_[1] is its ticket counter, zero between launches)
+        if (!am_) { static const std::uint32_t zero[1024] = {}; am_ = dmalloc(sizeof zero, "scratch"); ck(htod_s(am_, zero, sizeof zero, stream_), "memcpy HtoD"); }
+        std::uint32_t n32 = std::uint32_t(n), nb = std::uint32_t(std::min<std::size_t>(128, (n + 2047) / 2048)); void* args[] = {&dp, &n32, &am_, &nb};
+        ck(launch_s(function("forge_argmax"), nb, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         ++dispatches_["argmax"];
-        int r = -1; ck(dtoh_s(&r, am_, 4, stream_), "memcpy DtoH"); sync();
+        int r = -1; void* pr = stage(4, true);   // page-locked: no driver staging on the read-back
+        ck(dtoh_s(pr ? pr : &r, am_, 4, stream_), "memcpy DtoH"); sync();
+        if (pr) std::memcpy(&r, pr, 4);
         return r;
     }
     void host_wrote(const float* p, std::size_t n) {
@@ -514,6 +534,20 @@ public:
         q81_drop(); if (q81_) free_s(q81_); q81_ = 0; q81_cap_ = 0;
         q81_ = dmalloc(std::max<std::size_t>(need, 1 << 20), "scratch"); q81_cap_ = std::max<std::size_t>(need, 1 << 20);
     }
+    // decode matvec: output columns per 128-thread block (1, 2 or 4; the block's warps split between them).
+    // $FORGE_MMVQ_CPB forces one for every shape.
+    static std::uint32_t mmvq_cpb(std::uint32_t fmt, std::uint32_t k) {
+        static const std::uint32_t forced = [] { auto* e = std::getenv("FORGE_MMVQ_CPB"); unsigned v = e ? unsigned(std::atoi(e)) : 0u; return v == 1 || v == 2 || v == 4 ? v : 0u; }();
+        if (forced) return forced;
+        // q4_k with up to 24 super-blocks per column: a 4-warp block takes 16 per step, so k = 4096 / 5120 leave
+        // most lanes idle on the second step; two columns per block (2 warps each, 8 per step) balance it
+        // (25600x5120: 93 -> 87 us, 12288x4096: 39 -> 35.5 us). q6_k, q8_0 and longer k: no gain.
+        return fmt == 2 && k <= 6144 ? 2 : 1;
+    }
+    // q8_0 decode (regrouped weights): 16-byte loads per lane; $FORGE_MMVQ_Q8V=0 keeps the 4-byte-per-lane loop
+    static bool mmvq_q8v() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_Q8V"); return !(e && std::string(e) == "0"); }(); return on; }
+    // decode matvec weight loads through ld.global.nc.L1::no_allocate ($FORGE_MMVQ_NC=1; measured no faster on a 3090)
+    static bool mmvq_nc() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_NC"); return e && std::string(e) == "1"; }(); return on; }
     // Decode rms_norm / silu_mul also emit the q8_1 form of their output for the next matmul ($FORGE_FUSE_Q81=0 off).
     static bool fuse_q81() { static const bool on = [] { auto* e = std::getenv("FORGE_FUSE_Q81"); return !(e && std::string(e) == "0"); }(); return on; }
     bool run_qmatmul(const tensor_view& x, const std::uint8_t* q, std::size_t rb, std::uint32_t cols, std::uint32_t fmt, tensor_view out) {
@@ -647,8 +681,9 @@ public:
                     ck(launch_s(function("forge_quant_q81"), (nb + 7) / 8, 1, 1, 256, 1, 1, 0, stream_, qa, nullptr), "launch");
                     q81_src_ = xd; q81_n_ = nb;
                 } else ++dispatches_["quant_q81_reused"];
-                void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fmt, &rb32};
-                unsigned grid = cols * ((rows + 3) / 4);   // a 4-warp block per column (and 4 activation rows)
+                const std::uint32_t cpb = mmvq_cpb(fmt, k); std::uint32_t fc = fmt | (cpb << 8) | (fmt == 6 && !mmvq_q8v() ? 0x800u : 0u) | (mmvq_nc() ? 0x1000u : 0u);
+                void* a2[] = {&qx, &wd, &yd, &rows, &cols, &k, &fc, &rb32};
+                unsigned grid = (cols + cpb - 1) / cpb * ((rows + 3) / 4);   // a 4-warp block per cpb columns (and 4 activation rows)
                 if (grid) ck(launch_s(function("forge_qmatmul_q81"), grid, 1, 1, 128, 1, 1, 0, stream_, a2, nullptr), "launch");
                 q81_keep_ = false;
                 if (yd < xd + std::uint64_t(nb) * 128 && xd < yd + std::uint64_t(out.size()) * 4) q81_drop();   // y overwrote the source
@@ -1089,6 +1124,8 @@ private:
         int (*peer)(std::uint64_t, std::uintptr_t, std::uint64_t, std::uintptr_t, std::size_t) = nullptr;
         int (*mem_info)(std::size_t*, std::size_t*) = nullptr;
         int (*func_attr)(void*, int, int) = nullptr;   // cuFuncSetAttribute (dynamic shared memory above 48 KB)
+        int (*host_alloc)(void**, std::size_t) = nullptr;   // cuMemAllocHost_v2 (page-locked staging; CUDA only)
+        int (*host_free)(void*) = nullptr;                  // cuMemFreeHost
         // wrappers that fall back to the synchronous copies when the async ones are missing
         int htod_async(std::uint64_t d, const void* h, std::size_t n, void* s) const { return htod_a ? htod_a(d, h, n, s) : htod(d, h, n); }
         int dtoh_async(void* h, std::uint64_t d, std::size_t n, void* s) const { return dtoh_a ? dtoh_a(h, d, n, s) : dtoh(h, d, n); }
@@ -1202,10 +1239,18 @@ private:
                 reissue_captured();   // the segment changed shape: capture it after all
         } else r = f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
         // Split long segments so the GPU runs one while the host records the next ($FORGE_GRAPH_SEG kernels, 0 = off).
-        if (r == 0 && ++seg_kernels_ >= graph_seg()) flush();
+        // The first segments of a run are shorter ($FORGE_GRAPH_SEG0 kernels, doubling up to $FORGE_GRAPH_SEG): the
+        // device idles from the previous run's end until the first launch, so that one goes out early.
+        if (r == 0 && ++seg_kernels_ >= seg_limit()) flush();
         return r;
     }
     std::size_t seg_kernels_ = 0;
+    std::size_t seg_limit() const {
+        static const std::size_t s0 = [] { auto* e = std::getenv("FORGE_GRAPH_SEG0"); return std::size_t(e ? std::strtoul(e, nullptr, 10) : 8); }();
+        const std::size_t full = graph_seg();
+        if (!s0 || seg_ >= 16) return full;
+        return std::min(full, s0 << seg_);
+    }
     static std::size_t graph_seg() {
         static const std::size_t v = [] { auto* e = std::getenv("FORGE_GRAPH_SEG"); std::size_t n = e ? std::strtoul(e, nullptr, 10) : 64; return n ? n : ~std::size_t(0); }();
         return v;
@@ -1227,7 +1272,25 @@ private:
         if (q8r_src_ && d < q8r_src_ + q8r_n_ * 4 && q8r_src_ < d + n) q8r_src_ = 0;
         if (g8_src_ && d < g8_src_ + std::uint64_t(g8_n_) * 128 && g8_src_ < d + n) g8_src_ = 0;
     }
-    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q_written(d, n); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) {
+        flush(); q_written(d, n); dirty_ |= in_run_; cuda_hip::count(counters().htod);
+        if (void* p = st == stream_ ? stage(n) : nullptr) { std::memcpy(p, h, n); return f_.htod_async(d, p, n, st); }   // a real async copy
+        return f_.htod_async(d, h, n, st); }
+    // Small host-to-device copies (decode: the token id and position each run) go through a page-locked staging
+    // ring: from pageable memory the driver stages them itself, synchronously (tens of us each under WSL). A slot is
+    // reused only after the next sync(), which drains every copy issued before it; when the ring is full, or while a
+    // stream capture is open (a memcpy node would keep pointing at a reused slot), the pageable path is taken.
+    // $FORGE_GPU_STAGE=0 turns it off.
+    static constexpr std::size_t stage_cap = 64 << 10, stage_max = 4096;
+    void* stage_ = nullptr; std::size_t stage_off_ = 0; bool stage_tried_ = false;
+    static bool stage_on() { static const bool on = [] { auto* e = std::getenv("FORGE_GPU_STAGE"); return !(e && std::string(e) == "0"); }(); return on; }
+    void* stage(std::size_t n, bool reserve_tail = false) {
+        if (n > stage_max || capturing_ || user_cap_ || !stage_on() || !f_.host_alloc || !f_.htod_a) return nullptr;
+        if (!stage_tried_) { stage_tried_ = true; if (f_.host_alloc(&stage_, stage_cap) != 0) stage_ = nullptr; }
+        if (!stage_) return nullptr;
+        if (reserve_tail) return static_cast<char*>(stage_) + stage_cap - 64;   // the argmax read-back slot
+        if (stage_off_ + n > stage_cap - 64) return nullptr;
+        void* p = static_cast<char*>(stage_) + stage_off_; stage_off_ += (n + 63) & ~std::size_t(63); return p; }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; cuda_hip::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return dfree(p); }
     // ---- device memory accounting (gpu/device_memory.hpp) ----
@@ -1357,7 +1420,7 @@ private:
         }
         else if (f_.set_device) f_.set_device(ordinal_);
     }
-    void sync() { flush(); dirty_ |= in_run_; cuda_hip::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); }
+    void sync() { flush(); dirty_ |= in_run_; cuda_hip::count(counters().syncs); if (stream_ && f_.stream_sync) ck(f_.stream_sync(stream_), "stream synchronize"); else ck(f_.sync_(), "synchronize"); stage_off_ = 0; }
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
         void* f = nullptr; ck(f_.get_fn(&f, mod_, n.c_str()), ("get function " + n).c_str());
@@ -1365,7 +1428,12 @@ private:
     }
     template<class F> void each_overlap(const float* p, std::size_t n, F&& f) {
         auto lo = reinterpret_cast<std::uintptr_t>(p), hi = lo + std::max<std::size_t>(n, 1) * 4;
-        for (auto& [k, e] : res_) { auto el = k, eh = k + e.count * 4; if (el < hi && lo < eh) f(e); }
+        // entries are disjoint host ranges (acquire splits or merges overlaps), so only the one starting before lo can
+        // reach into the range: a log-time seek instead of a scan of every resident buffer (decode calls this per state
+        // slot per token)
+        auto it = res_.upper_bound(lo);
+        if (it != res_.begin()) { auto pv = std::prev(it); if (pv->first + pv->second.count * 4 > lo) it = pv; }
+        for (; it != res_.end() && it->first < hi; ++it) { auto el = it->first, eh = el + it->second.count * 4; if (el < hi && lo < eh) f(it->second); }
     }
     void download(entry& e) { ck(dtoh_s(e.host, e.d, e.count * 4, stream_), "memcpy DtoH"); e.host_valid = true; ++stats_.downloads; }
     // freed device buffers are pooled by size and reused: decode runs the same shapes every token
@@ -1453,6 +1521,7 @@ private:
             opt(f_.g_roots, "cuGraphGetRootNodes"); opt(f_.g_deps, "cuGraphNodeGetDependentNodes"); opt(f_.g_type, "cuGraphNodeGetType"); opt(f_.graph_launch, "cuGraphLaunch");
             opt(f_.gexec_destroy, "cuGraphExecDestroy"); opt(f_.graph_destroy, "cuGraphDestroy");
             opt(f_.peer, "cuMemcpyPeer"); opt(f_.mem_info, "cuMemGetInfo_v2"); opt(f_.func_attr, "cuFuncSetAttribute");
+            opt(f_.host_alloc, "cuMemAllocHost_v2"); opt(f_.host_free, "cuMemFreeHost"); if (!f_.host_free) f_.host_alloc = nullptr;
         } else {
             ok = sym(f_.init, "hipInit") && sym(f_.count, "hipGetDeviceCount") && sym(f_.name, "hipDeviceGetName") &&
                  sym(f_.set_device, "hipSetDevice") && sym(f_.load, "hipModuleLoadData") && sym(f_.unload, "hipModuleUnload") &&
@@ -1479,7 +1548,12 @@ private:
         if (api_ == api::cuda && f_.device_get && f_.device_get(&dev, ordinal_) != 0) return "cuDeviceGet failed";
         char buf[256] = {}; f_.name(buf, sizeof buf, dev); name_ = buf;
         if (int v = 0; api_ == api::cuda && f_.dev_attr && f_.dev_attr(&v, 16 /* MULTIPROCESSOR_COUNT */, dev) == 0 && v > 0) sms_ = unsigned(v);
-        if (api_ == api::cuda) { if (f_.ctx_create(&ctx_, 0, dev) != 0) return "context creation failed"; }
+        if (api_ == api::cuda) {
+            // $FORGE_CUDA_SCHED: how a host thread waits on the device (auto | spin | yield | block): CU_CTX_SCHED_*
+            const char* sc = std::getenv("FORGE_CUDA_SCHED"); const std::string s = sc ? sc : "";
+            const unsigned fl = s == "spin" ? 1u : s == "yield" ? 2u : s == "block" ? 4u : 0u;
+            if (f_.ctx_create(&ctx_, fl, dev) != 0) return "context creation failed";
+        }
         else if (f_.set_device(ordinal_) != 0) return "hipSetDevice failed";
         if (f_.stream_create && f_.stream_create(&stream_, 1 /* non-blocking */) != 0) stream_ = nullptr;
         for (auto& [arch, img] : imgs) {

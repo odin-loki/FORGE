@@ -428,6 +428,22 @@ template<class Open, class Count> static int features_t(Open open, Count device_
     std::vector<float> slot(64, 0.f), row(16, 3.f);
     rt->begin_run(); rt->copy_resident(row.data(), 16, slot.data(), 64, 16); rt->to_host(slot.data(), 64);
     chk(slot[16] == 3.f && slot[31] == 3.f && slot[15] == 0.f && slot[32] == 0.f, "copy_resident writes the slot on the device"); rt->end_run();
+    // greedy argmax on a device-newer buffer (multi-block over a vocabulary-sized row; ties: the lowest index), twice
+    // per size so the blocks' ticket counter is seen to reset
+    if constexpr (requires { rt->argmax_resident((const float*)nullptr, std::size_t(0)); }) {
+        bool am_ok = true;
+        for (std::size_t n : {std::size_t(1000), std::size_t(248320), std::size_t(3)})
+            for (std::size_t at : {n - 1, n / 3}) {
+                std::vector<float> lv(n), lo(n);
+                for (std::size_t i = 0; i < n; ++i) lv[i] = float((i * 7919) % 1000) * 1e-3f;
+                lv[at] = 5.f; if (at + 1 < n) lv[n - 1] = 5.f;   // a tie after `at`
+                shape_t ls{i64(n)};
+                rt->begin_run(); rt->run_op("scale", {{lv.data(), ls}}, {{"alpha", 1.0}}, {lo.data(), ls});
+                const long long r = rt->argmax_resident(lo.data(), n); rt->end_run();
+                if (r != (long long)at) { am_ok = false; std::printf("     argmax n %zu: %lld, want %zu\n", n, r, at); }
+            }
+        chk(am_ok, "argmax_resident finds the first largest value");
+    }
     // graphs
     if (rt->has_graphs()) {
         // warm run makes the buffers resident, then capture the same op and replay it on new input
