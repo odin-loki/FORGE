@@ -343,7 +343,10 @@ public:
         if (!has_fn_locked("forge_copy2d")) return false;
         if (!rows || !w) return true;
         ++dispatches_["copy2d"];
-        auto d = acquire(dst_base, dst_count, false);
+        // A write that covers the whole destination (a first prefill filling a KV slot) needs none of its old contents:
+        // allocate without uploading the host copy.
+        const bool whole = off == 0 && ds == w && rows * w >= dst_count;
+        auto d = acquire(dst_base, dst_count, whole);
         auto s = acquire(src, sn, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
@@ -356,7 +359,7 @@ public:
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); bind(); begin_op();
         if (!n) return;
-        auto d = acquire(dst_base, dst_count, false);
+        auto d = acquire(dst_base, dst_count, off == 0 && n >= dst_count);   // whole destination overwritten: no upload
         auto s = acquire(src, n, false);
         d = acquire(dst_base, dst_count, false);
         d.e->host_valid = false;
