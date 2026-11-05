@@ -178,32 +178,132 @@ TEST(rpc_key_permissions) {
     CHECK(srv.scripts() == 3);
     srv.stop();
 }
+// ---- scoped tokens (token-file lines "[allow=...] <token> [name]") and config errors with line numbers
+static bool throws_with(auto&& fn, std::string_view needle) {
+    try { fn(); } catch (const std::exception& e) { bool ok = std::string_view(e.what()).find(needle) != std::string_view::npos; if (!ok) std::printf("  message: %s\n", e.what()); return ok; }
+    return false;
+}
+TEST(rpc_token_file_parse) {
+    auto ts = graph::rpc::parse_tokens("# tokens\n\nbare-token\r\n"
+                                       "allow=device dev+tok/== gpu borrower\n"
+                                       "  allow=scripts allow=device both\n"
+                                       "allow= nothing\n");
+    CHECK(ts.size() == 4);
+    if (ts.size() == 4) {
+        CHECK(ts[0].token == "bare-token" && ts[0].perms == graph::rpc::perm_all && ts[0].name.empty());   // a bare token: full access
+        CHECK(ts[1].token == "dev+tok/==" && ts[1].perms == graph::rpc::perm_device && ts[1].name == "gpu borrower");
+        CHECK(ts[2].token == "both" && ts[2].perms == graph::rpc::perm_all);
+        CHECK(ts[3].token == "nothing" && ts[3].perms == graph::rpc::perm_none);
+    }
+    CHECK(graph::rpc::parse_tokens("abc=").at(0).token == "abc=");                          // '=' inside a token is fine
+    CHECK(throws_with([] { graph::rpc::parse_tokens("ok\n# c\nallow=root t\n", "tok.txt"); }, "tok.txt line 3: unknown permission 'root'"));
+    CHECK(throws_with([] { graph::rpc::parse_tokens("ok\nallow=device\n"); }, "line 2: no token"));
+    // authorized_keys errors carry line numbers too
+    CHECK(throws_with([] { graph::rpc::parse_authorized_keys("\n\nallow=device,root " + std::string(64, 'a')); }, "authorized_keys line 3: unknown permission 'root'"));
+    // client-certificate maps
+    auto fp = std::string(64, 'a'); std::string colons; for (std::size_t i = 0; i < 64; i += 2) { if (i) colons += ':'; colons += "AA"; }
+    auto m = graph::rpc::parse_client_map("# map\nallow=device sha256:" + colons + " laptop\ncn:ci-runner\nallow=scripts,device cn:x\n");
+    CHECK(m.size() == 3);
+    if (m.size() == 3) {
+        CHECK(m[0].kind == graph::rpc::cert_rule::sha256 && m[0].value == fp && m[0].perms == graph::rpc::perm_device && m[0].comment == "laptop");
+        CHECK(m[1].kind == graph::rpc::cert_rule::cn && m[1].value == "ci-runner" && m[1].perms == graph::rpc::perm_all);
+        CHECK(m[2].value == "x" && m[2].perms == graph::rpc::perm_all);
+    }
+    CHECK(throws_with([] { graph::rpc::parse_client_map("cn:a\nsha256:abcd\n", "map.txt"); }, "map.txt line 2: sha256: wants a 64-hex"));
+    CHECK(throws_with([] { graph::rpc::parse_client_map("cn:a\n\nallow=device\n"); }, "line 3: no certificate identity"));
+    CHECK(throws_with([] { graph::rpc::parse_client_map("cn:a\nfrom=x cn:b\n"); }, "line 2: unknown option 'from'"));
+    CHECK(throws_with([] { graph::rpc::parse_client_map("cn:a\ncn:a\n"); }, "line 2: duplicate"));
+    CHECK(throws_with([] { graph::rpc::parse_client_map("cn:\n"); }, "line 1: empty cn"));
+    CHECK(throws_with([] { graph::rpc::parse_client_map("alice\n"); }, "line 1"));
+    // a client map needs client certificates
+    graph::rpc::server_security s; s.client_map = graph::rpc::parse_client_map("cn:a\n");
+    CHECK_THROWS(graph::rpc::server(nullptr, 0, "127.0.0.1", s));
+}
+TEST(rpc_token_scopes) {
+    graph::rpc::server_security sec; sec.allow_scripts = true;
+    sec.tokens = graph::rpc::parse_tokens("allow=device devtok gpu\nallow=scripts scrtok\nfulltok\nallow= nonetok\n");
+    sec.tokens.push_back(std::string("legacy"));                                              // bare token pushed as before
+    graph::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
+    srv.script_handler = [](const std::string&, const std::string&, const std::vector<std::string>&, std::uint32_t) {
+        return graph::rpc::server::script_result{true, "", "", "ran"};
+    };
+    std::mutex lm; std::vector<std::string> logs;
+    srv.log = [&](const std::string& m) { std::lock_guard g(lm); logs.push_back(m); };
+    srv.start(); auto port = std::to_string(srv.port());
+    auto conn = [&](const std::string& t) { std::string why; auto c = graph::rpc::client::connect("127.0.0.1", port, &why, tok(t)); CHECK_MSG(c != nullptr, "%s", why.c_str()); return c; };
+    auto denied = [](auto&& fn) { return throws_with(fn, "permission denied"); };
+    if (auto c = conn("devtok")) { CHECK(relu_ok(*c)); CHECK(denied([&] { c->run_script("x"); })); CHECK(relu_ok(*c)); }
+    if (auto c = conn("scrtok")) { CHECK(c->run_script("x").ok); CHECK(denied([&] { relu_ok(*c); })); CHECK(c->run_script("y").ok); }
+    if (auto c = conn("fulltok")) { CHECK(relu_ok(*c)); CHECK(c->run_script("x").ok); }
+    if (auto c = conn("legacy")) { CHECK(relu_ok(*c)); CHECK(c->run_script("x").ok); }
+    if (auto c = conn("nonetok")) { CHECK(denied([&] { relu_ok(*c); })); CHECK(denied([&] { c->run_script("x"); })); }
+    std::string why; CHECK(!graph::rpc::client::connect("127.0.0.1", port, &why, tok("wrong")));
+    CHECK(srv.scripts() == 4);
+    srv.stop();
+    // the log names the principal (token number and name, never the token) and its permissions
+    std::string all; for (auto& l : logs) all += l + "\n";
+    CHECK_MSG(all.find("authenticated token#1 (gpu) allow=device") != std::string::npos, "%s", all.c_str());
+    CHECK_MSG(all.find("authenticated token#5 allow=all") != std::string::npos, "%s", all.c_str());
+    CHECK_MSG(all.find("denied script for token#1 (gpu)") != std::string::npos, "%s", all.c_str());
+    CHECK_MSG(all.find("refused: bad token") != std::string::npos, "%s", all.c_str());
+    CHECK(all.find("devtok") == std::string::npos && all.find("fulltok") == std::string::npos);
+}
 
 // ---- TLS. These skip without OpenSSL (or its CLI); the `test_rpc_tls` ctest entry runs only them and then exits 77.
+// The CLI runs through os::run (no shell, no redirects), so the probe and the throwaway PKI work on Windows too.
+// FORGE_TEST_OPENSSL names the binary; on Windows, Git for Windows' copies are tried after PATH.
+static const std::string& openssl_bin() {
+    static const std::string b = [] {
+        std::vector<std::string> c;
+        if (const char* e = std::getenv("FORGE_TEST_OPENSSL"); e && *e) c.push_back(e);
+        c.push_back("openssl");
+#if defined(_WIN32)
+        c.push_back("C:\\Program Files\\Git\\usr\\bin\\openssl.exe"); c.push_back("C:\\Program Files\\Git\\mingw64\\bin\\openssl.exe");
+#endif
+        for (auto& x : c) { auto r = os::run({x, "version"}, true); if (r && r.value.exit_code == 0) return x; }
+        return std::string{};
+    }();
+    return b;
+}
+static bool ossl(std::vector<std::string> args, std::string* out = nullptr) {
+    args.insert(args.begin(), openssl_bin()); auto r = os::run(args, true);
+    if (out && r) *out = r.value.out;
+    return r && r.value.exit_code == 0;
+}
 static bool tls_or_skip() {
-    if (graph::rpc::tls_available() && std::system("openssl version >/dev/null 2>&1") == 0) return true;
+    if (graph::rpc::tls_available() && !openssl_bin().empty()) return true;
     std::printf("skip: %s\n", graph::rpc::tls_available() ? "no openssl CLI" : "built without TLS");
     if (const char* only = std::getenv("FORGE_TEST_ONLY"); only && std::strstr(only, "rpc_tls")) std::exit(77);
     return false;
 }
-static bool sh(const std::string& c) { return std::system((c + " >/dev/null 2>&1").c_str()) == 0; }
-// Throwaway PKI: a self-signed server cert for localhost, a client CA with one client cert, and a self-signed
-// "rogue" client cert the server does not trust.
-struct test_pki { std::string srv, srv_key, ca, ca_key, cl, cl_key, rogue, rogue_key; bool ok = false; };
+// Throwaway PKI: a self-signed server cert for localhost, a client CA with three client certs (CN forge-client,
+// forge-client-2, forge-client-3), and a self-signed "rogue" client cert (CN forge-client) the server does not trust.
+struct test_pki { std::string srv, srv_key, ca, ca_key, cl, cl_key, cl2, cl2_key, cl3, cl3_key, rogue, rogue_key; bool ok = false; };
 static const test_pki& pki() {
     static test_pki p = [] {
-        test_pki p; std::string ec = " -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes ";
+        test_pki p; const std::vector<std::string> ec = {"-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes"};
+        auto req = [&](std::vector<std::string> a, const std::vector<std::string>& tail) { a.insert(a.end(), ec.begin(), ec.end()); a.insert(a.end(), tail.begin(), tail.end()); return ossl(a); };
         p.srv = tmp("srv.pem"); p.srv_key = tmp("srv.key"); p.ca = tmp("ca.pem"); p.ca_key = tmp("ca.key");
-        p.cl = tmp("cl.pem"); p.cl_key = tmp("cl.key"); p.rogue = tmp("rogue.pem"); p.rogue_key = tmp("rogue.key"); auto csr = tmp("cl.csr");
-        p.ok = sh("openssl req -x509" + ec + "-days 1 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout " + p.srv_key + " -out " + p.srv)
-            && sh("openssl req -x509" + ec + "-days 1 -subj /CN=forge-test-ca -keyout " + p.ca_key + " -out " + p.ca)
-            && sh("openssl req" + ec + "-subj /CN=forge-client -keyout " + p.cl_key + " -out " + csr)
-            && sh("openssl x509 -req -in " + csr + " -CA " + p.ca + " -CAkey " + p.ca_key + " -set_serial 2 -days 1 -out " + p.cl)
-            && sh("openssl req -x509" + ec + "-days 1 -subj /CN=forge-client -keyout " + p.rogue_key + " -out " + p.rogue);
-        std::filesystem::remove(csr);
+        p.cl = tmp("cl.pem"); p.cl_key = tmp("cl.key"); p.cl2 = tmp("cl2.pem"); p.cl2_key = tmp("cl2.key"); p.cl3 = tmp("cl3.pem"); p.cl3_key = tmp("cl3.key");
+        p.rogue = tmp("rogue.pem"); p.rogue_key = tmp("rogue.key"); auto csr = tmp("cl.csr");
+        auto client = [&](const std::string& cn, const std::string& crt, const std::string& key, const char* serial) {
+            return req({"req"}, {"-subj", "/CN=" + cn, "-keyout", key, "-out", csr})
+                && ossl({"x509", "-req", "-in", csr, "-CA", p.ca, "-CAkey", p.ca_key, "-set_serial", serial, "-days", "1", "-out", crt});
+        };
+        p.ok = req({"req", "-x509"}, {"-days", "1", "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost", "-keyout", p.srv_key, "-out", p.srv})
+            && req({"req", "-x509"}, {"-days", "1", "-subj", "/CN=forge-test-ca", "-keyout", p.ca_key, "-out", p.ca})
+            && client("forge-client", p.cl, p.cl_key, "2") && client("forge-client-2", p.cl2, p.cl2_key, "3") && client("forge-client-3", p.cl3, p.cl3_key, "4")
+            && req({"req", "-x509"}, {"-days", "1", "-subj", "/CN=forge-client", "-keyout", p.rogue_key, "-out", p.rogue});
+        std::error_code e; std::filesystem::remove(csr, e);
         return p;
     }();
     return p;
+}
+// SHA-256 fingerprint of a PEM certificate as the openssl CLI prints it ("AB:CD:..."), or "".
+static std::string cli_fingerprint(const std::string& pem) {
+    std::string out; if (!ossl({"x509", "-noout", "-fingerprint", "-sha256", "-in", pem}, &out)) return {};
+    auto eq = out.find('='); if (eq == std::string::npos) return {};
+    auto v = out.substr(eq + 1); while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back()))) v.pop_back(); return v;
 }
 static graph::rpc::client_security tls_tok(const std::string& t) { auto s = tok(t); s.tls.enabled = true; s.tls.ca_file = pki().srv; s.tls.server_name = "localhost"; return s; }
 
@@ -315,8 +415,65 @@ TEST(rpc_tls_channel_binding) {
     }
     srv.stop();
 }
+// mTLS client map: fingerprint and CN rules, intersection with token permissions, unmapped certificates refused,
+// and a certificate-only server (no tokens or keys) where a mapped certificate authenticates device ops.
+TEST(rpc_tls_client_map) {
+    if (!tls_or_skip()) return;
+    auto& p = pki(); CHECK(p.ok); namespace R = graph::rpc;
+    auto fp = cli_fingerprint(p.cl); CHECK_MSG(fp.size() == 95, "fingerprint '%s'", fp.c_str());   // AB:CD:... form
+    // cl: fingerprint rule (device only) wins over the CN rule for its CN (all); cl2: CN rule (all); cl3: unmapped
+    auto map = R::parse_client_map("allow=device sha256:" + fp + " laptop\ncn:forge-client\ncn:forge-client-2 ci\n");
+    auto cert = [&](R::client_security s, const std::string& crt, const std::string& key) { s.tls.cert_file = crt; s.tls.key_file = key; return s; };
+    auto script_ok = [](const std::string&, const std::string&, const std::vector<std::string>&, std::uint32_t) { return R::server::script_result{true, "", "", "ran"}; };
+    auto denied = [](auto&& fn) { return throws_with(fn, "permission denied"); };
+    std::mutex lm; std::string logs; auto logger = [&](const std::string& m) { std::lock_guard g(lm); logs += m + "\n"; };
+    {
+        R::server_security sec; sec.tls = {p.srv, p.srv_key, p.ca}; sec.client_map = map; sec.allow_scripts = true;
+        sec.tokens = R::parse_tokens("full\nallow=device dev\n");
+        auto key_id = ident(5); sec.authorized_keys = R::parse_authorized_keys("allow=scripts " + pubhex(*key_id) + " runner\n");
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.script_handler = script_ok; srv.log = logger; srv.start();
+        auto port = std::to_string(srv.port()); std::string why;
+        auto conn = [&](const R::client_security& s) { why.clear(); auto c = R::client::connect("127.0.0.1", port, &why, s); CHECK_MSG(c != nullptr, "%s", why.c_str()); return c; };
+        if (auto c = conn(cert(tls_tok("full"), p.cl, p.cl_key))) {        // full token & device cert = device
+            CHECK(relu_ok(*c)); CHECK(denied([&] { c->run_script("x"); }));
+        }
+        if (auto c = conn(cert(tls_tok("full"), p.cl2, p.cl2_key))) {      // full token & full cert = all
+            CHECK(relu_ok(*c)); CHECK(c->run_script("x").ok);
+        }
+        if (auto c = conn(cert(tls_tok("dev"), p.cl2, p.cl2_key))) {       // device token & full cert = device
+            CHECK(relu_ok(*c)); CHECK(denied([&] { c->run_script("x"); }));
+        }
+        auto ks = cert(tls_tok(""), p.cl, p.cl_key); ks.key = key_id;     // scripts key & device cert = nothing
+        if (auto c = conn(ks)) { CHECK(denied([&] { relu_ok(*c); })); CHECK(denied([&] { c->run_script("x"); })); }
+        why.clear(); CHECK(!R::client::connect("127.0.0.1", port, &why, cert(tls_tok("full"), p.cl3, p.cl3_key)));   // unmapped cert
+        CHECK_MSG(why.find("client certificate not authorized") != std::string::npos, "%s", why.c_str());
+        // a mapped certificate without a token: this server has tokens, so they are required
+        if (auto c = conn(cert(tls_tok(""), p.cl2, p.cl2_key))) CHECK(throws_with([&] { relu_ok(*c); }, "authentication required"));
+        CHECK(srv.scripts() == 1);
+        srv.stop();
+    }
+    {   // certificate-only server: a mapped certificate authenticates device ops; scripts cannot be enabled
+        R::server_security sec; sec.tls = {p.srv, p.srv_key, p.ca}; sec.client_map = map;
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.script_handler = script_ok; srv.log = logger; srv.start();
+        auto port = std::to_string(srv.port()); std::string why;
+        auto c = R::client::connect("127.0.0.1", port, &why, cert(tls_tok(""), p.cl, p.cl_key)); CHECK_MSG(c != nullptr, "%s", why.c_str());
+        if (c) { CHECK(relu_ok(*c)); CHECK(throws_with([&] { c->run_script("x"); }, "disabled")); }
+        auto c3 = R::client::connect("127.0.0.1", port, &why, cert(tls_tok(""), p.cl3, p.cl3_key)); CHECK(c3 != nullptr);   // TLS ok, then refused
+        if (c3) CHECK(throws_with([&] { relu_ok(*c3); }, "client certificate not authorized"));
+        CHECK(srv.ops() == 1);
+        srv.stop();
+        R::server_security s2 = sec; s2.allow_scripts = true;                // scripts still need tokens or keys
+        CHECK_THROWS(R::server(nullptr, 0, "127.0.0.1", s2));
+        R::server_security s3; s3.tls = {p.srv, p.srv_key}; s3.client_map = map; s3.tokens = {"t"};   // map without a client CA
+        CHECK_THROWS(R::server(nullptr, 0, "127.0.0.1", s3));
+    }
+    CHECK_MSG(logs.find("authenticated token#1 cert:sha256:") != std::string::npos && logs.find("(laptop) allow=device") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("authenticated token#2 cert:cn=forge-client-2 (ci) allow=device") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("(runner) cert:sha256:") != std::string::npos && logs.find("(laptop) allow=none") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("cn=forge-client-3 is not in the client map") != std::string::npos, "%s", logs.c_str());
+}
 TEST(rpc_tls_zz_cleanup) {
     if (!graph::rpc::tls_available()) return;
     auto& p = pki();
-    for (auto* f : {&p.srv, &p.srv_key, &p.ca, &p.ca_key, &p.cl, &p.cl_key, &p.rogue, &p.rogue_key}) { std::error_code ec; std::filesystem::remove(*f, ec); }
+    for (auto* f : {&p.srv, &p.srv_key, &p.ca, &p.ca_key, &p.cl, &p.cl_key, &p.cl2, &p.cl2_key, &p.cl3, &p.cl3_key, &p.rogue, &p.rogue_key}) { std::error_code ec; std::filesystem::remove(*f, ec); }
 }

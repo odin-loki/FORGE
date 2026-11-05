@@ -83,11 +83,14 @@ Lends a local device to other processes as a remote `rpc:host:port` device (see 
 | `--port N` | 7000 | Listen port |
 | `--bind ADDR` | `127.0.0.1` | Listen address. Without authentication on a non-loopback address it prints a warning |
 | `--device D` | `cpu` | Device to serve (`FORGE_DEVICE` syntax); falls back to the CPU if unavailable |
-| `--token T`, `--token-file F` | | Accept this bearer token (repeatable) |
+| `--token T` | | Accept this bearer token, full access (repeatable); `--token 'allow=device T'` limits it |
+| `--token-file F` | | One token per line: `[allow=device,scripts] <token> [name]`; a line without `allow=` has full access (repeatable) |
 | `--authorized-keys FILE` | | One key per line: `[allow=device,scripts] <64-hex key> [comment]`; a line without `allow=` has full access (repeatable) |
 | `--pubkey HEX\|FILE` | | Accept this Ed25519 public key (repeatable) |
 | `--tls-cert C --tls-key K` | | Serve TLS (needs a build with OpenSSL). Both or neither |
 | `--tls-client-ca CA.pem` | | Require a client certificate signed by this CA (mTLS); needs `--tls-cert`/`--tls-key` |
+| `--tls-client-map FILE` | | Accept only these client certificates: `[allow=...] sha256:<fingerprint>` or `cn:<name>` per line; permissions intersect with the token's or key's (repeatable) |
+| `--quiet` | off | No security log on stderr |
 | `--allow-scripts` | off | Run scripts sent by authenticated clients |
 | `--script-timeout MS` | 60000 | Upper limit per script |
 | `--script-mem-mb N` | 2048 | Memory limit per script process |
