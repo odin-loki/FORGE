@@ -147,6 +147,7 @@ TEST(spec_planner_and_ngram_index) {
     ngram_index none(3); none.push(std::vector<int>{1, 2, 3});
     CHECK(none.draft(4).empty());
 }
+static const std::string& model_h();
 TEST(lookup_planner_and_seed_exact) {
     // planner mode (k = 0) and sampling with a fixed seed: identical text to plain decoding (CPU logits)
     auto tm = model::open(model_a());
