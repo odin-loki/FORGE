@@ -32,6 +32,10 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_GRAPHS=0` | CUDA | Do not capture decode kernel launches into CUDA graphs (capture and replay are on by default) |
 | `FORGE_GRAPH_REPLAY=0` | CUDA | With decode graphs on: always re-capture instead of patching kernel parameters in place |
 | `FORGE_GRAPH_SEG` | CUDA | With decode graphs on: kernels per captured segment (default 64; 0 = no splitting) |
+| `FORGE_GRAPH_SEG0` | CUDA | Kernels in a run's first captured segment, doubling per segment up to `FORGE_GRAPH_SEG` (default 8; 0 = off) |
+| `FORGE_REPLAY_EAGER=0` | CUDA | Whole-run replay patches every segment before launching any (default: patch and launch one at a time) |
+| `FORGE_GPU_STAGE=0` | CUDA | Small host-to-device copies (≤ 4 KB) go from pageable memory instead of a page-locked staging ring |
+| `FORGE_CUDA_SCHED` | CUDA | `spin`, `yield` or `block`: the context's host wait mode (default auto) |
 | `FORGE_CUDA_IMAGE` | CUDA | Load only this embedded PTX image: `ptx` (sm_70) or `ptx sm_80`. By default `sm_80` is tried first, then `sm_70` |
 | `FORGE_MMA=0` | CUDA | Disable the int8 tensor-core prefill matmul (`sm_80` image) and the q6_k/q8_0 weight repacking; prefill uses MMQ |
 | `FORGE_MMA_BT` | CUDA | `64` or `128`: tokens per tensor-core matmul block (default: 64 for q4_k, 128 for q6_k/q8_0 when rows ≥ 128) |
@@ -41,6 +45,8 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_DELTA_RULE_R` | CUDA | If set, Gated DeltaNet uses the earlier register-state kernels `forge_delta_rule_r8/_r16/_r32` (a block per head and 32 columns) instead of the staged `_p8/_p16/_p32` |
 | `FORGE_CAUSAL_CONV_OLD` | CUDA, HIP | If set, the DeltaNet causal conv uses the per-channel `forge_causal_conv` kernel instead of the token-parallel `forge_causal_conv_t` |
 | `FORGE_MMVQ=0` | CUDA, HIP | Disable the q8_1/dp4a decode matmul kernels |
+| `FORGE_MMVQ_CPB` | CUDA, HIP | `1`, `2` or `4`: output columns per decode-matmul block (default: 2 for q4_k with k ≤ 6144, else 1) |
+| `FORGE_MMVQ_Q8V=0` | CUDA, HIP | q8_0 decode matmul uses the older 4-bytes-per-lane loop |
 | `FORGE_MMQ_MIN_ROWS` | CUDA, HIP | Rows at or above which quantised matmul uses the tiled MMA / MMQ kernels (default 16; 0 disables both) |
 | `FORGE_ATTN_DEC=0` | CUDA, HIP | Disable split-K decode attention |
 | `FORGE_GPU_NO_FA` | CUDA, HIP | If set, prefill attention does not use the flash-attention kernels (including the tiled `sm_80` ones) |

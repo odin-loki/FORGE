@@ -532,7 +532,10 @@ public:
     static std::uint32_t mmvq_cpb(std::uint32_t fmt, std::uint32_t k) {
         static const std::uint32_t forced = [] { auto* e = std::getenv("FORGE_MMVQ_CPB"); unsigned v = e ? unsigned(std::atoi(e)) : 0u; return v == 1 || v == 2 || v == 4 ? v : 0u; }();
         if (forced) return forced;
-        (void)fmt; (void)k; return 1;
+        // q4_k with up to 24 super-blocks per column: a 4-warp block takes 16 per step, so k = 4096 / 5120 leave
+        // most lanes idle on the second step; two columns per block (2 warps each, 8 per step) balance it
+        // (25600x5120: 93 -> 87 us, 12288x4096: 39 -> 35.5 us). q6_k, q8_0 and longer k: no gain.
+        return fmt == 2 && k <= 6144 ? 2 : 1;
     }
     // q8_0 decode (regrouped weights): 16-byte loads per lane; $FORGE_MMVQ_Q8V=0 keeps the 4-byte-per-lane loop
     static bool mmvq_q8v() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ_Q8V"); return !(e && std::string(e) == "0"); }(); return on; }
@@ -1299,7 +1302,12 @@ private:
         if (api_ == api::cuda && f_.device_get && f_.device_get(&dev, ordinal_) != 0) return "cuDeviceGet failed";
         char buf[256] = {}; f_.name(buf, sizeof buf, dev); name_ = buf;
         if (int v = 0; api_ == api::cuda && f_.dev_attr && f_.dev_attr(&v, 16 /* MULTIPROCESSOR_COUNT */, dev) == 0 && v > 0) sms_ = unsigned(v);
-        if (api_ == api::cuda) { if (f_.ctx_create(&ctx_, 0, dev) != 0) return "context creation failed"; }
+        if (api_ == api::cuda) {
+            // $FORGE_CUDA_SCHED: how a host thread waits on the device (auto | spin | yield | block): CU_CTX_SCHED_*
+            const char* sc = std::getenv("FORGE_CUDA_SCHED"); const std::string s = sc ? sc : "";
+            const unsigned fl = s == "spin" ? 1u : s == "yield" ? 2u : s == "block" ? 4u : 0u;
+            if (f_.ctx_create(&ctx_, fl, dev) != 0) return "context creation failed";
+        }
         else if (f_.set_device(ordinal_) != 0) return "hipSetDevice failed";
         if (f_.stream_create && f_.stream_create(&stream_, 1 /* non-blocking */) != 0) stream_ = nullptr;
         for (auto& [arch, img] : imgs) {
