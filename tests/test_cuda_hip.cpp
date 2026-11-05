@@ -190,7 +190,7 @@ template<class RT> static int fusion_check(RT& rt, const std::string& api) {
     // add + rms_norm: decode rows (q8_1 reduction; 1024 threads for one wide row), prefill rows (tree; q8r output when
     // cols % 256 == 0), in place (s = a) and out of place
     struct an { i64 rows, cols; bool inplace; };
-    for (auto c : {an{1, 4096, true}, an{3, 256, false}, an{2, 96, false}, an{40, 512, true}, an{20, 160, false}, an{70, 1024, false}}) {
+    for (auto c : {an{1, 4096, true}, an{3, 256, false}, an{2, 96, false}, an{40, 512, true}, an{20, 160, false}, an{70, 1024, false}, an{33, 2048, true}}) {
         const std::size_t N = std::size_t(c.rows * c.cols);
         auto a = rnd(N, 1), b = rnd(N, 2), w = rnd(std::size_t(c.cols), 3);
         std::vector<float> a2 = a, s1(N), y1(N), s2(N), y2(N);
@@ -238,7 +238,7 @@ template<class RT> static int fusion_check(RT& rt, const std::string& api) {
     // the same bits as a matmul that quantises the same input itself
     if (std::getenv("FORGE_FUSE_Q8R") == nullptr && rt.has_function("forge_quant_q8r")) {
         const auto* c4 = graph::codecs::find("q4_k");
-        const std::size_t R = 48, K = 512, C = 40, rb = c4->bytes(K);
+        const std::size_t R = 48, K = 1024, C = 40, rb = c4->bytes(K);
         auto x = rnd(R * K, 6), w = rnd(K, 7), wf = rnd(C * K, 8); std::vector<float> h(R * K), o1(R * C), o2(R * C), o3(R * C);
         std::vector<std::uint8_t> enc(C * rb); for (std::size_t j = 0; j < C; ++j) c4->encode(wf.data() + j * K, K, enc.data() + j * rb);
         rt.begin_run();   // uploads the weight (an upload drops the q8r tracking)

@@ -925,9 +925,11 @@ private:
         }
         return 0;
     }
-    // a prefill rms_norm output that the next matmul quantises for the tensor cores (run_qmatmul's MMA conditions)
+    // a prefill rms_norm output that the next matmul quantises for the tensor cores (run_qmatmul's MMA conditions).
+    // Only model-width rows (>= 1024): per-head norms (QK-norm, head dim <= 256) feed rope/attention, not a matmul, and
+    // emitting for them would also evict the q/k/v projections' shared input from the scratch.
     bool q8r_emit(std::uint32_t rows, std::uint32_t cols) {
-        return in_run_ && fuse_q8r() && use_mma() && rows >= mmq_min_rows() && cols % 256 == 0 &&
+        return in_run_ && fuse_q8r() && use_mma() && rows >= mmq_min_rows() && cols % 256 == 0 && cols >= 1024 &&
                has_fn_locked("forge_quant_q8r") && has_fn_locked("forge_rms_norm_f");
     }
     // the q8r scratch laid out as run_qmatmul's MMA path expects: int8 rows (padded to 256 bytes), then (d, d*sum) pairs
@@ -1109,9 +1111,14 @@ private:
         return true; }
     int htod_or_zero(std::uint64_t d, const void* h, std::size_t n, void* st) {
         if (f_.memset32 && n >= (64u << 10) && n % 4 == 0 && all_zero(h, n)) {
-            flush(); q81_drop(); dirty_ |= in_run_; ++stats_.zero_fills; return f_.memset32(d, 0u, n / 4, st); }
+            flush(); q_written(d, n); dirty_ |= in_run_; ++stats_.zero_fills; return f_.memset32(d, 0u, n / 4, st); }
         return htod_s(d, h, n, st); }
-    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q81_drop(); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
+    // a copy wrote device range [d, d + n): drop the quantised-activation scratches whose source it overlaps
+    void q_written(std::uint64_t d, std::size_t n) {
+        if (q81_src_ && d < q81_src_ + std::uint64_t(q81_n_) * 128 && q81_src_ < d + n) q81_src_ = 0;
+        if (q8r_src_ && d < q8r_src_ + q8r_n_ * 4 && q8r_src_ < d + n) q8r_src_ = 0;
+    }
+    int htod_s(std::uint64_t d, const void* h, std::size_t n, void* st) { flush(); q_written(d, n); dirty_ |= in_run_; cuda_hip::count(counters().htod); return f_.htod_async(d, h, n, st); }
     int dtoh_s(void* h, std::uint64_t d, std::size_t n, void* st) { flush(); dirty_ |= in_run_; cuda_hip::count(counters().dtoh); return f_.dtoh_async(h, d, n, st); }
     int free_s(std::uint64_t p) { flush(); q81_drop(); dirty_ |= in_run_; return dfree(p); }
     // ---- device memory accounting (gpu/device_memory.hpp) ----
@@ -1158,7 +1165,7 @@ private:
     // device-to-device copy on the stream; inside a graph-mode run it is a kernel (forge_copy_words), so segments hold
     // kernel nodes only and replay can patch them
     int dtod_s(std::uint64_t d, std::uint64_t s, std::size_t n) {
-        cuda_hip::count(counters().dtod); q81_drop();
+        cuda_hip::count(counters().dtod); q_written(d, n);
         if (in_run_ && gmode() && n % 4 == 0 && n / 4 < (1ull << 32) && has_fn_locked("forge_copy_words")) {
             std::uint32_t w = std::uint32_t(n / 4); void* args[] = {&s, &d, &w}; writes(d, n);
             return w ? launch_s(function("forge_copy_words"), (w + 255) / 256, 1, 1, 256, 1, 1, 0, stream_, args, nullptr) : 0;
