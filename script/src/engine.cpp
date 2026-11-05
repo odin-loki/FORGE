@@ -50,32 +50,19 @@ struct engine::impl {
         return r;
     }
     // .fsc lookup/store; returns null to make exec() parse normally (syntax errors are reported there).
+    // The cached tree still goes through the static checks and the VM verifier in exec(), so the cache only
+    // skips lexing, parsing and resolution (fsc.hpp has the trust model).
     std::shared_ptr<const FnDecl> cached_parse(std::string_view src, const std::string& name) {
         if (fsc_dir.empty()) { cache = "off"; return nullptr; }
         auto key = fsc::key_of(src, name);
-        auto path = fsc::path_for(fsc_dir, key);
-        fsc::trust t = fsc_trust;
-        if (!dir_private(fsc_dir)) t.require_signed = true;
         std::string why = "no cache file";
-        if (auto b = os::read_file(path)) {
-            std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(b.value.data()), b.value.size());
-            if (auto f = fsc::decode(bytes, key, t, &why)) { cache = "hit"; return *f; }
-        }
+        if (auto f = fsc::load(fsc_dir, key, fsc_trust, &why)) { cache = "hit"; return *f; }
         std::shared_ptr<const FnDecl> top;
         try { top = parse_program(src, name); } catch (...) { cache = "miss: syntax error"; return nullptr; }
         auto enc = fsc::encode(*top, key, fsc_seed ? &*fsc_seed : nullptr);
-        std::error_code ec; std::filesystem::create_directories(fsc_dir, ec);
-        auto w = os::fs::write_file_atomic(path, std::string_view(reinterpret_cast<const char*>(enc.data()), enc.size()), 0600);
-        cache = w ? "miss (stored): " + why : "miss: " + why + "; store failed: " + w.err.what;
+        std::string err;
+        cache = fsc::store(fsc_dir, key, enc, fsc_seed.has_value(), &err) ? "miss (stored): " + why : "miss: " + why + "; not stored: " + err;
         return top;
-    }
-    static bool dir_private(const std::string& d) {
-#if defined(_WIN32)
-        (void)d; return false;   // no cheap owner/ACL check: Windows caches must be signed
-#else
-        struct stat st{}; if (::stat(d.c_str(), &st) != 0) return true;   // created below with our umask, by us
-        return st.st_uid == ::geteuid() && !(st.st_mode & (S_IWGRP | S_IWOTH));
-#endif
     }
     result exec(std::string_view src, const std::string& name, bool vm, bool want_value, std::shared_ptr<const FnDecl> top = nullptr) {
         result r;

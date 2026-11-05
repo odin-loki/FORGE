@@ -12,13 +12,14 @@ CI is `.github/workflows/ci.yml`; it runs on every pull request and every push t
 | Linux x86_64, Clang 18 | CI `linux-clang` | same, 111/111 | Ubuntu 24.04 |
 | Linux, ASan + UBSan | CI `linux-asan` | `test_script` only | Clang 18, `FORGE_SANITIZE=ON` |
 | Linux, TSan | CI `linux-tsan` | `test_script` only | Clang 18, `FORGE_TSAN=ON` |
+| Linux, Vulkan on lavapipe | CI `linux-vulkan` | `test_vulkan`, `test_vulkan_align256`, `golden_tiny_llama_vulkan`, `golden_moe_mla_vulkan` (added 2026-11-05; first CI run pending) | GCC 14, Ubuntu `glslang-tools` + `libvulkan-dev` + `mesa-vulkan-drivers`; loader pinned to the lavapipe ICD |
 | macOS | CI `macos` | ctest 111/111, including `test_gpu_metal` | `macos-latest` runner, Xcode toolchain |
-| iOS | CI `ios` | **nothing run** | `forge_c` static library built with Xcode, signing off; tests, apps and examples off |
+| iOS | CI `ios` | `test_os`, `test_text`, `test_locale`, `test_mobile`, `test_util` in an arm64 iPhone simulator via `xcrun simctl spawn` (added 2026-11-05; first CI run pending) | `forge_c`, `forge_mobile`, `forge_text` built with Xcode for device, signing off; tests built with Ninja for the simulator (`FORGE_IOS_SIMULATOR=ON`, arm64) |
 | Windows, MSVC | CI `windows-msvc` | ctest 106/106; script emit goldens | `windows-latest`, Ninja + `cl` |
 | Windows, MinGW | CI `windows-mingw` | ctest: 84 run, all pass | MSYS2 UCRT64 GCC |
 | FreeBSD 14.3 | CI `freebsd` | ctest `-LE "slow\|emu\|gpu"`: 60/60 | `vmactions/freebsd-vm` VM on Ubuntu |
 | Android arm64-v8a | CI `android` | build only | NDK, `tests/mobile_build.sh` |
-| Android x86_64 | CI `android` | `test_script` and `--emit android` goldens on an API 34 emulator | NDK build of `forge`, `test_script`, the example plugin; KVM emulator |
+| Android x86_64 | CI `android` | `test_script`, `--emit android` goldens, `test_mobile`, `test_locale`, `test_text`, `test_os`, `test_os_ext`, `test_os_sys`, `test_util`, `test_loadbalancer` on an API 34 emulator (the last five added 2026-11-05; first CI run pending) | NDK build of `forge`, `test_script`, the example plugin; KVM emulator |
 | Android, physical device | no | never | — |
 | Linux aarch64 (SVE) | locally, zig cross | under qemu-user only (2026-10-31: 50/54, see changelog) | `qemu-aarch64 -cpu max,sveN=on` |
 | Linux riscv64 (RVV) | locally, zig cross | under qemu-user only (same) | `qemu-riscv64 -cpu rv64,v=true,vlen=N` |
@@ -40,7 +41,7 @@ found and tested. The other shells in the job's install list were not present in
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
 | Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering) | MSL host syntax check | `macos` |
-| Vulkan | **never** on a GPU | Mesa lavapipe (local, historical); SwiftShader in the Android emulator (local) | compiled out in every CI job (no `glslangValidator`) |
+| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe); SwiftShader in the Android emulator (local) | `linux-vulkan` on lavapipe; compiled out in every other job |
 
 `test_gpu_metal` passing means the runtime opened a device and all checks passed; the device name is not in the
 CI log because ctest only prints output on failure.
@@ -73,17 +74,18 @@ Greedy output is identical with CUDA graphs on and off.
 
 ## Known gaps
 
-- iOS: built in CI, never run. The Swift package and XCTest have not been run.
-- Android: never run on a physical device. CI runs only `test_script` on the emulator.
+- iOS: CI runs five test executables in the simulator only; never run on a device. The Swift package and XCTest have
+  not been run.
+- Android: never run on a physical device. CI runs `test_script` and eight other suites on the x86_64 emulator; the
+  rest of the suite (`test_inference` and other heavy tests) is not run there.
 - HIP, OpenCL and Level Zero have never run on real hardware. Vulkan has never run on a real GPU.
 - CUDA: one GPU model (RTX 3090). No multi-GPU or peer-copy test on hardware.
-- Vulkan is not built in CI.
+- Vulkan is built and tested in CI only on lavapipe (`linux-vulkan`); every other job compiles it out.
 - `test_rpc_tls` skips on Windows CI: its `openssl` CLI probe redirects to `/dev/null`, which `cmd` does not have.
 - AMX/SME: AMX ran natively and under Intel SDE; SME only under qemu.
 - GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open;
   graphs recorded before an eviction must not be replayed after it.
 - RPC: tokens have full access; client-certificate identities are not mapped to permissions.
-- `.fsc` script cache has no tests.
 - Not tested anywhere: hybrid P/E cores, multi-node NUMA, batteries and thermal sensors, running under
   systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox decode, CUDA graphics interop.
 - Security gaps: [security.md](security.md#known-gaps).

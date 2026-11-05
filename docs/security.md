@@ -111,7 +111,7 @@ on Linux, macOS and FreeBSD CI; it skips on Windows CI because its `openssl` CLI
 | `verify_signature(reader, trusted)`: with no trusted keys, any valid signature passes (integrity only, not provenance). | `sign.hpp` |
 | `.fpk` encryption: the data section sealed with XChaCha20-Poly1305 (vendored Monocypher). `forge encrypt`; key from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Metadata opens without the key. | `modelfile/include/forge/modelfile/fpk.hpp` |
 | Signed bundles: Ed25519 over a `FORGE-SIGNATURE.json` manifest of (path, size, BLAKE3) for a directory. Verification re-hashes and reports modified, missing and unsigned extra files; multiple signers; paths that escape the root are refused. Also `sign_bytes`/`verify_bytes` with a domain-separation context. Library API only, no CLI command. Test: `test_bundle_sign`. | `modelfile/include/forge/modelfile/bundle.hpp` |
-| Script cache `.fsc`: BLAKE3 key, optional Ed25519 signature (`--cache-dir`, `--cache-trust`, `--cache-require-signed`, `--cache-sign-seed`). Signatures are required when the cache directory is not private. No test. | `script/src/fsc.cpp`, `engine.cpp` |
+| Script cache `.fsc`: BLAKE3 key, optional Ed25519 signature (`--cache-dir`, `--cache-trust`, `--cache-require-signed`, `--cache-sign-seed`). Signatures are required when the cache directory is not private. Tests: `tests/test_script_fsc.cpp`, fuzz `fuzz/fuzz_fsc.cpp`. | `script/src/fsc.cpp`, `engine.cpp` |
 | Release artefacts | `tools/release.py`, docs/RELEASING.md |
 
 ## Secrets at rest (`os/include/forge/os/keystore.hpp`)
@@ -183,7 +183,6 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 - Keystore file backend: unless a passphrase or the TPM wraps the store key, same-user code can read it. TPM
   sealing has no PCR policy, so it binds the key to the machine but not to a boot state, and a process running as
   the same user can still ask the TPM to unseal it.
-- `.fsc` script cache has no tests.
 - `forge-serve --kv-spill` writes KV-cache data (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
   (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
   destroyed). Use a private directory if prompts are sensitive.

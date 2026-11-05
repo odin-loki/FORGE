@@ -35,7 +35,7 @@ struct options {
     // ForgeScript treats this as a core guarantee: it is on by default whenever a capability is turned off.
     enum class os_sandbox_mode { off, best_effort, require };
     os_sandbox_mode os_sandbox = os_sandbox_mode::best_effort;
-    // .fsc cache (docs/scripting.md "Bytecode cache"): run_file() stores the parsed, resolved program under
+    // .fsc cache (docs/scripting.md ".fsc parse cache"): run_file() stores the parsed, resolved program under
     // <dir>/<BLAKE3 key>.fsc and reuses it while the source, file name and VM version are unchanged.
     // Empty dir = $FORGE_SCRIPT_CACHE, and if that is unset the cache is off. Unsigned cache files are trusted
     // only from a directory owned by the current user and not writable by group/other (POSIX); otherwise, or
@@ -96,7 +96,7 @@ public:
     std::string stats();
     // What os_sandbox did: e.g. "seccomp", "pledge", "off", or "failed: <reason>".
     const std::string& sandbox_status() const;
-    // What the .fsc cache did on the last run_file(): "off", "hit", "miss (stored)", "miss: <reason>".
+    // What the .fsc cache did on the last run_file(): "off", "hit", "miss (stored): <reason>", "miss: <reason>".
     const std::string& cache_status() const;
 
     // ---- host bindings (embedding): native C++ functions callable from scripts, and script callbacks the host
