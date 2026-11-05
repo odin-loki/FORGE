@@ -59,8 +59,10 @@ CUDA embeds two PTX images built from the same `kernels.cu`: `ptx sm_80` (`kerne
 | rms_norm | `forge_rms_norm_b` (block per row) | when present | |
 | q8_1 fusion | `forge_rms_norm_q81`, `forge_silu_mul_q81` also write the q8_1 form of their output for the next matmul. `forge_rms_norm_q81` reduces with warp shuffles and uses one 1024-thread block for a wide row (rows ≤ 4, cols ≥ 2048) | decode rows inside a run, with MMVQ on | `FORGE_FUSE_Q81=0` |
 | Broadcast add/sub/mul/div | `forge_bcast` | the smaller shape is a suffix of the larger | |
-| Gated DeltaNet state ops | `forge_delta_rule_r8` / `_r16` / `_r32`: the recurrent state in registers, a 256-thread block per (value head, 32 state columns) | CUDA (both images), inside a run; dk ∈ {64, 128, 256}, dv % 32 = 0 | `FORGE_DELTA_RULE_OLD` (any value) |
-| | `forge_delta_rule` (dk ≤ 256), `forge_causal_conv` (kernel width 1–9) | inside a run; state slot stays resident | `FORGE_GPU_NO_STATE_OPS` (any value) |
+| Gated DeltaNet state ops | `forge_delta_rule_p8` / `_p16` / `_p32`: the recurrent state in registers, a 64-thread block per (value head, 8 state columns); tokens in chunks of 4, the next chunk's q/k/v/g/beta loaded and l2-normalised into a double-buffered shared tile while the current one is computed. Bitwise the same results as `_rN` | CUDA (both images), inside a run; dk ∈ {64, 128, 256}, dv % 8 = 0 | `FORGE_DELTA_RULE_R` (any value) |
+| | `forge_delta_rule_r8` / `_r16` / `_r32`: the state in registers, a 256-thread block per (value head, 32 state columns), q/k read per token | with `FORGE_DELTA_RULE_R`; dv % 32 = 0 | `FORGE_DELTA_RULE_OLD` (any value) |
+| | `forge_causal_conv_t`: a thread per (channel, 8 tokens), kernel width 1–9 | inside a run | `FORGE_CAUSAL_CONV_OLD` (any value) |
+| | `forge_delta_rule` (dk ≤ 256), `forge_causal_conv` (a thread per channel; kernel width 1–9) | inside a run; state slot stays resident | `FORGE_GPU_NO_STATE_OPS` (any value) |
 | Device copies | `forge_copy2d` (concat), `forge_copy_words` (copies inside a captured segment) | | |
 
 Encoded weights (q8_0, q4_k, q6_k, q5_k) are uploaded once and stay on the device. With the `sm_80` image and both MMA and MMVQ on, two codecs are repacked on upload so the kernels can use aligned 16-byte loads (k % 256 = 0 only): q6_k blocks are padded from 210 to 224 bytes (about 6.7% more device memory), and q8_0 is regrouped so each 8 blocks become 8 fp16 scales followed by 256 int8 values (272 bytes, the same size). Decode MMVQ reads both layouts; q4_k reads its 16-byte super-block header in one load. Consecutive decode matmuls that read the same activation reuse its q8_1 form instead of re-quantising.
@@ -143,6 +145,8 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | `FORGE_MMA` | on | CUDA | `0`: no int8 tensor-core prefill matmul (and no q6_k/q8_0 repacking); MMQ is used instead |
 | `FORGE_MMA_BT` | per codec | CUDA | `64` or `128`: tokens per MMA block |
 | `FORGE_DELTA_RULE_OLD` | unset | CUDA | Set: use `forge_delta_rule` instead of the register-state kernels |
+| `FORGE_DELTA_RULE_R` | unset | CUDA | Set: use the `forge_delta_rule_rN` register-state kernels instead of the staged `_pN` ones |
+| `FORGE_CAUSAL_CONV_OLD` | unset | CUDA/HIP | Set: use the per-channel `forge_causal_conv` instead of `forge_causal_conv_t` |
 | `FORGE_FUSE_Q81` | on | CUDA/HIP | `0`: rms_norm/silu_mul do not emit q8_1 |
 | `FORGE_GPU_QMATMUL` | on | CUDA/HIP | `0`: no device quantised matmul; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` |
 | `FORGE_GPU_QGATHER` | on | CUDA/HIP | `0`: no device quantised gather |
