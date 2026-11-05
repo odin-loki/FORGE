@@ -55,16 +55,17 @@ Wine, the Android emulator and qemu: see [building.md](building.md). Results per
 | Job | Runner | What it does |
 |-----|--------|--------------|
 | `linux-gcc`, `linux-clang` | ubuntu-24.04 | `dev` preset with g++-14 / clang-18 and ccache; `ctest -LE "slow|emu"` |
+| `linux-vulkan` | ubuntu-24.04 | g++-14 with glslang, Vulkan headers and Mesa lavapipe; builds `forge` and `test_vulkan`, checks `test_vulkan` reports an `llvmpipe` device (a skip fails the job), then `ctest -R vulkan` (both `test_vulkan` runs and the two Vulkan goldens) |
 | `linux-asan`, `linux-tsan` | ubuntu-24.04 | clang-18 with `FORGE_SANITIZE` (Debug) / `FORGE_TSAN`; builds and runs `test_script` only |
 | `shells` | ubuntu-24.04 | Installs many shells; runs `FORGE_TEST_ONLY=emit test_script` |
 | `macos` | macos-latest | `dev` preset; `ctest -LE "slow|emu"` |
-| `ios` | macos-latest | Xcode build of `forge_c` with `ios.cmake`; no tests |
+| `ios` | macos-latest | Xcode device build of `forge_c`, `forge_mobile`, `forge_text` with `ios.cmake`; then a Ninja arm64 simulator build of `test_os`, `test_text`, `test_locale`, `test_mobile`, `test_util`, run in a booted iPhone simulator with `xcrun simctl spawn` (`.github/ios_sim_check.sh`) |
 | `windows-msvc` | windows-latest | MSVC, Ninja; `ctest -LE "slow|emu"`, then the emitted cmd/pwsh/PowerShell goldens |
 | `windows-mingw` | windows-latest | MSYS2 UCRT64 GCC; `ctest -LE "slow|emu"` |
 | `freebsd` | FreeBSD 14.3 VM | Native build; `ctest -LE "slow|emu|gpu"` |
-| `android` | ubuntu-24.04 + API 34 x86_64 emulator | NDK cross builds; `--emit android` goldens and `test_script` on the emulator |
+| `android` | ubuntu-24.04 + API 34 x86_64 emulator | NDK cross builds; `--emit android` goldens, `test_script`, `test_mobile`, `test_locale`, `test_text`, `test_os`, `test_os_ext`, `test_os_sys`, `test_util` and `test_loadbalancer` on the emulator (`.github/android_check.sh`) |
 
-No CI job has `glslangValidator`, so the Vulkan backend and its tests are compiled out in CI. `test_rpc_tls` skips on Windows CI (its `openssl` probe redirects to `/dev/null`). Pass counts per job: [STATUS.md](STATUS.md).
+Only `linux-vulkan` installs `glslangValidator` and the Vulkan headers; every other job compiles the Vulkan backend and its tests out. To reproduce `linux-vulkan` locally, set `VK_ICD_FILENAMES` and `VK_DRIVER_FILES` to the lavapipe ICD (`/usr/share/vulkan/icd.d/lvp_icd*.json`) so the loader cannot pick a real GPU. `test_rpc_tls` skips on Windows CI (its `openssl` probe redirects to `/dev/null`). Pass counts per job: [STATUS.md](STATUS.md).
 
 `ci/run-local.sh [job...]` mirrors these jobs with user-local toolchains for a machine without GitHub Actions. It hard-codes default toolchain paths under `/workspace` that you override with environment variables (`LLVM`, `MINGW_TC`, `WINE`, `ZIG`, `NDK`, `SHELL_DIRS`, ...). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`.
 
