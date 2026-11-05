@@ -271,6 +271,72 @@ TEST(qdot_matches_decode_exactly) {
     }
 }
 
+// Integer matvec (simd/qdot_i8.hpp): every ISA table this machine runs gives the scalar reference's bits, for
+// quantisation and products, and a vector's result does not depend on how many vectors ran with it. The
+// result stays close to the f32 product of the decoded weights (int8 activations: ~0.5% of sum |x*w|).
+TEST(qdot_i8_matches_reference_on_every_isa) {
+    std::mt19937 r(5);
+    const auto* ref = simd::qi8_by_name("scalar");
+    CHECK(ref != nullptr);
+    std::printf("  qi8 active: %s\n", simd::qi8_active().target);
+    for (const char* cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) {
+        const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
+        for (std::size_t k : {std::size_t(256), std::size_t(1280)}) {
+            const std::size_t rows = 37, nvmax = 13, rb = c->bytes(k), ab = simd::qi8::act_bytes(fmt, k);
+            CHECK(simd::qi8::supported(fmt, k));
+            auto W = verify::random_tensor({i64(rows), i64(k)}, r, -2, 2);
+            auto X = verify::random_tensor({i64(nvmax), i64(k)}, r, -1, 1);
+            for (std::size_t i = 0; i < X.data.size(); i += 7) X.data[i] *= 1e-3f;   // small values next to large ones
+            std::vector<u8> enc(rows * rb);
+            for (std::size_t j = 0; j < rows; ++j) c->encode(W.data.data() + j * k, k, enc.data() + j * rb);
+            std::vector<simd::qi8::act_k> abuf_ref((nvmax * ab) / sizeof(simd::qi8::act_k) + 1), abuf((nvmax * ab) / sizeof(simd::qi8::act_k) + 1);
+            auto* aref = reinterpret_cast<u8*>(abuf_ref.data()); auto* aq = reinterpret_cast<u8*>(abuf.data());
+            for (std::size_t v = 0; v < nvmax; ++v) ref->quantize(fmt, X.data.data() + v * k, k, aref + v * ab);
+            std::vector<float> yref(nvmax * rows), y(nvmax * rows), y1(rows);
+            ref->matvec(fmt, enc.data(), rb, rows, aref, ab, k, nvmax, yref.data(), rows);
+            // accuracy vs f32 decode + dot
+            std::vector<float> wd(k);
+            for (std::size_t j = 0; j < rows; ++j) {
+                c->decode(enc.data() + j * rb, k, wd.data());
+                for (std::size_t v = 0; v < nvmax; ++v) {
+                    double exact = 0, mag = 0;
+                    for (std::size_t i = 0; i < k; ++i) { exact += double(wd[i]) * X.data[v * k + i]; mag += std::fabs(double(wd[i]) * X.data[v * k + i]); }
+                    CHECK_MSG(std::fabs(yref[v * rows + j] - exact) <= 0.01 * mag + 1e-6, "%s k=%zu row %zu vec %zu: %g vs %g (|.|=%g)", cn, k, j, v,
+                              double(yref[v * rows + j]), exact, mag);
+                }
+            }
+            for (const char* tgt : {"scalar", "avx2", "avxvnni", "avx512vnni"}) {
+                const auto* ker = simd::qi8_by_name(tgt);
+                if (!ker) continue;
+                for (std::size_t v = 0; v < nvmax; ++v) ker->quantize(fmt, X.data.data() + v * k, k, aq + v * ab);
+                CHECK_MSG(std::memcmp(aq, aref, nvmax * ab) == 0, "%s/%s k=%zu: quantised activations differ", tgt, cn, k);
+                for (std::size_t nv : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(5), std::size_t(8), std::size_t(9), nvmax}) {
+                    std::fill(y.begin(), y.end(), -1.f);
+                    ker->matvec(fmt, enc.data(), rb, rows, aref, ab, k, nv, y.data(), rows);
+                    CHECK_MSG(std::memcmp(y.data(), yref.data(), nv * rows * 4) == 0, "%s/%s k=%zu nv=%zu: differs from the scalar reference", tgt, cn, k, nv);
+                }
+                for (std::size_t v = 0; v < nvmax; ++v) {   // one vector at a time, in odd row slices
+                    for (std::size_t r0 = 0; r0 < rows; r0 += 11) ker->matvec(fmt, enc.data() + r0 * rb, rb, std::min<std::size_t>(11, rows - r0), aref + v * ab, ab, k, 1, y1.data() + r0, rows);
+                    CHECK_MSG(std::memcmp(y1.data(), yref.data() + v * rows, rows * 4) == 0, "%s/%s k=%zu: vector %zu alone differs from the batch", tgt, cn, k, v);
+                }
+            }
+        }
+    }
+    // the whole graph path: a batch of activation rows gives each row's single-row bits
+    for (const char* cn : {"q4_k", "q6_k", "q8_0"}) {
+        const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
+        const std::size_t n = 300, k = 512, m = 21, rb = c->bytes(k);
+        auto W = verify::random_tensor({i64(n), i64(k)}, r, -1, 1); auto X = verify::random_tensor({i64(m), i64(k)}, r, -1, 1);
+        std::vector<u8> enc(n * rb); for (std::size_t j = 0; j < n; ++j) c->encode(W.data.data() + j * k, k, enc.data() + j * rb);
+        std::vector<float> yb(m * n), ys(n);
+        qweights::gemm_nt_i8(fmt, enc.data(), rb, n, X.data.data(), m, k, yb.data());
+        for (std::size_t i = 0; i < m; ++i) {
+            qweights::gemm_nt_i8(fmt, enc.data(), rb, n, X.data.data() + i * k, 1, k, ys.data());
+            CHECK_MSG(std::memcmp(ys.data(), yb.data() + i * n, n * 4) == 0, "%s: gemm_nt_i8 row %zu differs between m=%zu and m=1", cn, i, m);
+        }
+    }
+}
+
 #include <forge/graph/autodiff.hpp>
 // Reverse-mode gradients vs central finite differences (double-precision forward via the same plan in f32,
 // so the tolerance is loose but the check catches wrong formulas immediately).
@@ -357,6 +423,7 @@ TEST(resident_backend_quantised_weight_budget) {
     setb("");
     CHECK(q0);    // budget 0: the weight stays encoded (CPU quantised matmul)
     CHECK(!q1);   // ample budget: decoded to f32 for the device
-    auto cmp = verify::compare(y0, y1, {ops::tol_kind::rel, 1e-4});
+    // the encoded CPU path quantises activations to int8 (simd/qdot_i8.hpp) unless FORGE_CPU_INT8=0
+    auto cmp = verify::compare(y0, y1, {ops::tol_kind::rel, qweights::int8_enabled() ? 1e-2 : 1e-4});
     CHECK_MSG(cmp.ok, "%s", cmp.message.c_str());
 }

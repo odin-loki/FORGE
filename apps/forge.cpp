@@ -15,6 +15,8 @@
 #include <sstream>
 #include <mutex>
 #include <chrono>
+#include <random>
+#include <forge/simd/qdot_i8.hpp>
 #include <forge/gpu/prims.hpp>
 #include <forge/gpu/cuda.hpp>
 #include <forge/script/script.hpp>
@@ -62,7 +64,7 @@ int usage() {
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
         "      [--grammar file.gbnf] [--draft draft.fpk [--spec-k 4]] [--codec C (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
-        "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512\n"
+        "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512  |  bench --kernels 1024 (MB, quantised matvec GB/s)\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
         "  sign <model.fpk> --key <name.key> [-o out.fpk]   add/extend the signature section\n"
@@ -383,8 +385,54 @@ int cmd_bench_gemm(int n) {
     return 0;
 }
 
+// Quantised matvec bandwidth per weight format: a matrix of `mb` MB (well past the last-level cache) times 1..8
+// activation vectors, on the integer kernels and on the f32 decode + dot path, with every pool thread.
+int cmd_bench_kernels(int mb) {
+    using namespace forge::graph;
+    const std::size_t k = 4096;
+    std::mt19937 rng(1);
+    std::printf("quantised matvec, k=%zu, %d MB matrix, %u threads, integer kernels: %s, prefetch %d B\n", k, mb, task::pool::global().size(),
+                simd::qi8_active().target, simd::qi8_prefetch_bytes);
+    for (const char* cn : {"q4_k", "q5_k", "q6_k", "q8_0"}) {
+        const auto* c = codecs::find(cn); const int fmt = qweights::fmt_of(c);
+        const std::size_t rb = c->bytes(k), n = std::size_t(mb) * 1000000 / rb, bytes = n * rb;
+        std::vector<std::uint8_t> w(bytes);
+        for (auto& b : w) b = std::uint8_t(rng());
+        const std::uint16_t one = 0x2000;   // a small finite f16 for every scale field
+        for (std::size_t j = 0; j < n * (k / c->block); ++j) {
+            std::uint8_t* blk = w.data() + j * c->block_bytes;
+            if (c->name == "q6_k") std::memcpy(blk + 208, &one, 2);
+            else { std::memcpy(blk, &one, 2); if (c->name != "q8_0") std::memcpy(blk + 2, &one, 2); }
+        }
+        std::vector<float> x(8 * k), y(8 * n);
+        for (auto& v : x) v = float(rng() % 2001) / 1000.f - 1.f;
+        auto timeit = [&](auto&& f) {
+            f(); double best = 1e30;
+            for (int rep = 0; rep < 5; ++rep) {
+                auto t0 = std::chrono::steady_clock::now(); f();
+                best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+            return best;
+        };
+        std::printf("  %-5s", cn);
+        for (std::size_t nv : {1, 2, 4, 8}) {
+            double s = timeit([&] { qweights::gemm_nt_i8(fmt, w.data(), rb, n, x.data(), nv, k, y.data()); });
+            std::printf("  int8 nv=%zu %6.1f GB/s", nv, double(bytes) / s / 1e9);
+        }
+        double s = timeit([&] {
+            task::parallel_for(n, 8, [&](std::size_t b, std::size_t e) {
+                const auto& ker = simd::active();
+                for (std::size_t j = b; j < e; ++j) y[j] = ker.qdot(fmt, w.data() + j * rb, x.data(), k, c->decode, c->block, c->block_bytes);
+            });
+        });
+        std::printf("  | f32 nv=1 %6.1f GB/s\n", double(bytes) / s / 1e9);
+    }
+    return 0;
+}
+
 int cmd_bench(const args& a) {
     if (a.kv.count("gemm")) return cmd_bench_gemm(int(a.num("gemm", 512)));
+    if (a.kv.count("kernels")) return cmd_bench_kernels(int(a.num("kernels", 1024)));
     if (a.pos.empty()) return usage();
     activate_policy(a.get("policy"));
     inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")));
