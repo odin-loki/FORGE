@@ -755,7 +755,8 @@ public:
                 const unsigned tcd = k <= 64 && u6 <= 64 ? 64 : small ? 128 : 256;
                 const std::string tcn = "forge_attention_fa2tc_d" + std::to_string(tcd);
                 if (fa_tc() && has_fn_locked(tcn)) {
-                    fn = function(tcn); bq = 64; block = 128; smem = 2 * (tcd == 64 ? 64 : 32) * (tcd + 8) * 2; ++dispatches_["attention_fa2tc"];
+                    fn = function(tcn); bq = 64; block = 128; smem = (tcd == 64 ? 128 : 64) * (tcd + 8) * 2;   // max(2 BK, 64) rows (BK 64, 32, 16)
+                    ++dispatches_["attention_fa2tc"];
                 } else {
                     fn = function(small ? "forge_attention_fa2_d128" : "forge_attention_fa2_d256"); block = 256;
                     smem = small ? (64 * 132 + 32 * 132 + 32 * 128 + 64 * 33) * 4 : (32 * 260 + 16 * 260 + 16 * 256 + 32 * 17) * 4; }
