@@ -37,6 +37,9 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_MMA_BT` | CUDA | `64` or `128`: tokens per tensor-core matmul block (default: 64 for q4_k, 128 for q6_k/q8_0 when rows ≥ 128) |
 | `FORGE_MMA_SPLITK=0` | CUDA | Turns off split-K for tensor-core matmuls whose grid cannot fill the GPU (k/v projections, DeltaNet a/b); on by default |
 | `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
+| `FORGE_CPU_ATTN` | CPU | `old` selects the previous per-(token, head) attention kernel instead of the chunked GQA-shared one (`graph/attn_cpu.hpp`; f32 and int8 KV) |
+| `FORGE_CPU_DELTA` | CPU | `old` selects the previous two-pass delta_rule instead of the column-blocked one-pass kernel |
+| `FORGE_OP_TIME` | CPU executor | `1`: wall time per op kind (attention split by KV codec, state ops by fn), printed at exit |
 | `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
 | `FORGE_DELTA_RULE_R` | CUDA | If set, Gated DeltaNet uses the earlier register-state kernels `forge_delta_rule_r8/_r16/_r32` (a block per head and 32 columns) instead of the staged `_p8/_p16/_p32` |
 | `FORGE_CAUSAL_CONV_OLD` | CUDA, HIP | If set, the DeltaNet causal conv uses the per-channel `forge_causal_conv` kernel instead of the token-parallel `forge_causal_conv_t` |

@@ -6,6 +6,7 @@
 #include <forge/core/log.hpp>
 #include <forge/graph/ir.hpp>
 #include <forge/graph/kv_codec.hpp>
+#include <forge/graph/attn_cpu.hpp>
 #include <forge/gpu/prims.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/verify/oracle.hpp>
@@ -197,6 +198,10 @@ inline kernel_fn attention() {
         const auto& ker = simd::active();
         auto kc = kv_codec(int(a.num("kv_codec_k", 0))), vc = kv_codec(int(a.num("kv_codec_v", 0)));
         if (vc != kv_codec::f32) dv = std::size_t(a.num("kv_dv", 0));
+        if (attn_cpu::enabled() && attn_cpu::supports(kc, vc) && hk && hq % hk == 0) {   // chunked, GQA-shared (attn_cpu.hpp)
+            attn_cpu::attention(q.data, s, hq, d, k.data, v.data, t, hk, dv, kc, vc, causal, window, sc, out.data);
+            return;
+        }
         std::size_t kw = std::size_t(kv_head_words(i64(d), kc)), vw = std::size_t(kv_head_words(i64(dv), vc));
         if (kc != kv_codec::f32 || vc != kv_codec::f32) {   // quantised KV: decode each (row, head) on the fly
             task::parallel_for(s * hq, 1, [&](std::size_t b, std::size_t e) {

@@ -105,3 +105,5 @@ In a container the cgroup limit is detected, so the defaults are usually enough.
 - Per-request KV reservation sized from `(prompt + max_tokens) × KV bytes per token`, so a request that can never fit is rejected at submission.
 - Budget awareness in `forge run` and the C ABI entry points.
 - `os_proc_available_memory` on iOS and Job Object limit detection on Windows.
+
+CPU attention reads int8 and f32 KV slots in place through the chunked kernel (`graph/attn_cpu.hpp`), and int8 rows are encoded on the task pool. fp8 and tbq slots still use the per-(token, head) decode path.

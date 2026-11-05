@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <deque>
+#include <optional>
 #include <set>
 
 namespace forge::graph {
@@ -458,9 +459,40 @@ private:
             }
         }
     }
+    // FORGE_OP_TIME=1: wall time per op kind (state ops by fn, attention split by KV codec), printed at exit
+    struct op_time {
+        static bool on() { static const bool b = [] { const char* e = std::getenv("FORGE_OP_TIME"); return e && *e && *e != '0'; }(); return b; }
+        static void add(const std::string& k, double sec) {
+            static std::mutex m; static std::map<std::string, std::pair<double, std::size_t>>* t = nullptr;
+            std::lock_guard g(m);
+            if (!t) {
+                t = new std::map<std::string, std::pair<double, std::size_t>>();
+                std::atexit([] {
+                    double tot = 0; for (auto& [n, v] : *t) tot += v.first;
+                    std::vector<std::pair<double, std::string>> r; for (auto& [n, v] : *t) r.push_back({v.first, n});
+                    std::sort(r.rbegin(), r.rend());
+                    std::fprintf(stderr, "op time (FORGE_OP_TIME), total %.3f s\n", tot);
+                    for (auto& [sec, n] : r) std::fprintf(stderr, "  %-28s %9.3f s %5.1f%%  %zu calls\n", n.c_str(), sec, 100 * sec / std::max(tot, 1e-12), (*t)[n].second);
+                });
+            }
+            auto& e = (*t)[k]; e.first += sec; ++e.second;
+        }
+        std::string key; std::chrono::steady_clock::time_point t0;
+        explicit op_time(std::string k) : key(std::move(k)), t0(std::chrono::steady_clock::now()) {}
+        ~op_time() { add(key, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); }
+    };
+    std::string op_key(const step& s) const {
+        if (s.kind == 1) return "state_append";
+        if (s.kind == 2) return "state." + s.attrs->str("fn");
+        std::string k(ops::info(p_.g.at(s.out).op).name);
+        if (p_.g.at(s.out).op == ops::op::attention) k += s.attrs->num("kv_codec_k", 0) != 0 ? ".q" : ".f32";
+        return k;
+    }
     void run_steps(device_hooks* h) {
         std::vector<tensor_view> ins;
         for (auto& s : p_.steps) {
+            std::optional<op_time> timer;
+            if (op_time::on()) timer.emplace(op_key(s));
             ins.clear();
             for (auto v : s.in) ins.push_back(p_.views[v]);
             auto& out = p_.views[s.out];
@@ -507,7 +539,9 @@ private:
                 host_ops_ = true;
                     if (h) { h->to_host(ins[0].data, ins[0].size()); h->to_host(dst, nphys); if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
                     i64 heads = ins[0].shape[1], d = ins[0].shape[2], hw = kv_head_words(d, sl.codec);
-                    for (i64 r = 0; r < rows * heads; ++r) kv_encode_head(ins[0].data + r * d, d, sl.codec, dst + r * hw);
+                    task::parallel_for(std::size_t(rows * heads), 64, [&](std::size_t b, std::size_t e) {   // on the pool: long prompts
+                        for (std::size_t r = b; r < e; ++r) kv_encode_head(ins[0].data + i64(r) * d, d, sl.codec, dst + i64(r) * hw);
+                    });
                     if (h) h->host_wrote(dst, nphys);
                 } else if (h && h->copy) {
                     if (sl.buf.data.data() != before) h->host_wrote(sl.buf.data.data(), sl.buf.data.size());

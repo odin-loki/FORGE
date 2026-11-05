@@ -202,6 +202,58 @@ TEST(state_ops_conv_and_delta_rule_streaming) {
     CHECK(eo < 1e-4); CHECK(ec < 1e-4);
 }
 
+// Chunked CPU attention (attn_cpu.hpp): GQA, f32 and int8 KV, contexts spanning several 256-position chunks.
+// Against a float64 reference over the same (decoded) KV; a prefill block gives the same bits as each token
+// alone; every seq kernel table (scalar / avx2 / avx512) gives the same bits.
+TEST(attn_cpu_chunked_long_context) {
+    std::mt19937 rng(5); std::normal_distribution<float> nd(0.f, 1.f);
+    for (int codec = 0; codec < 2; ++codec)
+    for (auto [t, s, hq, hk, d, window] : std::vector<std::array<std::size_t, 6>>{{700, 40, 8, 2, 64, 0}, {1300, 3, 16, 4, 80, 0}, {600, 9, 4, 4, 32, 300}}) {
+        auto kc = codec ? kv_codec::int8 : kv_codec::f32;
+        std::size_t dv = d, w = codec ? std::size_t(kv_head_words(i64(d))) : d;
+        std::vector<float> q(s * hq * d), kf(t * hk * d), vf(t * hk * dv), kq(t * hk * w), vq(t * hk * w), kd(t * hk * d), vd(t * hk * dv);
+        for (auto& x : q) x = nd(rng);
+        for (auto& x : kf) x = nd(rng);
+        for (auto& x : vf) x = nd(rng);
+        for (std::size_t r = 0; r < t * hk; ++r) {
+            if (codec) { kv_encode_head(kf.data() + r * d, i64(d), kc, kq.data() + r * w); kv_encode_head(vf.data() + r * dv, i64(dv), kc, vq.data() + r * w);
+                         kv_decode_head(kq.data() + r * w, i64(d), kc, kd.data() + r * d); kv_decode_head(vq.data() + r * w, i64(dv), kc, vd.data() + r * dv); }
+        }
+        if (!codec) { kq = kf; vq = vf; kd = kf; vd = vf; }
+        float sc = 1.f / std::sqrt(float(d));
+        std::vector<float> out(s * hq * dv), one(hq * dv);
+        attn_cpu::attention(q.data(), s, hq, d, kq.data(), vq.data(), t, hk, dv, kc, kc, true, window, sc, out.data());
+        double err = 0;
+        for (std::size_t i = 0; i < s; ++i) for (std::size_t h = 0; h < hq; ++h) {
+            std::size_t pos = t - s + i, lo = window && pos + 1 > window ? pos + 1 - window : 0, kh = h / (hq / hk);
+            std::vector<double> sco(pos + 1); double mx = -1e300, sum = 0;
+            for (std::size_t j = lo; j <= pos; ++j) { double a = 0; for (std::size_t e = 0; e < d; ++e) a += double(q[(i * hq + h) * d + e]) * kd[(j * hk + kh) * d + e]; sco[j] = a * sc; mx = std::max(mx, sco[j]); }
+            for (std::size_t j = lo; j <= pos; ++j) { sco[j] = std::exp(sco[j] - mx); sum += sco[j]; }
+            for (std::size_t e = 0; e < dv; ++e) { double a = 0; for (std::size_t j = lo; j <= pos; ++j) a += sco[j] * vd[(j * hk + kh) * dv + e]; err = std::max(err, std::fabs(a / sum - out[(i * hq + h) * dv + e])); }
+            // the same token alone (decode) gives identical bits
+            if (i == s - 1 || i == 0) {
+                attn_cpu::attention(q.data() + i * hq * d, 1, hq, d, kq.data(), vq.data(), pos + 1, hk, dv, kc, kc, true, window, sc, one.data());
+                CHECK(std::memcmp(one.data(), out.data() + i * hq * dv, hq * dv * 4) == 0);
+            }
+        }
+        CHECK_MSG(err < 2e-5, "attn_cpu err %g", err);
+        // every kernel table gives the same bits
+        const auto* ref = simd::seq_by_name("scalar");
+        for (const char* tg : {"avx2", "avx512"}) {
+            const auto* k = simd::seq_by_name(tg); if (!k) continue;
+            std::size_t ns = hq / hk;
+            std::vector<const float*> qp; std::vector<std::size_t> lo(ns, 0), hi(ns, t);
+            for (std::size_t h = 0; h < ns; ++h) qp.push_back(q.data() + h * d);
+            std::vector<float> m1(ns), l1(ns), a1(ns * dv), m2(ns), l2(ns), a2(ns * dv), sc1(ref->attn_scratch(ns, d, dv)), sc2(k->attn_scratch(ns, d, dv));
+            simd::seq_kv K{kq.data(), hk * w, codec}, V{vq.data(), hk * w, codec};
+            ref->attn_chunk(K, V, d, dv, sc, 256, std::min<std::size_t>(t, 512), ns, qp.data(), lo.data(), hi.data(), m1.data(), l1.data(), a1.data(), sc1.data());
+            k->attn_chunk(K, V, d, dv, sc, 256, std::min<std::size_t>(t, 512), ns, qp.data(), lo.data(), hi.data(), m2.data(), l2.data(), a2.data(), sc2.data());
+            CHECK(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0);
+            for (float x : {-0.f, -1.5f, -30.f, -79.f, 3.f}) CHECK(ref->exp1(x) == k->exp1(x));
+        }
+    }
+}
+
 TEST(codecs_exact_and_layout) {
     // values exactly representable in a codec survive the round trip bit-for-bit
     auto rt = [](std::string_view name, std::vector<float> x) {
