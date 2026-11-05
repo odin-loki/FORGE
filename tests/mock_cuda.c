@@ -153,7 +153,7 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
     if (!strcmp(op, "copy_words")) return 3; if (!strcmp(op, "rms_norm_q81")) return 7; if (!strcmp(op, "silu_mul_q81")) return 5;
     if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq")) return 8;
-    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32, _p8/16/32 */ if (!strcmp(op, "causal_conv")) return 7;
+    if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32, _p8/16/32 */ if (!strncmp(op, "causal_conv", 11)) return 7;   /* causal_conv, causal_conv_t */
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13)) return 12; if (!strcmp(op, "attention_dec")) return 13;
     if (!strcmp(op, "attention_comb")) return 5; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
@@ -287,10 +287,10 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
                     for (a = 0; a < dk; ++a) { Sh[a * dv + j] = fmaf(kt[a] * kf, d, Sh[a * dv + j]); acc = fmaf(Sh[a * dv + j], qt[a] * qf, acc); }
                     ot[j] = acc; } } }
         return 0; }
-    if (!strcmp(op, "causal_conv")) {
+    if (!strncmp(op, "causal_conv", 11)) {   /* causal_conv: a thread per channel; causal_conv_t: per (channel, 8 tokens) */
         float *x = P(ARG(0, dptr)), *w = P(ARG(1, dptr)), *st = P(ARG(2, dptr)), *o = P(ARG(3, dptr));
         unsigned s = ARG(4, unsigned), C = ARG(5, unsigned), K = ARG(6, unsigned), c, t, j, P_ = K - 1; float nw[8];
-        if (gx * bx < C || K > 9) return 1;
+        if (gx * bx < C || K > 9 || (op[11] == '_' && (bx != 128 || gx < ((C + 127) / 128) * ((s + 7) / 8)))) return 1;
         for (c = 0; c < C; ++c) {
             for (t = 0; t < s; ++t) { float acc = 0; for (j = 0; j < K; ++j) { unsigned p = t + j; acc = fmaf(w[c * K + j], p < P_ ? st[p * C + c] : x[(size_t)(p - P_) * C + c], acc); } o[(size_t)t * C + c] = acc; }
             for (j = 0; j < P_; ++j) { unsigned p = s + j; nw[j] = p < P_ ? st[p * C + c] : x[(size_t)(p - P_) * C + c]; }

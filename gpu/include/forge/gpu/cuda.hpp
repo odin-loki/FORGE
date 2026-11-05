@@ -656,6 +656,8 @@ public:
             u[0] = std::uint32_t(in[0].shape[0]); u[1] = std::uint32_t(in[0].shape[1]); u[2] = std::uint32_t(in[1].shape[1]);
             if (u[2] < 1u || u[2] > 9u) return false;
             grid = (u[1] + 127u) / 128u;
+            // token-parallel: a thread per (channel, 8 tokens); FORGE_CAUSAL_CONV_OLD the per-channel kernel
+            if (!std::getenv("FORGE_CAUSAL_CONV_OLD") && has_fn_locked("forge_causal_conv_t")) { kfn = "forge_causal_conv_t"; grid *= (u[0] + 7u) / 8u; }
         } else return false;
         bool known = false; for (auto& [p, n] : pinned_) if (p == S && n == sn) known = true;
         if (!known) pinned_.push_back({S, sn});

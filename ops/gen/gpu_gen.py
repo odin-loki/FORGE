@@ -1183,6 +1183,34 @@ FORGE_GLOBAL void forge_delta_rule(const float* q, const float* k, const float* 
       for (unsigned i = 0; i < dk; ++i) { float r = fma_(kn[i] * kf, d, Sh[i * dv + j]); Sh[i * dv + j] = r; acc = fma_(r, qn[i] * qf, acc); }
       o[j] = acc; }
     bar_(); } }
+// causal_conv_t (the default; same arguments as forge_causal_conv): a thread per (channel, chunk of 8 tokens), so a
+// prefill launches ceil(C / 128) * ceil(s / 8) blocks of 128 instead of ceil(C / 128) threads walking every token in
+// turn (block b: channels (b % ncb) * 128 + tid, tokens (b / ncb) * 8 ..). A thread loads its 8 + K - 1 inputs and K
+// weights into registers once; each output is the same fma sequence as forge_causal_conv's. Only tokens t < K - 1
+// read the state, and with K <= 9 they all lie in chunk 0, so chunk 0's thread writes the new state after its reads.
+FORGE_GLOBAL void forge_causal_conv_t(const float* x, const float* w, float* st, float* out, unsigned s, unsigned C, unsigned K) {
+  unsigned ncb = (C + 127u) / 128u, bi = bid_(), c = (bi % ncb) * 128u + tid_(), t0 = (bi / ncb) * 8u;
+  if (c >= C || K > 9u) return;
+  unsigned P = K - 1u;
+  float wr[9], xv[16];
+#pragma unroll
+  for (unsigned j = 0; j < 9u; ++j) wr[j] = j < K ? w[c * K + j] : 0.0f;
+#pragma unroll
+  for (unsigned i = 0; i < 16u; ++i) { unsigned p = t0 + i;
+    xv[i] = i < 8u + P && p < s + P ? (p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]) : 0.0f; }
+#pragma unroll
+  for (unsigned tt = 0; tt < 8u; ++tt) {
+    unsigned t = t0 + tt; if (t >= s) break;
+    float acc = 0.0f;
+#pragma unroll
+    for (unsigned j = 0; j < 9u; ++j) if (j < K) acc = fma_(wr[j], xv[tt + j], acc);
+    out[(unsigned long long)t * C + c] = acc; }
+  if (t0 == 0u) {
+    float nw[8];
+#pragma unroll
+    for (unsigned i = 0; i < 8u; ++i) { unsigned p = s + i; nw[i] = i < P ? (p < P ? st[p * C + c] : x[(unsigned long long)(p - P) * C + c]) : 0.0f; }
+#pragma unroll
+    for (unsigned i = 0; i < 8u; ++i) if (i < P) st[i * C + c] = nw[i]; } }
 // causal_conv: one thread per channel; state [K-1, C] is the previous K-1 inputs. Requires K <= 9.
 FORGE_GLOBAL void forge_causal_conv(const float* x, const float* w, float* st, float* out, unsigned s, unsigned C, unsigned K) {
   unsigned c = bid_() * 128u + tid_(); if (c >= C) return;
