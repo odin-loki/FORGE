@@ -83,7 +83,6 @@ Greedy output is identical with CUDA graphs on and off.
 - GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open;
   graphs recorded before an eviction must not be replayed after it.
 - RPC: tokens have full access; client-certificate identities are not mapped to permissions.
-- `.fsc` script cache has no tests.
 - Not tested anywhere: hybrid P/E cores, multi-node NUMA, batteries and thermal sensors, running under
   systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox decode, CUDA graphics interop.
 - Security gaps: [security.md](security.md#known-gaps).
