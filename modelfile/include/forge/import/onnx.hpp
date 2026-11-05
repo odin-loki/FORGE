@@ -369,7 +369,8 @@ inline onnx_translation translate_onnx(const onnx_pb::model_t& m) {
 }
 
 inline import_report import_onnx(const std::string& path, const std::string& out, const import_options& opt = {}) {
-    auto bytes = read_file(path);
+    check_write(out);
+    auto bytes = read_file(path);   // checks fs_read (hf.hpp)
     auto m = onnx_pb::parse_model(bytes);
     auto tr = translate_onnx(m);
     auto bp = modelfile::parse_blueprint(tr.blueprint);  // validate syntax before writing

@@ -12,6 +12,8 @@
 //                                "signatures":[{"key_id":hex8,"public_key":hex,"sig":hex}]}
 #include <forge/os/os.hpp>
 #include <forge/modelfile/fpk.hpp>
+#include <forge/security/files.hpp>
+#include <forge/security/secure_buffer.hpp>
 #include <fstream>
 
 extern "C" {
@@ -41,7 +43,8 @@ inline std::vector<std::uint8_t> from_hex(std::string_view s) {
 }
 } // namespace detail
 
-struct keypair { std::array<std::uint8_t, 32> seed{}, pub{}; };
+// seed: the Ed25519 secret, in locked, non-dumpable memory wiped on destruction (FSS-CRY-2). Move-only.
+struct keypair { security::secure_bytes<32> seed; std::array<std::uint8_t, 32> pub{}; };
 
 inline keypair keypair_from_seed(std::span<const std::uint8_t> seed) {
     if (seed.size() != 32) raise(errc::invalid_argument, "ed25519 seed must be 32 bytes");
@@ -160,10 +163,14 @@ inline signature_report verify_signature(const reader& r, const std::vector<std:
 }
 
 // Key files: secret = 64 hex chars (seed) on one line; public = 64 hex chars.
+// The secret key file must be private under a strict security policy (FSS-FIO-2: owner-only, ours, no symlink);
+// other profiles audit a warning.
 inline keypair load_secret_key(const std::string& path) {
+    security::require_private_file("secret key", path, security::file_kind::secret);
     std::ifstream f(path); std::string h; f >> h;
-    if (!f) raise(errc::io_error, "cannot read key {}", path);
-    auto b = detail::from_hex(h); auto k = keypair_from_seed(b); crypto_wipe(b.data(), b.size()); return k;
+    if (!f) { if (!h.empty()) crypto_wipe(h.data(), h.size()); raise(errc::io_error, "cannot read key {}", path); }
+    auto b = detail::from_hex(h); crypto_wipe(h.data(), h.size());
+    auto k = keypair_from_seed(b); crypto_wipe(b.data(), b.size()); return k;
 }
 inline std::string load_public_key(const std::string& path) {
     std::ifstream f(path); std::string h; f >> h;

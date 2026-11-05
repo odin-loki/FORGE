@@ -25,6 +25,7 @@ def policy(name, doc):
     base = {"audit": {"os": False, "file": os.path.join(top, name + ".audit.jsonl")}, "allow_root": True}
     base.update(doc)
     with open(p, "w") as f: json.dump(base, f)
+    os.chmod(p, 0o600)   # FIO-2: a strict policy must not be writable by group/other (umask 002 would make it 0664)
     return p
 
 def audit(name):

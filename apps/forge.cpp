@@ -165,6 +165,7 @@ int cmd_import(const args& a) {
         auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
         tt = c == std::string::npos ? "" : tt.substr(c + 1);
     }
+    activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     return 0;
@@ -203,8 +204,11 @@ int cmd_keygen(const args& a) {
     if (a.get("o").empty()) return usage();
     auto k = modelfile::generate_keypair();
     auto base = a.get("o");
-    { std::ofstream f(base + ".key"); f << modelfile::detail::to_hex(k.seed) << "\n"; }
-    std::filesystem::permissions(base + ".key", std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    {   // FSS-FIO-1: the secret is 0600 from its first byte (exclusive temp file + rename), never world-readable
+        auto hex = modelfile::detail::to_hex(k.seed) + "\n";
+        auto w = os::fs::write_file_atomic(base + ".key", hex, 0600); crypto_wipe(hex.data(), hex.size());
+        if (!w) throw std::runtime_error("cannot write " + base + ".key: " + w.err.what);
+    }
     { std::ofstream f(base + ".pub"); f << modelfile::detail::to_hex(k.pub) << "\n"; }
     std::printf("key id %s\npublic %s\nwrote %s.key (keep secret) and %s.pub\n", modelfile::key_id(k.pub).c_str(), modelfile::detail::to_hex(k.pub).c_str(), base.c_str(), base.c_str());
     return 0;
@@ -242,10 +246,12 @@ int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key
     modelfile::model_key k;
     if (!a.get("new-key").empty()) {
         k = modelfile::generate_model_key();
-        std::ofstream f(a.get("new-key")); f << modelfile::detail::hex(k.data(), 32) << "\n";
-        if (!f) throw std::runtime_error("cannot write " + a.get("new-key"));
-        ::chmod(a.get("new-key").c_str(), 0600);
+        auto hex = modelfile::detail::hex(k.data(), 32) + "\n";   // FSS-FIO-1: 0600 from the first byte
+        auto st = os::fs::write_file_atomic(a.get("new-key"), hex, 0600); crypto_wipe(hex.data(), hex.size());
+        if (!st) throw std::runtime_error("cannot write " + a.get("new-key") + ": " + st.err.what);
     } else {
+        activate_policy(a.get("policy"));
+        security::require_private_file("model key", a.get("key"), security::file_kind::secret);   // FSS-FIO-2
         std::ifstream f(a.get("key")); std::string h, w; while (f >> w) h += w;
         auto b = modelfile::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
         std::memcpy(k.data(), b.data(), 32);
@@ -440,14 +446,19 @@ int cmd_rpc_serve(const args& a) {
         for (auto& e : graph::rpc::parse_tokens(t, "--token")) sec.tokens.push_back(std::move(e));
     }
     auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
+    // FSS-FIO-2: secrets (token files, the TLS key) must be owner-only and trusted lists (authorized keys, client
+    // maps) writable only by their owner; profile strict refuses otherwise, other profiles warn (audit).
+    for (auto& f : files) security::require_private_file(pol, "--token-file", f, security::file_kind::secret);
     for (auto& f : files) {   // "[allow=device,scripts] <token> [name]" per line (graph/rpc_secure.hpp)
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
+        struct wipe_on_exit { std::string& s; ~wipe_on_exit() { if (!s.empty()) crypto_wipe(s.data(), s.size()); } } w{r.value};
         auto ts = graph::rpc::parse_tokens(r.value, f);
         if (ts.empty()) throw std::runtime_error(f + ": no tokens");
         for (auto& e : ts) sec.tokens.push_back(std::move(e));
     }
     auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
     for (auto& f : keyfiles) {   // "[allow=device,scripts] <hex> [comment]" per line (graph/rpc_secure.hpp)
+        security::require_private_file(pol, "--authorized-keys", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         try { for (auto& k : graph::rpc::parse_authorized_keys(r.value)) sec.authorized_keys.push_back(std::move(k)); }
         catch (const std::exception& e) { throw std::runtime_error(f + ": " + e.what()); }
@@ -456,9 +467,11 @@ int cmd_rpc_serve(const args& a) {
     for (auto& p : pubs) sec.authorized_keys.push_back(p.size() == 64 && p.find('/') == std::string::npos && !std::filesystem::exists(p) ? p : modelfile::load_public_key(p));
     sec.tls.cert_file = a.get("tls-cert"); sec.tls.key_file = a.get("tls-key"); sec.tls.client_ca_file = a.get("tls-client-ca");
     if (sec.tls.cert_file.empty() != sec.tls.key_file.empty()) throw std::runtime_error("--tls-cert and --tls-key go together");
+    security::require_private_file(pol, "--tls-key", sec.tls.key_file, security::file_kind::secret);
     if (!sec.tls.client_ca_file.empty() && sec.tls.cert_file.empty()) throw std::runtime_error("--tls-client-ca needs --tls-cert and --tls-key");
     auto maps = a.all("tls-client-map"); if (maps.empty() && a.has("tls-client-map")) maps.push_back(a.get("tls-client-map"));
     for (auto& f : maps) {   // "[allow=...] sha256:<hex>|cn:<name> [comment]" per line (graph/rpc_secure.hpp)
+        security::require_private_file(pol, "--tls-client-map", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         auto rs = graph::rpc::parse_client_map(r.value, f);
         if (rs.empty()) throw std::runtime_error(f + ": no rules (an empty client map would accept no certificate)");
@@ -685,7 +698,7 @@ int main(int argc, char** argv) {
         if (c == "bench") return cmd_bench(a);
         if (c == "dump") return cmd_dump(a);
         if (c == "keygen") return cmd_keygen(a);
-        if (c == "sign") return cmd_sign(a);
+        if (c == "sign") { activate_policy(a.get("policy")); return cmd_sign(a); }   // FIO-2 on the secret key under a policy
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);

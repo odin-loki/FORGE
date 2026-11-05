@@ -18,6 +18,8 @@
 #include <forge/graph/codecs.hpp>
 #include <forge/hash/blake3.hpp>
 #include <forge/json/json.hpp>
+#include <forge/security/enforce.hpp>
+#include <forge/security/files.hpp>
 #include "monocypher.h"
 #include <array>
 #include <algorithm>
@@ -252,9 +254,14 @@ using model_key = std::array<std::uint8_t, 32>;
 inline std::optional<model_key> model_key_from_env() {
     std::string h;
     if (auto* e = std::getenv("FORGE_MODEL_KEY")) h = e;
-    else if (auto* f = std::getenv("FORGE_MODEL_KEY_FILE")) { std::ifstream in(f); std::string w; while (in >> w) h += w; }
+    else if (auto* f = std::getenv("FORGE_MODEL_KEY_FILE")) {
+        security::require_private_file("FORGE_MODEL_KEY_FILE", f, security::file_kind::secret);   // FSS-FIO-2
+        std::ifstream in(f); std::string w; while (in >> w) h += w;
+        if (!w.empty()) crypto_wipe(w.data(), w.size());
+    }
     else return std::nullopt;
-    auto b = detail::unhex(h); if (b.size() != 32) raise(errc::invalid_argument, "model key must be 32 bytes (64 hex chars)");
+    auto b = detail::unhex(h); if (!h.empty()) crypto_wipe(h.data(), h.size());
+    if (b.size() != 32) raise(errc::invalid_argument, "model key must be 32 bytes (64 hex chars)");
     model_key k; std::memcpy(k.data(), b.data(), 32); crypto_wipe(b.data(), b.size()); return k;
 }
 
@@ -262,6 +269,9 @@ inline std::optional<model_key> model_key_from_env() {
 class reader {
 public:
     explicit reader(const std::string& path, std::optional<model_key> key = std::nullopt) : path_(path) {
+        // FSS CAP-1: every .fpk opened (run, serve, inspect, dump, verify, sign, encrypt) passes enforce(fs_read)
+        // under an active policy; no-op with profile none.
+        security::enforce(security::capability::fs_read, path);
         map_ = forge::map_readonly(path, size_);
         try { init_(path, key); } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // the dtor does not run on a throwing ctor
     }

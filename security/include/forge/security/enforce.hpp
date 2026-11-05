@@ -61,6 +61,13 @@ inline active_state& act() { static active_state s; return s; }
 } // namespace detail
 
 inline std::string expand_root(const std::string& e);
+inline os::status try_enforce(capability c, std::string_view target);
+namespace detail {
+// os::check_access (code below forge::security: core's KV spill store) asks the active policy through this gate.
+inline os::status access_gate(os::access_kind k, std::string_view path) {
+    return try_enforce(k == os::access_kind::write ? capability::fs_write : capability::fs_read, path);
+}
+} // namespace detail
 // The active policy's fs roots are made absolute when it becomes active ("." is the working directory at that moment),
 // so a later chdir() cannot move them.
 inline void set_active_policy(policy p) {
@@ -73,7 +80,9 @@ inline void set_active_policy(policy p) {
         if (!sp->audit.file.empty() && audit_file() != sp->audit.file) (void)open_audit_file(sp->audit.file);
         if (sp->audit.os) (void)set_audit_os(true);
     }
-    auto& s = detail::act(); std::lock_guard g(s.m); s.p = std::move(sp);
+    const bool on = sp->active();
+    { auto& s = detail::act(); std::lock_guard g(s.m); s.p = std::move(sp); }
+    os::set_access_gate(on ? &detail::access_gate : nullptr);
 }
 inline std::shared_ptr<const policy> active_policy() { auto& s = detail::act(); std::lock_guard g(s.m); return s.p; }
 

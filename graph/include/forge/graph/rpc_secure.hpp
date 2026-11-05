@@ -21,6 +21,8 @@
 // ("[allow=...] <token> [name]"), and an mTLS client map ("[allow=...] sha256:<hex>|cn:<name> [comment]") limits
 // what each client certificate may do; a request must be allowed by both its token/key and its certificate.
 #include <forge/os/os.hpp>
+#include <forge/security/files.hpp>
+#include <forge/security/secure_buffer.hpp>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -83,16 +85,22 @@ inline std::array<std::uint8_t, 64> token_mac(std::string_view token, const std:
 inline bool ct_equal_bytes(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) { unsigned char d = 0; for (std::size_t i = 0; i < n; ++i) d |= a[i] ^ b[i]; return d == 0; }
 } // namespace sec
 
-// Ed25519 identity (same format as modelfile::keypair / `forge keygen`).
-struct identity { std::array<std::uint8_t, 32> seed{}, pub{}; };
+// Ed25519 identity (same format as modelfile::keypair / `forge keygen`). The seed is in locked, non-dumpable memory,
+// wiped on destruction (FSS-CRY-2); identity is move-only (it is shared through std::shared_ptr).
+struct identity { security::secure_bytes<32> seed; std::array<std::uint8_t, 32> pub{}; };
 inline identity identity_from_seed_hex(std::string_view h) {
     identity k; if (!sec::unhex(h, k.seed.data(), 32)) raise(errc::parse_error, "rpc: secret key must be 64 hex chars");
     std::uint8_t sk[64], s2[32]; std::memcpy(s2, k.seed.data(), 32); crypto_ed25519_key_pair(sk, k.pub.data(), s2); crypto_wipe(sk, 64);
     return k;
 }
+// A secret key file: private under a strict security policy (FSS-FIO-2), a warning otherwise. The file's bytes are
+// wiped after reading; identity_from_seed_hex copies the returned hex into locked memory.
 inline std::string read_key_file(const std::string& path) {
+    security::require_private_file("rpc key", path, security::file_kind::secret);
     auto r = os::read_file(path); if (!r) raise(errc::io_error, "rpc: cannot read key {}: {}", path, r.err.what);
-    std::string s; for (char c : r.value) if (!std::isspace(static_cast<unsigned char>(c))) s += c; return s;
+    std::string s; s.reserve(r.value.size()); for (char c : r.value) if (!std::isspace(static_cast<unsigned char>(c))) s += c;
+    if (!r.value.empty()) crypto_wipe(r.value.data(), r.value.size());
+    return s;
 }
 
 // client_ca_file set = mTLS: every client must present a certificate that chains to it.
@@ -169,11 +177,11 @@ inline std::vector<authorized_key> parse_authorized_keys(std::string_view text) 
 
 // One accepted bearer token and what it may do. Constructible from a bare token (full access), as before scopes.
 struct token_entry {
-    std::string token;
+    security::secure_string token;              // locked, non-dumpable, wiped on destruction (FSS-CRY-2)
     unsigned perms = perm_all;
     std::string name;                           // comment from the token file; used in logs instead of the token
     token_entry() = default;
-    token_entry(std::string t, unsigned p = perm_all, std::string n = {}) : token(std::move(t)), perms(p), name(std::move(n)) {}
+    token_entry(std::string t, unsigned p = perm_all, std::string n = {}) : token(t), perms(p), name(std::move(n)) { if (!t.empty()) crypto_wipe(t.data(), t.size()); }
     token_entry(const char* t) : token_entry(std::string(t)) {}
 };
 // Token file (`--token-file`): one token per line, as authorized_keys but with a token instead of a key:
@@ -237,7 +245,7 @@ struct server_security {
     bool auth_required() const { return has_credentials() || !client_map.empty(); }
 };
 struct client_security {
-    std::string token;                          // method 1
+    security::secure_string token;              // method 1 (locked memory, FSS-CRY-2)
     std::shared_ptr<identity> key;              // method 2 (preferred when set)
     tls_client_config tls;
     bool any_auth() const { return key || !token.empty(); }

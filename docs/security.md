@@ -185,12 +185,25 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 - Keystore file backend: unless a passphrase or the TPM wraps the store key, same-user code can read it. TPM
   sealing has no PCR policy, so it binds the key to the machine but not to a boot state, and a process running as
   the same user can still ask the TPM to unseal it.
-- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) as plain files under `FORGE_MEM_SPILL_DIR`
-  (default `<tmp>/forge-spill-<pid>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is
-  destroyed). Use a private directory if prompts are sensitive.
+- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) unencrypted to disk: 0600 files created
+  exclusively in a private (0700 / owner-only DACL) directory, `FORGE_MEM_SPILL_DIR` or a fresh
+  `<tmp>/forge-spill-<pid>-<random>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is destroyed.
+  Root / Administrators and a crash that leaves the files behind still expose them.
+- Key memory (FSS-CRY-2): locking is best effort (RLIMIT_MEMLOCK, working-set quota) and reported; macOS has no
+  per-range core-dump exclusion and Windows excludes the pages only from WER reports, not from debuggers or
+  `MiniDumpWriteDump`. The TLS private key lives in OpenSSL's memory, `model_key` (`.fpk` encryption) and the keystore
+  passphrase in ordinary memory; short-lived copies are wiped, not locked.
+- Private files (FSS-FIO-2) are checked when a key, token or policy file is loaded, not continuously; the check and the
+  open are separate steps (a same-user attacker could swap the file in between). Files that are not keys (models,
+  scripts, the `.fsc` cache, imported weights) are scoped by `enforce`, not by ownership. Only profile strict refuses;
+  other profiles log a warning.
+- `enforce` covers the paths FORGE's own code routes through it (see [security-api.md](security-api.md#integration));
+  C++ embedders calling `os::read_file`, `std::ifstream` or `modelfile::writer` directly are not checked.
 - `forge::security` ([security-api.md](security-api.md)) has the policy file, `enforce`, `lockdown` and `forge security
   check`. FORGE uses it only when a policy is active (`--policy`, a policy file or `FORGE_SECURITY_PROFILE`): then
   `forge script` takes its capabilities from the policy, scopes script file / net / exec / env built-ins through
   `enforce` and locks down before running; `forge-serve` and `forge rpc-serve` lock down after binding; model loads
-  check `integrity.models`; plugin loads `plugin_load` ([security-api.md, "Integration"](security-api.md#integration)).
-  Without a policy none of this applies.
+  check `integrity.models`; plugin loads `plugin_load`; `.fpk` readers, importers, the `.fsc` cache and the KV spill
+  directory check `fs_read` / `fs_write`; key, token and policy files are checked for private permissions (refused in
+  strict) ([security-api.md, "Integration"](security-api.md#integration)). Without a policy none of this applies,
+  except the private-file warnings and the private spill / temp files.
