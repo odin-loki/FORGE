@@ -11,6 +11,7 @@ class gguf_file {
 public:
     struct tinfo { std::string name; shape_t shape; std::uint32_t type = 0; std::uint64_t offset = 0; };
     explicit gguf_file(const std::string& path) : path_(path) {
+        check_read(path);   // FSS CAP-1 (hf.hpp)
         map_ = forge::map_readonly(path, size_);
         try {
             if (!map_) raise(errc::format_error, "{}: empty file", path);
@@ -72,6 +73,7 @@ private:
 };
 
 inline import_report import_gguf(const std::string& path, const std::string& out, const import_options& opt = {}) {
+    check_write(out);
     gguf_file g(path);
     auto arch = g.need("general.architecture").str();
     if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral" && arch != "qwen35")

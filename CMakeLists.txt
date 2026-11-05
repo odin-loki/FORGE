@@ -124,7 +124,7 @@ if(Threads_FOUND)
   target_link_libraries(forge_os INTERFACE Threads::Threads)
 endif()
 if(WIN32)
-  target_link_libraries(forge_os INTERFACE ws2_32 bcrypt)
+  target_link_libraries(forge_os INTERFACE ws2_32 bcrypt advapi32)   # advapi32: fs.hpp check_private / private DACLs
 elseif(UNIX AND NOT APPLE)
   target_link_libraries(forge_os INTERFACE ${CMAKE_DL_LIBS})
 endif()
@@ -376,7 +376,7 @@ target_link_libraries(forge_gpu INTERFACE forge_simd)
 
 add_library(forge_graph INTERFACE)
 target_include_directories(forge_graph INTERFACE graph/include)
-target_link_libraries(forge_graph INTERFACE forge_ops forge_simd forge_gpu forge_trust)
+target_link_libraries(forge_graph INTERFACE forge_ops forge_simd forge_gpu forge_trust forge_security)   # security: rpc key memory (CRY-2), key file checks (FIO-2)
 # TLS for rpc-serve (graph/rpc.hpp). OpenSSL is optional; without it rpc stays plain TCP (auth still works).
 option(FORGE_TLS "TLS for forge rpc-serve via OpenSSL when available" ON)
 if(FORGE_TLS)

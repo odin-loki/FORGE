@@ -15,6 +15,7 @@
 // FORGE_MEM_FRACTION (default 0.85) of the detected limit = min(physical RAM, cgroup v2 memory.max,
 // cgroup v1 memory.limit_in_bytes, RLIMIT_AS). Device budgets come from FORGE_MEM_DEVICE_LIMIT or set_limit.
 #include <forge/core/error.hpp>
+#include <forge/os/fs.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/memory_pressure.hpp>
 #include <forge/os/process.hpp>
@@ -340,13 +341,27 @@ private:
     budget& b_; std::string tag_; std::pmr::memory_resource* up_; lease l_;
 };
 
-// Evicted blobs on disk. Directory from FORGE_MEM_SPILL_DIR, else <tmp>/forge-spill-<pid>; removed on destruction.
-// Writes are size-capped by FORGE_MEM_SPILL_MAX (default unlimited).
+// Evicted blobs on disk. Directory: `dir`, else FORGE_MEM_SPILL_DIR, else a fresh <tmp>/forge-spill-<pid>-<random>;
+// removed on destruction. Writes are size-capped by FORGE_MEM_SPILL_MAX (default unlimited).
+// FSS: the directory is private (0700 / owner + SYSTEM + Administrators DACL; an existing one must be ours and not a
+// symlink, and is tightened to 0700 on POSIX) and every spill file is created exclusively, 0600, without following
+// symlinks (FIO-1). Under an active forge::security policy the directory must pass enforce(fs_write) (CAP-1, through
+// os::check_access); a denial throws errc::io_error with the policy's reason.
 class spill_store {
 public:
     explicit spill_store(std::filesystem::path dir = {}) {
-        if (dir.empty()) { auto e = os::getenv("FORGE_MEM_SPILL_DIR"); dir = e.empty() ? std::filesystem::temp_directory_path() / std::format("forge-spill-{}", os::pid()) : std::filesystem::path(e); }
-        dir_ = std::move(dir); std::filesystem::create_directories(dir_);
+        if (dir.empty()) if (auto e = os::getenv("FORGE_MEM_SPILL_DIR"); !e.empty()) dir = std::filesystem::path(e);
+        if (!dir.empty()) {
+            auto d = os::fs::u8str(dir);
+            if (auto s = os::check_access(os::access_kind::write, d); !s) raise(errc::io_error, "spill directory {}: {}", d, s.err.what);
+            if (auto s = os::fs::ensure_private_dir(d); !s) raise(errc::io_error, "spill directory {}: {}", d, s.err.what);
+            dir_ = std::move(dir);
+        } else {
+            if (auto s = os::check_access(os::access_kind::write, os::temp_dir()); !s) raise(errc::io_error, "spill directory {}: {}", os::temp_dir(), s.err.what);
+            auto t = os::fs::make_temp_dir(std::format("forge-spill-{}-", os::pid()));
+            if (!t) raise(errc::io_error, "spill directory: {}", t.err.what);
+            dir_ = os::fs::u8path(t.value);
+        }
         if (auto m = os::getenv("FORGE_MEM_SPILL_MAX"); !m.empty()) cap_ = parse_size(m).value_or(0);
     }
     ~spill_store() { std::error_code ec; for (auto& [k, _] : sizes_) std::filesystem::remove(path_(k), ec); std::filesystem::remove(dir_, ec); }
@@ -355,8 +370,8 @@ public:
     std::uint64_t put(const void* data, std::size_t n) {
         std::lock_guard g(m_);
         if (cap_ && bytes_ + n > cap_) return 0;
-        auto k = ++next_; std::ofstream f(path_(k), std::ios::binary); f.write(static_cast<const char*>(data), std::streamsize(n));
-        if (!f) { f.close(); std::error_code ec; std::filesystem::remove(path_(k), ec); return 0; }   // close first: Windows can't delete open files
+        auto k = ++next_;
+        if (!os::fs::write_new_private_file(os::fs::u8str(path_(k)), std::string_view(static_cast<const char*>(data), n))) return 0;   // removes a partial file
         sizes_[k] = n; bytes_ += n; return k;
     }
     // Reads back and deletes. Empty optional if the key is unknown.
