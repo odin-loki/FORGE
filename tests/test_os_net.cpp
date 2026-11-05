@@ -129,8 +129,7 @@ TEST(tree_watch_fsevents_deep) {   // one recursive FSEvents stream: events deep
     CHECK(fs::make_dirs(deep)); CHECK(os::write_file(deep + "/old.txt", "1"));
     os::tree_watch_opts o; o.debounce_ms = 80;
     auto w = os::tree_watcher::open(r, o); CHECK(w); if (!w) return;
-    std::printf("  backend %s, %zu dirs
-", (*w)->backend(), (*w)->watched_dirs());
+    std::printf("  backend %s, %zu dirs\n", (*w)->backend(), (*w)->watched_dirs());
     CHECK(std::string((*w)->backend()) == "fsevents"); CHECK((*w)->watched_dirs() == 6); CHECK((*w)->polled_dirs() == 0);
     os::sleep_ns(50'000'000);
     CHECK(os::write_file(deep + "/new.txt", "n"));

@@ -28,6 +28,7 @@
 #include <forge/os/process.hpp>   // find_executable, detail_proc::win_cmdline
 #if defined(_WIN32)
 #include <userenv.h>   // CreateAppContainerProfile (link userenv)
+#include <psapi.h>     // K32EnumProcessModules (kernel32): the DLLs a worker of this image needs
 #include <aclapi.h>    // SetEntriesInAcl (advapi32): grant the container read+execute on a worker image
 #if defined(_MSC_VER)
 #pragma comment(lib, "userenv.lib")
@@ -233,7 +234,22 @@ inline error create_in_appcontainer(const sandbox_policy& p, const wchar_t* app,
                                     PROCESS_INFORMATION& pi, const std::wstring& image = {}) {
     PSID ac = nullptr;
     if (auto e = profile_sid(p, &ac)) return e;
-    if (!image.empty()) if (auto e = grant_read_execute(image, ac)) { FreeSid(ac); return e; }
+    if (!image.empty()) {
+        if (auto e = grant_read_execute(image, ac)) { FreeSid(ac); return e; }
+        // The worker is usually this program: it also needs the non-system DLLs we loaded (a MinGW or MSVC
+        // runtime next to the exe or on PATH), or it dies with STATUS_DLL_NOT_FOUND. Best effort per DLL.
+        wchar_t sys[MAX_PATH] = {}, win[MAX_PATH] = {};
+        UINT ns = GetSystemDirectoryW(sys, MAX_PATH), nw = GetWindowsDirectoryW(win, MAX_PATH);
+        auto under = [](const std::wstring& f, const wchar_t* d, UINT n) { return n && f.size() > n && _wcsnicmp(f.c_str(), d, n) == 0 && (f[n] == L'\\' || f[n] == L'/'); };
+        HMODULE mods[512]; DWORD need = 0;
+        if (K32EnumProcessModules(GetCurrentProcess(), mods, sizeof mods, &need))
+            for (DWORD i = 1; i < std::min<DWORD>(need / sizeof(HMODULE), 512); ++i) {   // [0] is the exe itself
+                wchar_t f[MAX_PATH * 2]; DWORD n = GetModuleFileNameW(mods[i], f, DWORD(sizeof f / sizeof f[0]));
+                if (!n || n >= sizeof f / sizeof f[0]) continue;
+                std::wstring w(f, n); if (under(w, sys, ns) || under(w, win, nw)) continue;
+                (void)grant_read_execute(w, ac);
+            }
+    }
     SID_AND_ATTRIBUTES caps[1]{}; DWORD ncaps = 0; PSID net = nullptr;
     if (!p.deny_network) {   // fs denied only: keep outbound network
         SID_IDENTIFIER_AUTHORITY auth = SECURITY_APP_PACKAGE_AUTHORITY;
