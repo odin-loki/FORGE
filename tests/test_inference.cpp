@@ -194,6 +194,32 @@ TEST(grammar_parse_and_match) {
     CHECK_THROWS(grammar("root ::= \"a"));
 }
 
+TEST(grammar_counted_repetition) {
+    auto run = [](const grammar& g, std::string s) { auto st = g.start(); for (unsigned char c : s) { st = g.advance(st, c); if (st.empty()) return 0; } return grammar::can_end(st) ? 2 : 1; };
+    grammar exact(R"(root ::= "a"{3})");
+    CHECK(run(exact, "aaa") == 2);
+    CHECK(run(exact, "aa") == 1);
+    CHECK(run(exact, "aaaa") == 0);
+    grammar range(R"(root ::= "x" [0-9]{1,3} "y")");
+    CHECK(run(range, "x7y") == 2);
+    CHECK(run(range, "x123y") == 2);
+    CHECK(run(range, "xy") == 0);
+    CHECK(run(range, "x1234y") == 0);
+    grammar open(R"(root ::= ("ab"){2,})");
+    CHECK(run(open, "abab") == 2);
+    CHECK(run(open, "ababababab") == 2);
+    CHECK(run(open, "ab") == 1);
+    grammar zero(R"(root ::= "p" ("," "q"){0,2} "r")");
+    CHECK(run(zero, "pr") == 2);
+    CHECK(run(zero, "p,q,qr") == 2);
+    CHECK(run(zero, "p,q,q,qr") == 0);
+    CHECK_THROWS(grammar("root ::= \"a\"{3,2}"));
+    CHECK_THROWS(grammar("root ::= \"a\"{x}"));
+    CHECK_THROWS(grammar("root ::= \"a\"{2"));
+    CHECK_THROWS(grammar("root ::= \"a\"{0,9999}"));
+}
+
+
 TEST(grammar_constrained_generation) {
     auto m = model::open(model_a());
     auto g = std::make_shared<grammar>(R"(root ::= "{\"name\": \"" [a-z] [a-z]? [a-z]? [a-z]? [a-z]? "\", \"age\": " [1-9] [0-9]? "}")");

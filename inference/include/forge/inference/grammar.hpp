@@ -160,6 +160,42 @@ private:
                 elem e; e.is_rule = true; e.rule = rule_id(ident()); seq.push_back(e);
             }
             // postfix operators apply to the whole primary
+            // counted repetition: {m}, {m,} and {m,n} (unrolled; the bound is part of the grammar)
+            if (i_ < s_.size() && s_[i_] == '{') {
+                ++i_;
+                auto num = [&]() {
+                    std::size_t b0 = i_; int v = 0;
+                    while (i_ < s_.size() && std::isdigit(static_cast<unsigned char>(s_[i_]))) v = v * 10 + (s_[i_++] - '0');
+                    if (b0 == i_) fail("expected a number in {m,n}");
+                    return v;
+                };
+                int lo = num(), hi = lo;
+                if (i_ < s_.size() && s_[i_] == ',') { ++i_; if (i_ < s_.size() && s_[i_] == '}') hi = -1; else hi = num(); }
+                if (i_ >= s_.size() || s_[i_] != '}') fail("expected }");
+                ++i_;
+                if (hi != -1 && hi < lo) fail("repetition upper bound below lower bound");
+                if (lo > 5000 || hi > 5000) fail("repetition bound above 5000");
+                int body = seq.size() == 1 && seq[0].is_rule ? seq[0].rule : synth({seq});
+                elem b; b.is_rule = true; b.rule = body;
+                std::vector<elem> unrolled;
+                for (int k = 0; k < lo; ++k) unrolled.push_back(b);
+                if (hi == -1) {
+                    int r = int(rules_.size()); rules_.push_back({std::format("_r{}", r), {}}); defined_.insert(r);
+                    elem self; self.is_rule = true; self.rule = r;
+                    rules_[std::size_t(r)].alts = {{b, self}, {}};
+                    unrolled.push_back(self);
+                } else if (hi > lo) {
+                    int next = -1;
+                    for (int k = 0; k < hi - lo; ++k) {   // innermost optional first: o_j = (b o_{j+1})?
+                        int r = int(rules_.size()); rules_.push_back({std::format("_r{}", r), {}}); defined_.insert(r);
+                        if (next < 0) rules_[std::size_t(r)].alts = {{b}, {}};
+                        else { elem nx; nx.is_rule = true; nx.rule = next; rules_[std::size_t(r)].alts = {{b, nx}, {}}; }
+                        next = r;
+                    }
+                    elem o; o.is_rule = true; o.rule = next; unrolled.push_back(o);
+                }
+                seq = unrolled;
+            }
             if (i_ < s_.size() && (s_[i_] == '*' || s_[i_] == '+' || s_[i_] == '?')) {
                 char op = s_[i_++];
                 int body = seq.size() == 1 && seq[0].is_rule ? seq[0].rule : synth({seq});
