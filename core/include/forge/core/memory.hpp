@@ -271,7 +271,9 @@ inline bool lease::resize(std::uint64_t n) {
 // Process-wide registry of budgets. host() is created on first use from the environment.
 class governor {
 public:
-    static governor& instance() { static governor g; return g; }
+    // Never destroyed on purpose: objects with static storage duration elsewhere (a model cache holding a GPU runtime) release
+    // their budget leases in their own destructors at exit, possibly after a function-local static would already be gone.
+    static governor& instance() { static governor* g = new governor; return *g; }
     budget& host() { return pool("host"); }
     budget& pool(const std::string& name) {
         std::lock_guard g(m_);
