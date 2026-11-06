@@ -19,17 +19,19 @@ struct builder {
         n.shape = ops::infer_shape(ops::info(o).shape, ss, n.attrs); return v;
     }
     value_id k(float x) { auto v = g.scalar(x); return v; }
+    // Returns a reference into the node vector: valid only until the next g.apply(). Parameters that receive a
+    // shape taken from it are therefore taken by value (sum_to, unreduce, reshape), not by reference.
     const shape_t& sh(value_id v) const { return g.at(v).shape; }
-    value_id reshape(value_id v, const shape_t& s) { return sh(v) == s ? v : op(ops::op::reshape, {v}, {{"shape", std::vector<i64>(s.begin(), s.end())}}); }
+    value_id reshape(value_id v, shape_t s) { return sh(v) == s ? v : op(ops::op::reshape, {v}, {{"shape", std::vector<i64>(s.begin(), s.end())}}); }
     // Sum a broadcast-shaped gradient back down to `target` (numpy broadcasting rules).
-    value_id sum_to(value_id v, const shape_t& target) {
+    value_id sum_to(value_id v, shape_t target) {
         while (sh(v).size() > target.size()) v = op(ops::op::reduce_sum, {v}, {{"axis", 0.0}});
         for (std::size_t ax = 0; ax < target.size(); ++ax)
             if (target[ax] == 1 && sh(v)[ax] != 1) { shape_t keep = sh(v); keep[ax] = 1; v = reshape(op(ops::op::reduce_sum, {v}, {{"axis", double(ax)}}), keep); }
         return reshape(v, target);
     }
     // Broadcast a reduced gradient (axis removed) back to `full`.
-    value_id unreduce(value_id v, const shape_t& full, i64 ax) {
+    value_id unreduce(value_id v, shape_t full, i64 ax) {
         shape_t keep = full; keep[std::size_t(ax)] = 1; v = reshape(v, keep);
         return full[std::size_t(ax)] == 1 ? v : op(ops::op::expand, {v}, {{"axis", double(ax)}, {"n", double(full[std::size_t(ax)])}});
     }
