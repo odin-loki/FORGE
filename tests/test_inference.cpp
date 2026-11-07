@@ -220,6 +220,21 @@ TEST(grammar_counted_repetition) {
 }
 
 
+TEST(grammar_loop_keeps_the_stack_bounded) {
+    // `*` and `+` compile to right recursion; finished frames must be popped (tail calls) or the stack grows with the match
+    grammar g(R"(root ::= "" ( [a-z] )+ "!" )");
+    auto st = g.start();
+    std::size_t depth0 = 0;
+    for (auto& s : st) depth0 = std::max(depth0, s.size());
+    for (int i = 0; i < 2000; ++i) st = g.advance(st, 'a');
+    std::size_t depth = 0;
+    for (auto& s : st) depth = std::max(depth, s.size());
+    CHECK(!st.empty());
+    CHECK(depth <= depth0 + 4);          // does not grow with the 2000 characters matched
+    st = g.advance(st, '!');
+    CHECK(grammar::can_end(st));
+}
+
 TEST(grammar_constrained_generation) {
     auto m = model::open(model_a());
     auto g = std::make_shared<grammar>(R"(root ::= "{\"name\": \"" [a-z] [a-z]? [a-z]? [a-z]? [a-z]? "\", \"age\": " [1-9] [0-9]? "}")");

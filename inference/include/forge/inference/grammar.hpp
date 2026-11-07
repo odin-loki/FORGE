@@ -14,7 +14,11 @@
 // masks every vocabulary token whose bytes cannot extend any stack (walked through a token trie).
 #include <forge/core/error.hpp>
 #include <forge/modelfile/tokenizer.hpp>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <memory>
+#include <thread>
 #include <map>
 #include <set>
 #include <span>
@@ -83,6 +87,11 @@ private:
         auto& e = rules_[std::size_t(p.rule)].alts[std::size_t(p.alt)][std::size_t(p.idx)];
         if (!e.is_rule) { out.insert(s); return; }
         s.back().idx++;                 // continuation after the referenced rule
+        // Tail calls: a frame whose last element is the reference has nothing left to match, so pop it before pushing the rule. Otherwise
+        // every iteration of a right-recursive loop (how * + ? and {m,} are compiled) leaves one finished frame behind, the stack grows with the
+        // length of the match, no two states repeat (so nothing can be cached) and each step copies a deeper stack: measured 7 Nov 2026 as
+        // 0.3-2 s per token inside a long string.
+        while (!s.empty() && std::size_t(s.back().idx) >= rules_[std::size_t(s.back().rule)].alts[std::size_t(s.back().alt)].size()) s.pop_back();
         push_alts(s, e.rule, out);
     }
     void push_alts(const stack& base, int r, std::set<stack>& out) const {
@@ -279,13 +288,30 @@ public:
     }
     bool finished() const { return grammar::can_end(stacks_) && stacks_.size() == 1; }
     bool can_end() const { return grammar::can_end(stacks_); }
-    // set logits of tokens that cannot continue the grammar to -inf
+    // set logits of tokens that cannot continue the grammar to -inf.
+    // Measured 7 Nov 2026 (PRISM, Goedel-8B, a grammar with a counted string): this walk over the whole token trie took 0.3 s per token on one
+    // thread, 95% of decode time, while the GPU forward pass took 8 ms. The allowed-token set depends only on the stack set, so it is cached
+    // per stack set (a bit mask, bounded), and a miss is computed with the trie's first-byte subtrees spread over threads.
     void apply(std::span<float> logits) const {
-        std::vector<char> ok(logits.size(), 0);
-        walk(0, stacks_, ok);
-        if (eos_ >= 0 && std::size_t(eos_) < ok.size() && grammar::can_end(stacks_)) ok[std::size_t(eos_)] = 1;
-        for (std::size_t i = 0; i < logits.size(); ++i) if (!ok[i]) logits[i] = -INFINITY;
+        const std::vector<std::uint64_t>* m = nullptr;
+        {
+            auto it = cache_.find(stacks_);
+            if (it != cache_.end()) m = &it->second;
+        }
+        std::vector<std::uint64_t> fresh;
+        if (!m) {
+            std::vector<char> ok(logits.size(), 0);
+            walk_parallel(stacks_, ok);
+            if (eos_ >= 0 && std::size_t(eos_) < ok.size() && grammar::can_end(stacks_)) ok[std::size_t(eos_)] = 1;
+            fresh.assign((ok.size() + 63) / 64, 0);
+            for (std::size_t i = 0; i < ok.size(); ++i) if (ok[i]) fresh[i >> 6] |= std::uint64_t(1) << (i & 63);
+            if (cache_.size() >= kMaxCached) cache_.clear();
+            m = &(cache_[stacks_] = std::move(fresh));
+        }
+        for (std::size_t i = 0; i < logits.size(); ++i) if (!((*m)[i >> 6] >> (i & 63) & 1)) logits[i] = -INFINITY;
     }
+    // start a new generation with the same grammar and token trie (and the mask cache, which stays valid)
+    void reset() { stacks_ = g_->start(); }
     // whether `t` may come next (the per-token form of apply(), for sampler::allow); the state is not changed
     bool allows(int t) const {
         if (t == eos_) return grammar::can_end(stacks_);
@@ -304,6 +330,22 @@ public:
     }
 private:
     struct node { std::map<unsigned char, int> next; std::vector<int> tokens; };
+    void walk_parallel(const std::vector<grammar::stack>& st, std::vector<char>& ok) const {
+        for (int t : nodes_[0].tokens) if (std::size_t(t) < ok.size()) ok[std::size_t(t)] = 1;
+        std::vector<std::pair<unsigned char, int>> kids;
+        for (auto [c, m] : nodes_[0].next) kids.emplace_back(c, m);
+        const unsigned hw = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+        if (kids.size() < 8 || hw == 1) { for (auto [c, m] : kids) { auto s2 = g_->advance(st, c); if (!s2.empty()) walk(m, s2, ok); } return; }
+        std::vector<std::thread> th;
+        for (unsigned w = 0; w < hw; ++w)
+            th.emplace_back([&, w] {
+                for (std::size_t k = w; k < kids.size(); k += hw) {
+                    auto s2 = g_->advance(st, kids[k].first);
+                    if (!s2.empty()) walk(kids[k].second, s2, ok);
+                }
+            });
+        for (auto& t : th) t.join();
+    }
     void walk(int n, const std::vector<grammar::stack>& st, std::vector<char>& ok) const {
         for (int t : nodes_[std::size_t(n)].tokens) if (std::size_t(t) < ok.size()) ok[std::size_t(t)] = 1;
         for (auto [c, m] : nodes_[std::size_t(n)].next) {
@@ -316,6 +358,8 @@ private:
     std::vector<grammar::stack> stacks_;
     std::vector<std::string> tokens_;
     std::vector<node> nodes_;
+    static constexpr std::size_t kMaxCached = 4096;
+    mutable std::map<std::vector<grammar::stack>, std::vector<std::uint64_t>> cache_;
 };
 
 } // namespace forge::inference
