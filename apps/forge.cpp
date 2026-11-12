@@ -6,6 +6,7 @@
 #include <forge/import/gguf.hpp>
 #include <forge/import/onnx.hpp>
 #include <forge/import/requant.hpp>
+#include <forge/import/blueprint_dir.hpp>
 #include <forge/modelfile/shard.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
@@ -60,6 +61,7 @@ int usage() {
     std::puts(
         "usage: forge <command> [options]\n"
         "  info                                   CPU features, lane target, grid backends, memory budget\n"
+        "  import <dir with blueprint.fbp + *.safetensors> -o <out.fpk>   a model described by its own blueprint (any session kind)\n"
         "  import <hf_dir|model.gguf> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|fp8_e5m2|q8_0|q4_k|q4_g32|q8_g32|mxfp8|mxfp6|mxfp4|mxint8|nvfp4|tq2] [--template llama] [--emb-codec q8_0|q4_k|f32]\n"
         "      more codecs (GGUF block layouts): q5_k q6_k q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0\n"
         "      --codec keep (default for .gguf and AWQ/GPTQ checkpoints): tensors stay in their stored quantisation; another codec re-quantises them\n"
@@ -90,6 +92,10 @@ int usage() {
         "      [--out file.f32] [--device D]     embedding models (BERT family, ViT / CLIP / SigLIP, Whisper encoder):\n"
         "      prints the vector, or writes it as raw f32; --input feeds a declared input (an image, mel frames)\n"
         "      --text: the model's tokenizer adds its special tokens ([CLS] .. [SEP]) and token types; --ids prints the ids to stderr\n"
+        "  denoise <model.fpk> [--steps N] [--sampler ddim|ddpm|euler] [--guidance G] [--eta E] [--seed S | --init latent.f32]\n"
+        "      [--input name=file ...] [--uncond name=file ...] [--dim name=N] [--out latent.f32]   models with `session diffusion_loop`\n"
+        "  stream <model.fpk> --input samples.f32 [--chunk N] [--out frames.f32]    models with `session streaming`: framing from the file,\n"
+        "      one run per frame with the model's state carried over\n"
         "  aot <model.fpk> [-o out] [--aot-mode plan|native]   compile the model's plans ahead of time (docs/aot-models.md)\n"
         "      [--shapes 1,8,16 (sequence lengths; default 1,2,4,...,64)] [--all-rows] [--kv-codec f32,int8] [--ctx N]\n"
         "      plan:   plans go into the .fpk's \"aot\" section (-o out.fpk, default in place) [--sidecar] [--key name.key | --drop-signature]\n"
@@ -232,7 +238,9 @@ int cmd_import(const args& a) {
     // single file next to the output first, which is then split (modelfile/shard.hpp) and removed.
     const bool shard = a.kv.count("shard-size") != 0;
     const std::string final_out = a.get("o"), import_out = shard ? final_out + ".unsharded" : final_out;
-    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], import_out, o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], import_out, o) : import::import_hf(a.pos[0], import_out, o);
+    // a directory with a blueprint.fbp is a model described by its blueprint (import/blueprint_dir.hpp)
+    auto r = import::is_blueprint_dir(a.pos[0]) ? import::import_blueprint_dir(a.pos[0], import_out, o)
+           : a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], import_out, o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], import_out, o) : import::import_hf(a.pos[0], import_out, o);
     if (shard) {
         modelfile::shard_options so; so.shard_bytes = parse_size_arg(a.get("shard-size"), "--shard-size"); so.blob_dir = a.get("blob-dir");
         modelfile::shard_report sr;
@@ -622,6 +630,85 @@ int run_one_shot(inference::session& s, const args& a) {
         std::ofstream f(prefix + "." + k + ".f32", std::ios::binary);
         f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
     }
+    return 0;
+}
+
+// name=file arguments -> {name: values}; files are raw f32, or .i64 / .i32 integers
+inference::tensor_map read_named_inputs(const std::vector<std::string>& specs, const char* opt) {
+    inference::tensor_map m;
+    for (auto& spec : specs) {
+        auto eq = spec.find('=');
+        if (eq == std::string::npos || eq == 0) raise(errc::invalid_argument, "{} expects name=file, got '{}'", opt, spec);
+        auto file = spec.substr(eq + 1); auto bytes = import::read_file(file);
+        std::vector<float> v;
+        if (file.ends_with(".i64") || file.ends_with(".i32")) {
+            const std::size_t w = file.ends_with(".i64") ? 8 : 4;
+            if (bytes.size() % w) raise(errc::invalid_argument, "input file {} is not raw {}", file, w == 8 ? "int64" : "int32");
+            v.resize(bytes.size() / w);
+            for (std::size_t i = 0; i < v.size(); ++i) { if (w == 8) { std::int64_t x; std::memcpy(&x, bytes.data() + 8 * i, 8); v[i] = float(x); } else { std::int32_t x; std::memcpy(&x, bytes.data() + 4 * i, 4); v[i] = float(x); } }
+        } else {
+            if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", file);
+            v.resize(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        }
+        m[spec.substr(0, eq)] = std::move(v);
+    }
+    return m;
+}
+void write_f32(const std::string& path, const std::vector<float>& v) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+    if (!f) throw std::runtime_error("cannot write " + path);
+}
+
+// `forge denoise`: a model whose blueprint declares `session diffusion_loop`: scheduler, step plan and guidance from
+// the file (overridable), the model's graph as the denoiser. Writes or prints the final latent.
+int cmd_denoise(const args& a) {
+    if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
+    inference::session_options so; so.verify = a.has("verify");
+    inference::session s(a.pos[0], so);
+    if (!a.get("device").empty()) s.shared_model()->set_device(a.get("device"));
+    std::map<std::string, i64> dims;
+    for (auto& spec : a.all("dim")) { auto eq = spec.find('='); if (eq == std::string::npos || eq == 0) raise(errc::invalid_argument, "--dim expects name=N, got '{}'", spec); dims[spec.substr(0, eq)] = i64(std::stoll(spec.substr(eq + 1))); }
+    inference::diffusion_runner d(s, dims);
+    auto o = d.defaults();
+    o.steps = int(a.num("steps", o.steps)); o.guidance = float(a.num("guidance", o.guidance)); o.eta = a.num("eta", o.eta); o.seed = std::uint64_t(a.num("seed", 0));
+    if (auto k = a.get("sampler"); !k.empty()) {
+        if (k == "ddim") o.kind = inference::diffusion::sampler_kind::ddim; else if (k == "ddpm") o.kind = inference::diffusion::sampler_kind::ddpm;
+        else if (k == "euler" || k == "euler_flow") o.kind = inference::diffusion::sampler_kind::euler_flow; else raise(errc::invalid_argument, "--sampler takes ddim, ddpm or euler, not '{}'", k);
+    }
+    auto cond = read_named_inputs(a.all("input"), "--input"), uncond = read_named_inputs(a.all("uncond"), "--uncond");
+    inference::diffusion::latent x;
+    if (!a.get("init").empty()) { auto m = read_named_inputs({"x=" + a.get("init")}, "--init"); x = std::move(m.at("x")); }   // start from a given latent instead of seeded noise
+    else x = d.initial_noise(o.seed);
+    auto t0 = std::chrono::steady_clock::now();
+    auto y = d.run(std::move(x), o, cond, uncond);
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[diffusion: %d steps, %zu denoiser calls, latent of %zu values, %.3fs]\n", o.steps, d.model_calls(), y.size(), sec);
+    if (!a.get("out").empty()) write_f32(a.get("out"), y);
+    else { for (auto v : y) std::printf("%.6g ", v); std::printf("\n"); }
+    return 0;
+}
+
+// `forge stream`: a model whose blueprint declares `session streaming`: samples from --input are fed in chunks of
+// --chunk, framed by the file's window / hop, and the model runs once per frame with its state carried over.
+int cmd_stream(const args& a) {
+    if (a.pos.empty() || a.get("input").empty()) return usage();
+    activate_policy(a.get("policy"));
+    inference::session_options so; so.verify = a.has("verify");
+    inference::session s(a.pos[0], so);
+    if (!a.get("device").empty()) s.shared_model()->set_device(a.get("device"));
+    inference::stream_runner r(s);
+    auto samples = read_named_inputs({"x=" + a.get("input")}, "--input").at("x");
+    std::size_t chunk = std::size_t(std::max(1.0, a.num("chunk", double(r.options().hop))));
+    auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t at = 0; at < samples.size(); at += chunk) r.feed({samples.data() + at, std::min(chunk, samples.size() - at)});
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const auto& st = r.stat();
+    std::fprintf(stderr, "[stream: %zu samples in chunks of %zu, window %zu hop %zu: %zu frames, %zu dropped, %zu values per frame, worst frame %.3f ms, %.3fs]\n",
+                 st.samples_in, chunk, r.options().window, r.options().hop, st.frames, st.dropped, r.frame_size(), st.worst_ms, sec);
+    if (!a.get("out").empty()) write_f32(a.get("out"), r.output());
+    else { for (auto v : r.output()) std::printf("%.6g ", v); std::printf("\n"); }
     return 0;
 }
 
@@ -1284,6 +1371,8 @@ int main(int argc, char** argv) {
         if (c == "inspect") return cmd_inspect(a);
         if (c == "run") return cmd_run(a);
         if (c == "embed") return cmd_embed(a);
+        if (c == "denoise") return cmd_denoise(a);
+        if (c == "stream") return cmd_stream(a);
         if (c == "bench") return cmd_bench(a);
         if (c == "dump") return cmd_dump(a);
         if (c == "keygen") return cmd_keygen(a);

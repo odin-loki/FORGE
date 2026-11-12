@@ -141,6 +141,47 @@ std::vector<float> t = s.embed_text("hello world");     // the same through the 
 
 `generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per call: there is no batch axis, so padding only matters when the caller pads. Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).
 
+### Session kinds chosen by the file: `diffusion_loop` and `streaming` (`file_sessions.hpp`)
+A blueprint of opset 4 can declare `session diffusion_loop(...)` or `session streaming(...)` with the parameters of the kind ([modelfile.md](modelfile.md#opsets)). Such a model is opened like every other (`inference::model`, `inference::session`); a runner attaches the service the kind names to the session's graph.
+
+```cpp
+inference::session s("denoiser.fpk");                    // blueprint: session diffusion_loop(steps: 1000, schedule: scaled_linear, ...)
+inference::diffusion_runner d(s);
+auto o = d.defaults();                                   // steps, sampler, prediction, guidance, eta as the file declares them
+o.guidance = 3.5f; o.seed = 7;
+auto latent = d.sample(o, {{"label", {3.f}}}, {{"label", {0.f}}});   // conditional and unconditional inputs
+
+inference::session a("encoder.fpk");                     // blueprint: session streaming(window: 400, hop: 160, max_lag: 8)
+inference::stream_runner r(a);
+while (auto chunk = next_samples()) r.feed(*chunk);      // any chunk size; one model run per frame
+use(r.output(), r.frame_size());
+```
+
+| `session diffusion_loop(...)` parameter | Default | Meaning |
+|---|---|---|
+| `steps`, `schedule`, `beta_start`, `beta_end` | 1000, `scaled_linear`, 0.00085, 0.012 | The noise schedule (`linear`, `scaled_linear`, `cosine`) |
+| `prediction` | `epsilon` | What the graph outputs: `epsilon`, `v` or `sample` |
+| `sampler`, `inference_steps`, `guidance`, `eta` | `ddim`, 20, 1, 0 | Defaults of a run (`ddim`, `ddpm`, `euler_flow`); `diffusion_runner::defaults()` returns them and a caller may change them per run |
+| `latent`, `timestep` | the first input, `t` | Names of the graph inputs that take the latent and the timestep. Every other input is conditioning: fed from the caller's maps by name, zeros when absent |
+| `encoder` | none | An entry point (`entry name { ... }`) run once before the loop: the caller's maps then hold its inputs, and its outputs are fed to the denoiser inputs of the same names |
+
+| `diffusion_runner` | |
+|---|---|
+| `diffusion_runner(session, dims = {})` | Reads the parameters; raises `unsupported` for another session kind and `format_error` for bad parameters |
+| `run(x, options, cond = {}, uncond = {})`, `sample(options, cond, uncond)` | Denoise `x` (or noise drawn with `options.seed`). With `guidance != 1` the graph runs twice per step |
+| `defaults()`, `scheduler()`, `latent_size()`, `initial_noise(seed)`, `cache()`, `model_calls()` | |
+
+| `session streaming(...)` parameter | Default | Meaning |
+|---|---|---|
+| `window`, `hop` | 400, 160 | Frame length and stride in samples; `window` must be the size of the frame input |
+| `max_lag` | 8 | Frames allowed to be pending; beyond it the oldest are dropped (counted in `stat().dropped`) |
+| `capacity`, `deadline_us` | max(65536, 4 windows), 0 | Ring size in samples; per-frame processing budget (overruns are counted) |
+| `input` | the first input | The graph input that takes a frame |
+
+`stream_runner(session)` (or `(session, streaming::options)` to override the framing): `feed(span)` pushes samples and runs every frame that is ready, `output()` / `take_output()` return the first graph output of each frame concatenated, `frame_size()`, `frame_indices()`, `stat()`. The model's state between frames is whatever the graph declares (`state conv[1] : conv_window` and `conv[0].conv(x, w)`, recurrent state, appended rows): it lives in the session's state store, so `session::reset()` starts a new stream. The output does not depend on how the input was cut into chunks.
+
+Limits: the diffusion loop runs one latent at a time on the host (the graph runs on the session's device, the scheduler arithmetic on the CPU); there is no VAE, text encoder or image I/O, and no UNet / DiT template: a denoiser is imported as a blueprint directory ([modelfile.md](modelfile.md#blueprint-directories)). The streaming runner is single-threaded: `feed` both queues and processes. `forge-serve` and the C ABI do not expose either kind. CLI: `forge denoise`, `forge stream` ([cli.md](cli.md)). Tests: `tests/test_sessions.cpp` (against the graph computed by hand) and `verify/golden/tiny_sessions.py` (ctest `golden_tiny_sessions`: numpy references for five scheduler / prediction / sampler combinations, guidance, and the streaming encoder).
+
 ### Other session kinds
 - `diffusion.hpp` (`forge::inference::diffusion`): `noise_scheduler::make(T, beta_schedule, b0, b1)` (linear, scaled_linear, cosine), `options` (`steps`, `kind` = ddim / ddpm / euler_flow, `pred` = epsilon / v / sample, `guidance` (classifier-free, 1 = off), `eta`, `seed`, `cache_at`, `start_step`), `session(scheduler, denoiser).run(x, opt)`. The denoiser is any callable `(x, t, cond) → prediction`. Noise is Philox, so a seed gives the same trajectory on every backend. `cache()` holds latents for `cache_at` steps; resume with `start_step`.
 - `streaming.hpp` (`forge::inference::streaming`): lock-free SPSC `ring<T>`, and `session(options, frame_fn)` with `feed(p, n)` (producer) and `pump()` (consumer). `options`: `window` 400, `hop` 160, `max_lag_frames` 8, `deadline`, `capacity` 65536. When more than `max_lag_frames` frames are pending, the oldest are dropped. `stat()` counts frames, drops, overruns and rejected samples.

@@ -1523,7 +1523,7 @@ if(FORGE_BUILD_TESTS)
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden)
     # Tiny random models of the other template families (GPT-2, Gemma 1/2/3, Phi-3 / Phi-4-mini, BERT / RoBERTa
     # embedding, ViT / CLIP / SigLIP vision, Whisper encoder) against float64 numpy references.
-    set(FORGE_GOLDEN_FAMILIES gpt2 gemma phi3 bert vit whisper)
+    set(FORGE_GOLDEN_FAMILIES gpt2 gemma phi3 bert vit whisper sessions)   # sessions: diffusion_loop and streaming models (verify/golden/tiny_sessions.py)
     foreach(_g ${FORGE_GOLDEN_FAMILIES})
       add_test(NAME golden_tiny_${_g}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py

@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `shard`, `adapter`, `blueprint`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `shard`, `adapter`, `blueprint`, `inspect`, `run`, `denoise`, `stream`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -15,7 +15,7 @@ Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage t
 Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), every kernel table this CPU can run, preferred first (line `targets`; pass one to `FORGE_SIMD_TARGET`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
 ### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [options]`
-Converts a model to `.fpk`.
+Converts a model to `.fpk`. A directory that holds a `blueprint.fbp` is imported as a model described by its own blueprint ([modelfile.md](modelfile.md#blueprint-directories)); the template and mixed-precision options do not apply to it.
 
 | Option | Meaning |
 |--------|---------|
@@ -111,6 +111,21 @@ forge embed bge.fpk --text "hello world"
 forge embed bge.fpk --tokens 101,7592,2088,102
 forge embed vit.fpk --input image=cat.f32 --out cat.emb.f32
 ```
+
+### `forge denoise <model.fpk> [options]`
+Runs a model whose blueprint declares `session diffusion_loop` ([inference.md](inference.md#session-kinds-chosen-by-the-file-diffusion_loop-and-streaming-file_sessionshpp)): the scheduler, sampler and step count come from the file.
+
+| Option | Meaning |
+|--------|---------|
+| `--steps N`, `--sampler ddim\|ddpm\|euler`, `--guidance G`, `--eta E` | Override what the file declares |
+| `--seed S` | Seed of the initial noise (and of DDPM's per-step noise); default 0 |
+| `--init latent.f32` | Start from this latent instead of seeded noise |
+| `--input name=file`, `--uncond name=file` | Conditioning inputs for the conditional and the unconditional branch (raw f32, or `.i64` / `.i32`); with an `encoder` entry point they are the encoder's inputs. Absent inputs are zeros |
+| `--dim name=N`, `--device D`, `--verify` | Symbolic dimensions of the graph; execution device; check hashes at open |
+| `--out latent.f32` | Write the final latent as raw f32 (default: print it) |
+
+### `forge stream <model.fpk> --input samples.f32 [--chunk N] [--out frames.f32]`
+Runs a model whose blueprint declares `session streaming`: the samples are fed in chunks of `--chunk` (default: the hop), framed by the file's window and hop, and the model runs once per frame with its state carried over. Writes (or prints) the first output of every frame, concatenated; a summary line on stderr gives the frames processed and dropped. The result does not depend on `--chunk`.
 
 ### `forge aot <model.fpk> [-o out] [--aot-mode plan|native] [options]`
 Compiles the model's plans ahead of time. The full description is in [aot-models.md](aot-models.md).

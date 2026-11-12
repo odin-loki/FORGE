@@ -95,14 +95,18 @@ inline state_schema derive_state_schema(const blueprint& bp, const std::function
     state_schema out;
     if (bp.states.empty()) return out;
     build_options bo;
-    for (auto* io : {&bp.inputs, &bp.outputs}) for (auto& d : *io) for (auto& dim : d.dims)
-        if (!dim.empty() && !std::isdigit(static_cast<unsigned char>(dim[0])) && !bp.params.count(dim)) bo.dims[dim] = 1;
+    auto bind = [&](const std::vector<bp_io_decl>& ios) { for (auto& d : ios) for (auto& dim : d.dims) if (!dim.empty() && !std::isdigit(static_cast<unsigned char>(dim[0])) && !bp.params.count(dim)) bo.dims[dim] = 1; };
+    bind(bp.inputs); bind(bp.outputs);
+    for (auto& [en, e] : bp.entries) { bind(e.inputs); bind(e.outputs); }
     bo.dims["seq"] = 1;
     bo.weight = [&](const std::string& n) -> std::pair<shape_t, const float*> { return {weight_shape(n), nullptr}; };
-    graph::tensor_graph g;
-    try { g = build_graph(bp, bo); graph::verify_graph(g); }
-    catch (const std::out_of_range& e) { raise(errc::format_error, "blueprint \"{}\": malformed graph ({})", bp.name, e.what()); }
     std::map<std::string, state_slot> by_name;
+    std::vector<std::string> graphs{""};   // the main graph, then every entry point: they share the state slots
+    for (auto& [en, e] : bp.entries) graphs.push_back(en);
+    for (auto& gname : graphs) {
+    graph::tensor_graph g;
+    try { g = build_graph(bp, bo, gname); graph::verify_graph(g); }
+    catch (const std::out_of_range& e) { raise(errc::format_error, "blueprint \"{}\": malformed graph ({})", bp.name, e.what()); }
     for (std::size_t i = 0; i < g.size(); ++i) try {
         const auto& n = g.at(graph::value_id(i));
         state_slot s; s.name = n.name;
@@ -117,6 +121,7 @@ inline state_schema derive_state_schema(const blueprint& bp, const std::function
         if (auto [it, fresh] = by_name.emplace(s.name, s); !fresh && !(it->second == s))
             raise(errc::format_error, "blueprint \"{}\": state slot '{}' is used with two layouts", bp.name, s.name);
     } catch (const std::out_of_range& e) { raise(errc::format_error, "blueprint \"{}\": malformed state node ({})", bp.name, e.what()); }
+    }
     for (auto& [k, s] : by_name) out.slots.push_back(std::move(s));
     return out;
 }

@@ -239,9 +239,11 @@ public:
     // plan for `n` new tokens; all_rows keeps logits for every position
     // `dims` binds symbolic dimensions other than `seq` (graphs imported from ONNX may have several); such plans are
     // compiled here, never taken from precompiled ones (those are keyed on `seq` alone).
-    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}, const std::map<std::string, i64>* dims = nullptr) {
+    // `entry` names an entry point of the blueprint (`entry name { ... }`, opset 4) to build instead of the main graph.
+    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}, const std::map<std::string, i64>* dims = nullptr, const std::string& entry = {}) {
         std::string dk;
         if (dims) for (auto& [k, v] : *dims) if (k != "seq") dk += std::format(";{}={}", k, v);
+        if (!entry.empty() && entry != "main") dk += ";entry=" + entry;
         return cache_.get(std::format("{}:{}:{}:{}{}", all_rows ? "all" : "seq", n, adapter, st ? graph::kv_codec_pair_name({st->codec, st->codec_v == graph::kv_codec::f32 ? st->codec : st->codec_v}) : "f32", dk), [&] {
             modelfile::build_options bo;
             if (dims) for (auto& [k, v] : *dims) bo.dims[k] = v;
@@ -277,7 +279,7 @@ public:
             };
             graph::pass_options po; po.lowerings = reg_.get();
             if (!decode_all && dk.empty()) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
-            return graph::compile(modelfile::build_graph(bp_, bo), st, po);
+            return graph::compile(modelfile::build_graph(bp_, bo, entry), st, po);
         });
     }
 private:
@@ -561,6 +563,26 @@ public:
         ex.run();
         std::map<std::string, std::vector<float>> out;
         for (auto& o : blueprint().outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
+        return out;
+    }
+
+    // A named entry point of the blueprint (opset 4): binds its inputs, runs it once, returns its outputs.
+    std::map<std::string, std::vector<float>> infer_entry(const std::string& entry, const std::map<std::string, std::vector<float>>& in, i64 seq = 1, const std::map<std::string, i64>& dims = {}) {
+        if (entry.empty() || entry == "main") return infer(in, seq, dims);
+        const auto& e = blueprint().entry_at(entry);
+        std::lock_guard lk(m_->run_mutex());
+        auto& p = m_->plan_for(seq, false, &st_, {}, dims.empty() ? nullptr : &dims, entry);
+        auto it = execs_.find(&p);
+        if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<graph::executor>(p, &st_)).first;
+        auto& ex = *it->second;
+        for (auto& d : e.inputs) {
+            auto f = in.find(d.name);
+            if (f == in.end()) raise(errc::invalid_argument, "infer: entry '{}' is missing input '{}'", entry, d.name);
+            ex.set_input(d.name, f->second);
+        }
+        ex.run();
+        std::map<std::string, std::vector<float>> out;
+        for (auto& o : e.outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
         return out;
     }
 

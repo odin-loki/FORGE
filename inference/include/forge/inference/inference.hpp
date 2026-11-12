@@ -7,3 +7,4 @@
 #include <forge/inference/grammar.hpp>
 #include <forge/inference/batch.hpp>
 #include <forge/inference/chat_template.hpp>
+#include <forge/inference/file_sessions.hpp>   // session kinds chosen by the file: diffusion_loop, streaming

@@ -99,12 +99,16 @@ inline std::string canonical_blueprint_text(const std::vector<bp_token>& toks) {
         if (toks[i].kind != bp_token::k_ident) return false;
         if (toks[i].text == "repeat" || toks[i].text == "return") return true;
         if (i > 0 && (is_p(i - 1, ",") || is_p(i - 1, "."))) return false;
+        // declarations inside an `entry name { ... }` block: one per line, the declared name stays on it
+        const bool decl_kw = toks[i].text == "input" || toks[i].text == "output" || toks[i].text == "graph";
+        if (decl_kw && i + 1 < n && (toks[i + 1].kind == bp_token::k_ident || is_p(i + 1, "{")) && !is_p(i + 1, ":") && !is_p(i + 1, "=") && !is_p(i + 1, ",") && !is_p(i + 1, "(")) return true;
+        if (i > 0 && toks[i - 1].kind == bp_token::k_ident && (toks[i - 1].text == "input" || toks[i - 1].text == "output") && is_p(i + 1, ":") && !(i > 1 && is_p(i - 2, "."))) return false;
         if (is_p(i + 1, ":")) return true;                         // params entry
         std::size_t j = i + 1;                                     // a, b, c = ...
         while (is_p(j, ",") && j + 1 < n && toks[j + 1].kind == bp_token::k_ident) j += 2;
         return is_p(j, "=");
     };
-    static const std::string_view top[] = {"params", "state", "input", "output", "graph", "session", "op"};
+    static const std::string_view top[] = {"params", "state", "input", "output", "graph", "session", "op", "entry"};
     std::string out; int brace = 0, paren = 0; bool line_start = true;
     auto newline = [&] { if (!out.empty() && out.back() != '\n') out += '\n'; line_start = true; };
     for (std::size_t i = 0; i < n; ++i) {
