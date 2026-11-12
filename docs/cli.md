@@ -47,7 +47,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprin
 | `--ctx N` | 0 | Context length; 0 = model maximum |
 | `--ids` | off | Print token ids instead of text (always on when the model has no tokenizer) |
 | `--no-bos` | off | Do not prepend the BOS token |
-| `--chat`, `--system TEXT` | off | Treat `--prompt` as a user message (after an optional system message) and render it with the model's chat template; fails when the file has none. The template writes BOS itself |
+| `--chat`, `--system TEXT` | off | Treat `--prompt` as a user message (after an optional system message) and render it with the model's chat template; fails when the file has none. The template writes BOS itself. Generation also stops (without printing the token) at the model's end-of-turn tokens: the manifest's `eos_token_ids` and markers such as `<\|im_end\|>` or `<\|eot_id\|>` that the template writes ([inference.md](inference.md#chat-tools-chat_toolshpp)) |
 | `--logits FILE` | | Write the prefill logits as raw f32 |
 | `--verify` | off | Check BLAKE3 hashes on open |
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |

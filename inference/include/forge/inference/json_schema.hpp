@@ -25,7 +25,8 @@ struct conv {
     // Schemas come from requests. A "type" list is expanded once per listed type, so nesting such lists costs
     // 2^depth visits from a few hundred bytes; the conversion stops at this many subschema visits.
     int budget = 20000;
-    std::string fresh(const std::string& base) { return base + std::to_string(n++); }
+    std::string prefix;   // in front of every rule name this conversion defines (several schemas in one grammar)
+    std::string fresh(const std::string& base) { return prefix + base + std::to_string(n++); }
     void def(const std::string& name, const std::string& body) { out += name + " ::= " + body + "\n"; }
     std::string visit(const json::value& s) {
         if (--budget < 0) return throw_bad("schema too complex (more than 20000 subschema visits)");
@@ -95,11 +96,9 @@ struct conv {
     [[noreturn]] std::string throw_bad(const std::string& m) { raise(errc::invalid_argument, "json schema: {}", m); }
 };
 }
-inline std::string json_schema_to_gbnf(const json::value& schema) {
-    detail_schema::conv c{schema, {}, {}, 0};
-    std::string r = c.visit(schema);
-    return "root ::= " + r + "\n" + c.out +
-        "value ::= object | array | string | number | boolean | null\n"
+// The rules every converted schema refers to (any JSON value, compact).
+inline const char* json_schema_base_rules() {
+    return "value ::= object | array | string | number | boolean | null\n"
         "object ::= \"{\" (string \":\" value (\",\" string \":\" value)*)? \"}\"\n"
         "array ::= \"[\" (value (\",\" value)*)? \"]\"\n"
         "string ::= \"\\\"\" ([^\"\\\\\\x00-\\x1F] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]))* \"\\\"\"\n"
@@ -107,5 +106,18 @@ inline std::string json_schema_to_gbnf(const json::value& schema) {
         "number ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\n"
         "boolean ::= \"true\" | \"false\"\n"
         "null ::= \"null\"\n";
+}
+// One schema as part of a larger grammar: appends its rules (names start with `prefix`) to `rules` and returns the
+// expression that matches a value of the schema. The grammar must also contain json_schema_base_rules().
+inline std::string json_schema_rules(const json::value& schema, const std::string& prefix, std::string& rules) {
+    detail_schema::conv c{schema, {}, {}, 0};
+    c.prefix = prefix;
+    std::string r = c.visit(schema);
+    rules += c.out;
+    return r;
+}
+inline std::string json_schema_to_gbnf(const json::value& schema) {
+    std::string rules, r = json_schema_rules(schema, "", rules);
+    return "root ::= " + r + "\n" + rules + json_schema_base_rules();
 }
 }

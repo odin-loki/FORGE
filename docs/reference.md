@@ -228,7 +228,7 @@ Generated from `graph/codecs.hpp` (codec list), `qweights::fmt_of` in `graph/pla
 | `tq1_0` | 256 / 54 | decode + f32 dot |  |  |
 | `tq2_0` | 256 / 66 | decode + f32 dot |  |  |
 
-## C ABI (version 3, `inference/include/forge.h`)
+## C ABI (version 4, `inference/include/forge.h`)
 
 | function | signature | notes |
 |---|---|---|
@@ -249,3 +249,48 @@ Generated from `graph/codecs.hpp` (codec list), `qweights::fmt_of` in `graph/pla
 | `forge_forward_all` | `int forge_forward_all(forge_model* m, const int32_t* ids, int64_t n, float* logits, int64_t cap);` |  |
 | `forge_generate_ex` | `int64_t forge_generate_ex(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new, const forge_sampling* s, const forge_generate_options* o, int32_t* out, int64_t cap, forge_token_cb cb, void* user);` |  |
 | `forge_generate_ex2` | `int64_t forge_generate_ex2(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new, const forge_sampling* s, const forge_generate_options* o, const forge_sampling_ext* ext, int32_t* out, int64_t cap, forge_token_cb cb, void* user);` |  |
+| `forge_weights_open` | `forge_weights* forge_weights_open(const char* fpk_path, const forge_open_params* p);` | [any] |
+| `forge_weights_close` | `void forge_weights_close(forge_weights* w);` | [handle]; sessions stay valid |
+| `forge_model_weights` | `forge_weights* forge_model_weights(forge_model* m);` | [handle] |
+| `forge_weights_error` | `const char* forge_weights_error(const forge_weights* w);` | [handle] |
+| `forge_weights_device` | `const char* forge_weights_device(forge_weights* w);` | [handle] |
+| `forge_weights_set_device` | `const char* forge_weights_set_device(forge_weights* w, const char* device);` | [setup] |
+| `forge_set_deterministic` | `int forge_set_deterministic(int mode);` | [any] |
+| `forge_session_open` | `forge_model* forge_session_open(forge_weights* w, const forge_session_params* p);` | [any]; close with forge_close |
+| `forge_model_error` | `const char* forge_model_error(const forge_model* m);` | [handle] |
+| `forge_context_size` | `int64_t forge_context_size(const forge_model* m);` | [handle] |
+| `forge_session_kind` | `const char* forge_session_kind(const forge_model* m);` | [handle] |
+| `forge_manifest_json` | `int64_t forge_manifest_json(const forge_model* m, char* out, int64_t cap);` | [handle] |
+| `forge_token_bos` | `int32_t forge_token_bos(const forge_model* m);` | [handle]; -1 = none |
+| `forge_token_eos` | `int32_t forge_token_eos(const forge_model* m);` | [handle]; -1 = none |
+| `forge_token_text` | `int64_t forge_token_text(const forge_model* m, int32_t id, char* out, int64_t cap);` | [handle] |
+| `forge_token_id` | `int32_t forge_token_id(const forge_model* m, const char* token);` | [handle] |
+| `forge_token_is_special` | `int forge_token_is_special(const forge_model* m, int32_t id);` | [handle]; 1 / 0 |
+| `forge_stop_tokens` | `int64_t forge_stop_tokens(const forge_model* m, int chat, int32_t* out, int64_t cap);` | [handle] |
+| `forge_chat_template` | `int64_t forge_chat_template(const forge_model* m, char* out, int64_t cap);` | [handle] |
+| `forge_chat_template_apply_ex` | `int64_t forge_chat_template_apply_ex(const forge_model* m, const char* messages_json, const char* tools_json, const char* extra_json, int add_generation_prompt, char* out, int64_t cap);` | [handle] |
+| `forge_generate_v4` | `int64_t forge_generate_v4(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new, const forge_generate_params* p, int32_t* out, int64_t cap, int32_t* stop_reason);` | [handle] (m and p->draft) |
+| `forge_json_schema_to_grammar` | `int64_t forge_json_schema_to_grammar(const char* schema_json, char* out, int64_t cap);` | [any] |
+| `forge_grammar_check` | `int forge_grammar_check(const char* grammar);` | [any] |
+| `forge_adapter_load` | `int forge_adapter_load(forge_weights* w, const char* name, const char* path);` | [setup] |
+| `forge_adapter_exists` | `int forge_adapter_exists(forge_weights* w, const char* name);` | [handle]; 1 / 0 |
+| `forge_adapter_set` | `int forge_adapter_set(forge_model* m, const char* name);` | [handle] |
+| `forge_adapter_get` | `const char* forge_adapter_get(const forge_model* m);` | [handle] |
+| `forge_state_save` | `int64_t forge_state_save(forge_model* m, int64_t n_tokens, void* out, int64_t cap);` | [handle] |
+| `forge_state_load` | `int forge_state_load(forge_model* m, const void* data, int64_t n);` | [handle] |
+| `forge_state_copy` | `int forge_state_copy(forge_model* dst, forge_model* src, int64_t n_tokens);` | [handle] (both) |
+| `forge_state_bytes` | `int64_t forge_state_bytes(const forge_model* m);` | [handle]; KV bytes held |
+| `forge_embed_dim` | `int64_t forge_embed_dim(const forge_model* m);` | [handle] |
+| `forge_embed_tokens` | `int64_t forge_embed_tokens(forge_model* m, const int32_t* ids, int64_t n, const int32_t* type_ids, float* out, int64_t cap);` | [handle] |
+| `forge_embed_text` | `int64_t forge_embed_text(forge_model* m, const char* text, const char* pair, float* out, int64_t cap, int64_t* n_tokens);` | [handle] |
+| `forge_embed_texts` | `int64_t forge_embed_texts(forge_model* m, const char* const* texts, int64_t n, float* out, int64_t cap);` | [handle] |
+| `forge_batch_open` | `forge_batch* forge_batch_open(forge_weights* w, const forge_batch_params* p);` | [any] |
+| `forge_batch_close` | `void forge_batch_close(forge_batch* b);` | [handle] |
+| `forge_batch_error` | `const char* forge_batch_error(const forge_batch* b);` | [handle] |
+| `forge_batch_submit` | `uint64_t forge_batch_submit(forge_batch* b, const forge_batch_request* r);` | [any] |
+| `forge_batch_cancel` | `int forge_batch_cancel(forge_batch* b, uint64_t request_id);` | [any] |
+| `forge_batch_step` | `int forge_batch_step(forge_batch* b);` | [handle] |
+| `forge_batch_run` | `int forge_batch_run(forge_batch* b);` | [handle] |
+| `forge_batch_stats_get` | `int forge_batch_stats_get(forge_batch* b, forge_batch_stats* out);` | [handle]; set out->size first |
+| `forge_batch_evict_prefix_cache` | `void forge_batch_evict_prefix_cache(forge_batch* b, int64_t keep);` | [any] |
+| `forge_aot_precompile` | `int64_t forge_aot_precompile(const char* fpk_path, const char* out_path, const int32_t* seq_lengths, int64_t n);` | [any] |

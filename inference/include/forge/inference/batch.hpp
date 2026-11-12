@@ -16,6 +16,10 @@
 
 namespace forge::inference {
 
+// Log-probabilities of one sampled token under the model's raw distribution (log-softmax of the logits, before the
+// sampler chain, logit bias and grammar), and the `top` most likely tokens, most likely first.
+struct token_logprob { int token = 0; float logprob = 0; std::vector<std::pair<int, float>> top; };
+
 struct request {
     std::vector<int> prompt;
     int max_new = 64;
@@ -23,6 +27,9 @@ struct request {
     std::shared_ptr<const forge::inference::grammar> grammar;    // optional constraint
     std::vector<int> stop_tokens;              // in addition to EOS
     int priority = 0;                          // higher is admitted first; FIFO within a priority
+    std::string adapter;                       // LoRA adapter registered on the model ("" = base weights)
+    int top_logprobs = -1;                     // >= 0: report each sampled token's log-probability and this many alternatives
+    std::function<void(const token_logprob&)> on_logprobs;   // called before on_token for the same token
     std::function<bool(int)> on_token;         // streaming; return false to cancel
     std::function<void(const std::vector<int>&, const std::string& finish_reason)> on_done;
 };
@@ -40,7 +47,7 @@ struct batch_options { int max_active = 8; i64 prefill_chunk = 256; std::size_t 
 // prefix_reload_failures: spilled prefixes that could not be read back (file missing, truncated, or failing the
 // store's authentication): the prefix is discarded and recomputed, never loaded
 struct batch_stats { std::size_t steps = 0, completed = 0, prefix_hits = 0, prefix_tokens_reused = 0, peak_active = 0, peak_kv_bytes = 0, deferred = 0,
-                     prefix_spills = 0, prefix_reloads = 0, prefix_reload_failures = 0; };
+                     prefix_spills = 0, prefix_reloads = 0, prefix_reload_failures = 0, failed = 0; };
 
 class batch_scheduler {
 public:
@@ -56,9 +63,11 @@ public:
     std::size_t waiting() { std::lock_guard lk(mu_); return waiting_.size(); }
     std::size_t active_count() { std::lock_guard lk(mu_); return active_.size(); }
 
-    std::uint64_t submit(request r) {
+    // An id for a request whose callbacks need to know it: pass it to submit(request, id).
+    std::uint64_t allocate_id() { std::lock_guard lk(mu_); return ++next_id_; }
+    std::uint64_t submit(request r, std::uint64_t allocated_id = 0) {
         std::lock_guard lk(mu_);
-        auto id = ++next_id_;
+        auto id = allocated_id ? allocated_id : ++next_id_;
         auto pos = std::find_if(waiting_.begin(), waiting_.end(), [&](const pending& w) { return w.r.priority < r.priority; });
         waiting_.insert(pos, {id, std::move(r)});
         cv_.notify_all();
@@ -71,6 +80,12 @@ public:
             if (it->id == id) { auto r = std::move(it->r); waiting_.erase(it); ++stats_.completed; if (r.on_done) r.on_done({}, "cancelled"); return true; }
         for (auto& a : active_) if (a->id == id && !a->cancelled) { a->cancelled = true; return true; }
         return false;
+    }
+    // Cancel everything: waiting requests end at once, active ones at the next step() (run_until_idle() finishes them).
+    void cancel_all() {
+        std::lock_guard lk(mu_);
+        while (!waiting_.empty()) { auto r = std::move(waiting_.front().r); waiting_.pop_front(); ++stats_.completed; if (r.on_done) r.on_done({}, "cancelled"); }
+        for (auto& a : active_) a->cancelled = true;
     }
     bool idle() { std::lock_guard lk(mu_); return waiting_.empty() && active_.empty(); }
     const batch_stats& stats() const { return stats_; }
@@ -96,7 +111,11 @@ public:
                 }
                 ++admitted;
                 auto w = std::move(waiting_.front()); waiting_.pop_front();
-                active_.push_back(admit(w.id, std::move(w.r)));
+                // A request that cannot be admitted (unknown adapter, a prompt that does not fit, a grammar without a
+                // tokenizer) fails alone: its on_done gets "error: ...", the others are not touched.
+                auto done = w.r.on_done;
+                try { active_.push_back(admit(w.id, std::move(w.r))); }
+                catch (const std::exception& e) { ++stats_.completed; ++stats_.failed; if (done) done({}, std::string("error: ") + e.what()); }
             }
             if (active_.empty()) return false;
         }
@@ -106,9 +125,14 @@ public:
             auto& a = **it;
             bool fin;
             { std::lock_guard lk(mu_); fin = a.cancelled; }
-            if (fin) finish(a, "cancelled"); else fin = advance(a);
+            if (fin) finish(a, "cancelled");
+            else {
+                // an error in one sequence (context exceeded, a device failure for this plan) ends that request only
+                try { fin = advance(a); }
+                catch (const std::exception& e) { ++stats_.failed; finish(a, std::string("error: ") + e.what()); fin = true; a.failed = true; }
+            }
             auto sb = a.s->state().bytes(); kv += sb; ++ran; if (!fin) live += sb;
-            if (fin) { retire(std::move(*it)); it = active_.erase(it); }
+            if (fin) { std::lock_guard lk(mu_); if (!a.failed) retire(std::move(*it)); it = active_.erase(it); }
             else ++it;
         }
         stats_.peak_kv_bytes = std::max(stats_.peak_kv_bytes, kv);
@@ -148,21 +172,24 @@ private:
         std::vector<int> hist, out;
         std::size_t fed = 0;           // prompt tokens already in the KV state
         std::vector<float> logits;
-        bool cancelled = false;
+        bool cancelled = false, failed = false;
     };
     std::unique_ptr<active> admit(std::uint64_t id, request r) {
         auto a = std::make_unique<active>();
         a->id = id; a->r = std::move(r);
         a->s = std::make_unique<session>(m_, o_.session);
+        if (!a->r.adapter.empty()) a->s->set_adapter(a->r.adapter);   // raises for a name the model does not have
+        if (a->r.prompt.empty()) raise(errc::invalid_argument, "request with empty prompt");
+        if (i64(a->r.prompt.size()) >= a->s->context())
+            raise(errc::invalid_argument, "the prompt is {} tokens; with at least one new token it does not fit the context of {}", a->r.prompt.size(), a->s->context());
         a->smp = std::make_unique<sampler>(a->r.sampling);
         if (a->r.grammar) {
             auto* tok = m_->tokenizer();
             if (!tok) raise(errc::unsupported, "grammar constraints need a tokenizer");
-            a->gc = std::make_unique<grammar_constraint>(a->r.grammar, *tok, int(m_->vocab()), tok->eos());
+            a->gc = std::make_unique<grammar_constraint>(a->r.grammar, *tok, int(m_->vocab()), tok->eos(), a->r.stop_tokens);
             a->smp->filter = [g = a->gc.get()](std::span<float> l) { g->apply(l); };
             a->smp->allow = [g = a->gc.get()](int t) { return g->allows(t); };
         }
-        if (a->r.prompt.empty()) raise(errc::invalid_argument, "request with empty prompt");
         a->hist = a->r.prompt;
         // prefix cache: reuse the longest shared prefix (always leave >= 1 prompt token to compute logits); an
         // in-memory entry wins a tie with a spilled one. An entry with recurrent state (e.g. Qwen3.5) only matches
@@ -171,6 +198,7 @@ private:
         auto shared = [&](const cached& c) {
             std::size_t n = 0, lim = std::min(c.tokens.size(), a->r.prompt.size() - 1);
             while (n < lim && c.tokens[n] == a->r.prompt[n]) ++n;
+            if (c.adapter != a->r.adapter) return std::size_t(0);   // KV rows computed with other weights
             return c.full_only && n != c.tokens.size() ? std::size_t(0) : n;
         };
         auto mem_hit = cache_.end(), sp_hit = spilled_.end();
@@ -181,7 +209,7 @@ private:
             bool loaded = false;
             try {   // take() throws on a file that is gone, short or (encrypted store) not what was written: a miss
                 if (auto blob = o_.spill->take(c.spill_key)) {
-                    c.s = std::make_unique<session>(m_, o_.session); c.s->load_prefix(*blob); c.spill_key = 0; loaded = true;
+                    c.s = std::make_unique<session>(m_, o_.session); c.s->set_adapter(c.adapter); c.s->load_prefix(*blob); c.spill_key = 0; loaded = true;
                 }
             } catch (const std::exception&) { ++stats_.prefix_reload_failures; }
             if (loaded) { cache_.push_front(std::move(c)); mem_hit = cache_.begin(); ++stats_.prefix_reloads; }
@@ -205,6 +233,7 @@ private:
         }
         int t = a.smp->sample(a.logits, a.hist);
         if (a.gc && !a.gc->accept(t)) { finish(a, "grammar"); return true; }
+        if (a.r.top_logprobs >= 0 && a.r.on_logprobs) a.r.on_logprobs(logprobs_of(a.logits, t, a.r.top_logprobs));
         a.out.push_back(t); a.hist.push_back(t);
         int eos = m_->tokenizer() ? m_->tokenizer()->eos() : -1;
         bool stop = t == eos || std::find(a.r.stop_tokens.begin(), a.r.stop_tokens.end(), t) != a.r.stop_tokens.end();
@@ -220,7 +249,7 @@ private:
         if (o_.prefix_cache == 0) return;
         std::vector<int> toks(a->hist.begin(), a->hist.begin() + std::min<std::size_t>(a->hist.size(), std::size_t(a->s->position())));
         bool full_only = a->s->has_recurrent_state();
-        cache_.push_front({std::move(toks), std::move(a->s), 0, full_only});
+        cache_.push_front({std::move(toks), std::move(a->s), 0, full_only, a->r.adapter});
         while (cache_.size() > o_.prefix_cache) evict_lru_();
         update_cache_bytes_();
     }
@@ -229,7 +258,23 @@ private:
         for (auto& a : active_) if (a->r.on_done) a->r.on_done(a->out, "error: " + msg);
         active_.clear();
     }
-    struct cached { std::vector<int> tokens; std::unique_ptr<session> s; std::uint64_t spill_key = 0; bool full_only = false; };
+    // adapter: the LoRA adapter the rows were computed with; a prefix is only shared with requests that name the same one
+    struct cached { std::vector<int> tokens; std::unique_ptr<session> s; std::uint64_t spill_key = 0; bool full_only = false; std::string adapter; };
+    static token_logprob logprobs_of(std::span<const float> l, int t, int top) {
+        token_logprob r; r.token = t;
+        if (l.empty()) return r;
+        double mx = *std::max_element(l.begin(), l.end()), sum = 0;
+        for (float x : l) sum += std::exp(double(x) - mx);
+        const double lse = mx + std::log(sum);
+        if (t >= 0 && std::size_t(t) < l.size()) r.logprob = float(double(l[std::size_t(t)]) - lse);
+        std::size_t k = std::min<std::size_t>(std::size_t(std::max(top, 0)), l.size());
+        if (k) {
+            std::vector<int> idx(l.size()); std::iota(idx.begin(), idx.end(), 0);
+            std::partial_sort(idx.begin(), idx.begin() + std::ptrdiff_t(k), idx.end(), [&](int x, int y) { return l[std::size_t(x)] > l[std::size_t(y)] || (l[std::size_t(x)] == l[std::size_t(y)] && x < y); });
+            for (std::size_t i = 0; i < k; ++i) r.top.emplace_back(idx[i], float(double(l[std::size_t(idx[i])]) - lse));
+        }
+        return r;
+    }
     // Evict the least recently used in-memory prefix: with a spill store its KV goes to disk (a later hit reloads
     // it), otherwise, or when the store is full or the state cannot be saved, it is dropped.
     void evict_lru_() {

@@ -936,6 +936,9 @@ if(FORGE_BUILD_APPS)
   target_link_libraries(forge PRIVATE forge_security)   # forge security check
   add_executable(forge-serve apps/forge_serve.cpp)
   target_link_libraries(forge-serve PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
+  if(TARGET forge_rpc_tls)   # --tls-cert / --tls-key / --tls-client-ca; without OpenSSL forge-serve is plain HTTP only
+    target_link_libraries(forge-serve PRIVATE forge_rpc_tls)
+  endif()
 endif()
 
 if(FORGE_BUILD_TESTS)
@@ -1566,14 +1569,44 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(golden_tiny_llama golden_tiny_qwen2 golden_rope_scaling golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla golden_gguf_types golden_hf_quant modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
-      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
-      set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
+      # ABI 1-4: the generative golden, the tiny BERT for forge_embed_*, and a work dir for the adapter / plan sidecar it writes
+      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
+      set_tests_properties(capi_smoke PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert")
       add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python_bindings.py
-               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk)
-      set_tests_properties(python_bindings PROPERTIES DEPENDS golden_tiny_llama ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
+               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk
+               ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
+      set_tests_properties(python_bindings PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert" ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # The JNI surface: the Kotlin externals, their Java mirror and forge_jni.c declare the same natives
+      add_test(NAME jni_decl_matches COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/jni_decl_check.py ${PROJECT_SOURCE_DIR})
+      # ... and the bridge runs on a host JVM (every native, -Xcheck:jni). Linux hosts with a JDK only: the one place
+      # it has been run. The Kotlin classes on top are not compiled by this (docs/bindings.md).
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT FORGE_SANITIZE)
+        find_package(JNI QUIET)
+        find_package(Java QUIET COMPONENTS Runtime Development)
+        if(JNI_FOUND AND Java_FOUND)
+          if(NOT TARGET forge_jni)
+            add_library(forge_jni SHARED bindings/android/jni/forge_jni.c)
+            target_include_directories(forge_jni PRIVATE inference/include ${JNI_INCLUDE_DIRS})
+            target_link_libraries(forge_jni PRIVATE forge_c)
+          endif()
+          add_test(NAME jni_smoke COMMAND ${CMAKE_COMMAND} -DJAVAC=${Java_JAVAC_EXECUTABLE} -DJAVA=${Java_JAVA_EXECUTABLE}
+                   -DSRC=${PROJECT_SOURCE_DIR}/tests/jni -DOUT=${PROJECT_BINARY_DIR}/jni_smoke -DLIBDIR=$<TARGET_FILE_DIR:forge_jni>
+                   -DFPK=${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk -DBERT=${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk
+                   -P ${PROJECT_SOURCE_DIR}/tests/jni_smoke.cmake)
+          set_tests_properties(jni_smoke PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert" TIMEOUT 300)
+        endif()
+      endif()
+      # request fields, tool calling, HTTP behaviour (keep-alive, chunked bodies, limits, shutdown) and --lora
+      add_test(NAME serve_api COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_api_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden/hf ${PROJECT_BINARY_DIR}/serve_api)
+      set_tests_properties(serve_api PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 600)
+      # API keys, rate limits and quotas; TLS and mutual TLS (skipped parts are printed when the build has no OpenSSL)
+      add_test(NAME serve_auth COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_auth_test.py
+               $<TARGET_FILE:forge-serve> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/serve_auth)
+      set_tests_properties(serve_auth PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 300)
       # /v1/embeddings on a `session embedding` model (the tiny BERT the bert golden imports), 400 on a generative one
       add_test(NAME serve_embeddings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_embeddings_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk
@@ -1605,7 +1638,10 @@ if(FORGE_BUILD_TESTS)
       golden_gguf_types golden_hf_quant
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
-      capi_smoke python_bindings serve_http security_cli modelfile_signing)
+      capi_smoke python_bindings serve_http serve_api serve_auth security_cli modelfile_signing)
+    if(TEST jni_smoke)
+      forge_py_needs("numpy;safetensors" jni_smoke)   # it runs on the golden models
+    endif()
     foreach(_g ${FORGE_GOLDEN_FAMILIES})   # the family goldens (and the mock-device runs of them, where defined)
       forge_py_needs("numpy;safetensors" golden_tiny_${_g} golden_tiny_${_g}_cuda_mock golden_tiny_${_g}_opencl_mock)
     endforeach()
