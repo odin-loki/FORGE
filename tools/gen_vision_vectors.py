@@ -160,7 +160,10 @@ for name, (data, raw) in sorted(vectors.items()):
 for kind, pre in [("png", "png_"), ("bmp", "bmp_"), ("pnm", "pnm_")]:
     d = os.path.join(FUZZ, kind); os.makedirs(d, exist_ok=True)
     for name, (data, raw) in sorted(vectors.items()):
-        if name.startswith(pre) and len(data) < 4000: open(os.path.join(d, name), "wb").write(data)
+        if not (name.startswith(pre) and len(data) < 4000): continue
+        # fuzz_png reads a leading flag byte: 0 = checksums not verified (so mutations get past the CRC), 1 = verified
+        open(os.path.join(d, name), "wb").write((b"\x00" if kind == "png" else b"") + data)
+        if kind == "png" and "33x17" in name: open(os.path.join(d, name + ".crc"), "wb").write(b"\x01" + data)
 # zlib streams for the inflate fuzz target: stored, fixed and dynamic blocks
 d = os.path.join(FUZZ, "inflate"); os.makedirs(d, exist_ok=True)
 text = (b"the quick brown fox jumps over the lazy dog. " * 20) + bytes(range(256))

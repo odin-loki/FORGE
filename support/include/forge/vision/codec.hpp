@@ -34,6 +34,7 @@ struct raster {
 };
 struct decode_limits {
     std::size_t max_pixels = std::size_t(1) << 26;   // width * height above this is refused before any allocation
+    bool verify_checksums = true;                    // PNG chunk CRCs and the zlib Adler-32. Off only for fuzzing: it lets mutated inputs reach the parser
 };
 
 namespace codec {
@@ -184,7 +185,7 @@ inline std::vector<std::uint8_t> inflate(const std::uint8_t* data, std::size_t n
     return out;
 }
 // zlib stream (RFC 1950): header checks, inflate, Adler-32 verified. Bytes after the checksum are ignored.
-inline std::vector<std::uint8_t> zlib_decompress(const std::uint8_t* data, std::size_t n, std::size_t max_out, std::size_t reserve = 0) {
+inline std::vector<std::uint8_t> zlib_decompress(const std::uint8_t* data, std::size_t n, std::size_t max_out, std::size_t reserve = 0, bool verify = true) {
     using namespace codec;
     if (n < 6) bad("zlib stream is too short");
     if ((data[0] & 0x0f) != 8 || (data[0] >> 4) > 7 || ((std::uint32_t(data[0]) << 8 | data[1]) % 31) != 0) bad("zlib header is invalid");
@@ -192,7 +193,7 @@ inline std::vector<std::uint8_t> zlib_decompress(const std::uint8_t* data, std::
     std::size_t used = 0;
     auto out = inflate(data + 2, n - 2, max_out, &used, reserve);
     if (n - 2 - used < 4) bad("zlib checksum is missing");
-    if (be32(data + 2 + used) != adler32(out.data(), out.size())) bad("zlib Adler-32 mismatch");
+    if (verify && be32(data + 2 + used) != adler32(out.data(), out.size())) bad("zlib Adler-32 mismatch");
     return out;
 }
 
@@ -435,7 +436,7 @@ inline raster decode_png(std::span<const std::uint8_t> in, decode_limits lim = {
         const std::uint32_t len = be32(in.data() + pos);
         if (len > 0x7fffffffu || in.size() - pos - 12 < len) bad("PNG chunk length runs past the end of the file");
         const std::uint8_t* type = in.data() + pos + 4; const std::uint8_t* body = type + 4;
-        if (crc32(type, std::size_t(len) + 4) != be32(body + len)) bad("PNG chunk CRC mismatch");
+        if (lim.verify_checksums && crc32(type, std::size_t(len) + 4) != be32(body + len)) bad("PNG chunk CRC mismatch");
         auto is = [&](const char* t) { return std::memcmp(type, t, 4) == 0; };
         if (!have_ihdr && !is("IHDR")) bad("PNG does not start with IHDR");
         if (is("IHDR")) {
@@ -477,7 +478,7 @@ inline raster decode_png(std::span<const std::uint8_t> in, decode_limits lim = {
     if (!interlace) expect = mul(add(row_bytes(w), 1), h);
     else for (int p = 0; p < 7; ++p) { const std::size_t pw = (w + pdx[p] - 1 - px0[p]) / pdx[p], ph = (h + pdy[p] - 1 - py0[p]) / pdy[p]; if (pw && ph) expect = add(expect, mul(add(row_bytes(pw), 1), ph)); }
     // reserve no more than this input could possibly inflate to (deflate tops out near 1032:1)
-    std::vector<std::uint8_t> raw = zlib_decompress(idat.data(), idat.size(), expect, std::min(expect, add(mul(idat.size(), 1032), 64)));
+    std::vector<std::uint8_t> raw = zlib_decompress(idat.data(), idat.size(), expect, std::min(expect, add(mul(idat.size(), 1032), 64)), lim.verify_checksums);
     if (raw.size() != expect) bad("PNG image data is shorter than the header implies");
     idat.clear(); idat.shrink_to_fit();
     // output layout
