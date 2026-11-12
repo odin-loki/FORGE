@@ -925,7 +925,7 @@ if(FORGE_BUILD_TESTS)
     set(_mob_list "${PROJECT_SOURCE_DIR}/os/src/mobile/mobile.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/services.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/linux.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/windows.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/freebsd.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/android.cpp")
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
       add_test(NAME xos_mobile_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/mobile_${tg}
-               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include"
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include|-I${PROJECT_SOURCE_DIR}/third_party/monocypher"
                "-DSRCS=${_mob_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_mobile_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
@@ -934,7 +934,7 @@ if(FORGE_BUILD_TESTS)
     string(REPLACE ";" "|" _text_list "${_text_srcs}")
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
       add_test(NAME xos_text_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/text_${tg}
-               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include"
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include|-I${PROJECT_SOURCE_DIR}/third_party/monocypher"
                "-DSRCS=${_text_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_text_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
