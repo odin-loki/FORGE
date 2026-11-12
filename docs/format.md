@@ -20,13 +20,27 @@ Readers find sections through the table, so section order on disk does not matte
 | `tokenizer` | text models | Hugging Face style `tokenizer.json`: see [Tokenizer section](#tokenizer-section). HF imports copy it (or convert a SentencePiece `.model`); GGUF imports synthesise one from the GGUF vocabulary |
 | `chat_template` | no | The model's Jinja chat template as UTF-8 text, from `tokenizer_config.json` / `chat_template.jinja` / GGUF `tokenizer.chat_template`. Older readers ignore the section; files without it have no template |
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
-| `data` | yes | Tensor bytes, each tensor aligned to 64 B, in the codec's block layout (`graph/codecs.hpp`) |
+| `data` | yes | Tensor bytes in the codec's block layout (`graph/codecs.hpp`), each tensor on a file offset that is a multiple of the file's [tensor alignment](#tensor-alignment) (64 B unless the manifest says otherwise) |
 | `experts` | no | Minor revision 1 (manifest `forge_format_minor: 1`). JSON `{version, align: 4096, tensors: [{layer, proj (gate/up/down), name, codec, n_experts, offset, file_offset, expert_bytes, aligned}]}` indexing the stacked MoE expert tensors `[n_experts, rows, k]` read by `moe_ffn`. Expert e is bytes `[offset + e * expert_bytes, + expert_bytes)` of `data`; `aligned` means every expert slice starts on a 4 KiB file offset (one direct read per expert, groundwork for expert streaming). Older readers ignore the section |
 | `license` | no | The model's licence text as UTF-8, copied at import (Hugging Face `LICENSE*`, `LICENCE*`, `COPYING*`, `NOTICE*` files; an ONNX `doc_string` that mentions a licence). With several files each follows a `===== NAME =====` line. Never sealed; covered by the signature like every other section; `forge sign`, `forge encrypt` and `forge aot` copy it unchanged. No format revision: readers that predate it ignore the section |
 | `aot` | no | Precompiled plans written by `forge aot` (binary, see [The aot section](#the-aot-section)). Older readers ignore the section; a reader that cannot use it compiles plans as usual |
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | JSON header of the sealed `data` section; two schemes, told apart by `alg`: see [Encryption](#encryption) |
 | `enc_macs` | with chunked encryption | Binary: one 16-byte Poly1305 tag per sealed chunk, in chunk order |
+
+## Tensor alignment
+The manifest key `tensor_alignment` (a power of two from 64 to 1048576) says that every tensor of the file starts on a file offset that is a multiple of it. The writers take 64, 4096 or 65536 (`forge import --align`):
+
+| Value | For |
+|-------|-----|
+| 64 | Compact files. What every file written before the option has, and what an absent key means |
+| 4096 | One tensor = whole pages: it can be mapped, read with direct I/O or advised on its own. FORGE_PLAN's default |
+| 65536 | The same for 16 KiB and 64 KiB page systems and for device uploads that want large alignment |
+
+- **Default.** `forge import` writes 4096 when the source weights (the `.safetensors` / `.gguf` / `.onnx` files) total at least 64 MiB, else 64. Padding is half the alignment per tensor on average: measured on the 21-tensor golden test model (449 KiB at 64): 472 KiB at 4096 (+5 %) and 1492 KiB at 65536 (3.3 times). Above the threshold the padding at 4096 is at most 4 KiB per tensor against at least 64 MiB of weights. `modelfile::writer` and `stream_writer` default to 64; `set_alignment` changes it.
+- **Layout.** `writer` puts `data` on a multiple of the alignment and tensors on multiples of it within `data`. `stream_writer` keeps `data` at file offset 64 and pads each tensor so that its *file* offset is aligned (so `offset` values in the index are 64 short of a multiple). Tools that rewrite a container (`forge sign`, `forge encrypt`) place `data` at an offset with the same remainder modulo the alignment as before; `forge aot` leaves every section where it was. `forge inspect` prints the alignment and how many tensors comply.
+- **Compatibility.** No format revision: readers locate tensors by `offset` and never use the key, so older readers load aligned files unchanged, and a file without the key reads as 64. A file whose index does not match the key (rewritten by a tool that predates the option) still loads; `inspect` reports the count.
+- The stacked MoE expert tensors keep their own 4096-byte alignment (`experts` section) when the file's is smaller.
 
 ## Tokenizer section
 The section is the text of a `tokenizer.json`. Two versions exist; readers tell them apart by the keys present.

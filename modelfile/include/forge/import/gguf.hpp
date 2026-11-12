@@ -253,6 +253,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
 
     // streamed: tensors go straight from the mapped GGUF to disk, so a 20 GB model never sits in memory twice
     modelfile::stream_writer w(out);
+    w.set_alignment(import_alignment(opt, path));
     expert_index xi;
     import_report rep{arch, tname, 0, 0};
     std::set<std::string> used;

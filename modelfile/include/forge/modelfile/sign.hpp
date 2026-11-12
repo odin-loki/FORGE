@@ -92,6 +92,7 @@ inline void sign_file(const std::string& in, const std::string& out, const keypa
     std::vector<std::pair<std::string, std::string>> secs;
     json::array sigs;
     std::string dig;
+    detail::data_layout dl;
     {
         reader r(in);
         if (auto bad = r.verify(); !bad.empty()) raise(errc::format_error, "{}: refusing to sign a corrupt file ({})", in, bad.front());
@@ -102,32 +103,11 @@ inline void sign_file(const std::string& in, const std::string& out, const keypa
         }
         sigs.push_back(json::object{{"key_id", key_id(k.pub)}, {"public_key", detail::to_hex(k.pub)}, {"sig", sign_digest_hex(d, k)}});
         for (auto& [name, s] : r.sections()) if (name != "signature") { auto b = r.raw_section_bytes(name); secs.emplace_back(name, std::string(reinterpret_cast<const char*>(b.data()), b.size())); }
+        dl = r.layout();
     }
     secs.emplace_back("signature", json::dump(json::object{{"alg", "ed25519"}, {"scheme", std::string(sign_scheme)}, {"digest", dig}, {"signatures", sigs}}));
-    std::sort(secs.begin(), secs.end());
-    // raw container write (same layout as writer::write, sections verbatim)
-    std::vector<std::uint8_t> o(64, 0);
-    struct ent { std::string name; std::uint64_t off, size; hash::blake3::digest h; };
-    std::vector<ent> table;
-    for (auto& [nm, s] : secs) {
-        while (o.size() % alignment) o.push_back(0);
-        table.push_back({nm, o.size(), s.size(), hash::blake3::of({reinterpret_cast<const std::uint8_t*>(s.data()), s.size()})});
-        o.insert(o.end(), s.begin(), s.end());
-    }
-    while (o.size() % alignment) o.push_back(0);
-    std::uint64_t toff = o.size();
-    for (auto& e : table) {
-        std::uint8_t rec[96] = {};
-        std::memcpy(rec, e.name.data(), e.name.size());
-        std::memcpy(rec + 32, &e.off, 8); std::memcpy(rec + 40, &e.size, 8); std::memcpy(rec + 48, e.h.data(), 32);
-        o.insert(o.end(), rec, rec + 96);
-    }
-    std::uint32_t n = std::uint32_t(table.size()); std::uint64_t fsz = o.size();
-    std::memcpy(o.data(), magic, 8); std::memcpy(o.data() + 8, &format_version, 4); std::memcpy(o.data() + 12, &n, 4);
-    std::memcpy(o.data() + 16, &toff, 8); std::memcpy(o.data() + 24, &fsz, 8);
-    auto tmp = out + ".tmp";
-    { std::ofstream f(tmp, std::ios::binary); f.write(reinterpret_cast<const char*>(o.data()), std::streamsize(o.size())); if (!f) raise(errc::io_error, "cannot write {}", tmp); }
-    if (auto rs = forge::os::rename(tmp, out); !rs) { forge::os::remove(tmp); raise(errc::io_error, "cannot replace {}: {}", out, rs.err.what); }
+    // same layout as writer::write (sections in name order, verbatim); the data section keeps its tensor alignment
+    detail::write_sections(out, std::move(secs), dl);
 }
 
 struct signature_report {

@@ -159,6 +159,60 @@ output w : f32[8]
     CHECK_THROWS(modelfile::build_graph(modelfile::parse_blueprint("blueprint \"e\"\nop f(a) { b = a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
 }
 
+// Tensor alignment: 64 (default of the writers), 4096, 65536; recorded in the manifest; kept by every tool that
+// rewrites the container (sign, encrypt, aot).
+TEST(fpk_tensor_alignment) {
+    std::mt19937 rng(3); std::normal_distribution<float> N(0, 1);
+    std::vector<float> a(1000), b(64), c(7);
+    for (auto* v : {&a, &b, &c}) for (auto& x : *v) x = N(rng);
+    auto fill = [&](auto& w) { w.add_tensor("a", {10, 100}, a); w.add_tensor("b", {2, 32}, b, "q8_0"); w.add_tensor("c", {7}, c, "f16");
+                               w.set_manifest(json::value(json::object{{"format", "fpk"}})); w.set_section("blueprint", "blueprint \"t\"\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n"); };
+    auto check = [&](const std::string& f, std::size_t al, const char* what) {
+        modelfile::reader r(f);
+        bool ok = r.tensor_alignment() == al && r.misaligned_tensors().empty() && r.verify().empty() && r.load("a").data == a;
+        for (auto& [n, e] : r.tensors()) ok = ok && (r.sections().at("data").offset + e.offset) % al == 0;
+        for (auto& [n, sc] : r.sections()) ok = ok && sc.offset % 64 == 0;
+        if (!ok) std::fprintf(stderr, "  alignment %zu not kept by %s\n", al, what);
+        return ok;
+    };
+    auto key = modelfile::generate_model_key(); auto kp = modelfile::generate_keypair();
+    std::size_t size64 = 0;
+    for (std::size_t al : {std::size_t(64), std::size_t(4096), std::size_t(65536)}) {
+        auto f = tmp("al.fpk"), g = tmp("al_s.fpk"), h = tmp("al_e.fpk"), s2 = tmp("al_st.fpk");
+        { modelfile::writer w; w.set_alignment(al); CHECK(w.tensor_alignment() == al); fill(w); w.write(f); }
+        CHECK(check(f, al, "writer"));
+        { modelfile::reader r(f); CHECK(r.manifest().num_or("tensor_alignment", 0) == double(al)); }
+        if (al == 64) size64 = std::size_t(std::filesystem::file_size(f));
+        else CHECK(std::filesystem::file_size(f) > size64 + al);   // the padding is real: why small files stay at 64
+        modelfile::sign_file(f, g, kp); CHECK(check(g, al, "sign_file"));
+        { std::vector<std::uint8_t> blob(100, 7); modelfile::aot::write_section(g, g, blob); CHECK(check(g, al, "aot::write_section")); }   // forge aot keeps offsets
+        modelfile::encrypt_file(g, h, key);
+        { modelfile::reader r(h, key); CHECK(r.tensor_alignment() == al && r.misaligned_tensors().empty() && r.verify().empty() && r.load("a").data == a); }
+        modelfile::sign_file(h, h, kp);
+        { modelfile::reader r(h, key); CHECK(r.misaligned_tensors().empty() && modelfile::verify_signature(r).digest_ok); }
+        { modelfile::stream_writer w(s2); w.set_alignment(al); fill(w); w.finish(); }
+        CHECK(check(s2, al, "stream_writer"));
+        modelfile::sign_file(s2, s2, kp); CHECK(check(s2, al, "sign_file after stream_writer"));   // data moves, its phase is kept
+        modelfile::encrypt_file(s2, h, key);
+        { modelfile::reader r(h, key); CHECK(r.misaligned_tensors().empty() && r.verify().empty()); }
+    }
+    {   // the option is set before the first tensor, and only to a valid value
+        modelfile::writer w; CHECK_THROWS(w.set_alignment(100)); CHECK_THROWS(w.set_alignment(32)); CHECK_THROWS(w.set_alignment(std::size_t(1) << 21));
+        w.add_tensor("a", {10, 100}, a); CHECK_THROWS(w.set_alignment(4096));
+    }
+    {   // a file without the manifest key is a 64-byte-aligned file, as before
+        auto f = tmp("al_old.fpk");
+        { modelfile::writer w; fill(w); w.write(f); }
+        std::vector<std::pair<std::string, std::string>> secs;
+        { modelfile::reader r(f); for (auto& [n, sc] : r.sections()) { auto bts = r.raw_section_bytes(n); secs.emplace_back(n, n == "manifest" ? std::string("{\"format\":\"fpk\"}") : std::string(reinterpret_cast<const char*>(bts.data()), bts.size())); } }
+        modelfile::detail::write_sections(f, secs);
+        modelfile::reader r(f); CHECK(r.tensor_alignment() == 64 && r.misaligned_tensors().empty() && r.verify().empty() && r.layout().align == 64 && r.layout().phase == 0);
+    }
+    CHECK(modelfile::default_tensor_alignment(0) == 64 && modelfile::default_tensor_alignment((64u << 20) - 1) == 64 && modelfile::default_tensor_alignment(64u << 20) == 4096);
+    CHECK(import::import_alignment({}, "no/such/file") == 64);
+    { import::import_options o; o.align = 65536; CHECK(import::import_alignment(o, "x") == 65536); o.align = 128; CHECK_THROWS(import::import_alignment(o, "x")); }
+}
+
 // Chunked encryption (the default of encrypt_file): tensors are decrypted one at a time, on use, and every way of
 // rearranging the sealed bytes is refused.
 TEST(fpk_chunked_encryption) {

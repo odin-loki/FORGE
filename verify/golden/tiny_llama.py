@@ -129,6 +129,13 @@ def forward(W, ids):
         x = x + ((gt / (1 + np.exp(-gt))) * (h @ W[p + "mlp.up_proj.weight"].T)) @ W[p + "mlp.down_proj.weight"].T
     return rms(x, W["model.norm.weight"], eps) @ W["lm_head.weight"].T
 
+def sections_of(path):   # .fpk section table -> {name: bytes}
+    import struct
+    b = open(path, "rb").read(); n, toff = struct.unpack_from("<IQ", b, 12); out = {}
+    for i in range(n):
+        r = b[toff + 96 * i: toff + 96 * (i + 1)]; off, size = struct.unpack_from("<QQ", r, 32)
+        out[r[:32].rstrip(b"\0").decode()] = b[off:off + size]
+    return out
 def run(cmd):
     runner = os.environ.get("FORGE_RUNNER", "").split()  # e.g. qemu-aarch64 for cross builds
     if runner and cmd and cmd[0].endswith("forge"): cmd = runner + list(cmd)
@@ -194,6 +201,24 @@ def main():
             d = np.abs(np.fromfile(pf, dtype=np.float32) - np.load(gp + ".probe.npy").reshape(-1)).max()
             print(f"[{'ok' if d == 0 else 'FAIL'}] gguf {qt}: block decoder matches gguf-py exactly (max diff {d:g})")
             fails += d != 0
+    # tensor alignment: --align 4096 / 65536 put every tensor on that file offset and change no value; a file this
+    # small defaults to 64
+    base = os.path.join(a.work, "tiny_f32.fpk"); lb = os.path.join(a.work, "logits_al_base.f32")
+    run([a.forge, "run", base, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lb])
+    ok = "alignment 64 bytes" in run([a.forge, "inspect", base])
+    for al in ("4096", "64k"):
+        fp = os.path.join(a.work, f"tiny_al{al}.fpk"); lf = os.path.join(a.work, f"logits_al{al}.f32")
+        run([a.forge, "import", hf, "-o", fp, "--align", al])
+        nb = 65536 if al == "64k" else int(al)
+        info = run([a.forge, "inspect", fp, "--verify"])
+        n = len(json.loads(sections_of(fp)["tensors"]))
+        ok = ok and f"alignment {nb} bytes: {n} of {n} tensors" in info and "verify    ok" in info
+        run([a.forge, "run", fp, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lf])
+        ok = ok and np.array_equal(np.fromfile(lf, dtype=np.float32), np.fromfile(lb, dtype=np.float32))
+        ok = ok and os.path.getsize(fp) > os.path.getsize(base)
+    r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "import", hf, "-o", os.path.join(a.work, "tiny_al_bad.fpk"), "--align", "100"], capture_output=True, text=True, errors="replace")
+    ok = ok and r.returncode != 0 and "64, 4096 or 65536" in r.stdout + r.stderr
+    print(f"[{'ok' if ok else 'FAIL'}] --align 4096 / 64k: every tensor aligned in the file, logits unchanged; default stays 64 for a small model"); fails += not ok
     # tokenizer + text path
     out = os.path.join(a.work, "tiny_f32.fpk")
     txt = run([a.forge, "run", out, "--prompt", "the theory of things", "-n", "4"])

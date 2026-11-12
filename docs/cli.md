@@ -24,6 +24,7 @@ Converts a model to `.fpk`.
 | `--template NAME` | Blueprint template from `import/templates/`: `llama`, `qwen2`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`, `qwen3_moe`, `qwen3_5_moe`. Normally chosen from the model's architecture |
 | `--allow-unused` | Import although the source has tensors the template does not use. Without it such an import fails and lists them (name and shape). Hugging Face leftovers are left out; GGUF leftovers are kept as `extra.<name>` |
 | `--ignore-tensor NAME[,NAME...]` | Source tensors known to be harmless: a whole name, `prefix*` or `*suffix`. `position_ids`, `masked_bias` and `inv_freq` buffers are always ignored |
+| `--align 64\|4096\|65536` | File alignment of every tensor (`4k`, `64k` also parse). Default: 4096 when the source weights are at least 64 MiB, else 64; see [format.md](format.md#tensor-alignment) |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
 | `--output-tensor-type T`, `--token-embedding-type T` | Mixed precision: codec for the output head / token embedding |
 | `--tensor-type REGEX=TYPE[,REGEX=TYPE...]` | Mixed precision: per-tensor overrides |

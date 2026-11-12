@@ -75,6 +75,7 @@ struct importer {
         bp_text = instantiate(read_file(template_path(rep.template_name)), json::value(c));
         bp = modelfile::parse_blueprint(bp_text);
         w = std::make_unique<modelfile::stream_writer>(out);
+        w->set_alignment(import_alignment(opt, dir));
     }
     std::string qcodec() const { return is_mix_ftype(opt.codec) ? mix_base(opt.codec) : opt.codec; }
     void put(const std::string& n, const tensor& t, bool quantisable = false) {

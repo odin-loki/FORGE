@@ -51,8 +51,29 @@ inline constexpr std::uint32_t format_version = 1;
 // stacked MoE expert tensors whose per-expert slices start on expert_alignment file offsets). Readers that predate it
 // ignore the section; the tensors themselves are ordinary entries of "tensors".
 inline constexpr std::uint32_t format_minor = 1;
-inline constexpr std::size_t alignment = 64;
+inline constexpr std::size_t alignment = 64;            // sections, and tensors of files that record no "tensor_alignment"
 inline constexpr std::size_t expert_alignment = 4096;
+// Tensor alignment (manifest "tensor_alignment"): every tensor starts on a file offset that is a multiple of it, so a
+// tensor can be mapped, read with direct I/O or handed to a device upload on its own. Writers take 64 (compact), 4096
+// (page) or 65536 (large pages / DMA); any power of two from 64 to 1 MiB is a valid value in a file.
+inline constexpr std::size_t page_alignment = 4096, large_alignment = 65536;
+inline constexpr std::uint64_t auto_alignment_threshold = std::uint64_t(64) << 20;
+inline bool valid_tensor_alignment(std::uint64_t a) { return a >= alignment && a <= (std::uint64_t(1) << 20) && (a & (a - 1)) == 0; }
+// The alignment used when none is asked for: page alignment once the weights are large enough that the padding
+// (half a page per tensor on average) is noise, 64 bytes below that, where it would dominate small files.
+inline std::size_t default_tensor_alignment(std::uint64_t weight_bytes) { return weight_bytes >= auto_alignment_threshold ? page_alignment : alignment; }
+namespace detail {
+// manifest JSON with "tensor_alignment" set (unchanged when it is not a JSON object)
+inline std::string stamp_alignment(const std::string& manifest, std::size_t a) {
+    json::value m;
+    try { m = json::parse(manifest); } catch (const forge_exception&) { return manifest; }
+    if (!m.is_obj()) return manifest;
+    auto& o = m.obj_mut(); bool have = false;
+    for (auto& [k, v] : o) if (k == "tensor_alignment") { v = json::value(double(a)); have = true; }
+    if (!have) o.emplace_back("tensor_alignment", json::value(double(a)));
+    return json::dump(m);
+}
+}
 
 struct tensor_entry {
     std::string name, codec;
@@ -71,7 +92,7 @@ public:
         if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
         if (std::size_t(numel(shape)) != data.size()) raise(errc::shape_mismatch, "tensor {}: shape/data mismatch", name);
         if (c->block > 1 && data.size() % std::size_t(c->block)) c = graph::codecs::find("f16");  // fallback for odd sizes
-        while (data_.size() % alignment) data_.push_back(0);
+        data_.resize((data_.size() + align_ - 1) / align_ * align_, 0);
         tensor_entry e{std::move(name), std::string(c->name), shape, data_.size(), c->bytes(data.size()), {}};
         data_.resize(data_.size() + e.bytes);
         c->encode(data.data(), data.size(), data_.data() + e.offset);
@@ -83,13 +104,21 @@ public:
         auto* c = graph::codecs::find(codec);
         if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
         if (c->bytes(std::size_t(numel(shape))) != bytes.size()) raise(errc::format_error, "tensor {}: {} bytes do not match {} {}", name, bytes.size(), codec, shape_str(shape));
-        while (data_.size() % alignment) data_.push_back(0);
+        data_.resize((data_.size() + align_ - 1) / align_ * align_, 0);
         tensor_entry e{std::move(name), std::string(c->name), shape, data_.size(), bytes.size(), {}};
         data_.insert(data_.end(), bytes.begin(), bytes.end());
         e.blake3 = hash::blake3::hex(hash::blake3::of(bytes));
         tensors_.push_back(std::move(e));
     }
+    // Tensor alignment of the file (64, 4096, 65536; see valid_tensor_alignment). Set it before the first tensor.
+    void set_alignment(std::size_t a) {
+        if (!valid_tensor_alignment(a)) raise(errc::invalid_argument, "tensor alignment {} is not a power of two from 64 to 1 MiB", a);
+        if (!tensors_.empty()) raise(errc::invalid_argument, "set_alignment: tensors were already added");
+        align_ = a;
+    }
+    std::size_t tensor_alignment() const { return align_; }
     void write(const std::string& path) {
+        if (auto it = sections_.find("manifest"); it != sections_.end()) it->second = detail::stamp_alignment(it->second, align_);
         json::array idx;
         for (auto& t : tensors_) {
             json::array sh; for (auto d : t.shape) sh.push_back(double(d));
@@ -102,13 +131,13 @@ public:
         struct ent { std::string name; const std::uint8_t* p; std::uint64_t off, size; hash::blake3::digest h; };
         std::vector<ent> table;
         std::uint64_t pos = 64;
-        auto place = [&](const std::string& nm, const std::uint8_t* p, std::size_t n) {
-            pos = (pos + alignment - 1) / alignment * alignment;
+        auto place = [&](const std::string& nm, const std::uint8_t* p, std::size_t n, std::size_t al = alignment) {
+            pos = (pos + al - 1) / al * al;
             table.push_back({nm, p, pos, n, hash::blake3::of({p, n})});
             pos += n;
         };
         for (auto& [nm, s] : sections_) place(nm, reinterpret_cast<const std::uint8_t*>(s.data()), s.size());
-        place("data", data_.data(), data_.size());
+        place("data", data_.data(), data_.size(), align_);   // tensor offsets are multiples of align_ within data
         std::uint64_t toff = (pos + alignment - 1) / alignment * alignment;
         std::vector<std::uint8_t> tail;
         for (auto& e : table) {
@@ -131,9 +160,10 @@ public:
             if (k && std::fwrite(p, 1, k, f) != k) { std::fclose(f); raise(errc::io_error, "short write {}", path); }
             at += k;
         };
+        auto pad_to = [&](std::uint64_t off) { while (at < off) emit(zeros, std::size_t(std::min<std::uint64_t>(alignment, off - at))); };
         emit(head, 64);
-        for (auto& e : table) { emit(zeros, std::size_t(e.off - at)); emit(e.p, e.size); }
-        emit(zeros, std::size_t(toff - at));
+        for (auto& e : table) { pad_to(e.off); emit(e.p, e.size); }
+        pad_to(toff);
         emit(tail.data(), tail.size());
         std::fclose(f);
     }
@@ -144,6 +174,7 @@ private:
     std::map<std::string, std::string> sections_;
     std::vector<tensor_entry> tensors_;
     std::vector<std::uint8_t> data_;
+    std::size_t align_ = alignment;
 };
 
 // Streaming writer: tensors go to disk as they are added (the caller frees each one), so peak memory is one
@@ -159,6 +190,14 @@ public:
     ~stream_writer() { if (f_) { std::fclose(f_); std::remove(tmp_.c_str()); } }
     void set_section(std::string name, std::string bytes) { sections_[std::move(name)] = std::move(bytes); }
     void set_manifest(const json::value& m) { set_section("manifest", json::dump(m)); }
+    // Tensor alignment of the file: every tensor's file offset is a multiple of it. Set it before the first tensor.
+    void set_alignment(std::size_t a) {
+        if (!valid_tensor_alignment(a)) raise(errc::invalid_argument, "tensor alignment {} is not a power of two from 64 to 1 MiB", a);
+        if (!tensors_.empty()) raise(errc::invalid_argument, "set_alignment: tensors were already added");
+        align_ = a;
+    }
+    std::size_t tensor_alignment() const { return align_; }
+    std::uint64_t data_offset() const { return 64; }   // file offset of the data section
     void add_tensor(std::string name, const shape_t& shape, std::span<const float> data, std::string_view codec = "f32", std::size_t align = alignment) {
         auto* c = graph::codecs::find(codec);
         if (!c) raise(errc::unsupported, "unknown codec '{}'", codec);
@@ -180,6 +219,7 @@ public:
     const tensor_entry& last() const { if (tensors_.empty()) raise(errc::invalid_argument, "no tensor written"); return tensors_.back(); }
     const std::vector<tensor_entry>& entries() const { return tensors_; }   // every tensor written so far, in order
     void finish() {
+        if (auto it = sections_.find("manifest"); it != sections_.end()) it->second = detail::stamp_alignment(it->second, align_);
         json::array idx;
         for (auto& t : tensors_) {
             json::array sh; for (auto d : t.shape) sh.push_back(double(d));
@@ -220,6 +260,7 @@ private:
     void put_(std::string name, std::string codec, const shape_t& shape, std::span<const std::uint8_t> b, std::size_t align = alignment) {
         static const std::uint8_t z[alignment] = {};
         if (align < alignment || align % alignment) raise(errc::invalid_argument, "tensor alignment {} is not a multiple of {}", align, alignment);
+        align = std::max(align, align_);   // both are powers of two (or multiples of 64 below the file's alignment)
         std::size_t padn = (align - (64 + dlen_) % align) % align;   // data starts at file offset 64: align the file offset
         for (std::size_t left = padn; left;) { std::size_t n = std::min(left, alignment); emit_(z, n); dhash_.update(z, n); left -= n; }
         dlen_ += padn;
@@ -229,6 +270,7 @@ private:
     }
     std::string path_, tmp_;
     std::FILE* f_ = nullptr;
+    std::size_t align_ = alignment;
     std::uint64_t at_ = 0, dlen_ = 0;
     hash::blake3 dhash_;
     std::map<std::string, std::string> sections_;
@@ -283,8 +325,11 @@ private:
     struct del { void operator()(std::uint8_t* p) const { ::operator delete(p, std::align_val_t(64)); } };
     std::unique_ptr<std::uint8_t, del> p_; os::locked_buffer lb_; std::size_t n_ = 0;
 };
+// Where a rewritten container must put its data section so that tensors keep their file alignment: at an offset
+// with the same remainder modulo the file's tensor alignment as before. {64, 0} for files that predate the option.
+struct data_layout { std::uint64_t align = alignment, phase = 0; };
 // Raw container write with sections copied verbatim.
-inline void write_sections(const std::string& out, std::vector<std::pair<std::string, std::string>> secs) {
+inline void write_sections(const std::string& out, std::vector<std::pair<std::string, std::string>> secs, data_layout dl = {}) {
     std::sort(secs.begin(), secs.end());
     std::vector<std::uint8_t> o(64, 0);
     struct ent { std::string name; std::uint64_t off, size; hash::blake3::digest h; };
@@ -292,6 +337,7 @@ inline void write_sections(const std::string& out, std::vector<std::pair<std::st
     for (auto& [nm, sec] : secs) {
         if (nm.size() >= 32) raise(errc::invalid_argument, "section name too long: {}", nm);
         while (o.size() % alignment) o.push_back(0);
+        if (nm == "data" && dl.align > alignment) o.resize(o.size() + std::size_t((dl.phase + dl.align - o.size() % dl.align) % dl.align), 0);
         table.push_back({nm, o.size(), sec.size(), hash::blake3::of({reinterpret_cast<const std::uint8_t*>(sec.data()), sec.size()})});
         o.insert(o.end(), sec.begin(), sec.end());
     }
@@ -405,6 +451,27 @@ public:
     bool encrypted() const { return !locked_ && (plain_.has_value() || enc2_.has_value()); }   // encrypted and opened with the key
     bool chunked_encryption() const { return enc2_.has_value(); }              // the on-demand scheme (alg ...-chunked)
     std::uint64_t data_size() const { return sections_.at("data").size; }      // size of the tensor data, without reading it
+    // The file's tensor alignment: manifest "tensor_alignment", 64 when it is absent (files written before the option)
+    // or not a valid value. Informational: readers find tensors by offset and never rely on it.
+    std::size_t tensor_alignment() const {
+        try { double a = manifest().num_or("tensor_alignment", double(alignment)); if (a >= 64 && a <= 1048576 && valid_tensor_alignment(std::uint64_t(a)) && double(std::uint64_t(a)) == a) return std::size_t(a); }
+        catch (const forge_exception&) {}
+        return alignment;
+    }
+    // Tensors whose file offset is not a multiple of `a` (0 = the file's own alignment): empty for a file as written.
+    std::vector<std::string> misaligned_tensors(std::size_t a = 0) const {
+        if (!a) a = tensor_alignment();
+        std::vector<std::string> bad; const std::uint64_t d = sections_.at("data").offset;
+        for (auto& [n, e] : tensors_) if ((d + e.offset) % a) bad.push_back(n);
+        return bad;
+    }
+    // Layout a rewrite of this file must keep (detail::write_sections): the data section's offset modulo the alignment
+    // in force (the recorded one, 4096 for files with an experts index, else 64).
+    detail::data_layout layout() const {
+        std::uint64_t a = tensor_alignment();
+        if (a < expert_alignment && has_section("experts")) a = expert_alignment;
+        return {a, sections_.at("data").offset % a};
+    }
     std::string_view section_text(const std::string& n) const {
         auto b = section_bytes(n); return {reinterpret_cast<const char*>(b.data()), b.size()};
     }
@@ -575,11 +642,12 @@ struct encrypt_options {
 
 // Seal the data section of `in` with `key`, writing `out`. Existing signatures are dropped (re-sign after).
 inline void encrypt_file(const std::string& in, const std::string& out, const model_key& key, const encrypt_options& opt = {}) {
-    std::vector<std::pair<std::string, std::string>> secs; std::string tj; std::vector<std::uint8_t> plain;
+    std::vector<std::pair<std::string, std::string>> secs; std::string tj; std::vector<std::uint8_t> plain; detail::data_layout dl;
     {
         reader r(in);
         if (r.has_section("encryption")) raise(errc::invalid_argument, "{}: already encrypted", in);
         if (auto bad = r.verify(); !bad.empty()) raise(errc::format_error, "{}: refusing to encrypt a corrupt file ({})", in, bad.front());
+        dl = r.layout();
         for (auto& [name, s] : r.sections()) {
             if (name == "signature") continue;
             auto b = r.section_bytes(name);
@@ -612,7 +680,7 @@ inline void encrypt_file(const std::string& in, const std::string& out, const mo
     }
     if (!plain.empty()) crypto_wipe(plain.data(), plain.size());
     secs.emplace_back("data", std::move(ct));
-    detail::write_sections(out, std::move(secs));
+    detail::write_sections(out, std::move(secs), dl);
 }
 inline model_key generate_model_key() { model_key k; if (forge::modelfile::os_entropy(k.data(), k.size()) != 0) raise(errc::io_error, "getentropy failed"); return k; }
 

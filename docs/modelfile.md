@@ -19,6 +19,7 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 | `set_manifest(json)`, `set_section(name, bytes)` | |
 | `add_tensor(name, shape, span<const float>, codec = "f32")` | Encodes on write with any codec in `graph::codecs::all()`. If a block codec's block size does not divide the element count, the tensor is stored as `f16` |
 | `add_raw(name, shape, codec, bytes)` | Stores already-encoded blocks (GGUF blocks, AWQ / GPTQ codes as `q4_g32`) without re-quantising; the byte count must match the codec |
+| `set_alignment(64 \| 4096 \| 65536)` | Tensor alignment of the file ([format.md](format.md#tensor-alignment)); before the first tensor. Recorded as manifest `tensor_alignment` |
 | `write(path)` | Writes to a temporary file and renames it over `path` |
 
 `modelfile::stream_writer(path)` has the same `set_*`/`add_*` calls but writes each tensor to disk as it is added, so peak memory is one tensor. Call `finish()` at the end.
@@ -35,7 +36,9 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 | `chunked_encryption()`, `plaintext_resident()`, `lock_plaintext(bool)`, `release_plaintext()` | Chunk-encrypted files: the scheme in use, bytes of decrypted tensor data held, whether new ones go into locked memory (default `FORGE_LOCK_WEIGHTS`), wipe and free them |
 | `data_size()` | Size of the tensor data without reading it |
 
-`modelfile::alignment` is 64; `modelfile::format_version` is 1.
+| `tensor_alignment()`, `misaligned_tensors()` | The alignment the manifest records (64 when absent) and the tensors whose file offset is not a multiple of it |
+
+`modelfile::alignment` (sections, and the default tensor alignment) is 64; `page_alignment` 4096, `large_alignment` 65536; `default_tensor_alignment(bytes)` is the size rule importers use (`import_options::align = 0`). `modelfile::format_version` is 1.
 
 ### Others
 

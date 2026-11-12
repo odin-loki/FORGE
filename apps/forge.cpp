@@ -65,6 +65,7 @@ int usage() {
         "      [--tensor-type REGEX=TYPE[,..]] [--pure] [--bf16-head]   (llama.cpp llama-quant.cpp rules; forge adds q6_k DeltaNet/attn_output, q8_0 head)\n"
         "      [--allow-unused] import although source tensors are left over (default: error listing them)\n"
         "      [--ignore-tensor NAME[,NAME..]] leftovers known to be harmless (NAME, prefix* or *suffix)\n"
+        "      [--align 64|4096|65536] file alignment of every tensor (default: 4096 when the source weights are >= 64 MiB, else 64)\n"
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
@@ -189,6 +190,7 @@ int cmd_info() {
     return 0;
 }
 
+std::uint64_t parse_size_arg(const std::string& v, const char* what);
 int cmd_import(const args& a) {
     if (a.pos.empty() || a.get("o").empty()) return usage();
     import::import_options o; o.codec = a.get("codec", "f32"); o.template_name = a.get("template"); o.emb_codec = a.get("emb-codec");
@@ -208,6 +210,8 @@ int cmd_import(const args& a) {
         auto c = it.find(','); o.ignore_tensors.push_back(it.substr(0, c));
         it = c == std::string::npos ? "" : it.substr(c + 1);
     }
+    // --align 64|4096|65536 (4k, 64k): tensor alignment of the output; default by size (import::import_alignment)
+    if (!a.get("align").empty()) o.align = std::size_t(parse_size_arg(a.get("align"), "--align"));
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
@@ -240,6 +244,12 @@ int cmd_inspect(const args& a) {
         if (auto* lf = m.find("license_files"); lf && lf->is_arr()) for (auto& f : lf->arr()) if (f.is_str()) line += (line.empty() ? "" : " ") + ("[" + f.str() + "]");
         if (r.has_section("license")) line += std::format("{}text: {} bytes (--license prints it)", line.empty() ? "" : ", ", r.section_text("license").size());
         std::printf("license   %s\n", line.empty() ? "(not recorded)" : line.c_str());
+    }
+    {   // tensor alignment: the recorded value and what the offsets actually are
+        std::size_t al = r.tensor_alignment(); auto off = r.misaligned_tensors();
+        bool recorded = r.manifest().find("tensor_alignment") != nullptr;
+        std::printf("alignment %zu bytes%s: %zu of %zu tensors start on a multiple of it in the file%s\n", al, recorded ? "" : " (not recorded: file written before the option)",
+                    r.tensors().size() - off.size(), r.tensors().size(), off.empty() ? "" : " (file rewritten by a tool that does not keep the alignment?)");
     }
     if (r.has_section("encryption")) {   // which sealing scheme, and whether this process holds the key
         json::value e; try { e = json::parse(r.section_text("encryption")); } catch (const std::exception&) {}

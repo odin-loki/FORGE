@@ -380,6 +380,7 @@ inline import_report import_onnx(const std::string& path, const std::string& out
     auto tr = translate_onnx(m);
     auto bp = modelfile::parse_blueprint(tr.blueprint);  // validate syntax before writing
     modelfile::writer w;
+    w.set_alignment(import_alignment(opt, path));
     import_report rep{"onnx", "onnx", 0, 0};
     for (auto& [k, t] : tr.weights) {
         auto codec = (opt.codec == "f32" || t.dims.size() < 2) ? std::string("f32") : opt.codec;
