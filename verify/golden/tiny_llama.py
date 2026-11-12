@@ -176,7 +176,11 @@ def main():
     for qt, thr in (("F32", 1e-3), ("Q8_0", 0.999), ("Q4_K", 0.99)) if have_gguf else ():
         gp = os.path.join(a.work, f"tiny_{qt}.gguf"); fp = os.path.join(a.work, f"tiny_gguf_{qt}.fpk")
         write_gguf(gp, W, hf, qt)
-        run([a.forge, "import", gp, "-o", fp])
+        if qt != "F32":  # the probe tensor is a leftover: refused unless the import is told to keep it (as extra.probe)
+            r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "import", gp, "-o", fp], capture_output=True, text=True, errors="replace")
+            ok = r.returncode != 0 and "probe [4," in r.stdout + r.stderr and "--allow-unused" in r.stdout + r.stderr
+            print(f"[{'ok' if ok else 'FAIL'}] gguf {qt}: an unused source tensor fails the import and is listed"); fails += not ok
+        run([a.forge, "import", gp, "-o", fp] + (["--allow-unused"] if qt != "F32" else []))
         lf = os.path.join(a.work, f"logits_gguf_{qt}.f32")
         run([a.forge, "run", fp, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lf])
         got = np.fromfile(lf, dtype=np.float32)

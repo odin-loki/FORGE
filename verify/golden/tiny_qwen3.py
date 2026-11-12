@@ -133,7 +133,7 @@ def main():
     if gguf:
         gp = os.path.join(a.work, "qwen3.gguf"); fp = os.path.join(a.work, "qwen3_gguf.fpk")
         probes = write_gguf(gp, W, hf)
-        run([a.forge, "import", gp, "-o", fp])
+        run([a.forge, "import", gp, "-o", fp, "--allow-unused"])   # keeps the probe tensors as extra.probe_*
         check(fp, "gguf qwen3 F32", 1e-3)
         for qt, want in probes.items():
             pf = os.path.join(a.work, f"probe_{qt}.f32")

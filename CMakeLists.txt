@@ -910,6 +910,15 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip")
+      # RoPE frequency scaling end to end on the mock devices (host-built inverse-frequency tables; dynamic NTK on the CPU)
+      add_test(NAME golden_rope_scaling_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope_cumock)
+      set_tests_properties(golden_rope_scaling_cuda_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
+      add_test(NAME golden_rope_scaling_opencl_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope_clmock)
+      set_tests_properties(golden_rope_scaling_opencl_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=opencl;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockopencl")
     endif()
   endif()
   if(FORGE_HAVE_VULKAN)
@@ -1048,17 +1057,28 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden)
+    # Qwen2 (biases on the Q/K/V projections) and RoPE frequency scaling (linear, dynamic, YaRN, llama3), HF and GGUF,
+    # against float64 numpy references
+    add_test(NAME golden_tiny_qwen2
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_qwen2.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_qwen2)
+    add_test(NAME golden_rope_scaling
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope)
     if(FORGE_HAVE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
       # Same goldens with the Vulkan lowerings (ops without a GPU kernel run on the CPU).
       add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_vk)
       add_test(NAME golden_moe_mla_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_moe_vk)
-      set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      # scaled rope has no GLSL kernel: vk::supports sends it to the CPU, the rest of the graph stays on the device
+      add_test(NAME golden_rope_scaling_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope_vk)
+      set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_rope_scaling_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
-      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+      set_tests_properties(golden_tiny_llama golden_tiny_qwen2 golden_rope_scaling golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
       add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
@@ -1087,7 +1107,8 @@ if(FORGE_BUILD_TESTS)
         endforeach()
       endif()
     endfunction()
-    forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
+    forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen2 golden_rope_scaling golden_rope_scaling_cuda_mock
+      golden_rope_scaling_opencl_mock golden_rope_scaling_vulkan golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_inference_generate doc_example_capi_generate
       capi_smoke python_bindings serve_http security_cli modelfile_signing)
