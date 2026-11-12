@@ -1,0 +1,20 @@
+denied: function
+denied: function calling a function
+denied: alias of a built-in
+denied: std::function
+denied: lambda in a variable
+denied: lambda in a vector
+denied: lambda in a vector, range-for
+denied: lambda in a map
+denied: lambda in a struct member
+denied: virtual dispatch
+denied: virtual dispatch through shared_ptr
+denied: callback argument
+denied: callback returned by a function
+denied: callback handed to std::for_each
+ran: pure function
+ran: pure lambda in a vector
+ran: pure lambda in a struct member
+ran: pure virtual dispatch
+ran: pure callback argument
+after: data

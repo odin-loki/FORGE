@@ -26,7 +26,7 @@
 | Doc examples | `docs/examples/*` | `doc_example_*` |
 | Integration examples | `examples/integrations/*.cpp` | `example_*`, label `integration` |
 | Docs freshness | `tools/gen_docs.py --check` | `docs_up_to_date` (fails if `docs/reference.md` is stale) |
-| Fuzz | `fuzz/fuzz_*.cpp` (blueprint, dbus, fpk, gguf, grammar, json, onnx, safetensors, script, tokenizer) | `fuzz_*`, label `fuzz` |
+| Fuzz | `fuzz/fuzz_*.cpp` (aot, blueprint, dbus, fpk, gguf, grammar, json, onnx, safetensors, script, tokenizer) | `fuzz_*`, label `fuzz` |
 | JNI syntax | `bindings/android/jni/forge_jni.c` against a JDK's `jni.h` | `jni_syntax` |
 | Mobile | `tests/mobile_build.sh` | `mobile_android_{arm64-v8a,x86_64}`, `mobile_android_device`, `mobile_ios`, labels `mobile;slow` |
 | Cross compile/link | zig cross builds (`zig` on PATH, `ZIG_PATH`, or the `ziglang` Python wheel): every `tests/test_os*.cpp` and `test_loadbalancer` linked per target through `cmake/xos_link.cmake` (C sources compiled separately); `xos_headers_<target>` compiles each os header as its own translation unit | `xos_*`, labels `cross;slow` |
@@ -81,7 +81,7 @@ Only `linux-vulkan` installs `glslangValidator` and the Vulkan headers; every ot
 The full list is in [configuration.md](configuration.md).
 
 ## Fuzzing
-By default each fuzz target links a small built-in mutation driver (`fuzz/driver.cpp`) and runs `FORGE_FUZZ_ITERS` inputs over its corpus in `fuzz/corpus/<name>/`, with a 600 s timeout. With clang and `-DFORGE_LIBFUZZER=ON` they link libFuzzer instead and are not registered with ctest. `fuzz/make_corpus.py` regenerates the seed inputs.
+By default each fuzz target links a small built-in mutation driver (`fuzz/driver.cpp`) and runs `FORGE_FUZZ_ITERS` inputs over its corpus in `fuzz/corpus/<name>/`, with a 600 s timeout. With clang and `-DFORGE_LIBFUZZER=ON` they link libFuzzer instead and are not registered with ctest. `fuzz/make_corpus.py` regenerates the seed inputs. The `aot` target (precompiled plan blobs, `fuzz/fuzz_aot.cpp`) has its seed written by `FORGE_AOT_WRITE_SEED=fuzz/corpus/aot/seed.fplan build/dev/test_aot`; `test_aot` fails when the checked-in seed no longer loads.
 
 ## Performance tools (not part of ctest)
 - `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T]` runs `forge bench` and records or checks throughput against a stored baseline.
