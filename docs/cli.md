@@ -88,7 +88,7 @@ LoRA adapters carried in the model file. `add` copies the `<weight>.lora_a` / `<
 
 Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr. When plans came precompiled ([`forge aot`](#forge-aot-modelfpk--o-out---aot-mode-plannative-options)) a second line says how many, how many of them ran as native code, and where they came from; `<model>` may also be a compiled model library (`model.so`).
 
-Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
+Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed. A file named `*.i64` or `*.i32` is read as integers (token ids, masks). A symbolic dimension is worked out from an input's size when it is that input's only unbound one; give the others with `--dim name=N` (the names are in the manifest's `onnx_inputs[].dims`, e.g. `seq`, `dim_batch`).
 
 ### `forge embed <model> (--text TEXT [--text-pair TEXT] | --tokens 1,2,3 | --input name=file.f32 ...) [options]`
 Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `whisper_encoder` templates) once and prints the result vector, or writes it as raw little-endian f32 with `--out file.f32`.

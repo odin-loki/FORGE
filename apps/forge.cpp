@@ -85,6 +85,7 @@ int usage() {
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
         "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
+        "      one-shot graphs (imported ONNX): --input name=file.f32 ... [--dim name=N ...] [--out prefix]; integer inputs take file.i64 / file.i32\n"
         "  embed <model.fpk> (--text TEXT [--text-pair TEXT] [--ids] | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
         "      [--out file.f32] [--device D]     embedding models (BERT family, ViT / CLIP / SigLIP, Whisper encoder):\n"
         "      prints the vector, or writes it as raw f32; --input feeds a declared input (an image, mel frames)\n"
@@ -567,21 +568,54 @@ int cmd_verify(const args& a) {
 int run_one_shot(inference::session& s, const args& a) {
     std::map<std::string, std::vector<float>> in; i64 seq = 1;
     const json::value* decl = s.manifest().find("onnx_inputs");
+    // symbolic dimensions: --dim name=N binds one; the rest are worked out from the input sizes where an input has
+    // exactly one unbound dimension
+    std::map<std::string, i64> dims;
+    for (auto& spec : a.all("dim")) {
+        auto eq = spec.find('=');
+        if (eq == std::string::npos || eq == 0) raise(errc::invalid_argument, "--dim expects name=N, got '{}'", spec);
+        dims[spec.substr(0, eq)] = i64(std::stoll(spec.substr(eq + 1)));
+    }
     for (auto& spec : a.all("input")) {
         auto eq = spec.find('=');
         if (eq == std::string::npos) raise(errc::invalid_argument, "--input expects name=file, got '{}'", spec);
-        auto name = spec.substr(0, eq); auto bytes = import::read_file(spec.substr(eq + 1));
-        if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", spec.substr(eq + 1));
-        std::vector<float> v(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        auto name = spec.substr(0, eq); auto file = spec.substr(eq + 1); auto bytes = import::read_file(file);
+        // raw little-endian f32, or integers for integer inputs: file.i64 / file.i32 (token ids, masks)
+        std::vector<float> v;
+        if (file.ends_with(".i64") || file.ends_with(".i32")) {
+            const std::size_t w = file.ends_with(".i64") ? 8 : 4;
+            if (bytes.size() % w) raise(errc::invalid_argument, "input file {} is not raw {}", file, w == 8 ? "int64" : "int32");
+            v.resize(bytes.size() / w);
+            for (std::size_t i = 0; i < v.size(); ++i) { if (w == 8) { std::int64_t x; std::memcpy(&x, bytes.data() + 8 * i, 8); v[i] = float(x); } else { std::int32_t x; std::memcpy(&x, bytes.data() + 4 * i, 4); v[i] = float(x); } }
+        } else {
+            if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", file);
+            v.resize(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        }
         if (decl) for (auto& d : decl->arr()) {
             if (d["onnx"].str() != name && d["name"].str() != name) continue;
-            name = d["name"].str(); i64 k = 1; bool sym = false;
-            for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= i64(x.num()); }
-            if (sym && k) seq = i64(v.size()) / k;
+            name = d["name"].str();
+            if (auto* dt = d.find("dims"); dt && dt->is_arr()) {   // dimension names: solve the one that is not bound yet
+                i64 k = 1; std::string unknown; int n_unknown = 0;
+                for (auto& x : dt->arr()) {
+                    const std::string t = x.str();
+                    if (!t.empty() && std::isdigit(static_cast<unsigned char>(t[0]))) k *= i64(std::stoll(t));
+                    else if (auto it = dims.find(t); it != dims.end()) k *= it->second;
+                    else { if (unknown != t) ++n_unknown; unknown = t; }
+                }
+                if (n_unknown == 1 && k > 0) {
+                    if (i64(v.size()) % k) raise(errc::invalid_argument, "input {} has {} values, which is not a multiple of {}", name, v.size(), k);
+                    dims[unknown] = i64(v.size()) / k;
+                } else if (n_unknown > 1) raise(errc::invalid_argument, "input {} has {} unbound dimensions; give them with --dim name=N", name, n_unknown);
+            } else {   // files imported before dimension names were recorded: one symbolic dimension, `seq`
+                i64 k = 1; bool sym = false;
+                for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= i64(x.num()); }
+                if (sym && k) dims["seq"] = i64(v.size()) / k;
+            }
         }
         in[name] = std::move(v);
     }
-    auto out = s.infer(in, seq);
+    if (auto it = dims.find("seq"); it != dims.end()) seq = it->second;
+    auto out = s.infer(in, seq, dims);
     auto prefix = a.get("out");
     for (auto& [k, v] : out) {
         if (prefix.empty()) { std::printf("%s:", k.c_str()); for (auto x : v) std::printf(" %.6g", x); std::printf("\n"); continue; }

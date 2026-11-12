@@ -237,9 +237,14 @@ public:
     std::size_t loaded_weights() const { return weights_.size(); }
 
     // plan for `n` new tokens; all_rows keeps logits for every position
-    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}) {
-        return cache_.get(std::format("{}:{}:{}:{}", all_rows ? "all" : "seq", n, adapter, st ? graph::kv_codec_pair_name({st->codec, st->codec_v == graph::kv_codec::f32 ? st->codec : st->codec_v}) : "f32"), [&] {
+    // `dims` binds symbolic dimensions other than `seq` (graphs imported from ONNX may have several); such plans are
+    // compiled here, never taken from precompiled ones (those are keyed on `seq` alone).
+    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}, const std::map<std::string, i64>* dims = nullptr) {
+        std::string dk;
+        if (dims) for (auto& [k, v] : *dims) if (k != "seq") dk += std::format(";{}={}", k, v);
+        return cache_.get(std::format("{}:{}:{}:{}{}", all_rows ? "all" : "seq", n, adapter, st ? graph::kv_codec_pair_name({st->codec, st->codec_v == graph::kv_codec::f32 ? st->codec : st->codec_v}) : "f32", dk), [&] {
             modelfile::build_options bo;
+            if (dims) for (auto& [k, v] : *dims) bo.dims[k] = v;
             bo.dims["seq"] = n;
             bo.all_rows = all_rows;
             bo.weight = [&](const std::string& name) -> std::pair<shape_t, const float*> {
@@ -271,7 +276,7 @@ public:
                 return inner(name);
             };
             graph::pass_options po; po.lowerings = reg_.get();
-            if (!decode_all) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
+            if (!decode_all && dk.empty()) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
             return graph::compile(modelfile::build_graph(bp_, bo), st, po);
         });
     }
@@ -543,9 +548,10 @@ public:
     }
 
     // one_shot graphs (e.g. imported ONNX): bind named f32 inputs, run once, return every declared output.
-    std::map<std::string, std::vector<float>> infer(const std::map<std::string, std::vector<float>>& in, i64 seq = 1) {
+    // `dims` binds further symbolic dimensions by name (a graph with more than one; see model::plan_for).
+    std::map<std::string, std::vector<float>> infer(const std::map<std::string, std::vector<float>>& in, i64 seq = 1, const std::map<std::string, i64>& dims = {}) {
         std::lock_guard lk(m_->run_mutex());
-        auto& p = m_->plan_for(seq, false, &st_);
+        auto& p = m_->plan_for(seq, false, &st_, {}, dims.empty() ? nullptr : &dims);
         auto it = execs_.find(&p);
         if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<graph::executor>(p, &st_)).first;
         auto& ex = *it->second;
