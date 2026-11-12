@@ -58,7 +58,13 @@ Wine, the Android emulator and qemu: see [building.md](building.md). Results per
 |-----|--------|--------------|
 | `linux-gcc`, `linux-clang` | ubuntu-24.04 | `dev` preset with g++-14 / clang-23 (from apt.llvm.org) and ccache; `ctest -LE "slow|emu"` |
 | `linux-vulkan` | ubuntu-24.04 | g++-14 with glslang, Vulkan headers and Mesa lavapipe; builds `forge` and `test_vulkan`, checks `test_vulkan` reports an `llvmpipe` device (a skip fails the job), then `ctest -R vulkan` (both `test_vulkan` runs and the two Vulkan goldens) |
-| `linux-asan`, `linux-tsan` | ubuntu-24.04 | clang-23 with `FORGE_SANITIZE` (Debug) / `FORGE_TSAN`; builds and runs `test_script` only |
+| `linux-asan` | ubuntu-24.04 | clang-23, `FORGE_SANITIZE=ON` (ASan + UBSan, Debug), leak detection on, `FORGE_FUZZ_ITERS=1000`: builds everything and runs `ctest -LE "slow|emu"` |
+| `linux-tsan` | ubuntu-24.04 | clang-23, `FORGE_TSAN=ON`: builds and runs the suites that start threads (`test_pool`, `test_process_pool`, `test_loadbalancer`, `test_inference`, `test_sessions`, `test_memory`, `test_aio`, `test_log`, `test_rpc`, `test_os*`, `test_script*`, `test_modelfile`, `test_kvquant`, `test_graph`) |
+| `linux-fuzz` | ubuntu-24.04 | clang-23, `FORGE_SANITIZE=ON` + `FORGE_LIBFUZZER=ON`: every `fuzz/fuzz_*.cpp` target for 60 s on its seed corpus; a finding fails the job and uploads the input (`fuzz-findings`) |
+| `emu-aarch64-sve`, `emu-riscv64-rvv` | ubuntu-24.04 + qemu-user | Cross build with `g++-14-<triple>` and `cmake/toolchains/<arch>-qemu.cmake`; `ctest -L emu` (`lane_*_vl<N>`, `tile_sme_svl<N>`, `qi8_aarch64_*`), then `test_simd`, `test_tile`, `test_dtypes`, `test_graph`, `test_kvquant`, `test_support`, `test_util` under each `-cpu` model of the row (SVE 256 and 512 bits; RVV VLEN 256). One matrix row per target |
+| `cross-zig` | ubuntu-24.04 | zig from the `ziglang` Python package; `ctest -L cross` (the `xos_*` compile and link checks) |
+| `perf` | ubuntu-24.04 | Release build of `forge`; `tools/perf_baseline.py --check --tolerance 0.75 --allow-missing` against `perf/baseline-x86_64.json`. Never blocks (`continue-on-error`): the table is in the job summary, the numbers in the `perf-report` artefact |
+| `repro` | ubuntu-24.04 | `ci/repro_check.sh`: two clean Release builds in directories of different path length; `forge`, `forge-serve` and `libforge.so` must be bit-identical |
 | `shells` | ubuntu-24.04 | Installs many shells; runs `FORGE_TEST_ONLY=emit test_script` |
 | `macos` | macos-latest | `dev` preset; `ctest -LE "slow|emu"` |
 | `ios` | macos-latest | Xcode device build of `forge_c`, `forge_mobile`, `forge_text` with `ios.cmake`; then a Ninja arm64 simulator build of `test_os`, `test_text`, `test_locale`, `test_mobile`, `test_util`, run in a booted iPhone simulator with `xcrun simctl spawn` (`.github/ios_sim_check.sh`) |
@@ -69,7 +75,21 @@ Wine, the Android emulator and qemu: see [building.md](building.md). Results per
 
 Only `linux-vulkan` installs `glslangValidator` and the Vulkan headers; every other job compiles the Vulkan backend and its tests out. To reproduce `linux-vulkan` locally, set `VK_ICD_FILENAMES` and `VK_DRIVER_FILES` to the lavapipe ICD (`/usr/share/vulkan/icd.d/lvp_icd*.json`) so the loader cannot pick a real GPU. `test_rpc_tls` skips on Windows CI (its `openssl` probe redirects to `/dev/null`). Pass counts per job: [STATUS.md](STATUS.md).
 
-`ci/run-local.sh [job...]` mirrors these jobs with user-local toolchains for a machine without GitHub Actions. It hard-codes default toolchain paths under `/workspace` that you override with environment variables (`LLVM`, `MINGW_TC`, `WINE`, `ZIG`, `NDK`, `SHELL_DIRS`, ...). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`.
+`ci/run-local.sh [job...]` mirrors these jobs with user-local toolchains for a machine without GitHub Actions. It hard-codes default toolchain paths under `/workspace` that you override with environment variables (`LLVM`, `MINGW_TC`, `WINE`, `ZIG`, `NDK`, `SHELL_DIRS`, ...). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so` (the `repro` job; `REPRO_JOBS=N` limits its compile jobs).
+
+## Sanitizers
+```sh
+# ASan + UBSan, everything (what linux-asan runs)
+cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF
+cmake --build build-asan -j4
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ctest --test-dir build-asan -LE "slow|emu" -j2 --timeout 3600
+# TSan, one suite
+cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
+cmake --build build-tsan --target test_rpc && TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1" ./build-tsan/test_rpc
+```
+- On kernels with `vm.mmap_rnd_bits` above 28 the sanitizer runtimes fail at start; `sudo sysctl vm.mmap_rnd_bits=28` (the CI jobs do this).
+- A full ASan Debug tree needs several GB of disk; a test that crashes on purpose (a child that segfaults) resets the signal to `SIG_DFL` first, because the sanitizer's own handler would report and exit instead.
+- Suppressions belong in `ci/sanitizers/` with a comment saying why each is a false positive; there are none at present.
 
 ## Useful environment variables
 - `FORGE_THREADS`: worker pool size (use 2 on small machines and emulators).
@@ -106,7 +126,7 @@ mkdir -p /tmp/rpc-corpus && cp fuzz/corpus/rpc/* /tmp/rpc-corpus/      # libFuzz
 ```
 
 ## Performance tools (not part of ctest)
-- `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T]` runs `forge bench` and records or checks throughput against a stored baseline.
+- `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T] [--allow-missing] [--report out.json] [--markdown FILE]` runs `forge bench` and records or checks throughput against a stored baseline. `--allow-missing` reports, without failing, baseline metrics this CPU cannot produce (no AVX-512 lane); `--report` and `--markdown` write the comparison as JSON and as a table. The `perf` CI job runs it without blocking.
 - `test_cuda_hip bench <codec> <rows> <cols> <k> [reps]` times one quantised matmul on CUDA device 0 (e.g. `q4_k 512 25600 5120`). Inputs stay resident inside a run, so only the kernels are timed; it reports the fastest of 7 batches of `reps` calls (default 20), the median, TOPS, weight GB/s and the kernel path (`qmatmul_mma`, `qmatmul_mmq` or `qmatmul_q81`).
 - `tools/bench_llm.sh --gguf <model.gguf> [--fpk <model.fpk>] [--forge PATH] [--llama-bench PATH] [-p 512] [-n 128] [-r 3] [--device cuda] [--codec q4_k] [--nsys PREFIX] [--no-llama]` compares FORGE with llama.cpp's `llama-bench` on the same model: prefill and decode tok/s, FORGE with and without `FORGE_GRAPHS=1`, and FORGE's GPU driver calls per decode token from `forge bench`. `--nsys` adds an Nsight Systems kernel summary per FORGE run. It needs a GPU and a model.
 

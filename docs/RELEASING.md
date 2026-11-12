@@ -1,7 +1,7 @@
 # Releasing FORGE
 
 ## Concepts
-`tools/release.py` drives a release that is reproducible and can be signed. During `build`, `SOURCE_DATE_EPOCH` is set from the last commit, so rebuilding the same commit should give identical archives and SBOMs as long as `FORGE_REPRODUCIBLE=ON` (the default). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`.
+`tools/release.py` drives a release that is reproducible and can be signed. During `build`, `SOURCE_DATE_EPOCH` is set from the last commit, so rebuilding the same commit should give identical archives and SBOMs as long as `FORGE_REPRODUCIBLE=ON` (the default). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`; the `repro` CI job runs it on every pull request.
 
 ## Commands (`tools/release.py --help`)
 
