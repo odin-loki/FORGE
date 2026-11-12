@@ -26,6 +26,12 @@
 #include <link.h>
 #define FORGE_OS_DYNLIB_ELF 1
 #endif
+#if defined(__APPLE__)
+#include <mach-o/loader.h>
+#endif
+#if defined(FORGE_OS_WINDOWS)
+#include <psapi.h>   // K32EnumProcessModules / K32GetModuleInformation live in kernel32 (no psapi.lib)
+#endif
 
 namespace forge::os {
 
@@ -53,6 +59,19 @@ struct dynlib_options {
     std::string env_var;                   // optional variable holding more dirs (':' separated, ';' on Windows)
     bool system_search = true;             // then the platform loader's own search, exactly like os::library::open
 };
+// Loader behaviour for dynlib::open_with(). Each flag maps to the closest thing the platform loader has:
+//   global        POSIX RTLD_GLOBAL: the library's symbols resolve references of libraries loaded later.
+//                 Windows: no effect (exports are never injected into other modules).
+//   lazy          POSIX RTLD_LAZY (bind functions on first call) instead of RTLD_NOW. Windows: no effect.
+//   pinned        never unloaded: RTLD_NODELETE / GetModuleHandleEx(PIN).
+//   system_only   Windows: LOAD_LIBRARY_SEARCH_SYSTEM32 (only %SystemRoot%\System32, no application or current
+//                 directory). POSIX: the name must have no directory part, so only the loader's default
+//                 directories are searched.
+//   deps_beside   Windows: LOAD_WITH_ALTERED_SEARCH_PATH - the DLL's own directory is searched for its
+//                 dependencies (needs an absolute path). POSIX: no effect (RPATH / RUNPATH in the file decide).
+struct dynlib_load_flags { bool global = false, lazy = false, pinned = false, system_only = false, deps_beside = false; };
+// One image mapped into this process. size: bytes of address space it spans (0 when unknown).
+struct loaded_module { std::string path; const void* base = nullptr; std::size_t size = 0; };
 
 namespace detail_dynlib {
 
@@ -468,6 +487,29 @@ public:
         return {{}, first};
     }
     static result<dynlib> self() { return open(""); }
+    // Open one library (a path, or a bare name for the system loader) with explicit loader flags.
+    static result<dynlib> open_with(const std::string& name, dynlib_load_flags f) {
+        if (name.empty()) return {{}, {-1, "dynlib::open_with: empty name"}};
+#if defined(FORGE_OS_WINDOWS)
+        DWORD fl = 0;
+        if (f.system_only) { if (detail_dynlib::has_sep(name)) return {{}, {ERROR_INVALID_PARAMETER, "dynlib::open_with: system_only takes a bare file name"}}; fl |= 0x00000800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/; }
+        else if (f.deps_beside && detail_dynlib::has_sep(name)) fl |= 0x00000008 /*LOAD_WITH_ALTERED_SEARCH_PATH*/;
+        std::wstring w = widen(fl & 0x8 ? absolute(name) : name); if (fl & 0x8) for (auto& c : w) if (c == L'/') c = L'\\';
+        HMODULE h = LoadLibraryExW(w.c_str(), nullptr, fl);
+        if (!h) return {{}, last_error("LoadLibraryEx " + name)};
+        if (f.pinned) { HMODULE pin = nullptr; GetModuleHandleExW(0x1 /*GET_MODULE_HANDLE_EX_FLAG_PIN*/, w.c_str(), &pin); }
+        return adopt(library::adopt(h), name);
+#else
+        if (f.system_only && detail_dynlib::has_sep(name)) return {{}, {EINVAL, "dynlib::open_with: system_only takes a bare file name"}};
+        int mode = (f.lazy ? RTLD_LAZY : RTLD_NOW) | (f.global ? RTLD_GLOBAL : RTLD_LOCAL);
+#if defined(RTLD_NODELETE)
+        if (f.pinned) mode |= RTLD_NODELETE;
+#endif
+        void* h = ::dlopen(name.c_str(), mode);
+        if (!h) { const char* e = ::dlerror(); return {{}, {-1, e ? e : ("dlopen " + name)}}; }
+        return adopt(library::adopt(h), name);
+#endif
+    }
     // Wrap an already open os::library (takes ownership). `hint` is the name it was opened with, used when the
     // platform cannot map a handle back to a file.
     static result<dynlib> adopt(library l, const std::string& hint = {}) {
@@ -595,5 +637,79 @@ private:
 #endif
     }
 };
+
+// Every image loaded in this process, the main program first where the loader says so.
+//   Linux / Android / FreeBSD: dl_iterate_phdr (size = the span of the PT_LOAD segments).
+//   macOS / iOS: the dyld image list (size = the sum of the segment sizes, __PAGEZERO left out).
+//   Windows: K32EnumProcessModules + K32GetModuleInformation.
+inline result<std::vector<loaded_module>> loaded_modules() {
+    std::vector<loaded_module> out;
+#if defined(FORGE_OS_WINDOWS)
+    std::vector<HMODULE> mods(256); DWORD need = 0;
+    for (int tries = 0; tries < 4; ++tries) {
+        if (!K32EnumProcessModules(GetCurrentProcess(), mods.data(), DWORD(mods.size() * sizeof(HMODULE)), &need)) return {{}, last_error("EnumProcessModules")};
+        if (need <= mods.size() * sizeof(HMODULE)) break;
+        mods.resize(need / sizeof(HMODULE) + 16);
+    }
+    mods.resize(std::min<std::size_t>(mods.size(), need / sizeof(HMODULE)));
+    for (HMODULE m : mods) {
+        loaded_module lm; lm.base = m; wchar_t b[32768]; DWORD n = GetModuleFileNameW(m, b, 32768);
+        if (n) lm.path = narrow(std::wstring_view(b, n));
+        MODULEINFO mi{}; if (K32GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof mi)) lm.size = mi.SizeOfImage;
+        out.push_back(std::move(lm));
+    }
+#elif defined(__APPLE__)
+    const std::uint32_t n = _dyld_image_count();
+    for (std::uint32_t i = 0; i < n; ++i) {
+        const mach_header* h = _dyld_get_image_header(i); const char* nm = _dyld_get_image_name(i); if (!h) continue;
+        loaded_module lm; lm.path = nm ? nm : ""; lm.base = h;
+        if (h->magic == MH_MAGIC_64) {
+            auto* h64 = reinterpret_cast<const mach_header_64*>(h); auto* lc = reinterpret_cast<const load_command*>(h64 + 1);
+            for (std::uint32_t c = 0; c < h64->ncmds && lc->cmdsize >= sizeof(load_command); ++c, lc = reinterpret_cast<const load_command*>(reinterpret_cast<const char*>(lc) + lc->cmdsize)) {
+                if (lc->cmd != LC_SEGMENT_64) continue;
+                auto* sg = reinterpret_cast<const segment_command_64*>(lc);
+                if (std::strncmp(sg->segname, "__PAGEZERO", 16) != 0) lm.size += std::size_t(sg->vmsize);
+            }
+        }
+        out.push_back(std::move(lm));
+    }
+#elif defined(FORGE_OS_DYNLIB_ELF)
+    ::dl_iterate_phdr([](dl_phdr_info* info, std::size_t, void* ud) -> int {
+        auto* v = static_cast<std::vector<loaded_module>*>(ud); loaded_module lm; lm.path = info->dlpi_name ? info->dlpi_name : "";
+        std::uintptr_t lo = ~std::uintptr_t(0), hi = 0;
+        for (int i = 0; i < info->dlpi_phnum; ++i) {
+            const auto& ph = info->dlpi_phdr[i]; if (ph.p_type != PT_LOAD) continue;
+            lo = std::min<std::uintptr_t>(lo, std::uintptr_t(ph.p_vaddr)); hi = std::max<std::uintptr_t>(hi, std::uintptr_t(ph.p_vaddr + ph.p_memsz));
+        }
+        if (hi > lo) { lm.base = reinterpret_cast<const void*>(std::uintptr_t(info->dlpi_addr) + lo); lm.size = std::size_t(hi - lo); }
+        else lm.base = reinterpret_cast<const void*>(std::uintptr_t(info->dlpi_addr));
+        v->push_back(std::move(lm)); return 0;
+    }, &out);
+    if (!out.empty() && out[0].path.empty()) out[0].path = exe_path();   // the main program has no name in the list
+#else
+    return {{}, unsupported("loaded_modules")};
+#endif
+    return {std::move(out), {}};
+}
+// The loaded image that contains address p (a function or data pointer): its file and load base.
+inline result<loaded_module> module_of_address(const void* p) {
+    loaded_module lm;
+#if defined(FORGE_OS_WINDOWS)
+    HMODULE m = nullptr;
+    if (!GetModuleHandleExW(0x4 /*FROM_ADDRESS*/ | 0x2 /*UNCHANGED_REFCOUNT*/, static_cast<const wchar_t*>(p), &m) || !m) return {{}, last_error("module_of_address")};
+    lm.base = m; wchar_t b[32768]; DWORD n = GetModuleFileNameW(m, b, 32768); if (n) lm.path = narrow(std::wstring_view(b, n));
+    MODULEINFO mi{}; if (K32GetModuleInformation(GetCurrentProcess(), m, &mi, sizeof mi)) lm.size = mi.SizeOfImage;
+    return {std::move(lm), {}};
+#else
+    Dl_info di{};
+    if (!::dladdr(const_cast<void*>(p), &di) || !di.dli_fbase) return {{}, {ENOENT, "module_of_address: no loaded image contains the address"}};
+    lm.path = di.dli_fname ? di.dli_fname : ""; lm.base = di.dli_fbase;
+    if (auto all = loaded_modules()) for (auto& x : all.value) {
+        auto b = reinterpret_cast<std::uintptr_t>(x.base), a = reinterpret_cast<std::uintptr_t>(p);
+        if (x.size && a >= b && a - b < x.size) { lm.size = x.size; if (lm.path.empty() || !detail_dynlib::has_sep(lm.path)) lm.path = x.path; break; }
+    }
+    return {std::move(lm), {}};
+#endif
+}
 
 }  // namespace forge::os

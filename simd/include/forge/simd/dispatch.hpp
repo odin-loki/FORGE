@@ -16,6 +16,7 @@ struct cpu_features {
     bool amx_permitted = false;          // Linux arch_prctl(ARCH_REQ_XCOMP_PERM) succeeded
     bool os_avx = false, os_avx512 = false; // XGETBV state enabled
     bool neon = false, sve = false, sve2 = false; int sve_bytes = 0, sve_hw_bytes = 0;
+    bool dotprod = false, i8mm = false;  // AArch64 sdot/udot (ASIMDDP) and usdot (I8MM)
     bool rvv = false; int rvv_bytes = 0;
     bool hybrid = false;                 // P/E-core part
     std::string vendor, brand;

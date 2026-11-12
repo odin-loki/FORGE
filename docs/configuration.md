@@ -12,8 +12,8 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 | `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
 | `FORGE_SPIN_US` | task pool | How long idle workers spin for the next `parallel_for` before sleeping (default 200; 0 = sleep at once) |
 | `FORGE_PROCESSES` | `os::process_pool` | Worker process count when the pool is created with 0 workers (default: hardware concurrency) |
-| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels (default: on when a SIMD integer table exists) |
-| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`, `avx2`, `avxvnni`, `avx512vnni` |
+| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels. Default: on for x86 with a SIMD integer table; off on AArch64 (NEON / dotprod / SVE tables exist, `=1` opts in: never timed on hardware) and on every other architecture (scalar table only) |
+| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`; x86 `avx2`, `avxvnni`, `avx512vnni`; AArch64 `neon`, `dotprod`, `sve` (ignored when the CPU cannot run it) |
 | `FORGE_QI8_PF` | quantised matmul (CPU) | Software prefetch distance of the integer kernels in bytes (default 2048, 0 = off) |
 | `FORGE_QDOT=0` | quantised matmul (CPU) | Use the plain scalar decode + dot path instead of the SIMD one (benchmarking, bisecting) |
 
@@ -47,7 +47,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_MMA_SK_MIN` | CUDA | Minimum 256-value k chunks per stream-K block (default 4) |
 | `FORGE_MMA_SPLITK=0` | CUDA | Turns off split-K for tensor-core matmuls whose grid cannot fill the GPU (k/v projections, DeltaNet a/b); on by default |
 | `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
-| `FORGE_CPU_ATTN` | CPU | Chunked GQA-shared attention (`graph/attn_cpu.hpp`): by default used with an int8 KV cache only; `new` uses it for f32 KV too (its f32 prefill has not yet been shown faster), `old` never |
+| `FORGE_CPU_ATTN` | CPU | Chunked GQA-shared attention (`graph/attn_cpu.hpp`): by default used with an int8 KV cache only; `new` uses it for f32 KV too (its f32 prefill has not yet been shown faster), `old` never. `q16` (opt-in, combines as `new,q16`) scores int8 keys with the int16-query integer kernel instead of converting them to float; see [inference.md](inference.md) |
 | `FORGE_CPU_DELTA` | CPU | `old` selects the previous two-pass delta_rule instead of the column-blocked one-pass kernel |
 | `FORGE_OP_TIME` | CPU executor | `1`: wall time per op kind (attention split by KV codec, state ops by fn), printed at exit |
 | `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
@@ -94,6 +94,7 @@ See [memory.md](memory.md) for how the budget is used.
 | `FORGE_MEM_DEVICE_LIMIT` | Limit for device memory pools (default: accounting only) |
 | `FORGE_MEM_PRESSURE=0` | Ignore OS memory-pressure signals |
 | `FORGE_MEM_SPILL_DIR`, `FORGE_MEM_SPILL_MAX` | Spill-store directory (default `<tmp>/forge-spill-<pid>`) and size cap |
+| `FORGE_MEM_SPILL_ENCRYPT` | `0` turns off the spill files' XChaCha20-Poly1305 encryption (default on; [memory.md](memory.md)) |
 
 ## Models and security
 
@@ -105,7 +106,7 @@ See [memory.md](memory.md) for how the budget is used.
 | `FORGE_SECURITY_POLICY` | Policy file for `forge::security::load_policy` and `forge security check` (an error if it cannot be read). See [security-api.md](security-api.md) |
 | `FORGE_SECURITY_PROFILE` | Base FSS profile: `strict`, `standard` or `permissive` (audited). Without it and without a policy file no FSS profile is active |
 | `FORGE_CACHE` | Where `forge run` / `forge bench` cache models imported on the fly (default `~/.cache/forge`) |
-| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `import/templates` in the source tree the binary was built from) |
+| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `../share/forge/templates` relative to the executable if that directory exists, else `import/templates` in the source tree the binary was built from). A template name must resolve to a file inside it (`safe_join`; a symlink that leads out of the directory is refused) |
 
 ## RPC clients
 

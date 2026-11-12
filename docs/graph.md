@@ -29,10 +29,30 @@ Quantised weights (`tensor_graph::qweight`) stay encoded. On the CPU, `matmul_t`
 | `state_store` | `plan.hpp` | Per-session slots: KV history (`state_append`) and fixed-size state (`state_op`). `reset()`, `truncate(len)`, paged growth (`page_rows`), KV codec, host offload |
 | `state_op` kernels | `state_ops.hpp` | `causal_conv` (depthwise causal conv1d) and `delta_rule` (gated delta rule recurrence), for Gated DeltaNet layers (Qwen3.5) |
 | `grad(g, loss, wrt)` | `autodiff.hpp` | Reverse-mode autodiff. Appends the backward graph and returns a map from each `wrt` value to its gradient. Supported ops: add sub mul div neg scale square sqrt rsqrt recip exp log tanh sigmoid silu relu abs, matmul (rank-2 b), matmul_t, transpose, reshape, reduce_sum, reduce_mean, logsumexp, softmax, rms_norm. Others raise `errc::unsupported` |
-| `codecs::find(name)`, `codecs::all()` | `codecs.hpp` | Weight codecs: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2` |
+| `codecs::find(name)`, `codecs::all()` | `codecs.hpp` | Weight codecs, [below](#weight-codecs) |
 | `kv_codec_from_name`, `kv_codec_pair_from_name` | `kv_codec.hpp` | KV cache codecs, below |
 | `device_registry(name, &why)` | `vulkan.hpp` | Lowering registry for a device string, or `nullptr` (CPU) with the reason in `why` |
 | `rpc::open(addr, &why)`, `rpc::server`, `rpc::client` | `rpc.hpp` | Remote device over TCP |
+
+### Weight codecs
+Each codec is a block layout with an encoder and a decoder (`codec{name, tag, block, block_bytes, encode, decode}`). A weight whose rows are whole blocks stays encoded and is read in place.
+
+| Name | Elements / bytes per block | Layout | CPU row kernel |
+|------|----------------------------|--------|----------------|
+| `f32`, `f16`, `bf16`, `fp8_e4m3`, `fp8_e5m2` | 1 / 4, 2, 2, 1, 1 | plain elements | f32 in place; the others decode + dot |
+| `q8_0` | 32 / 34 | GGUF Q8_0 | AVX2 decode, int8 kernels |
+| `q4_k`, `q5_k`, `q6_k` | 256 / 144, 176, 210 | GGUF K-quants | AVX2 decode, int8 kernels |
+| `q4_0`, `q5_0` | 32 / 18, 22 | GGUF: `{f16 d; [qh[4];] qs[16]}`, `x = d * (q - 8 or 16)` | scalar decode + SIMD dot |
+| `q4_1`, `q5_1` | 32 / 20, 24 | GGUF: `{f16 d; f16 m; [qh[4];] qs[16]}`, `x = d * q + m` | scalar decode + SIMD dot |
+| `q2_k`, `q3_k` | 256 / 84, 110 | GGUF K-quants at 2 and 3 bits, 16 sub-blocks of 16 | scalar decode + SIMD dot |
+| `iq4_nl`, `iq4_xs` | 32 / 18, 256 / 136 | GGUF non-linear 4-bit: codes index a 16-entry table | scalar decode + SIMD dot |
+| `tq1_0`, `tq2_0` | 256 / 54, 66 | GGUF ternary: 5 trits per byte, or 2 bits per value | scalar decode + SIMD dot |
+| `q4_g32`, `q8_g32` | 32 / 20, 36 | `{f16 scale; f16 min; q[32]}`, `x = q * scale + min` (AWQ / GPTQ style groups) | scalar decode + SIMD dot |
+| `mxfp8`, `mxfp6`, `mxfp4`, `mxint8` | 32 / 33, 25, 17, 33 | OCP Microscaling: one E8M0 scale per block | scalar decode + SIMD dot |
+| `nvfp4` | 16 / 9 | E2M1 elements with an E4M3 block scale | scalar decode + SIMD dot |
+| `tq2` | 64 / 18 | ternary, f16 absmean scale | scalar decode + SIMD dot |
+
+The decoders of the GGUF layouts give the reference dequantiser's bits ([modelfile.md](modelfile.md#gguf-tensor-types) says what each was checked against). The encoders are FORGE's own min/max or absmax fits, not ports of ggml's search-based quantisers: `forge import --codec q3_k` gives a valid Q3_K tensor with more error than llama.cpp's quantiser would. For the K-quants a GGUF made by llama.cpp and imported with `--codec keep` is the better source.
 
 ### KV cache codecs
 
@@ -42,7 +62,7 @@ Quantised weights (`tensor_graph::qweight`) stay encoded. On the CPU, `matmul_t`
 | `int8` (`i8`, `q8`) | symmetric int8, one f32 scale per (row, head) | CPU, Vulkan, CUDA/HIP |
 | `fp8` (`fp8_e4m3`, `e4m3`) | E4M3 (saturating), one f32 scale per (row, head) | CPU, Vulkan, CUDA/HIP |
 | `tbq4` (`tbq4_0`, `turbo4`), `tbq3` (`tbq3_0`, `turbo3`) | TurboQuant: Walsh-Hadamard rotation, then 4- or 3-bit Lloyd-Max codes and one gain per head | CPU; GPU up to head dim 256 |
-| `tbq4p`, `tbq3p` (`*_qjl`, `turbo*p`) | TurboQuant with a 1-bit QJL sketch of the residual | CPU only |
+| `tbq4p`, `tbq3p` (`*_qjl`, `turbo*p`) | TurboQuant_prod at the same bit budget: 3- or 2-bit Lloyd-Max codes, plus the residual's norm and one sign bit per coordinate of a seeded projection of it (QJL). Inner products against the decoded head are unbiased (measured within 1e-3 of ‖x‖² where `tbq4` / `tbq3` shrink by 1% / 3.4%), at about twice the vector MSE of `tbq4` / `tbq3` | CPU only (the GPU kernels raise `unsupported`) |
 | `k8v4` | int8 keys, tbq4 values (`kv_codec_pair_from_name` only) | as its parts |
 
 The attention kernels decode quantised slots on the fly. inference selects the codec with `session_options.kv_codec` or `FORGE_KV_CODEC` ([inference.md](inference.md)).

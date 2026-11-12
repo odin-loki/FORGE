@@ -1,0 +1,11 @@
+prefix=@FORGE_PC_PREFIX@
+exec_prefix=${prefix}
+libdir=@FORGE_PC_LIBDIR@
+includedir=@FORGE_PC_INCLUDEDIR@
+
+Name: forge
+Description: FORGE C ABI (forge.h, libforge): model loading, tokenisation and generation
+URL: https://github.com/odin-loki/FORGE
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lforge
+Cflags: -I${includedir}

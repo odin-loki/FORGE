@@ -28,7 +28,7 @@ struct session_options {
     i64 context = 0;       // 0 = manifest max_position_embeddings
     bool verify = false;   // check BLAKE3 hashes on open
     i64 page_rows = 256;   // KV page size in rows; 0 = reserve the whole context up front
-    std::string kv_codec;  // "", "f32", "int8", "fp8", "tbq4", "tbq3" or "k8v4"; empty = $FORGE_KV_CACHE_TYPE, $FORGE_KV_CODEC or f32
+    std::string kv_codec;  // "", "f32", "int8", "fp8", "tbq4", "tbq3", "tbq4p", "tbq3p" (tbq + QJL residual, CPU only) or "k8v4"; empty = $FORGE_KV_CACHE_TYPE, $FORGE_KV_CODEC or f32
     int kv_offload = -1;   // 1 = keep KV on the host, drop device copies after each attention; -1 = $FORGE_KV_OFFLOAD
 };
 

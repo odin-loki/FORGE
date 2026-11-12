@@ -13,6 +13,16 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#if defined(__aarch64__) || defined(_M_ARM64)
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#include <sys/sysctl.h>
+#elif defined(__FreeBSD__)
+#include <sys/auxv.h>
+#elif defined(_WIN32)
+extern "C" __declspec(dllimport) int __stdcall IsProcessorFeaturePresent(unsigned long);
+#endif
+#endif
 
 namespace forge::simd {
 namespace mv_scalar { extern const kernels table; }
@@ -168,13 +178,28 @@ static cpu_features do_detect() {
             std::memcpy(br + 16 * i + 8, &c, 4); std::memcpy(br + 16 * i + 12, &d, 4); }
         f.brand = br;
     }
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(_M_ARM64)
     f.neon = true; // mandatory in AArch64
     f.vendor = "aarch64";
-#if defined(__linux__)
+    // Integer dot products: ASIMDDP (sdot/udot, optional from ARMv8.2, mandatory from ARMv8.4) and I8MM (usdot).
+#if defined(__linux__)   // Linux and Android: HWCAP_ASIMDDP, HWCAP_SVE, HWCAP2_SVE2, HWCAP2_I8MM
     unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+    f.dotprod = hw & (1ul << 20); f.i8mm = hw2 & (1ul << 13);
     f.sve = hw & (1ul << 22); f.sve2 = hw2 & (1ul << 1);
     if (f.sve) { f.sve_bytes = sve_vl_bytes(); f.sve_hw_bytes = g_sve_hw_bytes ? g_sve_hw_bytes : f.sve_bytes; }
+#elif defined(__APPLE__)
+    auto sysctl_on = [](const char* name) { int v = 0; std::size_t n = sizeof v; return sysctlbyname(name, &v, &n, nullptr, 0) == 0 && v != 0; };
+    f.dotprod = sysctl_on("hw.optional.arm.FEAT_DotProd");
+    f.i8mm = sysctl_on("hw.optional.arm.FEAT_I8MM");
+#if TARGET_OS_OSX
+    f.dotprod = true;   // every Apple Silicon Mac (M1 and later); the FEAT_ sysctl names only exist from macOS 12
+#endif
+#elif defined(__FreeBSD__)   // same bit numbers as Linux
+    unsigned long hw = 0, hw2 = 0;
+    elf_aux_info(AT_HWCAP, &hw, sizeof hw); elf_aux_info(AT_HWCAP2, &hw2, sizeof hw2);
+    f.dotprod = hw & (1ul << 20); f.i8mm = hw2 & (1ul << 13);
+#elif defined(_WIN32)   // PF_ARM_V82_DP_INSTRUCTIONS_AVAILABLE = 43, PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE = 66
+    f.dotprod = IsProcessorFeaturePresent(43) != 0; f.i8mm = IsProcessorFeaturePresent(66) != 0;
 #endif
 #elif defined(__riscv)
     f.vendor = "riscv64";
@@ -196,6 +221,7 @@ std::string cpu_features::summary() const {
     add(avx512vnni, "avx512vnni"); add(avx512bf16, "avx512bf16"); add(avx512fp16, "avx512fp16");
     add(avx512ifma, "avx512ifma"); add(avx512vbmi, "avx512vbmi"); add(avxvnni, "avxvnni"); add(avx10, "avx10");
     add(amx_tile, "amx-tile"); add(amx_permitted, "(amx-permitted)"); add(hybrid, "hybrid"); add(neon, "neon");
+    add(dotprod, "dotprod"); add(i8mm, "i8mm");
     add(sve, "sve"); add(sve2, "sve2"); if (sve_bytes) s += std::format("(vl={}b)", sve_bytes * 8);
     if (sve_hw_bytes && sve_hw_bytes != sve_bytes) s += std::format("(hw vl={}b, lowered)", sve_hw_bytes * 8);
     add(rvv, "rvv"); if (rvv_bytes) s += std::format("(vlen={}b)", rvv_bytes * 8);

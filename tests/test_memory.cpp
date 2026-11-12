@@ -2,8 +2,11 @@
 #include "tiny_model.hpp"
 #include <forge/core/memory.hpp>
 #include <forge/inference/inference.hpp>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <thread>
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -108,6 +111,97 @@ TEST(spill_roundtrip_and_cap) {
     }
     CHECK(!std::filesystem::exists(dir));
 }
+// Spill files are XChaCha20-Poly1305 sealed under a per-store key: the plaintext is not on disk, and a file that is
+// modified, truncated, extended, swapped with another blob's or written by another store is refused, not returned.
+static std::string slurp_(const std::filesystem::path& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), {}}; }
+static void spit_(const std::filesystem::path& p, const std::string& s) { std::ofstream f(p, std::ios::binary | std::ios::trunc); f.write(s.data(), std::streamsize(s.size())); }
+static bool integrity_error_(mem::spill_store& s, std::uint64_t k) {
+    try { (void)s.take(k); } catch (const forge::forge_exception& e) { return e.code == forge::errc::integrity_error; } catch (...) {}
+    return false;
+}
+TEST(spill_is_encrypted_and_authenticated) {
+    auto dir = std::filesystem::temp_directory_path() / ("forge_spill_enc_" + std::to_string(::getpid()));
+    std::string secret; for (int i = 0; i < 400; ++i) secret += "the prompt was: launch codes 0000 ";
+    {
+        mem::spill_store s(dir);
+        CHECK(s.encrypted());
+        auto k1 = s.put(secret.data(), secret.size()), k2 = s.put(secret.data(), secret.size());
+        CHECK(k1 && k2 && k1 != k2); CHECK(s.bytes() == 2 * secret.size());
+        auto f1 = slurp_(s.file_of(k1)), f2 = slurp_(s.file_of(k2));
+        CHECK(f1.size() == secret.size() + mem::spill_store::file_overhead);
+        CHECK(f1.compare(0, 4, "FSP1") == 0);
+        CHECK(f1.find("launch codes") == std::string::npos); CHECK(f1.find("prompt") == std::string::npos);
+        CHECK(f1.substr(20, 256) != f2.substr(20, 256));   // same plaintext, different nonce: different keystream
+        CHECK(f1.substr(4, 16) != f2.substr(4, 16));
+        auto back = s.take(k1); CHECK(back && back->size() == secret.size() && std::memcmp(back->data(), secret.data(), secret.size()) == 0);
+        CHECK(!std::filesystem::exists(s.file_of(k1)));
+        // one flipped ciphertext bit
+        auto t = f2; t[20 + 777] = char(t[20 + 777] ^ 0x01); spit_(s.file_of(k2), t);
+        CHECK(integrity_error_(s, k2));
+        CHECK(!std::filesystem::exists(s.file_of(k2))); CHECK(s.bytes() == 0); CHECK(!s.take(k2));   // refused, removed, forgotten
+        // flipped tag bit, flipped magic, truncated, extended, emptied
+        auto bad = [&](auto&& mutate) {
+            auto k = s.put(secret.data(), secret.size()); CHECK(k);
+            auto f = slurp_(s.file_of(k)); mutate(f); spit_(s.file_of(k), f);
+            CHECK(integrity_error_(s, k)); CHECK(!std::filesystem::exists(s.file_of(k)));
+        };
+        bad([](std::string& f) { f[10] = char(f[10] ^ 0x80); });
+        bad([](std::string& f) { f[0] = 'X'; });
+        bad([](std::string& f) { f.resize(f.size() - 1); });
+        bad([](std::string& f) { f.resize(f.size() / 2); });
+        bad([](std::string& f) { f.resize(19); });
+        bad([](std::string& f) { f.push_back('\0'); });
+        bad([](std::string& f) { f.clear(); });
+        bad([&](std::string& f) { f = secret; });   // a plaintext file planted in place of the sealed one
+        // two blobs of the same length swapped on disk: each is authentic, but not for that key
+        std::string other(secret.size(), 'z');
+        auto ka = s.put(secret.data(), secret.size()), kb = s.put(other.data(), other.size()); CHECK(ka && kb);
+        auto fa = slurp_(s.file_of(ka)), fb = slurp_(s.file_of(kb)); spit_(s.file_of(ka), fb); spit_(s.file_of(kb), fa);
+        CHECK(integrity_error_(s, ka)); CHECK(integrity_error_(s, kb));
+        // a file sealed by another store (another key) with the same key number
+        auto dir2 = std::filesystem::temp_directory_path() / ("forge_spill_enc2_" + std::to_string(::getpid()));
+        {
+            mem::spill_store o(dir2);
+            auto kn = s.put(secret.data(), secret.size()); CHECK(kn);
+            std::uint64_t ko = 0; while (ko < kn) { if (ko) o.drop(ko); ko = o.put(secret.data(), secret.size()); CHECK(ko); if (!ko) break; }
+            CHECK(ko == kn);
+            spit_(s.file_of(kn), slurp_(o.file_of(ko)));
+            CHECK(integrity_error_(s, kn));
+            auto mine = o.take(ko); CHECK(mine && mine->size() == secret.size());   // the other store still reads its own
+        }
+        CHECK(!std::filesystem::exists(dir2));
+        // a missing file is an I/O error, and an empty blob round-trips
+        auto km = s.put(secret.data(), secret.size()); std::filesystem::remove(s.file_of(km));
+        CHECK_THROWS(s.take(km));
+        auto k0 = s.put(nullptr, 0); CHECK(k0);
+        auto e = s.take(k0); CHECK(e && e->empty());
+    }
+    CHECK(!std::filesystem::exists(dir));
+    {   // FORGE_MEM_SPILL_ENCRYPT=0: the old plain files (and their weaker checks)
+        forge::os::setenv("FORGE_MEM_SPILL_ENCRYPT", "0");
+        mem::spill_store s(dir);
+        forge::os::unsetenv("FORGE_MEM_SPILL_ENCRYPT");
+        CHECK(!s.encrypted()); CHECK(!s.key_locked());
+        auto k = s.put(secret.data(), secret.size()); CHECK(k);
+        CHECK(slurp_(s.file_of(k)) == secret);
+        auto back = s.take(k); CHECK(back && back->size() == secret.size());
+        auto kt = s.put(secret.data(), secret.size()); spit_(s.file_of(kt), secret.substr(0, 100));
+        CHECK_THROWS(s.take(kt));
+    }
+    CHECK(!std::filesystem::exists(dir));
+}
+// The key is wiped when the store goes away (os::locked_buffer's release hook sees the bytes just before unmapping).
+static std::atomic<int> g_wiped_48{0}, g_dirty_48{0};
+TEST(spill_key_is_wiped_on_destruction) {
+    forge::os::locked_buffer::set_release_hook([](const std::uint8_t* p, std::size_t n) {
+        if (n != 48) return;
+        bool zero = true; for (std::size_t i = 0; i < n; ++i) zero = zero && p[i] == 0;
+        ++(zero ? g_wiped_48 : g_dirty_48);
+    });
+    { mem::spill_store s; int x = 7; auto k = s.put(&x, sizeof x); CHECK(k); auto b = s.take(k); CHECK(b && b->size() == sizeof x); }
+    forge::os::locked_buffer::set_release_hook(nullptr);
+    CHECK(g_wiped_48 >= 1); CHECK(g_dirty_48 == 0);
+}
 TEST(scheduler_reports_kv_and_defers_under_budget) {
     auto path = (std::filesystem::temp_directory_path() / ("forge_test_mem_" + std::to_string(::getpid()) + ".fpk")).string();
     forge_test::make_tiny_model(path);
@@ -196,8 +290,28 @@ TEST(scheduler_spills_and_reloads_prefix_kv) {
         CHECK(s.spilled() == 3);
         CHECK(run(s, p3) == want3);
         CHECK(s.stats().prefix_reloads == 2);
+        CHECK(s.stats().prefix_reload_failures == 0);
     }
     CHECK(sp.bytes() == 0);   // the scheduler drops its spilled prefixes when it goes away
+    CHECK(sp.encrypted());
+    {   // a spilled prefix whose file was modified is not loaded: counted, recomputed, same tokens out
+        inference::batch_scheduler s(m, {.max_active = 1, .prefix_cache = 1, .spill = &sp});
+        CHECK(run(s, p1) == want1);
+        CHECK(run(s, p2) == want2);
+        CHECK(s.spilled() == 1);
+        std::size_t files = 0;
+        for (auto& e : std::filesystem::directory_iterator(sp.dir())) {
+            std::string f; { std::ifstream in(e.path(), std::ios::binary); f.assign(std::istreambuf_iterator<char>(in), {}); }
+            CHECK(f.size() > 64); f[f.size() / 2] = char(f[f.size() / 2] ^ 0x40);
+            std::ofstream(e.path(), std::ios::binary | std::ios::trunc).write(f.data(), std::streamsize(f.size())); ++files;
+        }
+        CHECK(files == 1);
+        auto reused = s.stats().prefix_tokens_reused;
+        CHECK(run(s, p3) == want3);
+        CHECK(s.stats().prefix_reload_failures == 1); CHECK(s.stats().prefix_reloads == 0);
+        CHECK(s.stats().prefix_tokens_reused - reused < p1.size());
+    }
+    CHECK(sp.bytes() == 0);
     {   // without a spill store the evicted prefix is recomputed: same output, no hit
         inference::batch_scheduler s(m, {.max_active = 1, .prefix_cache = 1});
         run(s, p1); run(s, p2);

@@ -3,6 +3,14 @@
 #include <forge/os/os.hpp>
 #include <forge/os/oserror.hpp>
 #include <atomic>
+#if defined(FORGE_OS_IOS)   // the only os test the iOS simulator job builds: it also covers what iOS must refuse cleanly
+#include <forge/os/fs.hpp>
+#include <forge/os/process.hpp>
+#include <forge/os/pty.hpp>
+#include <forge/os/sandbox.hpp>
+#include <forge/os/sync.hpp>
+#include <thread>
+#endif
 using namespace forge;
 
 static std::string scratch() { auto d = os::join(os::temp_dir(), "forge_os_" + std::to_string(os::pid())); os::remove_all(d); CHECK(os::mkdirs(d)); return d; }
@@ -233,3 +241,37 @@ TEST(completion_port_errors_and_reuse) {
     }
     os::remove_all(d);
 }
+#if defined(FORGE_OS_IOS)
+// iOS apps cannot start or see other processes: every such call must come back as a clean `unsupported`.
+TEST(ios_process_apis_are_unsupported) {
+    auto r = os::run({"true"}); CHECK(!r && os::is_unsupported(r.err));
+    os::spawn_spec sp; sp.argv = {"true"}; auto s = os::spawn_wait(sp); CHECK(!s && os::is_unsupported(s.err));
+    auto c = os::child::start({"true"}); CHECK(!c && os::is_unsupported(c.err));
+    auto c2 = os::child::start(sp); CHECK(!c2 && os::is_unsupported(c2.err));
+    auto l = os::list_processes(); CHECK(!l && os::is_unsupported(l.err));
+    auto w = os::wait_for_exit(1, 10); CHECK(!w && os::is_unsupported(w.err));
+    auto d = os::process_descendants(1); CHECK(!d && os::is_unsupported(d.err));
+    auto k = os::kill_tree(12345); CHECK(!k && os::is_unsupported(k.err));
+    auto a = os::get_process_affinity(); CHECK(!a && os::is_unsupported(a.err));
+    auto sa = os::set_process_affinity({0}); CHECK(!sa && os::is_unsupported(sa.err));
+    CHECK(!os::pty::available()); auto t = os::pty::spawn({"sh"}); CHECK(!t && os::is_unsupported(t.err));
+    os::sandbox_policy x; x.deny_exec = true; auto rs = os::run_sandboxed({"true"}, x); CHECK(!rs && os::is_unsupported(rs.err));
+    CHECK(os::apply_sandbox(x)); CHECK(os::sandbox_status().sandboxed);
+    CHECK(os::process_caps().empty()); CHECK(!os::kill_group(1234));
+    CHECK(os::get_process_priority());
+}
+TEST(ios_waiting_primitives_and_files) {
+    std::atomic<std::uint32_t> a{0};
+    CHECK(os::wait_on_address(a, 1, 1000000) == os::wait_result::mismatch);
+    std::thread th([&] { while (a.load() == 0) os::wait_on_address(a, 0, 50000000); });
+    a.store(1); os::wake_all(a); th.join();
+    auto e = os::wait_event::create(); CHECK(e); if (e) { CHECK(!e->wait(5)); e->set(); CHECK(e->wait(1000)); e->reset(); CHECK(!e->is_set()); }
+    auto t = os::wait_timer::create(); CHECK(t); if (t) { CHECK(t->arm(10000000)); auto n = t->wait(5000); CHECK(n && n.value == 1); }
+    auto d = scratch();
+    CHECK(os::write_file(os::join(d, "a"), "abc"));
+    auto cp = os::fs::copy_file(os::join(d, "a"), os::join(d, "b")); CHECK_MSG(cp, "%s", cp.err.what.c_str());
+    CHECK(os::read_file(os::join(d, "b")).value == "abc"); CHECK(os::fs::file_id(os::join(d, "a")));
+    auto an = os::fs::anonymous_file(d); CHECK(an);
+    CHECK(os::remove_all(d));
+}
+#endif

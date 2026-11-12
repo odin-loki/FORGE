@@ -36,9 +36,11 @@ struct request {
 struct batch_options { int max_active = 8; i64 prefill_chunk = 256; std::size_t prefix_cache = 4; session_options session; mem::budget* budget = nullptr;
                        mem::spill_store* spill = nullptr; std::size_t spill_entries = 64; };
 
-// prefix_spills: evicted prefixes written to the spill store; prefix_reloads: spilled prefixes read back on a hit
+// prefix_spills: evicted prefixes written to the spill store; prefix_reloads: spilled prefixes read back on a hit;
+// prefix_reload_failures: spilled prefixes that could not be read back (file missing, truncated, or failing the
+// store's authentication): the prefix is discarded and recomputed, never loaded
 struct batch_stats { std::size_t steps = 0, completed = 0, prefix_hits = 0, prefix_tokens_reused = 0, peak_active = 0, peak_kv_bytes = 0, deferred = 0,
-                     prefix_spills = 0, prefix_reloads = 0; };
+                     prefix_spills = 0, prefix_reloads = 0, prefix_reload_failures = 0; };
 
 class batch_scheduler {
 public:
@@ -176,10 +178,14 @@ private:
         for (auto it = spilled_.begin(); it != spilled_.end(); ++it) if (auto n = shared(*it); n > best) { best = n; sp_hit = it; mem_hit = cache_.end(); }
         if (sp_hit != spilled_.end()) {   // reload from disk; it becomes the most recently used in-memory entry
             auto c = std::move(*sp_hit); spilled_.erase(sp_hit);
-            if (auto blob = o_.spill->take(c.spill_key)) {
-                c.s = std::make_unique<session>(m_, o_.session); c.s->load_prefix(*blob); c.spill_key = 0;
-                cache_.push_front(std::move(c)); mem_hit = cache_.begin(); ++stats_.prefix_reloads;
-            } else best = 0;
+            bool loaded = false;
+            try {   // take() throws on a file that is gone, short or (encrypted store) not what was written: a miss
+                if (auto blob = o_.spill->take(c.spill_key)) {
+                    c.s = std::make_unique<session>(m_, o_.session); c.s->load_prefix(*blob); c.spill_key = 0; loaded = true;
+                }
+            } catch (const std::exception&) { ++stats_.prefix_reload_failures; }
+            if (loaded) { cache_.push_front(std::move(c)); mem_hit = cache_.begin(); ++stats_.prefix_reloads; }
+            else best = 0;
         } else if (mem_hit != cache_.end()) cache_.splice(cache_.begin(), cache_, mem_hit);   // LRU: a hit moves to the front
         if (mem_hit != cache_.end()) src = cache_.front().s.get();
         if (src && best > 0) {

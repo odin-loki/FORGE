@@ -15,7 +15,7 @@ Because the model file describes its own graph, a new architecture needs an impo
 
 ## Quick start (Linux)
 
-You need CMake 3.25 or newer, Ninja, Python 3 and a C++23 compiler (CI uses g++-14 and clang-18).
+You need CMake 3.25 or newer, Ninja, Python 3 and a C++23 compiler (CI uses g++-14 and clang-23).
 
 ```sh
 cmake --preset dev                      # configure into build/dev (RelWithDebInfo)
