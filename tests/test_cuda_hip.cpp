@@ -573,6 +573,96 @@ static int moe_check(graph::registry& reg, const std::string& api, const std::fu
     return fails;
 }
 
+// Every backend's quantised matmul_t (and fused FFN gate/up) against ONE reference: the f32 activations dotted with
+// the codec-decoded weight rows in float64, i.e. the exact value of the quantised model. The inputs are shaped like
+// the tensors of verify/golden/tiny_gemma.py's Gemma-2 model, where the paths were first seen to differ: 64-wide
+// projections whose weights are three times the usual scale, and activations with a few large entries per row.
+//   exact_activations backends (the portable forge_qmatmul_t / forge_qglu of OpenCL and Level Zero) must match the
+//     reference to f32 rounding: they decode each weight group and accumulate in f32.
+//   CUDA / HIP (q8_1 activations, integer dot products) and the CPU int8 kernels round the activations to 8 bits per
+//     32-value block first; they are held to that rounding's bound against the same reference.
+// So a q8_0 logit difference between OpenCL and the other paths is the int8 paths' activation rounding, not a
+// portable-kernel defect (docs/gpu.md "Quantised matmul: exact and int8-activation paths").
+template<class RT> static int exact_reference_check(graph::registry& reg, const std::string& api) {
+    if (!reg.device_qgemm) return 0;
+    using namespace graph;
+    bool exact = false;
+    if constexpr (requires { RT::exact_activations; }) exact = true;
+    int fails = 0, n = 0; double worst_dev = 0, worst_cpu = 0;
+    static std::deque<std::vector<std::uint8_t>> keep;   // device weights are cached by host address
+    std::uint32_t seed = 12345;
+    auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return float(seed >> 8) / float(1u << 24) - 0.5f; };   // uniform in [-0.5, 0.5)
+    auto gauss = [&] { float s = 0; for (int i = 0; i < 6; ++i) s += rnd(); return s * 1.4142f; };                // ~N(0, 1)
+    for (std::string cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) for (std::size_t rows : {1, 13, 70}) for (std::size_t k : {256, 512}) {
+        const auto* c = codecs::find(cn);
+        const std::size_t cols = 48, rb = c->bytes(k);
+        std::vector<float> wf(cols * k), x(rows * k), row(k);
+        for (auto& v : wf) v = gauss() * 3.f / std::sqrt(float(k));
+        for (std::size_t i = 0; i < x.size(); ++i) x[i] = gauss() * (i % 37 == 5 ? 8.f : 1.f);   // a few entries dominate each 32-value block
+        auto& enc = keep.emplace_back(cols * rb);
+        for (std::size_t j = 0; j < cols; ++j) c->encode(wf.data() + j * k, k, enc.data() + j * rb);
+        std::vector<double> ref(rows * cols); double mx = 0;
+        for (std::size_t j = 0; j < cols; ++j) {
+            c->decode(enc.data() + j * rb, k, row.data());
+            for (std::size_t i = 0; i < rows; ++i) { double s = 0; for (std::size_t e = 0; e < k; ++e) s += double(x[i * k + e]) * double(row[e]); ref[i * cols + j] = s; mx = std::max(mx, std::fabs(s)); }
+        }
+        tensor_view xv; xv.data = x.data(); xv.shape = {i64(rows), i64(k)};
+        tensor_view wv; wv.shape = {i64(cols), i64(k)}; wv.qdata = enc.data(); wv.qcodec = c;
+        std::vector<float> yd(rows * cols, -1.f), yc(rows * cols, -2.f);
+        tensor_view od; od.data = yd.data(); od.shape = {i64(rows), i64(cols)};
+        tensor_view oc; oc.data = yc.data(); oc.shape = od.shape;
+        std::vector<tensor_view> ins{xv, wv};
+        reg.device_qgemm->fn(ins, od, {});
+        qweights::gemm_nt(ins, oc, {});
+        double ed = 0, ec = 0;
+        for (std::size_t i = 0; i < ref.size(); ++i) { ed = std::max(ed, std::fabs(yd[i] - ref[i])); ec = std::max(ec, std::fabs(yc[i] - ref[i])); }
+        ed /= mx; ec /= mx; worst_dev = std::max(worst_dev, ed); worst_cpu = std::max(worst_cpu, ec);
+        // exact: f32 accumulation over k <= 512 terms. int8 activations: half a step of amax / 127 per value.
+        const double bound = exact ? 2e-5 : 3e-2;
+        ++n;
+        if (!(ed <= bound)) { std::printf("FAIL %s.qmatmul_t %s rows %zu k %zu vs decoded-weight reference: %.3g of the largest output (bound %.3g)\n", api.c_str(), cn.c_str(), rows, k, ed, bound); ++fails; }
+        if (!(ec <= 3e-2)) { std::printf("FAIL cpu gemm_nt %s rows %zu k %zu vs decoded-weight reference: %.3g of the largest output\n", cn.c_str(), rows, k, ec); ++fails; }
+    }
+    // the fused FFN gate/up/SiLU + down projection as a compiled plan (forge_qglu on the portable backends)
+    if (reg.device_qglu) for (std::string cn : {"q8_0", "q4_k"}) for (i64 rows : {1, 13}) {
+        const auto* c = codecs::find(cn);
+        const i64 k = 256, ff = 256, od = 32;
+        auto enc = [&](i64 r, i64 kk, std::vector<float>& dec) {
+            std::vector<float> w(std::size_t(r * kk)); auto& e = keep.emplace_back(std::size_t(r) * c->bytes(std::size_t(kk)));
+            for (auto& v : w) v = gauss() * 3.f / std::sqrt(float(kk));
+            dec.resize(w.size());
+            for (i64 j = 0; j < r; ++j) { c->encode(w.data() + j * kk, std::size_t(kk), e.data() + std::size_t(j) * c->bytes(std::size_t(kk)));
+                                          c->decode(e.data() + std::size_t(j) * c->bytes(std::size_t(kk)), std::size_t(kk), dec.data() + j * kk); }
+            return e.data(); };
+        std::vector<float> dg, du, dd;
+        const std::uint8_t* eg = enc(ff, k, dg); const std::uint8_t* eu = enc(ff, k, du); const std::uint8_t* ed_ = enc(od, ff, dd);
+        std::vector<float> x(std::size_t(rows * k)); for (std::size_t i = 0; i < x.size(); ++i) x[i] = gauss() * (i % 37 == 5 ? 4.f : 0.5f);
+        std::vector<double> ref(static_cast<std::size_t>(rows * od)), hid(static_cast<std::size_t>(ff)); double mx = 0;
+        for (i64 i = 0; i < rows; ++i) {
+            for (i64 f = 0; f < ff; ++f) {
+                double g = 0, u = 0;
+                for (i64 e = 0; e < k; ++e) { g += double(x[std::size_t(i * k + e)]) * dg[std::size_t(f * k + e)]; u += double(x[std::size_t(i * k + e)]) * du[std::size_t(f * k + e)]; }
+                hid[std::size_t(f)] = g / (1.0 + std::exp(-g)) * u;
+            }
+            for (i64 o = 0; o < od; ++o) { double s = 0; for (i64 f = 0; f < ff; ++f) s += hid[std::size_t(f)] * dd[std::size_t(o * ff + f)]; ref[std::size_t(i * od + o)] = s; mx = std::max(mx, std::fabs(s)); }
+        }
+        tensor_graph g; auto xi = g.input("x", {rows, k});
+        auto gt = g.apply(ops::op::matmul_t, {xi, g.qweight("wg", {ff, k}, eg, cn)});
+        auto up = g.apply(ops::op::matmul_t, {xi, g.qweight("wu", {ff, k}, eu, cn)});
+        g.output("y", g.apply(ops::op::matmul_t, {g.mul(g.apply(ops::op::silu, {gt}), up), g.qweight("wd", {od, ff}, ed_, cn)}));
+        pass_options po; po.lowerings = &reg; auto p = compile(std::move(g), nullptr, po);
+        executor ex(*p); ex.set_input("x", x); ex.run(); auto y = ex.output("y").data;
+        double e = 0; for (std::size_t i = 0; i < ref.size() && y.size() == ref.size(); ++i) e = std::max(e, std::fabs(y[i] - ref[i]));
+        e = y.size() == ref.size() ? e / mx : 1.0; worst_dev = std::max(worst_dev, e);
+        const double bound = exact ? 1e-4 : 6e-2;   // two matmuls and a product deep
+        ++n;
+        if (!(e <= bound)) { std::printf("FAIL %s FFN gate/up/down %s rows %lld vs decoded-weight reference: %.3g of the largest output (bound %.3g)\n", api.c_str(), cn.c_str(), (long long)rows, e, bound); ++fails; }
+    }
+    std::printf("%s %d/%d %s quantised cases within the %s bound of the decoded-weight reference (worst: device %.2g, CPU f32 kernel %.2g of the largest output)\n",
+                fails ? "FAIL" : "ok  ", n - fails, n, api.c_str(), exact ? "exact (f32 rounding)" : "int8-activation", worst_dev, worst_cpu);
+    return fails;
+}
+
 // Every runtime with the cuda.hpp contract: open(why, ordinal) via the Open functor.
 template<class RT, class Open> static int device_t(Open open) {
     std::string why; auto rt = open(&why, 0);
@@ -598,6 +688,7 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s %d/%d %s lowerings pass the oracle\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     fails += dec_fails;
     fails += qmatmul_check<RT>(*reg, api, mma_runs);
+    fails += exact_reference_check<RT>(*reg, api);
     if constexpr (requires { shared->run_qglu(tensor_view{}, nullptr, nullptr, std::size_t(0), 0u, 0u, tensor_view{}); }) {
         fails += glu_check(*reg, *shared, api);
         if constexpr (!requires { RT::exact_activations; }) {   // tensor-core paths: CUDA/HIP only

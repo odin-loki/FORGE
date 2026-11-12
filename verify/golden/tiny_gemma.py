@@ -3,7 +3,7 @@
 one float64 numpy reference parameterised by generation, and FORGE.
 
   gemma   RMSNorm (1 + w), embeddings * sqrt(d), GeGLU (GELU-tanh), tied head, grouped-query attention
-  gemma2  + pre/post norms, attention soft-capping (cap 5: active on these weights), query_pre_attn_scalar,
+  gemma2  + pre/post norms, attention soft-capping (cap 2: active on these weights), query_pre_attn_scalar,
             sliding window 4 on the even layers, final logit soft-capping
   gemma3  + QK-norm instead of soft-capping, sliding-window pattern 3 with a local RoPE base
 
@@ -27,11 +27,18 @@ TOK = {1: "spm_bpe_llama.model", 3: "hf_bpe_llama2.json"}
 CFGS = {
     1: dict(BASE, architectures=["GemmaForCausalLM"], model_type="gemma", vocab_size=560, bos_token_id=1, eos_token_id=2),
     2: dict(BASE, architectures=["Gemma2ForCausalLM"], model_type="gemma2", query_pre_attn_scalar=24, sliding_window=4,
-            attn_logit_softcapping=5.0, final_logit_softcapping=3.0),
+            attn_logit_softcapping=2.0, final_logit_softcapping=3.0),
     3: dict(BASE, architectures=["Gemma3ForCausalLM"], model_type="gemma3_text", query_pre_attn_scalar=24, sliding_window=4,
             sliding_window_pattern=3, rope_theta=1000000.0, rope_local_base_freq=100.0, attn_logit_softcapping=None, final_logit_softcapping=None,
             vocab_size=gu.tok_vocab_size("hf_bpe_llama2.json"), bos_token_id=1, eos_token_id=2),
 }
+
+# gemma2: q/k projections 1.5x the usual scale, so that raw attention scores (about 6 on the test prompt) pass the
+# soft-cap of 2. An earlier version used 3x with a cap of 5: raw scores near 28 made the logits so sensitive to q8_0
+# rounding that the cosine ranged from 0.945 to 0.9995 over prompts and, for the test prompt, landed on either side of
+# 0.999 depending on the path's rounding (exact f32 activations on OpenCL / Level Zero and FORGE_CPU_INT8=0: 0.9984;
+# int8 activations on the CPU default and CUDA: 0.9990). With these weights every path clears 0.999 with margin.
+QK_GAIN = {2: 1.5}
 
 def make_weights(gen, seed):
     c = CFGS[gen]; rng = np.random.default_rng(seed)
@@ -43,7 +50,7 @@ def make_weights(gen, seed):
         W[p + "input_layernorm.weight"] = nw(H); W[p + "post_attention_layernorm.weight"] = nw(H)
         if gen >= 2: W[p + "pre_feedforward_layernorm.weight"] = nw(H); W[p + "post_feedforward_layernorm.weight"] = nw(H)
         if gen == 3: W[p + "self_attn.q_norm.weight"] = nw(hd); W[p + "self_attn.k_norm.weight"] = nw(hd)
-        qs = (3 if gen == 2 else 1) / np.sqrt(H)   # gemma2: large q/k so soft-capping bites
+        qs = QK_GAIN.get(gen, 1) / np.sqrt(H)
         W[p + "self_attn.q_proj.weight"] = rng.normal(0, qs, (nh * hd, H))
         W[p + "self_attn.k_proj.weight"] = rng.normal(0, qs, (nk * hd, H))
         W[p + "self_attn.v_proj.weight"] = rng.normal(0, 1 / np.sqrt(H), (nk * hd, H))
@@ -100,9 +107,7 @@ def main():
         W = gu.save_model(hf, make_weights(gen, 100 + gen), CFGS[gen], tokenizer=None if gen in TOK else "BPE")
         if gen in TOK: gu.use_tokenizer(hf, TOK[gen], {"add_bos_token": True, "add_eos_token": False} if gen == 3 else None)
         fwd = lambda ids, gen=gen, W=W: forward(gen, W, ids)
-        # gemma2's q/k weights are 3x larger so that soft-capping is active, which also makes its logits the most
-        # sensitive to q8_0 rounding: cosine 0.9999 on the CPU and CUDA paths, 0.9984 on the OpenCL path (f32-decoded weights)
-        fp = ck.decoder(hf, name, fwd, prompt, CFGS[gen]["eos_token_id"], q8_cos=0.997 if gen == 2 else 0.999)
+        fp = ck.decoder(hf, name, fwd, prompt, CFGS[gen]["eos_token_id"], q8_cos=0.999)
         if gen == 1:   # SentencePiece itself adds no BOS; the session does (manifest bos_token_id, add_bos default)
             text, ids = gu.tok_golden("spm_bpe_llama")
             ck.text_logits(fp, text, fwd([1] + ids)[-1], f"gemma tokenizer.model (SentencePiece BPE, BOS + {len(ids)} ids)")
@@ -112,7 +117,7 @@ def main():
             ck.text_logits(fp, text, fwd(ids)[-1], f"gemma3 tokenizer.json (SentencePiece BPE as transformers writes it, {len(ids)} ids)")
         if gen == 2:
             st = []; forward(2, W, prompt, st)
-            ck.ok(max(st) > CFGS[2]["attn_logit_softcapping"], f"gemma2: raw attention scores reach {max(st):.1f}, above the cap of 5 (soft-capping is exercised)")
+            ck.ok(max(st) > CFGS[2]["attn_logit_softcapping"], f"gemma2: raw attention scores reach {max(st):.1f}, above the cap of {CFGS[2]['attn_logit_softcapping']:g} (soft-capping is exercised)")
             win = forward(2, W, prompt)[-1]; CFGS[2]["sliding_window"] = 4096
             ck.ok(np.abs(win - forward(2, W, prompt)[-1]).max() > 1e-2, "gemma2: the sliding window changes the reference logits (it is exercised)")
             CFGS[2]["sliding_window"] = 4
