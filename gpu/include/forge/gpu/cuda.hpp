@@ -184,7 +184,8 @@ public:
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
             for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_);
-            if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_); } catch (...) {}
+            if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_);
+            if (skfx_) f_.free_(skfx_); if (skfl_) f_.free_(skfl_); } catch (...) {}   // stream-K fix-up scratch and flags (were leaked: device memory never returned)
         for (auto& c : segc_) drop_seg(c);
         for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
         if (stage_ && f_.host_free) f_.host_free(stage_);
