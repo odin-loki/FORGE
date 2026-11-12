@@ -1,0 +1,51 @@
+# Vision transformer encoder as an image-embedding model: ViT, the CLIP vision tower and the SigLIP vision tower.
+#   image   one preprocessed (resized, normalised) image, f32[channels, size, size]
+#   stem    patch embedding = conv2d with stride = kernel = patch size, flattened to [patches, d_model]
+#   tokens  ViT / CLIP prepend a class token; SigLIP has none. Learned positions are added; CLIP then applies a
+#           pre-LayerNorm. The importer writes those two expressions (embed / pre) and the pooling expression:
+#             ViT     post-LayerNorm of the class token
+#             CLIP    post-LayerNorm of the class token, times the visual projection when the checkpoint has one
+#             SigLIP  attention pooling (map_pool below: a learned probe attends over the patch tokens, then an MLP)
+#   blocks  pre-LayerNorm transformer blocks with bidirectional attention.
+# Double-brace placeholders are substituted by `forge import` from config.json (vision_config).
+blueprint "vision-encoder" opset 1
+
+params {
+  d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
+  head_dim: {{head_dim}}  ffn: {{intermediate_size}}  eps: {{layer_norm_eps}}
+  channels: {{num_channels}}  image_size: {{image_size}}  patch: {{patch_size}}
+  n_patches: {{num_patches}}  n_tokens: {{num_tokens}}  out_dim: {{out_dim}}
+}
+
+input image : f32[channels, image_size, image_size]
+
+op affine(x, w, b) { return linear(x, w) + b }
+op mlp(x, w_in, b_in, w_out, b_out) { return affine({{act}}(affine(x, w_in, b_in)), w_out, b_out) }
+# SigLIP head: MultiheadAttention(probe, x, x) -> y; y + mlp(layer_norm(y)); one row
+op map_pool(x) {
+  q = heads(affine(W.head.probe, W.head.wq, W.head.bq), n_heads, head_dim)
+  k = heads(affine(x, W.head.wk, W.head.bk), n_heads, head_dim)
+  v = heads(affine(x, W.head.wv, W.head.bv), n_heads, head_dim)
+  y = affine(merge(attention(q, k, v, causal: false), d_model), W.head.wo, W.head.bo)
+  y = y + mlp(layer_norm(y, W.head.norm_w, W.head.norm_b, eps), W.head.w_in, W.head.b_in, W.head.w_out, W.head.b_out)
+  return reshape(y, [d_model])
+}
+
+graph {
+  p = transpose(reshape(conv2d(image, W.patch_w, W.patch_b, stride: patch), [d_model, n_patches]), [1, 0])
+  x = {{embed_expr}}
+  x = {{pre_expr}}
+  repeat l in 0..n_layers {
+    h = layer_norm(x, W.layer[l].norm1_w, W.layer[l].norm1_b, eps)
+    q = heads(affine(h, W.layer[l].wq, W.layer[l].bq), n_heads, head_dim)
+    k = heads(affine(h, W.layer[l].wk, W.layer[l].bk), n_heads, head_dim)
+    v = heads(affine(h, W.layer[l].wv, W.layer[l].bv), n_heads, head_dim)
+    x = x + affine(merge(attention(q, k, v, causal: false), d_model), W.layer[l].wo, W.layer[l].bo)
+    h = layer_norm(x, W.layer[l].norm2_w, W.layer[l].norm2_b, eps)
+    x = x + mlp(h, W.layer[l].w_in, W.layer[l].b_in, W.layer[l].w_out, W.layer[l].b_out)
+  }
+  embedding = {{pool_expr}}
+}
+
+output embedding : f32[out_dim]
+session embedding
