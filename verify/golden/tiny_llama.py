@@ -272,6 +272,16 @@ def main():
     lst = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "shard", "list", pk], capture_output=True, text=True, env={**os.environ, "FORGE_BLOB_DIR": os.path.join(sd, "packs")}).stdout
     ok = ok and "MISSING" not in lst and 1 < len(lst.strip().splitlines()) < nt
     print(f"[{'ok' if ok else 'FAIL'}] sharded import: {nt} blobs, second model shares {f32_kept}; logits unchanged (also with aot + binary blueprint); join restores every tensor; a flipped blob byte fails verify"); fails += not ok
+    # self-speculative decoding (early exit after layer 1): the same tokens as plain decoding, greedy and seeded sampling
+    toks = ",".join(map(str, prompt)); ok = True
+    for extra in ([], ["--temp", "0.9", "--seed", "3"], ["--temp", "1.1", "--top-k", "30", "--seed", "8"]):
+        plain = run([a.forge, "run", base, "--tokens", toks, "-n", "24", "--ids", *extra]).split()
+        for k in ("2", "0"):
+            spec = run([a.forge, "run", base, "--tokens", toks, "-n", "24", "--ids", "--self-spec", "--exit-layer", "1", "--spec-k", k, *extra]).split()
+            ok = ok and spec == plain and len(plain) > 0
+    r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "run", base, "--tokens", toks, "-n", "4", "--self-spec", "--exit-layer", "9"], capture_output=True, text=True, errors="replace")
+    ok = ok and r.returncode != 0 and "exit layer 9" in r.stdout + r.stderr
+    print(f"[{'ok' if ok else 'FAIL'}] --self-spec (early exit) gives the tokens of plain decoding: greedy and two seeded samplers"); fails += not ok
     # tokenizer + text path
     out = os.path.join(a.work, "tiny_f32.fpk")
     txt = run([a.forge, "run", out, "--prompt", "the theory of things", "-n", "4"])

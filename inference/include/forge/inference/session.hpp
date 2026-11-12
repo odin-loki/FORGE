@@ -37,6 +37,12 @@ struct session_options {
     // Determinism mode (gpu/determinism.hpp): 1 = order-stable device paths only (same device + same build -> bit-identical
     // results), 0 = off, -1 = $FORGE_DETERMINISTIC. Process-wide: it applies to every runtime in the process.
     int deterministic = -1;
+    // Early exit: > 0 runs only the first `exit_layer` layers and applies the model's final norm and LM head to that
+    // hidden state (the draft of self-speculative decoding, speculative.hpp). The blueprint is built with its depth
+    // param (`n_layers`, or the one named by `session generative_sequence(depth_param: "n_blocks")`: quoted, since a
+    // bare param name in a session parameter stands for the param's value) set to this value.
+    // Such a session has its own state and shares the model's weights. 0 = the whole model.
+    i64 exit_layer = 0;
 };
 
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
@@ -226,6 +232,26 @@ public:
         try { add_adapter(n, d, float(it->alpha)); }
         catch (const forge_exception&) { std::lock_guard lk(w_mu_); if (!adapters_.count(n)) throw; }   // another thread loaded it first
     }
+    // Depth of the model in the unit early exit counts in: the value of its depth param (0 when it has none).
+    std::string depth_param() const { return bp_.session_str("depth_param", "n_layers"); }
+    i64 depth() const { return i64(bp_.param_or(depth_param(), 0)); }
+    // The exit layer the file suggests for self-speculative decoding: `session generative_sequence(early_exit: K)`
+    // (opset 4), 0 when it names none.
+    i64 early_exit_default() const { return i64(bp_.session_arg("early_exit", 0)); }
+    // The blueprint cut at `exit_layer`: the same program with the depth param set to it, so its layer loop stops
+    // there and the final norm and head read that hidden state. Raises when the model cannot be cut there.
+    modelfile::blueprint early_exit_blueprint(i64 exit_layer) const {
+        const auto name = depth_param(); const i64 full = depth();
+        if (!bp_.params.count(name)) raise(errc::unsupported, "{}: early exit needs the blueprint's depth param '{}' (name another with `session generative_sequence(depth_param: \"name\")`)", fpk_path_, name);
+        if (exit_layer < 1 || exit_layer >= full) raise(errc::invalid_argument, "{}: exit layer {} is outside 1 .. {} ({} = {})", fpk_path_, exit_layer, full - 1, name, full);
+        modelfile::blueprint cut = bp_;
+        cut.params[name] = double(exit_layer);
+        // the cut must be a smaller graph: a blueprint whose layer loop runs on another param would give a "draft"
+        // that is the whole model
+        if (modelfile::blueprint_weights(cut).size() >= modelfile::blueprint_weights(bp_).size())
+            raise(errc::unsupported, "{}: setting '{}' to {} does not shorten the graph; name the param that sets the depth with `session generative_sequence(depth_param: \"name\")`", fpk_path_, name, exit_layer);
+        return cut;
+    }
     // The model's state schema: the file's "state" section when it has one (checked against the blueprint at open),
     // else derived from the blueprint on first use. Null when it cannot be derived (the old behaviour then applies:
     // nothing is checked against it).
@@ -240,10 +266,12 @@ public:
     // `dims` binds symbolic dimensions other than `seq` (graphs imported from ONNX may have several); such plans are
     // compiled here, never taken from precompiled ones (those are keyed on `seq` alone).
     // `entry` names an entry point of the blueprint (`entry name { ... }`, opset 4) to build instead of the main graph.
-    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}, const std::map<std::string, i64>* dims = nullptr, const std::string& entry = {}) {
+    // `exit_layer` > 0 builds the early-exit graph (session_options::exit_layer).
+    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}, const std::map<std::string, i64>* dims = nullptr, const std::string& entry = {}, i64 exit_layer = 0) {
         std::string dk;
         if (dims) for (auto& [k, v] : *dims) if (k != "seq") dk += std::format(";{}={}", k, v);
         if (!entry.empty() && entry != "main") dk += ";entry=" + entry;
+        if (exit_layer > 0) dk += std::format(";exit={}", exit_layer);
         return cache_.get(std::format("{}:{}:{}:{}{}", all_rows ? "all" : "seq", n, adapter, st ? graph::kv_codec_pair_name({st->codec, st->codec_v == graph::kv_codec::f32 ? st->codec : st->codec_v}) : "f32", dk), [&] {
             modelfile::build_options bo;
             if (dims) for (auto& [k, v] : *dims) bo.dims[k] = v;
@@ -279,6 +307,7 @@ public:
             };
             graph::pass_options po; po.lowerings = reg_.get();
             if (!decode_all && dk.empty()) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
+            if (exit_layer > 0) return graph::compile(modelfile::build_graph(early_exit_blueprint(exit_layer), bo, entry), st, po);
             return graph::compile(modelfile::build_graph(bp_, bo, entry), st, po);
         });
     }
@@ -332,6 +361,7 @@ public:
         st_.offload = off != 0;
     }
     const std::shared_ptr<model>& shared_model() const { return m_; }
+    const session_options& options() const { return opt_; }
     const modelfile::blueprint& blueprint() const { return m_->blueprint(); }
     const json::value& manifest() const { return m_->manifest(); }
     const modelfile::reader& file() const { return m_->file(); }
@@ -660,7 +690,7 @@ private:
         if (pos_ + i64(ids.size()) > st_.capacity) raise(errc::out_of_memory, "context {} exceeded", st_.capacity);
         i64 n = i64(ids.size());
         std::lock_guard lk(m_->run_mutex());
-        auto& p = m_->plan_for(n, all, &st_, adapter_);
+        auto& p = m_->plan_for(n, all, &st_, adapter_, nullptr, {}, opt_.exit_layer);
         auto it = execs_.find(&p);
         if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<graph::executor>(p, &st_)).first;
         auto& ex = *it->second;

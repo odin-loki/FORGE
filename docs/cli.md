@@ -80,6 +80,7 @@ LoRA adapters carried in the model file. `add` copies the `<weight>.lora_a` / `<
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
 | `--draft draft.fpk` | | Speculative decoding with a draft model |
 | `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
+| `--self-spec [--exit-layer K]` | | Self-speculative decoding: drafts from the model's own early exit after layer `K` (default: the blueprint's `early_exit`, else half the depth). Same tokens as plain decoding, greedy or seeded |
 | `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
 | `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
 | `--adapter NAME` | none | Run with a LoRA adapter carried in the model file (`forge adapter list` shows them) |

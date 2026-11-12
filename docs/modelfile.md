@@ -85,6 +85,7 @@ The declaration is enforced in both directions: a blueprint has to declare at le
 | opset 3 | a keyword argument to a composite (`f(x, eps: 1e-5)`); keyword attrs of spec ops are opset 1 | `build_graph` |
 | opset 3 | `session embedding` | `parse_blueprint` |
 | opset 4 | parameters of a session kind: `session kind(key: value, ...)` (numbers, `true` / `false`, names, strings; the name of a numeric param gives its value) | `parse_blueprint` |
+| opset 4 | `session generative_sequence(early_exit: K, depth_param: "name")`: the exit layer self-speculative decoding uses by default and the param that sets the model's depth ([inference.md](inference.md#speculative-decoding-speculativehpp)). A bare param name in a session parameter stands for the param's value; quote it to pass the name | `parse_blueprint` |
 | opset 4 | `session diffusion_loop`, `session streaming` ([inference.md](inference.md#session-kinds-chosen-by-the-file-diffusion_loop-and-streaming-file_sessionshpp)) | `parse_blueprint` |
 | opset 4 | named entry points: `entry name { input ...  output ...  graph { ... } }`, further graphs of the same model next to the main one. They share its params, composites, weights and state slots and are built with `build_graph(bp, options, "name")` / run with `session::infer_entry` | `parse_blueprint` |
 

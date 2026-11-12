@@ -84,7 +84,7 @@ int usage() {
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint [text|binary|canonical] [-o FILE]] [--license] [--state]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
-        "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
+        "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1] | --self-spec [--exit-layer K]] [--spec-k 0 (0 = planner)]\n"
         "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "      one-shot graphs (imported ONNX): --input name=file.f32 ... [--dim name=N ...] [--out prefix]; integer inputs take file.i64 / file.i32\n"
@@ -805,10 +805,14 @@ int cmd_run(const args& a) {
     // Speculative decoding: --draft model.fpk or --lookup (n-gram drafts from the prompt and output).
     // --spec-k N: N drafts per pass; 0 (default) = chosen per pass by the planner from measured costs.
     // Not with --grammar: the constraint advances one token at a time.
-    if ((a.kv.count("draft") || a.has("lookup")) && !gc) {
+    // --self-spec [--exit-layer K]: drafts from the model's own early exit (its first K layers and the LM head);
+    // K defaults to the blueprint's `early_exit`, else half the depth. The output is that of plain decoding.
+    if ((a.kv.count("draft") || a.has("lookup") || a.has("self-spec")) && !gc) {
         inference::speculative_stats sst;
         int k = int(a.num("spec-k", 0)), n = int(a.num("n", 32));
-        if (a.kv.count("draft")) {
+        if (a.has("self-spec")) {
+            inference::self_speculative_generate(s, prompt, n, smp, i64(a.num("exit-layer", 0)), k, show, &sst);
+        } else if (a.kv.count("draft")) {
             inference::session d(resolve_model(a.get("draft"), a.get("codec")), so);
             inference::speculative_generate(s, d, prompt, n, smp, k, show, &sst);
         } else {
@@ -1364,7 +1368,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "single-aead", "state", "calib", "no-calib", "pure", "bf16-head"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "self-spec", "single-aead", "state", "calib", "no-calib", "pure", "bf16-head"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
