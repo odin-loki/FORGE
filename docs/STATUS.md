@@ -170,6 +170,15 @@ GPU, and nothing was built by a compiler other than clang 23.
   the memory-capped and benchmark-weighted splits ran on synthetic records only. Stage hand-off is through host
   memory: peer copies are not used by the pipeline (the peer-copy API is covered by `test_gpu_features_*_mock` as
   before). No multi-GPU machine has run it.
+- **RPC remote weight residency** (protocol version 2 in `graph/rpc.hpp`: the `rpc.caps` probe, `FRPW` uploads keyed
+  by BLAKE3, `FRPR` ops with handles, a per-connection LRU under a shared byte budget, invalidation on reconnect).
+  Tested over **loopback only**, plain TCP, CPU server: `test_rpc` 7 new tests (upload once and the bytes saved, LRU
+  eviction and re-upload, reconnect by hand and after a server restart, a version 1 server and a version 1 client,
+  `allow=` / `max-bytes=` on uploads and on handles, hostile frames, a whole model against the CPU); the 24 older
+  `test_rpc` tests pass unchanged (the TLS ones included: this build has OpenSSL). `fuzz_rpc`: 32 new seeds, 150,000 mutated inputs without a finding, in a build
+  **without** sanitizers. Not run: two machines, TLS-specific paths, a GPU behind the server (the device pin of a
+  stored weight has only run against the CPU registry, where it is a no-op), concurrent connections under load. `forge rpc-serve` still opens its device non-resident, so only the network
+  transfer of a weight is saved, not the server's host-to-GPU copy.
 - The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
   tests pass unchanged after the move.
 

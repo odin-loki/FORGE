@@ -33,6 +33,10 @@ struct lowering {
 
 // A device backend's residency protocol, driven by the executor: buffers may live on the device for the
 // duration of run(); the executor asks for host copies before CPU work and reports host writes after it.
+// For a registry that wants to know a plan's weights and constants without being a resident device: the RPC client
+// uploads them once and refers to them by content hash afterwards (graph/rpc.hpp). note(p, n) is called for each of
+// them when a plan first runs, forget(p, n) when the plan is destroyed (the memory may go away or be reused).
+struct weight_sink { std::function<void(const float*, std::size_t)> note, forget; };
 struct device_hooks {
     std::function<void()> begin_run, end_run;
     // optional: end a run without copying device intermediates back (the executor has already fetched outputs/state)
@@ -94,6 +98,7 @@ public:
     }
     std::vector<lowering>& lowerings(ops::op o) { return by_op_[std::size_t(o)]; }
     std::shared_ptr<device_hooks> hooks;  // set by device backends that keep data resident
+    std::shared_ptr<weight_sink> weights; // set by registries that track a plan's constants themselves (rpc)
     // Pipeline split ("pipe:a,b,..."): when non-empty, compile() cuts the graph into contiguous stages of about
     // equal cost (weights in stage_weight) and selects each node's lowering from its stage's registry
     // (null entry = CPU). Stage registries must be non-resident; activations cross stages through host memory.

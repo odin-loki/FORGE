@@ -127,6 +127,9 @@ Read by `rpc:host:port` devices and `forge::remote` (see [rpc.md](rpc.md)).
 | `FORGE_RPC_FINGERPRINT` | SHA-256 fingerprint of the server certificate |
 | `FORGE_RPC_TLS_CERT`, `FORGE_RPC_TLS_KEY` | Client certificate and key, for servers started with `--tls-client-ca` |
 | `FORGE_RPC_SERVER_NAME` | Server name for TLS verification |
+| `FORGE_RPC_RESIDENT=0` | Device clients: do not upload weights to the server; send them with every op |
+| `FORGE_RPC_RESIDENT_MIN` | Device clients: smallest weight, in bytes, uploaded once and sent by handle (default 4096) |
+| `FORGE_RPC_WEIGHT_CACHE` | `forge rpc-serve` and `rpc::server`: bytes of uploaded weights kept over all connections (`k` / `m` / `g` suffix; default 1 GiB; `0` = none). See [rpc.md](rpc.md#weights-on-the-server) |
 
 `forge rpc-serve --allow-scripts` removes `FORGE_SCRIPT_CACHE_SIGN_SEED`, `FORGE_RPC_TOKEN`, `FORGE_RPC_KEY` and `FORGE_RPC_TLS_KEY` from the environment of script child processes.
 

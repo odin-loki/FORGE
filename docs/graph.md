@@ -138,7 +138,7 @@ tensor out = ex.output("y");
 ```
 
 ## RPC device
-`rpc:host:port` sends each op to a server started with `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu]`. The server runs it with its own device registry. Every op is still oracle-checked on the client. Weights travel with every op (no remote residency).
+`rpc:host:port` sends each op to a server started with `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu]`. The server runs it with its own device registry. Every op is still oracle-checked on the client. The plan's f32 weights and constants are uploaded once per connection and referred to by BLAKE3 hash afterwards ([rpc.md](rpc.md#weights-on-the-server)); activations travel with every op.
 
 Optional TLS (mTLS too) and token or Ed25519 key authentication are available. The client reads its credentials from `FORGE_RPC_KEY`, `FORGE_RPC_TOKEN`, `FORGE_RPC_TLS=1`, `FORGE_RPC_CA`, `FORGE_RPC_FINGERPRINT`, `FORGE_RPC_SERVER_NAME`, `FORGE_RPC_TLS_CERT` and `FORGE_RPC_TLS_KEY`. A server with no tokens or keys accepts anyone, so bind it to loopback. Details: [rpc.md](rpc.md).
 
