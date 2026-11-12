@@ -11,6 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <format>
 #include <functional>
 #include <string>
@@ -77,7 +79,8 @@ template<class RT> static int qmatmul_check(graph::registry& reg, const std::str
         const bool mma = mma_runs() != mma0;
         // rows < 16 on q8_0/q4_k/q6_k: the MMVQ path quantises x to q8_1 (32-value blocks, d = amax/127) like llama.cpp,
         // so the reference uses the same rounded activations.
-        const bool mmvq = mma || (rows < 16 && (cn == "q8_0" || cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0"));
+        bool mmvq = mma || (rows < 16 && (cn == "q8_0" || cn == "q4_k" || cn == "q6_k") && !(std::getenv("FORGE_MMVQ") && std::string(std::getenv("FORGE_MMVQ")) == "0"));
+        if constexpr (requires { RT::exact_activations; }) mmvq = false;   // the portable kernel (OpenCL, Level Zero) dots the f32 activations
         std::vector<float> xr(x);
         if (mmvq) for (std::size_t b = 0; b < xr.size(); b += 32) {
             float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(xr[b + i]));
@@ -184,6 +187,8 @@ static int state_ops_check_one(graph::registry& reg, const std::string& api, con
             for (auto nm : {"o", "c"}) { auto t = e.output(nm); out.insert(out.end(), t.data.begin(), t.data.end()); }
         };
         for (int pass = 0; pass < 2; ++pass) { feed(e3, 0, 3); for (i64 t = 3; t < S; ++t) feed(e1, t, 1); st.reset(); }
+        // the state slots are pinned on the device by host address: drop the device copies before the store is freed
+        if (r && r->hooks) { st.hooks = r->hooks.get(); st.forget(); }
         return out;
     };
     auto dev = run(&reg), cpu = run(nullptr);
@@ -403,7 +408,7 @@ template<class RT> static int glu_check(graph::registry& reg, RT& rt, const std:
             executor e(*p); e.set_input("x", x); e.run(); return e.output("y").data; };
         run(&reg);   // warm-up: the first run uploads the weights (an upload drops the quantised-activation reuse)
         fused_steps = 0;
-        const std::size_t glu0 = disp("qmatmul_glu"), re0 = disp("quant_q8r_reused") + disp("quant_q81_reused");
+        const std::size_t glu0 = disp("qmatmul_glu"), re0 = disp("quant_q8r_reused") + disp("quant_q81_reused"), pg0 = disp("qglu");
         auto fused = run(&reg);
         const int fs = fused_steps;
         const bool took = disp("qmatmul_glu") > glu0, reused = disp("quant_q8r_reused") + disp("quant_q81_reused") > re0;
@@ -416,15 +421,113 @@ template<class RT> static int glu_check(graph::registry& reg, RT& rt, const std:
         for (auto v : cpu) mx = std::max(mx, double(std::fabs(v)));
         for (std::size_t i = 0; i < cpu.size() && fused.size() == cpu.size() && plain.size() == cpu.size(); ++i) {
             dp = std::max(dp, std::fabs(double(fused[i]) - plain[i])); dc = std::max(dc, std::fabs(double(fused[i]) - cpu[i])); }
-        const bool want = cn != "q5_k";
+        const bool want = std::find(reg.device_qglu_codecs.begin(), reg.device_qglu_codecs.end(), cn) != reg.device_qglu_codecs.end();
         bool ok = fused.size() == cpu.size() && dp <= 2e-3 * (1 + mx) && dc <= 2e-2 * (1 + mx) && ps == 0 && fs == (want ? 1 : 0);
         // where the runtime takes it (sm_80 image / mock), the fused kernel ran and the down projection reused its quantised output
         if (want && took && !reused) ok = false;
+        if constexpr (requires { RT::qglu_any_shape; }) { if (want && disp("qglu") == pg0) ok = false; }   // the portable forge_qglu must have run
         ++n;
         if (!ok) { std::printf("FAIL %s.qglu %s rows %lld: fused steps %d/%d, ran %d, reused %d, |fused-unfused| %.3g, |fused-cpu| %.3g (max %.3g)\n", api.c_str(),
                                cn.c_str(), (long long)rows, fs, ps, int(took), int(reused), dp, dc, mx); ++fails; }
     }
     std::printf("%s %d/%d %s fused FFN gate/up cases match the unfused plan and the CPU\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
+// Embedding gather from an encoded table kept on the device (registry::device_qgather) vs the codec's own decoder:
+// in-range rows must match the decoded row, an index past the table gives a zero row (the kernel's contract).
+static int qgather_check(graph::registry& reg, const std::string& api) {
+    if (!reg.device_qgather) { std::printf("note %s: no device quantised gather\n", api.c_str()); return 0; }
+    int fails = 0, n = 0;
+    static std::deque<std::vector<std::uint8_t>> keep;   // device tables are cached by host address
+    for (std::string cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) {
+        const auto* c = graph::codecs::find(cn);
+        const std::size_t d = 512, nrows = 19, rb = c->bytes(d);
+        std::vector<float> tf(nrows * d);
+        for (std::size_t i = 0; i < tf.size(); ++i) tf[i] = std::sin(float(i) * 0.413f + float(cn.size())) * (0.5f + float(i % 61) / 40.f);
+        auto& enc = keep.emplace_back(nrows * rb);
+        for (std::size_t r = 0; r < nrows; ++r) c->encode(tf.data() + r * d, d, enc.data() + r * rb);
+        std::vector<float> idx{3, 0, 18, 7, 7, 25};   // 25: out of range
+        std::vector<float> y(idx.size() * d, -1.f), row(d);
+        tensor_view tv; tv.shape = {i64(nrows), i64(d)}; tv.qdata = enc.data(); tv.qcodec = c;
+        tensor_view iv; iv.data = idx.data(); iv.shape = {i64(idx.size())};
+        tensor_view ov; ov.data = y.data(); ov.shape = {i64(idx.size()), i64(d)};
+        std::vector<tensor_view> ins{tv, iv};
+        reg.device_qgather->fn(ins, ov, {});
+        double worst = 0;
+        for (std::size_t i = 0; i < idx.size(); ++i) {
+            if (std::size_t(idx[i]) < nrows) c->decode(enc.data() + std::size_t(idx[i]) * rb, d, row.data()); else std::fill(row.begin(), row.end(), 0.f);
+            for (std::size_t e = 0; e < d; ++e) worst = std::max(worst, std::fabs(double(y[i * d + e]) - row[e]) / (1.0 + std::fabs(double(row[e]))));
+        }
+        ++n; if (!(worst <= 1e-6)) { std::printf("FAIL %s.qgather %s: worst rel error %.3g\n", api.c_str(), cn.c_str(), worst); ++fails; }
+    }
+    std::printf("%s %d/%d %s quantised gather cases match the codec decoder\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
+// Sparse mixture of experts on the device (registry::device_moe, run_moe: host router + forge_moe_hidden / forge_moe_down
+// over the stacked expert weights kept on the device) vs the CPU moe-sparse path (plan.hpp moe_ffn) through compiled
+// plans, for encoded and f32 expert weights, softmax and sigmoid gating, prefill and single-token shapes; and the
+// lowering called directly against ops::ref::moe_ffn. The plan must have picked the device lowering.
+static int moe_check(graph::registry& reg, const std::string& api, const std::function<std::size_t(const char*)>& disp) {
+    if (!reg.device_moe) { std::printf("note %s: no device mixture of experts\n", api.c_str()); return 0; }
+    using namespace graph;
+    int fails = 0, n = 0;
+    static std::deque<std::vector<std::uint8_t>> keep;
+    static std::deque<tensor> keepf;
+    for (std::string cn : {"f32", "q8_0", "q4_k", "q5_k", "q6_k"}) for (i64 t : {1, 5}) for (int gating : {0, 1}) {
+        const i64 d = 256, f = 512, ne = 6, k = cn == "q4_k" ? 3 : 2;
+        auto wf = [&](i64 rows, i64 kd, float ph) { tensor w({ne, rows, kd});
+            for (std::size_t i = 0; i < w.data.size(); ++i) w.data[i] = std::sin(float(i) * 0.731f + ph) * (0.02f + float(i % 89) / 2000.f); return w; };
+        auto& G = keepf.emplace_back(wf(f, d, 1.f)); auto& U = keepf.emplace_back(wf(f, d, 2.f)); auto& D = keepf.emplace_back(wf(d, f, 3.f));
+        std::vector<float> h(std::size_t(t * d)), lg(std::size_t(t * ne));
+        for (std::size_t i = 0; i < h.size(); ++i) h[i] = std::cos(float(i) * 0.217f);
+        for (std::size_t i = 0; i < lg.size(); ++i) lg[i] = std::sin(float(i) * 1.37f + float(t));
+        ops::attrs a{{"k", double(k)}, {"norm", gating ? 0.0 : 1.0}, {"scale", 1.0}, {"gating", double(gating)}};
+        auto build = [&] {
+            tensor_graph g; auto hi = g.input("h", {t, d}); auto li = g.input("lg", {t, ne});
+            auto wt = [&](const char* nm, tensor& w) {
+                if (cn == "f32") { auto id = g.constant(tensor(w.shape, 0.f)); g.at(id).constant->data = w.data; return id; }
+                const auto* c = codecs::find(cn); const std::size_t kd = std::size_t(w.shape[2]), rows = std::size_t(w.shape[0] * w.shape[1]), rb = c->bytes(kd);
+                auto& e = keep.emplace_back(rows * rb);
+                for (std::size_t r = 0; r < rows; ++r) c->encode(w.data.data() + r * kd, kd, e.data() + r * rb);
+                return g.qweight(nm, w.shape, e.data(), cn); };
+            auto g1 = wt("wg", G), u1 = wt("wu", U), d1 = wt("wd", D);
+            // an op before and after, so the experts' input and output live on the device inside the run
+            auto hh = g.apply(ops::op::scale, {hi}, {{"alpha", 0.5}});
+            g.output("y", g.apply(ops::op::neg, {g.apply(ops::op::moe_ffn, {hh, li, g1, u1, d1}, a)}));
+            return g; };
+        int dev_steps = 0;
+        auto run = [&](registry* r) {
+            pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po);
+            for (auto& s : p->steps) if (s.low && s.low->name == api + ".moe_ffn") ++dev_steps;
+            executor e(*p); e.set_input("h", h); e.set_input("lg", lg); e.run(); auto y1 = e.output("y").data;
+            e.set_input("h", h); e.set_input("lg", lg); e.run(); auto y2 = e.output("y").data;   // second run: weights already resident
+            if (y1 != y2) y1.clear();
+            return y1; };
+        const std::size_t d0 = disp("moe_ffn");
+        auto dev = run(&reg); const int ds = dev_steps;
+        auto cpu = run(nullptr);
+        double worst = dev.size() == cpu.size() && !dev.empty() ? 0 : 1e9, mx = 0;
+        for (auto v : cpu) mx = std::max(mx, double(std::fabs(v)));
+        for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) worst = std::max(worst, std::fabs(double(dev[i]) - cpu[i]));
+        bool ok = worst <= 2e-4 * (1 + mx) && ds == 1 && disp("moe_ffn") == d0 + 2;
+        ++n; if (!ok) { std::printf("FAIL %s.moe_ffn %s t %lld gating %d: device steps %d, dispatches %zu, worst abs %.3g (max %.3g)\n", api.c_str(), cn.c_str(),
+                                    (long long)t, gating, ds, disp("moe_ffn") - d0, worst, mx); ++fails; }
+    }
+    {   // the lowering outside a run, f32 experts, against the op reference
+        const i64 t = 3, d = 64, f = 96, ne = 5;
+        auto mk = [](shape_t s, float ph) { tensor w(s); for (std::size_t i = 0; i < w.data.size(); ++i) w.data[i] = std::sin(float(i) * 0.531f + ph) * 0.1f; return w; };
+        static tensor G = mk({ne, f, d}, 1), U = mk({ne, f, d}, 2), D = mk({ne, d, f}, 3);
+        tensor h = mk({t, d}, 4), lg = mk({t, ne}, 5), y({t, d});
+        ops::attrs a{{"k", 2.0}};
+        std::vector<tensor_view> ins{{h.data.data(), h.shape}, {lg.data.data(), lg.shape}, {G.data.data(), G.shape}, {U.data.data(), U.shape}, {D.data.data(), D.shape}};
+        reg.device_moe->fn(ins, {y.data.data(), y.shape}, a);
+        auto want = ops::ref::moe_ffn({h, lg, G, U, D}, a);
+        double worst = 0; for (std::size_t i = 0; i < y.data.size(); ++i) worst = std::max(worst, std::fabs(double(y.data[i]) - want.data[i]));
+        ++n; if (!(worst < 1e-4)) { std::printf("FAIL %s.moe_ffn outside a run: worst abs error %.3g\n", api.c_str(), worst); ++fails; }
+    }
+    std::printf("%s %d/%d %s mixture-of-experts cases match the CPU sparse path\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails;
 }
 
@@ -435,8 +538,12 @@ template<class RT, class Open> static int device_t(Open open) {
     const std::string api = rt->backend();
     std::printf("%s device: %s (image %s)\n", api.c_str(), rt->device_name().c_str(), rt->image_arch().c_str());
     int dec_fails = 0;
-    if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); })
-        if (api == "cuda" || api == "hip") { dec_fails = attention_dec_check(*rt, api); dec_fails += fusion_check(*rt, api); }
+    if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); }) {
+        // every backend with split-K decode / one-pass prefill attention kernels (not Metal: only forge_attention)
+        if (api != "metal") dec_fails = attention_dec_check(*rt, api);
+        if constexpr (requires { rt->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
+            if (api == "cuda" || api == "hip") dec_fails += fusion_check(*rt, api);
+    }
     auto shared = std::shared_ptr<RT>(std::move(rt));
     auto reg = graph::gpu_registry(shared);
     auto mma_runs = [&]() -> std::size_t { auto d = shared->dispatches(); auto it = d.find("qmatmul_mma"); return it == d.end() ? 0 : it->second; };
@@ -451,12 +558,16 @@ template<class RT, class Open> static int device_t(Open open) {
     fails += qmatmul_check<RT>(*reg, api, mma_runs);
     if constexpr (requires { shared->run_qglu(tensor_view{}, nullptr, nullptr, std::size_t(0), 0u, 0u, tensor_view{}); }) {
         fails += glu_check(*reg, *shared, api);
+        if constexpr (!requires { RT::exact_activations; }) {   // tensor-core paths: CUDA/HIP only
         fails += streamk_check(*reg, *shared, api);
         // the fused GLU kernel with stream-K over single 256-value chunks (every tile split across blocks)
         set_env("FORGE_MMA_SK_MIN", "1"); set_env("FORGE_MMA_STREAMK", "2"); fails += glu_check(*reg, *shared, api);
         set_env("FORGE_MMA_SK_MIN", ""); set_env("FORGE_MMA_STREAMK", "");
+        }
     }
     fails += state_ops_check(*reg, api);
+    fails += qgather_check(*reg, api);
+    fails += moe_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     if constexpr (requires { shared->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
         fails += fusion_plan_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     return fails ? 1 : 0;
@@ -634,6 +745,163 @@ template<class Open> static int memory_t(Open open) {
 // resident inside a run, so only the kernels are timed). Not part of ctest; for kernel work (e.g. q4_k 512 25600 5120).
 // With VAR=a,b,...: batches alternate between the values of environment variable VAR (read per launch, e.g.
 // FORGE_MMA_STREAMK=0,1 or FORGE_MMA_BT=64,128), one line each: an A/B on a shared GPU in one process.
+// Kernel program cache (gpu/kernel_cache.hpp): OpenCL program binaries / Level Zero native module binaries on disk.
+// First open builds from source and writes the file (owner-only); the second loads it; a corrupted, truncated or
+// foreign file, a binary the driver refuses and a changed driver version all fall back to the source build;
+// FORGE_GPU_KERNEL_CACHE=0 neither reads nor writes. The runtime must compute correctly in every case.
+template<class Open> static int cache_t(Open open) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("forge-kcache-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::error_code ec; fs::remove_all(dir, ec);
+    set_env("FORGE_CACHE_DIR", dir.string()); set_env("FORGE_GPU_KERNEL_CACHE", "");
+    int fails = 0;
+    auto check = [&](bool ok, const char* what) { std::printf("%s kernel cache: %s\n", ok ? "ok  " : "FAIL", what); fails += !ok; };
+    auto works = [](auto& rt) {
+        std::vector<float> x{1, 2, 3, 4}, y(4, 0.f);
+        ops::attrs a{{"alpha", 2.0}};
+        return rt.run_op("scale", {{x.data(), {4}}}, a, {y.data(), {4}}) && y == std::vector<float>{2, 4, 6, 8}; };
+    std::string why; std::string path;
+    {
+        auto rt = open(&why, 0);
+        if (!rt) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+        path = rt->kernel_cache_path();
+        if (path.empty()) { std::printf("SKIP: this driver has no program-binary entry points\n"); return 77; }
+        check(!rt->program_from_cache() && works(*rt), "first open builds from source");
+        check(fs::exists(path) && fs::path(path).parent_path() == dir, "the binary is stored under FORGE_CACHE_DIR");
+#if !defined(_WIN32)
+        check((fs::status(path).permissions() & (fs::perms::group_all | fs::perms::others_all)) == fs::perms::none, "the file is owner-only");
+#endif
+    }
+    { auto rt = open(&why, 0); check(rt && rt->program_from_cache() && works(*rt), "second open loads the cached binary"); }
+    auto slurp = [&] { std::ifstream in(path, std::ios::binary); return std::vector<char>((std::istreambuf_iterator<char>(in)), {}); };
+    auto spit = [&](const std::vector<char>& d) { std::ofstream o(path, std::ios::binary | std::ios::trunc); o.write(d.data(), std::streamsize(d.size())); };
+    const auto good = slurp();
+    { auto bad = good; bad.back() = char(bad.back() ^ 0x5a); spit(bad);
+      auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && works(*rt), "a corrupted payload falls back to the source build");
+      check(slurp() == good, "and the file is rewritten"); }
+    { auto bad = good; bad.resize(bad.size() / 2); spit(bad);
+      auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && works(*rt), "a truncated file falls back"); }
+    { auto bad = good; bad[12] = char(bad[12] ^ 1); spit(bad);   // inside the stored key
+      auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && works(*rt), "a file with another key falls back"); }
+    { set_env("MOCK_REJECT_BINARY", "1");
+      auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && works(*rt), "a binary the driver refuses falls back (mock drivers only)");
+      set_env("MOCK_REJECT_BINARY", ""); }
+    { set_env("FORGE_GPU_KERNEL_CACHE", "0"); fs::remove(path, ec);
+      auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && works(*rt) && !fs::exists(path), "FORGE_GPU_KERNEL_CACHE=0 neither reads nor writes");
+      set_env("FORGE_GPU_KERNEL_CACHE", ""); }
+    { auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && fs::exists(path), "re-enabled: written again"); }
+    { set_env("MOCK_DRIVER_VERSION", "7");
+      auto rt = open(&why, 0); check(rt && !rt->program_from_cache() && (std::getenv("MOCK_DEVICES") ? rt->kernel_cache_path() != path : true), "another driver version uses another file (mock drivers only)");
+      set_env("MOCK_DRIVER_VERSION", ""); }
+    fs::remove_all(dir, ec);
+    return fails ? 1 : 0;
+}
+
+// Determinism mode (gpu/determinism.hpp; FORGE_DETERMINISTIC=1 or gpu::set_deterministic): with the mode on no
+// split-K / stream-K / split-over-keys launch is dispatched (even when FORGE_MMA_STREAMK=2 asks for stream-K), repeated
+// runs are bit-identical, the explicit switch wins over the environment, and compiled plans record the mode. With it
+// off the same work takes the order-varying paths where the backend has them.
+template<class RT, class Open> static int determinism_t(Open open) {
+    std::string why; auto rt0 = open(&why, 0);
+    if (!rt0) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    auto rt = std::shared_ptr<RT>(std::move(rt0));
+    const std::string api = rt->backend();
+    auto reg = graph::gpu_registry(rt);
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) { std::printf("%s %s determinism: %s\n", ok ? "ok  " : "FAIL", api.c_str(), what.c_str()); fails += !ok; };
+    auto disp = [&](const char* key) -> std::size_t { auto d = rt->dispatches(); auto it = d.find(key); return it == d.end() ? 0 : it->second; };
+    auto varying = [&] { return disp("qmatmul_mma_splitk") + disp("qmatmul_mma_streamk") + disp("qmatmul_glu_streamk") + disp("attention_dec"); };
+    static std::deque<std::vector<std::uint8_t>> keep;
+    // work: prefill-shaped quantised matmuls (ragged grids: split-K / stream-K candidates) and a decode-shaped attention
+    auto work = [&] {
+        std::vector<float> all;
+        if (reg->device_qgemm) for (auto [cn, rows, cols, k] : {std::tuple<const char*, std::size_t, std::size_t, std::size_t>{"q4_k", 130, 300, 2560}, {"q8_0", 17, 260, 2048}, {"q6_k", 64, 40, 768}}) {
+            const auto* c = graph::codecs::find(cn); const std::size_t rb = c->bytes(k);
+            std::vector<float> wf(cols * k), x(rows * k), y(rows * cols);
+            for (std::size_t i = 0; i < wf.size(); ++i) wf[i] = std::sin(float(i) * 0.731f) * (1.f + float(i % 97) / 50.f);
+            for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f);
+            auto& enc = keep.emplace_back(cols * rb);
+            for (std::size_t j = 0; j < cols; ++j) c->encode(wf.data() + j * k, k, enc.data() + j * rb);
+            tensor_view xv; xv.data = x.data(); xv.shape = {i64(rows), i64(k)};
+            tensor_view wv; wv.shape = {i64(cols), i64(k)}; wv.qdata = enc.data(); wv.qcodec = c;
+            tensor_view o; o.data = y.data(); o.shape = {i64(rows), i64(cols)};
+            std::vector<tensor_view> ins{xv, wv}; reg->device_qgemm->fn(ins, o, {});
+            all.insert(all.end(), y.begin(), y.end());
+        }
+        {
+            const i64 s = 1, t = 300, hq = 8, hk = 2, d = 64;
+            auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.613f + ph); return v; };
+            tensor q({s, hq, d}), k({t, hk, d}), v({t, hk, d}), y({s, hq, d});
+            q.data = rnd(q.data.size(), 1); k.data = rnd(k.data.size(), 2); v.data = rnd(v.data.size(), 3);
+            ops::attrs a{{"causal", 1.0}};
+            if (rt->run_op("attention", {{q.data.data(), q.shape}, {k.data.data(), k.shape}, {v.data.data(), v.shape}}, a, {y.data.data(), y.shape}))
+                all.insert(all.end(), y.data.begin(), y.data.end());
+        }
+        return all; };
+    set_env("FORGE_MMA_STREAMK", "2");   // ask for stream-K on every ragged grid: the mode must still refuse it
+    set_env("FORGE_DETERMINISTIC", "1"); forge::gpu::reset_deterministic();
+    std::size_t v0 = varying();
+    auto a = work(); auto b = work();
+    check(forge::gpu::deterministic() && varying() == v0, "FORGE_DETERMINISTIC=1: no split-K / stream-K / split-over-keys launch");
+    check(!a.empty() && a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0, "two runs are bit-identical");
+    {
+        graph::tensor_graph g; auto xi = g.input("x", {4}); g.output("y", g.apply(ops::op::neg, {xi}));
+        graph::pass_options po; po.lowerings = reg.get(); auto p = graph::compile(std::move(g), nullptr, po);
+        check(p->deterministic && p->describe().find("deterministic") != std::string::npos, "compiled plans record the mode");
+    }
+    forge::gpu::set_deterministic(false);   // the explicit switch wins over the environment
+    v0 = varying(); auto c = work();
+    check(!forge::gpu::deterministic() && varying() > v0, "set_deterministic(false) overrides the environment: the order-varying paths run again");
+    set_env("FORGE_DETERMINISTIC", ""); forge::gpu::set_deterministic(true);
+    v0 = varying(); auto d2 = work();
+    check(varying() == v0 && d2.size() == a.size() && std::memcmp(a.data(), d2.data(), a.size() * 4) == 0, "set_deterministic(true) without the variable: same bits as before");
+    forge::gpu::reset_deterministic(); set_env("FORGE_MMA_STREAMK", "");
+    check(!forge::gpu::deterministic(), "reset_deterministic() follows the (unset) environment again");
+    return fails ? 1 : 0;
+}
+
+// Automatic device selection against a mock driver (MOCK_DEVICES devices): every mock device is enumerated with its
+// kernel families and classified as software, so FORGE_DEVICE=auto stays on the CPU; with software allowed and the
+// backend preferred, auto picks the backend's device 0; an excluded backend is never picked; device_registry("auto")
+// opens what auto_device() named.
+static int select_t(const std::string& api) {
+    using namespace forge;
+    set_env("FORGE_DEVICE_BENCH", "0"); set_env("FORGE_DEVICE_PREFER", ""); set_env("FORGE_DEVICE_EXCLUDE", ""); set_env("FORGE_DEVICE_ALLOW_SOFTWARE", "");
+    const std::string backend = api == "ze" ? "level_zero" : api;
+    auto devs = graph::enumerate_devices(false);
+    int mine = 0, fails = 0; bool all_soft = true, kernels = true;
+    for (auto& d : devs) if (d.backend == backend) { ++mine; all_soft = all_soft && d.cls == gpu::device_class::software;
+        kernels = kernels && d.qcodecs.size() == 4 && d.moe && d.qgather && d.state_ops && d.memory_bytes > 0; }
+    if (!mine) { std::printf("SKIP: no %s device\n", backend.c_str()); return 77; }
+    auto check = [&](bool ok, const std::string& what) { std::printf("%s %s select: %s\n", ok ? "ok  " : "FAIL", backend.c_str(), what.c_str()); fails += !ok; };
+    const int want = std::getenv("MOCK_DEVICES") ? std::atoi(std::getenv("MOCK_DEVICES")) : 1;
+    check(mine == want, "enumerate_devices lists " + std::to_string(mine) + " device(s)");
+    check(all_soft, "mock devices are classified as software");
+    check(kernels, "records carry the kernel families (4 quantised codecs, MoE, gather, state ops) and the memory size");
+    check(devs.front().device == "cpu", "the CPU is a candidate");
+    std::string why;
+    check(graph::auto_device({}, &why) == "cpu", "auto stays on the CPU: software devices never win");
+    check(why.find("skipped, software device") != std::string::npos, "and the table says why");
+    set_env("FORGE_DEVICE_ALLOW_SOFTWARE", "1"); set_env("FORGE_DEVICE_PREFER", backend);
+    check(graph::auto_device({}) == backend + ":0", "allowed and preferred: auto picks " + backend + ":0");
+    { std::string w; auto reg = graph::device_registry("auto", &w); check(reg && reg->hooks, "device_registry(\"auto\") opens it"); }
+    set_env("FORGE_DEVICE_EXCLUDE", backend + ":0");
+    check(want < 2 || graph::auto_device({}) == backend + ":1", "device 0 excluded: auto picks device 1");
+    set_env("FORGE_DEVICE_EXCLUDE", backend);
+    check(graph::auto_device({}) == "cpu" || graph::auto_device({}).rfind(backend, 0) != 0, "the backend excluded: never picked");
+    set_env("FORGE_DEVICE_EXCLUDE", ""); set_env("FORGE_DEVICE_BENCH", "");
+    {   // the micro-benchmark runs and is cached (kernel cache directory)
+        namespace fs = std::filesystem; std::error_code ec;
+        const fs::path dir = fs::temp_directory_path() / ("forge-select-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        set_env("FORGE_CACHE_DIR", dir.string());
+        double a = graph::device_gflops("cpu", "test-cpu", nullptr), b = graph::device_gflops("cpu", "test-cpu", nullptr);
+        check(a > 0 && a == b, "the micro-benchmark is measured once and read back from the cache");
+        fs::remove_all(dir, ec);
+    }
+    set_env("FORGE_DEVICE_PREFER", ""); set_env("FORGE_DEVICE_ALLOW_SOFTWARE", "");
+    return fails ? 1 : 0;
+}
+
 static int bench_qmm(int argc, char** argv) {
     if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip bench <codec> <rows> <cols> <k> [reps] [VAR=a,b,...]\n"); return 2; }
     std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
@@ -776,6 +1044,17 @@ int main(int argc, char** argv) {
         if (w == "ze") return features_t(ze, [] { return forge::gpu::ze::runtime::device_count(); });
         auto a = w == "hip" ? cuda_hip::api::hip : cuda_hip::api::cuda;
         return features_t(cu(a), [a] { return cuda_hip::runtime::device_count(a); });
+    }
+    if (mode == "select") return select_t(argc > 2 ? argv[2] : "cuda");
+    if (mode == "determinism") {
+        std::string w = argc > 2 ? argv[2] : "cuda";
+        if (w == "opencl") return determinism_t<forge::gpu::ocl::runtime>(cl);
+        if (w == "ze") return determinism_t<forge::gpu::ze::runtime>(ze);
+        return determinism_t<cuda_hip::runtime>(cu(w == "hip" ? cuda_hip::api::hip : cuda_hip::api::cuda));
+    }
+    if (mode == "cache") {   // OpenCL program binaries / Level Zero native binaries on disk
+        std::string w = argc > 2 ? argv[2] : "opencl";
+        return w == "ze" ? cache_t(ze) : cache_t(cl);
     }
     if (mode == "memory") {
         std::string w = argc > 2 ? argv[2] : "cuda";

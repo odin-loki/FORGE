@@ -5,6 +5,7 @@
 // Apple GPUs have unified memory: buffers are MTLStorageModeShared, so the residency hooks are no-ops and each
 // op wraps the host views (page-aligned ones without a copy).
 // HARDWARE-UNTESTED: written without a Mac; on Linux only the MSL syntax check (gpu_compile_metal_syntax) runs.
+#include <forge/gpu/select.hpp>
 #include <forge/gpu/cuda.hpp>
 #include <map>
 #include <memory>
@@ -20,6 +21,7 @@ public:
     const char* backend() const { return "metal"; }
     int ordinal() const { return ordinal_; }
     const std::string& device_name() const { return name_; }
+    gpu::device_class device_class() const { return gpu::device_class::integrated; }   // unified memory (gpu/select.hpp)
     const std::string& image_arch() const { static const std::string s = "msl"; return s; }
     bool has_graphs() const { return false; }
     bool has_streams() const { return true; }

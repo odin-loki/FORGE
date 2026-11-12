@@ -25,9 +25,12 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 |----------|-----------|--------|
 | `FORGE_GPU_NO_RESIDENCY` | CUDA, HIP, OpenCL, Level Zero, Metal | If set, tensors are not kept on the device between ops; every op uploads and downloads. Vulkan always keeps tensors resident |
 | `FORGE_GPU_EAGER_SYNC` | CUDA, HIP | If set, every run ends by syncing all resident buffers to the host; turns off the fixed arena and whole-run replay |
-| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP | If set, Gated DeltaNet state ops run on the host instead of the device |
-| `FORGE_GPU_QMATMUL=0` | CUDA, HIP | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
-| `FORGE_GPU_QGATHER=0` | CUDA, HIP | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP, OpenCL, Level Zero | If set, Gated DeltaNet state ops run on the host instead of the device |
+| `FORGE_GPU_QMATMUL=0` | CUDA, HIP, OpenCL, Level Zero | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
+| `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
+| `FORGE_DETERMINISTIC=1` | all devices | Determinism mode: only order-stable device paths (no split-K / stream-K matmul, no split-over-keys decode attention, single-block argmax, fixed CPU chunking). Same device + same build gives bit-identical results; see [gpu.md](gpu.md#determinism-mode). `session_options::deterministic` and `gpu::set_deterministic` override it |
+| `FORGE_GPU_KERNEL_CACHE=0` | OpenCL, Level Zero | Disable the on-disk cache of driver-compiled kernel programs ([gpu.md](gpu.md#kernel-program-cache)) |
 | `FORGE_GPU_WEIGHT_BUDGET` | resident backends | f32 bytes of decoded quantised weights mirrored on the device, e.g. `4G`, `512M` (suffix `k`, `m`, `g`; default 8 GiB). The rest stay encoded and run on the CPU. Codecs with a device quantised matmul stay encoded on the device instead |
 | `FORGE_GPU_ARENA_MB` | CUDA, HIP | Largest activation arena held at fixed device addresses as one buffer, in MiB (default 1024; 0 disables) |
 | `FORGE_GPU_POOL_MB` | CUDA, HIP | MiB of freed device buffers kept for reuse (default 4096) |
@@ -71,7 +74,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
 | `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |
 | `FORGE_VK_PIPELINE_CACHE=0` | Vulkan | Disable the pipeline cache |
-| `FORGE_CACHE_DIR` | Vulkan | Pipeline cache directory (else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge`) |
+| `FORGE_CACHE_DIR` | Vulkan, OpenCL, Level Zero | Directory of the Vulkan pipeline cache and the OpenCL / Level Zero kernel program cache (else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge`). Must not be writable by other users |
 | `FORGE_OPENCL_TYPE` | OpenCL | Devices to enumerate: `gpu`, `cpu` or `all` (default; GPUs listed first) |
 
 ## Sessions and memory
