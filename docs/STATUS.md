@@ -28,11 +28,11 @@ have never run on GitHub, and it now uses clang 23 where the table below says Cl
 | Android, physical device | no | never | — |
 | Linux aarch64 (SVE) | locally, zig cross | under qemu-user only (2026-10-31: 50/54, see changelog) | `qemu-aarch64 -cpu max,sveN=on` |
 | Linux riscv64 (RVV) | locally, zig cross | under qemu-user only (same) | `qemu-riscv64 -cpu rv64,v=true,vlen=N` |
-| Linux loongarch64 (LSX, LASX) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-loongarch64 -cpu la464` |
-| Linux ppc64le (VSX) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-ppc64le -cpu power9`, `power8` |
-| Linux s390x (z14 vector) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
-| wasm32-wasi (SIMD128) | simd layer and `test_simd` only, `tests/wasm_simd.sh` | `test_simd` 7/7 under node 22 (2026-11-12) | zig `wasm32-wasi` |
-| Linux mips64el (MSA) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
+| Linux loongarch64 (LSX, LASX) | locally, zig cross: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-loongarch64 -cpu la464` |
+| Linux ppc64le (VSX) | locally, zig cross and g++ 13: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-ppc64le -cpu power9`, `power8` |
+| Linux s390x (z14 vector) | locally, zig cross and g++ 13: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
+| wasm32-wasi (SIMD128) | simd layer and its tests only, `tests/wasm_simd.sh` | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14 (one test per process), `vec_types` checks under node 22 (2026-11-12) | zig `wasm32-wasi` |
+| Linux mips64el (MSA) | locally, zig cross: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
 | 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: i386 7/7, arm 5/7 with the opt-in `neon` table, 7/7 without it (2026-11-12) | `qemu-i386`, `qemu-arm -cpu cortex-a7` |
 | Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
@@ -144,6 +144,39 @@ Sanitizers on this day: after the last merge, clang 23 `-DFORGE_SANITIZE=ON` (AS
 
 Environment notes for reproducing the run: Python packages numpy, safetensors, onnx, cryptography, gguf, tokenizers,
 sentencepiece; `llvm-spirv` absent; shells found for the script emit goldens: sh, bash, zsh, dash, ash, ksh, mksh, yash, posh, fish, tcsh, csh, xonsh, elvish, rc.
+
+### 2026-11-12 (simd: companion tables and element types on every ISA; std interop; CPU fusions; engine on the scheduler)
+One machine, as above: Linux x86_64, 4 cores shared with other jobs, clang 23. Everything for other architectures
+ran under qemu-user 8.2 or node 22 only; nothing ran on real non-x86 hardware and nothing was through CI.
+- **Tier A, `seq` and int8 tables for every Tier P backend** (`simd/src/isa_extra.cpp`, `qi8_gn.inc`). x86_64 natively:
+  `test_simd_tables` 3/3 (tables `avx512 avx2 sse4.2 sse2 scalar`; int8 `avx512vnni avxvnni avx2 sse4.2 sse2`),
+  `test_simd_tiera` 14/14, `test_graph` with the extended table lists. Emulated, per CPU model, `test_simd_tables` 3/3
+  and `test_simd_tiera` 14/14: AArch64 (g++ 13) `cortex-a57`, `max,sve=off`, SVE at 128 / 256 / 384 / 512 / 640 / 1024
+  / 1536 / 2048 bits; riscv64 (zig 0.17) VLEN 128 / 256 / 512 / 1024; loongarch64 `la464` (`lasx`, `lsx`); ppc64le
+  `power9`; s390x `max`; mips64el `Loongson-3A4000`; wasm32 under node (Tier A one test per process: node segfaults on
+  the whole binary). The int8 reference hash of fixed blocks equals x86's on every little-endian target; s390x is
+  only compared with its own scalar reference. No timing anywhere; the new int8 tables are off by default.
+- **`vec_types.hpp`** (`vec<T>` for double and the integers): about 25.5 million checks per register width, exhaustive
+  for 8-bit binary and 16-bit unary operations. 0 failed: x86 `scalar`, `emulated`, `sse2`, `sse4.2`, `avx2`, `avx512`
+  natively; `neon`, `sve` 128 / 256 / 512 / 1024, `rvv` 128 / 256 / 512 / 1024, `lsx`, `lasx`, `vsx`, `vxe`, `msa`, `simd128`
+  under emulation. Known: on loongarch64 with zig 0.17 the portable-array path (`emulated_t`, unused there) has 46,976
+  differing checks from a compiler defect, reported by the test without failing it. Compiler defects worked around:
+  MSA double `fma` / `abs`, LASX half-precision conversion (`tools/repro_llvm_vector_codegen.cpp`). MSVC is untested
+  and uses the portable arrays.
+- **`interop.hpp`**: `std::experimental::simd` conversions compiled and run with libstdc++ 13 (x86_64, and AArch64 under
+  qemu); `std::mdspan` overloads compiled and run with libc++ 23 (`test_simd_std_libcxx`) and with zig's libc++ on
+  s390x and riscv64 under qemu. C++26 `std::simd`: nothing (no library has it here). libstdc++ 15's `<mdspan>`: not tried.
+- **CPU fusions** (`fuse_cpu.hpp`, `passes.hpp`; [graph.md](graph.md#fusion)): row chains and shared int8 activations
+  bit-identical to the unfused plans on 60 random graphs / 27 quantised cases; conv + batch_norm folding within
+  2.8e-7 of the largest output over 24 random cases (stated bound 2e-5). x86_64 only. Host plans only: device plans
+  and `pipe:` stages are untouched. No model-level timing of the fusions was made.
+- **Engine on `task::scheduler`** (`FORGE_TASK_SCHEDULER=sched`): `test_engine` and `test_graph`, `test_inference`,
+  `test_kvquant`, `test_sessions`, `test_aot` pass under both executors; identical token ids from `forge run` on the
+  wide and deep synthetic models. `forge bench` (9 interleaved runs, loaded machine): wide prefill 1472 (pool) vs 1458
+  (sched) tok/s, wide decode 678 vs 418, deep prefill 28260 vs 13800, deep decode 5719 vs 2197. `pool` stays the default.
+- Not done: Tier A's hand-written byte search / partition for non-x86 ISAs (they use the 8-byte integer path or the
+  compiler); a fused GEMM epilogue; rope + attention fusion; 32-bit x86 / Arm companions; any of this on MSVC, GCC 14,
+  Apple clang, NDK, FreeBSD.
 
 ### 2026-11-12 (simd tables for more architectures; emulation only)
 New Tier P backend `vec_gn.hpp` and kernel tables `sse2`, `sse4.2`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` and

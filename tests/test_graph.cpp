@@ -405,8 +405,8 @@ TEST(attn_cpu_chunked_long_context) {
         CHECK_MSG(err < 2e-5, "attn_cpu err %g", err);
         // every kernel table gives the same bits
         const auto* ref = simd::seq_by_name("scalar");
-        for (const char* tg : {"avx2", "avx512"}) {
-            const auto* k = simd::seq_by_name(tg); if (!k) continue;
+        for (const char* tg : simd::target_names()) {
+            const auto* k = simd::seq_by_name(tg); if (!k || k == ref) continue;
             std::size_t ns = hq / hk;
             std::vector<const float*> qp; std::vector<std::size_t> lo(ns, 0), hi(ns, t);
             for (std::size_t h = 0; h < ns; ++h) qp.push_back(q.data() + h * d);
@@ -483,8 +483,8 @@ TEST(attn_cpu_int16_query) {
             }
             CHECK_MSG(std::fabs(m1[h] - best) <= bound * 1.001 + 1e-5 * (1 + std::fabs(best)), "q16 chunk max %g vs %g (bound %g)", m1[h], best, bound);
         }
-        for (const char* tg : {"avx2", "avx512"}) {
-            const auto* k = simd::seq_by_name(tg); if (!k) continue;
+        for (const char* tg : simd::target_names()) {
+            const auto* k = simd::seq_by_name(tg); if (!k || k == ref) continue;
             std::vector<float> sc2(k->attn_scratch(ns, d, dv));
             k->attn_chunk_q16(K, V, d, dv, sc, c0, c1, ns, qp.data(), lo.data(), hi.data(), m2.data(), l2.data(), a2.data(), sc2.data());
             CHECK_MSG(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0, "q16 %s differs from scalar (d %zu)", tg, d);
@@ -592,7 +592,7 @@ TEST(qdot_matches_decode_exactly) {
 // Integer matvec (simd/qdot_i8.hpp): every ISA table this machine runs gives the scalar reference's bits, for
 // quantisation and products, and a vector's result does not depend on how many vectors ran with it. The
 // result stays close to the f32 product of the decoded weights (int8 activations: ~0.5% of sum |x*w|).
-static const char* const qi8_targets[] = {"scalar", "avx2", "avxvnni", "avx512vnni", "neon", "dotprod", "sve"};
+static const char* const qi8_targets[] = {"scalar", "avx2", "avxvnni", "avx512vnni", "sse4.2", "sse2", "neon", "dotprod", "sve", "rvv", "lasx", "lsx", "vsx", "vxe", "simd128", "msa"};
 // FNV-1a of the scalar reference results on fixed raw blocks and fixed activations: one value for every platform.
 static constexpr std::uint64_t QI8_REF_HASH = 0xc763b823f7512501ull;
 TEST(qdot_i8_matches_reference_on_every_isa) {
@@ -802,4 +802,229 @@ TEST(resident_backend_quantised_weight_budget) {
     // the encoded CPU path quantises activations to int8 (simd/qdot_i8.hpp) unless FORGE_CPU_INT8=0
     auto cmp = verify::compare(y0, y1, {ops::tol_kind::rel, qweights::int8_enabled() ? 1e-2 : 1e-4});
     CHECK_MSG(cmp.ok, "%s", cmp.message.c_str());
+}
+
+// ---------------------------------------------------------------- CPU fusions (passes.hpp fold_conv_bn, fuse_cpu.hpp)
+namespace {
+pass_options fusion_off() { pass_options o; o.fold_conv_bn = false; o.fuse_chain = false; o.fuse_qact = false; return o; }
+pass_options fusion_on() { pass_options o; o.chain_min_elems = 1; return o; }
+bool same_bits(const tensor& a, const tensor& b) { return a.shape == b.shape && std::memcmp(a.data.data(), b.data.data(), a.data.size() * 4) == 0; }
+}
+
+// The row-vector forms of add / sub / mul, relu and scale are only reached with shapes the oracle's random cases
+// may not produce, so they are compared with the reference here: one float operation per element, same bits.
+TEST(row_vector_lowerings_match_reference_bits) {
+    std::mt19937 r(41);
+    auto& reg = registry::cpu();
+    for (auto [rows, n] : std::vector<std::pair<i64, i64>>{{1, 5}, {7, 33}, {64, 128}, {3, 1000}}) {
+        auto X = verify::random_tensor({rows, n}, r, -3, 3), V = verify::random_tensor({n}, r, -2, 2), V2 = verify::random_tensor({1, n}, r, -2, 2);
+        X.data[0] = -0.f; X.data[1] = std::numeric_limits<float>::quiet_NaN(); X.data[2] = std::numeric_limits<float>::infinity();
+        for (ops::op o : {ops::op::add, ops::op::sub, ops::op::mul})
+            for (int side = 0; side < 2; ++side)
+                for (const tensor* v : {&V, &V2}) {
+                    if (rows == 1 && v == &V2) continue;   // [1, n] against [1, n]: the same-shape lowering
+                    std::vector<tensor> in = side ? std::vector<tensor>{*v, X} : std::vector<tensor>{X, *v};
+                    std::vector<shape_t> ss{in[0].shape, in[1].shape};
+                    auto ref = ops::reference(o)(in, {});
+                    const lowering& l = reg.select(o, ss, ref.shape, {});
+                    if (rows > 1) CHECK_MSG(l.name.rfind("lane.", 0) == 0 && l.name.find("_row") != std::string::npos, "%s picked for a row-vector %s", l.name.c_str(), std::string(ops::info(o).name).c_str());
+                    tensor out(ref.shape, 7.f);
+                    std::vector<tensor_view> vs{in[0].view(), in[1].view()};
+                    l.fn(vs, out.view(), {});
+                    for (std::size_t i = 0; i < out.size(); ++i)
+                        CHECK_MSG(std::memcmp(&out.data[i], &ref.data[i], 4) == 0 || (out.data[i] != out.data[i] && ref.data[i] != ref.data[i]), "%s %s [%zu]", l.name.c_str(), std::string(ops::info(o).name).c_str(), i);
+                }
+        for (ops::op o : {ops::op::relu, ops::op::scale}) {
+            ops::attrs a; if (o == ops::op::scale) a.set("alpha", 0.3);
+            auto ref = ops::reference(o)({X}, a);
+            const lowering& l = reg.select(o, std::vector<shape_t>{X.shape}, ref.shape, a);
+            CHECK_MSG(l.name == (o == ops::op::relu ? "cpu.relu" : "cpu.scale"), "%s", l.name.c_str());
+            tensor out(ref.shape, 7.f);
+            std::vector<tensor_view> vs{X.view()};
+            l.fn(vs, out.view(), a);
+            for (std::size_t i = 0; i < out.size(); ++i)
+                CHECK_MSG(std::memcmp(&out.data[i], &ref.data[i], 4) == 0 || (out.data[i] != out.data[i] && ref.data[i] != ref.data[i]), "%s [%zu]: %g vs %g", l.name.c_str(), i, double(out.data[i]), double(ref.data[i]));
+        }
+    }
+}
+
+// Random graphs of row-local ops (elementwise with and without a SIMD lowering, bias adds, per-row scales,
+// rms_norm, layer_norm, a matmul_t in front, intermediates with several users): the plan with row chains gives
+// the bits of the plan without, and the result agrees with the unoptimised reference pipeline.
+TEST(fusion_row_chains_are_bit_identical) {
+    std::mt19937 r(2026);
+    const ops::op un[] = {ops::op::exp, ops::op::tanh, ops::op::sigmoid, ops::op::silu, ops::op::gelu, ops::op::gelu_tanh, ops::op::relu,
+                          ops::op::neg, ops::op::abs, ops::op::square, ops::op::quick_gelu, ops::op::erf, ops::op::softplus};
+    const ops::op bin[] = {ops::op::add, ops::op::mul, ops::op::sub, ops::op::maximum, ops::op::silu_mul};
+    std::size_t chains = 0, chained_steps = 0, plans_with = 0;
+    for (int trial = 0; trial < 60; ++trial) {
+        const i64 rows = std::array<i64, 5>{1, 3, 17, 64, 300}[r() % 5], k = std::array<i64, 3>{24, 64, 96}[r() % 3], n = std::array<i64, 4>{1, 8, 37, 128}[r() % 4];
+        std::vector<std::unique_ptr<tensor>> keep;   // weights live as long as the plans
+        auto weight = [&](tensor_graph& g, const std::string& name, shape_t s, float lo, float hi) {
+            keep.push_back(std::make_unique<tensor>(verify::random_tensor(s, r, lo, hi)));
+            return g.weight(name, s, keep.back()->data.data());
+        };
+        tensor_graph g;
+        auto x = g.input("x", {rows, k}), y = g.input("y", {rows, n});
+        std::vector<value_id> vals;
+        vals.push_back(g.apply(ops::op::matmul_t, {x, weight(g, "W", {n, k}, -0.3f, 0.3f)}));   // the head of an epilogue
+        vals.push_back(y);
+        const int len = 4 + int(r() % 10);
+        for (int i = 0; i < len; ++i) {
+            const value_id prev = vals.back();
+            value_id v;
+            switch (r() % 8) {
+                case 0: case 1: v = g.apply(un[r() % std::size(un)], {prev}); break;
+                case 2: v = g.apply(bin[r() % std::size(bin)], {prev, vals[r() % vals.size()]}); break;      // another whole tensor (or itself)
+                case 3: v = g.apply(ops::op::add, {prev, weight(g, "b" + std::to_string(i), {n}, -1, 1)}); break;   // a bias
+                case 4: v = g.apply(r() % 2 ? ops::op::mul : ops::op::sub, {weight(g, "s" + std::to_string(i), r() % 2 ? shape_t{n} : shape_t{1, n}, 0.5f, 1.5f), prev}); break;
+                case 5: v = g.apply(ops::op::rms_norm, {prev, weight(g, "g" + std::to_string(i), {n}, 0.5f, 1.5f)}, {{"eps", 1e-5}}); break;
+                case 6: v = n > 1 ? g.apply(ops::op::layer_norm, {prev, weight(g, "lw" + std::to_string(i), {n}, 0.5f, 1.5f), weight(g, "lb" + std::to_string(i), {n}, -0.5f, 0.5f)}, {{"eps", 1e-5}})
+                                  : g.apply(ops::op::scale, {prev}, {{"alpha", 0.75}}); break;
+                default: v = g.apply(ops::op::mul, {prev, g.scalar(0.5f)}); break;                             // a scalar operand
+            }
+            if (r() % 3 == 0) v = g.apply(ops::op::tanh, {v});   // keep values bounded
+            vals.push_back(v);
+        }
+        g.output("o", vals.back());
+        g.output("mid", vals[2 + r() % (vals.size() - 2)]);   // an intermediate with a second user
+        auto X = verify::random_tensor({rows, k}, r, -1, 1), Y = verify::random_tensor({rows, n}, r, -1, 1);
+        auto fused = compile(g, nullptr, fusion_on()), plain = compile(g, nullptr, fusion_off());
+        CHECK(plain->chains.empty());
+        CHECK(fused->steps.size() == plain->steps.size());   // the step list itself is unchanged
+        for (std::size_t i = 0; i < fused->steps.size(); ++i) CHECK(fused->steps[i].low == plain->steps[i].low && fused->steps[i].out == plain->steps[i].out);
+        chains += fused->chains.size(); plans_with += !fused->chains.empty();
+        for (auto& c : fused->chains) { chained_steps += c.count; CHECK(c.count >= 2 && c.units * c.unit == std::size_t(rows * n)); }
+        executor ef(*fused), ep(*plain);
+        for (int run = 0; run < 2; ++run) {   // a second run over the same plan (buffers reused)
+            if (run) for (auto& v : X.data) v = -v;
+            ef.set_input("x", X.data); ef.set_input("y", Y.data); ep.set_input("x", X.data); ep.set_input("y", Y.data);
+            ef.run(); ep.run();
+            CHECK_MSG(same_bits(ef.output("o"), ep.output("o")) && same_bits(ef.output("mid"), ep.output("mid")), "trial %d run %d: fused chain differs from the unfused plan\n%s%s", trial, run,
+                      fused->describe().c_str(), to_string(fused->g).c_str());
+        }
+        auto ref = compile(g, nullptr, {false, false, false, false});
+        executor er(*ref); er.set_input("x", X.data); er.set_input("y", Y.data); er.run();
+        CHECK(same_bits(er.output("o"), ep.output("o")));     // the passes themselves change nothing here either
+    }
+    std::printf("  %zu chains over %zu steps in %zu of 60 random plans\n", chains, chained_steps, plans_with);
+    CHECK(plans_with >= 50 && chained_steps >= 300);
+    // the switches: the environment variable, the option, and the size threshold
+    tensor_graph g; auto x = g.input("x", {8, 16});
+    g.output("y", g.apply(ops::op::tanh, {g.apply(ops::op::exp, {g.apply(ops::op::neg, {x})})}));
+    CHECK(compile(g, nullptr, fusion_on())->chains.size() == 1);
+    CHECK(compile(g)->chains.empty());                         // 128 elements: below the default threshold
+    forge_test::set_env("FORGE_FUSE_CHAIN", "0"); CHECK(compile(g, nullptr, fusion_on())->chains.empty());
+    forge_test::set_env("FORGE_FUSE_CHAIN", nullptr);
+    forge_test::set_env("FORGE_FUSE", "0"); CHECK(compile(g, nullptr, fusion_on())->chains.empty());
+    forge_test::set_env("FORGE_FUSE", nullptr);
+    CHECK(compile(g, nullptr, fusion_on())->describe().find("row chain") != std::string::npos);
+}
+
+// One activation feeding several quantised matmul_t steps is quantised to int8 once per run; the products keep
+// the unfused bits, also on a second run with other data and when m changes between plans.
+TEST(fusion_shared_int8_activations) {
+    if (!qweights::int8_enabled()) { std::printf("  integer matmul path is off here (FORGE_CPU_INT8): nothing to share\n"); return; }
+    std::mt19937 r(8);
+    for (const char* cn : {"q4_k", "q8_0", "q6_k"}) {
+        const auto* c = codecs::find(cn);
+        for (i64 m : {i64(1), i64(5), i64(40)}) {
+            const i64 k = 512, n1 = 48, n2 = 80;
+            auto mk = [&](i64 n) { auto W = verify::random_tensor({n, k}, r, -1, 1); std::vector<u8> e(std::size_t(n) * c->bytes(std::size_t(k)));
+                                   for (i64 j = 0; j < n; ++j) c->encode(W.data.data() + j * k, std::size_t(k), e.data() + std::size_t(j) * c->bytes(std::size_t(k))); return e; };
+            auto e1 = mk(n1), e2 = mk(n2), e3 = mk(n1);
+            auto gw = verify::random_tensor({k}, r, 0.5f, 1.5f);
+            tensor_graph g;
+            auto x = g.input("x", {m, k});
+            auto h = g.apply(ops::op::rms_norm, {x, g.weight("g", {k}, gw.data.data())}, {{"eps", 1e-6}});
+            g.output("q", g.apply(ops::op::matmul_t, {h, g.qweight("wq", {n1, k}, e1.data(), cn)}));
+            g.output("k", g.apply(ops::op::matmul_t, {h, g.qweight("wk", {n2, k}, e2.data(), cn)}));
+            g.output("v", g.apply(ops::op::matmul_t, {h, g.qweight("wv", {n1, k}, e3.data(), cn)}));
+            g.output("other", g.apply(ops::op::matmul_t, {x, g.qweight("wo", {n1, k}, e1.data(), cn)}));   // another activation: not shared
+            auto fused = compile(g, nullptr, fusion_on()), plain = compile(g, nullptr, fusion_off());
+            CHECK(fused->qacts.size() == 1 && plain->qacts.empty());
+            int marked = 0; for (auto& s : fused->steps) marked += s.qact >= 0;
+            CHECK(marked == 3);
+            executor ef(*fused), ep(*plain);
+            for (int run = 0; run < 3; ++run) {
+                auto X = verify::random_tensor({m, k}, r, -2, 2);
+                ef.set_input("x", X.data); ep.set_input("x", X.data); ef.run(); ep.run();
+                for (const char* o : {"q", "k", "v", "other"}) CHECK_MSG(same_bits(ef.output(o), ep.output(o)), "%s m=%lld run %d output %s", cn, static_cast<long long>(m), run, o);
+            }
+        }
+    }
+    tensor_graph g; auto c = codecs::find("q8_0"); std::vector<u8> e(8 * c->bytes(64));
+    auto x = g.input("x", {2, 64});
+    g.output("a", g.apply(ops::op::matmul_t, {x, g.qweight("w1", {8, 64}, e.data(), "q8_0")}));
+    g.output("b", g.apply(ops::op::matmul_t, {x, g.qweight("w2", {8, 64}, e.data(), "q8_0")}));
+    forge_test::set_env("FORGE_FUSE_QACT", "0"); CHECK(compile(g)->qacts.empty());
+    forge_test::set_env("FORGE_FUSE_QACT", nullptr); CHECK(compile(g)->qacts.size() == 1);
+}
+
+// batch_norm after a convolution with constant parameters is folded into the convolution's weights. Stated
+// tolerance: 2e-5 of the largest output against the unfolded graph (not bit-identical: W * s is rounded once
+// before the products are summed); the folded graph must also stay inside the convolution's oracle tolerance.
+TEST(fusion_conv_bn_folds) {
+    std::mt19937 r(31);
+    double worst = 0;
+    for (int trial = 0; trial < 24; ++trial) {
+        const bool d1 = trial % 4 == 3;                                    // conv1d
+        const i64 C = std::array<i64, 3>{3, 4, 8}[r() % 3], O = std::array<i64, 3>{4, 8, 12}[r() % 3], groups = (trial % 5 == 4 && C % 4 == 0 && O % 4 == 0) ? 4 : 1;
+        const i64 H = 9 + i64(r() % 6), Wd = 7 + i64(r() % 6), kh = 1 + i64(r() % 3), kw = 1 + i64(r() % 3);
+        auto X = d1 ? verify::random_tensor({C, H}, r, -1, 1) : verify::random_tensor({C, H, Wd}, r, -1, 1);
+        auto W = d1 ? verify::random_tensor({O, C / groups, kh}, r, -0.5f, 0.5f) : verify::random_tensor({O, C / groups, kh, kw}, r, -0.5f, 0.5f);
+        auto B = verify::random_tensor({trial % 3 == 0 ? i64(1) : O}, r, -0.5f, 0.5f);
+        auto gw = verify::random_tensor({O}, r, 0.5f, 2.f), gb = verify::random_tensor({O}, r, -1, 1), mu = verify::random_tensor({O}, r, -1, 1), var = verify::random_tensor({O}, r, 0.1f, 3.f);
+        tensor_graph g;
+        auto x = g.input("x", X.shape);
+        ops::attrs ca; ca.set("stride", double(1 + trial % 2)); ca.set("pad", double(trial % 3 == 1)); ca.set("groups", double(groups));
+        auto wv = trial % 2 ? g.weight("W", W.shape, W.data.data()) : g.constant(W);
+        auto cv = g.apply(d1 ? ops::op::conv1d : ops::op::conv2d, {x, wv, g.weight("B", B.shape, B.data.data())}, ca);
+        auto bn = g.apply(ops::op::batch_norm, {cv, g.weight("gw", {O}, gw.data.data()), g.weight("gb", {O}, gb.data.data()), g.weight("mu", {O}, mu.data.data()), g.weight("var", {O}, var.data.data())}, {{"eps", 1e-5}});
+        g.output("y", g.apply(ops::op::relu, {bn}));
+        auto folded = compile(g, nullptr, fusion_on()), plain = compile(g, nullptr, fusion_off());
+        int bn_f = 0, bn_p = 0;
+        for (auto& n : folded->g.nodes()) bn_f += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+        for (auto& n : plain->g.nodes()) bn_p += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+        CHECK(bn_f == 0 && bn_p == 1);
+        executor ef(*folded), ep(*plain);
+        ef.set_input("x", X.data); ep.set_input("x", X.data); ef.run(); ep.run();
+        auto a = ef.output("y"), b = ep.output("y");
+        CHECK(a.shape == b.shape);
+        double mx = 0, df = 0;
+        for (std::size_t i = 0; i < a.size(); ++i) { mx = std::max(mx, double(std::fabs(b.data[i]))); df = std::max(df, double(std::fabs(a.data[i] - b.data[i]))); }
+        worst = std::max(worst, df / std::max(mx, 1e-30));
+        CHECK_MSG(df <= 2e-5 * mx + 1e-7, "trial %d: folded conv + batch_norm differs by %g (largest output %g)", trial, df, mx);
+        // and against the float64 reference of the two ops
+        auto ref = ops::reference(ops::op::relu)({ops::reference(ops::op::batch_norm)({ops::reference(d1 ? ops::op::conv1d : ops::op::conv2d)({X, W, B}, ca), gw, gb, mu, var}, {{"eps", 1e-5}})}, {});
+        auto cmp = verify::compare(a, ref, {ops::tol_kind::rel, 1e-4});
+        CHECK_MSG(cmp.ok, "trial %d: %s", trial, cmp.message.c_str());
+    }
+    std::printf("  conv + batch_norm folding: largest difference from the unfolded graph %.2e of the largest output (stated bound 2e-5)\n", worst);
+    // not folded: the convolution has a second user, or a parameter is not constant
+    std::mt19937 r2(5);
+    auto W = verify::random_tensor({4, 3, 3, 3}, r2, -1, 1), B = verify::random_tensor({4}, r2, -1, 1), P = verify::random_tensor({4}, r2, 0.5f, 1.5f);
+    tensor_graph g; auto x = g.input("x", {3, 8, 8});
+    auto cv = g.apply(ops::op::conv2d, {x, g.weight("W", W.shape, W.data.data()), g.weight("B", B.shape, B.data.data())});
+    auto pw = g.weight("p", {4}, P.data.data());
+    g.output("y", g.apply(ops::op::batch_norm, {cv, pw, pw, pw, pw}));
+    g.output("c", cv);
+    int bn = 0; for (auto& n : compile(g, nullptr, fusion_on())->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    CHECK(bn == 1);
+    tensor_graph g2; auto x2 = g2.input("x", {3, 8, 8}); auto var_in = g2.input("var", {4});
+    auto cv2 = g2.apply(ops::op::conv2d, {x2, g2.weight("W", W.shape, W.data.data()), g2.weight("B", B.shape, B.data.data())});
+    auto pw2 = g2.weight("p", {4}, P.data.data());
+    g2.output("y", g2.apply(ops::op::batch_norm, {cv2, pw2, pw2, pw2, var_in}));
+    bn = 0; for (auto& n : compile(g2, nullptr, fusion_on())->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    CHECK(bn == 1);
+    forge_test::set_env("FORGE_FUSE_CONV_BN", "0");
+    tensor_graph g3; auto x3 = g3.input("x", {3, 8, 8});
+    auto cv3 = g3.apply(ops::op::conv2d, {x3, g3.weight("W", W.shape, W.data.data()), g3.weight("B", B.shape, B.data.data())});
+    auto pw3 = g3.weight("p", {4}, P.data.data());
+    g3.output("y", g3.apply(ops::op::batch_norm, {cv3, pw3, pw3, pw3, pw3}));
+    bn = 0; for (auto& n : compile(g3)->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    CHECK(bn == 1);
+    forge_test::set_env("FORGE_FUSE_CONV_BN", nullptr);
+    bn = 0; for (auto& n : compile(g3)->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    CHECK(bn == 0);
 }
