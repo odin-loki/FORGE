@@ -11,17 +11,28 @@
 //   calls) the seccomp filter alone applies; sandbox_status() says which mechanisms are active.
 //   run_sandboxed() uses Landlock to apply deny_exec to the target itself: EXECUTE is allowed only on the target
 //   binary, its #! interpreter and its ELF interpreter (ld.so), and Landlock rules survive execve, so the target
-//   starts but cannot start anything else (except by running a program through ld.so explicitly).
+//   starts but cannot start anything else. On top of that (and instead of it where Landlock is missing),
+//   run_sandboxed() puts a seccomp user-notification gate on execve/execveat (Linux 5.5+): the parent lets exactly
+//   one exec through, the one that starts the target, and answers EPERM to every later one, including
+//   `ld.so prog`, which Landlock alone cannot stop. sandbox_exec_gate() says whether the kernel offers it.
 //   FreeBSD: Capsicum cap_enter() (capability mode: no global namespaces at all; coarser than requested).
 //   run_sandboxed() there opens the binary, the run-time linker and the library directories first and starts
 //   the target with fexecve of ld-elf.so.1 -f <fd> (LD_LIBRARY_PATH_FDS), since capability mode allows no
 //   lookups by path: the target runs, but only on descriptors it inherited (no files, no network, no exec).
-//   OpenBSD (bonus): pledge().  macOS: sandbox_init named profiles (no-network / no-write / pure-computation);
+//   OpenBSD (bonus): pledge().  macOS: sandbox_init with a Seatbelt profile built from the policy ((allow default),
+//   then deny network* / file-write* / process-exec* as asked; AF_UNIX and /dev/null stay usable, as on Linux);
+//   run_sandboxed() allows process-exec on the target's own file (and its #! interpreter) only, so the target
+//   starts and nothing else does. If the profile is refused the named profiles (no-internet / no-write /
+//   pure-computation) are the fallback for apply_sandbox; run_sandboxed() with deny_exec then exits 126.
 //   App Sandbox is detected from APP_SANDBOX_CONTAINER_ID.  iOS: apps are always sandboxed; apply() reports that.
-//   Windows: the current process joins a job object (ActiveProcessLimit=1 blocks child processes; network and
-//   filesystem denial cannot be added to a running process, so run_sandboxed() starts children in an
-//   AppContainer (no network capability unless allowed; writes only to the container folder) inside a
-//   kill-on-close job with UI limits, or, for an exec-only policy, with a restricted token in the job).
+//   Windows: deny_exec: the current process joins a job object (ActiveProcessLimit=1 blocks child processes), or,
+//   where it cannot join one, sets the child-process mitigation policy (Windows 10 1709+). deny_fs_write: the
+//   process lowers its own token to low integrity (irreversible): the mandatory no-write-up rule then refuses
+//   writes to every file and key that is not labelled low (the user's files, the registry, %TEMP%); what stays
+//   writable is %LOCALAPPDATA%Low, volumes without ACLs (FAT / exFAT) and handles opened earlier. deny_network
+//   cannot be added to a running process (WFP filters need an administrator), so run_sandboxed() starts children in
+//   an AppContainer (no network capability unless allowed; writes only to the container folder) inside a
+//   kill-on-close job with UI limits, or, for an exec-only policy, with a restricted token in the job.
 //   process_pool starts its workers in the same AppContainer profiles (detail::create_in_appcontainer), and
 //   apply_sandbox() inside such a process accepts net/fs denial the token already enforces.
 #include <forge/os/detail.hpp>
@@ -41,6 +52,7 @@
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
+#include <sys/ioctl.h>
 #include <elf.h>
 #include <stddef.h>
 #include <atomic>
@@ -162,6 +174,49 @@ inline void exec_chain(const std::string& path, std::vector<std::string>& out, i
     ::close(f);
 }
 }
+#elif defined(FORGE_OS_MACOS)
+// Seatbelt (sandbox_init with a profile string, flags = 0). (allow default) keeps everything the policy does not
+// name; later rules win, so each deny is followed by the exceptions that keep parity with the Linux filter:
+// AF_UNIX sockets under deny_network, the null / tty devices under deny_fs_write, and under deny_exec the files
+// in `exec_ok` (run_sandboxed: the target and its #! interpreter).
+namespace detail::sb {
+inline std::string quote(const std::string& s) {
+    std::string o = "\"";
+    for (char c : s) { if (c == '"' || c == '\\') o += '\\'; o += c; }
+    return o + "\"";
+}
+inline std::string profile(const sandbox_policy& p, const std::vector<std::string>& exec_ok, bool unix_sockets = true) {
+    std::string s = "(version 1)\n(allow default)\n";
+    if (p.deny_network) {
+        s += "(deny network*)\n";
+        if (unix_sockets) s += "(allow network* (remote unix-socket))\n(allow network* (local unix-socket))\n";
+    }
+    if (p.deny_fs_write)
+        s += "(deny file-write*)\n(allow file-write* (literal \"/dev/null\") (literal \"/dev/zero\") (literal \"/dev/tty\") (literal \"/dev/dtracehelper\"))\n";
+    if (p.deny_exec) {
+        s += "(deny process-exec*)\n";
+        for (auto& e : exec_ok) s += "(allow process-exec* (literal " + quote(e) + "))\n";
+    }
+    return s;
+}
+using init_fn = int (*)(const char*, std::uint64_t, char**);
+inline init_fn init() { return reinterpret_cast<init_fn>(::dlsym(RTLD_DEFAULT, "sandbox_init")); }
+// The target's file as the kernel names it (symlinks resolved: /tmp is /private/tmp) plus the path as given, and
+// the same for a #! interpreter.
+inline void exec_chain(const std::string& path, std::vector<std::string>& out, int depth = 0) {
+    if (depth > 4 || path.empty()) return;
+    out.push_back(path);
+    char real[PATH_MAX]; if (::realpath(path.c_str(), real) && path != real) out.push_back(real);
+    int f = ::open(path.c_str(), O_RDONLY | O_CLOEXEC); if (f < 0) return;
+    char head[256] = {}; ssize_t n = ::pread(f, head, sizeof head - 1, 0); ::close(f);
+    if (n > 2 && head[0] == '#' && head[1] == '!') {
+        std::string s(head + 2, std::size_t(n - 2)); s = s.substr(0, s.find('\n'));
+        auto b = s.find_first_not_of(" \t"); if (b != std::string::npos) s = s.substr(b);
+        s = s.substr(0, s.find_first_of(" \t"));
+        exec_chain(s, out, depth + 1);
+    }
+}
+}
 #elif defined(FORGE_OS_WINDOWS)
 namespace detail::wsbx {
 // True when this process runs in an AppContainer; *net: it holds a network capability (internetClient,
@@ -225,6 +280,40 @@ inline error grant_read_execute(const std::wstring& path, PSID sid) {
         if (nd) LocalFree(nd);
     }
     LocalFree(sd); return r;
+}
+// The integrity level RID of this process's token (SECURITY_MANDATORY_*_RID), or -1.
+inline long integrity_rid() {
+    HANDLE t = nullptr; if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return -1;
+    DWORD len = 0; GetTokenInformation(t, TokenIntegrityLevel, nullptr, 0, &len);
+    std::vector<unsigned char> b(len ? len : 1); long rid = -1;
+    if (len && GetTokenInformation(t, TokenIntegrityLevel, b.data(), len, &len)) {
+        PSID s = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(b.data())->Label.Sid;
+        rid = long(*GetSidSubAuthority(s, DWORD(*GetSidSubAuthorityCount(s) - 1)));
+    }
+    CloseHandle(t); return rid;
+}
+// Lower this process to low integrity (a process may always lower its own level; it can never raise it again).
+// Mandatory integrity control then refuses write access to every securable object labelled medium or higher,
+// which is everything that carries no explicit low label.
+inline error lower_integrity() {
+    const long cur = integrity_rid();
+    if (cur >= 0 && cur <= long(SECURITY_MANDATORY_LOW_RID)) return {};
+    HANDLE t = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_DEFAULT | TOKEN_QUERY, &t)) return last_error("OpenProcessToken");
+    SID_IDENTIFIER_AUTHORITY auth = SECURITY_MANDATORY_LABEL_AUTHORITY; PSID low = nullptr;
+    if (!AllocateAndInitializeSid(&auth, 1, SECURITY_MANDATORY_LOW_RID, 0, 0, 0, 0, 0, 0, 0, &low)) { auto e = last_error("AllocateAndInitializeSid"); CloseHandle(t); return e; }
+    TOKEN_MANDATORY_LABEL tml{}; tml.Label.Attributes = SE_GROUP_INTEGRITY; tml.Label.Sid = low;
+    error e{};
+    if (!SetTokenInformation(t, TokenIntegrityLevel, &tml, DWORD(sizeof tml + GetLengthSid(low)))) e = last_error("SetTokenInformation(TokenIntegrityLevel)");
+    FreeSid(low); CloseHandle(t); return e;
+}
+// Windows 10 1709+: this process may create no more child processes (irreversible). False when the OS lacks it.
+inline bool no_child_processes() {
+    using fn_t = BOOL (WINAPI*)(int, PVOID, SIZE_T);
+    auto fn = reinterpret_cast<fn_t>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessMitigationPolicy")));
+    if (!fn) return false;
+    DWORD flags = 1;   // PROCESS_MITIGATION_CHILD_PROCESS_POLICY::NoChildProcessCreation
+    return fn(13 /*ProcessChildProcessPolicy*/, &flags, sizeof flags) != 0;
 }
 // CreateProcessW inside the policy's AppContainer (no network capability when deny_network, else internetClient).
 // With STARTF_USESTDHANDLES the child inherits exactly si's std handles (inheritable duplicates through
@@ -301,6 +390,7 @@ inline sandbox_info sandbox_status() {
 #elif defined(FORGE_OS_WINDOWS)
     if (detail::wsbx::in_appcontainer(nullptr)) { i.sandboxed = true; i.mechanism = "appcontainer"; }
     BOOL in = FALSE; if (IsProcessInJob(GetCurrentProcess(), nullptr, &in) && in) { i.sandboxed = true; i.mechanism += i.mechanism.empty() ? "job-object" : "+job-object"; }
+    if (long rid = detail::wsbx::integrity_rid(); rid >= 0 && rid <= long(SECURITY_MANDATORY_LOW_RID)) { i.sandboxed = true; i.mechanism += i.mechanism.empty() ? "low-integrity" : "+low-integrity"; }
 #endif
     return i;
 }
@@ -423,6 +513,115 @@ inline status apply_seccomp(const sandbox_policy& p) {
     return {};
 }
 }
+// "One exec" gate: a seccomp filter that sends execve / execveat to a user-notification listener (Linux 5.0;
+// letting a call continue needs 5.5). run_sandboxed()'s parent holds the listener: the first exec, the one that
+// starts the target, continues; every later one in the target or its descendants gets EPERM (ENOSYS once the
+// parent has stopped listening). The gate only counts calls, it never reads their arguments, so the usual
+// user-notification time-of-check race does not apply.
+namespace detail::xgate {
+struct notif { std::uint64_t id; std::uint32_t pid, flags; struct seccomp_data data; };
+struct notif_resp { std::uint64_t id; std::int64_t val; std::int32_t error; std::uint32_t flags; };
+inline unsigned long ioc_recv() { return static_cast<unsigned long>(_IOWR('!', 0, notif)); }
+inline unsigned long ioc_send() { return static_cast<unsigned long>(_IOWR('!', 1, notif_resp)); }
+constexpr std::uint32_t ret_user_notif = 0x7fc00000u, flag_new_listener = 1u << 3, resp_continue = 1u;
+// 0 = not tried yet, 1 = works, -1 = this kernel cannot (no listener, or no "continue"). FORGE_EXEC_GATE=0 turns
+// it off (Landlock only), e.g. to test the fallback.
+inline std::atomic<int>& state() {
+    static std::atomic<int> s{[] { const char* e = std::getenv("FORGE_EXEC_GATE"); return e && e[0] == '0' ? -1 : 0; }()};
+    return s;
+}
+inline std::vector<sock_filter> filter();
+inline int install(const std::vector<sock_filter>& f) noexcept;
+// Android: an app's seccomp policy may kill a process for a call it does not list, so the first use tries the
+// listener in a throwaway child (as detail::ll::abi does for Landlock).
+inline void probe_once() {
+#if defined(__ANDROID__)
+    static const bool done = [] {
+        if (state().load() != 0) return true;
+        const auto f = filter();
+        pid_t c = forge::os::serialized_fork();
+        if (c < 0) { state() = -1; return true; }
+        if (c == 0) ::_exit(install(f) >= 0 ? 0 : 1);
+        int st = 0; while (::waitpid(c, &st, 0) < 0 && errno == EINTR) {}
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) state() = -1;
+        return true;
+    }();
+    (void)done;
+#endif
+}
+inline std::vector<sock_filter> filter() {
+    std::vector<sock_filter> f;
+    auto st = [&](std::uint16_t code, std::uint32_t k, std::uint8_t jt = 0, std::uint8_t jf = 0) { f.push_back(sock_filter{code, jt, jf, k}); };
+    st(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, arch));
+    st(BPF_JMP | BPF_JEQ | BPF_K, audit_arch, 1, 0); st(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
+    st(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr));
+#if defined(__x86_64__)
+    st(BPF_JMP | BPF_JGE | BPF_K, 0x40000000u, 0, 1); st(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);   // x32 execve
+#endif
+    st(BPF_JMP | BPF_JEQ | BPF_K, std::uint32_t(__NR_execve), 0, 1); st(BPF_RET | BPF_K, ret_user_notif);
+#ifdef __NR_execveat
+    st(BPF_JMP | BPF_JEQ | BPF_K, std::uint32_t(__NR_execveat), 0, 1); st(BPF_RET | BPF_K, ret_user_notif);
+#endif
+    st(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    return f;
+}
+// Child side, async-signal-safe: install the filter, return its listener descriptor (-1: not available).
+inline int install(const std::vector<sock_filter>& f) noexcept {
+#ifdef __NR_seccomp
+    if (::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return -1;
+    sock_fprog prog{static_cast<unsigned short>(f.size()), const_cast<sock_filter*>(f.data())};
+    return int(::syscall(__NR_seccomp, 1 /*SECCOMP_SET_MODE_FILTER*/, flag_new_listener, &prog));
+#else
+    (void)f; return -1;
+#endif
+}
+inline bool send_fd(int sock, int fd) noexcept {
+    char b = 'F'; iovec io{&b, 1};
+    alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(int))] = {};
+    msghdr m{}; m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
+    cmsghdr* c = CMSG_FIRSTHDR(&m); c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(c), &fd, sizeof fd);
+    ssize_t n; do n = ::sendmsg(sock, &m, MSG_NOSIGNAL); while (n < 0 && errno == EINTR);
+    return n == 1;
+}
+// Parent side: the descriptor the child sent, or -1 when it closed the socket without sending one.
+inline int recv_fd(int sock) noexcept {
+    char b = 0; iovec io{&b, 1};
+    alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(int))] = {};
+    msghdr m{}; m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
+    ssize_t n; do n = ::recvmsg(sock, &m, MSG_CMSG_CLOEXEC); while (n < 0 && errno == EINTR);
+    if (n != 1) return -1;
+    for (cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS) { int fd = -1; std::memcpy(&fd, CMSG_DATA(c), sizeof fd); return fd; }
+    return -1;
+}
+// Serve the listener until `child` exits: the first exec continues, later ones get EPERM. Returns the wait
+// status; *unusable is set when the kernel refused "continue" (the child was killed before it started anything).
+inline int serve(int lfd, pid_t child, bool* unusable) {
+    int st = 0; bool first = true;
+    for (;;) {
+        struct pollfd pf{lfd, POLLIN, 0};
+        int pr = ::poll(&pf, 1, 20);
+        if (pr > 0 && (pf.revents & POLLIN)) {
+            notif n; std::memset(&n, 0, sizeof n);
+            if (::ioctl(lfd, ioc_recv(), &n) == 0) {
+                notif_resp r{}; r.id = n.id;
+                if (first) {
+                    first = false; r.flags = resp_continue;
+                    if (::ioctl(lfd, ioc_send(), &r) != 0 && errno == EINVAL) {   // Linux 5.0-5.4: no "continue"
+                        *unusable = true; ::kill(child, SIGKILL);
+                        while (::waitpid(child, &st, 0) < 0 && errno == EINTR) {}
+                        return st;
+                    }
+                } else { r.error = -EPERM; (void)::ioctl(lfd, ioc_send(), &r); }
+            }
+        }
+        pid_t w = ::waitpid(child, &st, WNOHANG);
+        if (w == child) return st;
+        if (w < 0 && errno != EINTR) return st;
+    }
+}
+}
 #endif
 
 inline status apply_sandbox(const sandbox_policy& p) {
@@ -441,26 +640,38 @@ inline status apply_sandbox(const sandbox_policy& p) {
     std::string pr = "stdio rpath flock"; if (!p.deny_fs_write) pr += " wpath cpath"; if (!p.deny_network) pr += " inet unix dns"; if (!p.deny_exec) pr += " proc exec";
     if (::pledge(pr.c_str(), nullptr)) return {{}, last_error("pledge")}; return {};
 #elif defined(FORGE_OS_MACOS)
-    auto init = reinterpret_cast<int (*)(const char*, std::uint64_t, char**)>(::dlsym(RTLD_DEFAULT, "sandbox_init"));
+    auto init = detail::sb::init();
     if (!init) return {{}, unsupported("sandbox_init")};
+    // The policy as a Seatbelt profile; if this OS refuses the unix-socket exceptions, without them; if it refuses
+    // profile strings altogether, the closest named profile (coarser: pure-computation for exec or net + write).
+    char* err = nullptr;
+    if (init(detail::sb::profile(p, {}).c_str(), 0, &err) == 0) return {};
+    if (p.deny_network && init(detail::sb::profile(p, {}, false).c_str(), 0, &err) == 0) return {};
     const char* prof = (p.deny_network && p.deny_fs_write) || p.deny_exec ? "pure-computation" : p.deny_network ? "no-internet" : "no-write";
-    char* err = nullptr; if (init(prof, 1 /*SANDBOX_NAMED*/, &err)) { std::string e = err ? err : "sandbox_init failed"; return {{}, {1, e}}; }
+    err = nullptr; if (init(prof, 1 /*SANDBOX_NAMED*/, &err)) { std::string e = err ? err : "sandbox_init failed"; return {{}, {1, e}}; }
     return {};
 #elif defined(FORGE_OS_IOS)
     return {};   // already confined by the iOS app sandbox (no exec, container-only fs); nothing further to apply
 #elif defined(FORGE_OS_WINDOWS)
     if (p.deny_network || p.deny_fs_write) {
-        // Cannot be added to a running process; accepted only when this process already runs in an
-        // AppContainer that enforces it (process_pool workers, run_sandboxed children): no network capability
-        // when the network is denied.
-        bool net = false;
-        if (!detail::wsbx::in_appcontainer(&net) || (p.deny_network && net))
-            return {{}, unsupported("in-process network/fs denial on Windows (use run_sandboxed or an AppContainer process_pool)")};
+        // An AppContainer this process already runs in (process_pool workers, run_sandboxed children) enforces
+        // both: no network capability when the network is denied, writes only to the container folder.
+        // Outside one, network denial cannot be added to a running process (nothing is applied then, so a
+        // policy is never half in force); file-write denial is the low integrity level.
+        bool net = false; const bool ac = detail::wsbx::in_appcontainer(&net);
+        if (p.deny_network && (!ac || net))
+            return {{}, unsupported("in-process network denial on Windows (use run_sandboxed or an AppContainer process_pool)")};
+        if (p.deny_fs_write && !ac) if (auto e = detail::wsbx::lower_integrity()) return {{}, e};
         if (!p.deny_exec) return {};
     }
     HANDLE j = CreateJobObjectW(nullptr, nullptr); if (!j) return {{}, last_error("CreateJobObject")};
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{}; li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_ACTIVE_PROCESS; li.BasicLimitInformation.ActiveProcessLimit = 1;
-    if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li) || !AssignProcessToJobObject(j, GetCurrentProcess())) { auto e = last_error("job object"); CloseHandle(j); return {{}, e}; }
+    if (!SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li) || !AssignProcessToJobObject(j, GetCurrentProcess())) {
+        auto e = last_error("job object"); CloseHandle(j);
+        // Already in a job that cannot nest (before Windows 8, or one that forbids it): the mitigation policy instead.
+        if (detail::wsbx::no_child_processes()) return {};
+        return {{}, e};
+    }
     return {};   // the job handle is intentionally leaked: it must live as long as the process
 #else
     return {{}, unsupported("sandbox")};
@@ -469,10 +680,17 @@ inline status apply_sandbox(const sandbox_policy& p) {
 
 // Run a child under the policy; returns its exit code (POSIX: 126 = the policy could not be applied, 127 = the
 // target could not be started, 128+n = killed by signal n). argv[0] is resolved like spawn_wait (PATH).
-// deny_exec: Windows (ActiveProcessLimit = 1), FreeBSD (capability mode) and Linux with Landlock (EXECUTE only on
-// the target's binary, #! interpreter and ld.so) keep the target itself from starting programs. Linux without
-// Landlock and macOS cannot deny exec yet allow the one that starts the target, so there the target runs under the
-// policy's other parts only (sandbox_status().landlock_abi says whether Landlock is there).
+// deny_exec keeps the target itself from starting programs everywhere: Windows (ActiveProcessLimit = 1), FreeBSD
+// (capability mode), macOS (Seatbelt: process-exec allowed on the target's file and #! interpreter only; a target
+// that is a wrapper around another program, like macOS's /bin/sh, therefore cannot start) and Linux (the one-exec
+// seccomp gate on 5.5+, and Landlock on 5.13+ with EXECUTE only on the target's binary, #! interpreter and ld.so).
+// Only a Linux kernel with neither (sandbox_exec_gate() false and sandbox_status().landlock_abi 0) runs the target
+// under the policy's other parts alone.
+#if defined(__linux__)
+// Whether run_sandboxed can gate exec through seccomp user notification on this kernel. Unknown until the first
+// run_sandboxed with deny_exec has tried: reported true until then unless FORGE_EXEC_GATE=0.
+inline bool sandbox_exec_gate() { return detail::audit_arch != 0 && detail::xgate::state().load() >= 0; }
+#endif
 inline result<int> run_sandboxed(const std::vector<std::string>& argv, const sandbox_policy& p) {
     if (argv.empty()) return {-1, {22, "run_sandboxed: empty argv"}};
 #if defined(FORGE_OS_WINDOWS)
@@ -533,6 +751,14 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
     error ll_err{};
     const int ll = confine ? detail::ll::ruleset(p, chain, &ll_err) : -1;
     if (ll_err) return {-1, ll_err};
+    // The one-exec gate (see detail::xgate). `sv` carries the listener from the child to us.
+    if (p.deny_exec) detail::xgate::probe_once();
+    bool gate = p.deny_exec && detail::xgate::state().load() >= 0;
+    const std::vector<sock_filter> gate_filter = gate ? detail::xgate::filter() : std::vector<sock_filter>{};
+    int sv[2] = {-1, -1};
+relaunch:
+    sv[0] = sv[1] = -1;
+    if (gate && ::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0) gate = false;
 #elif defined(FORGE_OS_FREEBSD)
     // Capability mode refuses every lookup by path, execve included, so the child opens nothing itself: the
     // binary (and for a dynamic one the run-time linker named by PT_INTERP plus the default library
@@ -572,8 +798,13 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
         }
     }
 #elif defined(FORGE_OS_MACOS)
-    sandbox_policy q = p; q.deny_exec = false;   // see above: the target must still be exec'd
-    (void)confine;
+    // The profile is built here (the child only calls sandbox_init, which has no async-signal-safe variant).
+    // With deny_exec the profile must apply as written (126 otherwise); without it the named profiles that
+    // apply_sandbox falls back to are equivalent.
+    std::vector<std::string> chain; if (p.deny_exec) detail::sb::exec_chain(exe, chain);
+    const std::string prof = confine ? detail::sb::profile(p, chain) : std::string(), prof2 = confine ? detail::sb::profile(p, chain, false) : std::string();
+    const auto sb_init = detail::sb::init();
+    sandbox_policy q = p; q.deny_exec = false;
 #else
     (void)confine;
 #endif
@@ -584,6 +815,7 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
         close_all();
 #elif defined(__linux__)
         if (ll >= 0) ::close(ll);
+        if (sv[0] >= 0) { ::close(sv[0]); ::close(sv[1]); }
 #endif
         return {-1, e};
     }
@@ -591,6 +823,10 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
 #if defined(__linux__)
         if (ll >= 0 && !detail::ll::restrict_self(ll)) ::_exit(126);
         if (!filter.empty() && !detail::install_seccomp(filter)) ::_exit(126);
+        if (gate) {   // last: the listener is sent before the exec it will be asked about
+            int lfd = detail::xgate::install(gate_filter);
+            if (lfd >= 0 && !detail::xgate::send_fd(sv[1], lfd)) ::_exit(126);
+        }
 #elif defined(FORGE_OS_FREEBSD)
         if (confine) {
             if (::cap_enter()) ::_exit(126);
@@ -598,7 +834,11 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
             ::_exit(127);
         }
 #elif defined(FORGE_OS_MACOS)
-        if (!apply_sandbox(q)) ::_exit(126);
+        if (confine) {
+            char* err = nullptr;
+            const bool ok = sb_init && (sb_init(prof.c_str(), 0, &err) == 0 || (p.deny_network && sb_init(prof2.c_str(), 0, &err) == 0));
+            if (!ok && (p.deny_exec || !apply_sandbox(q))) ::_exit(126);
+        }
 #else
         if (!apply_sandbox(p)) ::_exit(126);
 #endif
@@ -607,6 +847,21 @@ inline result<int> run_sandboxed(const std::vector<std::string>& argv, const san
 #if defined(FORGE_OS_FREEBSD)
     close_all();
 #elif defined(__linux__)
+    if (gate) {
+        ::close(sv[1]);
+        const int lfd = detail::xgate::recv_fd(sv[0]);   // -1: the child could not install the gate and runs without it
+        ::close(sv[0]);
+        if (lfd < 0) detail::xgate::state() = -1;
+        else {
+            bool unusable = false;
+            int gst = detail::xgate::serve(lfd, c, &unusable);
+            ::close(lfd);
+            if (unusable) { detail::xgate::state() = -1; gate = false; goto relaunch; }   // nothing ran yet: start over without the gate
+            detail::xgate::state() = 1;
+            if (ll >= 0) ::close(ll);
+            return {WIFEXITED(gst) ? WEXITSTATUS(gst) : 128 + WTERMSIG(gst), {}};
+        }
+    }
     if (ll >= 0) ::close(ll);
 #endif
     int st = 0; while (::waitpid(c, &st, 0) < 0 && errno == EINTR) {}
