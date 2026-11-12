@@ -82,7 +82,11 @@ See [memory.md](memory.md) for how the budget is used.
 |----------|--------|
 | `FORGE_KV_CACHE_TYPE`, `FORGE_KV_CODEC` | KV cache codec when `session_options.kv_codec` is empty (`FORGE_KV_CACHE_TYPE` is checked first): `f32` (default), `int8`, `fp8`, `tbq4`, `tbq3`, `tbq4p`, `tbq3p`, or `k8v4` (int8 keys, tbq4 values) |
 | `FORGE_KV_OFFLOAD=1` | Keep the KV cache on the host and drop device copies after each attention (when `session_options.kv_offload` is unset) |
-| `FORGE_DECODE_WEIGHTS=1` | Decode every weight to f32 at load time, instead of reading quantised weights in place from the mapped file |
+| `FORGE_DECODE_WEIGHTS=1` | Decode every weight to f32 at load time, instead of reading quantised weights in place from the mapped file. Precompiled plans are not used |
+| `FORGE_AOT=0` | Ignore precompiled plans (`aot` section, sidecar, compiled library code): every plan is compiled at run time ([aot-models.md](aot-models.md)) |
+| `FORGE_AOT_PLAN=FILE` | Sidecar plan file to use instead of `<model>.fplan` |
+| `FORGE_AOT_FPK=FILE` | Model file for a natively compiled model library, instead of the one recorded in it |
+| `FORGE_AOT_SDK=FILE` | Build description (`forge_aot_sdk.txt`) for `forge aot --aot-mode native` |
 | `FORGE_HUGEPAGES=1` | Advise huge pages for memory mappings of 2 MiB or more |
 | `FORGE_MEM_LIMIT` | Host memory budget: `6G`, `512M`, `1.5GiB`, bytes, or `75%` of the detected limit; `0` / `off` disables. Default: `FORGE_MEM_FRACTION` of min(RAM, cgroup limit, `RLIMIT_AS`) |
 | `FORGE_MEM_FRACTION` | Share of the detected limit used when `FORGE_MEM_LIMIT` is unset (default `0.85`) |

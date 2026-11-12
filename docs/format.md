@@ -21,6 +21,7 @@ Readers find sections through the table, so section order on disk does not matte
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
 | `data` | yes | Tensor bytes, each tensor aligned to 64 B, in the codec's block layout (`graph/codecs.hpp`) |
 | `experts` | no | Minor revision 1 (manifest `forge_format_minor: 1`). JSON `{version, align: 4096, tensors: [{layer, proj (gate/up/down), name, codec, n_experts, offset, file_offset, expert_bytes, aligned}]}` indexing the stacked MoE expert tensors `[n_experts, rows, k]` read by `moe_ffn`. Expert e is bytes `[offset + e * expert_bytes, + expert_bytes)` of `data`; `aligned` means every expert slice starts on a 4 KiB file offset (one direct read per expert, groundwork for expert streaming). Older readers ignore the section |
+| `aot` | no | Precompiled plans written by `forge aot` (binary, see [The aot section](#the-aot-section)). Older readers ignore the section; a reader that cannot use it compiles plans as usual |
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | `{alg, nonce, mac, key_id}`. `data` is sealed with XChaCha20-Poly1305; the `tensors` JSON is bound as associated data |
 
@@ -39,11 +40,35 @@ A tensor's codec is the `codec` string of its `tensors` entry, one of the names 
 - Several signatures can be present. `forge sign` on a signed file adds a signature if the digest still matches, and replaces an older signature by the same key.
 - A file whose hashes fail `verify()` is not signed (`forge sign` refuses it).
 
+## The aot section
+Written by `forge aot` ([aot-models.md](aot-models.md)), read by `graph/include/forge/graph/aot.hpp`, whose header comment is the authoritative description. `str` is a `u32` length followed by the bytes. The same bytes are the content of a sidecar `<model>.fplan` and are embedded in natively compiled models.
+
+```
+blob   : "FORGEAOT" | u32 format_version (1) | u32 n_entries | u8 model_key[32] | u32 pipeline_version
+         | str forge_version | str simd_target (informational)
+         | n_entries x { u8 key[32]; i64 seq; u8 all_rows; str kv_codec; str device; u64 offset; u64 size }
+         | entries | u8 blake3[32]                      (BLAKE3 of every byte before it)
+entry  : u32 n_nodes x node | u32 n_outputs x { str name; u32 value }
+         | u64 arena_bytes; u64 alignment (64); u64 naive_bytes; u32 in_place; u32 aliases
+         | n_nodes x { u8 kind (0 arena, 1 external, 2 alias); u64 offset; u64 bytes; u32 root }
+         | u32 n_steps x { u8 kind (0 kernel, 1 state_append, 2 state_op); u32 out; str lowering; u8 fuse }
+node   : u8 kind (0 input, 1 weight, 2 constant, 3 op, 4 state_append, 6 state_op) | str op_name
+         | u32 n_in, u32 in[] | attrs | u32 rank, i64 dim[] | str name | u8 weight_kind (0 none, 1 f32, 2 encoded) | str codec
+         | constants only: u64 n, f32[n]
+attrs  : u32 n x { str key; u8 type (0 f64, 1 i64 list: u32 n, i64[n], 2 str); value }
+```
+
+- `model_key` = BLAKE3 of `"forge-aot-plan"`, the format version, the pipeline version, the FORGE version, BLAKE3(`blueprint` section) and BLAKE3(`tensors` section). An entry's `key` = BLAKE3(`model_key`, device, KV codec, `seq`, `all_rows`). A reader uses an entry only when the key it computes for its own model and request equals the stored one.
+- Weights are referenced by tensor name; lowerings by registry name (`lane.gemm_nt`, `cpu.qgemm_nt`, ...). Offsets are in bytes from the start of the plan's arena. Nothing in the blob is an address.
+- Readers treat the blob as untrusted: see [aot-models.md](aot-models.md#security-of-precompiled-plans) for what is checked.
+- `forge aot` rewrites the file with every other section at its old offset and the `aot` section after them. It drops a `signature` section, which would no longer match.
+
 ## Encryption
 - Only `data` is sealed. The manifest, blueprint, tokenizer, tensor index and section table stay readable, so `forge inspect`, section-hash checks and signature checks work without the key.
 - Readers take the key from the constructor, or from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Without one the reader opens in the `locked()` state, and reading `data` raises an error naming the key id.
 
 ## Tools
 - `forge inspect <file> [--tensors] [--blueprint] [--verify]` shows the layout.
+- `forge aot <file> --list` shows the precompiled plans and whether they would be used; `--strip` removes them.
 - `forge dump <file> <tensor> out.f32` extracts one tensor as raw f32.
 - `forge keygen`, `forge sign`, `forge verify`, `forge encrypt`: see [modelfile.md](modelfile.md#examples).
