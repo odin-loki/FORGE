@@ -1321,6 +1321,7 @@ private:
         default:
             fail("catch: values of type '" + (word.empty() ? std::string("this type") : word) + "' cannot be caught by type; use a class, int, double, bool, std::string or catch (...)");
         }
+        return {};   // not reached (fail does not return); keeps compilers that cannot see that quiet
     }
     NodeP try_stmt() {
         int line = take().line; auto n = mk(NK::Try, line);
