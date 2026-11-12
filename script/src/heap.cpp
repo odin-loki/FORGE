@@ -1,8 +1,22 @@
 // forge::script managed heap: ARC release, weak cells, forge::mem accounting, cycle collector.
 #include "objects.hpp"
 #include <algorithm>
+#if !defined(_WIN32)
+#include <pthread.h>
+#endif
 
 namespace forge::script {
+
+#if !defined(_WIN32)
+void Heap::fork_safe() {
+    // prepare: take both mutexes (m_ then lm_; nothing else holds the two together); parent and child: give them back
+    pthread_atfork([] { auto& h = Heap::instance(); h.m_.lock(); h.lm_.lock(); },
+                   [] { auto& h = Heap::instance(); h.lm_.unlock(); h.m_.unlock(); },
+                   [] { auto& h = Heap::instance(); h.lm_.unlock(); h.m_.unlock(); });
+}
+#else
+void Heap::fork_safe() {}
+#endif
 
 Obj::~Obj() { Heap::instance().uncharge(charged); Heap::instance().note_object(-1); }
 

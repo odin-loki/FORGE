@@ -495,6 +495,47 @@ TEST(reference_binding) {
     EXPECT("struct B { int a; B() : a(0) {} B(int x) : a(x) {} };\nstruct D : B { D() : B(1, 2) {} };\nD d;", "!TypeError");
 }
 
+// fork() while another thread is inside the script heap. ProcessPool's fork-mode workers and sandbox({isolate: true})
+// build an interpreter in the forked child; when some other thread of the parent held the heap's object-set mutex
+// at the moment of the fork, the child waited for it for ever (test_script hung in an ASan run: a pool dispatcher
+// forked a worker while the main thread was allocating). The heap now takes its mutexes around fork (pthread_atfork).
+#if !defined(_WIN32) && !defined(FORGE_OS_IOS)
+#include <sys/wait.h>
+#include <unistd.h>
+#include <csignal>
+#include <atomic>
+#include <chrono>
+#include <thread>
+TEST(fork_while_another_thread_allocates) {
+    std::atomic<bool> stop{false};
+    std::thread busy([&] {   // allocates script objects until told to stop
+        script::options o; o.timeout_ms = 60000; o.out = [](std::string_view) {};
+        while (!stop.load()) { script::engine e(o); (void)e.run("std::vector<std::string> v; for (int i = 0; i < 3000; ++i) v.push_back(std::to_string(i));", "<busy>"); }
+    });
+    int hung = 0, bad = 0;
+    for (int k = 0; k < 150 && !hung; ++k) {
+        pid_t pid = ::fork();
+        if (pid < 0) break;
+        if (pid == 0) {   // what a fork-mode pool worker does first: build an interpreter and run a script
+            script::options o; o.out = [](std::string_view) {};
+            script::engine e(o);
+            ::_exit(e.run("std::vector<int> v(100, 1); int s = 0; for (int x : v) s += x;", "<child>").ok ? 0 : 3);
+        }
+        int st = 0; auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            pid_t r = ::waitpid(pid, &st, WNOHANG);
+            if (r == pid) break;
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) { ::kill(pid, SIGKILL); ::waitpid(pid, &st, 0); ++hung; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!hung && !(WIFEXITED(st) && WEXITSTATUS(st) == 0)) ++bad;
+    }
+    stop = true; busy.join();
+    CHECK_MSG(hung == 0, "%d forked child(ren) never finished: deadlock on a heap mutex copied in the locked state", hung);
+    CHECK_MSG(bad == 0, "%d forked child(ren) failed", bad);
+}
+#endif
+
 // Holes found by the conformance sweep (tests/script_conformance compares whole programs with the host compiler; these
 // are the same points without needing one).
 TEST(cpp_conformance_holes) {

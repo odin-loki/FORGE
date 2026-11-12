@@ -116,7 +116,11 @@ public:
     // Debug checks (race detector, lock-order / deadlock detector). Off by default; options::debug.
     std::atomic<bool> debug{false};
 private:
-    Heap() { (void)mem::host_budget(); }   // construct the budget first so it is destroyed after the heap
+    Heap() { (void)mem::host_budget(); fork_safe(); }   // construct the budget first so it is destroyed after the heap
+    // fork() copies only the calling thread. A ProcessPool fork-mode worker and sandbox({isolate: true}) run an
+    // interpreter in the child, so the heap's mutexes must not be held by some other thread at that moment: the
+    // child would wait for them for ever (heap.cpp).
+    void fork_safe();
     void grow_lease(std::uint64_t want);
     std::mutex m_;
     std::unordered_set<Obj*> tracked_;   // non-owning
