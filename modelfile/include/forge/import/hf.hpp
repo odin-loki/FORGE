@@ -27,8 +27,20 @@ inline std::string read_file(const std::filesystem::path& p) {
 #ifndef FORGE_SOURCE_DIR
 #define FORGE_SOURCE_DIR "."
 #endif
+// Directory of the running executable relative to which an installed tree keeps its templates
+// (<prefix>/bin/forge -> <prefix>/share/forge/templates). The build overrides it for non-default install dirs.
+#ifndef FORGE_TEMPLATES_RELDIR
+#define FORGE_TEMPLATES_RELDIR "../share/forge/templates"
+#endif
+// Blueprint templates (*.fbp): $FORGE_TEMPLATES when set; else <executable dir>/FORGE_TEMPLATES_RELDIR when that
+// directory exists (installed tree); else import/templates in the source tree the binary was built from.
 inline std::filesystem::path template_dir() {
     if (auto* e = std::getenv("FORGE_TEMPLATES")) return e;
+    if (auto exe = os::exe_path(); !exe.empty()) {
+        std::error_code ec;
+        auto d = (os::fs::u8path(exe).parent_path() / FORGE_TEMPLATES_RELDIR).lexically_normal();
+        if (std::filesystem::is_directory(d, ec)) return d;
+    }
     return std::filesystem::path(FORGE_SOURCE_DIR) / "import" / "templates";
 }
 

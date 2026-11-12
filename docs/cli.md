@@ -28,7 +28,7 @@ Converts a model to `.fpk`.
 | `--pure` | Mixed precision: no per-tensor rules, one codec for all |
 | `--bf16-head` | Mixed precision: keep the output head in bf16 |
 
-The mixed-precision options are documented for Hugging Face inputs. Templates are read from the source tree compiled into the binary; set `FORGE_TEMPLATES` for another directory (for example with an installed binary).
+The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
 
 ### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint]`
 Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a blueprint summary. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).

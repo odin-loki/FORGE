@@ -101,7 +101,7 @@ See [memory.md](memory.md) for how the budget is used.
 | `FORGE_SECURITY_POLICY` | Policy file for `forge::security::load_policy` and `forge security check` (an error if it cannot be read). See [security-api.md](security-api.md) |
 | `FORGE_SECURITY_PROFILE` | Base FSS profile: `strict`, `standard` or `permissive` (audited). Without it and without a policy file no FSS profile is active |
 | `FORGE_CACHE` | Where `forge run` / `forge bench` cache models imported on the fly (default `~/.cache/forge`) |
-| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `import/templates` in the source tree the binary was built from) |
+| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `../share/forge/templates` relative to the executable if that directory exists, else `import/templates` in the source tree the binary was built from) |
 
 ## RPC clients
 
