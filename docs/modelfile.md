@@ -4,7 +4,7 @@
 A `.fpk` file holds everything needed to run a model:
 - a JSON **manifest**,
 - a **blueprint** (the computation graph as text, `modelfile/blueprint.hpp`),
-- a **tokenizer** (Hugging Face style `tokenizer.json`),
+- a **tokenizer** (Hugging Face style `tokenizer.json`) and, when the source had one, the model's **chat template**,
 - a **tensor index** and the **tensor data**, each tensor in one of the weight codecs of `graph/codecs.hpp`.
 
 Every section and every tensor has a BLAKE3 hash. Files can be **signed** (Ed25519) and their tensor data **encrypted** (XChaCha20-Poly1305), both with the vendored Monocypher. Readers memory-map the file. The byte layout is in [format.md](format.md).
@@ -38,7 +38,7 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 
 | Header | Contents |
 |--------|----------|
-| `tokenizer.hpp` | `bpe_tokenizer`: `encode(text)`, `decode(ids)`, `decode_one(id)`, `token_id(str)`, `vocab_size()`, `bos()`, `eos()`, `add_bos()` (whether a prompt starts with BOS) |
+| `tokenizer.hpp` | `tokenizer` (`bpe_tokenizer` is the old name for it): see [Tokenizers](#tokenizers) |
 | `sign.hpp` | `generate_keypair()`, `load_secret_key(path)`, `load_public_key(path)`, `sign_file(in, out, key)`, `verify_signature(reader, trusted_keys)` → `signature_report` (`signed_`, `digest_ok`, `trusted`, `valid_keys`, `message`). With no trusted keys, any valid signature counts (integrity only, not provenance) |
 | `bundle.hpp` | Ed25519 over a directory: `sign_bundle(root, key)` writes `FORGE-SIGNATURE.json` (path, size, BLAKE3 per file); `verify_bundle(root, trusted)` re-hashes and reports modified, missing and extra files. Also detached `sign_bytes` / `verify_bytes` |
 | `blueprint.hpp` | `parse_blueprint(text)`: the blueprint language (params, state slots, `repeat` loops, any spec op by name, composites such as `linear`, `embed`, `heads`, user-defined `op name(args) { ... }`, fixed-size state ops `state[i].conv(...)` / `state[i].delta(...)`) |
@@ -48,7 +48,7 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 
 | Source | Function, header | Architectures | Weights |
 |--------|------------------|---------------|---------|
-| Hugging Face directory (`config.json`, `*.safetensors`, `tokenizer.json`) | `import_hf`, `hf.hpp` (+ `safetensors.hpp`) | `llama` template: Llama, Mistral, Qwen2. `qwen3`: Qwen3 (QK-norm). `qwen3_5`: Qwen3.5 dense text models (Gated DeltaNet + gated full attention, partial RoPE). `mixtral`: Mixtral MoE. `deepseek_v2`: DeepSeek-V2/V3 (absorbed MLA) | Encoded with `--codec`; mixed precision with `q4_k_m` / `q5_k_m` |
+| Hugging Face directory (`config.json`, `*.safetensors`, `tokenizer.json` or a SentencePiece `tokenizer.model`, `tokenizer_config.json`) | `import_hf`, `hf.hpp` (+ `safetensors.hpp`, `tokenizer_import.hpp`) | `llama` template: Llama, Mistral, Qwen2. `qwen3`: Qwen3 (QK-norm). `qwen3_5`: Qwen3.5 dense text models (Gated DeltaNet + gated full attention, partial RoPE). `mixtral`: Mixtral MoE. `deepseek_v2`: DeepSeek-V2/V3 (absorbed MLA) | Encoded with `--codec`; mixed precision with `q4_k_m` / `q5_k_m` |
 | GGUF v2/v3 | `import_gguf`, `gguf.hpp` | `llama`, `mistral`, `qwen2` → `llama`; `qwen3`; `qwen35` → `qwen3_5`; `qwen3moe` → `qwen3_moe`; `qwen35moe` → `qwen3_5_moe` (untested) | Copied verbatim: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K. `--codec` is not applied |
 | ONNX | `import_onnx`, `onnx.hpp` | Static-shape inference graphs (MLPs, classifiers, encoder blocks) | Initializers become weights |
 
@@ -59,6 +59,38 @@ Importer limits that raise an error:
 - ONNX ops: MatMul Gemm Add Sub Mul Div Pow Max Min Relu Sigmoid Tanh Exp Log Sqrt Neg Abs Erf Gelu Softplus Reciprocal Softmax LayerNormalization Transpose Reshape Flatten Identity Constant ReduceMean ReduceSum. One symbolic dimension maps to `seq`. Any other op is rejected by name.
 
 Templates are read from `FORGE_TEMPLATES` if set, else from `import/templates/` in the source tree.
+
+## Tokenizers
+`modelfile::tokenizer` (`tokenizer.hpp`) reads the `tokenizer` section, a Hugging Face `tokenizer.json`, and runs the `tokenizers` pipeline stage by stage:
+
+| Stage | Supported |
+|-------|-----------|
+| Added tokens | `special`, `normalized`, `lstrip`, `rstrip`, `single_word`; leftmost match, the longest at that position. Tokens with `normalized: false` are found in the raw text, the others in the normalized text |
+| Normalizer | `NFC` `NFD` `NFKC` `NFKD` `Lowercase` `Strip` `StripAccents` `Replace` `Prepend` `Nmt` `BertNormalizer` `Precompiled` (SentencePiece charsmap) `Sequence` |
+| Pre-tokenizer | `ByteLevel` (`add_prefix_space`, `use_regex`) `Split` (string or regex, every `behavior`, `invert`) `Whitespace` `WhitespaceSplit` `Punctuation` `Digits` `Metaspace` (`prepend_scheme`, `split`) `BertPreTokenizer` `CharDelimiterSplit` `Sequence` |
+| Model | `BPE` (merges, `unk_token`, `fuse_unk`, `byte_fallback`, `ignore_merges`, `continuing_subword_prefix`, `end_of_word_suffix`), `WordPiece`, `Unigram` (Viterbi, `byte_fallback`), `WordLevel`, and the FORGE model type `SentencePieceBPE` (SentencePiece's score-driven BPE; see [format.md](format.md#tokenizer-section)) |
+| Post-processor | `TemplateProcessing` (single sequence), `BertProcessing`, `RobertaProcessing`, `ByteLevel`, `Sequence` |
+| Decoder | `ByteLevel` `Metaspace` `WordPiece` `BPEDecoder` `ByteFallback` `Fuse` `Strip` `Replace` `Sequence` |
+
+Anything else in a `tokenizer.json` (another component type, a regex the engine cannot compile) raises `unsupported` when the tokenizer is built, with the name of the component; nothing is skipped silently. Patterns are compiled by `forge::os::text::regex` in its Oniguruma dialect, and Unicode classes, normalization forms and grapheme clusters come from the same library (`forge_text`, which `forge_modelfile` links; Unicode 16).
+
+| Member | Notes |
+|--------|-------|
+| `encode(text)` | Ids without BOS / EOS. Added tokens written in the text (`<|im_start|>`) become their ids. Input that is not valid UTF-8 is read with U+FFFD for the bad bytes |
+| `encode(text, true)`, `with_special(ids)` | Also what the model expects around a prompt: BOS / EOS per `add_bos()` / `add_eos()` when the session set them from the manifest, else the `tokenizer.json` post-processor (`[CLS] … [SEP]`, `<s> …`) |
+| `decode(ids, skip_special = false)` | The decoder chain over the whole sequence. Bytes of an incomplete UTF-8 character are passed through, not replaced |
+| `decode_one(id)` | The bytes one token adds in the middle of a text (streaming, grammar masks). It differs from `decode` where the decoder looks at the position: a SentencePiece word keeps its leading space, WordPiece puts a space before each word-initial piece |
+| `token_id(str)`, `id_to_token(id)`, `is_special(id)`, `vocab_size()`, `type()`, `bos()`, `eos()`, `unk()`, `add_bos()`, `add_eos()`, `has_post_processor()` | |
+| `normalize(text)`, `pre_tokenize(text)` | The first two stages on their own, for debugging a mismatch |
+
+Sources other than a ready `tokenizer.json` are converted to one at import (`import/tokenizer_import.hpp`):
+
+- **SentencePiece `.model`** (`tokenizer.model`, `spiece.model`, `sentencepiece.bpe.model` in a Hugging Face directory without `tokenizer.json`): read with a small protobuf reader. BPE models become `SentencePieceBPE`, unigram models `Unigram`; the model's normalization (precompiled charsmap, whitespace collapsing, dummy prefix) becomes the normalizer chain, and control / user-defined pieces plus `tokenizer_config.json`'s `added_tokens_decoder` become added tokens.
+- **GGUF** `tokenizer.ggml.model`: `gpt2` → byte-level BPE split by the regex of `tokenizer.ggml.pre` (`llama-bpe`, `qwen2`, `deepseek-llm`, `deepseek-coder`, `deepseek-v3`, `gpt-2`, `tekken`, `gpt-4o`, `falcon`, `starcoder`, … as in llama.cpp; an unknown name falls back to GPT-2's with a warning); `llama` → `SentencePieceBPE` over `tokenizer.ggml.scores`; `t5` → `Unigram` (with `precompiled_charsmap`, `remove_extra_whitespaces`); `bert` → `WordPiece`. `tokenizer.ggml.token_type` 3 (control) and 2 (unknown) become special added tokens, 4 (user-defined) plain added tokens, 6 (byte) switches byte fallback on. `add_bos_token` / `add_eos_token` go to the manifest, `add_space_prefix` into the normalizer. A `tokenizer.huggingface.json` key is used as it is. Other models (`rwkv`, …) give a file without a tokenizer, with a warning.
+
+How this is tested, and what is not: `tests/test_tokenizer.cpp` compares ids, normalizer and pre-tokenizer output and decoded text with goldens made by the `tokenizers` 0.23 and `sentencepiece` 0.2 packages (`tests/data/tokenizer/make_fixtures.py`) for small tokenizers trained on a multilingual corpus (ASCII, digit runs, CJK, emoji, combining marks, right-to-left text, mixed whitespace, control characters, invalid UTF-8). It has not been run against the tokenizers of full-size published models. The llama.cpp pre-tokenizer regexes and its BERT conventions were written from memory of llama.cpp and are only checked for `llama-bpe`, `qwen2` and `gpt-2` (against `tokenizers`) and on ASCII text for `bert`. llama.cpp's per-model token attributes (`lstrip` / `rstrip` on some special tokens) are not carried over. Unicode tables are FORGE's (Unicode 16); a reference built against another Unicode version can differ on characters assigned in between.
+
+The **chat template** (`tokenizer_config.json` `chat_template`, `chat_template.jinja`, or GGUF `tokenizer.chat_template`) is stored as the `chat_template` section and rendered by `inference::apply_chat_template` ([inference.md](inference.md#chat-templates-chat_templatehpp)).
 
 ### Mixed precision (HF only, `quant_recipe.hpp`)
 `--codec q4_k_m` or `q5_k_m` chooses a type per tensor. `--recipe llama` is a port of llama.cpp's `llama_tensor_get_type()` rules. `--recipe forge` (default) applies the same rules, then puts Gated DeltaNet in/out projections and `attn_output` at q6_k and the head and token embedding at q8_0 (bf16 with `--bf16-head`). Norms, conv weights, A/dt and the a/b gates stay f32. Overrides: `--output-tensor-type`, `--token-embedding-type`, `--tensor-type REGEX=TYPE[,...]` (first match wins), `--pure`.

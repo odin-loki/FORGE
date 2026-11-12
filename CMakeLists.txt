@@ -412,7 +412,9 @@ set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STAN
 
 add_library(forge_modelfile INTERFACE)
 target_include_directories(forge_modelfile INTERFACE modelfile/include)
-target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust)
+# forge_text: the tokenizer (modelfile/tokenizer.hpp) uses its Unicode tables, normalization forms and regex engine.
+# Every consumer of the header-only layers above (apps, tests, forge_c, the JNI and xcframework builds) links it from here.
+target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust forge_text)
 
 # forge::security: FORGE Security Standard policy, enforce, audit, lockdown, check (docs/security-api.md). Header-only.
 add_library(forge_security INTERFACE)
