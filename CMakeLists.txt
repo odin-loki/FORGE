@@ -394,7 +394,7 @@ if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
   add_library(forge_metal STATIC gpu/src/metal.mm)
   target_compile_options(forge_metal PRIVATE -fobjc-arc)
   target_compile_definitions(forge_metal PUBLIC FORGE_GPU_METAL=1)
-  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
+  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party third_party/monocypher ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
   add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
   target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
   target_link_libraries(forge_gpu INTERFACE forge_metal)
@@ -1446,6 +1446,16 @@ if(FORGE_BUILD_TESTS)
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
              -include ${PROJECT_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
+    # gpu/src/metal.mm (the Metal host code, Objective-C++) parsed against stub declarations of the Metal API on Linux,
+    # where no Apple SDK exists: catches C++ / Objective-C errors before the macOS build does. Not a check of Metal usage.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME gpu_compile_metal_host_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -x objective-c++ -std=c++23 -fobjc-arc -fobjc-runtime=gnustep-2.0
+               -fsyntax-only -Werror -Wno-objc-root-class -I${PROJECT_SOURCE_DIR}/tests/shims/metal_stub -I${PROJECT_SOURCE_DIR}/gpu/include
+               -I${PROJECT_SOURCE_DIR}/support/include -I${PROJECT_SOURCE_DIR}/third_party -I${PROJECT_SOURCE_DIR}/third_party/monocypher -I${FORGE_GEN_DIR}
+               -I${PROJECT_SOURCE_DIR}/core/include -I${PROJECT_SOURCE_DIR}/os/include -I${PROJECT_SOURCE_DIR}/ops/include -I${PROJECT_SOURCE_DIR}/simd/include
+               ${PROJECT_SOURCE_DIR}/gpu/src/metal.mm)
+      set_tests_properties(gpu_compile_metal_host_syntax PROPERTIES LABELS gpu)
+    endif()
     find_program(FORGE_XCRUN xcrun)
     if(FORGE_XCRUN)   # real Metal compiler (macOS with Xcode)
       add_test(NAME gpu_compile_metal COMMAND ${FORGE_XCRUN} -sdk macosx metal -c ${FORGE_GPU_DIR}/kernels.metal -o ${PROJECT_BINARY_DIR}/kernels.air)

@@ -9,5 +9,7 @@
 #define thread
 #define kernel
 using uint = unsigned;
+using uchar = unsigned char;   // the portable kernels' encoded weights (gpu_gen.py msl_port)
 template<class T, class F> T as_type(F f) { T t; std::memcpy(&t, &f, sizeof t); return t; }
 using std::exp2; using std::log2; using std::sqrt; using std::fma; using std::sin; using std::cos;
+using std::size_t;

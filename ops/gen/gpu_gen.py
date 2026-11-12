@@ -2139,7 +2139,41 @@ def msl(names):
     # local pointers into device buffers
     body = re.sub(r"(?<![\w>])const float\* (xr|qp|kp|vp)\b", r"device const float* \1", body)
     body = re.sub(r"(?<![\w>])float\* (yr|yp)\b", r"device float* \1", body)
-    return MSL_PRELUDE + body
+    return MSL_PRELUDE + body + msl_port()
+
+# ==== BEGIN Metal (MSL) translation of the portable device kernels =================================================
+# kernels.metal takes PORT_HELPERS + PORT_SHARED + PORT_KERNELS through a textual translation, so the arithmetic is the
+# OpenCL C's token for token: address-space qualifiers (G -> device, pointers to locals -> thread), integer type names,
+# as_float -> as_type<float>, and kernel signatures in the form msl() gives the spec kernels (buffers and scalars are
+# [[buffer(i)]] in argument order). One body differs: moe_dot's f32 branch reads its words bytewise instead of casting
+# the byte pointer to a float pointer. NEVER EXECUTED: on Linux only the C++ syntax check (gpu_compile_metal_syntax)
+# sees this text; no Metal compiler has.
+def msl_port():
+    import re
+    b = cl_port()
+    cast = "G const float* wf = (G const float*)w + row * k; float s = 0.0f; for (unsigned i = 0; i < k; ++i) s = fma_(x[i], wf[i], s); return s; }"
+    assert b.count(cast) == 1
+    b = b.replace(cast, "G const unsigned char* wf = w + row * k * 4u; float s = 0.0f; for (unsigned i = 0; i < k; ++i) s = fma_(x[i], ldf32(wf + 4u * i), s); return s; }")
+    ld = "static inline unsigned ld16(G const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }\n"
+    assert b.count(ld) == 1
+    b = b.replace(ld, ld + "static inline float ldf32(G const unsigned char* p) { return as_float((unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24)); }\n")
+    b = re.sub(r"\bG ", "device ", b)
+    b = b.replace("unsigned char", "uchar").replace("(signed char)", "(char)")
+    b = re.sub(r"\bunsigned\b", "uint", b)
+    b = b.replace("as_float(", "as_type<float>(")
+    b = re.sub(r"(?<!device )(?<!const )\b(uint|float)\* (\w+)", r"thread \1* \2", b)   # pointers to locals
+    def sig(m):
+        out = []
+        for i, q in enumerate(x.strip() for x in m.group(2).split(",")):
+            if "*" in q: out.append(f"{q} [[buffer({i})]]")
+            else:
+                t, n = q.rsplit(" ", 1); out.append(f"constant {t}& {n} [[buffer({i})]]")
+        out.append("uint _gid [[thread_position_in_grid]]")
+        return f"kernel void {m.group(1)}({', '.join(out)})"
+    b, n = re.subn(r"FORGE_K void (forge_\w+)\(([^)]*)\)", sig, b, flags=re.S)
+    assert n == 11 and "FORGE_K" not in b and " G " not in b
+    return b
+# ==== END Metal (MSL) translation ===================================================================================
 
 def main():
     ap = argparse.ArgumentParser()

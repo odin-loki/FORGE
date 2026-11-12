@@ -131,6 +131,14 @@ GPU, and nothing was built by a compiler other than clang 23.
 - **Vulkan dispatch folding**: launches are folded over the second dispatch dimension (rows of 32768 groups); before,
   a launch of more than 65535 × 64 work items exceeded what `maxComputeWorkGroupCount` guarantees. Lavapipe: a
   2,098,152-item `add` (0 wrong). The 36 spec shaders were regenerated with the linear index and pass as before.
+- **Metal ports of the same families**: `kernels.metal` gets the eleven portable kernels through a textual
+  translation of the OpenCL C (`msl_port`), and `gpu/src/metal.mm` gets the host side (`gpu::portable_kernels<>`).
+  **Never executed, never compiled by a Metal toolchain.** Checked here: the generated MSL passes the C++ syntax
+  check `gpu_compile_metal_syntax` (45 kernels; address-space keywords vanish in that check), and `metal.mm` parses
+  as Objective-C++ against stub declarations of the Metal API (`gpu_compile_metal_host_syntax`, new). That second
+  check found that `forge_metal` lacked the `third_party/monocypher` include directory `core/memory.hpp` needs since
+  the 2026-11-12 merges (not verified on macOS, but the include path was missing from the target); added. `test_gpu_metal` now runs the attention, quantised,
+  state-op and MoE checks too, so the macOS CI job is the first place any of this runs.
 - The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
   tests pass unchanged after the move.
 

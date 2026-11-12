@@ -301,8 +301,8 @@ template<class RT, class Open> static int device_t(Open open) {
     std::printf("%s device: %s (image %s)\n", api.c_str(), rt->device_name().c_str(), rt->image_arch().c_str());
     int dec_fails = 0;
     if constexpr (requires { rt->run_op("attention", {}, ops::attrs{}, tensor_view{}); }) {
-        // every backend with split-K decode / one-pass prefill attention kernels (not Metal: only forge_attention)
-        if (api != "metal") dec_fails = attention_dec_check(*rt, api);
+        // every backend has split-over-keys decode / one-pass prefill attention kernels (Metal: the msl_port translation)
+        dec_fails = attention_dec_check(*rt, api);
         if constexpr (requires { rt->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
             if (api == "cuda" || api == "hip") dec_fails += fusion_check(*rt, api);
     }
