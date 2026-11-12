@@ -102,6 +102,23 @@ Methods: `submit(request)` → id, `cancel(id)`, `step()`, `run_until_idle()`, `
 
 A new prompt reuses the longest prefix it shares with a cached (in memory or spilled) sequence, always leaving at least one prompt token to compute.
 
+### Embedding sessions
+A blueprint that ends with `session embedding` is an embedding model: one stateless pass whose first declared output is the result. The same `session` class runs it (BERT-family sentence embeddings, ViT / CLIP / SigLIP image embeddings, Whisper encoder states):
+
+| Member | Meaning |
+|---|---|
+| `embed(ids, token_types = {}, mask = {})` | Token models. Feeds the inputs the blueprint declares out of `tokens`, `positions` (0 .. n-1), `token_types` (zeros unless given) and `mask` (ones unless given; 0 marks padding, which the `bert` template masks out of attention and of mean pooling). Returns the vector |
+| `embed_inputs({name → data}, seq = 1)` | Any embedding model: named f32 inputs as declared (`image` `[channels, size, size]`, `mel` `[n_mels, frames]`, or the token inputs). Returns the first output, flattened row-major |
+| `embedding_shape(seq = 1)` | Declared shape of that output, e.g. `{384}` or `{1500, 384}` |
+
+```cpp
+inference::session s("bge-small.fpk");
+std::vector<int> ids = {101, 7592, 2088, 102};          // [CLS] hello world [SEP]
+std::vector<float> v = s.embed(ids);                    // pooled (and L2-normalised if the model says so)
+```
+
+`generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per call: there is no batch axis, so padding only matters when the caller pads. Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).
+
 ### Other session kinds
 - `diffusion.hpp` (`forge::inference::diffusion`): `noise_scheduler::make(T, beta_schedule, b0, b1)` (linear, scaled_linear, cosine), `options` (`steps`, `kind` = ddim / ddpm / euler_flow, `pred` = epsilon / v / sample, `guidance` (classifier-free, 1 = off), `eta`, `seed`, `cache_at`, `start_step`), `session(scheduler, denoiser).run(x, opt)`. The denoiser is any callable `(x, t, cond) → prediction`. Noise is Philox, so a seed gives the same trajectory on every backend. `cache()` holds latents for `cache_at` steps; resume with `start_step`.
 - `streaming.hpp` (`forge::inference::streaming`): lock-free SPSC `ring<T>`, and `session(options, frame_fn)` with `feed(p, n)` (producer) and `pump()` (consumer). `options`: `window` 400, `hop` 160, `max_lag_frames` 8, `deadline`, `capacity` 65536. When more than `max_lag_frames` frames are pending, the oldest are dropped. `stat()` counts frames, drops, overruns and rejected samples.

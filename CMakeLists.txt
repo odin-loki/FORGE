@@ -910,6 +910,18 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip")
+      # Device fallback: the other template families use ops with no device kernel (attention_bias over the KV state,
+      # conv1d / conv2d, layer_norm, gelu); those steps must run on the CPU between device steps and give the same result.
+      foreach(_g gpt2 gemma phi3 bert vit whisper)
+        add_test(NAME golden_tiny_${_g}_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py
+                 --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_cumock)
+        set_tests_properties(golden_tiny_${_g}_cuda_mock PROPERTIES LABELS gpu
+          ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
+        add_test(NAME golden_tiny_${_g}_opencl_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py
+                 --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_clmock)
+        set_tests_properties(golden_tiny_${_g}_opencl_mock PROPERTIES LABELS gpu
+          ENVIRONMENT "FORGE_DEVICE=opencl;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockopencl")
+      endforeach()
     endif()
   endif()
   if(FORGE_HAVE_VULKAN)
@@ -1048,6 +1060,18 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden)
+    # Tiny random models of the other template families (GPT-2, Gemma 1/2/3, Phi-3 / Phi-4-mini, BERT / RoBERTa
+    # embedding, ViT / CLIP / SigLIP vision, Whisper encoder) against float64 numpy references.
+    set(FORGE_GOLDEN_FAMILIES gpt2 gemma phi3 bert vit whisper)
+    foreach(_g ${FORGE_GOLDEN_FAMILIES})
+      add_test(NAME golden_tiny_${_g}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py
+                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g})
+      if(CMAKE_CROSSCOMPILING_EMULATOR)
+        list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner_g)
+        set_tests_properties(golden_tiny_${_g} PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner_g}")
+      endif()
+    endforeach()
     if(FORGE_HAVE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
       # Same goldens with the Vulkan lowerings (ops without a GPU kernel run on the CPU).
       add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py

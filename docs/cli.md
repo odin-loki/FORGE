@@ -58,6 +58,25 @@ Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compi
 
 Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
 
+### `forge embed <model> (--text TEXT | --tokens 1,2,3 | --input name=file.f32 ...) [options]`
+Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `whisper_encoder` templates) once and prints the result vector, or writes it as raw little-endian f32 with `--out file.f32`.
+
+| Option | Meaning |
+|---|---|
+| `--tokens 1,2,3` | Token ids, including the model's special tokens (`[CLS]` ... `[SEP]`) |
+| `--text TEXT` | Tokenise with the model's tokenizer. Only byte-level BPE tokenizers are available at run time; BERT-family (WordPiece) models need `--tokens` |
+| `--token-types 0,0,1` | Segment ids (default all 0) |
+| `--mask 1,1,0` | 1 = real token, 0 = padding (default all 1) |
+| `--input name=file.f32` | Raw f32 for a declared input, repeatable: `image=...` (`[channels, size, size]`, already resized and normalised), `mel=...` (`[n_mels, frames]`) |
+| `--out file.f32` | Write the vector instead of printing it |
+| `--device D`, `--codec C`, `--verify`, `--policy F` | As for `forge run` |
+
+```sh
+forge import ./bge-small-en -o bge.fpk
+forge embed bge.fpk --tokens 101,7592,2088,102
+forge embed vit.fpk --input image=cat.f32 --out cat.emb.f32
+```
+
 ### `forge bench <model> [-p 32] [-n 32] [--warmup 1] [--codec C]` / `forge bench --gemm N`
 Measures prefill (`-p` prompt tokens) and decode (`-n` new tokens, always all of them) throughput after `--warmup` untimed runs. With `--gemm N` it instead times an N×N `gemm_nt` with each available simd table (one thread) and with `gpu::prims` (all threads).
 
