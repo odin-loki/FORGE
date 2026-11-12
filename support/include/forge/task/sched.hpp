@@ -16,8 +16,9 @@
 //     mutex-protected injector queue.
 //   * Priorities (low, normal, high) are scanned highest first across own deques, injector and victims. They
 //     are a preference, not a strict order: a running task is never preempted.
-//   * Idle workers spin briefly, then park on an event count (std::atomic wait/notify, or a mutex and
-//     condition variable with FORGE_TASK_PARK_CONDVAR or where the library has no atomic wait).
+//   * Idle workers spin briefly, then park on an event count through os::wait_on_address (os/sync.hpp: futex
+//     and its equivalents). FORGE_TASK_PARK_ATOMIC selects std::atomic wait/notify instead and
+//     FORGE_TASK_PARK_CONDVAR a mutex and condition variable.
 //   * wait / get / parallel_for called on any thread help: they run queued tasks until the awaited work is
 //     done, so nested parallel_for and task-in-task waits cannot deadlock on an exhausted pool. A task must
 //     not hold a lock across such a call (the helper may run a task that wants the same lock).
@@ -30,6 +31,7 @@
 //     and when, is not deterministic.
 #include <forge/os/cpu_topology.hpp>
 #include <forge/os/numa.hpp>
+#include <forge/os/sync.hpp>
 #include <forge/task/pool.hpp>
 #include <deque>
 #include <map>
@@ -49,7 +51,12 @@ namespace detail {
 
 // ---- parking primitive: wait while *w == old; wake one / all ----
 struct parker {
-#if defined(__cpp_lib_atomic_wait) && !defined(FORGE_TASK_PARK_CONDVAR)
+#if !defined(FORGE_TASK_PARK_CONDVAR) && !defined(FORGE_TASK_PARK_ATOMIC)
+    // the OS primitive (futex, WaitOnAddress, umtx, os_sync; a bucket table elsewhere). A spurious return is fine: callers re-check.
+    void wait(std::atomic<std::uint32_t>& w, std::uint32_t old) { (void)os::wait_on_address(w, old); }
+    void wake_one(std::atomic<std::uint32_t>& w) { os::wake_one(w); }
+    void wake_all(std::atomic<std::uint32_t>& w) { os::wake_all(w); }
+#elif defined(__cpp_lib_atomic_wait) && !defined(FORGE_TASK_PARK_CONDVAR)
     void wait(std::atomic<std::uint32_t>& w, std::uint32_t old) { w.wait(old, std::memory_order_seq_cst); }
     void wake_one(std::atomic<std::uint32_t>& w) { w.notify_one(); }
     void wake_all(std::atomic<std::uint32_t>& w) { w.notify_all(); }
