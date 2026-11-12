@@ -15,6 +15,158 @@
 #include "check.hpp"
 using namespace forge;
 namespace fs = forge::os::fs;
+// ---- machine identity, budgets, virtualization, account database, sessions, scheduler, service logs (begin)
+#include <forge/os/sysinfo.hpp>
+#include <forge/os/virtualization.hpp>
+#include <forge/os/users.hpp>
+#include <forge/os/sessions.hpp>
+#include <forge/os/scheduler.hpp>
+TEST(sysinfo_identity_and_budgets) {
+    auto id = os::machine_id();
+    std::printf("  machine id: %s\n", id ? (id->substr(0, 6) + "...").c_str() : id.err.what.c_str());
+    CHECK(id || os::is_unsupported(id.err)); if (id) { CHECK(id->size() >= 16); CHECK(*os::machine_id() == *id); }
+    os::set_machine_id("test-machine-id-0001"); CHECK(*os::machine_id() == "test-machine-id-0001"); os::set_machine_id("");
+    auto bt = os::boot_time_ns(); CHECK(bt); auto up = os::uptime_seconds();
+    if (bt && up) {
+        std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        CHECK(*bt > 0 && *bt < now); double d = double(now - *bt) / 1e9 - *up; CHECK_MSG(d > -120 && d < 120, "boot time vs uptime differ by %.1f s", d);
+    }
+    auto c = os::cpu_limits(); std::printf("  cpus: affinity %u quota %.2f usable %u (%s)\n", c.affinity, c.quota, c.usable, c.source.c_str());
+    CHECK(c.affinity >= 1 && c.usable >= 1 && c.usable <= c.affinity); CHECK(os::usable_cpu_count() == c.usable);
+    auto m = os::memory_limits(); std::printf("  memory: physical %llu limit %llu usable %llu (%s)\n", (unsigned long long)m.physical, (unsigned long long)m.limit, (unsigned long long)m.usable, m.source.c_str());
+    CHECK(m.physical > 0 && m.usable > 0 && m.usable <= m.physical);
+    CHECK(os::detail::parse_cpu_max("max 100000") == 0); CHECK(os::detail::parse_cpu_max("150000 100000") == 1.5); CHECK(os::detail::parse_cpu_max("-1 100000") == 0); CHECK(os::detail::parse_cpu_max("") == 0);
+}
+TEST(virtualization_detect) {
+    auto v = os::virtualization();
+    std::printf("  hypervisor '%s' container '%s' translator '%s' emulator %d\n", v.hypervisor.c_str(), v.container.c_str(), v.translator.c_str(), v.emulator);
+    CHECK(v.virtualized() == !v.hypervisor.empty());
+    namespace d = os::detail;
+    CHECK(d::hypervisor_from_cpuid_vendor("KVMKVMKVM\0\0\0") == "kvm"); CHECK(d::hypervisor_from_cpuid_vendor("Microsoft Hv") == "hyperv");
+    CHECK(d::hypervisor_from_cpuid_vendor("VMwareVMware") == "vmware"); CHECK(d::hypervisor_from_cpuid_vendor("GenuineIntel").empty());
+    CHECK(d::hypervisor_from_dmi("QEMU", "Standard PC (Q35 + ICH9, 2009)") == "qemu"); CHECK(d::hypervisor_from_dmi("Microsoft Corporation", "Virtual Machine") == "hyperv");
+    CHECK(d::hypervisor_from_dmi("Microsoft Corporation", "Surface Laptop 5").empty()); CHECK(d::hypervisor_from_dmi("Dell Inc.", "XPS 13").empty());
+    CHECK(d::hypervisor_from_dmi("innotek GmbH", "VirtualBox") == "virtualbox"); CHECK(d::hypervisor_from_dmi("Amazon EC2", "t3.micro") == "kvm");
+    CHECK(d::container_from_cgroup("0::/system.slice/docker-abc.scope\n") == "docker"); CHECK(d::container_from_cgroup("12:memory:/kubepods/burstable/pod1/abc\n") == "kubernetes");
+    CHECK(d::container_from_cgroup("0::/user.slice/user-1000.slice/session-3.scope\n").empty()); CHECK(d::container_from_cgroup("0::/machine.slice/libpod-123.scope") == "podman");
+    CHECK(d::wsl_kernel("5.15.153.1-microsoft-standard-WSL2")); CHECK(d::wsl_kernel("4.4.0-19041-Microsoft")); CHECK(!d::wsl_kernel("6.8.0-45-generic"));
+}
+TEST(users_database_and_groups) {
+    auto me = os::current_user();
+    auto us = os::list_users(); std::printf("  users: %s\n", us ? std::to_string(us->size()).c_str() : us.err.what.c_str());
+    CHECK(us || os::is_unsupported(us.err));
+    if (us) { for (auto& u : *us) CHECK(!u.name.empty()); }
+#if defined(__linux__) && !defined(__ANDROID__)
+    if (us) { bool root = false; for (auto& u : *us) root |= u.name == "root" && u.uid == 0; CHECK(root); }
+#endif
+    auto gs = os::list_groups(); std::printf("  groups: %s\n", gs ? std::to_string(gs->size()).c_str() : gs.err.what.c_str());
+    CHECK(gs || os::is_unsupported(gs.err));
+    if (gs && !gs->empty()) {
+        for (auto& g : *gs) CHECK(!g.name.empty());
+        auto g0 = os::lookup_group((*gs)[0].name); CHECK_MSG(bool(g0), "%s", (*gs)[0].name.c_str()); if (g0) CHECK(g0->name == (*gs)[0].name && g0->gid == (*gs)[0].gid);
+    }
+    CHECK(!os::lookup_group("forge-no-such-group-xyz"));
+    if (!me.groups.empty()) { auto g = os::lookup_group(me.groups[0]); std::printf("  group %s: %s\n", me.groups[0].c_str(), g ? ("gid " + std::to_string(g->gid)).c_str() : g.err.what.c_str()); }
+    std::printf("  is_admin %d, is_elevated %d\n", os::is_admin(), os::is_elevated()); if (os::is_elevated()) CHECK(os::is_admin());
+    for (auto d : {os::user_dir::music, os::user_dir::pictures, os::user_dir::videos, os::user_dir::public_share, os::user_dir::templates, os::user_dir::fonts, os::user_dir::applications, os::user_dir::temp})
+        CHECK(!os::user_directory(d).empty());
+    CHECK(os::user_directory(os::user_dir::home) == os::home_dir()); CHECK(os::user_directory(os::user_dir::temp) == os::temp_dir());
+}
+TEST(sessions_and_elevation) {
+    auto s = os::login_sessions(); std::printf("  sessions: %s\n", s ? std::to_string(s->size()).c_str() : s.err.what.c_str());
+    CHECK(s || os::is_unsupported(s.err));
+    for (auto& x : s.value) { std::printf("  session %ld user %s on '%s' from '%s'%s\n", x.id, x.user.c_str(), x.terminal.c_str(), x.host.c_str(), x.active ? "" : " (inactive)"); CHECK(!x.user.empty()); }
+    CHECK(!os::run_elevated({})); CHECK(!os::run_elevated({"a", std::string("b\0c", 3)}));
+    namespace de = os::detail_elevate;
+    CHECK(de::sh_quote("it's") == "'it'\\''s'"); CHECK(de::win_quote("a b\\") == "\"a b\\\\\""); CHECK(de::win_quote("plain") == "plain");
+    auto cmd = os::elevation_command({"/bin/echo", "a b"}, false); std::printf("  elevation command:"); for (auto& a : cmd) std::printf(" %s", a.c_str()); std::printf("\n");
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    CHECK(os::is_unsupported(os::run_elevated({"true"}).err));
+#else
+#if defined(_WIN32)
+    std::vector<std::string> argv = {"cmd.exe", "/c", "exit 7"};
+#else
+    std::vector<std::string> argv = {"/bin/sh", "-c", "exit 7"};
+#endif
+    auto r = os::run_elevated(argv, false, 20000);   // never prompts: runs (root, or passwordless sudo) or fails cleanly
+    std::printf("  run_elevated without prompt: %s\n", r ? ("exit " + std::to_string(*r)).c_str() : r.err.what.c_str());
+    if (r) CHECK(*r == 7 || !os::is_elevated()); else CHECK(os::needs_prompt(r.err) || os::is_unsupported(r.err) || r.err.code != 0);
+    if (os::is_elevated()) CHECK(r && *r == 7);
+#endif
+}
+TEST(schedule_render_and_validate) {
+    namespace sc = os::schedule;
+    sc::task t; t.name = "forge.nightly"; t.argv = {"/opt/forge/bin/forge", "sync", "--pct=100%", "it's"}; t.minute = 30; t.hour = 2; t.description = "Nightly <sync>";
+    CHECK(sc::validate(t));
+    { auto b = t; b.name = "a b"; CHECK(!sc::validate(b)); } { auto b = t; b.argv = {}; CHECK(!sc::validate(b)); } { auto b = t; b.interval_s = 600; CHECK(!sc::validate(b)); }
+    { auto b = t; b.minute = 60; CHECK(!sc::validate(b)); } { auto b = t; b.minute = -1; CHECK(!sc::validate(b)); } { auto b = t; b.day = 3; b.weekday = 1; CHECK(!sc::validate(b)); }
+    { auto b = t; b.month = 6; CHECK(!sc::validate(b)); } { auto b = t; b.argv[1] = "a\nb"; CHECK(!sc::validate(b)); } { sc::task i; i.name = "x"; i.argv = {"/bin/true"}; i.interval_s = 30; CHECK(!sc::validate(i)); }
+    CHECK(sc::render_cron_line(t) == "30 2 * * * '/opt/forge/bin/forge' 'sync' '--pct=100\\%' 'it'\\''s' # forge-schedule:forge.nightly");
+    auto timer = sc::render_systemd_timer(t); CHECK(timer.find("OnCalendar=*-*-* 02:30:00\nPersistent=true\nUnit=forge.nightly.service\n") != std::string::npos);
+    auto svc = sc::render_systemd_service(t); CHECK(svc.find("Type=oneshot\nExecStart=") != std::string::npos); CHECK(svc.find("100%%") != std::string::npos);
+    auto pl = sc::render_launchd_plist(t); CHECK(pl.find("<key>StartCalendarInterval</key>\n  <dict>\n    <key>Minute</key><integer>30</integer>\n    <key>Hour</key><integer>2</integer>\n  </dict>") != std::string::npos);
+    auto xml = sc::render_task_xml(t);
+    CHECK(xml.find("<StartBoundary>2020-01-01T02:30:00</StartBoundary>") != std::string::npos); CHECK(xml.find("<ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>") != std::string::npos);
+    CHECK(xml.find("<Description>Nightly &lt;sync&gt;</Description>") != std::string::npos); CHECK(xml.find("<Command>/opt/forge/bin/forge</Command>") != std::string::npos);
+    CHECK(xml.find("<Arguments>sync --pct=100% it&apos;s</Arguments>") != std::string::npos);
+    sc::task w = t; w.weekday = 1; w.working_dir = "/var/lib/forge data";
+    CHECK(sc::render_cron_line(w).rfind("30 2 * * 1 cd '/var/lib/forge data' && ", 0) == 0); CHECK(sc::render_systemd_timer(w).find("OnCalendar=Mon *-*-* 02:30:00") != std::string::npos);
+    CHECK(sc::render_task_xml(w).find("<ScheduleByWeek><DaysOfWeek><Monday /></DaysOfWeek>") != std::string::npos); CHECK(sc::render_launchd_plist(w).find("<key>Weekday</key><integer>1</integer>") != std::string::npos);
+    sc::task m = t; m.day = 15; m.month = 6; CHECK(sc::validate(m)); CHECK(sc::render_systemd_timer(m).find("OnCalendar=*-06-15 02:30:00") != std::string::npos);
+    CHECK(sc::render_task_xml(m).find("<DaysOfMonth><Day>15</Day></DaysOfMonth><Months><June /></Months>") != std::string::npos);
+    sc::task h; h.name = "hourly"; h.argv = {"/bin/true"}; h.minute = 5; CHECK(sc::validate(h)); CHECK(sc::render_cron_line(h).rfind("5 * * * * ", 0) == 0);
+    CHECK(sc::render_task_xml(h).find("<Interval>PT1H</Interval>") != std::string::npos); CHECK(sc::render_systemd_timer(h).find("OnCalendar=*-*-* *:05:00") != std::string::npos);
+    sc::task i; i.name = "every"; i.argv = {"/bin/true"}; i.interval_s = 900; CHECK(sc::validate(i));
+    CHECK(sc::render_cron_line(i).rfind("*/15 * * * * ", 0) == 0); CHECK(sc::render_systemd_timer(i).find("OnUnitActiveSec=900s") != std::string::npos);
+    CHECK(sc::render_launchd_plist(i).find("<key>StartInterval</key><integer>900</integer>") != std::string::npos); CHECK(sc::render_task_xml(i).find("<Interval>PT15M</Interval>") != std::string::npos);
+    i.interval_s = 7200; CHECK(sc::render_cron_line(i).rfind("0 */2 * * * ", 0) == 0); i.interval_s = 86400; CHECK(sc::render_cron_line(i).rfind("0 0 * * * ", 0) == 0);
+    i.interval_s = 420; CHECK(sc::render_cron_line(i).empty()); i.interval_s = 90; CHECK(sc::render_cron_line(i).empty());   // 7 min / 90 s: not expressible
+    namespace ds = sc::detail_schedule;
+    bool found = false; std::string tab = "MAILTO=x\n0 1 * * * /a # forge-schedule:other\n30 2 * * * /b # forge-schedule:forge.nightly\n";
+    CHECK(ds::cron_without(tab, "forge.nightly", &found) == "MAILTO=x\n0 1 * * * /a # forge-schedule:other\n"); CHECK(found);
+    CHECK(ds::cron_without(tab, "forge", &found) == tab); CHECK(!found);   // a name that is a prefix of another does not match
+    CHECK(ds::utf16_bom("aé𝄞") == std::string("\xFF\xFE" "a\0" "\xE9\0" "\x34\xD8\x1E\xDD", 10));
+}
+TEST(schedule_definition_files) {
+    namespace sc = os::schedule;
+    std::printf("  scheduler backend: %s\n", sc::backend().c_str());
+    sc::task t; t.name = "forge-test-" + std::to_string(os::pid()); t.argv = {"/bin/true"}; t.interval_s = 3600;
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    CHECK(os::is_unsupported(sc::install(t).err)); CHECK(os::is_unsupported(sc::uninstall(t).err)); CHECK(os::is_unsupported(sc::installed(t).err)); CHECK(sc::backend() == "none");
+#else
+    auto d = os::fs::make_temp_dir("fsched-"); CHECK(d); if (!d) return;
+    t.dir = *d;   // definitions only: nothing is registered with the scheduler
+    auto in0 = sc::installed(t); CHECK(in0 && !*in0);
+    auto r = sc::install(t); CHECK_MSG(bool(r), "%s", r.err.what.c_str());
+    auto files = sc::definition_files(t); CHECK(!files.empty());
+    for (auto& f : files) { auto st = os::stat(f); CHECK_MSG(st.exists && st.size > 0, "%s", f.c_str()); }
+    auto in1 = sc::installed(t); CHECK(in1 && *in1);
+#if defined(_WIN32)
+    auto x = os::read_file(files[0]); CHECK(x && x->size() > 4 && (unsigned char)(*x)[0] == 0xFF && (unsigned char)(*x)[1] == 0xFE);
+#endif
+    CHECK(sc::uninstall(t)); auto in2 = sc::installed(t); CHECK(in2 && !*in2); CHECK(sc::uninstall(t));
+    os::fs::remove_all(*d);
+    sc::task bad; bad.name = "../x"; bad.argv = {"/bin/true"}; bad.interval_s = 60; CHECK(!sc::install(bad)); CHECK(!sc::installed(bad)); CHECK(!sc::uninstall(bad));
+#endif
+}
+TEST(service_logs_and_restart) {
+    namespace svc = os::service;
+    CHECK(svc::tail_lines_("a\nb\nc\n", 2) == "b\nc\n"); CHECK(svc::tail_lines_("a\nb\nc", 1) == "c"); CHECK(svc::tail_lines_("a\nb\n", 5) == "a\nb\n"); CHECK(svc::tail_lines_("", 3).empty());
+    svc::service_spec s; s.name = "forge-test-nonexistent-" + std::to_string(os::pid()); s.argv = {"/bin/true"};
+    auto cmd = svc::logs_command(s, 20); std::printf("  logs command:"); for (auto& a : cmd) std::printf(" %s", a.c_str()); std::printf("\n");
+    { auto bad = s; bad.name = "a b"; CHECK(svc::logs_command(bad).empty()); CHECK(!svc::logs(bad)); }
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+    CHECK(cmd.empty()); CHECK(os::is_unsupported(svc::logs(s).err)); CHECK(os::is_unsupported(svc::restart(s).err));
+#else
+    CHECK(!cmd.empty());
+#if !defined(__APPLE__)   // `log show` takes many seconds on a busy Mac: the command line is checked above, not run
+    auto l = svc::logs(s, 20); std::printf("  logs: %s\n", l ? (std::to_string(l->size()) + " bytes").c_str() : l.err.what.c_str());
+    CHECK(l || os::is_unsupported(l.err) || l.err.code != 0);
+#endif
+    auto r = svc::restart(s); CHECK(!r);   // not installed (or no service manager): an error, never a hang
+#endif
+}
+// ---- machine identity, budgets, virtualization, account database, sessions, scheduler, service logs (end)
 
 TEST(glob_match_rules) {
     CHECK(fs::glob_match("*.cpp", "a.cpp")); CHECK(!fs::glob_match("*.cpp", "d/a.cpp"));

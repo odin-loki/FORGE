@@ -123,6 +123,28 @@ implements the call; macOS, FreeBSD, iOS and Android were cross-compiled only (s
 | P10 | Console mouse / paste / focus / alternate screen, resize; boot and awake clocks; core-dump control | fixed 2026-11-12 (`console.hpp`, `time.hpp`, `crash.hpp`) |
 | P11 | cgroup v2 / `rctl` limits, ReFS `clone_file`, one reactor over all waitables, `mremap` | open |
 
+## Wave 3 (2026-11-12): parity, system / hardware / network / services half
+The per-function matrix is [os-parity.md](os-parity.md). Run on Linux (clang 23) and, for Windows, as MinGW builds
+under wine 9; FreeBSD and macOS compiled with zig only; Android and iOS branches were only syntax-checked with
+faked platform macros.
+
+| ID | Cat | Item | Status |
+|---|---|---|---|
+| S1 | A | No link details, default routes, DNS servers, system proxy or network change notifications | fixed 2026-11-12: `netinfo.hpp` (iOS: no routes, the SDK lacks `<net/route.h>`; Android: proxy through `set_proxy_hook`) |
+| S2 | A | No keep-alive tuning, fast open, reuseport, dual stack, AF_UNIX on Windows, multicast, mDNS, happy eyeballs, TLS capability query | fixed 2026-11-12: `sockopt.hpp`, `net::tls_backend()`; `SO_REUSEPORT` and client fast open stay unsupported on Windows |
+| S3 | A | No machine id, boot time, container-aware CPU / memory budget, virtualization detection | fixed 2026-11-12: `sysinfo.hpp`, `virtualization.hpp` |
+| S4 | A | FreeBSD reports every core as a P-core on Intel hybrid CPUs | fixed 2026-11-12: CPUID leaf 0x1A read per CPU (compiled only) |
+| S5 | A | No device hot-plug; clipboard unsupported on iOS / Android | fixed 2026-11-12: `device_watch.hpp`; UIPasteboard, `clipboard::set_backend` |
+| S6 | A | No loaded-module list or loader flags | fixed 2026-11-12: `loaded_modules`, `module_of_address`, `dynlib::open_with` |
+| S7 | A | Services: no restart, no logs; no scheduled tasks | fixed 2026-11-12: `service::restart`, `service::logs`, `scheduler.hpp` |
+| S8 | A | No user / group enumeration, admin check, sessions, elevation; registry is Windows-only | fixed 2026-11-12: `users.hpp`, `sessions.hpp`, `preferences.hpp` |
+| S9 | C | `service_control.hpp` used `fs::` without including `fs.hpp` (compiled only after another header) | fixed 2026-11-12 |
+| S10 | A | Missing on every OS: volumes, displays, idle / lock state, single instance, autostart, open URL / file, notifications, trash | added 2026-11-12, one header each |
+| S11 | B | Linux clipboard, `open_url`, `notify` need helper programs (wl-clipboard / xclip / xsel, xdg-open / gio, notify-send / gdbus); no native X11 / Wayland / D-Bus client | open: a wire-protocol client is a large addition; calls return `unsupported` without the helper |
+| S12 | B | Rename events are not paired (old → new) on any backend | won't fix: kqueue and FSEvents cannot pair; all backends report `renamed` + `created` |
+| S13 | B | `system_proxy` does not evaluate PAC scripts or read KDE settings | open |
+| S14 | D | The Android and iOS branches added here have never been compiled by a real toolchain; MSVC has not built them | open: first CI run |
+
 ## Inherent limits (not fixed)
 Windows: `chown`, POSIX signals beyond kill/terminate, user-mode PMCs, THP, per-process open-file/file-size limits,
 in-process network denial, atomic rename exchange, sealing a section. macOS: hard CPU affinity, temperature without SMC. iOS: spawning, process listing,
