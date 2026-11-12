@@ -138,6 +138,16 @@ public:
         auto L = cuda_hip::kernel_args(op, in, a, out);
         std::lock_guard lk(mu_); begin_op();
         ++dispatches_[op];
+        // Settle the residency map before binding anything: acquiring a range that partly overlaps a resident entry
+        // drops that entry (after syncing it back), and an input bound earlier in this same launch may live inside
+        // it (an activation inside a stale larger entry of the reused arena, then an output that overlaps the same
+        // entry). Its handle would then be freed while the kernel still uses it. After this pass every range has
+        // its entry, so the binds below only hit the cache.
+        if (in_run_) {
+            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+            acquire(out.data, out.size(), true);
+            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+        }
         launch l; l.kernel = kernel("forge_" + op); l.global = L.threads;
         std::vector<void*> temps;
         auto free_temps = [&] { for (auto p : temps) dfree(p); };

@@ -109,15 +109,20 @@ new CUDA code ran on the RTX 3090.
   (14/14 attention shapes, 24/24 quantised matmul cases, 20/20 fused FFN cases, state ops, 4/4 quantised gather).
   The OpenCL/Level Zero mocks execute the generated `kernels.cl` as C. Not compiled by any real OpenCL C compiler.
 - Device mixture of experts (`run_moe`) on CUDA, HIP, OpenCL, Level Zero: 21/21 cases match the CPU sparse path on
-  each mock. The two kernels compile to PTX (sm_70, sm_80) and AMDGPU code objects. `golden_moe_mla_*_mock` ctests
-  are registered but were **not run** here (the `forge` app was not built: the shared build machine ran out of disk).
+  each mock. The two kernels compile to PTX (sm_70, sm_80) and AMDGPU code objects. `golden_moe_mla_{cuda,hip,opencl,ze}_mock`
+  (Mixtral and DeepSeek-V2 tiny models, f32 expert weights) pass.
 - Kernel program cache (OpenCL program binaries, Level Zero native binaries): `test_cuda_hip cache opencl|ze` 12/12.
 - Determinism mode: `test_cuda_hip determinism <api>` 6/6 on the four mocks. The mocks run serially, so this shows
   the kernel selection, not a device's scheduling.
 - Automatic device selection: `test_gpu` scoring test; `test_cuda_hip select <api>` 11/11 with `MOCK_DEVICES=2`.
 - Fixed: plans destroyed on OpenCL, Level Zero and Vulkan left pins and resident constants behind (no
   `device_hooks::forget`), corrupting later plans (heap corruption / SIGBUS with `FORGE_DEVICE=opencl`). The OpenCL
-  sub-buffer cache also ignored the view size. Regression: `test_cuda_hip stale <api>` 6/6 on the four mocks.
+  sub-buffer cache also ignored the view size. Regression: `test_cuda_hip stale <api>` 7/7 on the four mocks.
+- Fixed: OpenCL and Level Zero `run_op` bound its inputs before acquiring the output; an output that partly
+  overlapped the resident entry an input lived in (a reused plan arena) dropped that entry and left the input's
+  handle freed. That was the SIGBUS in `forge_matmul_t` with `FORGE_DEVICE=opencl` (DeepSeek-V2 tiny golden; reported
+  for Gemma / Phi-3 plans). `run_op` now settles the residency map first. `golden_moe_mla_opencl_mock` failed before
+  and passes now; the Gemma / Phi-3 goldens of the reporting branch were not run here (not merged yet).
 - Vulkan on lavapipe: `test_vulkan` still passes (the new `forget` hook); no new Vulkan kernels.
 - Not done in this round: Vulkan (GLSL) and Metal (MSL) ports of the kernels above, eviction during captures with
   buffer generations, the missing `gpu::prims`, `pipe:auto` partitioning, RPC remote weight residency.

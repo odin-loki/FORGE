@@ -944,6 +944,25 @@ template<class RT, class Open> static int stale_t(Open open) {
     check(host_step, "the plans have a host step between device steps");
     check(match, "18 plans compiled, run twice and destroyed in turn match the CPU");
     check(rt->residency().resident == 0, "nothing of a dead plan stays resident");
+    {   // One launch whose output partly overlaps the resident entry its input lives in (what a reused plan arena
+        // produces: golden_moe_mla_opencl_mock died with SIGBUS in forge_matmul_t here). Acquiring the output drops
+        // that entry; the input must have been re-bound, not left pointing at the freed buffer.
+        std::vector<float> v(2048), other(128, 2.f), want(1024);
+        for (std::size_t i = 0; i < v.size(); ++i) v[i] = float(i % 97) * 0.5f;
+        bool ok = true;
+        for (int rep = 0; rep < 4 && ok; ++rep) {
+            std::vector<float> tmp(1024);
+            rt->begin_run();
+            rt->run_op("neg", {{v.data(), {1024}}}, {}, {tmp.data(), {1024}});            // v[0, 1024) resident as one entry
+            for (std::size_t i = 0; i < 128; ++i) want[i] = v[i] + other[i];
+            rt->run_op("add", {{v.data(), {128}}, {other.data(), {128}}}, {}, {v.data() + 512, {128}});   // inside the entry: fine
+            rt->run_op("add", {{v.data(), {128}}, {other.data(), {128}}}, {}, {v.data() + 960, {128}});   // out = v[960, 1088): straddles its end
+            rt->end_run();
+            for (std::size_t i = 0; i < 128; ++i) ok = ok && v[512 + i] == want[i] && v[960 + i] == want[i];
+            for (std::size_t i = 0; i < v.size(); ++i) v[i] = float((i + std::size_t(rep)) % 97) * 0.5f;
+        }
+        check(ok, "an output that straddles the entry holding its input: the input is re-bound");
+    }
     if constexpr (requires { rt->forget((const float*)nullptr, std::size_t(0)); }) {
         // runtime level: a pinned buffer survives end_run; forget() drops it and the pin, so a smaller buffer placed at
         // the same address is uploaded afresh and is not synced back with the old size
