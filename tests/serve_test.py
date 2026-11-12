@@ -12,6 +12,16 @@ try:
         r = urllib.request.urlopen(req, timeout=60)
         return r.read().decode() if raw else json.loads(r.read())
     assert json.loads(urllib.request.urlopen(base + "/health").read())["status"] == "ok"
+    # A Content-Length that is not a number used to end the whole server (uncaught std::invalid_argument on the
+    # connection thread); the request is dropped and the server keeps serving.
+    import socket
+    for bad in (b"abc", b"", b"99999999999999999999999999", b"-1", b"12abc"):
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sk:
+            sk.sendall(b"POST /v1/completions HTTP/1.1\r\nContent-Length: " + bad + b"\r\n\r\n{}")
+            sk.settimeout(10)
+            assert sk.recv(4096) == b"", bad   # closed without a reply
+        assert p.poll() is None, f"forge-serve died on Content-Length: {bad!r}"
+    assert json.loads(urllib.request.urlopen(base + "/health").read())["status"] == "ok"
     prompts = ["the", "in the", "a cat", "on the mat", "hello world", "re"]
     want = {}
     for q in prompts:

@@ -2,9 +2,12 @@
 // forge-serve's HTTP/1.1 request reader, kept apart from the socket so the parser can be driven from a buffer
 // (fuzz/fuzz_serve_http.cpp). Limits: 1 MiB of header bytes, 64 MiB of body.
 #include <cctype>
+#include <charconv>
 #include <cstddef>
 #include <map>
 #include <string>
+#include <string_view>
+#include <system_error>
 
 namespace forge::serve {
 
@@ -32,7 +35,15 @@ template <class Recv> bool read_request(Recv&& recv, http_request& r) {
         auto v = l.substr(c + 1); while (!v.empty() && v[0] == ' ') v.erase(0, 1);
         r.headers[k] = v;
     }
-    std::size_t len = r.headers.count("content-length") ? std::stoul(r.headers["content-length"]) : 0;
+    // Content-Length: decimal digits only (trailing blanks allowed). std::stoul threw on "abc", "" or a value
+    // out of range, and the exception left the connection thread uncaught: one request ended the server.
+    std::size_t len = 0;
+    if (auto it = r.headers.find("content-length"); it != r.headers.end()) {
+        std::string_view v = it->second;
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+        auto [end, ec] = std::from_chars(v.data(), v.data() + v.size(), len);
+        if (v.empty() || ec != std::errc() || end != v.data() + v.size()) return false;
+    }
     if (len > (64u << 20)) return false;
     r.body = buf.substr(hdr_end + 4);
     while (r.body.size() < len) { auto n = recv(tmp, sizeof tmp); if (n <= 0) return false; r.body.append(tmp, std::size_t(n)); }
