@@ -2,6 +2,7 @@
 // a SIMD table) and the choice of table for this CPU.
 #include <forge/simd/qdot_i8.hpp>
 #include <forge/simd/dispatch.hpp>
+#include "isa_tables.hpp"
 #include <cstdlib>
 #include <string_view>
 
@@ -78,7 +79,16 @@ const qi8_kernels* qi8_by_name(const char* t) {
 #endif
     (void)f;
 #endif
+    // the GNU-vector kernels (qi8_gn.inc), one per Tier P table outside AArch64 and the x86 AVX tables
+    for (const char* g : {"sse4.2", "sse2", "rvv", "lasx", "lsx", "vsx", "vxe", "simd128", "msa"})
+        if (n == g) { const isa_tables* e = isa_extra_by_name(g); return e ? e->qi8 : nullptr; }
     return nullptr;
+}
+
+std::span<const char* const> qi8_target_names() {
+    static const char* const names[] = {"avx512vnni", "avxvnni", "avx2", "sse4.2", "sse2", "sve", "dotprod", "neon", "rvv",
+                                        "lasx", "lsx", "vsx", "vxe", "simd128", "msa", "scalar"};
+    return names;
 }
 
 const qi8_kernels& qi8_active() {
@@ -91,11 +101,14 @@ const qi8_kernels& qi8_active() {
             if (s == "scalar") return &qi8_tables::scalar;
             if (s == "avx2") if (auto* p = qi8_by_name("avx2")) return p;
             if (s == "neon") if (auto* p = qi8_by_name("neon")) return p;
+            for (const char* g : {"sse4.2", "sse2", "rvv", "lasx", "lsx", "vsx", "vxe", "simd128", "msa"})
+                if (s == g) if (auto* p = qi8_by_name(g)) return p;
         }
         // AArch64: the SVE table only where registers are wider than NEON's (at 128 bits it does the dotprod
         // table's work with predicates on top); dotprod over the ARMv8.0 widening multiplies.
         if (detect().sve_bytes >= 32) if (auto* p = qi8_by_name("sve")) return p;
-        for (const char* t : {"avx512vnni", "avxvnni", "avx2", "dotprod", "neon"}) if (auto* p = qi8_by_name(t)) return p;
+        for (const char* t : {"avx512vnni", "avxvnni", "avx2", "sse4.2", "sse2", "dotprod", "neon", "rvv", "lasx", "lsx", "vsx", "vxe", "simd128", "msa"})
+            if (auto* p = qi8_by_name(t)) return p;
         return &qi8_tables::scalar;
     }();
     return *k;
@@ -103,10 +116,12 @@ const qi8_kernels& qi8_active() {
 
 bool qi8_default_on() {
 #if defined(__x86_64__) || defined(_M_X64)
-    return std::string_view(qi8_active().target) != "scalar";
+    // the AVX tables only: the SSE tables (GNU-vector kernels) have not been timed against the f32 path
+    return std::string_view(qi8_active().target).substr(0, 3) == "avx";
 #else
-    // AArch64 has SIMD tables (neon, dotprod, sve) that match the reference bit for bit under qemu, but they
-    // have never been timed on hardware: the default stays the f32 path, FORGE_CPU_INT8=1 turns them on.
+    // AArch64 has SIMD tables (neon, dotprod, sve) and the other architectures the GNU-vector ones (qi8_gn.inc);
+    // they match the reference bit for bit under qemu, but have never been timed on hardware: the default
+    // stays the f32 path, FORGE_CPU_INT8=1 turns them on.
     return false;
 #endif
 }

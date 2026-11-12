@@ -12,14 +12,16 @@
 // result does not depend on how many other vectors were computed with it (nv = 1..N).
 //
 // qi8_kernels is a dispatch table separate from simd::kernels: it is chosen once from the CPU's integer
-// dot-product support (x86: avx512vnni > avxvnni > avx2; AArch64: sve when the vector length is 256 bits or
-// more > dotprod > neon; scalar everywhere else), FORGE_QI8_TARGET overrides.
+// dot-product support (x86: avx512vnni > avxvnni > avx2 > sse4.2 > sse2; AArch64: sve when the vector length is
+// 256 bits or more > dotprod > neon; rvv, lasx > lsx, vsx, vxe, simd128, msa on their architectures: one kernel
+// source over GNU vector types, simd/src/qi8_gn.inc; scalar otherwise), FORGE_QI8_TARGET overrides.
 #include <forge/simd/qdot.hpp>
 #include <forge/core/fma.hpp>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <span>
 
 namespace forge::simd {
 
@@ -156,8 +158,10 @@ struct qi8_kernels {
                    std::size_t act_stride, std::size_t k, std::size_t nv, float* y, std::size_t y_stride);
 };
 const qi8_kernels& qi8_active();                 // best for this CPU (FORGE_QI8_TARGET overrides)
-// "scalar"; x86: "avx2", "avxvnni", "avx512vnni"; AArch64: "neon", "dotprod", "sve". nullptr if unusable here.
+// "scalar"; x86: "avx2", "avxvnni", "avx512vnni", "sse4.2", "sse2"; AArch64: "neon", "dotprod", "sve"; "rvv",
+// "lasx", "lsx", "vsx", "vxe", "simd128", "msa" on their architectures. nullptr if unusable here.
 const qi8_kernels* qi8_by_name(const char* t);
+std::span<const char* const> qi8_target_names();   // every name qi8_by_name knows, preferred first, scalar last
 // Whether the CPU quantised matmul uses the integer kernels when FORGE_CPU_INT8 is not set: x86 with a SIMD
 // table. AArch64 stays on the f32 path until the kernels have been timed on hardware (FORGE_CPU_INT8=1 opts in).
 bool qi8_default_on();

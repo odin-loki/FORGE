@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build tests/test_simd.cpp and the simd kernel tables for wasm32-wasi (scalar + SIMD128) and run them.
+# Build tests/test_simd.cpp, test_simd_tables.cpp, test_simd_tiera.cpp (and test_simd_types.cpp) and the simd
+# tables for wasm32-wasi (scalar + SIMD128: kernels, Tier A, seq, int8) and run them.
 # The rest of FORGE is not ported to WebAssembly; this covers what is: the simd headers, the kernel tables
 # and their dispatch (docs/simd.md, "WebAssembly").
 #
@@ -20,21 +21,55 @@ for d in tests inference/include modelfile/include graph/include ops/include cor
          support/include third_party security/include verify/include loadbalancer/include; do INC="$INC -I$R/$d"; done
 FLAGS="-std=c++23 -O2 -DNDEBUG -DFORGE_SOURCE_DIR=\"$R\" $INC -I$GEN"
 DEFS=""
+OBJS=""
 if [ "${WASM_SIMD:-1}" = 1 ]; then
   $CXX $FLAGS -msimd128 -ffp-contract=off -c "$R/simd/src/kernels_gn.cpp" -o "$OUT/kernels_gn.o"
+  # the Tier A, seq and int8 tables of the simd128 backend
+  $CXX $FLAGS -msimd128 -ffp-contract=off -c "$R/simd/src/isa_extra.cpp" -o "$OUT/isa_extra.o"
   DEFS="-DFORGE_SIMD_HAVE_WASM128=1"
-  OBJS="$OUT/kernels_gn.o"
+  OBJS="$OUT/kernels_gn.o $OUT/isa_extra.o"
 fi
-for s in simd/src/kernels_scalar simd/src/qi8_dispatch simd/src/seq_dispatch tests/test_simd tests/wasm_no_exceptions; do
+for s in simd/src/kernels_scalar simd/src/qi8_dispatch simd/src/seq_dispatch simd/src/tiera_scalar simd/src/tiera_dispatch tests/wasm_no_exceptions; do
   $CXX $FLAGS -c "$R/$s.cpp" -o "$OUT/$(basename $s).o"
   OBJS="$OBJS $OUT/$(basename $s).o"
 done
 $CXX $FLAGS -ffp-contract=off -c "$R/simd/src/seq_scalar.cpp" -o "$OUT/seq_scalar.o"
 $CXX $FLAGS $DEFS -c "$R/simd/src/dispatch.cpp" -o "$OUT/dispatch.o"
-$CXX -O2 $OBJS "$OUT/seq_scalar.o" "$OUT/dispatch.o" -o "$OUT/test_simd.wasm"
-echo "built $OUT/test_simd.wasm"
-if [ -n "$WASM_RUN" ]; then
-  (cd "$R" && $WASM_RUN "$OUT/test_simd.wasm")
-else
-  (cd "$R" && node --no-warnings "$R/tests/wasm_run.mjs" "$OUT/test_simd.wasm")
+TESTS="test_simd test_simd_tables test_simd_tiera"
+[ -f "$R/tests/test_simd_types.cpp" ] && TESTS="$TESTS test_simd_types"
+for t in $TESTS; do
+  $CXX $FLAGS -c "$R/tests/$t.cpp" -o "$OUT/$t.o"
+  $CXX -O2 $OBJS "$OUT/$t.o" "$OUT/seq_scalar.o" "$OUT/dispatch.o" -o "$OUT/$t.wasm"
+  echo "built $OUT/$t.wasm"
+done
+if [ "${WASM_SIMD:-1}" = 1 ] && [ -f "$R/tests/simd_types_isa.cpp" ]; then   # vec_types.hpp on SIMD128 registers (tests/simd_types_isa.cpp, as CMake's test_simd_types_<table>)
+  $CXX $FLAGS -msimd128 -c "$R/tests/simd_types_isa.cpp" -o "$OUT/simd_types_isa.o"
+  $CXX $FLAGS -c "$R/tests/simd_types_main.cpp" -o "$OUT/simd_types_main.o"
+  $CXX -O2 $OBJS "$OUT/simd_types_isa.o" "$OUT/simd_types_main.o" "$OUT/seq_scalar.o" "$OUT/dispatch.o" -o "$OUT/test_simd_types_simd128.wasm"
+  echo "built $OUT/test_simd_types_simd128.wasm"
+  TESTS="$TESTS test_simd_types_simd128"
 fi
+rc=0
+run_one() {
+  if [ -n "$WASM_RUN" ]; then (cd "$R" && $WASM_RUN "$1"); else (cd "$R" && node --no-warnings "$R/tests/wasm_run.mjs" "$1"); fi
+}
+# node 22.23 (V8) itself segfaults part-way through test_simd_tiera when all of its tests run in one process
+# (at a different test each time; every test passes on its own, also with --liftoff-only). So that binary is
+# run one test at a time under node; another runner (WASM_RUN) gets it whole.
+if [ -z "$WASM_RUN" ]; then
+  TESTS=$(echo "$TESTS" | sed 's/ test_simd_tiera//')
+  for only in tiera_tables_present minmax generic_predicates prefix_sums histograms transpose blas1 bitsets byte_search \
+              sorting_networks sort_matches partial_sort utf8 hex_and_base64; do
+    FORGE_TEST_ONLY=$only run_one "$OUT/test_simd_tiera.wasm" > "$OUT/tiera.out" 2>&1 || { rc=1; echo "FAIL test_simd_tiera ($only)"; }
+    grep -v '^0 failure' "$OUT/tiera.out" || true
+  done
+  echo "test_simd_tiera: one test per process, rc=$rc"
+fi
+for t in $TESTS; do
+  if [ -n "$WASM_RUN" ]; then
+    (cd "$R" && $WASM_RUN "$OUT/$t.wasm") || rc=1
+  else
+    (cd "$R" && node --no-warnings "$R/tests/wasm_run.mjs" "$OUT/$t.wasm") || rc=1
+  fi
+done
+exit $rc
