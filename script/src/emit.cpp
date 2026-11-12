@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <forge/os/process.hpp>
+#include <mutex>
 
 namespace forge::script {
 
@@ -575,11 +576,29 @@ std::string host_shell() {
 #endif
 }
 
-std::string shell_exe(const shell_backend& b) {
+bool shell_probe(const shell_backend& b, const std::string& exe) {
+    if (b.probe.empty() || !b.argv) return true;
+    std::string path = os::find_executable(exe);
+    if (path.empty()) return false;
+    static std::mutex mu; static std::map<std::string, bool> seen;   // "<backend>\0<resolved path>" -> verdict
+    std::string key = b.name; key.push_back('\0'); key += path;
+    { std::lock_guard g(mu); if (auto it = seen.find(key); it != seen.end()) return it->second; }
+    os::spawn_spec sp; sp.argv = b.argv(path, b.probe); sp.timeout_ms = 5000; sp.max_output = 4096;
+    bool ok = false;
+    if (auto r = os::spawn_wait(sp); r && r->exit_code == 0 && !r->timed_out) {
+        std::string out = r->out; while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' ')) out.pop_back();
+        ok = out == b.probe_out;
+    }
+    std::lock_guard g(mu); seen[key] = ok;
+    return ok;
+}
+
+std::string shell_exe(const shell_backend& b, bool probe) {
+    auto is_it = [&](const std::string& p) { return !probe || shell_probe(b, p); };
 #if defined(_WIN32)
     std::string path = os::getenv("PATH");
     for (auto& e : b.exes) {
-        if (e.find_first_of("/\\") != std::string::npos) { if (auto p = os::find_executable(e); !p.empty()) return p; continue; }
+        if (e.find_first_of("/\\") != std::string::npos) { if (auto p = os::find_executable(e); !p.empty() && is_it(p)) return p; continue; }
         std::size_t i = 0;
         while (i <= path.size()) {
             auto j = path.find(';', i); if (j == std::string::npos) j = path.size();
@@ -590,16 +609,28 @@ std::string shell_exe(const shell_backend& b) {
             std::string low = p; for (auto& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
             if (e == "bash" && (low.find("\\system32\\") != std::string::npos || low.find("\\microsoft\\windowsapps\\") != std::string::npos)) continue;   // WSL relays
             if (e == "rc" && low.find("\\windows kits\\") != std::string::npos) continue;   // the Resource Compiler, not Plan 9 rc
+            if (!is_it(p)) continue;   // same name, different program
             return p;
         }
     }
     return {};
 #else
+    auto wsl = [](const std::string& p) { return p.size() > 4 && p.compare(p.size() - 4, 4, ".exe") == 0; };   // WSL interop (cmd.exe): no Linux cwd
     for (auto& e : b.exes) {
         auto p = os::find_executable(e);
-        if (p.empty()) continue;
-        if (p.size() > 4 && p.compare(p.size() - 4, 4, ".exe") == 0) continue;   // WSL interop (cmd.exe): no Linux cwd
-        return e;
+        if (p.empty() || wsl(p)) continue;
+        if (is_it(p)) return e;
+        // The first PATH hit is another program with this shell's name (e.g. npm's `rc` ahead of /usr/bin/rc):
+        // look at the later PATH entries and return the real shell by full path.
+        if (e.find('/') != std::string::npos) continue;
+        std::string path = os::getenv("PATH");
+        for (std::size_t i = 0; i <= path.size();) {
+            auto j = path.find(':', i); if (j == std::string::npos) j = path.size();
+            std::string d = path.substr(i, j - i); i = j + 1;
+            if (d.empty()) continue;
+            auto q = os::find_executable(d + "/" + e);
+            if (!q.empty() && q != p && !wsl(q) && is_it(q)) return q;
+        }
     }
     return {};
 #endif

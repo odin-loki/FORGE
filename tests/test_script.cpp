@@ -796,6 +796,44 @@ TEST(shell_backends_golden) {
     std::printf("shells tested:%s\nshells skipped (not installed):%s\n", ran.c_str(), skipped.c_str());
 }
 
+// A file on PATH that only has a shell's name is not that shell (npm ships an `rc`, a config-file tool): discovery
+// runs the backend's identity probe, skips an impostor and looks further along PATH for the real one.
+#if !defined(_WIN32)
+#include <cstring>
+#include <unistd.h>
+TEST(shell_identity_probe) {
+    namespace stdfs = std::filesystem;
+    auto dir = stdfs::temp_directory_path() / ("forge_fakeshell_" + std::to_string(::getpid()));
+    stdfs::create_directories(dir);
+    const char* probed[] = {"rc", "es", "fish", "elvish", "nu", "ysh", "xonsh"};
+    for (const char* n : probed) {
+        auto p = dir / n; { std::ofstream(p) << "#!/bin/sh\necho '{ \"_\": [] }'\n"; }
+        stdfs::permissions(p, stdfs::perms::owner_all);
+    }
+    std::string old = std::getenv("PATH") ? std::getenv("PATH") : "";
+    ::setenv("PATH", (dir.string() + ":" + old).c_str(), 1);
+    auto got = run("for (auto& s : forge::shells()) std::print(\";{}={}|{}\", s[\"name\"], s[\"exe\"], s[\"available\"]);");
+    CHECK_MSG(got.find(dir.string()) == std::string::npos, "an impostor was taken for a shell: %s", got.c_str());
+    for (const char* n : probed) {
+        auto at = got.find(";" + std::string(n) + "="); CHECK_MSG(at != std::string::npos, "%s missing from forge::shells()", n);
+        if (at == std::string::npos) continue;
+        auto v = got.substr(at + std::strlen(n) + 2, got.find(';', at + 1) - at - std::strlen(n) - 2);
+        // not installed at all, or the real one further along PATH, named by its full path
+        CHECK_MSG(v == "|false" || (v[0] == '/' && v.ends_with("|true")), "%s resolved to [%s]", n, v.c_str());
+    }
+    // running it reaches the real shell or says it is not installed; never the impostor's output
+    auto ran = run("try { auto r = forge::rc(\"echo a^b\"); std::print(\"{}\", r.out); } catch (const ShellError& e) { std::print(\"{}\", e.what()); }");
+    CHECK_MSG(ran == "ab\n" || ran.find("is not installed") != std::string::npos, "forge::rc gave [%s]", ran.c_str());
+    // without the right to start processes nothing is probed: the listing is PATH lookup only
+    script::options o; std::string out; o.allow_proc = false; o.os_sandbox = script::options::os_sandbox_mode::off;
+    o.out = [&](std::string_view s) { out += s; };
+    script::engine e(o); auto r = e.run("for (auto& s : forge::shells()) if (s[\"name\"] == \"rc\") std::print(\"{}\", s[\"exe\"]);", "t");
+    CHECK_MSG(r.ok && out == "rc", "no-proc listing gave [%s] %s", out.c_str(), r.error.c_str());
+    ::setenv("PATH", old.c_str(), 1);
+    stdfs::remove_all(dir);
+}
+#endif
+
 // "Write once, emit anywhere": every golden script is emitted for every backend that has an emitter and is
 // installed, run by that shell without FORGE, and must match the interpreter's output and exit code.
 #include <array>
