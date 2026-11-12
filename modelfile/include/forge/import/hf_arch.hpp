@@ -113,20 +113,8 @@ struct importer {
         for (auto& kv : extra) man.push_back(kv);
         bool have_ctx = false; for (auto& [k, v] : man) have_ctx |= k == "max_position_embeddings";
         if (!have_ctx) man.emplace_back("max_position_embeddings", cfg.num_or("max_position_embeddings", 2048));
-        if (std::filesystem::exists(dir / "tokenizer_config.json")) {
-            auto tc = json::parse(read_file(dir / "tokenizer_config.json"));
-            if (auto* ab = tc.find("add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
-        }
-        if (std::filesystem::exists(dir / "tokenizer.json")) {
-            // The runtime tokenizer is byte-level BPE. Other tokenizer.json models (WordPiece, Unigram) are kept in
-            // their own section so the file stays loadable; token ids are then passed in directly.
-            auto text = read_file(dir / "tokenizer.json");
-            auto tj = json::parse(text);
-            const json::value* m = tj.find("model");
-            std::string type = m && m->is_obj() ? m->str_or("type", m->find("merges") ? "BPE" : "") : "";
-            if (type == "BPE" && m->find("merges") && m->find("vocab")) w->set_section("tokenizer", text);
-            else { w->set_section("tokenizer_json", text); man.emplace_back("tokenizer_type", type); }
-        }
+        // tokenizer (BPE, SentencePiece, Unigram, WordPiece, WordLevel) and chat template, as import_hf stores them
+        store_hf_tokenizer(dir, man, *w, rep);
         std::size_t left_out = 0;
         for (auto& s : shards)
             for (auto& [n, e] : s->entries()) {

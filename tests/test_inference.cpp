@@ -474,7 +474,7 @@ TEST(embedding_session_tokens_mask_and_named_inputs) {
         modelfile::writer w;
         w.add_tensor("tok", {10, 4}, tok, "f32"); w.add_tensor("pos", {8, 4}, pos, "f32");
         w.set_manifest(json::value(json::object{{"format", "fpk"}, {"session", "embedding"}, {"max_position_embeddings", 8.0}}));
-        w.set_section("blueprint", R"(blueprint "emb" opset 1
+        w.set_section("blueprint", R"(blueprint "emb" opset 3
 params { d: 4  vocab: 10 }
 input tokens    : f32[seq]
 input positions : f32[seq]

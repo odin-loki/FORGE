@@ -435,6 +435,70 @@ TEST(aot_golden_moe_mla_and_quantised_models) {
 }
 #endif
 
+#if defined(FORGE_TEST_BINARY_DIR)
+// The tiny models of the other template families, when their golden tests have written them: GPT-2 (learned
+// positions, biases), Gemma 1 / 2 / 3 (attention_bias with soft-capping and a sliding window, scalar(), number
+// helpers), Phi-3 / Phi-4-mini (fused projections, partial RoPE through a composite), Qwen2 (Q/K/V biases), the RoPE
+// frequency-scaling variants (opset 2 attrs: linear, dynamic, YaRN, llama3, per-dimension factors), and the
+// embedding sessions: BERT / RoBERTa (token types, masks, pooling) and ViT / CLIP / SigLIP / the Whisper encoder
+// (conv patch / frame embedding). Precompiled plans must give the bits of plans compiled at run time.
+TEST(aot_golden_template_families) {
+    const std::string dir = FORGE_TEST_BINARY_DIR;
+    int n = 0, families = 0;
+    for (const char* name : {"golden_gpt2/gpt2_f32.fpk", "golden_gpt2/gpt2_q8_0.fpk", "golden_gemma/gemma_f32.fpk", "golden_gemma/gemma2_f32.fpk", "golden_gemma/gemma2_q8_0.fpk",
+                             "golden_gemma/gemma3_f32.fpk", "golden_phi3/phi3_f32.fpk", "golden_phi3/phi4mini_f32.fpk", "golden_qwen2/qwen2_f32.fpk", "golden_qwen2/qwen2_q8_0.fpk",
+                             "golden_rope/rope0.fpk", "golden_rope/rope1.fpk", "golden_rope/rope2.fpk", "golden_rope/rope4.fpk", "golden_rope/rope5.fpk", "golden_rope/rope6.fpk",
+                             "golden_rope/rope7.fpk", "golden_rope/rope_gguf2.fpk"}) {
+        auto src = dir + "/" + name;
+        if (!fs::exists(src)) continue;
+        auto pl = plans_of(src, {.shapes = {1, 6}});
+        expect_identical(with_plans(src, pl.blob, "fam" + std::to_string(n) + ".fpk"), src, {6, 1, 1, 6, 1}, {}, 2);
+        ++n;
+    }
+    families += n > 0;
+    // embedding models that take tokens
+    int e = 0;
+    for (const char* name : {"golden_bert/bert_f32.fpk", "golden_bert/bert_q8_0.fpk", "golden_bert/roberta_f32.fpk"}) {
+        auto src = dir + "/" + name;
+        if (!fs::exists(src)) continue;
+        auto pl = plans_of(src, {.shapes = {7}});
+        auto ma = model::open(with_plans(src, pl.blob, "emb" + std::to_string(e) + ".fpk")); auto mr = jit_model(src);
+        session a(ma), r(mr);
+        std::vector<int> ids{2, 40, 7, 99, 150, 12, 3}, types{0, 0, 0, 0, 1, 1, 1}, mask{1, 1, 1, 1, 1, 1, 0};
+        if (std::string(name).find("roberta") != std::string::npos) types.assign(ids.size(), 0);   // one token type
+        CHECK_MSG(same_bits(a.embed(ids, types, mask), r.embed(ids, types, mask)), "%s", name);
+        CHECK_MSG(ma->aot().stats().used == 1 && mr->aot().stats().used == 0, "%s: precompiled plans used %zu (%s)", name, ma->aot().stats().used, ma->aot().stats().last_reject.c_str());
+        ++e;
+    }
+    families += e > 0;
+    // embedding models that take a declared f32 input (an image, mel frames): the input's size from the blueprint
+    int v = 0;
+    for (const char* name : {"golden_vit/vit_f32.fpk", "golden_vit/clip_f32.fpk", "golden_vit/siglip_f32.fpk", "golden_vit/clip_q8_0.fpk", "golden_whisper/whisper_f32.fpk"}) {
+        auto src = dir + "/" + name;
+        if (!fs::exists(src)) continue;
+        auto pl = plans_of(src);
+        auto ma = model::open(with_plans(src, pl.blob, "vis" + std::to_string(v) + ".fpk")); auto mr = jit_model(src);
+        session a(ma), r(mr);
+        std::map<std::string, std::vector<float>> in;
+        for (auto& d : mr->blueprint().inputs) {
+            std::size_t count = 1;
+            for (auto& dim : d.dims) {
+                auto it = mr->blueprint().params.find(dim);
+                count *= it != mr->blueprint().params.end() ? std::size_t(it->second) : dim == "seq" ? 1 : std::size_t(std::strtoull(dim.c_str(), nullptr, 10));
+            }
+            auto& x = in[d.name]; x.resize(count);
+            for (std::size_t i = 0; i < count; ++i) x[i] = float(int(i * 37 % 101) - 50) * 0.02f;
+        }
+        CHECK_MSG(same_bits(a.embed_inputs(in), r.embed_inputs(in)), "%s", name);
+        CHECK_MSG(ma->aot().stats().used == 1, "%s: precompiled plans used %zu (%s)", name, ma->aot().stats().used, ma->aot().stats().last_reject.c_str());
+        ++v;
+    }
+    families += v > 0;
+    if (!families) std::printf("  (no family models in %s: run the golden_tiny_* tests first)\n", dir.c_str());
+    else std::printf("  %d decoder, %d token-embedding and %d image / audio embedding model(s)\n", n, e, v);
+}
+#endif
+
 // A valid blob that fits the fuzz harness (fuzz/fuzz_aot.cpp: every weight is an 8x8 f32 matrix). It is the seed of
 // the fuzz corpus: FORGE_AOT_WRITE_SEED=<path> writes it; the checked-in copy must still load, or it has to be
 // regenerated after a format change.

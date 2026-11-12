@@ -8,6 +8,8 @@
 //                                 "repetition_penalty", "seed", "stop": [str], "grammar": GBNF, "stream": bool,
 //                                 "typical_p", "mirostat_tau", "mirostat_eta", "presence_penalty", "frequency_penalty", "response_format": {json_schema}}
 //   POST /v1/chat/completions    {"messages": [{"role","content"}], ...same sampling fields}
+//   POST /v1/embeddings          {"input": str | [str] | [ids] | [[ids]], "model", "encoding_format": "float" | "base64"}
+//                                 (models whose blueprint declares `session embedding`; 400 on a generative model)
 //   GET  /metrics                -> scheduler counters
 #include <forge/import/gguf.hpp>
 #include <forge/inference/json_schema.hpp>
@@ -128,9 +130,16 @@ private:
                                              sched_.waiting(), sched_.active_count(), s.deferred, rejected_.load(), sched_.evictions(),
                                              s.prefix_spills, s.prefix_reloads, s.prefix_reload_failures, sched_.spilled()) + mem::governor::instance().prometheus(), "text/plain")); return;
         }
+        if (path == "/v1/embeddings") {
+            if (r.method != "POST") { c.send(response(405, error_json("use POST"))); return; }
+            embeddings(c, r);
+            return;
+        }
         bool chat = path == "/v1/chat/completions";
         if (path != "/v1/completions" && !chat) { c.send(response(404, error_json("no route " + path))); return; }
         if (r.method != "POST") { c.send(response(405, error_json("use POST"))); return; }
+        if (embedding_model())
+            raise(errc::unsupported, "{} is an embedding model (blueprint session 'embedding'): it has no completions; use POST /v1/embeddings", name_);
         // Backpressure: a full queue answers 503 + Retry-After instead of piling up work it cannot hold.
         if (max_queue_ && sched_.waiting() >= max_queue_) { ++rejected_; c.send(response(503, error_json("server busy: request queue is full, retry later"))); return; }
         auto j = json::parse(r.body);
@@ -241,7 +250,89 @@ private:
         c.send(response(200, json::dump(json::value(json::object{{"id", id}, {"object", chat ? "chat.completion" : "text_completion"}, {"created", created},
                                                                   {"model", name_}, {"choices", json::value(json::array{json::value(choice)})}, {"usage", json::value(usage)}}))));
     }
+    bool embedding_model() const { return m_->blueprint().session == "embedding"; }
+
+    // POST /v1/embeddings (OpenAI-compatible). "input" is one text, a list of texts, one list of token ids or a list
+    // of such lists; texts go through the model's tokenizer with its special tokens and token types ([CLS] .. [SEP]),
+    // ids are taken as they are. One vector per input, in order; "encoding_format": "base64" returns each vector as
+    // base64 of its little-endian f32 bytes. usage counts the tokens fed to the model.
+    void embeddings(conn& c, const http_request& r) {
+        if (!embedding_model())
+            raise(errc::unsupported, "{} is not an embedding model (blueprint session '{}'): /v1/embeddings needs a model whose blueprint declares `session embedding`",
+                  name_, m_->blueprint().session);
+        auto j = json::parse(r.body);
+        auto* in = j.find("input");
+        if (!in) raise(errc::invalid_argument, "\"input\" is required: a string, a list of strings, or token ids");
+        auto fmt = j.str_or("encoding_format", "float");
+        if (fmt != "float" && fmt != "base64") raise(errc::invalid_argument, "encoding_format must be \"float\" or \"base64\", got \"{}\"", fmt);
+        // one entry per vector to compute: a text, or ids
+        struct item { const std::string* text = nullptr; std::vector<int> ids; };
+        std::vector<item> items;
+        auto ids_of = [&](const json::value& a) {
+            std::vector<int> ids;
+            for (auto& x : a.arr()) {
+                if (!x.is_num() || x.num() < 0 || x.num() >= double(m_->vocab() > 0 ? m_->vocab() : (i64(1) << 31) - 1) || x.num() != std::floor(x.num()))
+                    raise(errc::invalid_argument, "\"input\": token ids must be integers in [0, {})", m_->vocab());
+                ids.push_back(int(x.num()));
+            }
+            if (ids.empty()) raise(errc::invalid_argument, "\"input\": an empty token list");
+            return ids;
+        };
+        if (in->is_str()) items.push_back({&in->str(), {}});
+        else if (in->is_arr() && !in->arr().empty()) {
+            auto& a = in->arr();
+            if (a[0].is_num()) items.push_back({nullptr, ids_of(*in)});
+            else for (auto& e : a) {
+                if (e.is_str() && a[0].is_str()) items.push_back({&e.str(), {}});
+                else if (e.is_arr() && a[0].is_arr()) items.push_back({nullptr, ids_of(e)});
+                else raise(errc::invalid_argument, "\"input\" must be a string, a list of strings, a list of token ids or a list of token id lists");
+            }
+        } else raise(errc::invalid_argument, "\"input\" must be a non-empty string, list of strings, list of token ids or list of token id lists");
+        if (items.size() > 2048) raise(errc::invalid_argument, "\"input\": at most 2048 entries per request, got {}", items.size());
+        for (auto& it : items) if (it.text && it.text->empty()) raise(errc::invalid_argument, "\"input\": an empty string");
+        json::array data; std::size_t tokens = 0;
+        {
+            std::lock_guard lk(embed_mu_);   // one embedding session, one pass at a time
+            if (!embed_) embed_ = std::make_unique<inference::session>(m_);
+            if (auto* d = j.find("dimensions"); d && d->is_num()) {
+                auto shape = embed_->embedding_shape(1);
+                if (shape.size() != 1 || d->num() != double(shape[0]))
+                    raise(errc::unsupported, "\"dimensions\": {} is not available, the model's embeddings have {} values", d->num(), shape.empty() ? i64(0) : shape.back());
+            }
+            for (std::size_t i = 0; i < items.size(); ++i) {
+                std::vector<int> types;
+                if (items[i].text) {   // the tokenizer's special tokens and token types
+                    if (!m_->tokenizer()) raise(errc::invalid_argument, "{} has no tokenizer: \"input\" must be token ids", name_);
+                    auto enc = m_->tokenizer()->encode_typed(*items[i].text);
+                    items[i].ids = std::move(enc.ids); types = std::move(enc.type_ids);
+                }
+                const std::size_t n = items[i].ids.size();
+                if (i64(n) > m_->max_context())   // a request error (400), not a capacity one
+                    raise(errc::invalid_argument, "\"input\"[{}] is {} tokens, more than the model's {} positions (inputs are not truncated)", i, n, m_->max_context());
+                auto v = embed_->embed(items[i].ids, types);
+                tokens += n;
+                json::object e{{"object", "embedding"}, {"index", double(i)}};
+                if (fmt == "base64") {
+                    std::string raw(v.size() * 4, '\0');
+                    for (std::size_t k = 0; k < v.size(); ++k) {   // little-endian f32, whatever the host order
+                        std::uint32_t u; std::memcpy(&u, &v[k], 4);
+                        for (int b = 0; b < 4; ++b) raw[k * 4 + std::size_t(b)] = char((u >> (8 * b)) & 0xFF);
+                    }
+                    e.emplace_back("embedding", import::tokimp::base64(raw));
+                } else {
+                    json::array vals; vals.reserve(v.size());
+                    for (float x : v) vals.push_back(double(x));
+                    e.emplace_back("embedding", std::move(vals));
+                }
+                data.push_back(json::value(std::move(e)));
+            }
+        }
+        c.send(response(200, json::dump(json::value(json::object{{"object", "list"}, {"data", std::move(data)}, {"model", name_},
+            {"usage", json::value(json::object{{"prompt_tokens", double(tokens)}, {"total_tokens", double(tokens)}})}}))));
+    }
+
     std::shared_ptr<inference::model> m_;
+    std::mutex embed_mu_; std::unique_ptr<inference::session> embed_;
     inference::batch_scheduler sched_;
     std::string name_;
     std::atomic<std::uint64_t> counter_{0}, rejected_{0};
@@ -371,7 +462,8 @@ int main(int argc, char** argv) {
         }
         mem::governor::instance().watch_pressure();
         auto m = inference::model::open(path);
-        if (m->blueprint().session != "generative_sequence") raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session);
+        if (m->blueprint().session != "generative_sequence" && m->blueprint().session != "embedding")
+            raise(errc::unsupported, "model session '{}' is neither generative nor an embedding model", m->blueprint().session);
         inference::batch_options bo;
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));

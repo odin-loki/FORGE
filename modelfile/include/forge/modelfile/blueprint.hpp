@@ -32,6 +32,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <set>
 #include <string>
 #include <variant>
 #include <vector>
@@ -83,7 +84,24 @@ inline std::vector<bp_token> bp_lex(std::string_view s) {
 //   3  the spatial and encoder op families (conv, pooling, resize, group / batch norm, pad, attention_bias, ...),
 //      composite-op defaults and keyword arguments, scalar() and the number helpers, and `session embedding`.
 //      An older engine would stop at the first of these with an unknown-op or parse error.
+// A blueprint has to declare the opset of the newest thing it uses: the builder (and, for what the parser sees, the
+// parser) refuses a use below its opset with an error that names the feature and the opset it needs. Otherwise a file
+// that says "opset 1" could carry ops an opset-1 engine does not have, and the declaration would mean nothing.
 inline constexpr int opset_min = 1, opset_max = 3;
+
+// The opset that introduced a spec op (1 for the first op set). New ops get a line here with the opset that adds them.
+inline int op_min_opset(std::string_view name) {
+    static const std::set<std::string_view> opset3{
+        "quick_gelu", "mish", "hard_swish", "floor", "attention_bias", "alibi_bias", "sinusoid_embed", "l2_normalize", "topk", "topk_indices",
+        "index_select", "masked_mean", "conv1d", "conv2d", "conv_transpose2d", "max_pool2d", "avg_pool2d", "adaptive_avg_pool2d", "global_avg_pool",
+        "upsample_nearest", "upsample_bilinear", "group_norm", "batch_norm", "pad"};
+    return opset3.count(name) ? 3 : 1;
+}
+// The opset that introduced an attr of an op that is older than the attr (1: the attr came with the op).
+inline int attr_min_opset(std::string_view op, std::string_view attr) {
+    static const std::set<std::string_view> rope2{"scaling", "factor", "orig_ctx", "low_freq", "high_freq", "beta_fast", "beta_slow", "truncate", "freq_factors"};
+    return op == "rope" && rope2.count(attr) ? 2 : 1;
+}
 
 struct bp_state_decl { std::string name; i64 count = 1; std::string kind; std::map<std::string, double> args; };
 struct bp_io_decl { std::string name, dtype; std::vector<std::string> dims; };
@@ -91,6 +109,12 @@ struct bp_io_decl { std::string name, dtype; std::vector<std::string> dims; };
 struct blueprint {
     std::string name;
     int opset = 1;
+    // Raises when this blueprint declares less than opset `need`, which `feature` (as the message words it) requires.
+    void need_opset(int need, int line, const std::string& feature) const {
+        if (opset < need)
+            raise(errc::parse_error, "blueprint:{}: {} needs opset {}, but blueprint \"{}\" declares opset {} (write `blueprint \"{}\" opset {}`)",
+                  line, feature, need, name, opset, name, need);
+    }
     std::map<std::string, double> params;          // dotted keys: "rope.base"
     std::map<std::string, std::string> str_params;
     std::vector<bp_state_decl> states;
@@ -345,11 +369,18 @@ private:
             return T(g_.apply(ops::op::slice, {as_tensor(pos.at(0))}, {{"axis", 0.0}, {"start", double(n - 1)}, {"end", double(n)}}));
         }
         if (fn == "scalar") {   // a number as a [1] constant tensor (e.g. the zero bias of attention_bias)
+            bp_.need_opset(3, line, "scalar()");
             if (pos.size() != 1 || !kw.empty()) ps_.fail("scalar(x) takes one number");
             return T(g_.scalar(float(expect_num(pos[0]))));
         }
         // number helpers, folded while the graph is built (per-layer attrs: `window * min(1, mod(l + 1, pattern))`)
-        if (kw.empty() && !pos.empty() && std::all_of(pos.begin(), pos.end(), [](const bp_val& v) { return v.k == bp_val::num; })) {
+        // (opset 3. Below it a call on numbers means what it meant before the helpers existed: the spec op of that
+        // name on a constant where there is one in the blueprint's opset -- sqrt -- and an error otherwise.)
+        const bool helper_name = fn == "sqrt" || fn == "floor" || fn == "ceil" || fn == "min" || fn == "max" || fn == "mod";
+        const bool all_numbers = kw.empty() && !pos.empty() && std::all_of(pos.begin(), pos.end(), [](const bp_val& v) { return v.k == bp_val::num; });
+        if (helper_name && all_numbers && bp_.opset < 3 && !(ops::op_from_name(fn) && op_min_opset(fn) <= bp_.opset))
+            bp_.need_opset(3, line, "the number helper " + fn + "()");
+        if (all_numbers && bp_.opset >= 3) {
             auto N = [](double x) { bp_val r; r.k = bp_val::num; r.n = x; return r; };
             if (pos.size() == 1 && fn == "sqrt") return N(std::sqrt(pos[0].n));
             if (pos.size() == 1 && fn == "floor") return N(std::floor(pos[0].n));
@@ -369,6 +400,7 @@ private:
                       line, fn, bp_.name, bp_.opset, opset_min, opset_max);
             return expand_composite(fn, cit->second, pos, kw, line);
         }
+        bp_.need_opset(op_min_opset(fn), line, "op '" + fn + "'");
         const auto& inf = ops::info(*o);
         std::vector<std::string> anames;
         for (std::size_t s = 0, e; s < inf.attrs.size(); s = e + 1) {
@@ -390,6 +422,7 @@ private:
             else a.set(k, expect_num(v));
         }
         if (int(ins.size()) != inf.inputs) ps_.fail(std::format("{} expects {} tensor inputs, got {}", fn, inf.inputs, ins.size()));
+        for (auto& [k, v] : a.v) bp_.need_opset(attr_min_opset(fn, k), line, fn == "rope" ? "RoPE frequency scaling (rope attr '" + k + "')" : fn + " attr '" + k + "'");
         return T(g_.apply(*o, ins, a));
     }
 
@@ -398,6 +431,7 @@ private:
     bp_val expand_composite(const std::string& fn, const blueprint::composite& c, const std::vector<bp_val>& pos,
                             const std::vector<std::pair<std::string, bp_val>>& kw, int line) {
         if (pos.size() > c.args.size()) raise(errc::parse_error, "blueprint:{}: {} expects {} arguments, got {}", line, fn, c.args.size(), pos.size());
+        if (!kw.empty()) bp_.need_opset(3, line, "a keyword argument to the composite op '" + fn + "' ('" + kw.front().first + ":')");
         std::map<std::string, bp_val> bound;
         for (std::size_t i = 0; i < pos.size(); ++i) bound[c.args[i]] = pos[i];
         for (auto& [k, v] : kw) {
@@ -501,13 +535,18 @@ inline blueprint parse_blueprint(std::string_view src) {
             bp.states.push_back(s);
         } else if (ps.accept("input")) bp.inputs.push_back(detail::parse_io(ps));
         else if (ps.accept("output")) bp.outputs.push_back(detail::parse_io(ps));
-        else if (ps.accept("session")) bp.session = ps.ident();
+        else if (ps.accept("session")) {
+            int line = ps.cur().line;
+            bp.session = ps.ident();
+            if (bp.session == "embedding") bp.need_opset(3, line, "`session embedding`");
+        }
         else if (ps.accept("op")) {
             auto nm = ps.ident(); blueprint::composite c; ps.expect("(");
             while (!ps.accept(")")) {
                 auto an = ps.ident();
                 if (std::find(c.args.begin(), c.args.end(), an) != c.args.end()) ps.fail("op '" + nm + "': parameter '" + an + "' repeated");
                 c.args.push_back(an);
+                if (ps.is("=")) bp.need_opset(3, ps.cur().line, "a default value for parameter '" + an + "' of the composite op '" + nm + "'");
                 if (ps.accept("=")) { bool neg = ps.accept("-"); double v = ps.number(); c.defaults[an] = neg ? -v : v; }
                 else if (!c.defaults.empty()) ps.fail("op '" + nm + "': parameter '" + an + "' without a default follows one with a default");
                 ps.accept(",");

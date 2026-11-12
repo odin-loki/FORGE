@@ -51,7 +51,7 @@ Verification of the non-CUDA columns is by the mock drivers only (they compile `
 | HIP | `gpu/cuda.hpp` | `hip[:N]` | `hip:N` | mock driver only |
 | OpenCL | `gpu/opencl.hpp` | `opencl[:N]` (all platforms, GPUs first) | `opencl:N` | mock driver only |
 | Level Zero | `gpu/levelzero.hpp` | `ze[:N]` / `level_zero[:N]` | `level_zero:N` | mock driver only |
-| Metal | `gpu/metal.hpp` + `gpu/src/metal.mm` | `metal[:N]` | none | never compiled (no Mac) |
+| Metal | `gpu/metal.hpp` + `gpu/src/metal.mm` | `metal[:N]` | none | the GitHub macOS runner's GPU in CI (`test_gpu_metal`, last on PR #53). The Metal changes of 2026-11-12 (the RoPE frequency table, the kernels `msl_port` translates) have only passed the MSL syntax check on Linux |
 
 All runtimes except Metal share one contract: `run_op` over host tensor views, and a **residency protocol** (`begin_run`, `end_run`, `pin`, `to_host`, `host_wrote`, `release`, `forget`, `copy_resident`). `forget(p, n)` drops the device copies and pin records of host memory that is going away; `graph::plan`'s destructor calls it for the plan's constants on every backend. (Until 2026-11-12 only CUDA/HIP had it: on OpenCL, Level Zero and Vulkan a destroyed plan left pins and resident entries behind, and the next plan's buffers at the same addresses read stale device data or were overwritten at sync-back. Regression test `test_gpu_stale_*_mock`.) The OpenCL and Level Zero `run_op` also acquire every buffer of a launch before binding any: acquiring a range that partly overlaps a resident entry drops that entry, and an input bound earlier in the same launch could live in it (the SIGBUS in `forge_matmul_t` with `FORGE_DEVICE=opencl` on the mock). Between `begin_run` and `end_run`, buffers stay on the device keyed by host address. Pinned ranges (weights) survive across runs. Metal uses unified memory, so its residency hooks do nothing.
 
@@ -174,6 +174,18 @@ OpenCL (`gpu::ocl`) and Level Zero (`gpu::ze`) runtimes have `open(&why, ordinal
 | Mixture of experts | `forge_moe_hidden` + `forge_moe_down` (also in `kernels.cu`): see [Mixture of experts](#mixture-of-experts-on-the-device) | | `FORGE_GPU_MOE=0` |
 
 KV codecs (`int8`, `fp8`, `tbq4`, `tbq3`) keep using the spec kernel `forge_attention`. Encoded weights are uploaded once, keyed by host address and size, and are evicted least recently used first under memory pressure (the host copy is re-uploaded on the next use). These kernels are correct-first: a work item re-decodes its weight row and the DeltaNet item recomputes the token's q/k norms, so they are slower per flop than the tuned CUDA kernels. None of them has run on real hardware.
+
+### Quantised matmul: exact and int8-activation paths
+A quantised `matmul_t` has two families of kernels, and they give slightly different numbers for the same model file:
+
+| Path | Where | What it computes |
+|------|-------|------------------|
+| exact | the portable `forge_qmatmul_t` / `forge_qglu` (OpenCL, Level Zero), the CPU with `FORGE_CPU_INT8=0` or `FORGE_DECODE_WEIGHTS=1`, AArch64 CPUs by default | f32 activations times the decoded weights: the exact output of the quantised model, to f32 rounding |
+| int8 activations | the CPU's integer kernels (x86 default), CUDA / HIP (`forge_qmatmul_q81`, the tensor-core kernels) | the activations are rounded to 8 bits per 32-value block first (q8_1, as llama.cpp does), then integer dot products: up to about 1.6 % of the largest output on test inputs with a wide dynamic range |
+
+`tests/test_cuda_hip.cpp` (`exact_reference_check`) holds every backend to one reference, the float64 dot product of the f32 activations with the codec-decoded weights: within 2e-5 of the largest output for the exact backends (measured on the OpenCL mock: 1e-6), within 3e-2 for the int8-activation ones (CUDA / HIP mocks: 1.6e-2).
+
+This is what was behind a q8_0 logit cosine of 0.9984 on the OpenCL mock against 0.9990 on the CPU and the CUDA mock for the Gemma-2 model of `verify/golden/tiny_gemma.py`. The OpenCL run was bit-for-bit the exact path (cosine 1.000000 with `FORGE_CPU_INT8=0` on the CPU); soft-capping, scale rounding and intermediates in the portable kernels were not involved. That model's attention scores reached 28 against a soft-cap of 5, which made its logits so sensitive to q8_0 weight rounding that over 12 prompts the cosine against the unquantised reference ran from 0.945 to 0.9995 on the int8 path and from 0.979 to 0.9995 on the exact one (the exact path was the closer one for 11 of the 12; the golden's prompt was the twelfth). The golden now uses weights whose scores pass the cap by a factor of 3 (6.4 against 2), and its bound is 0.999 for every generation on every path (measured: 0.99936 CPU and CUDA mock, 0.99977 OpenCL mock).
 
 ## Mixture of experts on the device
 `moe_ffn` runs on CUDA, HIP, OpenCL and Level Zero when the three stacked expert weights are encoded (q8_0, q4_k, q5_k, q6_k) or f32 constants (`registry::device_moe`, `run_moe`; `FORGE_GPU_MOE=0` keeps it on the host):

@@ -26,10 +26,12 @@ jobs:
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 clang-23 ccache
+      # dbus-daemon, xvfb, xsel, libxcb1: test_os_dbus and test_os_clipboard run against a real bus / a private X
+      # server when these are installed and skip those cases otherwise
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 clang-23 ccache dbus-daemon xvfb xsel libxcb1
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
       - uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: linux-${{ matrix.cc }}
@@ -83,7 +85,7 @@ jobs:
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache python3-numpy
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache python3-numpy dbus-daemon xvfb xsel libxcb1
       - uses: hendrikmuhs/ccache-action@v1.2
         with: { key: linux-tsan }
       - run: sudo sysctl vm.mmap_rnd_bits=28
@@ -105,10 +107,10 @@ jobs:
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache dbus-daemon xvfb xsel libxcb1
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
       - uses: hendrikmuhs/ccache-action@v1.2
         with: { key: linux-asan }
       - run: sudo sysctl vm.mmap_rnd_bits=28
@@ -165,8 +167,13 @@ jobs:
     # Fixed-width rows (LoongArch LSX/LASX, POWER VSX, s390x VXE, MIPS MSA) have no kernel-table configure line
     # (`tables` empty), no emu-labelled tests (`emu_min` 0) and one CPU model, which their toolchain file sets
     # (`cpus` "default"); their lane_<table> tests force each table and require it to be the active one.
+    # The cross compiler: g++-14-<triple> where Ubuntu 24.04 has it, else g++-13-<triple>, else the unversioned
+    # g++-<triple> (the install step tries them in that order and exports the one it found). The loongarch64 and
+    # mips64el rows are `experimental`: whether those cross packages exist on the runner image has not been
+    # checked (this job has never run on GitHub), so they do not fail the workflow.
     name: emu-${{ matrix.name }}
     runs-on: ubuntu-24.04
+    continue-on-error: ${{ matrix.experimental == true }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -194,6 +201,7 @@ jobs:
             emu_min: 0
             lanes: "lasx lsx"
             cpus: "default"
+            experimental: true
           - name: ppc64le-vsx
             toolchain: ppc64le-vsx-qemu
             triple: powerpc64le-linux-gnu
@@ -218,18 +226,29 @@ jobs:
             emu_min: 0
             lanes: "msa"
             cpus: "default"
+            experimental: true
     env:
       QEMU_LD_PREFIX: /usr/${{ matrix.triple }}
       EMU_TESTS: test_simd test_tile test_dtypes test_graph test_kvquant test_support test_util
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache qemu-user gcc-14-${{ matrix.triple }} g++-14-${{ matrix.triple }}
+      - name: install qemu-user and the cross compiler (g++-14, else g++-13, else unversioned)
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build ccache qemu-user
+          t=${{ matrix.triple }}
+          for v in -14 -13 ""; do
+            if sudo apt-get install -y gcc$v-$t g++$v-$t; then
+              echo "CROSS_CC=$t-gcc$v" >> "$GITHUB_ENV"; echo "CROSS_CXX=$t-g++$v" >> "$GITHUB_ENV"
+              echo "cross compiler: $t-g++$v"; exit 0
+            fi
+          done
+          echo "::error::no g++ cross package for $t on this image"; exit 1
       - uses: hendrikmuhs/ccache-action@v1.2
         with: { key: "emu-${{ matrix.name }}" }
       - name: configure (cross build, tests run under qemu-user)
         run: |
           ${{ matrix.qemu }} --version | head -1
-          cmake -S . -B build/emu -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }}.cmake -DFORGE_CROSS_CC=${{ matrix.triple }}-gcc-14 -DFORGE_CROSS_CXX=${{ matrix.triple }}-g++-14 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF | tee configure.log
+          cmake -S . -B build/emu -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }}.cmake -DFORGE_CROSS_CC=$CROSS_CC -DFORGE_CROSS_CXX=$CROSS_CXX -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF | tee configure.log
           if [ -n "${{ matrix.tables }}" ]; then grep -E "FORGE: (SVE|RVV) kernel tables: .*FORGE_SIMD_(SVE|RVV)256" configure.log; fi
       - run: cmake --build build/emu -j4 --target $EMU_TESTS
       - name: fixed-width kernel tables, each forced and required to be the active one
@@ -353,7 +372,7 @@ jobs:
       - run: brew install ninja ccache
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
       - uses: hendrikmuhs/ccache-action@v1.2
         with: { key: macos }
       - run: cmake --preset dev -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
@@ -385,7 +404,7 @@ jobs:
       - uses: ilammy/msvc-dev-cmd@v1
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
       - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl -DCMAKE_C_COMPILER=cl -DFORGE_BUILD_EXAMPLES=OFF
       - run: cmake --build build -j4
       - run: ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200

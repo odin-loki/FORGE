@@ -1,14 +1,25 @@
 FORGE
 Copyright (c) 2026 Odin Loch (Imortek). Dual licensed: AGPL-3.0-or-later or commercial.
 
-This is a clean-room implementation, with one vendored third-party library:
+This is a clean-room implementation. It vendors one third-party library and one API header, and carries data
+derived from third-party sources; all of them are listed in this file.
 
   third_party/monocypher  Monocypher 4.0.2 (Loup Vaillant et al.), BSD-2-Clause OR CC0-1.0.
                           Used for Ed25519 pack signing and XChaCha20-Poly1305 pack encryption.
 
-A machine-readable SPDX 2.3 SBOM is produced by tools/sbom.py.
-ops/intrinsics/x86.json is a hand-curated subset of intrinsic signatures (facts about the
-public Intel ISA interface), not copied from the Intel Intrinsics Guide data files.
+A machine-readable SBOM (SPDX 2.3 or CycloneDX 1.5) is produced by tools/sbom.py; the third-party code and the
+data derived from third-party sources listed below are packages / components of it.
+
+Vendored code and data derived from third-party sources, with where each licence statement was read:
+
+  third_party/level-zero            see "Level Zero API header" below
+  modelfile/.../quant_recipe.hpp    see "llama.cpp / ggml" below
+  ops/intrinsics/*.json             see "Intrinsic databases" below
+  os/src/text/ucd_data.inc,
+  os/src/text/cldr_data.inc,
+  os/src/text/encoding_data.inc     see "Unicode and encoding data" below
+  tests/data/tokenizer,
+  tests/data/chat_template          see "Test fixtures" below
 
 Level Zero API header (third_party/level-zero/ze_api.h)
 Copyright (C) 2019-2026 Intel Corporation. SPDX-License-Identifier: MIT
@@ -18,6 +29,11 @@ Copyright (c) 2023-2026 The ggml authors. SPDX-License-Identifier: MIT
 The CUDA decode matvec (forge_qmatmul_q81 / forge_quant_q81 in ops/gen/gpu_gen.py) follows the design of
 ggml-cuda's mul_mat_vec_q (mmvq.cu, vecdotq.cuh): q8_1-quantised activations, dp4a dot products against
 the GGUF-encoded weight blocks, and a warp per output column. The code is a FORGE implementation.
+modelfile/include/forge/import/quant_recipe.hpp: its "llama" recipe is a port of llama_tensor_get_type() from
+src/llama-quant.cpp (commit bc428e407a52bd3e21b5985cabeef57cdff9bc4a; the ported line ranges are listed in the file).
+modelfile/include/forge/import/tokenizer_import.hpp: the table of pre-tokenizer names and their split regexes
+(gguf_pre_regexes) and the conventions for "bert" vocabularies follow llama.cpp's tokenizer;
+they were written from memory of it and have not been diffed against the original.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
 associated documentation files (the "Software"), to deal in the Software without restriction, including
@@ -29,3 +45,94 @@ KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHAN
 PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
 CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
 OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Intrinsic databases (ops/intrinsics/*.json, and the wrappers ops/gen/intrin_gen.py generates from them at build time)
+The databases hold the names, signatures, required target features and immediate-operand constraints of compiler
+intrinsics. They are derived by the build scripts next to them (build_*_db.py), not typed in, from:
+
+  x86.json, loongarch.json, mips.json, ppc.json, s390x.json, wasm.json
+      the intrinsic headers of clang 23 (<immintrin.h>, <lsxintrin.h>, <lasxintrin.h>, <msa.h>, <altivec.h>,
+      <vecintrin.h>, <wasm_simd128.h>). Each of these headers states: "Part of the LLVM Project, under the Apache
+      License v2.0 with LLVM Exceptions. See https://llvm.org/LICENSE.txt for license information."
+      SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+  arm.json
+      <arm_acle.h>, <arm_sve.h>, <arm_neon_sve_bridge.h>, <arm_sme.h> of clang 23 (same statement, Apache-2.0 WITH
+      LLVM-exception) and <arm_neon.h>, which clang generates and which carries the MIT permission notice (without a
+      copyright line) instead.
+  riscv.json, riscv_policy.json
+      The prototype lists of the RISC-V Vector intrinsics specification, https://github.com/riscv-non-isa/rvv-intrinsic-doc
+      (auto-generated/**/intrinsic_funcs.adoc), each prototype compiled against clang 23's builtins; the scalar helpers
+      come from clang's <riscv_bitmanip.h> and <riscv_crypto.h> (Apache-2.0 WITH LLVM-exception).
+      LICENCE OF rvv-intrinsic-doc: NOT ESTABLISHED. Neither ops/intrinsics/build_riscv_db.py, ops/README.md nor the
+      generated databases record it, the copy the databases were built from is not in this repository, and it could
+      not be read from the project when this notice was written (2026-11-12: its README.md names no licence and no
+      LICENSE file was found at the root of its main branch). It has to be confirmed from the project and filled in
+      here before FORGE is distributed with these two files.
+
+No header text is copied into the databases: what they hold is each intrinsic's name and prototype. The attribution
+is given because the lists as a whole are taken from those sources.
+
+Unicode and encoding data
+  os/src/text/ucd_data.inc     generated by tools/unicode/gen_ucd.py from the Unicode Character Database 16.0.0 and DUCET
+  os/src/text/cldr_data.inc    generated by tools/cldr/gen_cldr.py from Unicode CLDR 46 (cldr-json)
+Both are data files of Unicode, Inc., used under the Unicode License V3 (SPDX: Unicode-3.0), reproduced here as it
+requires (text from https://www.unicode.org/license.txt, read 2026-11-12):
+
+    UNICODE LICENSE V3
+
+    COPYRIGHT AND PERMISSION NOTICE
+
+    Copyright © 1991-2026 Unicode, Inc.
+
+    NOTICE TO USER: Carefully read the following legal agreement. BY
+    DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+    SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+    TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+    DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of data files and any associated documentation (the "Data Files") or
+    software and any associated documentation (the "Software") to deal in the
+    Data Files or Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, and/or sell
+    copies of the Data Files or Software, and to permit persons to whom the
+    Data Files or Software are furnished to do so, provided that either (a)
+    this copyright and permission notice appear with all copies of the Data
+    Files or Software, or (b) this copyright and permission notice appear in
+    associated Documentation.
+
+    THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+    KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+    MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+    THIRD PARTY RIGHTS.
+
+    IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+    BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+    OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+    WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+    FILES OR SOFTWARE.
+
+    Except as contained in this notice, the name of a copyright holder shall
+    not be used in advertising or otherwise to promote the sale, use or other
+    dealings in these Data Files or Software without prior written
+    authorization of the copyright holder.
+
+  os/src/text/encoding_data.inc   generated by tools/unicode/gen_encodings.py from the indexes of the WHATWG Encoding
+      Standard (https://encoding.spec.whatwg.org/; the generator records them as CC BY 4.0)
+      and from the Unicode vendor mapping tables for CP437 and CP850 (Unicode, Inc.).
+      The licence statements of these source files were not re-read when this notice was written.
+
+Test fixtures (not part of any built library or program)
+  tests/data/tokenizer   Tokenizers trained by tests/data/tokenizer/make_fixtures.py on the corpus in that script, with
+      the Hugging Face `tokenizers` package (Apache-2.0) and the `sentencepiece` package (Apache-2.0); the .gguf files
+      were written with the `gguf` package of llama.cpp (MIT). The files are outputs of those tools on FORGE's own
+      text; they contain no vocabulary, normalization table or model of a third party (the SentencePiece charsmap in
+      spm_unigram_charsmap.model is compiled from a rule table defined in the script, not from nmt_nfkc).
+      goldens.json records what those packages return for the corpus.
+  tests/data/chat_template   make_goldens.py holds chat templates of published models (ChatML, Qwen 2.5 / 3, Llama 2 / 3,
+      Mistral, Gemma, Phi-3, DeepSeek, Zephyr), written out from memory of the models' tokenizer_config.json
+      files and not diffed against them. The originals belong to the model publishers and are under each model's
+      licence; they are used here only as test input for the template renderer. goldens.json is the rendering of them
+      by the `jinja2` package (BSD licence, per its package metadata).
+

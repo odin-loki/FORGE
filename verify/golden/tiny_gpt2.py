@@ -4,13 +4,16 @@ Conv1D weights stored [in, out], head tied to the embedding), a float64 numpy re
 
   1. HF import (f32, q8_0) -> prefill logits and KV-cached greedy decode against the reference
   2. GGUF import (general.architecture gpt2, weights transposed as llama.cpp's converter stores them) -> prefill logits
+  3. text -> ids -> logits: the checkpoint's tokenizer.json is a trained byte-level BPE (tests/data/tokenizer/
+     hf_bpe_gpt2.json), the GGUF carries the same vocabulary as tokenizer.ggml.* (model gpt2, pre gpt-2);
+     `forge run --prompt` must reach the logits of the ids the `tokenizers` package gives for that text
 """
 import os
 import numpy as np
 import golden_util as gu
 
 CFG = dict(architectures=["GPT2LMHeadModel"], model_type="gpt2", n_embd=64, n_layer=2, n_head=4, n_positions=128, n_ctx=128,
-           vocab_size=300, layer_norm_epsilon=1e-5, activation_function="gelu_new", bos_token_id=291, eos_token_id=291)
+           vocab_size=gu.tok_vocab_size("hf_bpe_gpt2.json"), layer_norm_epsilon=1e-5, activation_function="gelu_new", bos_token_id=0, eos_token_id=0)   # <|endoftext|>
 
 def make_weights(seed=77):
     rng = np.random.default_rng(seed); D, V = CFG["n_embd"], CFG["vocab_size"]
@@ -50,14 +53,21 @@ def gguf_tensors(W):
 def main():
     a = gu.args(); ck = gu.Checker(a.forge, a.work)
     hf = os.path.join(a.work, "hf")
-    W = gu.save_model(hf, {"transformer." + k: v for k, v in make_weights().items()}, CFG)
+    W = gu.save_model(hf, {"transformer." + k: v for k, v in make_weights().items()}, CFG, tokenizer=None)
+    gu.use_tokenizer(hf, "hf_bpe_gpt2.json")
     W = {k[len("transformer."):]: v for k, v in W.items()}
     prompt = [72, 101, 108, 108, 111, 44, 32, 116, 104, 101, 32, 119]
-    ck.decoder(hf, "gpt2", lambda ids: forward(W, ids), prompt, CFG["eos_token_id"])
+    fp = ck.decoder(hf, "gpt2", lambda ids: forward(W, ids), prompt, CFG["eos_token_id"])
+    text, ids = gu.tok_golden("hf_bpe_gpt2")   # GPT-2 puts no special token in front of a prompt
+    ck.text_logits(fp, text, forward(W, ids)[-1], f"gpt2 hf tokenizer.json (byte-level BPE, {len(ids)} ids)")
     gp = gu.write_gguf(os.path.join(a.work, "gpt2.gguf"), "gpt2",
                        {"context_length": CFG["n_positions"], "embedding_length": CFG["n_embd"], "block_count": CFG["n_layer"],
-                        "attention.head_count": CFG["n_head"], "attention.layer_norm_epsilon": CFG["layer_norm_epsilon"]}, gguf_tensors(W))
-    if gp: ck.logits(ck.imp(gp, "gpt2_gguf.fpk", None), prompt, forward(W, prompt)[-1], "gpt2 gguf F32")
+                        "attention.head_count": CFG["n_head"], "attention.layer_norm_epsilon": CFG["layer_norm_epsilon"]}, gguf_tensors(W),
+                       tokenizer="gguf_gpt2_default.gguf")
+    if gp:
+        fg = ck.imp(gp, "gpt2_gguf.fpk", None)
+        ck.logits(fg, prompt, forward(W, prompt)[-1], "gpt2 gguf F32")
+        ck.text_logits(fg, text, forward(W, ids)[-1], "gpt2 gguf tokenizer.ggml (gpt2)")
     else: print("[skip] gguf python package not installed")
     ck.done("gpt2")
 

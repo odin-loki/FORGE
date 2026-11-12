@@ -3,6 +3,9 @@
 ## Concepts
 `tools/release.py` drives a release that is reproducible and can be signed. During `build`, `SOURCE_DATE_EPOCH` is set from the last commit, so rebuilding the same commit should give identical archives and SBOMs as long as `FORGE_REPRODUCIBLE=ON` (the default). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`; the `repro` CI job runs it on every pull request.
 
+### Before a release: third-party notices
+[`NOTICE`](../NOTICE) lists the vendored code and the data derived from third-party sources; `tools/sbom.py` carries the same list as packages (`VENDORED`, `DERIVED`), and `tests/sbom_test.py` fails when an intrinsic database or a NOTICE entry is missing from either. One entry is open: the licence of `riscv-non-isa/rvv-intrinsic-doc`, the source of the prototype lists in `ops/intrinsics/riscv.json` and `riscv_policy.json`, is recorded nowhere in the tree and was not established when the entry was written (NOTICE says `NOT ESTABLISHED`, the SBOM `NOASSERTION`). Read it from the project, put it in NOTICE and in `DERIVED`, and only then ship those two files. The licence statements behind `os/src/text/encoding_data.inc` (WHATWG indexes, Unicode vendor tables) are likewise recorded from the generator's comment and should be re-read.
+
 ## Commands (`tools/release.py --help`)
 
 | Command | Effect |
