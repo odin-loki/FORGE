@@ -7,6 +7,7 @@
 #include <forge/import/onnx.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
+#include <forge/inference/aot_build.hpp>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -65,6 +66,12 @@ int usage() {
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
         "      [--codec C (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
+        "  aot <model.fpk> [-o out] [--aot-mode plan|native]   compile the model's plans ahead of time (docs/aot-models.md)\n"
+        "      [--shapes 1,8,16 (sequence lengths; default 1,2,4,...,64)] [--all-rows] [--kv-codec f32,int8] [--ctx N]\n"
+        "      plan:   plans go into the .fpk's \"aot\" section (-o out.fpk, default in place) [--sidecar] [--key name.key | --drop-signature]\n"
+        "              [--strip] remove them  [--list] show them\n"
+        "      native: -o model.so|model.a|model [--emit shared|static|exe] [--embed-weights] [--cxx C] [--target TRIPLE] [--simd T]\n"
+        "              [--march M|none] [--cxxflag F]... [--sdk forge_aot_sdk.txt] [--work DIR]; `forge run model.so` loads the result\n"
         "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512  |  bench --kernels 1024 (MB, quantised matvec GB/s)\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
@@ -376,6 +383,8 @@ int cmd_run(const args& a) {
     std::fprintf(stderr, "[%zu prompt tokens in %.3fs, %zu new tokens in %.3fs = %.1f tok/s; plans %zu compiled, %zu reused]\n",
                  st.prompt_tokens, st.prefill_s, st.new_tokens, st.decode_s, st.new_tokens > 1 ? double(st.new_tokens - 1) / st.decode_s : 0.0,
                  s.plans().misses(), s.plans().hits());
+    if (auto& as = s.shared_model()->aot().stats(); as.used)   // precompiled plans (forge aot)
+        std::fprintf(stderr, "[aot: %zu of the plans were precompiled (%zu native), from %s]\n", as.used, as.native, as.origin.c_str());
     return 0;
 }
 
@@ -741,6 +750,77 @@ int cmd_script(int argc, char** argv) {
     return r.exit_code;
 }
 
+// ---- forge aot: ahead-of-time compilation of a model's plans (docs/aot-models.md) ----
+int cmd_aot(const args& a) {
+    if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
+    const std::string& in = a.pos[0];
+    const std::string mode = a.get("aot-mode", "plan");
+    if (a.has("list")) {
+        modelfile::reader r(in);
+        if (!r.has_section(modelfile::aot::section)) { std::printf("%s: no precompiled plans\n", in.c_str()); return 0; }
+        graph::aot::image img(r.raw_section_bytes(modelfile::aot::section));
+        bool match = img.model() == modelfile::aot::model_key(r);
+        std::string why; bool covered = !r.has_section("signature") || modelfile::aot::covered_by_signature(r, &why);
+        std::printf("%s: %zu precompiled plan(s), FORGE %s, pipeline %u, built on %s, %s%s\n", in.c_str(), img.entries().size(), img.forge().c_str(), img.pipeline(),
+                    img.simd().c_str(), match ? "key matches this model and build" : "key does NOT match (other model, weights or FORGE version): ignored at load",
+                    covered ? "" : (", NOT covered by the signature: ignored at load (" + why + ")").c_str());
+        for (auto& e : img.entries()) std::printf("  %-28s %8llu bytes  key %s\n", e.t.name().c_str(), (unsigned long long)e.size, hash::blake3::hex(e.key).substr(0, 16).c_str());
+        return 0;
+    }
+    if (a.has("strip")) {
+        auto out = a.get("o").empty() ? in : a.get("o");
+        bool dropped = modelfile::aot::write_section(in, out, {});
+        std::printf("removed the precompiled plans -> %s%s\n", out.c_str(), dropped ? " (the signature was dropped: sign again)" : "");
+        return 0;
+    }
+    if (a.kv.count("adapter")) raise(errc::unsupported, "aot: LoRA adapters are not compiled ahead of time; sessions that select an adapter compile their plans at run time");
+    if (auto dev = a.get("device", "cpu"); dev != "cpu" && !dev.empty())
+        raise(errc::unsupported, "aot: plans can only be precompiled for the CPU, not for device '{}' (a device plan holds kernels the backend creates per process)", dev);
+    inference::aot_build_options bo;
+    for (int n : parse_ids(a.get("shapes"))) bo.shapes.push_back(n);
+    bo.all_rows = a.has("all-rows"); bo.context = i64(a.num("ctx", 0));
+    { std::string k = a.get("kv-codec"); for (std::size_t p = 0, q; p < k.size(); p = q + 1) { q = k.find(',', p); if (q == std::string::npos) q = k.size(); if (q > p) bo.kv_codecs.push_back(k.substr(p, q - p)); } }
+    if (mode == "native") {
+        inference::aot_native_options no;
+        no.emit = a.get("emit", "shared"); no.out = a.get("o");
+        if (no.out.empty()) return usage();
+        no.cxx = a.get("cxx"); no.target = a.get("target"); no.simd = a.get("simd"); no.march = a.get("march"); no.sdk = a.get("sdk"); no.work_dir = a.get("work");
+        no.embed_weights = a.has("embed-weights"); no.extra_flags = a.all("cxxflag");
+        if (a.kv.count("embed-limit-mb")) no.embed_limit = std::uint64_t(a.num("embed-limit-mb", 1024)) << 20;
+        no.temperature = float(a.num("temp", 0)); no.top_k = int(a.num("top-k", 0)); no.top_p = float(a.num("top-p", 1)); no.max_new_tokens = int(a.num("n", 32));
+        auto r = inference::aot_build_native(in, bo, no);
+        std::printf("compiled %zu plan(s) (%zu steps as direct calls, %zu as kernel calls) with %s in %.1fs -> %s (%s, SIMD target %s, weights %s)\n",
+                    r.plans.targets.size(), r.direct_steps, r.generic_steps, r.compiler.c_str(), r.compile_s, r.out.c_str(), no.emit.c_str(), r.simd.c_str(),
+                    no.embed_weights ? "embedded" : ("in " + os::absolute(in)).c_str());
+        if (!r.source.empty()) std::printf("source kept: %s\n", r.source.c_str());
+        if (!r.same_compiler) std::fprintf(stderr, "forge aot: note: %s is not the compiler this FORGE was built with; the code was compiled with -ffp-contract=off, but bit-identical results are only tested for the build's compiler\n", r.compiler.c_str());
+        return 0;
+    }
+    if (mode != "plan") raise(errc::invalid_argument, "aot: --aot-mode {} (plan or native)", mode);
+    bool is_signed = false;
+    { modelfile::reader r(in); is_signed = r.has_section("signature"); }
+    const bool sidecar = a.has("sidecar");
+    if (is_signed && !sidecar && a.get("key").empty() && !a.has("drop-signature"))
+        raise(errc::invalid_argument, "aot: {} is signed and adding plans changes what the signature covers; pass --key name.key to sign the result, or --drop-signature", in);
+    inference::aot_plans pl;
+    { inference::model m(in); pl = inference::aot_compile_plans(m, bo); }
+    std::string out = a.get("o");
+    if (sidecar) {
+        if (out.empty()) out = in + modelfile::aot::sidecar_ext;
+        modelfile::aot::write_sidecar(out, pl.blob);
+        if (is_signed) std::fprintf(stderr, "forge aot: note: %s is signed; a sidecar is not covered by its signature and is ignored when it is loaded\n", in.c_str());
+    } else {
+        if (out.empty()) out = in;
+        modelfile::aot::write_section(in, out, pl.blob);
+        if (!a.get("key").empty()) modelfile::sign_file(out, out, modelfile::load_secret_key(a.get("key")));
+    }
+    std::printf("precompiled %zu plan(s) (%zu nodes, %zu steps, %zu bytes) -> %s%s\n", pl.targets.size(), pl.nodes, pl.steps, pl.blob.size(), out.c_str(),
+                sidecar ? " (sidecar)" : is_signed ? (a.get("key").empty() ? " (signature dropped)" : " (signed again)") : "");
+    for (auto& t : pl.targets) std::printf("  %s\n", t.name().c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
     forge::script::install_local_ai();   // forge::ask & co run FORGE_ASK_MODEL / --ask-model in-process
@@ -752,6 +832,7 @@ int main(int argc, char** argv) {
     }
     try {
         auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
