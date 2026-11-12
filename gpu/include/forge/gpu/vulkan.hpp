@@ -11,6 +11,7 @@
 #include <forge/core/tensor.hpp>
 #include <forge/core/dl.hpp>
 #include <forge/gpu/device_memory.hpp>
+#include <forge/gpu/portable_kernels.hpp>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -34,9 +35,23 @@ inline double transcendental_tol(const std::string& n) { return (n == "sin" || n
 
 struct push { std::uint32_t n = 0, rows = 0, cols = 0, k = 0; float alpha = 0; std::uint32_t a = 0, b = 0, c = 0, d = 0; float beta = 0; };
 struct hbuf { float* data; std::size_t count; };
+// Bytes of push constants every pipeline layout reserves: the spec kernels push `push` (40), the ported kernels
+// (ops/gen/gpu_gen.py VK_PORT) their own block of up to 9 words.
+inline constexpr std::uint32_t push_bytes = 64;
+// The ported kernels that bind more than 4 storage buffers (the Vulkan minimum for maxPerStageDescriptorStorageBuffers).
+inline std::uint32_t port_bindings(const std::string& n) { return n == "forge_delta_rule" ? 7u : n == "forge_moe_hidden" || n == "forge_attention_bias" ? 5u : 4u; }
 
-class runtime {
+// Besides the spec kernels the runtime has the portable kernel families of OpenCL / Level Zero (quantised matmul_t /
+// gather / FFN gate-up over encoded weights, one-pass and split-over-keys attention, the Gated DeltaNet state ops,
+// broadcast binaries, the sparse mixture of experts) as GLSL ports, driven by the same gpu::portable_kernels<> host code.
+class runtime : public portable_kernels<runtime> {
+    friend class portable_kernels<runtime>;
 public:
+    const char* backend() const { return "vulkan"; }
+    // One spec op over host views (the free function vk::run_op below); the member spelling is the cuda.hpp contract.
+    bool run_op(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out);
+    // Attention with plain f32 K/V through the ported one-pass / split-over-keys kernels: 1 = ran, -1 = use the spec kernel.
+    int attention_fast(const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) { return this->attention_port(in, a, out); }
     // Returns nullptr (with reason) when no loader / no compute-capable device is present.
     static std::unique_ptr<runtime> open(std::string* why = nullptr) {
         auto r = std::unique_ptr<runtime>(new runtime);
@@ -51,6 +66,8 @@ public:
             if (cb_) vkFreeCommandBuffers(dev_, pool_, 1, &cb_);
             for (auto dp : pending_pools_) vkDestroyDescriptorPool(dev_, dp, nullptr);
             for (auto& [k, e] : res_) free_entry(e);
+            for (auto& e : scratch_) free_entry(e);
+            for (auto& [k, e] : qres_) free_entry(e);
             for (auto& [n, p] : pipes_) { vkDestroyPipeline(dev_, p.pipe, nullptr); vkDestroyPipelineLayout(dev_, p.layout, nullptr);
                                           vkDestroyDescriptorSetLayout(dev_, p.dsl, nullptr); vkDestroyShaderModule(dev_, p.mod, nullptr); }
             if (pool_) vkDestroyCommandPool(dev_, pool_, nullptr);
@@ -132,7 +149,7 @@ public:
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &ds, 0, nullptr);
         vkCmdPushConstants(cb, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &pc);
-        vkCmdDispatch(cb, (invocations + 63) / 64, 1, 1);
+        dispatch(cb, invocations);
         ck(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; ck(vkCreateFence(dev_, &fi, nullptr, &f), "vkCreateFence");
         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
@@ -258,7 +275,7 @@ public:
         vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
         vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &ds, 0, nullptr);
         vkCmdPushConstants(cb_, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &pc);
-        vkCmdDispatch(cb_, (invocations + 63) / 64, 1, 1);
+        dispatch(cb_, invocations);
         ++recorded_;
         if (auto& o = es.back(); o.parent) {   // staged output: copy the result back into its parent buffer
             open_cb(); VkBufferCopy r{0, o.poff, o.range}; vkCmdCopyBuffer(cb_, o.e->b, o.parent->b, 1, &r); ++recorded_;
@@ -280,6 +297,12 @@ public:
         ++recorded_;
     }
 private:
+    // Work items are 64 per group; the groups are folded into rows of at most 32768 so that a large launch stays
+    // inside maxComputeWorkGroupCount (65535 per dimension is all the spec guarantees). The shaders' gid() undoes it.
+    void dispatch(VkCommandBuffer cb, std::size_t invocations) {
+        std::size_t groups = std::max<std::size_t>(1, (invocations + 63) / 64), gx = std::min<std::size_t>(groups, 32768);
+        vkCmdDispatch(cb, std::uint32_t(gx), std::uint32_t((groups + gx - 1) / gx), 1);
+    }
     void open_cb() {
         if (!cb_) {
             VkCommandBufferAllocateInfo ca{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ca.commandPool = pool_; ca.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ca.commandBufferCount = 1;
@@ -357,6 +380,7 @@ private:
         vkGetDeviceQueue(dev_, fam, 0, &q_);
         VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO}; cp.queueFamilyIndex = fam; cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         if (vkCreateCommandPool(dev_, &cp, nullptr, &pool_) != VK_SUCCESS) return "vkCreateCommandPool failed";
+        { VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys_, &pr); max_bindings_ = pr.limits.maxPerStageDescriptorStorageBuffers; }
         init_pipeline_cache();
         dm_.attach("vulkan:0", mu_, [this](std::uint64_t w, bool ext) { return evict_device(w, ext); });
         return {};
@@ -421,7 +445,7 @@ private:
         for (std::uint32_t i = 0; i < nbuf; ++i) lb[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}; li.bindingCount = nbuf; li.pBindings = lb.data();
         ck(vkCreateDescriptorSetLayout(dev_, &li, nullptr, &p.dsl), "vkCreateDescriptorSetLayout");
-        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push)};
+        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes};
         VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO}; pl.setLayoutCount = 1; pl.pSetLayouts = &p.dsl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pr;
         ck(vkCreatePipelineLayout(dev_, &pl, nullptr, &p.layout), "vkCreatePipelineLayout");
         VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -463,12 +487,21 @@ private:
         std::sort(vs.begin(), vs.end());
         std::size_t n = 0; std::uint64_t got = 0;
         while (n < vs.size() && (!want || got < want)) got += std::max<std::size_t>(4, res_[vs[n++].second].count * 4);
-        if (!n) return 0;
+        // then encoded weights the op in progress has not bound, least recently used first (the host copy is the
+        // source of truth: nothing is synced back, the next use uploads again)
+        std::vector<std::pair<std::uint64_t, std::pair<std::uintptr_t, std::size_t>>> qs;
+        if (!want || got < want) for (auto& [k, q] : qres_) if (q.last <= op_mark_) qs.push_back({q.last, k});
+        if (!n && qs.empty()) return 0;
+        std::sort(qs.begin(), qs.end());
         submit_locked();
         for (std::size_t i = 0; i < n; ++i) {
             auto& e = res_[vs[i].second];
             if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); ++stats_.downloads; }
             free_entry(e); res_.erase(vs[i].second);
+        }
+        for (auto& [last, k] : qs) {
+            if (want && got >= want) break;
+            auto it = qres_.find(k); got += it->second.count * 4; free_entry(it->second); qres_.erase(it); ++n;
         }
         stats_.evictions += n; stats_.evicted_bytes += got;
         return got;
@@ -485,7 +518,7 @@ private:
         if (it != res_.begin()) { auto pr = std::prev(it); if (pr->first + pr->second.count * 4 > lo) it = pr; }
         for (; it != res_.end() && it->first < hi; ++it) f(it->second);
     }
-    void submit_locked() {
+    void submit_locked(bool keep_scratch = false) {
         if (!cb_) return;
         ck(vkEndCommandBuffer(cb_), "vkEndCommandBuffer");
         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; ck(vkCreateFence(dev_, &fi, nullptr, &f), "vkCreateFence");
@@ -495,8 +528,94 @@ private:
         vkDestroyFence(dev_, f, nullptr); vkFreeCommandBuffers(dev_, pool_, 1, &cb_); cb_ = nullptr;
         for (auto dp : pending_pools_) vkDestroyDescriptorPool(dev_, dp, nullptr);
         pending_pools_.clear(); ++stats_.submits; recorded_ = 0;
+        if (keep_scratch) return;
         for (auto& e : scratch_) free_entry(e); scratch_.clear(); op_scratch_ = 0;
     }
+    // ---- kernel-call builder for portable_kernels<> (gpu/portable_kernels.hpp); mu_ held ----
+    // Buffers are bound in call order (binding 0..N-1), scalars are appended to the push-constant block in call order:
+    // the GLSL ports declare both in the OpenCL kernels' argument order. Launches are recorded into the run's command
+    // buffer like run_resident's; outside a run every host tensor is staged through a scratch buffer and the call is
+    // submitted in k_done. Scratch buffers live until the submit that used them.
+    struct kcall {
+        struct slot { entry* e; VkDeviceSize off, range; };
+        std::vector<slot> bufs; std::vector<std::uint32_t> pc;
+        struct wb_t { entry* tmp; entry* dst; VkDeviceSize off, bytes; }; std::vector<wb_t> wb;   // staged outputs to copy back on the device
+        struct rd_t { entry* tmp; float* h; std::size_t bytes; }; std::vector<rd_t> rd;           // outputs to read back (outside a run)
+    };
+    void k_touch(const float* h, std::size_t cnt, int mode) {
+        if (!in_run_) return;
+        no_stage_ = true; try { acquire({const_cast<float*>(h), cnt}, mode == 1); } catch (...) { no_stage_ = false; throw; } no_stage_ = false;
+    }
+    entry* k_buf(kcall& c, const float* h, std::size_t cnt, int mode) {   // mode 0 in, 1 out, 2 in/out
+        if (in_run_) {
+            auto b = acquire({const_cast<float*>(h), cnt}, mode == 1);
+            entry* owner = b.parent ? b.parent : b.e;
+            if (mode) { owner->host_valid = false; if (b.parent) c.wb.push_back({b.e, b.parent, b.poff, b.range}); }
+            c.bufs.push_back({b.e, b.off, b.range});
+            return owner;
+        }
+        scratch_.push_back(make_buffer_(cnt)); entry* sc = &scratch_.back();
+        if (mode != 1) { std::memcpy(sc->map, h, cnt * 4); stats_.upload_bytes += cnt * 4; }
+        if (mode) c.rd.push_back({sc, const_cast<float*>(h), cnt * 4});
+        c.bufs.push_back({sc, 0, std::max<VkDeviceSize>(4, cnt * 4)});
+        return nullptr;
+    }
+    void k_dev(kcall& c, void* m) { c.bufs.push_back({static_cast<entry*>(m), 0, VK_WHOLE_SIZE}); }
+    void k_u32(kcall& c, std::uint32_t v) { c.pc.push_back(v); }
+    void k_f32(kcall& c, float v) { std::uint32_t u; std::memcpy(&u, &v, 4); c.pc.push_back(u); }
+    void* k_scratch(kcall&, std::size_t bytes) { scratch_.push_back(make_buffer_((bytes + 3) / 4)); return &scratch_.back(); }
+    void k_upload(void* m, const void* h, std::size_t bytes) { std::memcpy(static_cast<entry*>(m)->map, h, bytes); stats_.upload_bytes += bytes; }
+    void k_launch(kcall& c, const std::string& name, std::size_t global) {
+        if (global) {
+            auto& p = pipeline(name, std::uint32_t(c.bufs.size()));
+            VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, std::uint32_t(c.bufs.size())};
+            VkDescriptorPoolCreateInfo pi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO}; pi.maxSets = 1; pi.poolSizeCount = 1; pi.pPoolSizes = &ps;
+            VkDescriptorPool dp; ck(vkCreateDescriptorPool(dev_, &pi, nullptr, &dp), "vkCreateDescriptorPool");
+            pending_pools_.push_back(dp);
+            VkDescriptorSetAllocateInfo sa{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO}; sa.descriptorPool = dp; sa.descriptorSetCount = 1; sa.pSetLayouts = &p.dsl;
+            VkDescriptorSet ds; ck(vkAllocateDescriptorSets(dev_, &sa, &ds), "vkAllocateDescriptorSets");
+            std::vector<VkDescriptorBufferInfo> dbi(c.bufs.size()); std::vector<VkWriteDescriptorSet> w;
+            for (std::size_t i = 0; i < c.bufs.size(); ++i) {
+                dbi[i] = {c.bufs[i].e->b, c.bufs[i].off, c.bufs[i].range};
+                VkWriteDescriptorSet x{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}; x.dstSet = ds; x.dstBinding = std::uint32_t(i); x.descriptorCount = 1;
+                x.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; x.pBufferInfo = &dbi[i]; w.push_back(x);
+            }
+            vkUpdateDescriptorSets(dev_, std::uint32_t(w.size()), w.data(), 0, nullptr);
+            open_cb();
+            vkCmdBindPipeline(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+            vkCmdBindDescriptorSets(cb_, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &ds, 0, nullptr);
+            if (c.pc.size() * 4 > push_bytes) throw std::runtime_error("vulkan: " + name + " has too many scalar arguments");
+            vkCmdPushConstants(cb_, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, std::uint32_t(c.pc.size() * 4), c.pc.data());
+            dispatch(cb_, global);
+            ++recorded_;
+        }
+        c.bufs.clear(); c.pc.clear();
+    }
+    void k_done(kcall& c) {
+        for (auto& w : c.wb) { open_cb(); VkBufferCopy r{0, w.off, w.bytes}; vkCmdCopyBuffer(cb_, w.tmp->b, w.dst->b, 1, &r); ++recorded_; }
+        c.wb.clear();
+        if (in_run_) return;                 // submitted with the run's command buffer; its scratch buffers go then
+        submit_locked(true);
+        for (auto& r : c.rd) { std::memcpy(r.h, r.tmp->map, r.bytes); ++stats_.downloads; }
+        c.rd.clear();
+        free_scratch();                      // nothing is recorded any more
+    }
+    void k_abort(kcall& c) { c.wb.clear(); c.rd.clear(); try { submit_locked(); } catch (...) {} if (!in_run_ && !cb_) free_scratch(); }
+    void free_scratch() { for (auto& e : scratch_) free_entry(e); scratch_.clear(); op_scratch_ = 0; }
+    bool k_has(const std::string& n) { return has_kernel(n) && port_bindings(n) <= max_bindings_; }
+    // An encoded weight (or any read-only blob) uploaded once and kept for the runtime's lifetime, keyed by host address
+    // and size, padded to whole words; evictable least recently used first (evict_device).
+    void* qweight(const std::uint8_t* q, std::size_t bytes) {
+        auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(q), bytes);
+        if (auto it = qres_.find(key); it != qres_.end()) { it->second.last = ++clock_; return &it->second; }
+        entry e = make_buffer_((bytes + 3) / 4);
+        std::memset(e.map, 0, std::max<std::size_t>(4, (bytes + 3) / 4 * 4)); std::memcpy(e.map, q, bytes);
+        e.last = ++clock_; ++stats_.uploads; stats_.upload_bytes += bytes;
+        return &qres_.emplace(key, e).first->second;
+    }
+    std::map<std::pair<std::uintptr_t, std::size_t>, entry> qres_;
+    bool no_stage_ = false;                  // k_touch: settle the residency map without staging misaligned views
+    std::uint32_t max_bindings_ = 4;
     // Find or create the resident buffer for exactly [h.data, h.data+h.count). An overlapping entry of a
     // different extent (arena slot reuse, a view into a bigger buffer) is synced to the host and dropped first.
     // parent/poff: a staged copy of a sub-range whose offset breaks minStorageBufferOffsetAlignment
@@ -513,7 +632,7 @@ private:
             auto cl = reinterpret_cast<std::uintptr_t>(c.host);
             if (cl + c.count * 4 >= key + h.count * 4 && h.count) {
                 c.last = ++clock_;
-                if ((key - cl) % align_ == 0) return {&c, key - cl, range};
+                if ((key - cl) % align_ == 0 || no_stage_) return {&c, key - cl, range};
                 // Misaligned view (e.g. 256-byte SwiftShader limit): stage it through a scratch buffer with
                 // device-side copies instead of dropping the parent, which would force a submit + host sync.
                 scratch_.push_back(make_buffer_(h.count));
@@ -621,9 +740,17 @@ inline bool run_op(runtime& rt, const std::string& op, const std::vector<tensor_
         pc.d = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7);
         pc.alpha = float(a.num("scale", 1.0 / std::sqrt(double(pc.k)))); inv = pc.rows * pc.cols;
     }
+    if (op == "attention") if (int r = rt.attention_fast(in, a, out); r >= 0) return true;   // one-pass / split-over-keys ports (plain f32 K/V)
     std::vector<hbuf> b; for (auto& v : in) b.push_back({v.data, v.size()}); b.push_back({out.data, out.size()});
     if (rt.resident()) rt.run_resident(op, b, pc, inv); else rt.run(op, b, pc, inv);
     return true;
+}
+inline bool runtime::run_op(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) {
+    if (cuda_hip::sig sg; cuda_hip::kernel_sig(op, sg) && cuda_hip::nn_sig(sg)) {   // the encoder / vision kernels (GLSL ports of PORT_NN)
+        std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
+        return cuda_hip::supports(op, ss, a) && this->run_nn(op, in, a, out);
+    }
+    return vk::run_op(*this, op, in, a, out);
 }
 inline bool run_op(runtime& rt, const std::string& op, const std::vector<forge::tensor>& in, const ops::attrs& a, forge::tensor& out) {
     auto o = ops::op_from_name(op);

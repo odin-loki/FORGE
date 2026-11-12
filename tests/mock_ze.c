@@ -30,7 +30,7 @@ static float as_float(unsigned u) { float f; memcpy(&f, &u, 4); return f; }
 #define MOCK_MEM(p) (*(char**)(p))
 #include "kernels_cl_mock.inc"
 
-typedef struct { int idx; uint32_t gx; void* args[16]; char store[16][8]; } kern;
+typedef struct { int idx; uint32_t gx; void* args[24]; char store[24][8]; } kern;
 static int ndev(void) { const char* e = getenv("MOCK_DEVICES"); return e ? atoi(e) : 1; }
 static size_t g_live;
 int mock_source_builds = 0;   /* modules compiled from IL (not created from a native binary) */
@@ -95,7 +95,7 @@ ze_result_t zeKernelCreate(ze_module_handle_t m, const ze_kernel_desc_t* d, ze_k
 ze_result_t zeKernelDestroy(ze_kernel_handle_t k) { free(k); return ZE_RESULT_SUCCESS; }
 ze_result_t zeKernelSetGroupSize(ze_kernel_handle_t k, uint32_t x, uint32_t y, uint32_t z) { (void)y; (void)z; ((kern*)k)->gx = x; return ZE_RESULT_SUCCESS; }
 ze_result_t zeKernelSetArgumentValue(ze_kernel_handle_t k_, uint32_t i, size_t n, const void* v) {
-    kern* k = (kern*)k_; if (i >= 16 || n > 8) return ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_INDEX;
+    kern* k = (kern*)k_; if (i >= 24 || n > 8) return ZE_RESULT_ERROR_INVALID_KERNEL_ARGUMENT_INDEX;
     memcpy(k->store[i], v, n); k->args[i] = k->store[i]; return ZE_RESULT_SUCCESS; }
 ze_result_t zeCommandListAppendLaunchKernel(ze_command_list_handle_t l, ze_kernel_handle_t k_, const ze_group_count_t* g, ze_event_handle_t e, uint32_t ne, ze_event_handle_t* w) {
     (void)l; (void)e; (void)ne; (void)w; kern* k = (kern*)k_;

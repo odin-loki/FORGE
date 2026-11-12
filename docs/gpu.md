@@ -13,34 +13,35 @@ Nothing links against a vendor SDK. Each runtime `dlopen`s its driver library at
 
 | Output | Used by | Built with |
 |--------|---------|------------|
-| one GLSL compute shader per kernel (33) | Vulkan | `glslangValidator` → SPIR-V, embedded |
+| one GLSL compute shader per kernel (37 spec kernels, 11 ports of the portable kernels, 7 encoder / vision kernels) | Vulkan | `glslangValidator` → SPIR-V, embedded |
 | `kernels.cu` | CUDA, HIP | clang, no SDK: two PTX images, `sm_70` and `sm_80` (JIT-compiled by the driver; the `sm_80` one adds the tensor-core kernels); AMDGPU code objects for `FORGE_HIP_ARCHS` (default `gfx90a gfx942 gfx1100`, needs lld) |
 | `kernels.cl` | OpenCL (built by the driver at open, then loaded from the [kernel program cache](#kernel-program-cache)), Level Zero (offline to SPIR-V with clang + `llvm-spirv`; the driver's native binary is cached the same way) | |
 | `kernels.metal` | Metal (compiled at open with `newLibraryWithSource`) | |
 
-The 33 spec kernels are: 18 unary (`neg abs sqrt rsqrt recip square exp exp2 log log2 sin cos tanh sigmoid silu relu softplus gelu_tanh`), 6 binary (`add sub mul div maximum minimum`) and `scale softmax rms_norm matmul_t silu_mul rope gather attention slice`. CUDA, HIP, OpenCL, Level Zero and Metal have no `sin`/`cos`, so they register **31** lowerings. [reference.md](reference.md) marks which ops have a GPU kernel.
+The 37 spec kernels are: 22 unary (`neg abs sqrt rsqrt recip square exp exp2 log log2 sin cos tanh sigmoid silu relu softplus gelu gelu_tanh quick_gelu mish hard_swish`), 6 binary (`add sub mul div maximum minimum`) and `scale softmax rms_norm matmul_t silu_mul rope gather attention slice`. On top of them every backend has the 7 [encoder and vision kernels](#encoder-and-vision-kernels) (`layer_norm group_norm conv1d conv2d max_pool2d avg_pool2d attention_bias`). CUDA, HIP, OpenCL, Level Zero and Metal have no `sin`/`cos`, so they register **42** lowerings; Vulkan registers 45 (`vk.reshape` included). [reference.md](reference.md) marks which ops have a GPU kernel.
 
 `rope` with frequency scaling (`scaling`, `freq_factors`; `ops/include/forge/ops/rope.hpp`): the CUDA, HIP, OpenCL, Level Zero and Metal kernels read the inverse frequencies from a table the host builds, so they run every variant unchanged except dynamic NTK, whose table depends on the positions of each call and runs on the CPU. The Vulkan kernel computes `base^(-2j/d)` itself and hands any scaled `rope` to the CPU. The mock drivers cover the CUDA, HIP, OpenCL and Level Zero paths; the Metal and Vulkan paths for scaled `rope` have not been run.
 
-`kernels.cu` also holds CUDA/HIP-only kernels that the runtime picks itself: see [CUDA and HIP](#cuda-and-hip). `kernels.cl` holds portable versions of the same families (the `PORT_*` section of `gpu_gen.py`): see [Portable kernels](#portable-kernels-opencl-and-level-zero).
+`kernels.cu` also holds CUDA/HIP-only kernels that the runtime picks itself: see [CUDA and HIP](#cuda-and-hip). `kernels.cl` holds portable versions of the same families (the `PORT_*` section of `gpu_gen.py`), and Vulkan has a GLSL port of each (`VK_PORT`): see [Portable kernels](#portable-kernels-opencl-level-zero-and-vulkan).
 
 ### Kernels per backend
 Beyond the spec kernels. "tuned" = the block / shared-memory / tensor-core kernels of [CUDA and HIP](#cuda-and-hip); "portable" = one work item per output, no workgroup-shared memory; "–" = runs on the host (or, for quantised weights, decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET`).
 
 | Kernel family | CUDA | HIP | OpenCL | Level Zero | Vulkan | Metal |
 |---|---|---|---|---|---|---|
-| Quantised `matmul_t` (q8_0, q4_k, q5_k, q6_k weights kept encoded) | tuned (MMVQ, MMQ, + tensor cores on `sm_80`) | `forge_qmatmul_t`, `forge_qmatmul_mmq` | portable `forge_qmatmul_t` | portable | – | – |
-| Quantised gather (embedding from encoded rows) | `forge_qgather` | `forge_qgather` | portable `forge_qgather` | portable | – | – |
-| FFN gate/up/SiLU fusion | `forge_qmatmul_glu_*`, `forge_glu_q81` (`sm_80`) | – | portable `forge_qglu` (all four codecs) | portable | – | – |
-| Attention, prefill | `forge_attention_fa`, `_fa2_*`, `_fa2tc_*` | `forge_attention_fa` | portable `forge_attention_fa` (one pass) | portable | spec kernel | spec kernel |
-| Attention, decode (split over keys) | `forge_attention_dec` + `_comb` | – (`forge_attention_fa`) | portable `forge_attention_dec` + `_comb` | portable | spec kernel | spec kernel |
-| Gated DeltaNet state ops | `forge_delta_rule*`, `forge_causal_conv*` | `forge_delta_rule`, `forge_causal_conv*` | portable `forge_delta_rule`, `forge_causal_conv` | portable | – | – |
-| Sparse mixture of experts (`moe_ffn`) | `forge_moe_hidden` + `forge_moe_down` | same | same | same | – | – |
-| Broadcast add/sub/mul/div | `forge_bcast` | `forge_bcast` | portable `forge_bcast` | portable | – | – |
+| Quantised `matmul_t` (q8_0, q4_k, q5_k, q6_k weights kept encoded) | tuned (MMVQ, MMQ, + tensor cores on `sm_80`) | `forge_qmatmul_t`, `forge_qmatmul_mmq` | portable `forge_qmatmul_t` | portable | GLSL port | MSL translation, never executed |
+| Quantised gather (embedding from encoded rows) | `forge_qgather` | `forge_qgather` | portable `forge_qgather` | portable | GLSL port | MSL translation, never executed |
+| FFN gate/up/SiLU fusion | `forge_qmatmul_glu_*`, `forge_glu_q81` (`sm_80`) | – | portable `forge_qglu` (all four codecs) | portable | GLSL port | MSL translation, never executed |
+| Attention, prefill | `forge_attention_fa`, `_fa2_*`, `_fa2tc_*` | `forge_attention_fa` | portable `forge_attention_fa` (one pass) | portable | GLSL port (KV codecs: spec kernel) | MSL translation, never executed (KV codecs: spec kernel) |
+| Attention, decode (split over keys) | `forge_attention_dec` + `_comb` | – (`forge_attention_fa`) | portable `forge_attention_dec` + `_comb` | portable | GLSL port (KV codecs: spec kernel) | MSL translation, never executed (KV codecs: spec kernel) |
+| Gated DeltaNet state ops | `forge_delta_rule*`, `forge_causal_conv*` | `forge_delta_rule`, `forge_causal_conv*` | portable `forge_delta_rule`, `forge_causal_conv` | portable | GLSL port (needs 7 storage buffers per stage) | MSL translation, never executed |
+| Sparse mixture of experts (`moe_ffn`) | `forge_moe_hidden` + `forge_moe_down` | same | same | same | GLSL port (needs 5 storage buffers per stage) | MSL translation, never executed |
+| Broadcast add/sub/mul/div (suffix shapes, or a single-element operand) | `forge_bcast` | `forge_bcast` | portable `forge_bcast` | portable | GLSL port | MSL translation, never executed |
+| Encoder / vision ops: `gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d`, `attention_bias` | one portable source (`PORT_NN`), CUDA dialect | same | same source | same source | GLSL ports (`attention_bias` needs 5 storage buffers per stage) | MSL translation, never executed |
 | q8_1 / q8r activation fusions, add+rms_norm, rms+rope | yes | – | – | – | – | – |
 | Device concat (`forge_copy2d`), device argmax | yes | yes | – | – | – | – |
 
-Verification of the non-CUDA columns is by the mock drivers only (they compile `kernels.cl` as C and run it); see [Platform notes](#platform-notes-and-limits).
+Verification: the HIP, OpenCL and Level Zero columns by the mock drivers only (they compile `kernels.cl` as C and run it); the Vulkan column on Mesa lavapipe (a CPU implementation of Vulkan) only, where the SPIR-V itself runs; the Metal column's "MSL translation" entries have **never been executed** and never been compiled by a Metal compiler ([Metal translation](#metal-translation)); see [Platform notes](#platform-notes-and-limits).
 
 ### Backends
 
@@ -51,7 +52,7 @@ Verification of the non-CUDA columns is by the mock drivers only (they compile `
 | HIP | `gpu/cuda.hpp` | `hip[:N]` | `hip:N` | mock driver only |
 | OpenCL | `gpu/opencl.hpp` | `opencl[:N]` (all platforms, GPUs first) | `opencl:N` | mock driver only |
 | Level Zero | `gpu/levelzero.hpp` | `ze[:N]` / `level_zero[:N]` | `level_zero:N` | mock driver only |
-| Metal | `gpu/metal.hpp` + `gpu/src/metal.mm` | `metal[:N]` | none | the GitHub macOS runner's GPU in CI (`test_gpu_metal`, last on PR #53). The Metal changes of 2026-11-12 (the RoPE frequency table, the kernels `msl_port` translates) have only passed the MSL syntax check on Linux |
+| Metal | `gpu/metal.hpp` + `gpu/src/metal.mm` | `metal[:N]` | none | the GitHub macOS runner's GPU in CI (`test_gpu_metal`, last on PR #53). The Metal changes of 2026-11-12 (the RoPE frequency table, the portable kernels `msl_port` translates and their host code in `metal.mm`) have only passed the syntax checks on Linux: never compiled by a Metal toolchain, never executed |
 
 All runtimes except Metal share one contract: `run_op` over host tensor views, and a **residency protocol** (`begin_run`, `end_run`, `pin`, `to_host`, `host_wrote`, `release`, `forget`, `copy_resident`). `forget(p, n)` drops the device copies and pin records of host memory that is going away; `graph::plan`'s destructor calls it for the plan's constants on every backend. (Until 2026-11-12 only CUDA/HIP had it: on OpenCL, Level Zero and Vulkan a destroyed plan left pins and resident entries behind, and the next plan's buffers at the same addresses read stale device data or were overwritten at sync-back. Regression test `test_gpu_stale_*_mock`.) The OpenCL and Level Zero `run_op` also acquire every buffer of a launch before binding any: acquiring a range that partly overlaps a resident entry drops that entry, and an input bound earlier in the same launch could live in it (the SIGBUS in `forge_matmul_t` with `FORGE_DEVICE=opencl` on the mock). Between `begin_run` and `end_run`, buffers stay on the device keyed by host address. Pinned ranges (weights) survive across runs. Metal uses unified memory, so its residency hooks do nothing.
 
@@ -131,7 +132,7 @@ Results are bitwise those of the unfused path, except where the unfused prefill 
 Attention supports the KV codecs `int8`, `fp8`, `tbq4` and `tbq3` (tbq only up to head dim 256). `tbq4p` and `tbq3p` run on the CPU only. The same holds for Vulkan.
 
 ### Graphs and replay (CUDA)
-- **User capture**: `capture_begin()`, `capture_end()` → id, `graph_launch(id)`. Streams are captured in relaxed mode so `run_op` may allocate while capturing. Needs the driver's graph API (`has_graphs()`); both CUDA and HIP export it.
+- **User capture**: `capture_begin()`, `capture_end()` → id, `graph_launch(id)`. Streams are captured in relaxed mode so `run_op` may allocate while capturing. Needs the driver's graph API (`has_graphs()`); both CUDA and HIP export it. A capture whose buffers were evicted since is re-recorded at `graph_launch` ([Eviction and recorded graphs](#eviction-and-recorded-graphs)).
 - **Decode graphs** (CUDA only, on by default; `FORGE_GRAPHS=0` turns them off). Inside a run, kernel launches are stream-captured in segments. A segment ends at a host copy, a free, a sync, or after `FORGE_GRAPH_SEG` kernels (default 64; 0 = no split). The first segments of a run are shorter, `FORGE_GRAPH_SEG0` kernels (default 8; 0 = off) doubling up to `FORGE_GRAPH_SEG`, so the device starts on the new token while the host is still recording the rest. Each segment's exec graph is cached by index. On later tokens, if the sequence of kernels and launch shapes matches, only the kernel nodes whose arguments changed are patched (`cuGraphExecKernelNodeSetParams`) and the graph is relaunched, without capturing. This needs `cuFuncGetParamInfo` (CUDA 12.4+). Without it, or with `FORGE_GRAPH_REPLAY=0`, each segment is re-captured and refreshed with `cuGraphExecUpdate`.
 - **Whole-run replay** (`FORGE_GPU_REPLAY` set, experimental, opt-in; also needs decode graphs on and the fixed arena). When every step of a run was a recorded kernel, the runtime predicts the next run's arguments from the last two (decode moves the KV write row and attention length by one each token) and relaunches all segments without the executor. A run becomes replayable only after a real run confirmed a prediction. The executor does one real run every `FORGE_REPLAY_VERIFY` runs (default 32). A wrong prediction disables replay for that plan and prints a warning. Segments are patched and launched one at a time, so the device starts on the first while the host patches the next (`FORGE_REPLAY_EAGER=0`: patch all, then launch).
 - **Small copies** (CUDA): host-to-device copies of up to 4 KB (decode: the token id and position) are staged through a 64 KB page-locked ring and issued as real async copies; from pageable memory the driver stages them synchronously, which costs tens of µs per copy under WSL. A slot is reused only after the next stream sync. `FORGE_GPU_STAGE=0` turns it off.
@@ -139,6 +140,25 @@ Attention supports the KV codecs `int8`, `fp8`, `tbq4` and `tbq3` (tbq only up t
 - **Fixed arena**: a plan's whole activation arena is held as one device buffer across runs, so every intermediate keeps its device address. Used when the arena is at most `FORGE_GPU_ARENA_MB` (default 1024; 0 = off).
 
 Freed device buffers are kept in a per-runtime pool for reuse, up to `FORGE_GPU_POOL_MB` (default 4096). The pool is the first thing given back under memory pressure.
+
+### Eviction and recorded graphs
+A recorded graph (`capture_begin` … `capture_end` → `graph_launch`) holds device buffers by handle or address. Evicting, releasing or re-creating one of them used to leave the graph pointing at freed memory, so graphs recorded before an eviction could not be replayed and nothing was evicted while a recording was open. Now every resident device buffer has a **generation** (a number never reused within a runtime), and each recorded buffer argument remembers what it referred to (`gpu::buffer_ref` in `gpu/graph_refs.hpp`: the host view or encoded weight, and the generation it resolved to). `graph_launch` checks the generations first:
+
+| | Unchanged buffers | A buffer was evicted, released or re-created |
+|---|---|---|
+| OpenCL, Level Zero (a graph is a list of launches) | the launch is enqueued as recorded | that launch is **re-recorded**: its arguments are bound again from the host views (uploading what was evicted, staging unaligned views again), it runs, and the refreshed launch replaces the recorded one |
+| CUDA, HIP (a driver graph from stream capture) | the driver graph is launched | the whole graph is re-recorded: the tensors are made resident again from their host views, the pointer arguments of the recorded launches are patched, and the launches are captured into a new driver graph |
+
+Either way the buffers a replay writes are marked device-newer, so `to_host` fetches them. `residency()` counts `graph_replays` and `graph_rerecords`. A graph recorded in one run is stale in the next (the run's buffers are dropped at `end_run`) and is re-recorded on its first launch there.
+
+What may be evicted when:
+- **Between captures / before a replay**: anything, on every backend.
+- **While an OpenCL / Level Zero recording is open**: anything the op in progress has not bound. Recorded launches whose buffers went are re-recorded at replay.
+- **While a CUDA / HIP stream capture is open**: nothing. A capturing stream can neither be synchronised nor have its buffers freed, so an allocation that does not fit fails as it would without eviction. (Decode-graph segments are not affected: eviction ends the open segment first, as before.)
+
+Limits of the CUDA / HIP re-recording: it needs each captured kernel's parameter sizes, from `cuFuncGetParamInfo` (CUDA 12.4+) or else from the table `gpu_gen.py` derives from the signatures in `kernels.cu` (72 kernels; the tensor-core kernels stamped out by macros are not in it). It cannot bring back an evicted encoded weight, whose device layout may be repacked. A stale graph it cannot re-record makes `graph_launch` throw instead of running on dead addresses. Pointers into runtime-owned scratch (the split-K attention partials, the RoPE tables) are not tracked. A kernel captured before its input was ever uploaded is still a hazard: capture after a warm run, as `test_cuda_hip features` does.
+
+Tested on the mock drivers only (`test_gpu_memory_{cuda,hip,opencl,ze}_mock`, step 6: replay, eviction between capture and replay, re-record, replay of the re-recorded graph, a graph from an earlier run, eviction during an open OpenCL / Level Zero recording, no eviction during an open CUDA / HIP capture). The CUDA path has not run on the RTX 3090.
 
 `FORGE_GPU_EAGER_SYNC` (any value) turns off the fixed arena, whole-run replay, and the end-of-run shortcut that leaves intermediates unread on the device. Every run then ends by syncing all resident buffers to the host.
 
@@ -154,12 +174,12 @@ Freed device buffers are kept in a per-runtime pool for reuse, up to `FORGE_GPU_
 | `argmax_resident(p, n)` | Greedy decode: `forge_argmax` over a device-newer buffer, one `int` read back into page-locked memory (ties: lowest index); `-1` when not resident. Up to 128 blocks scan the buffer and the last one to finish merges their partials (a 248k vocabulary: ~10 µs, against ~85 µs for one block). Wired as the `device_hooks::argmax` hook: with a plain greedy sampler, `session::generate` asks the executor for the logits' argmax instead of downloading them |
 | `capture_begin`, `capture_end`, `graph_launch` | User stream capture |
 | `copy_to_peer`, `device_alloc`, `device_free`, `upload`, `download` | Raw device memory and peer copies (host-staged when the APIs differ) |
-| `residency()`, `dispatches()`, `memory_pool()`, `charged_bytes()` | Statistics: uploads, downloads, resident and pooled bytes, evictions, per-kernel dispatch counts |
+| `residency()`, `dispatches()`, `memory_pool()`, `charged_bytes()` | Statistics: uploads, downloads, resident and pooled bytes, evictions, graph replays and re-records, per-kernel dispatch counts |
 | `cuda_hip::counters()` | Process-wide driver call counters (launches, captured, graph launches, copies, syncs) read by `forge bench` and `tools/bench_llm.sh` |
 
-OpenCL (`gpu::ocl`) and Level Zero (`gpu::ze`) runtimes have `open(&why, ordinal)`, `device_count()`, `run_op`, the residency protocol, peer copies, and recorded "graphs" (enqueues replayed with the same arguments). They also have `run_qmatmul`, `run_qglu`, `run_qgather`, `run_state`, `run_bcast`, `run_moe` and `has_function` with the CUDA/HIP signatures, from one shared implementation (`gpu/portable_kernels.hpp`), plus `program_from_cache()` / `kernel_cache_path()`.
+OpenCL (`gpu::ocl`) and Level Zero (`gpu::ze`) runtimes have `open(&why, ordinal)`, `device_count()`, `run_op`, the residency protocol, peer copies, and recorded "graphs" (enqueues replayed with the same arguments). They also have `run_qmatmul`, `run_qglu`, `run_qgather`, `run_state`, `run_bcast`, `run_moe` and `has_function` with the CUDA/HIP signatures, from one shared implementation (`gpu/portable_kernels.hpp`), plus `program_from_cache()` / `kernel_cache_path()`. The Vulkan runtime (`gpu::vk::runtime`) has the same seven entry points from the same implementation, and `run_op` as a member next to the free function `vk::run_op`.
 
-## Portable kernels (OpenCL and Level Zero)
+## Portable kernels (OpenCL, Level Zero and Vulkan)
 `ops/gen/gpu_gen.py` has one portable source (`PORT_HELPERS`, `PORT_SHARED`, `PORT_KERNELS`) for the kernel families that used to exist only for CUDA/HIP. Every kernel is one work item per output element (or per row-head, per state column), uses no workgroup-shared memory, barriers or vendor intrinsics, and so builds on any OpenCL 1.2 device. `gpu::portable_kernels<Runtime>` (`gpu/portable_kernels.hpp`) is the host side for both runtimes.
 
 | Work | Kernel | Launch | Disable |
@@ -175,6 +195,25 @@ OpenCL (`gpu::ocl`) and Level Zero (`gpu::ze`) runtimes have `open(&why, ordinal
 
 KV codecs (`int8`, `fp8`, `tbq4`, `tbq3`) keep using the spec kernel `forge_attention`. Encoded weights are uploaded once, keyed by host address and size, and are evicted least recently used first under memory pressure (the host copy is re-uploaded on the next use). These kernels are correct-first: a work item re-decodes its weight row and the DeltaNet item recomputes the token's q/k norms, so they are slower per flop than the tuned CUDA kernels. None of them has run on real hardware.
 
+### Vulkan ports
+Every kernel of the table has a GLSL compute shader of the same name (`VK_PORT` in `gpu_gen.py`, translated by hand line for line), and `gpu::vk::runtime` derives from the same `gpu::portable_kernels<>`, so entry points, launch shapes, the residency of encoded weights and the switches of the table are the same. `graph::vulkan_registry` registers `vk.qmatmul_t`, `vk.qglu`, `vk.qgather`, `vk.moe_ffn`, the state-op hook, and broadcast shapes on `vk.add` / `sub` / `mul` / `div`. What differs from the OpenCL C:
+
+- **Pointers are offsets.** Buffers are bound in the OpenCL argument order (binding 0..N-1) and the scalar arguments are the push-constant block in the same order. Encoded weights are bound as `uint` words and read bytewise, so a weight is uploaded padded to a whole word. Offsets are 32-bit: a buffer is limited to 4 GiB.
+- **Attention scores** are summed in 4 partial sums, as the spec attention shader does, instead of one `fma` chain: on llvmpipe (whose `fma` is a multiply and an add) one chain left decode shapes at 1.2e-5 against the oracle's 1e-5. The other kernels keep the index-order `fma` accumulation.
+- **`exp`**: `fexp` is the shader head's polynomial, not `exp2(x · log2 e)`; the SiLU of `forge_qglu` / `forge_moe_hidden` uses the builtin `exp` like the `silu_mul` shader.
+- **Empty key chunk** of `forge_attention_dec` is marked by a zero weight sum (a chunk with a key has a sum of at least 1), not by a maximum of −inf.
+- **Storage buffers per stage**: `forge_delta_rule` binds 7 and `forge_moe_hidden` 5. The Vulkan minimum for `maxPerStageDescriptorStorageBuffers` is 4; on a device below a kernel's count that family is not registered and runs on the host.
+- **Large launches** (all Vulkan shaders, the spec kernels included): work items are 64 per group and the groups are folded into rows of 32768, so a launch no longer needs more than `maxComputeWorkGroupCount[0]` = 65535 groups in one dimension (before, more than 4.2 million work items were out of the guaranteed range).
+
+### Metal translation
+`kernels.metal` holds the same eleven kernels through a textual translation of the OpenCL C (`msl_port` in `gpu_gen.py`): `G` becomes `device`, pointers to locals become `thread`, `unsigned` / `unsigned char` become `uint` / `uchar`, `as_float` becomes `as_type<float>`, and each kernel gets the signature form of the spec kernels (buffers and scalars are `[[buffer(i)]]` in argument order). The arithmetic is the OpenCL kernels' token for token, with one exception: the f32 branch of `moe_dot` reads its words bytewise instead of casting the byte pointer to a float pointer.
+
+The host side is `gpu::portable_kernels<>` on `gpu::metal::runtime` (`gpu/src/metal.mm`). Metal keeps no tensors on the device, so a launch wraps each host tensor in a shared buffer (copied in unless it is output-only), runs to completion and copies outputs and in/out tensors (the DeltaNet state) back. Encoded weights are the exception: each is copied once into a buffer that stays, charged to the pool `metal:<ordinal>` as `weights`; when the pool is full the weights the op in progress has not bound are dropped and re-created on their next use.
+
+**Never executed.** No Mac was available: the MSL passes only the C++ syntax check on Linux (`gpu_compile_metal_syntax`, in which the address-space keywords vanish, so a wrong `device` / `thread` qualifier would not be caught), and `metal.mm` is only parsed as Objective-C++ against stub declarations of the Metal API (`tests/shims/metal_stub`, ctest `gpu_compile_metal_host_syntax`). The first real compile and run is the macOS CI job (`gpu_compile_metal`, `test_gpu_metal`), which now runs the checks of `tests/gpu_checks.hpp` for Metal too.
+
+Outside a run (`vulkan_registry_flat`: pipeline stages, RPC servers, the device benchmark) each call stages its tensors through scratch buffers and submits once; the encoded weights stay resident either way. Verified on Mesa lavapipe only (`test_vulkan`: the checks of `tests/gpu_checks.hpp`, shared with `test_cuda_hip`; `golden_*_vulkan`). No physical GPU has run them.
+
 ### Quantised matmul: exact and int8-activation paths
 A quantised `matmul_t` has two families of kernels, and they give slightly different numbers for the same model file:
 
@@ -187,15 +226,33 @@ A quantised `matmul_t` has two families of kernels, and they give slightly diffe
 
 This is what was behind a q8_0 logit cosine of 0.9984 on the OpenCL mock against 0.9990 on the CPU and the CUDA mock for the Gemma-2 model of `verify/golden/tiny_gemma.py`. The OpenCL run was bit-for-bit the exact path (cosine 1.000000 with `FORGE_CPU_INT8=0` on the CPU); soft-capping, scale rounding and intermediates in the portable kernels were not involved. That model's attention scores reached 28 against a soft-cap of 5, which made its logits so sensitive to q8_0 weight rounding that over 12 prompts the cosine against the unquantised reference ran from 0.945 to 0.9995 on the int8 path and from 0.979 to 0.9995 on the exact one (the exact path was the closer one for 11 of the 12; the golden's prompt was the twelfth). The golden now uses weights whose scores pass the cap by a factor of 3 (6.4 against 2), and its bound is 0.999 for every generation on every path (measured: 0.99936 CPU and CUDA mock, 0.99977 OpenCL mock).
 
+## Encoder and vision kernels
+`gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d` and `attention_bias` ran on the host on every backend until 2026-11-12; a BERT, ViT, Whisper-encoder, GPT-2 or Gemma-2/3 plan fetched its activations back for each of them. They now have device kernels on every backend, as ordinary lowerings (`cuda.layer_norm`, `vk.conv2d`, ...) that the oracle checks against the op's float64 reference like any other.
+
+| Op | Kernel | Work items | Notes |
+|---|---|---|---|
+| `gelu` | unary `forge_gelu` / `gelu.comp` | elements | `0.5 x erfc(-x / √2)` with `erfc` by Abramowitz & Stegun 7.1.26 (absolute error 1.5e-7): no `erf` builtin is needed (the CUDA / HIP images link no math library), and the negative tail is a product instead of `1 + erf` |
+| `layer_norm` | `forge_layer_norm` | rows | mean and variance in 4 partial sums; safe in place |
+| `group_norm` | `forge_group_norm` | groups | `x[c, ...]`; one work item reduces a whole group, so few groups over a large image is one long work item |
+| `conv1d`, `conv2d` | `forge_conv1d`, `forge_conv2d` | output elements | direct convolution (no im2col buffer): groups and depthwise, stride / pad / dilation per axis, a bias of `[o]` or `[1]`; `fma` accumulation over `c/groups × k` in index order |
+| `max_pool2d`, `avg_pool2d` | `forge_max_pool2d`, `forge_avg_pool2d` | output elements | padding never wins a max (an all-padding window is −inf); `count_pad` 0 and 1 |
+| `attention_bias` | `forge_attention_bias` | (row, head) | one pass with an online softmax; the bias dims (right-aligned to `[hq, s, t]`) must each be 1 or the full size; −inf masks a key, a fully masked row gives zeros; soft-cap, causal and two-sided window; plain f32 K/V only (a graph that feeds it from a quantised KV state is refused at plan time anyway) |
+
+The seven non-unary kernels are written once in the portable OpenCL C dialect (`PORT_NN` in `gpu_gen.py`). `kernels.cl` takes that text, `kernels.cu` a dialect change of it (`cu_nn`), `kernels.metal` the `msl_port` translation, and Vulkan hand-written GLSL ports (`VK_PORT_NN`: the norms and the attention scores in `vec4` partial sums, −inf tested as "below every finite float"). Their arguments are (inputs, output, scalars) exactly as `cuda_hip::kernel_args` lays them out, so OpenCL, Level Zero and Metal run them through their generic `run_op`; CUDA / HIP through `run_nn` in `cuda.hpp`; Vulkan through `portable_kernels<>::run_nn`.
+
+They are correct-first kernels with no tiling or shared memory: a convolution reads its window per output element, and nothing is fused with the neighbouring ops. No timing exists for any of them.
+
+Verification: every lowering through the oracle on the CUDA, HIP, OpenCL and Level Zero mocks (42/42 each) and on lavapipe (all `vk.*`), plus `nn_ops_check` (`tests/gpu_checks.hpp`: 26 cases over groups, depthwise, per-axis stride / pad / dilation, shared bias, padded pooling, every bias broadcast, −inf masks, soft-cap, window, scalar broadcast) on the same five. For CUDA and HIP the mock (`tests/mock_cuda.c`) compiles the generated portable source as C instead of a hand copy, so the kernel text itself is what runs; the PTX and AMDGPU builds of the same text are only compiled. `FORGE_PLAN_TRACE` on the family goldens shows what is left on the host: `transpose`, `l2_normalize`, `masked_mean` and the other ops without a kernel. Not run on any GPU; the Metal versions have never been executed.
+
 ## Mixture of experts on the device
-`moe_ffn` runs on CUDA, HIP, OpenCL and Level Zero when the three stacked expert weights are encoded (q8_0, q4_k, q5_k, q6_k) or f32 constants (`registry::device_moe`, `run_moe`; `FORGE_GPU_MOE=0` keeps it on the host):
+`moe_ffn` runs on CUDA, HIP, OpenCL, Level Zero, Vulkan and (never executed) Metal when the three stacked expert weights are encoded (q8_0, q4_k, q5_k, q6_k) or f32 constants (`registry::device_moe`, `run_moe`; `FORGE_GPU_MOE=0` keeps it on the host):
 
 1. **Router on the host.** The router logits are synced back (`to_host`), and each token's top-k experts and weights come from `ops::ref::moe_route`, the same function the CPU path uses, so ties and the softmax / sigmoid gating are identical.
 2. **Route table.** Three floats per (token, slot) pair (expert id, token row, weight) are uploaded to a scratch buffer.
 3. **`forge_moe_hidden`**: a work item per (pair, hidden column) computes `silu(gate_e[c] · h) * (up_e[c] · h)` straight from the stacked `[e, f, d]` weights.
 4. **`forge_moe_down`**: a work item per (token, output column) sums `w * (down_e[c] · hidden)` over the token's slots in slot order.
 
-Only the routed experts' rows are read (sparse dispatch, like the CPU "moe-sparse" path); the stacked weights are uploaded once and stay on the device. The same two kernels are in `kernels.cu` (CUDA/HIP dialect) and `kernels.cl`. The CUDA/HIP launches sync at the end of the op (they use temporaries), so a decode graph segment ends there. Verified against the CPU path by `moe_check` in `test_cuda_hip` and by `golden_moe_mla_{cuda,hip,opencl,ze}_mock`; never run on hardware. Vulkan and Metal have no MoE kernel.
+Only the routed experts' rows are read (sparse dispatch, like the CPU "moe-sparse" path); the stacked weights are uploaded once and stay on the device. The same two kernels are in `kernels.cu` (CUDA/HIP dialect) and `kernels.cl`. The CUDA/HIP launches sync at the end of the op (they use temporaries), so a decode graph segment ends there. Verified against the CPU path by `moe_check` (`tests/gpu_checks.hpp`) in `test_cuda_hip` and `test_vulkan`, and by `golden_moe_mla_{cuda,hip,opencl,ze}_mock` and `golden_moe_mla_vulkan` (lavapipe); never run on hardware. Vulkan runs the same two kernels as GLSL ports. Metal has them through the MSL translation, never executed.
 
 ## Kernel program cache
 OpenCL builds `kernels.cl` with the driver at `open()`; Level Zero compiles the SPIR-V. Both are cached on disk (`gpu/kernel_cache.hpp`), in the same directory as the Vulkan pipeline cache: `$FORGE_CACHE_DIR`, else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge` (`%LOCALAPPDATA%\forge` when none of those is set).
@@ -233,6 +290,8 @@ Classes come from the driver: Vulkan `VkPhysicalDeviceType`; OpenCL `CL_DEVICE_T
 
 Tested with synthetic records (`test_gpu`: `device_selection_scoring`) and with the mock drivers at `MOCK_DEVICES=2` (`test_gpu_select_*_mock`). No real multi-GPU machine has run it; the priors are guesses, not measurements.
 
+`FORGE_DEVICE=pipe:auto` uses the same records to split a model over the devices of one backend, by throughput and device memory: see [graph.md](graph.md#automatic-split-pipeauto).
+
 ## Determinism mode
 `FORGE_DETERMINISTIC=1`, `gpu::set_deterministic(true)` or `inference::session_options::deterministic = 1` (`gpu/determinism.hpp`; the explicit calls win over the variable, and the mode is process-wide).
 
@@ -244,8 +303,7 @@ With the mode on, every runtime takes only paths whose reduction order depends o
 |---|---|
 | CUDA | split-K and stream-K tensor-core matmuls (their k-sum order follows the launch grid, which follows how many blocks the GPU holds at once), the split-K decode attention, the multi-block `forge_argmax` (one block scans the buffer), whole-run replay |
 | HIP | the multi-block argmax (HIP has no split-K kernels: they are in the NVPTX-only part of `kernels.cu`) |
-| OpenCL, Level Zero | the split-over-keys decode attention (`forge_attention_fa` / `forge_attention` run instead) |
-| Vulkan, Metal | nothing: their kernels have one fixed order per shape already |
+| OpenCL, Level Zero, Vulkan, Metal | the split-over-keys decode attention (`forge_attention_fa` / `forge_attention` run instead) |
 | CPU (`gpu::graph::launch`) | chunk boundaries are fixed at 4096 items whatever the worker count |
 
 The runtimes read the switch at each launch, so it can be changed between runs; `plan::deterministic` records the mode a plan was compiled under and `describe()` prints it. `FORGE_MMA_STREAMK` and `FORGE_MMA_SPLITK` are ignored while the mode is on. Cost: prefill matmuls on ragged grids lose the split-K / stream-K speedup, and decode attention runs as one work item (block) per row-head. Tested with the mock drivers (`test_gpu_determinism_{cuda,hip,opencl,ze}_mock`: no order-varying launch is dispatched, repeated runs are bit-identical). The mocks execute serially, so they cannot show a real device's scheduling; on hardware this is untested.
@@ -260,8 +318,26 @@ The runtimes read the switch at each launch, so it can be changed between runs; 
 | `graph::copy(src, dst)`, `graph::launch(kernel, extent, args...)`, `graph::host(fn)` | Return a node. Nodes run in recorded order by default; `node.after(other)` adds a dependency |
 | `graph::compile(device)` → `executable` | `run()` replays the flat order; `steps()` counts nodes |
 | `item<3>` | `global(d)`, `local(d)`, `group(d)`, `range(d)` |
-| `gpu::prims` | `reduce`, `scan(x, y, inclusive = true)`, `compact(x, out, pred)`, `radix_sort(keys, vals = {})`, `histogram`, `segmented_scan`, `segmented_reduce`, `bitonic_sort`, `top_k`, `gemm_nt`, `philox_uniform`, `hash_map`. CPU implementations |
+| `gpu::prims` | `reduce`, `scan(x, y, inclusive = true)`, `compact(x, out, pred)`, `radix_sort(keys, vals = {})`, `histogram`, `segmented_scan`, `segmented_reduce`, `bitonic_sort`, `top_k`, `gemm_nt`, `philox_uniform`, `hash_map`, and the linear-algebra / signal / normalisation / attention primitives of the next table. CPU implementations |
+| `gpu::prims::device` (`prims_device.hpp`) | The primitives of the next table on a device runtime, through the generated kernels |
 | `interop.hpp` | `vk_external`: allocate exportable Vulkan buffers and semaphores on the application's `VkDevice`, export/import them as OS handles (fd or NT handle). `cuda_import`: map them into CUDA (`cuImportExternalMemory`) |
+
+### Linear algebra, convolution, FFT, normalisation, attention (`prims.hpp`, `prims_device.hpp`)
+The FORGE_PLAN B.6 list beyond the scans and sorts. The CPU versions run on the `simd` kernel table with rows or tiles split over the task pool. The device versions (`gpu::prims::device::<name>(rt, ...)`, same arguments after the runtime) take any runtime with the `run_op` contract (CUDA, HIP, OpenCL, Level Zero, Metal, Vulkan) and return `false`, having computed nothing, when the device has no kernel for the primitive or shape.
+
+| Primitive | CPU (`gpu::prims`) | Device (`gpu::prims::device`) |
+|---|---|---|
+| `gemv(W, x, y, n, k, epilogue)` | `y = act(W·x + bias)`: a SIMD dot per output, columns over the pool | `forge_matmul_t`, then the epilogue |
+| `gemm_batched(A, B, C, batch, m, n, k, shared_b, epilogue)` | `C[b] = act(A[b]·Bᵀ + bias)`; `B` is `[n, k]` for every batch or `[batch, n, k]`; the blocked `gemm_nt`, the epilogue per output row | one `forge_matmul_t` over `batch × m` rows (shared `B`) or one per batch, then the epilogue |
+| `epilogue {bias, fn}` | bias add and `relu`, `silu`, `gelu_tanh`, `tanh` or `sigmoid` in place on the row (SIMD) | `forge_bcast` for the bias and the activation's unary kernel: separate launches, not fused into the matmul kernel |
+| `conv2d`, `conv1d` | im2col + `gemm_nt`, one product per group; stride / pad / dilation per axis, bias `[O]` or `[1]` | `forge_conv2d` / `forge_conv1d` (direct) |
+| `fft(x, inverse)` | complex f32 in place: iterative radix 2 for powers of two, Bluestein's chirp-z over it for every other length (O(n log n)); twiddles computed in double; inverse scaled by 1/n | none |
+| `softmax`, `rms_norm`, `layer_norm` | rows over the pool; `softmax_row` / `rms_norm_row` of the SIMD table, layer norm with sums in double | `forge_softmax`, `forge_rms_norm`, `forge_layer_norm` |
+| `flash_attention(q, k, v, y, s, hq, d, t, hk, dv, opts)` | keys in tiles (`opts.tile`, default 64) with an online softmax, so no `[s, t]` score matrix exists; causal, window, GQA; SIMD dot and saxpy | the `attention` kernels: one-pass `forge_attention_fa`, split over keys for decode shapes, tiled / tensor-core on CUDA `sm_80` |
+
+"Epilogue fusion" on the CPU means the epilogue runs on each output row right after the product. On a device it is separate kernel launches on the resident output; a matmul kernel with a fused epilogue exists only for the quantised FFN gate/up path. No vendor BLAS is used anywhere (the B.6 "vendor escape hatch" does not exist).
+
+Tested: every CPU primitive against the op's float64 reference in `test_gpu` (`prims_gemv_gemm_epilogue`, `prims_convolution`, `prims_fft` against the DFT definition in double for 10 lengths plus the inverse round trip, `prims_softmax_norms`, `prims_flash_attention` for 6 shapes and tile sizes). The device versions by `prims_check` (`tests/gpu_checks.hpp`: 22 cases, outside and inside a run) on the CUDA, HIP, OpenCL and Level Zero mocks and on lavapipe. Not on a GPU; Metal never executed. Nothing was timed: the CPU FFT and convolution are straightforward implementations, not tuned ones.
 
 ## Example
 `docs/examples/gpu_graph.cpp` (ctest `doc_example_gpu_graph`):
@@ -291,9 +367,9 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | Variable | Default | Backend | Effect |
 |----------|---------|---------|--------|
 | `FORGE_CUDA_IMAGE` | unset | CUDA | `ptx` (sm_70) or `ptx sm_80`: load only that PTX image |
-| `FORGE_GPU_NO_FA` | unset | CUDA/HIP, OpenCL, Level Zero | Set: no flash-attention kernels (`forge_attention_fa`, `forge_attention_fa2_*`, `forge_attention_fa2tc_*`) |
+| `FORGE_GPU_NO_FA` | unset | CUDA/HIP, OpenCL, Level Zero, Vulkan, Metal | Set: no flash-attention kernels (`forge_attention_fa`, `forge_attention_fa2_*`, `forge_attention_fa2tc_*`) |
 | `FORGE_FA_TC` | on | CUDA | `0`: tiled prefill attention uses the f32 SIMT kernel (`forge_attention_fa2_*`) instead of the fp16 tensor-core one |
-| `FORGE_ATTN_DEC` | on | CUDA/HIP, OpenCL, Level Zero | `0`: no split-K decode attention |
+| `FORGE_ATTN_DEC` | on | CUDA/HIP, OpenCL, Level Zero, Vulkan, Metal | `0`: no split-K decode attention |
 | `FORGE_MMVQ` | on | CUDA/HIP | `0`: no q8_1/dp4a decode matmul |
 | `FORGE_MMVQ_CPB` | per shape | CUDA/HIP | `1`, `2` or `4`: output columns per decode-matmul block (default 2 for q4_k with k ≤ 6144, else 1) |
 | `FORGE_MMVQ_Q8V` | on | CUDA/HIP | `0`: q8_0 decode matmul uses the older 4-bytes-per-lane loop |
@@ -311,11 +387,11 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | `FORGE_FUSE_ADD_NORM` | on | CUDA | `0`: residual add and the following rms_norm run as two kernels |
 | `FORGE_FUSE_QK_ROPE` | on | CUDA | `0`: QK-norm rms_norm and rope run as two kernels |
 | `FORGE_ROPE_HPB` | per shape | CUDA | Heads per `forge_rms_rope` block (tuning) |
-| `FORGE_FUSE_GLU` | on | CUDA, OpenCL, Level Zero | `0`: FFN gate and up run as two matmuls plus `silu_mul` (see [FFN gate/up fusion](#ffn-gateup-fusion)) |
-| `FORGE_GPU_QMATMUL` | on | CUDA/HIP, OpenCL, Level Zero | `0`: no device quantised matmul; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` |
-| `FORGE_GPU_QGATHER` | on | CUDA/HIP, OpenCL, Level Zero | `0`: no device quantised gather |
-| `FORGE_GPU_NO_STATE_OPS` | unset | CUDA/HIP, OpenCL, Level Zero | Set: DeltaNet state ops run on the host |
-| `FORGE_GPU_MOE` | on | CUDA/HIP, OpenCL, Level Zero | `0`: `moe_ffn` runs on the host ([Mixture of experts](#mixture-of-experts-on-the-device)) |
+| `FORGE_FUSE_GLU` | on | CUDA, OpenCL, Level Zero, Vulkan, Metal | `0`: FFN gate and up run as two matmuls plus `silu_mul` (see [FFN gate/up fusion](#ffn-gateup-fusion)) |
+| `FORGE_GPU_QMATMUL` | on | CUDA/HIP, OpenCL, Level Zero, Vulkan, Metal | `0`: no device quantised matmul; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` |
+| `FORGE_GPU_QGATHER` | on | CUDA/HIP, OpenCL, Level Zero, Vulkan, Metal | `0`: no device quantised gather |
+| `FORGE_GPU_NO_STATE_OPS` | unset | CUDA/HIP, OpenCL, Level Zero, Vulkan, Metal | Set: DeltaNet state ops run on the host |
+| `FORGE_GPU_MOE` | on | CUDA/HIP, OpenCL, Level Zero, Vulkan, Metal | `0`: `moe_ffn` runs on the host ([Mixture of experts](#mixture-of-experts-on-the-device)) |
 | `FORGE_DETERMINISTIC` | off | all | `1`: [determinism mode](#determinism-mode) |
 | `FORGE_DEVICE_PREFER` | unset | `auto` | Comma list of backends or devices that win whenever eligible (`cuda`, `opencl:1`) |
 | `FORGE_DEVICE_EXCLUDE` | unset | `auto` | Comma list of backends or devices never chosen |
@@ -350,11 +426,11 @@ Test hooks, not for normal use: `FORGE_VK_SSBO_ALIGN` (emulate a stricter storag
 - **Vulkan** needs `glslangValidator` and `vulkan/vulkan.h` at build time. Without them it is compiled out, even if `forge info` finds `libvulkan`. One device only. The pipeline cache is keyed by vendor, device, driver, pipeline-cache UUID and a hash of the SPIR-V.
 - **CUDA / HIP** images need a clang with the NVPTX / AMDGPU backends at build time (HIP also needs lld; zig's `ld.lld` works). Without them `open()` reports "this build has no embedded kernel image". Mobile builds have no CUDA/HIP images.
 - **Level Zero** needs `llvm-spirv` at build time; without it `open()` says so. `opencl` on the same GPU is the alternative.
-- **Metal** builds only on Apple platforms (`FORGE_GPU_METAL`); elsewhere `open()` reports "not an Apple platform build". On Linux only an MSL syntax check runs (`gpu_compile_metal_syntax`). Metal has no graphs. Each op charges its buffers to the `metal:<ordinal>` memory pool while it runs; with unified memory and no residency there is nothing to evict, so an op that does not fit fails (see [memory.md](memory.md)).
+- **Metal** builds only on Apple platforms (`FORGE_GPU_METAL`); elsewhere `open()` reports "not an Apple platform build". On Linux only syntax checks run: the MSL as C++ (`gpu_compile_metal_syntax`) and `metal.mm` against stub declarations (`gpu_compile_metal_host_syntax`). Metal has no graphs. Each op charges its buffers to the `metal:<ordinal>` memory pool while it runs; with unified memory and no residency there is nothing to evict but the encoded weights of the portable kernels, so an op that does not fit fails (see [memory.md](memory.md)).
 - Tested on hardware:
   - **CUDA** on an NVIDIA RTX 3090. 2026-10-31 (WSL2, CUDA 13, clang 23.1.4): full ctest 104/104. 2026-11-04 (Windows 11, mingw-w64 build): `test_gpu_cuda` passed 31/31 lowerings against the oracle, 24/24 quantised matmul cases, 7/7 split-K decode-attention shapes, and delta_rule/causal_conv matched the CPU. The same day a bug was fixed where the split-K combine kernel was launched with dangling argument pointers (commit 7fe8a83); the 3090 had passed by luck, the mocks failed. 2026-11-05 (WSL2, CUDA 13 driver 610.88, clang 23): the `sm_80` image (tensor-core prefill matmul, tiled prefill attention), register-state delta_rule and graphs on by default; full Linux ctest passes and greedy output is identical with graphs on and off. Prefill (512 tokens) / decode (128 tokens) tok/s on Q4_K_M GGUF weights, against llama.cpp `llama-bench` (bc428e4) on the same file: Qwen3.5 9B 2720 / 107.5 (llama.cpp 4740 / 120.5); Goedel-Prover-V2 32B (Qwen3) 839 / 35.3 (llama.cpp 1360 / 38.4). See [STATUS.md](STATUS.md).
-  - **Vulkan** on Mesa lavapipe and SwiftShader only (software devices).
+  - **Vulkan** on Mesa lavapipe and SwiftShader only (software devices). The ports of the portable kernels (2026-11-12) ran on lavapipe 25.2.8 (LLVM 20) only: `test_vulkan`, `test_vulkan_align256` and the 13 `golden_*_vulkan` tests.
   - **Metal** on the GitHub `macos-latest` runner's GPU: `test_gpu_metal` passes in CI (oracle check of every `metal.*` lowering). The device model is not logged.
   - **HIP, OpenCL, Level Zero**: never on real hardware. HIP, OpenCL and Level Zero run against mock driver libraries (`tests/mock_cuda.c` serves CUDA and HIP, `mock_opencl.c`, `mock_ze.c`) in `test_gpu_*_mock`, `test_gpu_memory_*_mock`, `test_gpu_determinism_*_mock`, `test_gpu_kernel_cache_*_mock`, `golden_tiny_llama_*_mock` and `golden_moe_mla_*_mock`. The OpenCL and Level Zero mocks compile the generated OpenCL C as C and run it, so the portable kernels (quantised matmul / gather / GLU, attention, DeltaNet, MoE) are checked as generated; whether a real OpenCL C compiler accepts them has not been checked. `mock_cuda.c` has hand-written C versions of the CUDA kernels, so for CUDA/HIP the mock checks the host code and the algorithm, not the PTX / code object; the two MoE kernels were compiled to PTX and AMDGPU code objects (2026-11-12) and have not run on a GPU. The AMD code objects are only compile-checked (`gpu_compile_hip`).
 - Graphics interop: the Vulkan export/import round trip has run on lavapipe. The CUDA import has not run on hardware.
-- Known gaps: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero recording is open, and graphs recorded before an eviction must not be replayed after it.
+- Known gaps: no eviction while a CUDA/HIP stream capture is open (the driver cannot synchronise a capturing stream); a stale CUDA/HIP capture that refers to an evicted encoded weight, or holds a kernel stamped out by a macro on a driver without `cuFuncGetParamInfo`, throws at `graph_launch` instead of being re-recorded ([Eviction and recorded graphs](#eviction-and-recorded-graphs)).

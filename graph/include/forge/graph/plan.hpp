@@ -426,12 +426,20 @@ public:
     std::vector<int> stage_of_node;    // pipeline stage per node (empty = single device)
     device_hooks* hooks = nullptr;     // device residency protocol (null = everything on the host)
     std::shared_ptr<device_hooks> hooks_ref;   // keeps the hooks (and the runtime behind them) alive for ~plan
+    std::vector<std::shared_ptr<weight_sink>> weight_sinks;   // registry::weights of the registry and of its pipeline stages
+    bool weights_noted = false;
     bool arena_resident = false;       // arena held on the device across runs (device_hooks::arena)
     std::size_t replays = 0;           // device_hooks::replay runs since the last real run
     plan() = default;
     plan(const plan&) = delete;
     plan& operator=(const plan&) = delete;
     ~plan() {
+        // weights and constants reported to a weight sink (rpc): their host memory may go away or be reused from here on
+        if (weights_noted) for (std::size_t i = 0; i < g.size() && i < views.size(); ++i) {
+            auto k = g.nodes()[i].kind;
+            if ((k == node_kind::weight || k == node_kind::constant) && views[i].data)
+                for (auto& ws : weight_sinks) if (ws && ws->forget) { try { ws->forget(views[i].data, views[i].size()); } catch (...) {} }
+        }
         if (!hooks_ref || !hooks_ref->forget) return;
         try {
             if (arena_resident) hooks_ref->forget(arena.data(), arena.size());
@@ -514,6 +522,8 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
     auto& reg = po.lowerings ? *po.lowerings : registry::cpu();
     p->hooks = reg.stages.empty() ? reg.hooks.get() : nullptr;
     if (p->hooks) p->hooks_ref = reg.hooks;
+    if (reg.weights) p->weight_sinks.push_back(reg.weights);
+    for (auto& st : reg.stages) if (st && st->weights) p->weight_sinks.push_back(st->weights);
     // Pipeline split: contiguous node ranges per stage, balanced by spec cost x output size.
     std::vector<registry*> stage_of(G.size(), &reg);
     if (!reg.stages.empty()) {
@@ -710,6 +720,14 @@ public:
     }
     void run() {
         auto* h = p_.hooks;
+        if (!p_.weights_noted && !p_.weight_sinks.empty()) {   // registries that track the plan's constants themselves (rpc)
+            for (std::size_t i = 0; i < p_.g.size(); ++i) {
+                auto k = p_.g.nodes()[i].kind;
+                if ((k == node_kind::weight || k == node_kind::constant) && p_.views[i].data)
+                    for (auto& ws : p_.weight_sinks) if (ws && ws->note) ws->note(p_.views[i].data, p_.views[i].size());
+            }
+            p_.weights_noted = true;
+        }
         if (!h) return run_steps(nullptr);
         if (!p_.pinned) {   // weights and constants never change: they stay on the device across runs
             for (std::size_t i = 0; i < p_.g.size(); ++i) {

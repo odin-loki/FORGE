@@ -255,7 +255,7 @@ set(FORGE_GPU_SOURCES)
 foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
-add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels.metal
+add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels_nn_mock.inc ${FORGE_GPU_DIR}/kernels.metal
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
   DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
@@ -395,7 +395,7 @@ if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
   add_library(forge_metal STATIC gpu/src/metal.mm)
   target_compile_options(forge_metal PRIVATE -fobjc-arc)
   target_compile_definitions(forge_metal PUBLIC FORGE_GPU_METAL=1)
-  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
+  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party third_party/monocypher ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
   add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
   target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
   target_link_libraries(forge_gpu INTERFACE forge_metal)
@@ -1421,6 +1421,8 @@ if(FORGE_BUILD_TESTS)
     add_library(mock_cuda SHARED tests/mock_cuda.c)
     set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockcuda)
     target_link_libraries(mock_cuda PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+    target_include_directories(mock_cuda PRIVATE ${FORGE_GPU_DIR})   # kernels_nn_mock.inc (generated)
+    add_dependencies(mock_cuda forge_gpu_gen)
     add_test(NAME test_gpu_cuda_mock COMMAND test_cuda_hip cuda)
     set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda" LABELS gpu SKIP_RETURN_CODE 77)
     add_dependencies(test_cuda_hip mock_cuda)
@@ -1428,6 +1430,8 @@ if(FORGE_BUILD_TESTS)
     target_compile_definitions(mock_hip PRIVATE MOCK_HIP)
     set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockhip)
     target_link_libraries(mock_hip PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+    target_include_directories(mock_hip PRIVATE ${FORGE_GPU_DIR})
+    add_dependencies(mock_hip forge_gpu_gen)
     add_dependencies(test_cuda_hip mock_hip)
     foreach(m opencl ze)
       if(m STREQUAL "opencl")
@@ -1478,6 +1482,11 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_cumock)
       set_tests_properties(golden_tiny_llama_cuda_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
+      # "pipe:auto" over two mock CUDA devices (gpu::plan_pipeline): the layers split over cuda:0 and cuda:1
+      add_test(NAME golden_tiny_llama_pipe_auto_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_pipeauto_cumock)
+      set_tests_properties(golden_tiny_llama_pipe_auto_cuda_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=pipe:auto;MOCK_DEVICES=2;FORGE_DEVICE_ALLOW_SOFTWARE=1;FORGE_DEVICE_BENCH=0;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
       add_test(NAME golden_tiny_llama_opencl_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_clmock)
       set_tests_properties(golden_tiny_llama_opencl_mock PROPERTIES LABELS gpu
@@ -1501,8 +1510,9 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip")
-      # Device fallback: the other template families use ops with no device kernel (attention_bias over the KV state,
-      # conv1d / conv2d, layer_norm, gelu); those steps must run on the CPU between device steps and give the same result.
+      # The other template families: attention_bias over the KV state, conv1d / conv2d, layer_norm and gelu run on the
+      # device (the PORT_NN kernels); what has no device kernel (transpose, l2_normalize, masked_mean, ...) must run on
+      # the CPU between device steps and give the same result.
       foreach(_g gpt2 gemma phi3 bert vit whisper)
         add_test(NAME golden_tiny_${_g}_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py
                  --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_cumock)
@@ -1585,6 +1595,16 @@ if(FORGE_BUILD_TESTS)
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
              -include ${PROJECT_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
+    # gpu/src/metal.mm (the Metal host code, Objective-C++) parsed against stub declarations of the Metal API on Linux,
+    # where no Apple SDK exists: catches C++ / Objective-C errors before the macOS build does. Not a check of Metal usage.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME gpu_compile_metal_host_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -x objective-c++ -std=c++23 -fobjc-arc -fobjc-runtime=gnustep-2.0
+               -fsyntax-only -Werror -Wno-objc-root-class -I${PROJECT_SOURCE_DIR}/tests/shims/metal_stub -I${PROJECT_SOURCE_DIR}/gpu/include
+               -I${PROJECT_SOURCE_DIR}/support/include -I${PROJECT_SOURCE_DIR}/third_party -I${PROJECT_SOURCE_DIR}/third_party/monocypher -I${FORGE_GEN_DIR}
+               -I${PROJECT_SOURCE_DIR}/core/include -I${PROJECT_SOURCE_DIR}/os/include -I${PROJECT_SOURCE_DIR}/ops/include -I${PROJECT_SOURCE_DIR}/simd/include
+               ${PROJECT_SOURCE_DIR}/gpu/src/metal.mm)
+      set_tests_properties(gpu_compile_metal_host_syntax PROPERTIES LABELS gpu)
+    endif()
     find_program(FORGE_XCRUN xcrun)
     if(FORGE_XCRUN)   # real Metal compiler (macOS with Xcode)
       add_test(NAME gpu_compile_metal COMMAND ${FORGE_XCRUN} -sdk macosx metal -c ${FORGE_GPU_DIR}/kernels.metal -o ${PROJECT_BINARY_DIR}/kernels.air)
@@ -1699,6 +1719,20 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME golden_rope_scaling_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope_vk)
       set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_rope_scaling_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      # Quantised weights kept encoded on the device (the GLSL ports of forge_qmatmul_t / forge_qglu / forge_qgather:
+      # q8_0 HF imports, in-place quantisation, AWQ / GPTQ checkpoints), QK-norm, and the other template families
+      # (their attention_bias / conv / layer_norm steps run on the CPU between device steps).
+      set(_vk_goldens hf_quant:${Python3_EXECUTABLE} quant_inplace:${FORGE_GOLDEN_PYTHON} tiny_qwen2:${Python3_EXECUTABLE} tiny_qwen3:${Python3_EXECUTABLE})
+      foreach(_g ${FORGE_GOLDEN_FAMILIES})
+        list(APPEND _vk_goldens tiny_${_g}:${Python3_EXECUTABLE})
+      endforeach()
+      foreach(_e ${_vk_goldens})
+        string(REGEX REPLACE "^([^:]+):(.*)$" "\\1" _g "${_e}")
+        string(REGEX REPLACE "^([^:]+):(.*)$" "\\2" _py "${_e}")
+        add_test(NAME golden_${_g}_vulkan COMMAND ${_py} ${PROJECT_SOURCE_DIR}/verify/golden/${_g}.py
+                 --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_vk)
+        set_tests_properties(golden_${_g}_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      endforeach()
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)

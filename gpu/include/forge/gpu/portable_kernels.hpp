@@ -184,6 +184,29 @@ public:
         return true;
     }
 
+    // A spec op whose kernel takes (inputs..., output, scalars...) exactly as cuda_hip::kernel_args lays them out: the
+    // encoder / vision kernels (layer_norm, group_norm, conv1d, conv2d, pooling, attention_bias; gpu_gen.py PORT_NN).
+    // OpenCL, Level Zero and Metal reach the same kernels through their generic run_op; this is the entry for runtimes
+    // whose run_op is not generic (Vulkan). false = no such kernel on this device; the caller checks the shapes
+    // (cuda_hip::supports).
+    bool run_nn(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) {
+        auto L = cuda_hip::kernel_args(op, in, a, out);
+        std::lock_guard lk(d().mu_); d().begin_op();
+        if (!d().k_has("forge_" + op)) return false;
+        ++d().dispatches_[op];
+        typename D::kcall c;
+        try {
+            for (auto& v : in) d().k_touch(v.data, v.size(), 0);
+            d().k_touch(out.data, out.size(), 1);
+            for (auto& v : in) d().k_buf(c, v.data, v.size(), 0);
+            d().k_buf(c, out.data, out.size(), 1);
+            for (auto& sc : L.scalars) { if (sc.is_float) d().k_f32(c, sc.f); else d().k_u32(c, sc.u); }
+            d().k_launch(c, "forge_" + op, L.threads);
+            d().k_done(c);
+        } catch (...) { d().k_abort(c); throw; }
+        return true;
+    }
+
 protected:
     // Attention kernel selection for run_op (plain f32 K/V): 1 = ran, -1 = use forge_attention.
     //   rows x heads <= 256 (decode): forge_attention_dec + forge_attention_comb over attention_splits key chunks;

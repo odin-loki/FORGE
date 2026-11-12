@@ -22,6 +22,7 @@
 #include <forge/ops/ops.gen.hpp>
 #include <forge/core/dl.hpp>
 #include <forge/gpu/device_memory.hpp>
+#include <forge/gpu/graph_refs.hpp>
 #include <forge/gpu/determinism.hpp>
 #include <forge/gpu/select.hpp>
 #include <algorithm>
@@ -64,13 +65,18 @@ inline void count(std::atomic<std::uint64_t>& a) { a.fetch_add(1, std::memory_or
 inline const char* api_name(api a) { return a == api::cuda ? "cuda" : "hip"; }
 
 // Kernels in kernels.cu and how their arguments are laid out.
-enum class sig { unary, binary, scale, rows, rms, matmul, rope, gather, slice, attention };
+enum class sig { unary, binary, scale, rows, rms, matmul, rope, gather, slice, attention,
+                 // the encoder / vision kernels (gpu_gen.py PORT_NN): arguments are exactly kernel_args' (inputs, output, scalars)
+                 lnorm, gnorm, conv1d, conv2d, pool, attn_bias };
+inline bool nn_sig(sig s) { return s >= sig::lnorm; }
 inline bool kernel_sig(const std::string& op, sig& s) {
     static const std::map<std::string, sig> m = [] {
         std::map<std::string, sig> r;
         for (auto n : {"neg", "abs", "sqrt", "rsqrt", "recip", "square", "exp", "exp2", "log", "log2", "tanh", "sigmoid",
                        "silu", "relu", "softplus", "gelu_tanh"}) r[n] = sig::unary;
-        for (auto n : {"quick_gelu", "mish", "hard_swish"}) r[n] = sig::unary;   // ops/defs/sequence.fspec
+        for (auto n : {"quick_gelu", "mish", "hard_swish", "gelu"}) r[n] = sig::unary;   // ops/defs/sequence.fspec; gelu: fgelu
+        r["layer_norm"] = sig::lnorm; r["group_norm"] = sig::gnorm; r["conv1d"] = sig::conv1d; r["conv2d"] = sig::conv2d;
+        r["max_pool2d"] = sig::pool; r["avg_pool2d"] = sig::pool; r["attention_bias"] = sig::attn_bias;
         for (auto n : {"add", "sub", "mul", "div", "maximum", "minimum", "silu_mul"}) r[n] = sig::binary;
         r["scale"] = sig::scale; r["softmax"] = sig::rows; r["rms_norm"] = sig::rms; r["matmul_t"] = sig::matmul;
         r["rope"] = sig::rope; r["gather"] = sig::gather; r["slice"] = sig::slice; r["attention"] = sig::attention;
@@ -105,12 +111,35 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     case sig::gather: return in.size() == 2 && x.size() == 2;
     case sig::slice: return in.size() == 1 && !x.empty() && a.num("step", 1) == 1;
     case sig::attention: return in.size() == 3 && x.size() == 3 && in[1].size() == 3 && in[2].size() == 3 && in[1][1] > 0 && x[1] % in[1][1] == 0;
+    case sig::lnorm: return in.size() == 3 && !x.empty() && x.back() > 0 && in[1].size() == 1 && in[2].size() == 1 && in[1][0] == x.back() && in[2][0] == x.back();
+    case sig::gnorm: {
+        if (in.size() != 3 || x.size() < 2 || x[0] <= 0) return false;
+        const i64 g = i64(a.num("groups", 32));
+        return g >= 1 && x[0] % g == 0 && numel(in[1]) == x[0] && numel(in[2]) == x[0]; }
+    case sig::conv1d: case sig::conv2d: {   // x[c, ...], w[o, c / groups, k...], b[o] or [1]; attrs as the reference reads them
+        const std::size_t nd = s == sig::conv1d ? 1 : 2;
+        if (in.size() != 3 || x.size() != nd + 1 || in[1].size() != nd + 2) return false;
+        const i64 C = x[0], O = in[1][0], cg = in[1][1];
+        if (C <= 0 || O <= 0 || cg <= 0 || C % cg || O % (C / cg) || (numel(in[2]) != O && numel(in[2]) != 1)) return false;
+        for (auto key : {"stride", "dilation"}) { auto v = ops::attr2(a, key, 1); if (v[0] < 1 || (nd == 2 && v[1] < 1)) return false; }
+        auto pd = ops::attr2(a, "pad", 0); return pd[0] >= 0 && (nd == 1 || pd[1] >= 0); }
+    case sig::pool: {
+        if (in.size() != 1 || x.size() != 3) return false;
+        auto k = ops::attr2(a, "kernel", 2), st = a.has("stride") ? ops::attr2(a, "stride", 1) : k, pd = ops::attr2(a, "pad", 0);
+        return k[0] >= 1 && k[1] >= 1 && st[0] >= 1 && st[1] >= 1 && pd[0] >= 0 && pd[1] >= 0; }
+    case sig::attn_bias: {   // plain f32 K/V; the bias dims (right-aligned to [hq, s, t]) are each 1 or the full size
+        if (in.size() != 4 || x.size() != 3 || in[1].size() != 3 || in[2].size() != 3 || in[1][1] <= 0 || x[1] % in[1][1] || in[1][2] != x[2]) return false;
+        if (a.num("kv_codec_k", 0) != 0 || a.num("kv_codec_v", 0) != 0 || in[3].size() > 3 || numel(in[3]) == 0) return false;
+        shape_t b = in[3]; while (b.size() < 3) b.insert(b.begin(), 1);
+        const i64 full[3] = {x[1], x[0], in[1][0]};
+        for (int i = 0; i < 3; ++i) if (b[std::size_t(i)] != 1 && b[std::size_t(i)] != full[i]) return false;
+        return true; }
     }
     return false;
 }
 
-// Broadcast binaries the CUDA/HIP runtime runs with forge_bcast: the smaller input's shape (leading 1s dropped)
-// is a suffix of the larger one's. Other GPU backends keep these on the CPU.
+// Broadcast binaries every device runtime runs with forge_bcast: the smaller input's shape (leading 1s dropped) is a
+// suffix of the larger one's, or the smaller input is a single element.
 inline int bcast_op(const std::string& op, const std::vector<shape_t>& in) {
     int o = op == "add" ? 0 : op == "sub" ? 1 : op == "mul" ? 2 : op == "div" ? 3 : -1;
     if (o < 0 || in.size() != 2 || numel(in[0]) == numel(in[1])) return -1;
@@ -118,6 +147,7 @@ inline int bcast_op(const std::string& op, const std::vector<shape_t>& in) {
     shape_t a = strip(in[0]), b = strip(in[1]);
     const shape_t& big = numel(in[0]) > numel(in[1]) ? a : b; const shape_t& sm = numel(in[0]) > numel(in[1]) ? b : a;
     if (sm.size() > big.size() || numel(sm) == 0) return -1;
+    if (numel(sm) == 1) return o;   // a scalar operand ([1], [1, 1]): b[i % 1]
     for (std::size_t i = 0; i < sm.size(); ++i) if (sm[sm.size() - 1 - i] != big[big.size() - 1 - i]) return -1;
     return o;
 }
@@ -161,6 +191,36 @@ inline launch_args kernel_args(const std::string& op, const std::vector<tensor_v
         U(vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]));
         U((a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7));
         F(float(a.num("scale", 1.0 / std::sqrt(double(d))))); L.threads = s * hq; break; }
+    case sig::lnorm: {
+        std::uint32_t cols = std::uint32_t(x.shape.back()), rows = cols ? std::uint32_t(x.size()) / cols : 0;
+        L.threads = rows; U(rows); U(cols); F(float(a.num("eps", 1e-5))); break; }
+    case sig::gnorm: {
+        std::uint32_t C = std::uint32_t(x.shape[0]), g = std::uint32_t(a.num("groups", 32));
+        L.threads = g; U(C); U(C ? std::uint32_t(x.size()) / C : 0); U(g); F(float(a.num("eps", 1e-5))); break; }
+    case sig::conv1d: {
+        auto& w = in[1];
+        L.threads = n; U(std::uint32_t(x.shape[0])); U(std::uint32_t(x.shape[1])); U(std::uint32_t(w.shape[0])); U(std::uint32_t(w.shape[1])); U(std::uint32_t(w.shape[2]));
+        U(std::uint32_t(out.shape[1])); U(std::uint32_t(a.num("stride", 1))); U(std::uint32_t(a.num("pad", 0))); U(std::uint32_t(a.num("dilation", 1)));
+        U(std::uint32_t(in[2].size())); break; }
+    case sig::conv2d: {
+        auto& w = in[1]; auto st = ops::attr2(a, "stride", 1), pd = ops::attr2(a, "pad", 0), dl = ops::attr2(a, "dilation", 1);
+        L.threads = n;
+        for (i64 v : {x.shape[0], x.shape[1], x.shape[2], w.shape[0], w.shape[1], w.shape[2], w.shape[3], out.shape[1], out.shape[2],
+                      st[0], st[1], pd[0], pd[1], dl[0], dl[1], i64(in[2].size())}) U(std::uint32_t(v));
+        break; }
+    case sig::pool: {
+        auto k = ops::attr2(a, "kernel", 2), st = a.has("stride") ? ops::attr2(a, "stride", 1) : k, pd = ops::attr2(a, "pad", 0);
+        L.threads = n;
+        for (i64 v : {x.shape[0], x.shape[1], x.shape[2], out.shape[1], out.shape[2], k[0], k[1], st[0], st[1], pd[0], pd[1]}) U(std::uint32_t(v));
+        U(op == "max_pool2d" ? 0u : a.num("count_pad", 1) != 0 ? 1u : 2u); break; }
+    case sig::attn_bias: {
+        std::uint32_t s = std::uint32_t(x.shape[0]), hq = std::uint32_t(x.shape[1]), d = std::uint32_t(x.shape[2]);
+        U(s); U(hq); U(d); U(std::uint32_t(in[1].shape[0])); U(std::uint32_t(in[1].shape[1])); U(std::uint32_t(in[2].shape[2]));
+        U((a.num("causal", 0) != 0 ? 1u : 0u) | (std::uint32_t(a.num("window", 0)) << 7));
+        F(float(a.num("scale", 1.0 / std::sqrt(double(d))))); F(float(a.num("softcap", 0)));
+        shape_t b = in[3].shape; while (b.size() < 3) b.insert(b.begin(), 1);
+        for (auto v : b) U(std::uint32_t(v));
+        L.threads = s * hq; break; }
     }
     return L;
 }
@@ -186,7 +246,7 @@ public:
             for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_);
             if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_); } catch (...) {}
         for (auto& c : segc_) drop_seg(c);
-        for (auto& [e, g] : graphs_) { if (f_.gexec_destroy) f_.gexec_destroy(e); if (f_.graph_destroy) f_.graph_destroy(g); }
+        for (auto& g : graphs_) { if (g.exec && f_.gexec_destroy) f_.gexec_destroy(g.exec); if (g.graph && f_.graph_destroy) f_.graph_destroy(g.graph); }
         if (stage_ && f_.host_free) f_.host_free(stage_);
         if (stream_ && f_.stream_destroy) f_.stream_destroy(stream_);
         if (mod_ && f_.unload) f_.unload(mod_);
@@ -207,7 +267,8 @@ public:
     mem_info memory() { mem_info m; if (f_.mem_info) { bind(); f_.mem_info(&m.free, &m.total); } return m; }
     // pooled_bytes: freed buffers kept for reuse; evictions / evicted_bytes: buffers dropped to fit the device budget
     struct residency_stats { std::size_t uploads = 0, downloads = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0, qweight_bytes = 0,
-                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0, zero_fills = 0; };   // zero_fills: uploads of all-zero data done as device clears
+                             pooled_bytes = 0, evictions = 0, evicted_bytes = 0, zero_fills = 0,   // zero_fills: uploads of all-zero data done as device clears
+                             graph_replays = 0, graph_rerecords = 0; };   // recorded launches / graphs replayed as recorded, and re-recorded because a buffer's generation changed (gpu/graph_refs.hpp)
     residency_stats residency() { std::lock_guard lk(mu_); auto s = stats_; s.resident = res_.size(); s.pooled_bytes = pool_bytes_; return s; }
     // The device memory pool this runtime charges ("cuda:0", ...) and the bytes it has charged to it.
     mem::budget* memory_pool() { return dm_.pool(); }
@@ -417,14 +478,34 @@ public:
     }
 
     // ---- graphs: capture the stream's work between capture_begin/capture_end and replay it ----
-    void capture_begin() { std::lock_guard lk(mu_); need_graphs(); bind(); flush(); user_cap_ = true; ck(f_.capture_begin(stream_, 2 /* RELAXED: run_op may allocate an output buffer while capturing */), "stream begin capture"); }
+    // The driver's graph holds device addresses. Next to it the runtime records every captured kernel launch (function,
+    // launch shape, argument bytes) and, for each pointer argument that lies in a resident tensor or an encoded weight,
+    // what it referred to (gpu::buffer_ref with the tensor's generation). graph_launch replays the driver graph only
+    // while every such buffer still exists with that generation. After an eviction, a release or the end of the run
+    // that captured it, the graph is re-recorded: the tensors are made resident again from their host views (the
+    // eviction synced them back), the pointer arguments are patched and the recorded launches are captured into a
+    // new driver graph. Re-recording needs the kernels' parameter sizes (cuFuncGetParamInfo, else the table generated
+    // from kernels.cu) and cannot bring back an evicted encoded weight (its device layout may be repacked); a stale
+    // graph that cannot be re-recorded throws instead of running on dead addresses.
+    // While a capture is open nothing is evicted: the capturing stream can neither be synchronised nor have its
+    // buffers freed. An allocation that does not fit then fails as it would without eviction.
+    void capture_begin() { std::lock_guard lk(mu_); need_graphs(); bind(); flush(); ucur_ = ugraph{}; user_cap_ = true; ck(f_.capture_begin(stream_, 2 /* RELAXED: run_op may allocate an output buffer while capturing */), "stream begin capture"); }
     std::size_t capture_end() { user_cap_ = false;
         std::lock_guard lk(mu_); need_graphs(); bind();
         void* g = nullptr; ck(f_.capture_end(stream_, &g), "stream end capture");
         void* e = nullptr; ck(f_.graph_inst(&e, g, 0), "graph instantiate");
-        graphs_.push_back({e, g}); return graphs_.size() - 1;
+        ucur_.exec = e; ucur_.graph = g; graphs_.push_back(std::move(ucur_)); ucur_ = ugraph{}; return graphs_.size() - 1;
     }
-    void graph_launch(std::size_t id) { std::lock_guard lk(mu_); need_graphs(); bind(); cuda_hip::count(counters().graph_launches); ck(f_.graph_launch(graphs_.at(id).first, stream_), "graph launch"); sync(); }
+    void graph_launch(std::size_t id) {
+        std::lock_guard lk(mu_); need_graphs(); bind(); flush();   // flush: an open decode-graph segment ends here
+        auto& g = graphs_.at(id);
+        bool stale = false;
+        for (auto& u : g.refs) if (!ref_current(u.ref)) { stale = true; break; }
+        if (stale) { urerecord(g); ++stats_.graph_rerecords; } else ++stats_.graph_replays;
+        for (auto& u : g.refs) if (u.ref.kind == buffer_ref::tensor) if (auto it = res_.find(reinterpret_cast<std::uintptr_t>(u.ref.host)); it != res_.end()) {
+            it->second.last = ++clock_; if (u.ref.mode) it->second.host_valid = false; }
+        cuda_hip::count(counters().graph_launches); ck(f_.graph_launch(g.exec, stream_), "graph launch"); sync();
+    }
 
     // ---- multi-device: copy device memory to another runtime (peer copy where available, else via host) ----
     void copy_to_peer(runtime& dst, std::uint64_t dst_ptr, std::uint64_t src_ptr, std::size_t bytes) {
@@ -955,6 +1036,7 @@ public:
         std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
         if (!supports(op, ss, a)) return false;
         sig s; kernel_sig(op, s);
+        if (nn_sig(s)) return run_nn(op, in, a, out);
         auto& x = in[0];
         std::uint32_t n = std::uint32_t(out.size()), rows = 0, cols = 0, k = 0, threads = n, u4 = 0, u5 = 0, u6 = 0, u7 = 0;
         float f0 = 0;
@@ -986,6 +1068,7 @@ public:
             u6 = vc ? std::uint32_t(a.num("kv_dv", 0)) : std::uint32_t(in[2].shape[2]);
             u7 = (a.num("causal", 1) != 0 ? 1u : 0u) | (kc << 1) | (vc << 4) | (std::uint32_t(a.num("window", 0)) << 7);
             f0 = float(a.num("scale", 1.0 / std::sqrt(double(k)))); threads = rows * cols; break; }
+        default: break;   // nn_sig: run_nn above
         }
         std::lock_guard lk(mu_); bind(); begin_op();
         ++dispatches_[op];
@@ -1022,6 +1105,7 @@ public:
             case sig::attention:
                 for (auto* p : {&rows, &cols, &k, &u4, &u5, &u6, &u7}) args.push_back(p);
                 args.push_back(&f0); break;
+            default: break;
             }
             unsigned block = 64, grid = (threads + block - 1) / block;
             if (s == sig::attention && !std::getenv("FORGE_GPU_NO_FA") && has_fn_locked("forge_attention_fa")) {   // block per (row, head)
@@ -1077,6 +1161,42 @@ public:
             if (grid) ck(launch_s(fn, grid, 1, 1, block, 1, 1, smem, stream_, args.data(), nullptr), "launch");
             if (fnb) { q81_src_ = ptrs.back(); q81_n_ = fnb; }
             if (q8) { q8r_src_ = ptrs.back(); q8r_n_ = std::size_t(rows) * cols; }
+            if (!in_run_) { ck(dtoh_s(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
+        } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
+        if (!temps.empty()) { sync(); free_temps(); }
+        return true;
+    }
+
+    // The encoder / vision kernels (layer_norm, group_norm, conv1d, conv2d, max / avg pooling, attention_bias; gpu_gen.py
+    // PORT_NN): one work item per output (per row / group for the norms), arguments as kernel_args lays them out. Inside
+    // a run the tensors are resident; outside, inputs are uploaded and the output read back. false = this image has no
+    // such kernel.
+    bool run_nn(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) {
+        auto L = kernel_args(op, in, a, out);
+        std::lock_guard lk(mu_); bind(); begin_op();
+        if (!has_fn_locked("forge_" + op)) return false;
+        ++dispatches_[op];
+        void* fn = function("forge_" + op);
+        std::vector<std::uint64_t> ptrs, temps;
+        auto free_temps = [&] { for (auto p : temps) dfree(p); };
+        try {
+            auto buf = [&](const float* h, std::size_t cnt, bool is_out) {
+                if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, is_out); if (is_out) b.e->host_valid = false; return b.ptr; }
+                std::uint64_t d = dmalloc(cnt * 4, "scratch"); temps.push_back(d);
+                if (!is_out) ck(htod_s(d, h, cnt * 4, stream_), "memcpy HtoD");
+                return d;
+            };
+            if (in_run_) {   // settle the residency map first: a later acquisition may drop an entry an earlier view lives in
+                for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+                acquire(out.data, out.size(), true);
+            }
+            for (auto& v : in) ptrs.push_back(buf(v.data, v.size(), false));
+            ptrs.push_back(buf(out.data, out.size(), true));
+            std::vector<void*> args; for (auto& p : ptrs) args.push_back(&p);
+            for (auto& sc : L.scalars) args.push_back(sc.is_float ? static_cast<void*>(&sc.f) : static_cast<void*>(&sc.u));
+            const unsigned block = 64, grid = (L.threads + block - 1) / block;
+            writes(ptrs.back(), out.size() * 4);
+            if (grid) ck(launch_s(fn, grid, 1, 1, block, 1, 1, 0, stream_, args.data(), nullptr), "launch");
             if (!in_run_) { ck(dtoh_s(out.data, ptrs.back(), out.size() * 4, stream_), "memcpy DtoH"); sync(); }
         } catch (...) { if (!in_run_) sync(); free_temps(); throw; }
         if (!temps.empty()) { sync(); free_temps(); }
@@ -1236,7 +1356,7 @@ private:
             std::vector<char> t(n); int r = dtoh(t.data(), s, n); return r ? r : htod(d, t.data(), n);
         }
     };
-    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false, arena = false; std::uint64_t last = 0; };
+    struct entry { float* host; std::size_t count; std::uint64_t d; bool host_valid = true, pinned = false, kept = false, arena = false; std::uint64_t last = 0, gen = 0; };   // gen: gpu/graph_refs.hpp
     struct qbuf { std::uint64_t d = 0, last = 0; };   // an encoded weight kept on the device (run_qmatmul / run_qgather)
     struct bound { entry* e; std::uint64_t ptr; };
 
@@ -1309,7 +1429,88 @@ private:
         std::vector<void*> ap;
         for (auto& r : prec_) { arg_ptrs(r, pbytes_.data(), ap); ck(f_.launch(r.fn, r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6], stream_, ap.data(), nullptr), "launch"); }
     }
+    // ---- user captures: the recorded launches and what their pointer arguments referred to (gpu/graph_refs.hpp) ----
+    struct ugraph {
+        void* exec = nullptr; void* graph = nullptr;
+        std::vector<krec> recs; std::vector<unsigned char> bytes;                    // as prec_ / pbytes_
+        struct uref { std::uint32_t at; std::uint64_t off; buffer_ref ref; };        // the 8-byte pointer at bytes[at] = buffer base + off
+        std::vector<uref> refs;
+        bool rerecordable = true;                                                    // every launch's parameter sizes were known
+    };
+    ugraph ucur_;
+    std::unordered_map<void*, std::string> fn_name_;
+    std::unordered_map<void*, std::vector<std::uint32_t>> usize_;
+    // Parameter sizes of a kernel: from the driver where it can tell (CUDA 12.4+), else from the table gpu_gen.py
+    // derives from the kernel signatures (pointers 8 bytes, unsigned / float 4). Null when neither knows the function.
+    const std::vector<std::uint32_t>* usizes(void* fn) {
+        if (auto it = usize_.find(fn); it != usize_.end()) return it->second.empty() ? nullptr : &it->second;
+        std::vector<std::uint32_t> v;
+        if (f_.param_info) v = *params_of(fn);
+        if (v.empty()) if (auto it = fn_name_.find(fn); it != fn_name_.end())
+            for (auto& kp : images::kernel_params) if (it->second == kp.name) { for (const char* c = kp.sizes; *c; ++c) v.push_back(std::uint32_t(*c - '0')); break; }
+        auto& r = usize_[fn] = std::move(v);
+        return r.empty() ? nullptr : &r;
+    }
+    void urecord(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void** a, unsigned nw) {
+        auto* sz = usizes(fn);
+        if (!sz) { ucur_.rerecordable = false; return; }
+        krec r{fn, {gx, gy, gz, bx, by, bz, sh}, std::uint32_t(ucur_.bytes.size()), 0};
+        for (auto z : *sz) {
+            std::size_t at = (ucur_.bytes.size() + 7) & ~std::size_t(7); ucur_.bytes.resize(at + z);
+            std::memcpy(ucur_.bytes.data() + at, *a++, z);
+            if (z != 8) continue;
+            std::uint64_t p; std::memcpy(&p, ucur_.bytes.data() + at, 8);
+            for (auto& [k, e] : res_) if (p >= e.d && p < e.d + std::max<std::size_t>(4, e.count * 4)) {
+                ugraph::uref u{std::uint32_t(at), p - e.d, {}};
+                u.ref.kind = buffer_ref::tensor; u.ref.host = e.host; u.ref.count = e.count; u.ref.gen = e.gen;
+                u.ref.mode = nw == 0 || nw > 3 ? 2 : 0;   // no declared writes: assume the launch may write it
+                for (unsigned i = 0; i < nw && i < 3; ++i) if (wr_[i][0] < e.d + std::max<std::size_t>(4, e.count * 4) && e.d < wr_[i][1]) u.ref.mode = 1;
+                ucur_.refs.push_back(u); p = 0; break; }
+            if (p) for (auto& [k, qb] : qres_) if (qb.d && p >= qb.d && p < qb.d + std::max<std::size_t>(4, k.second)) {
+                ugraph::uref u{std::uint32_t(at), p - qb.d, {}};
+                u.ref.kind = buffer_ref::weight; u.ref.host = reinterpret_cast<const void*>(k.first); u.ref.count = k.second; u.ref.gen = qb.d;   // immutable: its address is its generation
+                ucur_.refs.push_back(u); break; }
+        }
+        r.len = std::uint32_t(ucur_.bytes.size() - r.off); ucur_.recs.push_back(r);
+    }
+    bool ref_current(const buffer_ref& r) {
+        if (r.kind == buffer_ref::tensor) { auto it = res_.find(reinterpret_cast<std::uintptr_t>(r.host)); return it != res_.end() && it->second.count == r.count && it->second.gen == r.gen; }
+        auto it = qres_.find({reinterpret_cast<std::uintptr_t>(r.host), r.count}); return it != qres_.end() && it->second.d == r.gen;
+    }
+    // Capture g's recorded launches again over the buffers as they are now (see capture_begin).
+    void urerecord(ugraph& g) {
+        const std::string who = api_name(api_);
+        if (!g.rerecordable) throw std::runtime_error(who + ": a captured graph refers to device buffers that were evicted or re-created since, and the parameter layout of one of its kernels is unknown, so it cannot be re-recorded; capture it again");
+        for (auto& u : g.refs) if (u.ref.kind == buffer_ref::weight && !ref_current(u.ref))
+            throw std::runtime_error(who + ": a captured graph refers to an encoded weight that was evicted since; capture it again");
+        begin_op();   // the tensors bound below are not evicted by the allocations that follow them
+        for (auto& u : g.refs) if (u.ref.kind == buffer_ref::tensor) {
+            float* h = const_cast<float*>(static_cast<const float*>(u.ref.host));
+            const bool kept = ref_current(u.ref);
+            auto b = acquire(h, u.ref.count, false);
+            // a tensor that survived may never have received its upload (the copy was captured, not executed)
+            if (kept && b.e->host_valid && u.ref.count) { ck(htod_s(b.e->d, h, u.ref.count * 4, stream_), "memcpy HtoD"); ++stats_.uploads; }
+            const std::uint64_t p = b.e->d + u.off; std::memcpy(g.bytes.data() + u.at, &p, 8); u.ref.gen = b.e->gen;
+        }
+        for (auto& u : g.refs) if (u.ref.kind == buffer_ref::tensor && !ref_current(u.ref))
+            raise(errc::out_of_memory, "{}: the buffers of a captured graph do not fit on the device together", who);
+        sync();
+        if (g.exec && f_.gexec_destroy) f_.gexec_destroy(g.exec);
+        if (g.graph && f_.graph_destroy) f_.graph_destroy(g.graph);
+        g.exec = nullptr; g.graph = nullptr;
+        ck(f_.capture_begin(stream_, 2), "stream begin capture");
+        std::vector<void*> ap; int rc = 0;
+        for (auto& r : g.recs) {
+            ap.clear(); std::size_t at = r.off;
+            for (auto z : *usizes(r.fn)) { at = (at + 7) & ~std::size_t(7); ap.push_back(g.bytes.data() + at); at += z; }
+            if (!rc) rc = f_.launch(r.fn, r.d[0], r.d[1], r.d[2], r.d[3], r.d[4], r.d[5], r.d[6], stream_, ap.data(), nullptr);
+        }
+        void* ng = nullptr; ck(f_.capture_end(stream_, &ng), "stream end capture"); ck(rc, "launch");
+        void* ne = nullptr; ck(f_.graph_inst(&ne, ng, 0), "graph instantiate");
+        g.exec = ne; g.graph = ng;
+    }
     int launch_s(void* fn, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh, void* st, void** a, void** ex) {
+        const unsigned nw_decl = nwr_;   // the writes this launch declared (wr_), before the reset below
         if (!q81_keep_ && q81_src_) {
             bool hit = nwr_ == 0 || nwr_ > 3; const std::uint64_t lo = q81_src_, hi = lo + std::uint64_t(q81_n_) * 128;
             for (unsigned i = 0; i < nwr_ && i < 3; ++i) if (wr_[i][0] < hi && lo < wr_[i][1]) hit = true;
@@ -1323,6 +1524,7 @@ private:
         nwr_ = 0;
         if (!(in_run_ && !user_cap_ && gmode() && st == stream_ && !ex)) {
             count(user_cap_ ? counters().captured : counters().launches); if (in_run_) dirty_ = true;
+            if (user_cap_) { if (st == stream_ && !ex) urecord(fn, gx, gy, gz, bx, by, bz, sh, a, nw_decl); else ucur_.rerecordable = false; }
             return f_.launch(fn, gx, gy, gz, bx, by, bz, sh, st, a, ex);
         }
         if (!recording_) {
@@ -1399,6 +1601,7 @@ private:
     // Every driver allocation goes through dmalloc/dfree, so the pool "cuda:N" / "hip:N" sees it. A buffer
     // touched (acquired) after begin_op() belongs to the op in progress and is never evicted by it.
     device_memory dm_;
+    std::uint64_t gen_clock_ = 0;   // buffer generations (gpu/graph_refs.hpp): one per resident buffer ever created, never reused
     std::uint64_t clock_ = 0, op_mark_ = 0;
     void begin_op() { op_mark_ = clock_; }
     std::uint64_t dmalloc(std::size_t bytes, const char* tag) {
@@ -1526,6 +1729,7 @@ private:
     void* function(const std::string& n) {
         auto it = fn_.find(n); if (it != fn_.end()) return it->second;
         void* f = nullptr; ck(f_.get_fn(&f, mod_, n.c_str()), ("get function " + n).c_str());
+        fn_name_[f] = n;
         return fn_[n] = f;
     }
     template<class F> void each_overlap(const float* p, std::size_t n, F&& f) {
@@ -1575,7 +1779,7 @@ private:
         if (dl) sync();
         for (auto k : fetched) { drop(res_[k]); res_.erase(k); }
         entry e{h, count, 0};
-        dev_alloc(&e.d, count * 4); e.last = ++clock_;
+        dev_alloc(&e.d, count * 4); e.last = ++clock_; e.gen = ++gen_clock_;
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
         std::sort(olds.begin(), olds.end());
         if (!is_out) {   // upload only the gaps the resident pieces do not cover
@@ -1592,7 +1796,7 @@ private:
             if (!o.host_valid) e.host_valid = false;
             if (o.kept) e.kept = true;
             if (!o.host_valid) for (auto [x, y] : {std::pair{ol, std::min(oh, lo)}, std::pair{std::max(ol, hi), oh}}) if (y > x) {
-                entry r{reinterpret_cast<float*>(x), (y - x) / 4, 0}; r.host_valid = false;
+                entry r{reinterpret_cast<float*>(x), (y - x) / 4, 0}; r.host_valid = false; r.gen = ++gen_clock_;
                 dev_alloc(&r.d, y - x); ck(dtod_s(r.d, o.d + (x - ol), y - x), "memcpy DtoD");
                 stats_.resident_bytes += y - x; rest.push_back(r);
             }
@@ -1683,7 +1887,7 @@ private:
     std::multimap<std::size_t, std::uint64_t> pool_; std::size_t pool_bytes_ = 0;
     std::map<std::vector<float>, std::uint64_t> rope_;   // encoded weights (run_qmatmul)
     std::vector<std::pair<const float*, std::size_t>> pinned_;
-    std::vector<std::pair<void*, void*>> graphs_;
+    std::vector<ugraph> graphs_;
     std::map<std::string, void*> fn_;
     std::map<std::string, std::size_t> dispatches_;
     residency_stats stats_;

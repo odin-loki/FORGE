@@ -24,6 +24,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -123,6 +124,67 @@ inline std::string select_device(const std::vector<device_record>& devs, const s
         if (better) { best = &d; bs = s.score; }
     }
     return best ? best->device : std::string("cpu");
+}
+
+// ---- automatic multi-device split ("pipe:auto"; docs/graph.md) ----
+// One stage of a pipeline: the device and the share of the model's work it gets.
+struct pipe_stage { std::string device; double share = 0; };
+// Split a model over the devices of one backend. Candidates are the eligible devices (score(): not excluded, not
+// software unless allowed) of the best-ranked backend that has any; devices of other backends are left out, because
+// one physical GPU usually shows up under several APIs (cuda:0, opencl:0, vulkan) and must not be counted twice.
+// Shares start proportional to throughput (the micro-benchmark when every candidate has one, else the class prior).
+// With a known model size no device gets more than fits in 90% of its memory: the excess moves to the devices that
+// still have room (water-filling), and what fits on none of them becomes a last "cpu" stage. Stages are ordered by
+// device ordinal, so consecutive layer ranges go to consecutive devices. Returns no stage when no device is eligible
+// and one stage when a single device takes everything; `why` gets one line per candidate.
+inline std::vector<pipe_stage> plan_pipeline(const std::vector<device_record>& devs, const select_request& rq, std::string* why = nullptr) {
+    std::vector<const device_record*> cand; int rank = 1 << 20;
+    for (auto& d : devs) if (d.cls != device_class::cpu && score(d, rq).eligible) rank = std::min(rank, backend_rank(d.backend));
+    for (auto& d : devs) {
+        if (d.cls == device_class::cpu) continue;
+        auto sc = score(d, rq);
+        const bool take = sc.eligible && backend_rank(d.backend) == rank;
+        if (take) cand.push_back(&d);
+        else if (why) *why += d.device + ": not used, " + (sc.eligible ? "another backend's devices were chosen (the same GPU may be listed under several APIs)" : sc.why) + "\n";
+    }
+    std::sort(cand.begin(), cand.end(), [](const device_record* a, const device_record* b) { return a->ordinal < b->ordinal; });
+    if (cand.empty()) return {};
+    bool measured = true; for (auto* d : cand) if (!(d->gflops > 0)) measured = false;
+    const std::size_t n = cand.size();
+    std::vector<double> thr(n), cap(n, 1.0), share(n, 0.0);
+    for (std::size_t i = 0; i < n; ++i) {
+        thr[i] = measured ? cand[i]->gflops : class_prior(cand[i]->cls);
+        if (rq.model_bytes && cand[i]->memory_bytes) cap[i] = std::min(1.0, 0.9 * double(cand[i]->memory_bytes) / double(rq.model_bytes));
+    }
+    double left = 1.0; std::vector<bool> full(n, false);
+    for (std::size_t round = 0; round < n && left > 1e-12; ++round) {   // water-filling: each round at least one device fills up or all is placed
+        double t = 0; for (std::size_t i = 0; i < n; ++i) if (!full[i]) t += thr[i];
+        if (t <= 0) break;
+        const double give = left; bool capped = false;
+        for (std::size_t i = 0; i < n; ++i) if (!full[i]) {
+            const double want = give * thr[i] / t, room = cap[i] - share[i];
+            if (want >= room) { share[i] = cap[i]; left -= room; full[i] = true; capped = true; }
+        }
+        if (capped) continue;
+        for (std::size_t i = 0; i < n; ++i) if (!full[i]) share[i] += give * thr[i] / t;
+        left = 0;
+    }
+    std::vector<pipe_stage> out;
+    for (std::size_t i = 0; i < n; ++i) {
+        if (why) *why += cand[i]->device + " (" + name(cand[i]->cls) + (cand[i]->name.empty() ? "" : ", " + cand[i]->name) + "): share " + std::to_string(share[i]) +
+                         (measured ? ", measured throughput" : ", class prior") + (full[i] && share[i] < 1.0 ? ", limited by its memory" : "") + "\n";
+        if (share[i] > 1e-9) out.push_back({cand[i]->device, share[i]});
+    }
+    if (left > 1e-9) { out.push_back({"cpu", left}); if (why) *why += "cpu: share " + std::to_string(left) + ", what does not fit in the devices' memory\n"; }
+    return out;
+}
+// The stages as a device string: "pipe:cuda:0*0.67,cuda:1*0.33", a single device's own name, or "cpu".
+inline std::string pipeline_string(const std::vector<pipe_stage>& st) {
+    if (st.empty()) return "cpu";
+    if (st.size() == 1) return st[0].device;
+    std::string s = "pipe:";
+    for (std::size_t i = 0; i < st.size(); ++i) { char b[32]; std::snprintf(b, sizeof b, "*%.4f", st[i].share); s += (i ? "," : "") + st[i].device + b; }
+    return s;
 }
 
 } // namespace forge::gpu

@@ -24,7 +24,7 @@ typedef struct { size_t size; char* data; int sub; } mem;
 #define MOCK_MEM(p) (((mem*)*(void**)(p))->data)
 #include "kernels_cl_mock.inc"
 
-typedef struct { int idx; void* args[16]; char store[16][8]; } kern;
+typedef struct { int idx; void* args[24]; char store[24][8]; } kern;
 static int ndev(void) { const char* e = getenv("MOCK_DEVICES"); return e ? atoi(e) : 1; }
 int clGetPlatformIDs(unsigned n, void** p, unsigned* np) { if (np) *np = 1; if (n && p) p[0] = (void*)1; return 0; }
 int clGetDeviceIDs(void* p, uint64_t type, unsigned n, void** d, unsigned* nd) {
@@ -74,7 +74,7 @@ void* clCreateKernel(void* p, const char* name, int* e) {
     *e = -46; return NULL;
 }
 int clSetKernelArg(void* k_, unsigned i, size_t n, const void* v) {
-    kern* k = k_; if (i >= 16 || n > 8) return -51;
+    kern* k = k_; if (i >= 24 || n > 8) return -51;
     memcpy(k->store[i], v, n); k->args[i] = k->store[i]; return 0;
 }
 int clEnqueueNDRangeKernel(void* q, void* k_, unsigned dim, const size_t* off, const size_t* g, const size_t* l, unsigned ne, const void* ev, void* oe) {

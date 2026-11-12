@@ -52,7 +52,7 @@ found and tested. The other shells in the job's install list were not present in
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
 | Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering) | MSL host syntax check | `macos` |
-| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe); SwiftShader in the Android emulator (local) | `linux-vulkan` on lavapipe; compiled out in every other job |
+| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe; local 2026-11-12: 36 spec kernels, the 11 ported kernels and 13 Vulkan goldens, see the changelog); SwiftShader in the Android emulator (local, not since 2026-11-05) | `linux-vulkan` on lavapipe; compiled out in every other job |
 
 `test_gpu_metal` passing means the runtime opened a device and all checks passed; the device name is not in the
 CI log because ctest only prints output on failure.
@@ -110,6 +110,77 @@ Greedy output is identical with CUDA graphs on and off.
 ## Changelog of checks
 
 Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-12 (GPU follow-up: Vulkan and Metal ports, device conv / norm ops, eviction and captures, prims, pipe:auto, RPC residency)
+Linux x86_64, clang 23, no GPU. "lavapipe" = Mesa 25.2.8 llvmpipe (LLVM 20), a CPU implementation of Vulkan that
+executes the embedded SPIR-V; "mock" = the mock drivers of the entry below. Nothing in this entry ran on a physical
+GPU, and nothing was built by a compiler other than clang 23.
+- **Vulkan ports of the portable kernels** (`VK_PORT` in `ops/gen/gpu_gen.py`: quantised matmul_t / gather / FFN
+  gate-up for q8_0, q4_k, q5_k, q6_k, one-pass and split-over-keys attention, delta_rule, causal_conv, broadcast,
+  device MoE; host side `gpu::portable_kernels<>` on `gpu::vk::runtime`). **Lavapipe-verified**: all 47 shaders build
+  with glslang 15.1 and pass `spirv-val`; `test_vulkan` and `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`: views
+  staged through scratch buffers) run the checks of `tests/gpu_checks.hpp`, which `test_cuda_hip` runs on the mocks:
+  14/14 attention shapes, 24/24 quantised matmul cases, 28/28 against the decoded-weight reference (worst 1.2e-6 of
+  the largest output), 20/20 fused FFN cases, state ops (3 shapes, 2e-8), 4/4 quantised gather, 21/21 MoE cases, 8/8
+  broadcast cases, every `vk.*` lowering through the oracle. Goldens with `FORGE_DEVICE=vulkan`: the existing three
+  plus `golden_{hf_quant,quant_inplace,tiny_qwen2,tiny_qwen3,tiny_gpt2,tiny_gemma,tiny_phi3,tiny_bert,tiny_vit,tiny_whisper}_vulkan`
+  (13 in all) pass. `tiny_qwen3_5` (DeltaNet end to end) was skipped: no torch here; the state ops are covered by the
+  check above only. First attempt failed the oracle on decode attention by 1.2e-5 against 1e-5 (one `fma` chain per
+  score); the ports sum scores in 4 partial sums like the spec shader. Never on a GPU: descriptor limits, real
+  drivers' SPIR-V compilers and buffers over the tested sizes are untested.
+- **Vulkan dispatch folding**: launches are folded over the second dispatch dimension (rows of 32768 groups); before,
+  a launch of more than 65535 × 64 work items exceeded what `maxComputeWorkGroupCount` guarantees. Lavapipe: a
+  2,098,152-item `add` (0 wrong). The 36 spec shaders were regenerated with the linear index and pass as before.
+- **Metal ports of the same families**: `kernels.metal` gets the eleven portable kernels through a textual
+  translation of the OpenCL C (`msl_port`), and `gpu/src/metal.mm` gets the host side (`gpu::portable_kernels<>`).
+  **Never executed, never compiled by a Metal toolchain.** Checked here: the generated MSL passes the C++ syntax
+  check `gpu_compile_metal_syntax` (45 kernels; address-space keywords vanish in that check), and `metal.mm` parses
+  as Objective-C++ against stub declarations of the Metal API (`gpu_compile_metal_host_syntax`, new). That second
+  check found that `forge_metal` lacked the `third_party/monocypher` include directory `core/memory.hpp` needs since
+  the 2026-11-12 merges (not verified on macOS, but the include path was missing from the target); added. `test_gpu_metal` now runs the attention, quantised,
+  state-op and MoE checks too, so the macOS CI job is the first place any of this runs.
+- **Device kernels for `gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d`,
+  `attention_bias`** on every backend (one portable source, `PORT_NN`). **Mock-verified** on CUDA, HIP, OpenCL, Level
+  Zero: `test_gpu_{cuda,hip,opencl,ze}_mock` 42/42 lowerings through the oracle (34 before) and 26/26 cases of the new
+  `nn_ops_check`. The CUDA / HIP mock now compiles the generated portable source as C for these kernels (no hand
+  copy); the PTX (sm_70, sm_80) and AMDGPU builds of that text compile and have not run. **Lavapipe-verified** on
+  Vulkan: `gelu.comp` and the seven GLSL ports pass the oracle and the same 26 cases, also with
+  `FORGE_VK_SSBO_ALIGN=256`. **Metal: never executed** (`msl_port` translation, C++ syntax check only). Goldens of the
+  six template families pass on the CUDA mock, the OpenCL mock and lavapipe; with `FORGE_PLAN_TRACE` the OpenCL-mock
+  runs show no `attention_bias`, `layer_norm`, `gelu` or convolution left on the host (remaining: `transpose`,
+  `l2_normalize`, `masked_mean`). A broadcast with a single-element operand (`x * [1]`) now also stays on the device.
+  No GPU has run any of it and nothing was timed.
+- **Eviction and recorded graphs** (buffer generations, `gpu/graph_refs.hpp`): a graph whose buffers were evicted,
+  released or re-created is detected at `graph_launch` and re-recorded from the host views (per launch on OpenCL /
+  Level Zero, the whole captured graph on CUDA / HIP); OpenCL and Level Zero now evict while a recording is open.
+  **Mock-verified** only: `test_gpu_memory_{cuda,hip,opencl,ze}_mock` step 6 (6 checks per backend, see
+  [gpu.md](gpu.md#eviction-and-recorded-graphs)). On the mocks the CUDA / HIP re-record uses the generated
+  parameter-size table, since the mock has no `cuFuncGetParamInfo`; the driver path of that lookup has not run.
+  Still not possible: eviction while a CUDA / HIP stream capture is open. Not run on the RTX 3090.
+- **`gpu::prims` (FORGE_PLAN B.6)**: `gemv`, `gemm_batched` with an epilogue, `conv1d` / `conv2d`, `fft`,
+  `softmax`, `rms_norm`, `layer_norm`, `flash_attention` on the CPU (`prims.hpp`), and all but the FFT on a device
+  through the generated kernels (`prims_device.hpp`). CPU: 5 new `test_gpu` tests against the float64 references on
+  this x86_64 machine only. Device: `prims_check` 22/22 on the CUDA, HIP, OpenCL, Level Zero **mocks**
+  and on **lavapipe**; Metal never executed; no GPU. The device epilogue is separate launches, not a fused kernel.
+- **`pipe:auto`** (`gpu::plan_pipeline`): the layer split over the devices of one backend, shares from throughput,
+  capped by device memory, overflow to a CPU stage. Synthetic records in `test_gpu` (`pipeline_auto_partition`);
+  **mock-verified** with `MOCK_DEVICES=2` on CUDA, HIP, OpenCL, Level Zero (`test_gpu_select_*_mock`: the two-stage
+  split, an 8-layer graph running 8 + 8 ops over both devices against the CPU, the one-device case) and
+  `golden_tiny_llama_pipe_auto_cuda_mock`. The mocks report equal priors, so only the 50 / 50 split ran on a driver;
+  the memory-capped and benchmark-weighted splits ran on synthetic records only. Stage hand-off is through host
+  memory: peer copies are not used by the pipeline (the peer-copy API is covered by `test_gpu_features_*_mock` as
+  before). No multi-GPU machine has run it.
+- **RPC remote weight residency** (protocol version 2 in `graph/rpc.hpp`: the `rpc.caps` probe, `FRPW` uploads keyed
+  by BLAKE3, `FRPR` ops with handles, a per-connection LRU under a shared byte budget, invalidation on reconnect).
+  Tested over **loopback only**, plain TCP, CPU server: `test_rpc` 7 new tests (upload once and the bytes saved, LRU
+  eviction and re-upload, reconnect by hand and after a server restart, a version 1 server and a version 1 client,
+  `allow=` / `max-bytes=` on uploads and on handles, hostile frames, a whole model against the CPU); the 24 older
+  `test_rpc` tests pass unchanged (the TLS ones included: this build has OpenSSL). `fuzz_rpc`: 32 new seeds, 150,000 mutated inputs without a finding, in a build
+  **without** sanitizers. Not run: two machines, TLS-specific paths, a GPU behind the server (the device pin of a
+  stored weight has only run against the CPU registry, where it is a no-op), concurrent connections under load. `forge rpc-serve` still opens its device non-resident, so only the network
+  transfer of a weight is saved, not the server's host-to-GPU copy.
+- The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
+  tests pass unchanged after the move.
 
 ### 2026-11-12 (session summary: everything merged on this day, and how each part was verified)
 One machine did all of this: Linux x86_64 (4 cores, kernel 6.18), **clang 23**, no GPU. Nothing below has been
