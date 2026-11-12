@@ -23,6 +23,7 @@
 #include <forge/script/script.hpp>
 #include <forge/script/check.hpp>
 #include <forge/script/local_ai.hpp>
+#include <forge/script/aot.hpp>
 #include <forge/security/security.hpp>
 
 using namespace forge;
@@ -89,6 +90,8 @@ int usage() {
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
         "      [--mem-limit SIZE]  hard memory cap (\"512M\", \"2G\"): managed heap, child processes, and this process at OS level\n"
         "      [--policy F]  FSS policy: capabilities from the policy, lockdown() before the script runs\n"
+        "  script --aot <out> <file.cpp> [--aot-mode native|embed] [--cxx C] [-O<n>] [--target T] [--aot-runtime DIR]\n"
+        "      [--aot-keep-source DIR] [--aot-allow-widen]  compile a script to a native executable (docs/aot.md)\n"
         "  security check [--policy F] [--json]   FSS controls: state, backend, verdict (exit 1 if a required one cannot be met)\n"
         "  run, bench, script and rpc-serve take --policy F (else $FORGE_SECURITY_POLICY, ./forge-security.json, the config\n"
         "      dir, $FORGE_SECURITY_PROFILE; with none of them no FSS profile is active and nothing changes; docs/security-api.md)\n"
@@ -725,6 +728,7 @@ int cmd_script(int argc, char** argv) {
     forge::script::options o;
     std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
     std::string rpc_child, policy_path, rpc_sig_hex;
+    std::string aot_out; forge::script::aot_options aot;   // --aot OUT: compile to an executable instead of running (docs/aot.md)
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
@@ -735,6 +739,17 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--args") { ++i; break; }
         else if (s == "--emit") emit_target = val("--emit");
         else if (s == "-o") emit_out = val("-o");
+        else if (s == "--aot") aot_out = val("--aot");
+        else if (s == "--aot-mode") { auto m = val("--aot-mode"); aot.mode = m == "native" ? forge::script::aot_mode::native : m == "embed" ? forge::script::aot_mode::embed : m == "auto" ? forge::script::aot_mode::automatic : throw std::runtime_error("--aot-mode takes native|embed|auto"); }
+        else if (s == "--cxx") aot.cxx = val("--cxx");
+        else if (s == "--target") aot.target = val("--target");
+        else if (s == "--aot-keep-source") aot.keep_source_dir = val("--aot-keep-source");
+        else if (s == "--aot-runtime") aot.runtime_dir = val("--aot-runtime");
+        else if (s == "--aot-stub") aot.stub = val("--aot-stub");
+        else if (s == "--aot-allow-widen") aot.allow_widen = true;
+        else if (s == "--aot-pch") aot.pch_dir = val("--aot-pch");
+        else if (s == "--aot-cxx-flag") aot.cxx_flags.push_back(val("--aot-cxx-flag"));
+        else if (s.size() > 2 && s.starts_with("-O")) aot.opt_level = s.substr(2);
         else if (s == "--emit-targets") { for (auto& t : forge::script::emit_targets()) std::printf("%s\n", t.c_str()); return 0; }
         else if (s == "--check") check_only = true;           // static checks only (docs/scripting.md "Static checks")
         else if (s == "--json") check_json = true;
@@ -782,6 +797,16 @@ int cmd_script(int argc, char** argv) {
         auto txt = check_json ? forge::script::to_json(ds) + "\n" : forge::script::to_text(ds);
         std::fwrite(txt.data(), 1, txt.size(), check_json ? stdout : stderr);
         return forge::script::has_errors(ds) || (o.strict_check && !ds.empty()) ? 2 : 0;
+    }
+    if (!aot_out.empty()) {   // ahead-of-time compilation: write an executable instead of running (docs/aot.md)
+        if (!have_code) { if (file.empty()) throw std::runtime_error("--aot needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
+        aot.run = o; aot.run.argv.clear(); aot.policy_file = policy_path; aot.module_dirs = module_dirs; aot.self_is_runner = true;
+        try {
+            auto r = forge::script::aot_compile(code, have_code ? "<-e>" : file, aot_out, aot);
+            if (!r.fallback_reason.empty()) std::fprintf(stderr, "forge script --aot: native mode not used: %s\n", r.fallback_reason.c_str());
+            std::fprintf(stderr, "forge script --aot: wrote %s (%s)\n", r.output.c_str(), r.detail.c_str());
+            return 0;
+        } catch (const forge::script::aot_error& ex) { std::fprintf(stderr, "%s\n", ex.what()); return ex.exit_code; }
     }
     if (!emit_target.empty()) {   // write once, emit anywhere: translate instead of running
         if (!have_code) { if (file.empty()) throw std::runtime_error("--emit needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
@@ -904,6 +929,7 @@ int cmd_aot(const args& a) {
 int main(int argc, char** argv) {
     if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
     forge::script::install_local_ai();   // forge::ask & co run FORGE_ASK_MODEL / --ask-model in-process
+    if (auto rc = forge::script::aot_run_embedded(argc, argv)) return *rc;   // a copy of forge carrying a script (--aot embed mode)
     if (argc < 2) return usage();
     std::string c = argv[1];
     if (c == "script") {

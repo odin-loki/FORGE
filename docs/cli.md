@@ -130,6 +130,7 @@ forge script [options]                        interactive REPL
 forge script --emit <target> <file.cpp> [-o out]   translate to a standalone shell script
 forge script --emit-targets                   list the shells that have an emitter
 forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp>   static checks only
+forge script --aot <out> [--aot-mode native|embed] [--cxx C] [-O<n>] [--target T] <file.cpp>   compile to an executable
 ```
 
 | Option | Meaning |
@@ -146,6 +147,7 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 | `--cache-dir DIR`, `--cache-trust HEX`, `--cache-require-signed`, `--cache-sign-seed HEX` | Compiled-script cache: directory, trusted public keys, refuse unsigned entries, signing seed |
 | `--ask-model M.fpk`, `--ask-max-tokens N` | Run `forge::ask` and related calls on this model in-process (defaults `$FORGE_ASK_MODEL`, `$FORGE_ASK_MAX_TOKENS` or 256) |
 | `--emit TARGET`, `-o FILE` | Translate instead of running. `TARGET` is a shell from `--emit-targets`, `auto` (`$FORGE_SHELL` or the host shell), `android` (mksh), or `ast` |
+| `--aot OUT`, `--aot-mode native\|embed\|auto`, `--cxx C`, `-O<level>`, `--target TRIPLE`, `--aot-runtime DIR`, `--aot-keep-source DIR`, `--aot-pch DIR`, `--aot-cxx-flag F`, `--aot-stub FILE`, `--aot-allow-widen` | Compile the script to an executable instead of running it. The capability, limit, sandbox and policy options above are baked into the binary; it accepts them again at run time as leading `--forge-*` arguments, which can only narrow them. See [aot.md](aot.md) |
 | `--` | End of options; the next argument is the script file |
 
 - Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md). Arguments after the file are available as `forge::args()`.
