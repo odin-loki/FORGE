@@ -1,6 +1,7 @@
 // forge::os::process_pool: worker processes, IPC, crash detection, shutdown, sandbox.
 #include <forge/os/process_pool.hpp>
 #include "check.hpp"
+#include <csignal>
 #include <fstream>
 #include <iterator>
 using namespace forge;
@@ -28,7 +29,8 @@ FORGE_PROCESS_TASK(sb_mech, [](std::string) { return os::sandbox_status().mechan
 FORGE_PROCESS_TASK(probe_connect, [](std::string port) { return os::socket::connect("127.0.0.1", std::stoi(port), 3000) ? std::string("connected") : std::string("refused"); });
 FORGE_PROCESS_TASK(probe_write, [](std::string path) { return os::write_file(path, "x") ? std::string("wrote") : std::string("denied"); });
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
-FORGE_PROCESS_TASK(segv, [](std::string) -> std::string { ::raise(SIGSEGV); return {}; });
+// SIG_DFL first: a sanitizer runtime installs its own SIGSEGV handler, which reports and exits instead of dying by the signal
+FORGE_PROCESS_TASK(segv, [](std::string) -> std::string { std::signal(SIGSEGV, SIG_DFL); ::raise(SIGSEGV); return {}; });
 FORGE_PROCESS_TASK(pid, [](std::string) { return std::to_string(::getpid()); });
 FORGE_PROCESS_TASK(try_write, [](std::string path) -> std::string {
     int f = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
