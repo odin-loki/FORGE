@@ -91,7 +91,8 @@ struct FnDecl {
     std::vector<std::string> attrs;       // [[...]] attribute texts
     std::string access = "public";
     // Source text of the parameter list and body ([src_b, src_e) in *src), for forge::remote_call.
-    std::shared_ptr<const std::string> src; std::size_t src_b = 0, src_e = 0;
+    std::shared_ptr<const std::string> src; std::size_t src_b = 0, src_e = 0;    // AOT binaries (aot.hpp): the natively compiled body of this function, attached after parsing; null = interpret.
+    mutable void (*aot_body)() = nullptr;
 };
 
 // Reflection metadata for a class / struct, filled by the parser and shared with the runtime Class.

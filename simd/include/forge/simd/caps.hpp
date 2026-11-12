@@ -12,7 +12,8 @@ namespace forge::simd {
     X(avx512fp16) X(avx512ifma) X(avx512vbmi) X(avx512vbmi2) X(avx512bitalg) X(avx512vpopcntdq) \
     X(avxvnni) X(avx10_1) X(amx_tile) X(amx_int8) X(amx_bf16) X(amx_fp16) \
     X(neon) X(dotprod) X(i8mm) X(arm_bf16) X(arm_fp16) X(sve) X(sve2) X(sme) X(sme2) \
-    X(rvv) X(zvfh) X(zvbb) X(vsx) X(wasm_simd128) X(lsx) X(lasx)
+    X(rvv) X(zvfh) X(zvbb) X(vsx) X(wasm_simd128) X(lsx) X(lasx) \
+    X(s390_vxe) X(msa)
 
 #define FORGE_TAG(n) struct n { static constexpr const char* name = #n; };
 FORGE_FEATURES(FORGE_TAG)
@@ -37,8 +38,8 @@ FORGE_FEATURES(FORGE_TAG)
         X(zvfhmin) X(zvkb) X(zvkg) X(zvkned) X(zvknha) X(zvknhb) X(zvksed) X(zvksh) X(zvl256b) X(zvl512b) \
     /* PowerPC */ X(altivec) X(power8_vector) X(power9_vector) X(power10_vector) \
     /* WebAssembly */ X(wasm_relaxed_simd) X(wasm_fp16) \
-    /* s390x */ X(zvector) X(zvector_e1) X(zvector_e2) X(zvector_e3) \
-    /* MIPS */ X(msa)
+    /* s390x */ X(zvector) X(zvector_e1) X(zvector_e2) X(zvector_e3)
+    // (lsx, lasx, vsx, wasm_simd128 and msa are in FORGE_FEATURES above: Tier P and Tier R share those tags.)
 
 #define FORGE_TAG(n) struct n { static constexpr const char* name = #n; };
 FORGE_RAW_FEATURES(FORGE_TAG)
@@ -81,6 +82,18 @@ struct neoverse2 : caps<neon, dotprod, i8mm, arm_bf16, arm_fp16, sve, sve2> {
 struct apple_m : caps<neon, dotprod, i8mm, arm_bf16, arm_fp16> {
     using caps_type = caps<neon, dotprod, i8mm, arm_bf16, arm_fp16>; static constexpr const char* name = "apple-m"; };
 struct rvv1 : caps<rvv, zvfh> { using caps_type = caps<rvv, zvfh>; static constexpr const char* name = "rvv1"; };
+// Tier P presets for the vec_gn.hpp backends (one kernel table each; see docs/simd.md).
+struct x86_64_v1 : caps<sse2> { using caps_type = caps<sse2>; static constexpr const char* name = "x86-64-v1"; };
+struct loongarch_lsx : caps<lsx> { using caps_type = caps<lsx>; static constexpr const char* name = "loongarch-lsx"; };
+struct loongarch_lasx : caps<lsx, lasx> { using caps_type = caps<lsx, lasx>; static constexpr const char* name = "loongarch-lasx"; };
+// POWER presets: vsx selects the Tier P kernel table; altivec / powerN_vector are the Tier R gates the same -mcpu implies.
+struct power7 : caps<altivec, vsx> { using caps_type = caps<altivec, vsx>; static constexpr const char* name = "power7"; };
+struct power8 : caps<altivec, vsx, power8_vector> {
+    using caps_type = caps<altivec, vsx, power8_vector>; static constexpr const char* name = "power8"; };
+struct s390x_z14 : caps<s390_vxe> { using caps_type = caps<s390_vxe>; static constexpr const char* name = "z14"; };
+struct wasm_simd : caps<wasm_simd128> { using caps_type = caps<wasm_simd128>; static constexpr const char* name = "wasm-simd128"; };
+struct mips_msa : caps<msa> { using caps_type = caps<msa>; static constexpr const char* name = "mips-msa"; };
+struct armv7_neon : caps<neon> { using caps_type = caps<neon>; static constexpr const char* name = "armv7-neon"; };
 // Scalable-vector targets at a fixed register length (bits); one kernel table is compiled per length.
 template <int Bits> struct sve_vl : caps<neon, dotprod, i8mm, arm_bf16, arm_fp16, sve, sve2> {
     using caps_type = caps<neon, dotprod, i8mm, arm_bf16, arm_fp16, sve, sve2>; static constexpr int vl = Bits; static constexpr const char* name = "sve"; };
@@ -93,20 +106,15 @@ template <class T> constexpr int vl_bits() { if constexpr (requires { T::vl; }) 
 
 
 // ---- Tier R presets and compile-time detection ----
-struct loongarch_lsx : caps<lsx> { using caps_type = caps<lsx>; static constexpr const char* name = "loongarch-lsx"; };
-struct loongarch_lasx : caps<lsx, lasx> { using caps_type = caps<lsx, lasx>; static constexpr const char* name = "loongarch-lasx"; };
-struct power7 : caps<altivec, vsx> { using caps_type = caps<altivec, vsx>; static constexpr const char* name = "power7"; };
-struct power8 : caps_extend<power7, power8_vector> { static constexpr const char* name = "power8"; };
+// (loongarch_lsx / loongarch_lasx / power7 / power8 / wasm_simd / mips_msa are with the Tier P presets above.)
 struct power9 : caps_extend<power7, power8_vector, power9_vector> { static constexpr const char* name = "power9"; };
 struct power10 : caps_extend<power7, power8_vector, power9_vector, power10_vector> { static constexpr const char* name = "power10"; };
-struct wasm_simd : caps<wasm_simd128> { using caps_type = caps<wasm_simd128>; static constexpr const char* name = "wasm-simd128"; };
 struct wasm_relaxed : caps<wasm_simd128, wasm_relaxed_simd> {
     using caps_type = caps<wasm_simd128, wasm_relaxed_simd>; static constexpr const char* name = "wasm-relaxed-simd"; };
 struct z13 : caps<zvector> { using caps_type = caps<zvector>; static constexpr const char* name = "z13"; };
-struct z14 : caps<zvector, zvector_e1> { using caps_type = caps<zvector, zvector_e1>; static constexpr const char* name = "z14"; };
-struct z15 : caps<zvector, zvector_e1, zvector_e2> {
-    using caps_type = caps<zvector, zvector_e1, zvector_e2>; static constexpr const char* name = "z15"; };
-struct mips_msa : caps<msa> { using caps_type = caps<msa>; static constexpr const char* name = "mips-msa"; };
+struct z14 : caps<zvector, zvector_e1, s390_vxe> { using caps_type = caps<zvector, zvector_e1, s390_vxe>; static constexpr const char* name = "z14"; };
+struct z15 : caps<zvector, zvector_e1, zvector_e2, s390_vxe> {
+    using caps_type = caps<zvector, zvector_e1, zvector_e2, s390_vxe>; static constexpr const char* name = "z15"; };
 
 // The feature set this translation unit is compiled for, from the compiler's predefined macros
 // (-march / -m flags, /arch). `compiled_t` is a Target: Has<compiled_t, avx2> is true in a TU built with -mavx2.
@@ -445,6 +453,7 @@ template <Target T> constexpr int native_f32_lanes() {
     else if constexpr (Has<T, avx2>) return 8;
     else if constexpr (Has<T, sve>) return vl_bits<T>() / 32;   // SVE / RVV: fixed length per tag (default 256)
     else if constexpr (Has<T, rvv>) return vl_bits<T>() / 32;
+    else if constexpr (Has<T, lasx>) return 8;
     else if constexpr (Has<T, neon>) return 4;
     else return 4; // scalar emulation, 4-wide for ILP
 }
