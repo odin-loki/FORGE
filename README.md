@@ -35,6 +35,14 @@ To run a real model, import it first, or pass a Hugging Face directory, `.gguf` 
 ./build/dev/forge-serve model.fpk --port 8080
 ```
 
+To skip plan compilation at start-up, compile the model ahead of time ([docs/aot-models.md](docs/aot-models.md)):
+
+```sh
+./build/dev/forge aot model.fpk                                   # precompiled plans, stored in the .fpk
+./build/dev/forge aot model.fpk --aot-mode native -o model.so     # plans compiled to native code; forge run model.so
+./build/dev/forge aot model.fpk --aot-mode native --emit exe -o model && ./model --prompt "Hello" -n 32
+```
+
 ## What is in the box
 
 | Layer | Headers | Provides |
@@ -54,7 +62,7 @@ To run a real model, import it first, or pass a Hugging Face directory, `.gguf` 
 
 Programs built by default (`FORGE_BUILD_APPS=ON`):
 
-- `forge`: command-line tool (`info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `script`). See [docs/cli.md](docs/cli.md).
+- `forge`: command-line tool (`info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `script`). See [docs/cli.md](docs/cli.md).
 - `forge-serve`: OpenAI-compatible HTTP server, and `forge-serve proxy` load balancer. See [docs/serve.md](docs/serve.md).
 - `libforge` (`forge_c` target; `libforge.so.1` on Linux, `forge.dll` on Windows): the C ABI used by the Python, Kotlin and Swift bindings.
 

@@ -12,6 +12,8 @@ struct Limits {
     std::uint64_t max_steps = 0;      // statements + instructions; 0 = unlimited
     std::uint64_t timeout_ms = 0;     // wall clock for the whole run
     std::uint64_t heap_bytes = 0;     // managed heap cap (on top of the forge::mem budget)
+    std::uint64_t mem_bytes = 0;      // --mem-limit: hard cap on the managed heap (Heap::set_hard_cap) and the default
+                                      // OS memory cap of every child process (Interp::child_mem); 0 = none
     int max_depth = 800;              // script call depth (keeps the C++ stack safe)
     std::uint64_t max_output = 64ull << 20;   // per child-process stream
 };
@@ -76,7 +78,7 @@ struct Interp {
     std::shared_ptr<Quota> handle_quota, proc_quota;           // limit({handles}) / limit({procs}); shared with tasks started inside
     void charge_process(const std::string& what);              // count one child process against limit({procs})
 
-    explicit Interp(std::shared_ptr<Shared> s, Ref<Globals> g = {}) : sh(std::move(s)), globals(g ? std::move(g) : make<Globals>()), caps(sh->caps) {}
+    explicit Interp(std::shared_ptr<Shared> s, Ref<Globals> g = {}) : sh(std::move(s)), globals(g ? std::move(g) : make<Globals>()), caps(sh->caps), child_mem(sh->limits.mem_bytes) {}
 
     // ---- entry points
     Value run_top(const std::shared_ptr<const FnDecl>& top, bool vm);

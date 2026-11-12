@@ -29,6 +29,7 @@ syntax error, a script refused by the static checks, a failed `--emit`, or a bad
 | `--tree` | tree-walker only (no bytecode VM) |
 | `--debug` | race, lock-order and stall detectors (see *Threads*) |
 | `--timeout MS`, `--max-steps N`, `--heap BYTES` | whole-run wall clock, step count, managed-heap cap |
+| `--mem-limit SIZE` | hard memory cap for the run and its child processes, e.g. `512M`, `2G` (see *Resource limits*) |
 | `--no-fs`, `--no-net`, `--no-proc` | turn a capability off (see *Capabilities and sandboxing*) |
 | `--os-sandbox off\|best-effort\|require` | OS enforcement of the `--no-*` flags (default `best-effort`) |
 | `--policy FILE` | FORGE Security Standard policy (see *Security policy*); without it `$FORGE_SECURITY_POLICY`, `./forge-security.json`, the config dir or `$FORGE_SECURITY_PROFILE` is used, and with none of them nothing changes |
@@ -130,7 +131,9 @@ int main() {
 - **Memory budget.** Script heap memory is reserved from the process `forge::mem` budget (tag `script`; see
   [memory.md](memory.md), `FORGE_MEM_LIMIT`). `--heap BYTES`, `options::heap_bytes` and `limit {.mem = ...}` set a
   tighter cap. Over the cap the runtime runs the cycle collector, then throws a catchable `OutOfMemoryError`. Handlers
-  get about 4 MiB of grace to run before a second error.
+  get about 4 MiB of grace to run before a second error; the cap is enforced again once the heap is 16 KiB below it.
+  Building the error object itself is exempt from the cap. Growth in place (`push_back`, `insert`, `append`, `resize`
+  on containers and strings) is charged like a new object.
 
 ## Errors
 
@@ -307,9 +310,37 @@ that entered the block. A limit that fires is switched off until its block exits
 Over `handles` the new resource is closed again before the error; over `procs` nothing is started.
 
 Whole-run limits (`options` / CLI): `max_steps` (`--max-steps`), `timeout_ms` (`--timeout`), `heap_bytes`
-(`--heap`), call depth `max_depth` (default 800).
+(`--heap`), `mem_limit_bytes` (`--mem-limit`), call depth `max_depth` (default 800).
 
-Tests: `tests/script/limits.fs`, `limit_block.fs`, `limit_counts.fs`.
+**`--mem-limit SIZE`** (`options::mem_limit_bytes`) is a hard cap on the memory of the run. `SIZE` is a size string
+as in `limit {.mem = "2G"}` (`script::parse_size`); `0` and malformed sizes are refused (exit 2). It bounds three
+things:
+
+| what | how | over the limit |
+|---|---|---|
+| the managed heap | the same accounting as `--heap`: bytes charged for strings, containers, objects, closures and call frames, counted from the creation of the engine | cycle collection, then a catchable `OutOfMemoryError` ("script memory limit of N bytes exceeded (--mem-limit)"), with the same 4 MiB of grace for handlers |
+| each child process | every shell call, `run` / `proc::run`, `proc::start` child starts with an OS memory cap of `SIZE`, as if inside `limit {.proc_mem = SIZE}`; a `ProcessPool` worker runs its tasks under the same `mem_limit_bytes` | the child's allocations fail or it is killed (`RLIMIT_AS`; Job Object on Windows; resident-size watchdog on macOS and Android) |
+| the `forge script` process itself (CLI only) | Linux: `RLIMIT_AS` set to the address space in use at start plus `SIZE` plus headroom (`SIZE`/2, at least 64 MiB). Windows: a Job Object process-memory limit of the committed memory at start plus the same | a native allocation fails: `OutOfMemoryError` ("out of memory") where the interpreter can report it, otherwise the process ends |
+
+How it differs from `--heap BYTES`: `--heap` caps only the managed heap of this interpreter. `--mem-limit` caps
+the same heap (with both given, the lower one applies; a `limit {.mem}` block can narrow either, never widen it),
+and also memory the heap accounting does not see: child processes, and in the CLI native memory of the process
+(captured child output, file contents being read, the parsed program, thread stacks). `limit {.proc_mem}` can
+lower the cap of children inside a block but not raise it.
+
+What it does not bound: the heap accounting counts payload bytes, not allocator overhead, so the process uses more
+than `SIZE` when the heap cap fires; the headroom on the OS cap covers that, which makes the OS cap a backstop for
+native memory at about 1.5 x `SIZE` rather than an exact figure. The OS cap counts address space (Linux) or
+committed memory (Windows), not resident memory, so thread stacks and allocator reserves count, and a child capped
+at a small `SIZE` may fail to start. macOS, iOS, Android and the BSDs get no OS cap on the `forge script` process (no usable mechanism for a
+running process; the heap and child caps still apply). An embedder's process is never capped: the engine applies
+only the heap and child parts. Children are capped one by one, not as a sum. `forge rpc-serve` passes
+`--script-mem-mb` to its script children as `--mem-limit` too, on top of the OS cap it already set; that OS cap has
+no headroom, so there it usually fires first (`OutOfMemoryError: out of memory`).
+
+Tests: `tests/script/limits.fs`, `limit_block.fs`, `limit_counts.fs`, `mem_containers.fs` (heap accounting per
+container kind); `mem_limit_whole_run`, `mem_limit_size_strings`, `mem_limit_children` in `tests/test_script.cpp`.
+The OS cap on the CLI process has no automated test.
 
 ## Capabilities and sandboxing
 
@@ -343,6 +374,10 @@ process-wide. `--os-sandbox best-effort` (default) records a failure in `engine:
 it fatal; `off` leaves interpreter checks only. On Windows a running process cannot drop fs or net access, so the
 interpreter checks those. Only the Linux mechanism has an automated test (`tests/test_script_os_sandbox.cpp`). See
 [security.md](security.md).
+
+A nested `forge::sandbox` block without `isolate` is enforced by the interpreter only: every OS mechanism above
+can only be tightened for the rest of the process's life, so it cannot be applied on entry and lifted when the block
+returns. Use `isolate` when the block needs OS enforcement.
 
 **Isolated blocks** (POSIX only). `forge::sandbox` with `{"isolate", true}` runs the block in a forked child that
 applies the narrower OS policy. The block's return value (JSON-representable values only), its print output and
@@ -721,7 +756,7 @@ Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the
 | `use-after-move` | error on every path, warning on some | flow-sensitive over function locals and top-level globals (branches, `&&`/`\|\|`/`?:`, loops, try/catch, field paths, references) |
 | `unique-copy` | error | copy-initialising from a `std::make_unique` local |
 | `iter-mutation` | error for a literal or container-typed local, else warning | size-changing method on the container a range-for is iterating |
-| `capability` | error, or warning when the value may differ at run time | fs/net/proc/env built-ins, `run()` and shell calls when `--no-*` or an enclosing literal `forge::sandbox` denies them; also through locals, containers, function returns and parameters holding a built-in, `eval("literal")`, and imports (an import is itself an error with `fs` denied) |
+| `capability` | error, or warning when the value may differ at run time | fs/net/proc/env built-ins, `run()` and shell calls when `--no-*` or an enclosing literal `forge::sandbox` denies them; also through locals, containers, function returns and parameters holding a built-in, `eval("literal")`, and imports (an import is itself an error with `fs` denied). Warnings for indirect calls: see *Indirect calls* below |
 | `limit-option` | error | in a literal `limit {...}` or `forge::limit({...}, fn)`: unknown key, malformed size or duration string, or a string for `allocs`/`handles`/`procs` |
 | `pool-task` | error | `submit`/`map` with a literal task source that does not parse, does not define `task`, or whose `task` does not take one argument |
 | `pool-json` | error | a lambda or shell result passed as a `ProcessPool` argument |
@@ -744,12 +779,48 @@ The checker makes two passes: the first summarises functions and lambdas (return
 fields), the second reports, so a call may come before the definition. Imports resolve like the runtime; extra
 directories with `--module-dir DIR` or `check_options::module_dirs` (the engine passes its base directory).
 
-Known gaps: field taint is by field name, not per object; taint through more than two levels of
-function-returns-function may be missed; non-literal paths to `forge::import`/`plugin` are not followed; taint is
-per variable, not per element. Not built: undefined-variable checks, type inference beyond literals.
+**Indirect calls** (`script/src/capflow.hpp`). The `capability` errors above see a built-in only where the call
+names it as `lib.fn(...)` (`fs.read(p)`) or `run(...)`. A second, whole-script pass follows callables and reports
+`capability` **warnings**; it runs with `--check` and `--strict-check` (a normal run drops warnings, so it is skipped
+there). It is flow-insensitive:
 
-Only `limit-option` has a dedicated automated test (`limit_block_syntax_and_check`); the other checks run on every
-test script but are not asserted individually.
+1. Every local, global, field name and function return gets the set of callables it may hold: script functions,
+   lambdas, methods, and capability built-ins in any spelling (`forge::fs::read`, `fs::read` after
+   `using namespace forge`, `forge::sh`, `std::getenv`, ...). Sets are fed by initialisers, assignments, arguments,
+   returns, range-`for`, container literals and inserts, wrappers (`std::function`, `std::bind`, `std::move`,
+   `std::make_shared`) and element accessors, to a fixed point. A container or struct is the union of what it
+   holds.
+2. Each function gets a summary, also to a fixed point over the call graph: the capabilities its body may need
+   through the built-ins it calls, the functions it may call and the callables it hands to a built-in that may call
+   them (`std::for_each`, `std::async`, `forge::sandbox`, ...). A parameter the function itself calls stays
+   symbolic, so `apply(pure_fn)` does not inherit what `apply(reads_files)` needs.
+3. Method calls resolve through the classes the receiver may be, a declared base type standing for all its
+   subclasses (virtual dispatch); when nothing is known about the receiver, every class with a method of that name
+   counts.
+4. A callee nothing is known about (a value from `eval` or `forge::reflect`, a member of an imported module, a
+   parameter no call site passes anything to) is treated as any function or built-in whose address is taken
+   anywhere in the script.
+
+A call is reported when it sits where a capability is denied (by the run, or by an enclosing
+`forge::sandbox(<literal options>, [] { ... })` in any literal form: `{{"fs", false}}`,
+`std::map<std::string, bool>{{"fs", false}}`) and may reach a built-in that needs it. The message gives one path,
+e.g. `'apply' may need the 'fs' capability (denied by the enclosing sandbox block): apply -> its parameter 'f' ->
+lambda (line 4) -> forge::fs::read (line 4)`. With a capability denied for the whole run, a script function is not
+reported at its call sites: the line that uses the built-in is.
+
+Known gaps: fields are tracked by field name, not per object, and containers per variable, not per element (both
+can warn about a capability-free callable stored next to one that needs a capability); a write through an iterator
+is not followed back to its container; a function is summarised once for all its call sites except for the
+parameters it calls directly; `eval` of a non-literal string, functions of imported modules and methods of handles
+opened before the block (`file.read()`) are not followed; sandbox options held in a variable are not read; a lambda
+written inside a denied block is checked there even if it only runs later, outside. The `reflect` capability is not
+checked statically. Non-literal paths to `forge::import`/`plugin` are not followed. Not built: undefined-variable
+checks, type inference beyond literals.
+
+Automated tests: `limit-option` (`limit_block_syntax_and_check` in `tests/test_script.cpp`) and the indirect-call
+`capability` warnings (`static_capability_indirect_*` in `tests/test_script_security.cpp`, positive and negative
+cases per indirect form; run-time counterpart `tests/script/indirect_calls.fs`). The other checks run on every test
+script but are not asserted individually.
 
 ## Embedding
 

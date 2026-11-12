@@ -286,6 +286,11 @@ public:
         map_ = forge::map_readonly(path, size_);
         try { init_(path, key); } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // the dtor does not run on a throwing ctor
     }
+    // A .fpk that is already in memory (embedded in a compiled model, docs/aot-models.md). The bytes are borrowed and
+    // must outlive the reader; `label` stands in for the path in messages.
+    reader(std::span<const std::uint8_t> mem, const std::string& label, std::optional<model_key> key = std::nullopt) : path_(label), map_(mem.data()), size_(mem.size()), borrowed_(true) {
+        init_(label, key);
+    }
 private:
     void init_(const std::string& path, std::optional<model_key> key) {
         if (size_ < 64) raise(errc::format_error, "{}: too small to be .fpk", path);
@@ -314,7 +319,7 @@ private:
 public:
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
-    ~reader() { forge::unmap_readonly(map_, size_); }
+    ~reader() { if (!borrowed_) forge::unmap_readonly(map_, size_); }
 
     bool has_section(const std::string& n) const { return sections_.count(n) != 0; }
     std::span<const std::uint8_t> section_bytes(const std::string& n) const {
@@ -384,6 +389,7 @@ private:
     std::size_t size_ = 0;
     std::map<std::string, section> sections_;
     std::map<std::string, tensor_entry> tensors_;
+    bool borrowed_ = false;   // map_ is the caller's memory, not a mapping
 };
 
 // Seal the data section of `in` with `key`, writing `out`. Existing signatures are dropped (re-sign after).
