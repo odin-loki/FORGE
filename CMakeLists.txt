@@ -619,6 +619,19 @@ else()
   set_source_files_properties(simd/src/seq_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off")
   set_source_files_properties(simd/src/seq_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma;-ffp-contract=off")
 endif()
+# Tier A algorithm tables (simd/tier_a.hpp: search, sort, scan, text, bitsets): scalar everywhere, AVX2 and
+# AVX-512 tables on x86_64.
+target_sources(forge_simd_mv PRIVATE simd/src/tiera_scalar.cpp simd/src/tiera_dispatch.cpp)
+if(FORGE_ARCH STREQUAL "x86_64")
+  target_sources(forge_simd_mv PRIVATE simd/src/tiera_avx2.cpp simd/src/tiera_avx512.cpp)
+  if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set_source_files_properties(simd/src/tiera_avx2.cpp   PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+    set_source_files_properties(simd/src/tiera_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+  else()
+    set_source_files_properties(simd/src/tiera_avx2.cpp   PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    set_source_files_properties(simd/src/tiera_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma")
+  endif()
+endif()
 
 # Hardware video decode (vision/video.hpp): NVDEC when nvcuvid.h is available, VideoToolbox on Apple, MediaCodec on Android.
 add_library(forge_video STATIC support/src/video.cpp)
