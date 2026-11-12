@@ -1,6 +1,7 @@
 # Llama-family decoder (Llama 2/3, TinyLlama, SmolLM, Mistral without sliding window).
-# Double-brace placeholders are substituted by `forge import` from config.json.
-blueprint "decoder-lm" opset 1
+# Double-brace placeholders are substituted by `forge import` from config.json. The rope_args and attn_args placeholders are empty
+# unless the model scales its RoPE frequencies (linear, dynamic, YaRN, llama3: opset 2).
+blueprint "decoder-lm" opset {{opset|1}}
 
 params {
   d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
@@ -18,11 +19,11 @@ graph {
   x = embed(W.tok_emb, tokens)
   repeat l in 0..n_layers {
     h = rms_norm(x, W.layer[l].attn_norm, eps)
-    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: {{rope_neox}})
-    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: {{rope_neox}})
+    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: {{rope_neox}}{{rope_args|}})
+    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: {{rope_neox}}{{rope_args|}})
     v = heads(linear(h, W.layer[l].wv), n_kv, head_dim)
     kk, vv = kv[l].append(k, v)
-    a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv)
+    a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv{{attn_args|}})
     x = x + linear(merge(a, n_heads * head_dim), W.layer[l].wo)
     h = rms_norm(x, W.layer[l].ffn_norm, eps)
     x = x + linear(silu(linear(h, W.layer[l].w_gate)) * linear(h, W.layer[l].w_up), W.layer[l].w_down)

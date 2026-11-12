@@ -22,6 +22,8 @@
 #include <forge/ops/ops.gen.hpp>
 #include <forge/core/dl.hpp>
 #include <forge/gpu/device_memory.hpp>
+#include <forge/gpu/determinism.hpp>
+#include <forge/gpu/select.hpp>
 #include <algorithm>
 #include <atomic>
 #include <set>
@@ -37,6 +39,11 @@
 #include <tuple>
 #include <vector>
 
+namespace forge::gpu {
+// One stacked weight of a mixture-of-experts layer as the device sees it (run_moe): fmt 0 = f32 rows, 1 q8_0,
+// 2 q4_k, 3 q6_k, 4 q5_k (rb bytes per encoded row; ignored for f32).
+struct moe_weight { const std::uint8_t* data = nullptr; std::size_t bytes = 0; std::uint32_t fmt = 0, rb = 0; };
+}
 namespace forge::gpu::cuda_hip {
 
 enum class api { cuda, hip };
@@ -93,7 +100,7 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     case sig::rows: return !x.empty() && (a.num("axis", -1) == -1 || a.num("axis", -1) == double(x.size()) - 1);
     case sig::rms: return in.size() == 2 && !x.empty() && in[1].size() == 1 && in[1][0] == x.back();
     case sig::matmul: return in.size() == 2 && x.size() >= 2 && in[1].size() == 2 && in[1][1] == x.back();
-    case sig::rope: return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0];
+    case sig::rope: return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0] && !ops::rope_dynamic(a);   // dynamic NTK: CPU
     case sig::gather: return in.size() == 2 && x.size() == 2;
     case sig::slice: return in.size() == 1 && !x.empty() && a.num("step", 1) == 1;
     case sig::attention: return in.size() == 3 && x.size() == 3 && in[1].size() == 3 && in[2].size() == 3 && in[1][1] > 0 && x[1] % in[1][1] == 0;
@@ -135,8 +142,8 @@ inline launch_args kernel_args(const std::string& op, const std::vector<tensor_v
         L.threads = rows * cols; U(rows); U(cols); U(k); break; }
     case sig::rope: {
         std::uint32_t rows = std::uint32_t(x.shape[0]), cols = std::uint32_t(x.shape[1]), k = std::uint32_t(x.shape[2]);
-        double base = a.num("base", 10000.0); L.rope_inv.resize(k / 2);
-        for (std::uint32_t j = 0; j < k / 2; ++j) L.rope_inv[j] = float(std::pow(base, -2.0 * double(j) / double(k)));
+        const auto inv = ops::rope_inv_freq(a, i64(k)); L.rope_inv.resize(k / 2);   // scaling variants included (ops/rope.hpp)
+        for (std::uint32_t j = 0; j < k / 2; ++j) L.rope_inv[j] = float(inv[j]);
         L.threads = rows * cols * (k / 2); U(rows); U(cols); U(k); U(a.num("neox", 1) != 0); break; }
     case sig::gather: U(n); U(std::uint32_t(x.shape[0])); U(std::uint32_t(x.shape[1])); break;
     case sig::slice: {
@@ -189,6 +196,8 @@ public:
     const char* backend() const { return api_name(api_); }
     int ordinal() const { return ordinal_; }
     const std::string& device_name() const { return name_; }
+    // For automatic device selection (gpu/select.hpp): CUDA/HIP devices are discrete GPUs unless the name says otherwise.
+    gpu::device_class device_class() const { return software_name(name_) ? gpu::device_class::software : gpu::device_class::discrete; }
     const std::string& image_arch() const { return arch_; }
     bool has_graphs() const { return f_.capture_begin && f_.capture_end && f_.graph_inst && f_.graph_launch; }
     bool has_streams() const { return stream_ != nullptr; }
@@ -329,7 +338,7 @@ public:
         // up to 128 blocks of 256 threads (a lone block took ~30 us over a 248k vocabulary); the blocks leave partials
         // in am_ and the last one merges them (am_[1] is its ticket counter, zero between launches)
         if (!am_) { static const std::uint32_t zero[1024] = {}; am_ = dmalloc(sizeof zero, "scratch"); ck(htod_s(am_, zero, sizeof zero, stream_), "memcpy HtoD"); }
-        std::uint32_t n32 = std::uint32_t(n), nb = std::uint32_t(std::min<std::size_t>(128, (n + 2047) / 2048)); void* args[] = {&dp, &n32, &am_, &nb};
+        std::uint32_t n32 = std::uint32_t(n), nb = deterministic() ? 1u : std::uint32_t(std::min<std::size_t>(128, (n + 2047) / 2048)); void* args[] = {&dp, &n32, &am_, &nb};   // determinism mode: one block, no merge
         ck(launch_s(function("forge_argmax"), nb, 1, 1, 256, 1, 1, 0, stream_, args, nullptr), "launch");
         ++dispatches_["argmax"];
         int r = -1; void* pr = stage(4, true);   // page-locked: no driver staging on the read-back
@@ -485,12 +494,62 @@ public:
         if (!temps.empty()) { sync(); free_temps(); }
         return true;
     }
+    // Sparse mixture of experts (graph/plan.hpp moe_ffn semantics) with forge_moe_hidden / forge_moe_down, the kernels
+    // every backend shares (gpu_gen.py PORT_SHARED). h [t, d]; route = 3 floats per (token, slot) pair (expert id,
+    // token row, weight), kk slots per token, from the host router; gate/up are stacked [e, f, d], down [e, d, f],
+    // encoded or f32, uploaded once like run_qmatmul's weights. Only the routed experts' rows are read.
+    bool run_moe(const tensor_view& h, const std::vector<float>& route, std::uint32_t kk, const moe_weight& wg, const moe_weight& wu, const moe_weight& wd,
+                 std::uint32_t f, tensor_view out) {
+        if (h.shape.size() != 2 || !kk || !f) return false;
+        std::uint32_t t = std::uint32_t(h.shape[0]), dim = std::uint32_t(h.shape[1]), np = t * kk;
+        if (route.size() != std::size_t(np) * 3 || out.size() != h.size() || !wg.data || !wu.data || !wd.data) return false;
+        for (auto* w : {&wg, &wu}) if (w->fmt > 4 || (w->fmt && dim % 32)) return false;
+        if (wd.fmt > 4 || (wd.fmt && f % 32)) return false;
+        std::lock_guard lk(mu_); bind(); begin_op();
+        if (!has_fn_locked("forge_moe_hidden") || !has_fn_locked("forge_moe_down")) return false;
+        ++dispatches_["moe_ffn"];
+        if (!np) return true;
+        auto up = [&](const moe_weight& w) {
+            auto& qe = qres_[{reinterpret_cast<std::uintptr_t>(w.data), w.bytes}]; qe.last = ++clock_;
+            if (!qe.d) { std::uint64_t dp = dmalloc(w.bytes, "weights"); qe.d = dp; ck(htod_s(qe.d, w.data, w.bytes, stream_), "memcpy HtoD"); ++stats_.uploads; stats_.qweight_bytes += w.bytes; }
+            return std::uint64_t(qe.d); };
+        std::uint64_t g = 0, u = 0, dn = 0;
+        for (int pass = 0; pass < 2; ++pass) { g = up(wg); u = up(wu); dn = up(wd); }   // twice: an upload may evict an earlier one
+        std::vector<std::uint64_t> temps;
+        auto free_temps = [&] { for (auto p : temps) dfree(p); };
+        try {
+            std::uint64_t hd = 0, yd = 0;
+            if (in_run_) {
+                acquire(out.data, out.size(), true);
+                hd = acquire(h.data, h.size(), false).ptr;
+                auto b = acquire(out.data, out.size(), true); b.e->host_valid = false; yd = b.ptr;
+            } else {
+                hd = dmalloc(h.size() * 4, "scratch"); temps.push_back(hd);
+                ck(htod_s(hd, h.data, h.size() * 4, stream_), "memcpy HtoD");
+                yd = dmalloc(out.size() * 4, "scratch"); temps.push_back(yd);
+            }
+            std::uint64_t rt = dmalloc(route.size() * 4, "scratch"); temps.push_back(rt);
+            ck(htod_s(rt, route.data(), route.size() * 4, stream_), "memcpy HtoD");
+            std::uint64_t hid = dmalloc(std::size_t(np) * f * 4, "scratch"); temps.push_back(hid);
+            std::uint32_t fg = wg.fmt, rg = wg.rb, fu = wu.fmt, ru = wu.rb, fd = wd.fmt, rd = wd.rb;
+            void* a1[] = {&hd, &rt, &g, &u, &hid, &np, &f, &dim, &fg, &rg, &fu, &ru};
+            writes(hid, std::size_t(np) * f * 4);
+            ck(launch_s(function("forge_moe_hidden"), unsigned((std::size_t(np) * f + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, a1, nullptr), "launch");
+            void* a2[] = {&hid, &rt, &dn, &yd, &t, &kk, &dim, &f, &fd, &rd};
+            writes(yd, out.size() * 4);
+            ck(launch_s(function("forge_moe_down"), unsigned((std::size_t(t) * dim + 255) / 256), 1, 1, 256, 1, 1, 0, stream_, a2, nullptr), "launch");
+            if (!in_run_) ck(dtoh_s(out.data, yd, out.size() * 4, stream_), "memcpy DtoH");
+            sync();
+        } catch (...) { try { sync(); } catch (...) {} free_temps(); throw; }
+        free_temps();
+        return true;
+    }
     // Prefill on int8 tensor cores (forge_qmatmul_mma, sm_80+ image) for q8_0/q4_k/q6_k ($FORGE_MMA=0 off).
     static bool use_mma() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA"); return !(e && std::string(e) == "0"); }(); return on; }
     static bool use_mmvq() { static const bool on = [] { auto* e = std::getenv("FORGE_MMVQ"); return !(e && std::string(e) == "0"); }(); return on; }
     // Split-K decode attention ($FORGE_ATTN_DEC=0 off) and its partials scratch.
     static bool fa_tc() { static const bool on = [] { auto* e = std::getenv("FORGE_FA_TC"); return !(e && std::string(e) == "0"); }(); return on; }
-    static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on; }
+    static bool attn_dec() { static const bool on = [] { auto* e = std::getenv("FORGE_ATTN_DEC"); return !(e && std::string(e) == "0"); }(); return on && !deterministic(); }   // determinism mode: no split over keys
     std::uint64_t att_ = 0; std::size_t att_cap_ = 0;
     std::set<void*> mma_attr_;   // kernels (qmatmul_mma_*, attention_fa2_*) whose dynamic shared memory limit was raised
     static std::string mma_fn(std::uint32_t fmt, unsigned bt = 64) {
@@ -498,11 +557,11 @@ public:
     static unsigned mma_ns() { static const unsigned v = [] { auto* e = std::getenv("FORGE_MMA_STAGES"); return e && std::string(e) == "2" ? 2u : 1u; }(); return v; }   // $FORGE_MMA_STAGES=2: double-buffered q4_k (opt-in; no gain on an RTX 3090)
     static unsigned mma_bt() {   // $FORGE_MMA_BT: 64 or 128 tokens per block; 0 (unset) = per format
         auto* e = std::getenv("FORGE_MMA_BT"); return !e ? 0u : std::string(e) == "64" ? 64u : std::string(e) == "128" ? 128u : 0u; }
-    static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on; }
+    static bool use_splitk() { static const bool on = [] { auto* e = std::getenv("FORGE_MMA_SPLITK"); return !(e && std::string(e) == "0"); }(); return on && !deterministic(); }   // determinism mode: one k order per shape
     // $FORGE_MMA_STREAMK: off by default (greedy output on Qwen3.5 not yet verified against the default path); 1 on for
     // grids of 1/4 to 4 waves, 2 for every grid that does not fill whole waves (tests). Read per launch, so tests and
     // benches compare the paths in one process.
-    static unsigned streamk_mode() { auto* e = std::getenv("FORGE_MMA_STREAMK"); return !e || !*e ? 0u : std::string(e) == "1" ? 1u : std::string(e) == "2" ? 2u : 0u; }
+    static unsigned streamk_mode() { if (deterministic()) return 0u; auto* e = std::getenv("FORGE_MMA_STREAMK"); return !e || !*e ? 0u : std::string(e) == "1" ? 1u : std::string(e) == "2" ? 2u : 0u; }
     // Stream-K needs >= this many 256-value k chunks per block ($FORGE_MMA_SK_MIN, default 4): fewer blocks otherwise.
     static unsigned sk_min() { auto* e = std::getenv("FORGE_MMA_SK_MIN"); int n = e && *e ? std::atoi(e) : 4; return unsigned(n < 1 ? 1 : n); }
     std::uint64_t skfx_ = 0; std::size_t skfx_cap_ = 0;   // stream-K fixup slots (one bt x 128 float tile per block)
@@ -908,8 +967,8 @@ public:
             k = std::uint32_t(x.shape.back()); rows = std::uint32_t(x.size()) / k; cols = std::uint32_t(in[1].shape[0]); threads = rows * cols; break;
         case sig::rope: {
             rows = std::uint32_t(x.shape[0]); cols = std::uint32_t(x.shape[1]); k = std::uint32_t(x.shape[2]); u4 = a.num("neox", 1) != 0;
-            double base = a.num("base", 10000.0); extra.resize(k / 2);
-            for (std::uint32_t j = 0; j < k / 2; ++j) extra[j] = float(std::pow(base, -2.0 * double(j) / double(k)));
+            const auto inv = ops::rope_inv_freq(a, i64(k)); extra.resize(k / 2);   // scaling variants included (ops/rope.hpp)
+            for (std::uint32_t j = 0; j < k / 2; ++j) extra[j] = float(inv[j]);
             threads = rows * cols * (k / 2); break; }
         case sig::gather: rows = std::uint32_t(x.shape[0]); cols = std::uint32_t(x.shape[1]); break;
         case sig::slice: {
@@ -1076,8 +1135,9 @@ public:
             unsigned block = 256;
             std::uint32_t mode = rms_mode(std::uint32_t(s * H), std::uint32_t(d), &block);
             if (block != 256) return false;
-            std::vector<float> invf(std::size_t(d / 2)); const double base = a.num("base", 10000.0);
-            for (std::size_t j = 0; j < invf.size(); ++j) invf[j] = float(std::pow(base, -2.0 * double(j) / double(d)));   // as run_op's rope
+            if (ops::rope_dynamic(a)) return false;   // the table depends on the positions: the rope step runs on the CPU
+            std::vector<float> invf(std::size_t(d / 2)); const auto inv64 = ops::rope_inv_freq(a, d);
+            for (std::size_t j = 0; j < invf.size(); ++j) invf[j] = float(inv64[j]);   // as run_op's rope
             auto& tb = rope_[invf];
             if (!tb) { tb = dmalloc(invf.size() * 4, "scratch"); ck(htod_s(tb, invf.data(), invf.size() * 4, stream_), "memcpy HtoD"); }
             std::uint64_t tbl = tb;
