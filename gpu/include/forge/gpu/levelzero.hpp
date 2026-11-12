@@ -119,9 +119,23 @@ public:
         copy(static_cast<char*>(d.ptr) + off * 4, s, n * 4);
     }
 
+    // Recorded graphs with generation checks, as gpu/opencl.hpp: a launch whose buffers were evicted, released or
+    // re-created since it was recorded is bound again from the host views instead of replayed (gpu/graph_refs.hpp).
     void capture_begin() { std::lock_guard lk(mu_); capturing_ = true; cur_.clear(); }
     std::size_t capture_end() { std::lock_guard lk(mu_); capturing_ = false; graphs_.push_back(std::move(cur_)); cur_.clear(); return graphs_.size() - 1; }
-    void graph_launch(std::size_t id) { std::lock_guard lk(mu_); for (auto& l : graphs_.at(id)) enqueue(l); sync(); }
+    void graph_launch(std::size_t id) {
+        std::lock_guard lk(mu_);
+        for (auto& l : graphs_.at(id)) {
+            begin_op();
+            bool stale = false;
+            for (auto& g : l.args) if (g.ref.kind && !ref_current(g.ref)) { stale = true; break; }
+            if (stale) { rerecord(l); ++stats_.graph_rerecords; continue; }
+            if (l.global) enqueue(l);
+            ++stats_.graph_replays;
+            for (auto& g : l.args) if (g.ref.kind == buffer_ref::tensor) if (auto* e = find_view(g.ref.host, g.ref.count)) { e->last = ++clock_; if (g.ref.mode) e->host_valid = false; }
+        }
+        sync();
+    }
 
     std::uint64_t device_alloc(std::size_t bytes) { std::lock_guard lk(mu_); begin_op(); return reinterpret_cast<std::uintptr_t>(alloc(bytes, "raw")); }
     void device_free(std::uint64_t p) { std::lock_guard lk(mu_); dfree(reinterpret_cast<void*>(p)); }
@@ -138,67 +152,89 @@ public:
         auto L = cuda_hip::kernel_args(op, in, a, out);
         std::lock_guard lk(mu_); begin_op();
         ++dispatches_[op];
-        // Settle the residency map before binding anything: acquiring a range that partly overlaps a resident entry
-        // drops that entry (after syncing it back), and an input bound earlier in this same launch may live inside
-        // it (an activation inside a stale larger entry of the reused arena, then an output that overlaps the same
-        // entry). Its handle would then be freed while the kernel still uses it. After this pass every range has
-        // its entry, so the binds below only hit the cache.
-        if (in_run_) {
-            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
-            acquire(out.data, out.size(), true);
-            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
-        }
-        launch l; l.kernel = kernel("forge_" + op); l.global = L.threads;
-        std::vector<void*> temps;
-        auto free_temps = [&] { for (auto p : temps) dfree(p); };
+        kcall c;
         try {
-            auto buf = [&](const float* h, std::size_t cnt, bool is_out) {
-                void* d;
-                if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, is_out); if (is_out) b.e->host_valid = false; d = b.ptr; }
-                else { d = alloc(cnt * 4, "scratch"); temps.push_back(d); if (!is_out) copy(d, h, cnt * 4); }
-                l.args.push_back({d, 0, false}); return d;
-            };
+            // Settle the residency map before binding anything (see gpu/opencl.hpp run_op): after this pass every range
+            // has its entry, so the binds below only hit the cache.
+            for (auto& v : in) k_touch(v.data, v.size(), 0);
+            k_touch(out.data, out.size(), 1);
+            for (auto& v : in) k_touch(v.data, v.size(), 0);
             for (std::size_t i = 0; i < in.size(); ++i) {
-                buf(in[i].data, in[i].size(), false);
-                if (L.s == sig::rope && i == 1) {
-                    void* d = alloc(L.rope_inv.size() * 4, "scratch"); (capturing_ ? keep_ : temps).push_back(d);
-                    copy(d, L.rope_inv.data(), L.rope_inv.size() * 4); l.args.push_back({d, 0, false});
+                k_buf(c, in[i].data, in[i].size(), 0);
+                if (L.s == sig::rope && i == 1) {   // inverse-frequency table goes after pos
+                    void* d = alloc(L.rope_inv.size() * 4, "scratch"); c.temps.push_back(d);
+                    copy(d, L.rope_inv.data(), L.rope_inv.size() * 4); k_dev(c, d);
                 }
             }
-            void* od = buf(out.data, out.size(), true);
-            for (auto& sc : L.scalars) { arg g{nullptr, sc.u, true}; if (sc.is_float) std::memcpy(&g.v, &sc.f, 4); l.args.push_back(g); }
-            if (L.threads) enqueue(l);
-            if (capturing_) cur_.push_back(l);
-            if (!in_run_) { copy(out.data, od, out.size() * 4); sync(); }
-        } catch (...) { sync(); free_temps(); throw; }
-        if (!temps.empty()) { sync(); free_temps(); }
+            k_buf(c, out.data, out.size(), 1);
+            for (auto& sc : L.scalars) { if (sc.is_float) k_f32(c, sc.f); else k_u32(c, sc.u); }
+            k_launch(c, "forge_" + op, L.threads);
+            k_done(c);
+        } catch (...) { k_abort(c); throw; }
         return true;
     }
 
 private:
     runtime() = default;
-    struct arg { void* ptr; std::uint32_t v; bool scalar; };
+    struct arg { void* ptr; std::uint32_t v; bool scalar; buffer_ref ref{}; };   // ref: what a buffer argument referred to (recorded graphs)
     struct launch { ze_kernel_handle_t kernel = nullptr; std::uint32_t global = 0; std::vector<arg> args; };
-    struct entry { float* host; std::size_t count; void* d; bool host_valid = true, pinned = false; std::uint64_t last = 0; };
+    struct entry { float* host; std::size_t count; void* d; bool host_valid = true, pinned = false; std::uint64_t last = 0, gen = 0; };   // gen: gpu/graph_refs.hpp
     struct bound { entry* e; void* ptr; };
     // ---- kernel-call builder for portable_kernels<> (gpu/portable_kernels.hpp); mu_ held ----
     struct kcall {
         launch l; std::vector<void*> temps;
         struct rd_t { void* d; float* h; std::size_t bytes; }; std::vector<rd_t> rd;   // outputs to read back (outside a run)
     };
-    struct qentry { void* mem = nullptr; std::size_t bytes = 0; std::uint64_t last = 0; };
+    struct qentry { void* mem = nullptr; std::size_t bytes = 0; std::uint64_t last = 0, gen = 0; };
     void k_touch(const float* h, std::size_t cnt, int mode) { if (in_run_) acquire(const_cast<float*>(h), cnt, mode == 1); }
     entry* k_buf(kcall& c, const float* h, std::size_t cnt, int mode) {   // mode 0 in, 1 out, 2 in/out
-        void* dv; entry* ent = nullptr;
-        if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, mode == 1); if (mode) b.e->host_valid = false; dv = b.ptr; ent = b.e; }
-        else {
+        void* dv; entry* ent = nullptr; buffer_ref ref;
+        if (in_run_) {
+            auto b = acquire(const_cast<float*>(h), cnt, mode == 1); if (mode) b.e->host_valid = false; dv = b.ptr; ent = b.e;
+            ref.kind = buffer_ref::tensor; ref.mode = std::uint8_t(mode); ref.host = h; ref.count = cnt; ref.gen = b.e->gen;
+        } else {
             dv = alloc(cnt * 4, "scratch"); c.temps.push_back(dv);
             if (mode != 1) copy(dv, h, cnt * 4);
             if (mode) c.rd.push_back({dv, const_cast<float*>(h), cnt * 4});
         }
-        c.l.args.push_back({dv, 0, false}); return ent;
+        c.l.args.push_back({dv, 0, false, ref}); return ent;
     }
-    void k_dev(kcall& c, void* p) { c.l.args.push_back({p, 0, false}); }
+    void k_dev(kcall& c, void* p) {
+        c.l.args.push_back({p, 0, false});
+        if (capturing_) for (auto& [k, q] : qres_) if (q.mem == p) { c.l.args.back().ref = weight_ref(k, q); break; }   // an encoded weight: evictable
+    }
+    static buffer_ref weight_ref(const std::pair<std::uintptr_t, std::size_t>& k, const qentry& q) {
+        buffer_ref r; r.kind = buffer_ref::weight; r.host = reinterpret_cast<const void*>(k.first); r.count = k.second; r.gen = q.gen; return r;
+    }
+    // ---- recorded graphs: generation checks and re-recording (gpu/graph_refs.hpp); mu_ held ----
+    entry* find_view(const void* host, std::size_t count) {   // the resident entry that holds [host, host + count floats)
+        auto key = reinterpret_cast<std::uintptr_t>(host);
+        auto it = res_.upper_bound(key); if (it == res_.begin()) return nullptr;
+        --it; return it->first + it->second.count * 4 >= key + count * 4 ? &it->second : nullptr;
+    }
+    bool ref_current(const buffer_ref& r) {
+        if (!r.gen) return false;
+        if (r.kind == buffer_ref::tensor) { auto* e = find_view(r.host, r.count); return e && e->gen == r.gen; }
+        auto it = qres_.find({reinterpret_cast<std::uintptr_t>(r.host), r.count}); return it != qres_.end() && it->second.gen == r.gen;
+    }
+    void rerecord(launch& l) {   // bind a recorded launch again from what its arguments referred to, run it, keep the new arguments
+        kcall c; const bool was = capturing_; capturing_ = false;
+        try {
+            for (auto& g : l.args) if (g.ref.kind == buffer_ref::tensor) k_touch(static_cast<const float*>(g.ref.host), g.ref.count, g.ref.mode);
+            for (auto& g : l.args) {
+                if (g.ref.kind == buffer_ref::tensor) k_buf(c, static_cast<const float*>(g.ref.host), g.ref.count, g.ref.mode);
+                else if (g.ref.kind == buffer_ref::weight) {
+                    const auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(g.ref.host), g.ref.count);
+                    k_dev(c, qweight(static_cast<const std::uint8_t*>(g.ref.host), g.ref.count)); c.l.args.back().ref = weight_ref(key, qres_.at(key));
+                } else c.l.args.push_back(g);
+            }
+            launch nl = c.l; nl.kernel = l.kernel; nl.global = l.global;
+            if (nl.global) enqueue(nl);
+            k_done(c);
+            if (in_run_) l = std::move(nl);   // outside a run the views went through temporaries: the launch stays stale
+        } catch (...) { capturing_ = was; k_abort(c); throw; }
+        capturing_ = was;
+    }
     void k_u32(kcall& c, std::uint32_t v) { c.l.args.push_back({nullptr, v, true}); }
     void k_f32(kcall& c, float v) { arg g{nullptr, 0, true}; std::memcpy(&g.v, &v, 4); c.l.args.push_back(g); }
     void* k_scratch(kcall& c, std::size_t bytes) { void* p = alloc(bytes, "scratch"); c.temps.push_back(p); return p; }
@@ -234,7 +270,7 @@ private:
         if (auto it = qres_.find(key); it != qres_.end()) { it->second.last = ++clock_; return it->second.mem; }
         void* p = alloc(bytes, "weights");
         try { copy(p, q, bytes); sync(); } catch (...) { dfree(p); throw; }
-        qres_[key] = {p, bytes, ++clock_}; ++stats_.uploads; stats_.qweight_bytes += bytes;
+        qres_[key] = {p, bytes, ++clock_, ++gen_clock_}; ++stats_.uploads; stats_.qweight_bytes += bytes;
         return p;
     }
     // Encoded weights not bound by the op in progress, least recently used first (re-uploaded from the host on next use).
@@ -288,6 +324,7 @@ private:
     // ---- device memory accounting (gpu/device_memory.hpp): pool "level_zero:N" ----
     device_memory dm_;
     std::uint64_t clock_ = 0, op_mark_ = 0;   // buffers touched after begin_op() belong to the op in progress
+    std::uint64_t gen_clock_ = 0;             // buffer generations (gpu/graph_refs.hpp): one per device buffer ever created, never reused
     void begin_op() { op_mark_ = clock_; }
     void* alloc(std::size_t bytes, const char* tag) {
         bytes = std::max<std::size_t>(4, bytes);
@@ -299,9 +336,9 @@ private:
     }
     void dfree(void* p) { dm_.release(p); f_.free_(ctx_, p); }
     // device_memory's evict callback (mu_ held): resident buffers least recently used first, synced to the host
-    // first; never one the op in progress has bound, and nothing while a graph is being recorded.
+    // first; never one the op in progress has bound. Also while a graph is being recorded: graph_launch binds the
+    // launches whose buffers are gone again (gpu/graph_refs.hpp).
     std::uint64_t evict_device(std::uint64_t want, bool external) {
-        if (capturing_) return 0;
         std::uint64_t got = evict_tensors(want, external);
         if (!want || got < want) got += evict_weights(want ? want - got : 0);
         return got;
@@ -355,7 +392,7 @@ private:
         each_overlap(h, count, [&](entry& e) { if (!e.host_valid) download(e); ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         if (!ks.empty()) sync();
         for (auto k : ks) { drop(res_[k]); res_.erase(k); }
-        entry e{h, count, alloc(count * 4, "resident")}; e.last = ++clock_;
+        entry e{h, count, alloc(count * 4, "resident")}; e.last = ++clock_; e.gen = ++gen_clock_;
         for (auto& [p, n] : pinned_) if (p == h && n == count) e.pinned = true;
         if (!is_out) { copy(e.d, h, count * 4); ++stats_.uploads; }
         stats_.resident_bytes += count * 4; stats_.peak_resident_bytes = std::max(stats_.peak_resident_bytes, stats_.resident_bytes);

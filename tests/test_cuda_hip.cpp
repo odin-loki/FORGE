@@ -495,6 +495,83 @@ template<class Open> static int memory_t(Open open) {
         chk(ok && rt->residency().evictions >= ev0 + 2, std::format("driver out of memory: {} evictions, results intact", rt->residency().evictions - ev0));
     }
 #endif
+    // 6. recorded graphs and eviction (gpu/graph_refs.hpp): a graph whose buffers were evicted, or that was recorded in an
+    //    earlier run, is detected by the buffers' generations and re-recorded from the host views, not replayed on dead
+    //    handles. OpenCL / Level Zero also evict while the recording is open.
+    if (rt->has_graphs()) {
+        pool->evict(0);
+        std::vector<float> gx(N), gy(N), gz(N), gy2(N), gz2(N);
+        for (std::size_t i = 0; i < N; ++i) gx[i] = float(i % 9) * 0.25f - 1;
+        auto stats = [&] { return rt->residency(); };
+        rt->begin_run();
+        rt->run_op("exp", {{gx.data(), sh}}, {}, {gy.data(), sh});            // warm: gx, gy resident, gy device-newer
+        rt->to_host(gy.data(), N);
+        rt->capture_begin();
+        rt->run_op("scale", {{gy.data(), sh}}, {{"alpha", 2.0}}, {gz.data(), sh});
+        auto g = rt->capture_end();
+        auto s0 = stats();
+        rt->graph_launch(g); rt->to_host(gz.data(), N);
+        chk(same(gz, [&](std::size_t i) { return 2 * std::exp(gx[i]); }) && stats().graph_replays == s0.graph_replays + 1 && stats().graph_rerecords == s0.graph_rerecords,
+            "a captured graph replays as recorded while its buffers are unchanged");
+        ev0 = rt->residency().evictions;
+        pool->evict(0);                                                           // between captures: every resident buffer goes (synced back first)
+        chk(rt->residency().evictions > ev0, "eviction between a capture and its replay");
+        std::fill(gy.begin(), gy.end(), 1.5f); std::fill(gz.begin(), gz.end(), -1.f);
+        rt->host_wrote(gy.data(), N); rt->host_wrote(gz.data(), N);
+        s0 = stats();
+        rt->graph_launch(g); rt->to_host(gz.data(), N);
+        chk(same(gz, [&](std::size_t) { return 3.f; }) && stats().graph_rerecords == s0.graph_rerecords + 1,
+            std::format("after the eviction the graph is detected as stale and re-recorded ({} re-records), result intact", stats().graph_rerecords - s0.graph_rerecords));
+        std::fill(gy.begin(), gy.end(), 2.5f); rt->host_wrote(gy.data(), N);
+        s0 = stats();
+        rt->graph_launch(g); rt->to_host(gz.data(), N);
+        chk(same(gz, [&](std::size_t) { return 5.f; }) && stats().graph_rerecords == s0.graph_rerecords && stats().graph_replays == s0.graph_replays + 1,
+            "the re-recorded graph replays as recorded afterwards");
+        rt->end_run();                                                            // drops the run's buffers: their generations end here
+        std::fill(gy.begin(), gy.end(), 0.5f); std::fill(gz.begin(), gz.end(), -1.f);
+        rt->begin_run();
+        s0 = stats();
+        rt->graph_launch(g); rt->to_host(gz.data(), N);
+        chk(same(gz, [&](std::size_t) { return 1.f; }) && stats().graph_rerecords == s0.graph_rerecords + 1, "a graph recorded in an earlier run is re-recorded in the next one");
+        rt->end_run();
+        const std::string be = rt->backend();
+        if (be == "opencl" || be == "level_zero") {   // eviction while the recording is open
+            pool->evict(0);
+            for (std::size_t i = 0; i < N; ++i) { gy[i] = float(i % 5); gy2[i] = float(i % 3) + 1; }
+            pool->set_limit(pool->used() + 3 * B);       // room for three buffers: the second launch must evict the first one's
+            ev0 = rt->residency().evictions;
+            rt->begin_run();
+            rt->capture_begin();
+            rt->run_op("scale", {{gy.data(), sh}}, {{"alpha", 2.0}}, {gz.data(), sh});
+            rt->run_op("scale", {{gy2.data(), sh}}, {{"alpha", 3.0}}, {gz2.data(), sh});
+            auto g2 = rt->capture_end();
+            const bool evicted = rt->residency().evictions > ev0;
+            rt->to_host(gz.data(), N); rt->to_host(gz2.data(), N);
+            const bool first = same(gz, [&](std::size_t i) { return 2 * gy[i]; }) && same(gz2, [&](std::size_t i) { return 3 * gy2[i]; });
+            for (std::size_t i = 0; i < N; ++i) { gy[i] += 1; gy2[i] += 1; }
+            rt->host_wrote(gy.data(), N); rt->host_wrote(gy2.data(), N);
+            s0 = stats();
+            rt->graph_launch(g2); rt->to_host(gz.data(), N); rt->to_host(gz2.data(), N);
+            rt->end_run();
+            pool->set_limit(0);
+            chk(evicted && first && same(gz, [&](std::size_t i) { return 2 * gy[i]; }) && same(gz2, [&](std::size_t i) { return 3 * gy2[i]; }) && stats().graph_rerecords > s0.graph_rerecords,
+                std::format("buffers evicted while a recording is open: results intact, {} launches re-recorded at replay", stats().graph_rerecords - s0.graph_rerecords));
+        } else {   // CUDA / HIP: a capturing stream cannot be synchronised, so nothing is evicted while the capture is open
+            pool->evict(0);
+            for (std::size_t i = 0; i < N; ++i) gy[i] = float(i % 5);
+            rt->begin_run();
+            rt->run_op("scale", {{gy.data(), sh}}, {{"alpha", 1.0}}, {gy2.data(), sh});   // gy, gy2 resident
+            ev0 = rt->residency().evictions;
+            rt->capture_begin();
+            pool->evict(0);
+            const bool held = rt->residency().evictions == ev0;
+            rt->run_op("scale", {{gy2.data(), sh}}, {{"alpha", 4.0}}, {gz.data(), sh});
+            auto g3 = rt->capture_end();
+            rt->graph_launch(g3); rt->to_host(gz.data(), N);
+            rt->end_run();
+            chk(held && same(gz, [&](std::size_t i) { return 4 * gy[i]; }), "no eviction while a stream capture is open; the capture replays");
+        }
+    } else std::puts("note: driver has no graph API");
     rt.reset();
     chk(pool->used() == base, std::format("destroying the runtime returns every byte (used {})", pool->used() - base));
     return fails ? 1 : 0;

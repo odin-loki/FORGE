@@ -2420,7 +2420,7 @@ def main():
     vk_names = names + sorted(VK_PORT)   # Vulkan also builds the GLSL ports of the portable kernels
     if a.list: print(";".join(vk_names)); return
     if a.embed: embed(a.out, vk_names, a.embed); return
-    if a.embed_images: embed_images(a.images, a.embed_images); return
+    if a.embed_images: embed_images(a.images, a.embed_images, cuda(names) + "\n" + CU_QUANT + cu_port() + cu_nn()); return
     os.makedirs(a.out, exist_ok=True)
     def put(path, text):
         if not os.path.exists(path) or open(path, encoding="utf-8").read() != text: open(path, "w", encoding="utf-8", newline="\n").write(text)
@@ -2450,7 +2450,19 @@ def embed(spv_dir, names, out):
     text = "\n".join(lines)
     if not os.path.exists(out) or open(out, encoding="utf-8").read() != text: open(out, "w", encoding="utf-8", newline="\n").write(text)
 
-def embed_images(files, out):
+def kernel_param_sizes(cu_src):
+    """(kernel, sizes) for the kernels of kernels.cu whose signature is spelled out: one digit per parameter, 8 for a
+    pointer and 4 for unsigned / float. The CUDA/HIP runtime uses it to record captured launches where the driver
+    cannot report parameter sizes (cuda.hpp usizes); kernels stamped out by macros are not listed."""
+    import re
+    out = []
+    for m in re.finditer(r"FORGE_GLOBAL void (forge_\w+)\(([^)]*)\)", cu_src):
+        ps = [p.strip() for p in m.group(2).split(",")]
+        if any(not ("*" in p or p.startswith("unsigned ") or p.startswith("float ")) for p in ps): continue
+        out.append((m.group(1), "".join("8" if "*" in p else "4" for p in ps)))
+    return sorted(set(out))
+
+def embed_images(files, out, cu_src=""):
     """Write a header with the CUDA PTX and HIP code objects (used by grid/cuda.hpp); missing ones are empty."""
     def arr(name, data):
         return f"inline constexpr unsigned char {name}[] = {{" + "".join(str(b) + "," for b in data) + "0};"
@@ -2475,6 +2487,8 @@ def embed_images(files, out):
              "inline constexpr char metal_src[] = {" + "".join(str(b if b < 128 else b - 256) + "," for b in metal) + "0};",
              f"inline constexpr std::size_t metal_src_size = {len(metal)};",
              arr("spirv_l0", spv), f"inline constexpr std::size_t spirv_l0_size = {len(spv)};"]
+    lines.append("struct kernel_param { const char* name; const char* sizes; };   // one digit per parameter: its size in bytes")
+    lines.append("inline constexpr kernel_param kernel_params[] = {" + "".join(f'{{"{n}", "{z}"}}, ' for n, z in kernel_param_sizes(cu_src)) + '{"", ""}};')
     for arch, d in hsaco: lines.append(arr(f"hsaco_{arch}", d))
     lines.append("struct code_object { const char* arch; const unsigned char* data; std::size_t size; };")
     entries = ", ".join(f'{{"{a}", hsaco_{a}, {len(d)}}}' for a, d in hsaco) or '{"", nullptr, 0}'

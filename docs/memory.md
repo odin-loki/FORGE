@@ -64,7 +64,7 @@ Each runtime registers its buffers with the pool as a cache. Before an allocatio
 Buffers bound by the op in progress are never evicted. If nothing more can be evicted the allocation fails with `out_of_memory`, and the runtime stays usable for later ops that fit. Eviction requested from another thread (pressure response, another runtime on the same pool) only `try_lock`s the runtime and skips a busy one, so runtimes cannot deadlock.
 
 - Eviction moves device addresses, so the CUDA runtime turns off whole-run replay until runs are confirmed again.
-- Nothing is evicted while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open, and a graph recorded before an eviction must not be replayed after it.
+- Recorded graphs survive eviction: every resident buffer has a generation, and `graph_launch` re-records a graph (CUDA, HIP) or a launch (OpenCL, Level Zero) whose buffers were evicted or re-created instead of replaying it ([gpu.md](gpu.md#eviction-and-recorded-graphs)). Nothing is evicted while a CUDA/HIP stream capture is open; OpenCL and Level Zero evict during a recording too.
 - `residency()` counts `evictions` and `evicted_bytes`; `memory_pool()` and `charged_bytes()` return the pool and the bytes the runtime holds.
 - **Metal** has unified memory and no residency. Each op charges its buffers to `metal:<ordinal>` (tag `scratch`) only while it runs; nothing is evicted, and an op that does not fit fails.
 

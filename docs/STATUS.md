@@ -150,6 +150,13 @@ GPU, and nothing was built by a compiler other than clang 23.
   runs show no `attention_bias`, `layer_norm`, `gelu` or convolution left on the host (remaining: `transpose`,
   `l2_normalize`, `masked_mean`). A broadcast with a single-element operand (`x * [1]`) now also stays on the device.
   No GPU has run any of it and nothing was timed.
+- **Eviction and recorded graphs** (buffer generations, `gpu/graph_refs.hpp`): a graph whose buffers were evicted,
+  released or re-created is detected at `graph_launch` and re-recorded from the host views (per launch on OpenCL /
+  Level Zero, the whole captured graph on CUDA / HIP); OpenCL and Level Zero now evict while a recording is open.
+  **Mock-verified** only: `test_gpu_memory_{cuda,hip,opencl,ze}_mock` step 6 (6 checks per backend, see
+  [gpu.md](gpu.md#eviction-and-recorded-graphs)). On the mocks the CUDA / HIP re-record uses the generated
+  parameter-size table, since the mock has no `cuFuncGetParamInfo`; the driver path of that lookup has not run.
+  Still not possible: eviction while a CUDA / HIP stream capture is open. Not run on the RTX 3090.
 - The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
   tests pass unchanged after the move.
 
