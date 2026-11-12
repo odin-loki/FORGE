@@ -418,7 +418,10 @@ set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STAN
 
 add_library(forge_modelfile INTERFACE)
 forge_include_dirs(forge_modelfile INTERFACE modelfile/include)
-target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust)
+# forge_text: the tokenizer (modelfile/tokenizer.hpp) uses its Unicode tables, normalization forms and regex engine.
+# Every consumer of the header-only layers above (apps, tests, forge_c, the JNI and xcframework builds, the exported
+# forge:: targets) links it from here.
+target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust forge_text)
 
 # forge::security: FORGE Security Standard policy, enforce, audit, lockdown, check (docs/security-api.md). Header-only.
 add_library(forge_security INTERFACE)
@@ -1478,6 +1481,9 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # forge run --chat and /v1/chat/completions through a model file's own chat template (a checked-in tiny GGUF)
+      add_test(NAME chat_template_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/chat_template_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_SOURCE_DIR}/tests/data/tokenizer/gguf_tiny_llama.gguf ${PROJECT_BINARY_DIR}/chat_template_http)
       add_test(NAME security_cli COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/security_cli_test.py
                $<TARGET_FILE:forge> $<TARGET_FILE:forge-serve> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(security_cli PROPERTIES DEPENDS golden_tiny_llama LABELS security)
@@ -1654,7 +1660,7 @@ endif()
 
 # ---- fuzz targets (fuzz/): libFuzzer entry points + a built-in mutational driver for CI ----
 if(FORGE_BUILD_TESTS)
-  foreach(ft json blueprint fpk safetensors gguf tokenizer grammar onnx aot png bmp pnm inflate reflect)
+  foreach(ft json blueprint fpk safetensors gguf tokenizer chat_template grammar onnx aot png bmp pnm inflate reflect)
     if(FORGE_LIBFUZZER)
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp)
       target_compile_options(fuzz_${ft} PRIVATE -fsanitize=fuzzer)

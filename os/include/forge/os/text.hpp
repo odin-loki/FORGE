@@ -174,7 +174,10 @@ std::vector<fuzzy_hit> fuzzy_filter(std::string_view pattern, std::span<const st
 // ---------------------------------------------------------------- regex
 // Backtracking regex over code points with Unicode classes. Syntax: . [] [^] ranges, \p{..} \P{..},
 // \d \w \s \D \W \S \b \B \X (grapheme) ^ $ \A \z, (...) (?:...) (?<name>...) (?=..) (?!..), | * + ? {m,n}
-// lazy variants, backrefs \1, escapes \n \t \x{..} \u....  Flags: i (case fold), m (multiline), s (dotall), x.
+// lazy variants, backrefs \1, escapes \n \t \x{..} \u....  Lookbehind (?<=..) (?<!..) (bodies up to 255 code points),
+// inline flags (?i) (?i:...) (?s) (?m) (?x) (?-i), atomic groups (?>...) parsed as plain groups.
+// Flags: i (case fold), m (multiline), s (dotall), x, R (Ruby / Oniguruma dialect, the one Hugging Face tokenizer.json
+// patterns are written in: ^ and $ are line anchors and an inline (?m) means dot-all).
 struct regex_match {
     std::vector<std::pair<std::size_t, std::size_t>> groups;  // byte [begin, end); npos when unset; [0] = whole
     std::vector<std::string> names;                          // group names ("" for unnamed), same size
@@ -191,6 +194,11 @@ public:
     std::optional<regex_match> match(std::string_view s) const;                 // whole string
     std::optional<regex_match> search(std::string_view s, std::size_t from = 0) const;
     std::vector<regex_match> find_all(std::string_view s) const;
+    // Byte spans [begin, end) of the non-overlapping matches, left to right, without the capture groups
+    // (one pass over the subject; used by the tokenizer's pre-tokenizers). The step limit, plus 512 steps per
+    // code point of the subject, covers the whole call; when it runs out the spans found so far are returned
+    // and step_limit_hit() is set.
+    std::vector<std::pair<std::size_t, std::size_t>> find_spans(std::string_view s) const;
     // Replacement: $0..$9, ${name}, $$.
     std::string replace(std::string_view s, std::string_view repl, bool all = true) const;
     std::vector<std::string> split(std::string_view s) const;

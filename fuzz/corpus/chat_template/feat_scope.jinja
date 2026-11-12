@@ -1,0 +1,8 @@
+{% set x = 1 %}{% set ns = namespace(count=0, items='') %}{% for m in messages %}{% set x = x + 1 %}{% set ns.count = ns.count + 1 %}{% set ns.items = ns.items ~ m.role[0] %}{{ x }}{% endfor %} x={{ x }} count={{ ns.count }} items={{ ns.items }}
+{% if true %}{% set y = 'set in if' %}{% endif %}{{ y }}
+{% set block %}captured {{ x }} {% for i in range(3) %}{{ i }}{% endfor %}{% endset %}[{{ block }}] {{ block|length }}
+{% macro greet(name, punct='!') %}Hello {{ name }}{{ punct }}{% endmacro %}{{ greet('A') }} {{ greet('B', '?') }} {{ greet(name='C', punct='.') }} {{ greet('D')|upper }}
+{% macro wrap(m) -%}
+    <{{ m.role }}>{{ m.content|trim }}</{{ m.role }}>
+{%- endmacro %}{% for m in messages %}{{ wrap(m) }}{% endfor %}
+{% set a, b = 1, 2 %}{{ a }}{{ b }}{% set t = (1, 'two') %}{{ t[1] }}

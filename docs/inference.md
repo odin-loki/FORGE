@@ -84,6 +84,22 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 - `grammar_constraint(shared_ptr<const grammar>, tokenizer, vocab, eos)` masks tokens that cannot continue (`apply(logits)`), advances on `accept(token)`, and reports `can_end()` / `finished()`. EOS is allowed only when the grammar can end.
 - `json_schema_to_gbnf(json::value)` (`json_schema.hpp`) converts a JSON Schema subset to GBNF producing compact JSON (no whitespace): `type` (incl. lists), `properties` (declaration order; not in `required` = optional), `items`, `minItems`/`maxItems` ≤ 64, `enum`, `const`, `anyOf`/`oneOf`, `$ref` to `#/$defs/*` or `#/definitions/*`. An empty schema accepts any JSON value. Other keywords are ignored or rejected with `invalid_argument`.
 
+### Chat templates (`chat_template.hpp`)
+`model::chat_template()` is the model's Jinja template (empty when the file has none). `apply_chat_template(model, messages, chat_options)` renders it with `bos_token` / `eos_token` from the tokenizer; tokenize the result with `encode(text)` (no BOS: the template writes it). `render_chat_template(source, messages, options)` and the `chat_template` class (parse once, render many times) work on any template text.
+
+| `chat_options` | Default | Meaning |
+|----------------|---------|---------|
+| `add_generation_prompt` | true | End with the assistant's header |
+| `bos_token`, `eos_token` | from the tokenizer | |
+| `tools` | null | OpenAI-style tool list, visible to the template as `tools` |
+| `extra` | null | Object of further variables (`enable_thinking`, `date_string`, …) |
+| `now` | 0 | Clock for `strftime_now()`; 0 = system time |
+| `limits` | 8 MiB output, 2e7 steps, depth 150, 1 MiB template | Bounds for untrusted templates; exceeding one raises |
+
+The renderer is FORGE's own implementation of the Jinja2 subset chat templates use: `if` / `elif` / `else`, `for` (with `if` filter, `else`, `loop.*`, `break`, `continue`), `set` (also `ns.attr` and block form), `macro`, `raw`, comments, whitespace control, with `trim_blocks` and `lstrip_blocks` on as in transformers; expressions with slices, calls, filters, tests, string / dict methods, `namespace()`, `range()`, `raise_exception()`, `strftime_now()`. `tojson` is transformers' (`json.dumps(..., ensure_ascii=False)`), data is immutable as in its sandbox (`list.append` raises), and JSON numbers without a fraction are integers. Not supported: `include` / `extends` / `import`, `call` and `filter` blocks, `%` string formatting, chained comparisons, and filters outside the list in the header.
+
+It is tested against goldens rendered by jinja2 3.1 (`tests/data/chat_template/make_goldens.py`) for ChatML, Qwen2.5, Qwen3, Llama-2, Llama-3, Llama-3.1, Mistral v0.1 and v0.3, Gemma, Phi-3, DeepSeek, DeepSeek-R1 and Zephyr templates, with and without tools. Those template texts were written from memory of the published ones, so the test shows FORGE renders them as jinja2 does, not that they are byte-for-byte the vendors' files. `fuzz_chat_template` feeds it arbitrary templates.
+
 ### Continuous batching (`batch.hpp`)
 `batch_scheduler(shared_ptr<model>, batch_options)`. Each `step()` admits waiting requests up to `max_active`, prefills newcomers in chunks of `prefill_chunk` tokens and advances every active sequence by one token.
 

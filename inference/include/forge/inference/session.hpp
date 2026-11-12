@@ -104,8 +104,13 @@ public:
         if (r_.has_section("tokenizer")) {
             tok_.emplace(r_.section_text("tokenizer"));
             tok_->set_special(int(man_.num_or("bos_token_id", -1)), int(man_.num_or("eos_token_id", -1)));
-            tok_->set_add_bos(add_bos_default(man_));
+            // BOS / EOS around a prompt: the manifest's add_bos / add_eos when the importer recorded them, else the
+            // tokenizer.json post-processor when it has one, else the per-architecture default.
+            auto* ab = man_.find("add_bos"); auto* ae = man_.find("add_eos");
+            if ((ab && ab->is_bool()) || !tok_->has_post_processor()) tok_->set_add_bos(add_bos_default(man_));
+            if (ae && ae->is_bool()) tok_->set_add_eos(ae->b());
         }
+        if (r_.has_section("chat_template")) chat_template_ = std::string(r_.section_text("chat_template"));
         vocab_ = i64(bp_.param_or("vocab", 0));
         if (lib_ && (strict || r_.has_section("signature")))   // compiled code is not covered by the model's signature
             raise(errc::integrity_error, "{}: a compiled model library cannot be loaded for a signed model or under strict loading", path);
@@ -141,7 +146,10 @@ public:
     const modelfile::blueprint& blueprint() const { return bp_; }
     const json::value& manifest() const { return man_; }
     const modelfile::reader& file() const { return r_; }
-    const modelfile::bpe_tokenizer* tokenizer() const { return tok_ ? &*tok_ : nullptr; }
+    const modelfile::tokenizer* tokenizer() const { return tok_ ? &*tok_ : nullptr; }
+    // The model's Jinja chat template (the .fpk "chat_template" section), "" when it has none. Rendered by
+    // inference::apply_chat_template (chat_template.hpp).
+    const std::string& chat_template() const { return chat_template_; }
     i64 vocab() const { return vocab_; }
     i64 max_context() const { return i64(man_.num_or("max_position_embeddings", 2048)); }
     graph::plan_cache& plans() { return cache_; }
@@ -233,7 +241,8 @@ private:
     aot_source aot_;
     json::value man_;
     modelfile::blueprint bp_;
-    std::optional<modelfile::bpe_tokenizer> tok_;
+    std::optional<modelfile::tokenizer> tok_;
+    std::string chat_template_;
     graph::plan_cache cache_;
     std::map<std::string, tensor> weights_;
     std::map<std::string, std::map<std::string, tensor>> adapters_;
@@ -266,7 +275,7 @@ public:
     const modelfile::blueprint& blueprint() const { return m_->blueprint(); }
     const json::value& manifest() const { return m_->manifest(); }
     const modelfile::reader& file() const { return m_->file(); }
-    const modelfile::bpe_tokenizer* tokenizer() const { return m_->tokenizer(); }
+    const modelfile::tokenizer* tokenizer() const { return m_->tokenizer(); }
     i64 vocab() const { return m_->vocab(); }
     i64 position() const { return pos_; }
     i64 context() const { return st_.capacity; }

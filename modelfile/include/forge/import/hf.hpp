@@ -3,6 +3,7 @@
 #include <forge/import/safetensors.hpp>
 #include <forge/import/hf_quant.hpp>
 #include <forge/import/quant_recipe.hpp>
+#include <forge/import/tokenizer_import.hpp>
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
 #include <forge/security/enforce.hpp>
@@ -601,11 +602,19 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
                      {"template", tname}, {"codec", opt.codec}, {"session", bp.session},
                      {"bos_token_id", cfg.num_or("bos_token_id", -1)}, {"eos_token_id", cfg.num_or("eos_token_id", -1)},
                      {"max_position_embeddings", cfg.num_or("max_position_embeddings", 2048)}};
-    // tokenizer_config.json's add_bos_token decides whether prompts start with BOS (absent: the old default, BOS added).
+    // tokenizer_config.json's add_bos_token decides whether prompts start with BOS (absent: the old default, BOS added);
+    // add_eos_token likewise for a trailing EOS. Its chat template (or chat_template.jinja, which newer checkpoints
+    // carry instead) becomes the "chat_template" section.
+    json::value tok_cfg;
+    std::string chat_tpl;
     if (std::filesystem::exists(dir / "tokenizer_config.json")) {
-        auto tc = json::parse(read_file(dir / "tokenizer_config.json"));
-        if (auto* ab = tc.find("add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
+        tok_cfg = json::parse(read_file(dir / "tokenizer_config.json"));
+        if (auto* ab = tok_cfg.find("add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
+        if (auto* ae = tok_cfg.find("add_eos_token"); ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
+        chat_tpl = chat_template_of(tok_cfg);
     }
+    if (std::filesystem::exists(dir / "chat_template.jinja")) chat_tpl = read_file(dir / "chat_template.jinja");
+    else if (chat_tpl.empty() && std::filesystem::exists(dir / "chat_template.json")) chat_tpl = chat_template_of(json::parse(read_file(dir / "chat_template.json")));
     if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     auto lic = hf_license(dir);   // README.md front matter + LICENSE* files: manifest fields and the `license` section
     lic.store(man, w); rep.license = lic.summary();
@@ -620,7 +629,11 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
+    // tokenizer.json as it is; without one, a SentencePiece model (tokenizer.model, ...) is converted
     if (std::filesystem::exists(dir / "tokenizer.json")) w.set_section("tokenizer", read_file(dir / "tokenizer.json"));
+    else for (auto* spm : {"tokenizer.model", "spiece.model", "sentencepiece.bpe.model"})
+        if (std::filesystem::exists(dir / spm)) { w.set_section("tokenizer", sentencepiece_tokenizer_json(read_file(dir / spm), &tok_cfg)); break; }
+    if (!chat_tpl.empty()) w.set_section("chat_template", chat_tpl);
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

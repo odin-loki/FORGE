@@ -420,18 +420,14 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         }
     check_template_tensors(path, tname, bp, w.entries(), opt);
 
-    // tokenizer.json synthesised from the GGUF vocabulary (gpt2-style byte-level BPE)
-    auto model = g.get("tokenizer.ggml.model") ? g.need("tokenizer.ggml.model").str() : std::string("gpt2");
-    if (model == "gpt2") {
-        json::object vocab; json::array added;
-        const json::array* types = g.get("tokenizer.ggml.token_type") ? &g.need("tokenizer.ggml.token_type").arr() : nullptr;
-        for (std::size_t i = 0; i < toks.size(); ++i) {
-            vocab.emplace_back(toks[i].str(), double(i));
-            if (types && (*types)[i].num() == 3) added.push_back(json::object{{"id", double(i)}, {"content", toks[i].str()}});
-        }
-        json::array merges; if (auto* m = g.get("tokenizer.ggml.merges")) merges = m->arr();
-        json::object tj{{"added_tokens", added}, {"model", json::object{{"type", "BPE"}, {"vocab", vocab}, {"merges", merges}}}};
-        w.set_section("tokenizer", json::dump(json::value(tj)));
+    // tokenizer.json synthesised from the GGUF vocabulary (tokenizer_import.hpp): tokenizer.ggml.model gpt2 (byte-level
+    // BPE split by the tokenizer.ggml.pre regex), llama (SentencePiece BPE), t5 (Unigram), bert (WordPiece), with the
+    // token types as added tokens. The chat template gets its own section.
+    {
+        std::string warn;
+        if (auto tj = gguf_tokenizer_json(g, &warn); !tj.empty()) w.set_section("tokenizer", tj);
+        if (!warn.empty()) std::fprintf(stderr, "warning: %s: %s\n", path.c_str(), warn.c_str());
+        if (auto* ct = g.get("tokenizer.chat_template"); ct && ct->is_str() && !ct->str().empty()) w.set_section("chat_template", ct->str());
     }
     auto num_or = [&](const char* k, double d) { auto* v = g.get(k); return v ? v->num() : d; };
     json::object man{{"format", "fpk"}, {"forge_format_version", double(modelfile::format_version)}, {"architecture", arch},
@@ -440,6 +436,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
                      {"max_position_embeddings", Kor("context_length", 2048)}};
     // Whether prompts start with BOS: GGUF says so explicitly (Qwen-family files set it to false).
     if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
+    if (auto* ae = g.get("tokenizer.ggml.add_eos_token"); ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
     if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     {   // tensor types: what the GGUF stored, and what the import changed
         json::object ty; for (auto& [k, n] : seen) ty.emplace_back(k, double(n));

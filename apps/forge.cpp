@@ -419,8 +419,15 @@ int cmd_run(const args& a) {
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
     else if (a.kv.count("prompt")) {
         if (!s.tokenizer()) raise(errc::not_found, "model has no tokenizer; use --tokens");
-        prompt = s.tokenizer()->encode(a.get("prompt"));
-        if (s.tokenizer()->add_bos() && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
+        if (a.has("chat")) {   // --prompt is a user message (after an optional --system one), put through the model's chat template
+            json::array msgs;
+            if (a.kv.count("system")) msgs.push_back(json::object{{"role", "system"}, {"content", a.get("system")}});
+            msgs.push_back(json::object{{"role", "user"}, {"content", a.get("prompt")}});
+            prompt = s.tokenizer()->encode(inference::apply_chat_template(*s.shared_model(), json::value(msgs)));
+        } else {
+            prompt = s.tokenizer()->encode(a.get("prompt"));
+            if (s.tokenizer()->add_bos() && !a.has("no-bos")) prompt.insert(prompt.begin(), s.tokenizer()->bos());
+        }
     } else return usage();
     inference::sampler_config sc;
     sc.temperature = float(a.num("temp", 0)); sc.top_k = int(a.num("top-k", 0)); sc.top_p = float(a.num("top-p", 1));
@@ -1008,7 +1015,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);

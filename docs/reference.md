@@ -107,6 +107,7 @@ Every op has a float64 scalar reference that each lowering is tested against.
 | `forge_vocab_size` | `int64_t forge_vocab_size(const forge_model* m);` |  |
 | `forge_tokenize` | `int64_t forge_tokenize(const forge_model* m, const char* text, int add_bos, int32_t* out, int64_t cap);` |  |
 | `forge_detokenize` | `int64_t forge_detokenize(const forge_model* m, const int32_t* ids, int64_t n, char* out, int64_t cap);` |  |
+| `forge_chat_template_apply` | `int64_t forge_chat_template_apply(const forge_model* m, const char* messages_json, int add_generation_prompt, char* out, int64_t cap);` |  |
 | `forge_forward` | `int forge_forward(forge_model* m, const int32_t* ids, int64_t n, float* logits, int64_t cap);` |  |
 | `forge_generate` | `int64_t forge_generate(forge_model* m, const int32_t* prompt, int64_t n_prompt, int32_t max_new, const forge_sampling* s, int32_t* out, int64_t cap, forge_token_cb cb, void* user);` |  |
 | `forge_position` | `int64_t forge_position(const forge_model* m);` |  |

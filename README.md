@@ -53,8 +53,8 @@ To skip plan compilation at start-up, compile the model ahead of time ([docs/aot
 | simd | `simd/include/forge/simd` | CPU feature detection and kernel tables: scalar, AVX2, AVX-512, NEON, SVE, RVV; AMX/SME tile kernels |
 | gpu | `gpu/include/forge/gpu` | Devices, recorded graphs, parallel primitives, GPU runtimes loaded with `dlopen` |
 | graph | `graph/include/forge/graph` | Graph IR, optimisation passes, memory planning, weight and KV codecs, autodiff, remote (RPC) devices |
-| modelfile | `modelfile/include/forge/modelfile`, `modelfile/include/forge/import` | The `.fpk` container (BLAKE3, Ed25519 signing, XChaCha20-Poly1305 encryption), BPE tokenizer, importers for Hugging Face safetensors, GGUF and ONNX |
-| inference | `inference/include/forge/inference`, `inference/include/forge.h` | Sessions, samplers, continuous batching, speculative decoding, GBNF grammars, JSON Schema, LoRA, diffusion and streaming sessions, the C ABI |
+| modelfile | `modelfile/include/forge/modelfile`, `modelfile/include/forge/import` | The `.fpk` container (BLAKE3, Ed25519 signing, XChaCha20-Poly1305 encryption), tokenizers (BPE, SentencePiece, Unigram, WordPiece), importers for Hugging Face safetensors, GGUF and ONNX |
+| inference | `inference/include/forge/inference`, `inference/include/forge.h` | Sessions, samplers, chat templates, continuous batching, speculative decoding, GBNF grammars, JSON Schema, LoRA, diffusion and streaming sessions, the C ABI |
 | loadbalancer | `loadbalancer/include/forge/loadbalancer` | Load-balancing pool (7 strategies, circuit breakers, retries, backpressure) and L4/L7 proxy |
 | script | `script/include/forge/script` | The `forge script` interpreter, bytecode VM, static checker, shell emitters and AOT compiler (`forge_script`, `forge_script_rt`) |
 | support | `support/include/forge/*` | Hashing, JSON, async I/O, thread pool, caches, linear algebra, FFT/audio, vision, profiler, RNGs |
