@@ -12,8 +12,8 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 | `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
 | `FORGE_SPIN_US` | task pool | How long idle workers spin for the next `parallel_for` before sleeping (default 200; 0 = sleep at once) |
 | `FORGE_PROCESSES` | `os::process_pool` | Worker process count when the pool is created with 0 workers (default: hardware concurrency) |
-| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels (default: on when a SIMD integer table exists) |
-| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`, `avx2`, `avxvnni`, `avx512vnni` |
+| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels. Default: on for x86 with a SIMD integer table; off on AArch64 (NEON / dotprod / SVE tables exist, `=1` opts in: never timed on hardware) and on every other architecture (scalar table only) |
+| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`; x86 `avx2`, `avxvnni`, `avx512vnni`; AArch64 `neon`, `dotprod`, `sve` (ignored when the CPU cannot run it) |
 | `FORGE_QI8_PF` | quantised matmul (CPU) | Software prefetch distance of the integer kernels in bytes (default 2048, 0 = off) |
 | `FORGE_QDOT=0` | quantised matmul (CPU) | Use the plain scalar decode + dot path instead of the SIMD one (benchmarking, bisecting) |
 
