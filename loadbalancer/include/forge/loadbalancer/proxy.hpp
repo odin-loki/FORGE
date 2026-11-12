@@ -58,9 +58,9 @@ public:
     }
     void stop() {
         if (!running_.exchange(false)) return;
-        lis_.close(); acceptor_.join();
-        std::list<conn> cs; std::list<std::atomic<bool>*> ds; { std::lock_guard g(m_); cs.swap(conns_); ds.swap(done_); }
-        for (auto& c : cs) c.client->shutdown_both();
+        acceptor_.join(); lis_.close();   // the acceptor polls lis_ (100 ms slices): join it before closing the descriptor
+        // A connection thread closes its client socket under m_, so the shutdown is done under m_ too.
+        std::list<conn> cs; std::list<std::atomic<bool>*> ds; { std::lock_guard g(m_); cs.swap(conns_); ds.swap(done_); for (auto& c : cs) c.client->shutdown_both(); }
         for (auto& c : cs) c.t.join();
         for (auto* d : ds) delete d;
     }
@@ -82,7 +82,7 @@ private:
             auto& slot = conns_.back();
             auto* done = new std::atomic<bool>(false);
             done_.push_back(done);
-            slot.t = os::thread([this, cs, done] { if (cfg_.mode == proxy_config::l4) serve_l4_(*cs); else serve_l7_(*cs); cs->close(); *done = true; }, "forge-proxy-c");
+            slot.t = os::thread([this, cs, done] { if (cfg_.mode == proxy_config::l4) serve_l4_(*cs); else serve_l7_(*cs); { std::lock_guard g2(m_); cs->close(); } *done = true; }, "forge-proxy-c");
         }
     }
     void reap_() {   // join finished connection threads (called with m_ held)
