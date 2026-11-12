@@ -4,6 +4,7 @@
 // cases; the `lockdown` child (this binary re-run with FORGE_SCRIPT_SECURITY_CHILD) applies a real lockdown and runs
 // a script under it. The forge / forge-serve / rpc-serve command lines are covered by tests/security_cli_test.py.
 #include <forge/script/script.hpp>
+#include <forge/script/check.hpp>
 #include <forge/security/security.hpp>
 #include <forge/inference/inference.hpp>
 #include <forge/modelfile/sign.hpp>
@@ -275,4 +276,174 @@ TEST(lockdown_child_runs_script_confined) {
     os::unsetenv("FORGE_SCRIPT_SECURITY_CHILD"); os::unsetenv("FORGE_TEST_ONLY");
     CHECK_MSG(r && r->exit_code == 0, "child: %s", r ? (std::to_string(r->exit_code) + ": " + r->out).c_str() : r.err.what.c_str());
     os::remove_all(d);
+}
+
+// ---------------------------------------------------------------- static capability checks through indirect calls
+// script/src/capflow.hpp: the checker follows callables (aliases, std::function, lambdas in variables, containers
+// and struct members, callbacks, virtual dispatch) and warns where a call inside a context that denies a capability
+// may reach a built-in that needs it. All of it is warning level: tests/script/indirect_calls.fs is the run-time side.
+namespace {
+// `capability` diagnostics as "line:severity:message\n"
+std::string caps_of(const std::string& src, script::check_options o = {}) {
+    std::string s;
+    for (auto& d : script::check(src, "<t>", o)) if (d.id == "capability") s += std::to_string(d.line) + ":" + (d.severity == script::diagnostic::level::error ? "error:" : "warning:") + d.message + "\n";
+    return s;
+}
+// Code placed inside forge::sandbox(<literal with fs off>, [] { ... }) after `decls`; the sandbox call is on the last line.
+std::string in_no_fs(const std::string& decls, const std::string& body) {
+    return decls + "\nforge::sandbox(std::map<std::string, bool>{{\"fs\", false}}, [] { " + body + " });\n";
+}
+bool flags(const std::string& diags, const std::string& part) { return diags.find("warning:") != std::string::npos && diags.find(part) != std::string::npos; }
+const char* kDecls =
+    "std::string helper(std::string p) { return forge::fs::read(p); }\n"          // 1
+    "std::string outer(std::string p) { return helper(p); }\n"                    // 2
+    "std::string pure(std::string p) { return p + \"!\"; }\n"                     // 3
+    "auto lam = [] { return forge::fs::read(\"x\"); };\n"                         // 4
+    "auto pure_lam = [] { return std::string(\"p\"); };\n";                       // 5
+}
+
+TEST(static_capability_indirect_forms) {
+    struct form { const char* name; std::string decls, body, expect; };
+    const std::string D = kDecls;
+    const form forms[] = {
+        {"direct qualified call", "", "forge::fs::read(\"x\");", "forge::fs::read needs the 'fs' capability (denied by the enclosing sandbox block)"},
+        {"using namespace", "using namespace forge;", "fs::read(\"x\");", "fs::read needs the 'fs' capability"},
+        {"script function", D, "helper(\"x\");", "'helper' may need the 'fs' capability (denied by the enclosing sandbox block): helper -> forge::fs::read (line 1)"},
+        {"function calling a function", D, "outer(\"x\");", "outer -> helper -> forge::fs::read (line 1)"},
+        {"alias of a built-in", "auto f = forge::fs::read;", "f(\"x\");", "'f' may be the built-in forge::fs::read"},
+        {"alias of an alias", "auto f = forge::fs::read; auto g = f;", "g(\"x\");", "'g' may be the built-in forge::fs::read"},
+        {"reference to a function", D + "auto& r = helper;", "r(\"x\");", "'r' may need the 'fs' capability"},
+        {"function pointer variable", D + "auto fp = helper;", "fp(\"x\");", "'fp' may need the 'fs' capability"},
+        {"std::function of a function", D + "std::function<std::string(std::string)> sf = helper;", "sf(\"x\");", "'sf' may need the 'fs' capability"},
+        {"std::function of a built-in", "std::function<std::string(std::string)> sf = forge::fs::read;", "sf(\"x\");", "may be the built-in forge::fs::read"},
+        {"lambda in a variable", D, "lam();", "'lam' may need the 'fs' capability (denied by the enclosing sandbox block): lambda (line 4) -> forge::fs::read (line 4)"},
+        {"lambda reassigned", D + "std::function<std::string()> cur = pure_lam; void swap_in() { cur = lam; }", "cur();", "'cur' may need the 'fs' capability"},
+        {"lambda in a vector", D + "std::vector<std::function<std::string()>> v{lam};", "v[0]();", "may need the 'fs' capability"},
+        {"lambda pushed into a vector", D + "std::vector<std::function<std::string()>> v; v.push_back(lam);", "v.at(0)();", "may need the 'fs' capability"},
+        {"vector range-for", D + "std::vector<std::function<std::string()>> v{lam};", "for (auto& f : v) f();", "'f' may need the 'fs' capability"},
+        {"lambda in a map", D + "std::map<std::string, std::function<std::string()>> t{{\"r\", lam}};", "t[\"r\"]();", "may need the 'fs' capability"},
+        {"map assigned by key", D + "std::map<std::string, std::function<std::string()>> t; t[\"r\"] = lam;", "t[\"r\"]();", "may need the 'fs' capability"},
+        {"built-in in a map", "std::map<std::string, std::function<std::string(std::string)>> t{{\"r\", forge::fs::read}};", "t[\"r\"](\"x\");", "forge::fs::read"},
+        {"struct member (aggregate)", D + "struct H { std::function<std::string()> cb; }; H h{lam};", "h.cb();", "'h.cb' may need the 'fs' capability"},
+        {"struct member (assigned)", D + "struct H { std::function<std::string()> cb; }; H h; h.cb = lam;", "h.cb();", "'h.cb' may need the 'fs' capability"},
+        {"struct member (constructor)", D + "struct H { std::function<std::string()> cb; H(std::function<std::string()> f) : cb(f) {} std::string go() { return cb(); } }; H h(lam);", "h.go();", "'h.go' may need the 'fs' capability"},
+        {"struct member (default initialiser)", "struct H { std::function<std::string()> cb = [] { return forge::fs::read(\"x\"); }; }; H h;", "h.cb();", "'h.cb' may need the 'fs' capability"},
+        {"method", "struct R { std::string get() { return forge::fs::read(\"x\"); } }; R r;", "r.get();", "'r.get' may need the 'fs' capability (denied by the enclosing sandbox block): get -> forge::fs::read (line 1)"},
+        {"method calling a method", "struct R { std::string raw() { return forge::fs::read(\"x\"); } std::string get() { return raw(); } }; R r;", "r.get();", "get -> raw -> forge::fs::read"},
+        {"virtual dispatch through a base reference",
+         "struct S { virtual std::string get() { return \"m\"; } };\nstruct F : S { std::string get() override { return forge::fs::read(\"x\"); } };\nstd::string pull(S& s) { return s.get(); }\nF f;",
+         "pull(f);", "pull -> get -> forge::fs::read (line 2)"},
+        {"virtual dispatch through shared_ptr",
+         "struct S { virtual std::string get() { return \"m\"; } };\nstruct F : S { std::string get() override { return forge::fs::read(\"x\"); } };\nstd::shared_ptr<S> s = std::make_shared<F>();",
+         "s->get();", "may need the 'fs' capability"},
+        {"static member function", "struct U { static std::string load() { return forge::fs::read(\"x\"); } };", "U::load();", "may need the 'fs' capability"},
+        {"call operator", "struct C { std::string operator()() { return forge::fs::read(\"x\"); } }; C c;", "c();", "'c' may need the 'fs' capability"},
+        {"callback argument", D + "std::string apply(std::function<std::string()> f) { return f(); }", "apply(lam);", "'apply' may need the 'fs' capability (denied by the enclosing sandbox block): apply -> its parameter 'f' -> lambda (line 4) -> forge::fs::read (line 4)"},
+        {"callback passed on", D + "std::string apply(std::function<std::string()> f) { return f(); } std::string relay(std::function<std::string()> g) { return apply(g); }", "relay(lam);", "relay -> its parameter 'g' -> lambda (line 4) -> forge::fs::read (line 4)"},
+        {"built-in as a callback argument", "std::string apply(std::function<std::string(std::string)> f) { return f(\"x\"); }", "apply(forge::fs::read);", "its parameter 'f' -> forge::fs::read"},
+        {"callback returned by a function", D + "std::function<std::string()> pick() { return lam; }", "pick()();", "may need the 'fs' capability"},
+        {"callback captured by a lambda", D + "auto wrap = [] { return lam(); };", "wrap();", "'wrap' may need the 'fs' capability"},
+        {"callable handed to a built-in", D, "std::vector<std::string> ps{\"x\"}; std::for_each(ps.begin(), ps.end(), helper);", "a callable passed to std::for_each may need the 'fs' capability"},
+        {"built-in handed to a built-in", "", "std::vector<std::string> ps{\"x\"}; std::for_each(ps.begin(), ps.end(), forge::fs::remove);", "a callable passed to std::for_each may need the 'fs' capability"},
+        {"std::bind", D + "auto b = std::bind(helper, \"x\");", "b();", "'b' may need the 'fs' capability"},
+        {"thread body defined outside", D, "std::async(lam).get();", "a callable passed to std::async may need the 'fs' capability"},
+        {"nested limit block", D, "limit {.timeout = \"5s\"} { helper(\"x\"); }", "'helper' may need the 'fs' capability"},
+        {"forward reference", "std::string early() { return late(); }\nstd::string late() { return forge::fs::read(\"x\"); }", "early();", "early -> late -> forge::fs::read (line 2)"},
+        {"recursion", "std::string walk(int n) { return n ? walk(n - 1) : forge::fs::read(\"x\"); }", "walk(3);", "walk -> forge::fs::read"},
+    };
+    for (auto& f : forms) {
+        auto src = in_no_fs(f.decls, f.body);
+        auto got = caps_of(src);
+        CHECK_MSG(flags(got, f.expect), "%s: expected a warning with \"%s\"\n--- source\n%s--- got\n%s", f.name, f.expect.c_str(), src.c_str(), got.c_str());
+        CHECK_MSG(got.find("error:") == std::string::npos, "%s: indirect findings are warnings\n%s", f.name, got.c_str());
+        // warnings never refuse a run; --strict-check does
+        if (std::string(f.name) == "script function") {
+            script::options strict; strict.strict_check = true;
+            CHECK(run(src, strict).rfind("!StaticCheckError", 0) == 0);
+            CHECK(run(src) == "!PermissionError");
+        }
+    }
+}
+
+TEST(static_capability_indirect_no_false_positives) {
+    const std::string D = kDecls;
+    const std::pair<const char*, std::pair<std::string, std::string>> clean[] = {
+        {"pure function", {D, "pure(\"x\");"}},
+        {"pure lambda", {D, "pure_lam();"}},
+        {"alias of a pure built-in", {"auto p = std::to_string;", "p(1);"}},
+        {"std::function of a pure function", {D + "std::function<std::string(std::string)> sf = pure;", "sf(\"x\");"}},
+        {"pure lambdas in a vector", {D + "std::vector<std::function<std::string()>> v{pure_lam}; v.push_back(pure_lam);", "v[0](); for (auto& f : v) f();"}},
+        {"pure lambda in a map", {D + "std::map<std::string, std::function<std::string()>> t{{\"p\", pure_lam}};", "t[\"p\"]();"}},
+        {"pure struct member", {D + "struct H { std::function<std::string()> on_pure; }; H h{pure_lam};", "h.on_pure();"}},
+        // another member of the same struct holds a capability callable: fields are tracked by name
+        {"other member of a struct", {D + "struct H { std::function<std::string()> a; std::function<std::string()> b; }; H h{lam, pure_lam};", "h.b();"}},
+        {"pure callback argument", {D + "std::string apply(std::function<std::string()> f) { return f(); }\nauto elsewhere = apply(lam);", "apply(pure_lam);"}},
+        {"pure callback passed on", {D + "std::string apply(std::function<std::string()> f) { return f(); } std::string relay(std::function<std::string()> g) { return apply(g); }\nauto elsewhere = relay(lam);", "relay(pure_lam);"}},
+        {"literal lambda callback", {D + "std::string apply(std::function<std::string()> f) { return f(); }\nauto elsewhere = apply(lam);", "apply([] { return std::string(\"q\"); });"}},
+        // the receiver's class is known, so the override in another class does not count
+        {"method of a known class", {"struct S { virtual std::string get() { return \"m\"; } };\nstruct F : S { std::string get() override { return forge::fs::read(\"x\"); } };\nS s; F f;", "s.get();"}},
+        {"same method name in an unrelated class", {"struct A { std::string get() { return forge::fs::read(\"x\"); } };\nstruct B { std::string get() { return \"b\"; } };\nB b;", "b.get();"}},
+        {"callable handed to a built-in", {D, "std::vector<std::string> ps{\"x\"}; std::for_each(ps.begin(), ps.end(), pure); std::sort(ps.begin(), ps.end(), [](auto a, auto b) { return a < b; });"}},
+        {"storing is not calling", {D, "std::vector<std::function<std::string()>> keep; keep.push_back(lam); auto copy = lam; std::println(\"{}\", keep.size());"}},
+        {"built-in methods on a container of capability callables", {D + "std::vector<std::function<std::string()>> v{lam};", "std::println(\"{} {}\", v.size(), v.empty()); v.clear();"}},
+        {"capability function that is never reached", {D, "std::println(\"{}\", pure(\"a\")); int n = 0; for (int i = 0; i < 3; ++i) n += i;"}},
+        {"other capability", {"std::string host() { return forge::net::resolve(\"localhost\"); }", "host();"}},
+        {"data from a capability call made outside", {"auto text = forge::fs::read(\"x\");", "std::println(\"{}\", text.size());"}},
+        {"recursion over pure code", {"int fact(int n) { return n < 2 ? 1 : n * fact(n - 1); }", "fact(5);"}},
+    };
+    for (auto& [name, src2] : clean) {
+        auto src = in_no_fs(src2.first, src2.second);
+        auto got = caps_of(src);
+        CHECK_MSG(got.empty(), "%s: no capability diagnostic expected\n--- source\n%s--- got\n%s", name, src.c_str(), got.c_str());
+    }
+    // nothing is denied: no capability diagnostics at all, whatever the script does
+    CHECK(caps_of(D + "helper(\"x\"); lam(); auto f = forge::fs::read; f(\"x\"); std::function<void()> u; u();").empty());
+    // the repository's own scripts stay clean (no new diagnostics on the goldens)
+    for (auto& e : fs::directory_iterator("tests/script")) if (e.path().extension() == ".fs") {
+        auto got = caps_of(slurp(e.path()));
+        CHECK_MSG(got.empty(), "%s:\n%s", e.path().string().c_str(), got.c_str());
+    }
+}
+
+TEST(static_capability_indirect_contexts) {
+    const std::string D = kDecls;
+    // every literal spelling of the sandbox options is recognised
+    for (const char* open : {"forge::sandbox(std::map<std::string, bool>{{\"fs\", false}}, [] { ", "forge::sandbox({{\"fs\", false}}, [] { ", "sandbox({{\"fs\", false}, {\"net\", false}}, [] { "}) {
+        auto got = caps_of(D + open + "helper(\"x\"); });");
+        CHECK_MSG(flags(got, "'helper' may need the 'fs' capability"), "%s\n%s", open, got.c_str());
+    }
+    // options that are not a literal, or that leave the capability on, say nothing
+    CHECK(caps_of(D + "const std::map<std::string, bool> o{{\"fs\", false}}; forge::sandbox(o, [] { helper(\"x\"); });").empty());
+    CHECK(caps_of(D + "forge::sandbox({{\"fs\", true}, {\"net\", false}}, [] { helper(\"x\"); });").empty());
+    // the block is a named function instead of a literal lambda
+    CHECK(flags(caps_of(D + "void work() { helper(\"x\"); }\nforge::sandbox({{\"fs\", false}}, work);"), "a callable passed to forge::sandbox may need the 'fs' capability (denied by this sandbox block): work -> helper -> forge::fs::read (line 1)"));
+    CHECK(caps_of(D + "void work() { pure(\"x\"); }\nforge::sandbox({{\"fs\", false}}, work);").empty());
+    // nested blocks add up; a nested block cannot turn a capability back on
+    CHECK(flags(caps_of(D + "std::string host() { return forge::net::resolve(\"h\"); }\nforge::sandbox({{\"fs\", false}}, [] { forge::sandbox({{\"net\", false}, {\"fs\", true}}, [] { helper(\"x\"); host(); }); });"), "'host' may need the 'net' capability"));
+    CHECK(flags(caps_of(D + "forge::sandbox({{\"fs\", false}}, [] { forge::sandbox({{\"fs\", true}}, [] { helper(\"x\"); }); });"), "'helper' may need the 'fs' capability"));
+    // each capability: proc (shell call, run), net, env
+    CHECK(flags(caps_of("void sh_it() { forge::sh(\"echo hi\"); }\nforge::sandbox({{\"proc\", false}}, [] { sh_it(); });"), "sh_it -> forge::sh (line 1)"));
+    CHECK(flags(caps_of("void go() { forge::run(\"ls\"); }\nforge::sandbox({{\"proc\", false}}, [] { go(); });"), "'go' may need the 'proc' capability"));
+    CHECK(flags(caps_of("auto e = [] { return std::getenv(\"HOME\"); };\nforge::sandbox({{\"env\", false}}, [] { e(); });"), "'e' may need the 'env' capability"));
+    CHECK(flags(caps_of("auto r = forge::net::resolve;\nforge::sandbox({{\"net\", false}}, [] { r(\"h\"); });"), "'r' may be the built-in forge::net::resolve"));
+
+    // capabilities denied for the whole run (--no-fs): a built-in reached through a value is flagged at the call;
+    // script functions are not flagged at their call sites, because the place that uses the built-in is
+    script::check_options no_fs; no_fs.allow_fs = false;
+    auto run_level = caps_of(D + "auto f = forge::fs::read;\nvoid use(std::function<std::string(std::string)> g) { g(\"x\"); }\nuse(f);\nhelper(\"y\");", no_fs);
+    CHECK_MSG(flags(run_level, "1:warning:forge::fs::read needs the 'fs' capability (denied by this run)"), "%s", run_level.c_str());
+    CHECK_MSG(flags(run_level, "7:warning:'g' may be the built-in forge::fs::read, which needs the 'fs' capability (denied by this run)"), "%s", run_level.c_str());
+    CHECK_MSG(run_level.find("'helper' may need") == std::string::npos && run_level.find("'use' may need") == std::string::npos, "%s", run_level.c_str());
+    // the direct lib.fn spelling stays an error and is not reported twice
+    auto dotted = caps_of("fs.read(\"x\");", no_fs);
+    CHECK_MSG(dotted == "1:error:fs.read needs the 'fs' capability, which this run denies (raises PermissionError)\n", "%s", dotted.c_str());
+
+    // an unresolved callee: it may be any address-taken function
+    const std::string unk = "std::function<std::string()> saved = lam;\nstd::string fire(std::function<std::string()> cb) { return cb(); }\n";   // nobody calls fire()
+    auto u1 = caps_of(D + unk + "forge::sandbox({{\"fs\", false}}, [] { auto f = eval(\"lam\"); f(); });");
+    CHECK_MSG(flags(u1, "the target of 'f' cannot be resolved; it may be any function whose address is taken, and one of them needs the 'fs' capability"), "%s", u1.c_str());
+    // ... and says nothing when no address-taken function needs the capability
+    CHECK(caps_of("auto p = [] { return 1; };\nforge::sandbox({{\"fs\", false}}, [] { auto f = eval(\"p\"); f(); });").empty());
+    // suppression comments work as for every other check
+    CHECK(caps_of(D + "forge::sandbox({{\"fs\", false}}, [] {\n    helper(\"x\");   // forge-check: ignore[capability]\n});").empty());
 }

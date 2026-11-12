@@ -18,7 +18,7 @@ security and status docs:
 | macOS only cross-linked; iOS never built; Windows event log sink and dynlib Windows/Apple code never compiled | All built in CI; `test_log` and `test_os_dynlib` pass on macOS and Windows. iOS is build-only. |
 | CUDA/HIP/OpenCL/Level Zero/Metal never on hardware | CUDA ran on an RTX 3090; Metal passes on the GitHub macOS runner. HIP, OpenCL, Level Zero still mock-only. |
 | CI workflow must be moved by hand | It is at `.github/workflows/ci.yml`. |
-| Keystore fallback (implied encrypted) | The file fallback is XOR-padded, not encrypted. |
+| Keystore fallback (implied encrypted) | The file fallback is XOR-padded, not encrypted. (True at ccc0a7d; replaced the next day, in 0b76e23, by XChaCha20-Poly1305 under a store key file. See [security.md](security.md).) |
 
 ## 2026-10-31: audit on branch docs-verified (base 5940593), merged in PR #12
 
@@ -31,7 +31,7 @@ False claims found and fixed then:
 |---|---|---|
 | Scripts sandboxed "using sandbox.hpp" | No OS sandbox in script/src | Now true: `engine.cpp` applies it for `--no-fs/--no-net/--no-proc` (PR #27). |
 | `.fsc` bytecode cache | Absent | Now exists. |
-| `--mem-limit` for scripts | Absent | Still absent; `forge script` has `--timeout`, `--max-steps`, `--heap`. |
+| `--mem-limit` for scripts | Absent | Still absent on 2026-11-04. Added 2026-11-12: `forge script --mem-limit SIZE` (`options::mem_limit_bytes`); what it bounds is in docs/scripting.md "Resource limits". |
 | `limit {mem: "2G", ...}` block syntax | Absent | Now exists (`limit {...} { body }`, size/duration strings). |
 | Recursion depth default 10 000 | It was 800 | See `script/src/interp.hpp` `Limits`. |
 | Allocation, handle and child-count limits | Absent | Now exist (`allocs`, `handles`, `procs`). |
@@ -45,3 +45,12 @@ A second pass re-derived the changed sentences from source and found 5 more erro
 lazy REPL compilation wrongly marked false, goldens, fuzz target, `forge::limit` test). Claims verified then
 included: capability checks raise `PermissionError`; AI code needs confirmation; plugins are refused in
 sandboxed runs; remote scripts need auth; `.fpk` Ed25519 signing.
+
+## 2026-11-12: script memory limit and indirect capability checks
+
+| Claim | Finding | Status |
+|---|---|---|
+| security.md: "Static capability checks miss indirect calls" | True, and wider than stated: the error-level check saw only the `lib.fn(...)` spelling, so `forge::fs::read(p)` and a `forge::sandbox(std::map<std::string, bool>{{"fs", false}}, ...)` literal were not seen either | `script/src/capflow.hpp` follows callables and reports warnings (docs/scripting.md "Static checks", *Indirect calls*); the error-level check is unchanged. |
+| security.md: "Nested non-isolated `sandbox` blocks are interpreter-checked only" | True and inherent: every OS mechanism is one-way for the process | Behaviour kept; the docs now say why. |
+| security.md: "`sandbox({isolate: true})` ... unavailable on Windows" | True | Not changed; a re-spawn design is noted under Known gaps. |
+| scripting.md: only `limit-option` has a dedicated checker test | Was true | The indirect `capability` warnings now have tests too. |

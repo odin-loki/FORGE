@@ -29,15 +29,27 @@ When `--no-fs`, `--no-net` or `--no-proc` is given, the engine also applies the 
 
 `sandbox({..., isolate: true}, fn)` runs the block in a forked child under the narrower OS sandbox and returns
 its result as JSON (`builtins.cpp`). Without `fork()` (Windows) it raises `PermissionError` and does not run
-the block. Plain nested `sandbox` blocks are interpreter-checked only.
+the block. Plain nested `sandbox` blocks are interpreter-checked only: seccomp, Landlock, Capsicum, pledge,
+`sandbox_init` and the Windows job object can only be tightened for the rest of the process (or thread), so a
+narrower OS policy applied on entry could not be lifted when the block returns and would outlast it.
 
 ### Static capability checks
 
 Before a run, the static checker (docs/scripting.md "Static checks", `script/src/check.cpp`) reports direct calls
 to `fs`, `net`, `proc`, `service` or environment built-ins, `run()` and shell blocks that the run's capabilities
 or an enclosing literal `sandbox({...}, fn)` deny. They are errors, so the script is refused before it starts.
-Indirect calls (a built-in in a variable, `eval`, imported modules) are not seen; the runtime checks remain the
-enforcement.
+The errors cover the `lib.fn(...)` spelling (`fs.read(p)`), `run(...)` and shell blocks.
+
+Indirect calls are followed by a second pass (`script/src/capflow.hpp`; docs/scripting.md "Static checks",
+*Indirect calls*): function references, lambdas in variables, containers and struct members, `std::function`,
+callbacks passed as arguments or to built-ins, methods through virtual dispatch, aliases
+(`auto f = forge::fs::read;`) and the qualified spellings (`forge::fs::read(p)`). It computes a capability summary
+per function to a fixed point over the call graph and reports a `capability` **warning** where a call in a denying
+context may reach a built-in that needs the capability; an unresolved callee counts as any address-taken function.
+Warnings show with `forge script --check` and refuse the run only with `--strict-check`. It is a may-analysis with
+documented gaps (`eval` of computed strings, imported modules, handle methods, per-field-name and per-container
+precision), so the runtime checks remain the enforcement. Tests: `static_capability_indirect_*` in
+`tests/test_script_security.cpp`, `tests/script/indirect_calls.fs`.
 
 ## OS sandbox (`os/include/forge/os/sandbox.hpp`)
 
@@ -91,9 +103,9 @@ flags and child limits still apply.
 |---|---|
 | Auth | Tokens (`--token`, `--token-file`) and Ed25519 keys (`--authorized-keys`, `--pubkey`). Tokens are compared in constant time; nonces come from the OS CSPRNG. |
 | TLS | OpenSSL, when built with it (`--tls-cert`, `--tls-key`). |
-| mTLS | `--tls-client-ca`: every client must present a certificate that chains to the CA. Needs `--tls-cert/--tls-key`. `--tls-client-map` accepts only listed certificates (`sha256:` fingerprint or `cn:`), each with `allow=` permissions; unlisted certificates are refused. With tokens or keys configured a request needs both, and gets the intersection of their permissions; with only a map, a mapped certificate authenticates device ops by itself (never scripts). |
+| mTLS | `--tls-client-ca`: every client must present a certificate that chains to the CA. Needs `--tls-cert/--tls-key`. `--tls-client-map` accepts only listed certificates (`sha256:` fingerprint, `san:dns/uri/email/ip:` subjectAltName entry or `cn:`), each with `allow=` permissions; unlisted certificates are refused. `--tls-crl` (PEM CRLs, checked in the handshake for the whole client chain, fail closed) and `--tls-revoked` (SHA-256 fingerprint deny-list) refuse revoked certificates; both are re-read when the files change. With tokens or keys configured a request needs both, and gets the intersection of their permissions; with only a map, a mapped certificate authenticates device ops by itself (never scripts). |
 | Channel binding | Over TLS only the bound methods are accepted. The binding is RFC 9266 tls-exporter on TLS 1.3 and on TLS 1.2 with extended master secret, else RFC 5929 tls-unique. A relayed or replayed auth exchange fails; a bound token never crosses the wire. |
-| Per-key and per-token permissions | authorized_keys and `--token-file` lines may start with `allow=device`, `allow=scripts` or `allow=all`. Checked per request. Unknown options are errors (with file and line; the server does not start). A line without options, or a bare `--token`, has full access. The server logs each connection's principal (token number and name, key prefix, certificate) and every denial. |
+| Per-key and per-token permissions | authorized_keys and `--token-file` lines may start with `allow=device`, `allow=scripts` or `allow=all`, or the finer `device.<op class>` and `scripts.run/fs/net/proc`, and with the limits `ops=`, `max-bytes=` and `script-timeout=`. Checked per request. Unknown options are errors (with file and line; the server does not start). A line without options, or a bare `--token`, has full access. The server logs each connection's principal (token number and name, key prefix, certificate) and every denial. |
 | Remote scripts | `rpc-serve --allow-scripts`. The server refuses to start with it and no tokens or keys. Each script runs in its own child (`forge script --rpc-child`) with a timeout (`--script-timeout`, default 60000 ms), a memory cap (`--script-mem-mb`, default 2048) and optional `--script-no-proc/-fs/-net`. On POSIX the child requires the OS sandbox; on Windows it is best-effort. RPC secrets are removed from the child's environment. |
 | No auth | Allowed for non-script RPC. On a non-loopback bind the server prints a warning. |
 
@@ -101,8 +113,9 @@ flags and child limits still apply.
 child process, sandbox and limits apply. It refuses anything but plain data (nil, bool, numbers, strings,
 lists, maps, script functions) with a `TypeError` (`script/src/remote.cpp`).
 
-Tests: `test_rpc` (auth, `allow=` for keys and tokens, config errors), `test_rpc_tls` (server verify, mTLS, client-certificate
-map, channel binding). `test_rpc_tls` runs the `openssl` CLI without a shell, so it no longer depends on a POSIX redirect.
+Tests: `test_rpc` (auth, `allow=` for keys and tokens, per-op-class and script-capability permissions, limits, SAN rule
+parsing, config errors), `test_rpc_tls` (server verify, mTLS, client-certificate map, SAN rules, CRL and deny-list
+revocation with reload, channel binding). `test_rpc_tls` runs the `openssl` CLI without a shell, so it no longer depends on a POSIX redirect.
 
 ## Model files and signing
 
@@ -177,25 +190,40 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 
 ## Known gaps
 
-- RPC: permissions are coarse (`device`, `scripts`); client-certificate rules match only the fingerprint or subject CN
-  (no SANs, no revocation list).
-- Windows: no in-process network or file-write denial; scripts there get only the job object plus the
-  interpreter checks (script `ProcessPool` workers do get an AppContainer).
-- `run_sandboxed` does not apply `deny_exec` to the target on macOS, or on Linux without Landlock. With Landlock
-  the target can still run another program by invoking the dynamic loader explicitly (`ld.so prog`), since
-  Landlock does not govern `mmap(PROT_EXEC)`.
+- RPC: no OCSP or CRL fetching (revocation is by CRL file and fingerprint list); device ops have no per-model
+  scope.
+- Windows: no in-process network denial (no unprivileged per-process filter exists; `run_sandboxed` and script
+  `ProcessPool` workers get an AppContainer). In-process file-write denial is the low integrity level
+  (2026-11-12): `%LOCALAPPDATA%Low`, volumes without ACLs (FAT / exFAT) and handles opened before the call stay
+  writable.
+- `run_sandboxed` applies `deny_exec` to the target on macOS (Seatbelt, 2026-11-12; compiled, not yet run) and on
+  Linux through a one-exec seccomp gate (5.5+) and Landlock (5.13+); the gate also refuses `ld.so prog`. A Linux
+  kernel with neither still runs the target without exec denial, and a target can always map code into its own
+  process (`mmap(PROT_EXEC)`), which stays inside the same sandbox.
 - Windows AppContainer pool workers: the ACE added to the worker image stays (it names only the FORGE profile);
   the profiles persist per user like any package profile. Some CI images refuse AppContainer profiles.
-- `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
-- Nested non-isolated `sandbox` blocks are interpreter-checked only.
-- Static capability checks miss indirect calls.
+- `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows. A re-spawn (the `ProcessPool`
+  AppContainer worker plus `forge::remote_call`'s function shipping) could run a block there, but only for blocks
+  whose captures are plain data, without the copied heap the POSIX child gets; it is not built.
+- Nested non-isolated `sandbox` blocks are interpreter-checked only. This is inherent without a separate process:
+  no OS sandbox mechanism FORGE uses can be relaxed again when the block returns (see "OS sandbox for scripts").
+- Static capability checks follow indirect calls only as warnings, and miss `eval` of computed strings, functions
+  of imported modules, methods of handles opened earlier and the `reflect` capability; direct calls are errors only
+  in the `lib.fn(...)` spelling (`forge::fs::read(p)` is a warning).
+- `forge script --mem-limit` caps the managed heap and each child everywhere, but the `forge script` process itself
+  only on Linux (`RLIMIT_AS`) and Windows (job object); the cap counts address space / committed memory, not
+  resident memory, and children are capped one by one, not as a sum.
 - Keystore file backend: unless a passphrase or the TPM wraps the store key, same-user code can read it. TPM
   sealing has no PCR policy, so it binds the key to the machine but not to a boot state, and a process running as
   the same user can still ask the TPM to unseal it.
-- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) unencrypted to disk: 0600 files created
+- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) to disk: 0600 files created
   exclusively in a private (0700 / owner-only DACL) directory, `FORGE_MEM_SPILL_DIR` or a fresh
   `<tmp>/forge-spill-<pid>-<random>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is destroyed.
-  Root / Administrators and a crash that leaves the files behind still expose them.
+  Each file is sealed with XChaCha20-Poly1305 under a random key that exists only in the server's memory (locked
+  and wiped like other keys, FSS-CRY-2), so files left by a crash cannot be decrypted, and a modified, truncated or
+  swapped file is refused and the prefix recomputed. Still exposed: the number, sizes and times of the files; the
+  key and the decrypted KV to anything that can read the process's memory (root / Administrators, a debugger, swap
+  if the key could not be locked); and everything when `FORGE_MEM_SPILL_ENCRYPT=0` turns the encryption off.
 - Key memory (FSS-CRY-2): locking is best effort (RLIMIT_MEMLOCK, working-set quota) and reported; macOS has no
   per-range core-dump exclusion and Windows excludes the pages only from WER reports, not from debuggers or
   `MiniDumpWriteDump`. The TLS private key lives in OpenSSL's memory, `model_key` (`.fpk` encryption) and the keystore

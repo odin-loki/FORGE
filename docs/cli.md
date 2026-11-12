@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -19,7 +19,7 @@ Converts a model to `.fpk`.
 
 | Option | Meaning |
 |--------|---------|
-| `--codec C` | Weight codec (default `f32`): `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`, or the mixed-precision presets `q4_k_m` / `q5_k_m` |
+| `--codec C` | Weight codec: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2 q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0`, the mixed-precision presets `q4_k_m` / `q5_k_m` (Hugging Face inputs), or `keep`. Default `f32` for plain Hugging Face checkpoints. For a GGUF file or an AWQ / GPTQ checkpoint the default is `keep`: the tensors stay in the quantisation they are stored in; another value decodes and re-quantises them and prints a double-quantisation warning ([modelfile.md](modelfile.md#gguf-tensor-types)) |
 | `--emb-codec C` | Codec for the token embedding (default `q8_0` when `--codec` is quantised, else the same as `--codec`) |
 | `--template NAME` | Blueprint template from `import/templates/`: `llama`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`. Normally chosen from the model's architecture |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
@@ -28,7 +28,7 @@ Converts a model to `.fpk`.
 | `--pure` | Mixed precision: no per-tensor rules, one codec for all |
 | `--bf16-head` | Mixed precision: keep the output head in bf16 |
 
-The mixed-precision options are documented for Hugging Face inputs. Templates are read from the source tree compiled into the binary; set `FORGE_TEMPLATES` for another directory (for example with an installed binary).
+The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
 
 ### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint]`
 Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a blueprint summary. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
@@ -51,12 +51,20 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--draft draft.fpk` | | Speculative decoding with a draft model |
 | `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
 | `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
-| `--codec C` | `f32` | Codec for on-the-fly import of non-`.fpk` inputs |
+| `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 
-Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr.
+Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr. When plans came precompiled ([`forge aot`](#forge-aot-modelfpk--o-out---aot-mode-plannative-options)) a second line says how many, how many of them ran as native code, and where they came from; `<model>` may also be a compiled model library (`model.so`).
 
 Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
+
+### `forge aot <model.fpk> [-o out] [--aot-mode plan|native] [options]`
+Compiles the model's plans ahead of time. The full description is in [aot-models.md](aot-models.md).
+
+- `--aot-mode plan` (default) stores the plans in the file's `aot` section (in place, or `-o out.fpk`), or in `<model>.fplan` with `--sidecar`. Sessions then skip plan compilation for the precompiled sequence lengths; nothing needs to be passed to `forge run`. `--list` shows the section, `--strip` removes it. A signed input needs `--key NAME.key` (sign the result) or `--drop-signature`.
+- `--aot-mode native -o model.so` also generates C++ for the plans and compiles it with the host compiler into a shared library (`--emit shared`, default), a static library (`--emit static`) or an executable (`--emit exe`) that runs the model: `./model --prompt TEXT -n 32`. `forge run model.so` loads a compiled library. `--embed-weights` puts the `.fpk` into the artefact. Compiler and target: `--cxx`, `--target`, `--simd`, `--march`, `--cxxflag`, `--sdk`, `--work`.
+- Both: `--shapes 1,8,16` (sequence lengths, default `1,2,4,8,16,32,64`), `--all-rows`, `--kv-codec f32,int8`, `--ctx N`.
+- CPU only: `--device` other than `cpu` (or `FORGE_DEVICE`) is an error. These options are flags: `--all-rows`, `--sidecar`, `--strip`, `--list`, `--embed-weights`, `--drop-signature`.
 
 ### `forge bench <model> [-p 32] [-n 32] [--warmup 1] [--codec C]` / `forge bench --gemm N`
 Measures prefill (`-p` prompt tokens) and decode (`-n` new tokens, always all of them) throughput after `--warmup` untimed runs. With `--gemm N` it instead times an N×N `gemm_nt` with each available simd table (one thread) and with `gpu::prims` (all threads).
@@ -96,12 +104,14 @@ Lends a local device to other processes as a remote `rpc:host:port` device (see 
 | `--bind ADDR` | `127.0.0.1` | Listen address. Without authentication on a non-loopback address it prints a warning |
 | `--device D` | `cpu` | Device to serve (`FORGE_DEVICE` syntax); falls back to the CPU if unavailable |
 | `--token T` | | Accept this bearer token, full access (repeatable); `--token 'allow=device T'` limits it |
-| `--token-file F` | | One token per line: `[allow=device,scripts] <token> [name]`; a line without `allow=` has full access (repeatable) |
-| `--authorized-keys FILE` | | One key per line: `[allow=device,scripts] <64-hex key> [comment]`; a line without `allow=` has full access (repeatable) |
+| `--token-file F` | | One token per line: `[allow=PERM,...] [ops=...] [max-bytes=N] [script-timeout=MS] <token> [name]`; a line without `allow=` has full access (repeatable). Permissions: `device`, `scripts`, or finer `device.<op class>`, `scripts.run/fs/net/proc` ([rpc.md](rpc.md#authorized_keys-and-per-key-permissions)) |
+| `--authorized-keys FILE` | | One key per line: the same options, then `<64-hex key> [comment]`; a line without `allow=` has full access (repeatable) |
 | `--pubkey HEX\|FILE` | | Accept this Ed25519 public key (repeatable) |
 | `--tls-cert C --tls-key K` | | Serve TLS (needs a build with OpenSSL). Both or neither |
 | `--tls-client-ca CA.pem` | | Require a client certificate signed by this CA (mTLS); needs `--tls-cert`/`--tls-key` |
-| `--tls-client-map FILE` | | Accept only these client certificates: `[allow=...] sha256:<fingerprint>` or `cn:<name>` per line; permissions intersect with the token's or key's (repeatable) |
+| `--tls-client-map FILE` | | Accept only these client certificates: `[options] sha256:<fingerprint>`, `san:dns\|uri\|email\|ip:<value>` or `cn:<name>` per line; permissions intersect with the token's or key's (repeatable) |
+| `--tls-crl PEM` | | Refuse client certificates revoked by these CRLs (repeatable; needs `--tls-client-ca`; re-read when the file changes) |
+| `--tls-revoked SHA256\|FILE` | | Refuse the client certificate with this SHA-256 fingerprint, or those listed in a file (repeatable; needs `--tls-client-ca`; files are re-read when they change) |
 | `--quiet` | off | No security log on stderr |
 | `--allow-scripts` | off | Run scripts sent by authenticated clients |
 | `--script-timeout MS` | 60000 | Upper limit per script |
@@ -127,6 +137,7 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 | `--tree` | Tree-walking interpreter only (default: compile to verified bytecode) |
 | `--debug` | Race detector, lock-order and stall deadlock detection |
 | `--timeout MS`, `--max-steps N`, `--heap BYTES` | Wall-clock limit, instruction budget, managed heap cap |
+| `--mem-limit SIZE` | Hard memory cap (`512M`, `2G`, bytes): managed heap (`OutOfMemoryError`), every child process (OS cap), and on Linux and Windows the `forge script` process itself ([scripting.md](scripting.md), "Resource limits") |
 | `--no-proc`, `--no-fs`, `--no-net` | Capability sandbox |
 | `--os-sandbox off\|best-effort\|require` | How the capability flags are also enforced by the OS sandbox |
 | `--policy FILE` | Security policy: capabilities from the policy, file operations path-scoped to its roots, `lockdown()` before the script runs ([scripting.md](scripting.md), "Security policy") |

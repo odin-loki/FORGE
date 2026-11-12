@@ -233,6 +233,7 @@ std::string Interp::trace_text() const {
     return s;
 }
 ScriptError Interp::from_cpp(std::exception_ptr ep) {
+    Heap::exempt no_cap;   // the error object is built even when the heap cap is what failed
     auto mk = [&](const std::string& t, const std::string& m) { Value e = make_error(t, m); return ScriptError(e, t + ": " + m); };
     try { std::rethrow_exception(ep); }
     catch (const ScriptError& e) { return e; }

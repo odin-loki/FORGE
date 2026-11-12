@@ -508,3 +508,119 @@ TEST(registry_portable) {
     CHECK(os::is_unsupported(os::registry::get("HKCU\\Software", "x").err));
 #endif
 }
+// ---- network configuration, socket options (netinfo.hpp, sockopt.hpp) (begin)
+#include <forge/os/netinfo.hpp>
+#include <forge/os/sockopt.hpp>
+#include <forge/os/fs.hpp>
+#include <thread>
+namespace net = forge::os::net;
+TEST(netinfo_links) {
+    auto l = net::links(); CHECK(l); bool lo = false;
+    for (auto& x : l.value) {
+        std::printf("  link %s idx %u mtu %u mac '%s' type %s up %d run %d speed %llu:", x.name.c_str(), x.index, x.mtu, x.mac.c_str(), x.type.c_str(), x.up, x.running, (unsigned long long)x.speed_bps);
+        for (auto& a : x.addresses) std::printf(" %s/%d", a.ip.c_str(), a.prefix);
+        std::printf("\n"); lo |= x.loopback;
+    }
+    CHECK(lo);
+    auto r = net::default_routes(); CHECK_MSG(r || os::is_unsupported(r.err), "%d %s", r.err.code, r.err.what.c_str());
+    for (auto& x : r.value) std::printf("  gw %s via %s v%d metric %u\n", x.gateway.c_str(), x.interface_name.c_str(), x.family, x.metric);
+    auto d = net::dns_servers(); CHECK(d || os::is_unsupported(d.err));
+    for (auto& x : d.value) std::printf("  dns %s\n", x.c_str());
+    auto p = net::system_proxy(); std::printf("  proxy src %s http '%s' https '%s' nb %zu\n", p.source.c_str(), p.http.c_str(), p.https.c_str(), p.bypass.size());
+    auto m = net::network_monitor::open(); CHECK(m); if (m) { std::printf("  monitor %s\n", (*m)->backend()); auto ev = (*m)->poll(50); std::printf("  %zu events\n", ev.size()); }
+    net::network_monitor::options o; o.force_polling = true; o.poll_interval_ms = 20;
+    auto m2 = net::network_monitor::open(o); CHECK(m2); if (m2) { CHECK(std::string((*m2)->backend()) == "polling"); CHECK((*m2)->poll(60).empty()); }
+}
+namespace net = forge::os::net;
+TEST(sockopt_tcp_options) {
+    auto c = net::capabilities();
+    std::printf("  caps ipv6 %d dual %d unix %d reuseport %d tfo %d tls '%s'\n", c.ipv6, c.dual_stack, c.unix_sockets, c.reuseport, c.fastopen, c.tls.c_str());
+    auto l = os::socket::listen("127.0.0.1", 0); CHECK(l); if (!l) return;
+    auto tf = net::set_fastopen(*l); CHECK(tf || tf.err.code != 0);
+    auto s = os::socket::connect("127.0.0.1", l->local_port(), 2000); CHECK(s); if (!s) return;
+    auto k = net::set_keepalive(*s, true, 30, 5, 3); CHECK_MSG(bool(k), "%s", k.err.what.c_str());
+    CHECK(net::set_keepalive(*s, false)); CHECK(!net::set_keepalive(*s, true, 0, 1, 1));
+    CHECK(net::set_buffer_sizes(*s, 65536, 65536)); CHECK(net::set_linger(*s, 0)); CHECK(net::set_linger(*s, -1));
+    auto rp = net::set_reuseport(*s);
+#if defined(_WIN32)
+    CHECK(!rp && os::is_unsupported(rp.err));
+#else
+    CHECK(rp);
+#endif
+    auto fc = net::set_fastopen_connect(*s); CHECK(fc || fc.err.code != 0);
+    os::socket closed; CHECK(!net::set_keepalive(closed)); CHECK(!net::set_v6only(closed, true));
+}
+TEST(sockopt_dual_stack) {
+    auto c = net::capabilities(); if (!c.ipv6 || !c.dual_stack) { std::printf("  no ipv6: skipped\n"); return; }
+    auto l = net::listen_dual_stack(0); CHECK_MSG(bool(l), "%s", l.err.what.c_str()); if (!l) return;
+    int port = l->local_port(); CHECK(port > 0);
+    auto v4 = os::socket::connect("127.0.0.1", port, 2000); CHECK(v4);
+    if (v4) { auto a = l->accept(); CHECK(a); }
+    auto v6 = os::socket::connect("::1", port, 2000);
+    if (v6) { auto a = l->accept(); CHECK(a); } else std::printf("  ::1 not reachable (%s)\n", v6.err.what.c_str());
+}
+TEST(sockopt_unix_sockets) {
+    if (!net::unix_sockets_available()) { auto r = net::unix_listen("x.sock"); CHECK(!r && os::is_unsupported(r.err)); return; }
+    auto d = os::fs::make_temp_dir("fus-"); CHECK(d); if (!d) return;
+    std::string p = *d + "/s.sock";
+    auto l = net::unix_listen(p); CHECK_MSG(bool(l), "%s", l.err.what.c_str());
+    if (l) {
+        auto c = net::unix_connect(p); CHECK_MSG(bool(c), "%s", c.err.what.c_str());
+        if (c) {
+            auto a = l->accept(); CHECK(a);
+            if (a) { CHECK(c->send_all("ping", 4)); char b[4] = {}; CHECK(a->recv_all(b, 4)); CHECK(std::memcmp(b, "ping", 4) == 0); }
+        }
+        auto l2 = net::unix_listen(p); CHECK(l2);   // a stale socket file is replaced
+    }
+    CHECK(!net::unix_connect(*d + "/missing.sock"));
+    CHECK(!net::unix_listen(std::string(300, 'a')));
+    os::fs::remove_all(*d);
+}
+TEST(sockopt_udp_multicast) {
+    auto a = net::udp_bind("127.0.0.1", 0); CHECK(a); auto b = net::udp_bind("127.0.0.1", 0); CHECK(b); if (!a || !b) return;
+    auto w = net::send_to(*a, "hello", 5, "127.0.0.1", b->local_port()); CHECK(w && *w == 5);
+    auto d = net::recv_from(*b, 2000); CHECK(d); if (d) { CHECK(d->data == "hello"); CHECK(d->ip == "127.0.0.1"); CHECK(d->port == a->local_port()); }
+    auto to = net::recv_from(*b, 30); CHECK(!to && to.err.code == ETIMEDOUT);
+    CHECK(!net::udp_bind("not-an-ip", 0)); CHECK(!net::send_to(*a, "x", 1, "nope", 1));
+    auto m = net::udp_bind("0.0.0.0", 0, true); CHECK(m); if (!m) return;
+    CHECK(!net::join_multicast(*m, "10.1.2.3")); CHECK(!net::join_multicast(*m, "bogus"));
+    auto j = net::join_multicast(*m, "239.255.77.77");   // needs a multicast-capable interface: may fail in sandboxes
+    std::printf("  join 239.255.77.77: %s\n", j ? "ok" : j.err.what.c_str());
+    if (j) CHECK(net::leave_multicast(*m, "239.255.77.77"));
+    CHECK(net::set_multicast(*m, 4, 1, true)); CHECK(!net::set_multicast(*m, 4, 999, true));
+}
+TEST(sockopt_dns_messages) {
+    auto q = net::dns_encode_query("_http._tcp.local", net::dns_type::ptr, 0x1234, true); CHECK(q); if (!q) return;
+    CHECK(q->size() == 12 + 1 + 5 + 1 + 4 + 1 + 5 + 1 + 4); CHECK((unsigned char)(*q)[0] == 0x12 && (unsigned char)(*q)[q->size() - 2] == 0x80);
+    CHECK(!net::dns_encode_query(std::string(70, 'a') + ".local", 1)); CHECK(!net::dns_encode_query("a..b", 1));
+    CHECK(net::dns_encode_query("host.local.", 1));
+    // response: header, question "a.local" A, answers: a.local A 1.2.3.4 (compressed name), PTR -> a.local, TXT "k=v","x", SRV
+    std::string m("\x12\x34\x84\x00\x00\x01\x00\x04\x00\x00\x00\x00", 12);
+    m += std::string("\x01" "a" "\x05" "local" "\x00", 9); m += std::string("\x00\x01\x00\x01", 4);
+    m += std::string("\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x78\x00\x04\x01\x02\x03\x04", 16);
+    m += std::string("\x03" "ptr" "\xc0\x0e\x00\x0c\x00\x01\x00\x00\x00\x10\x00\x02\xc0\x0c", 18);
+    m += std::string("\xc0\x0c\x00\x10\x00\x01\x00\x00\x00\x10\x00\x06\x03k=v\x01x", 18);
+    m += std::string("\xc0\x0c\x00\x21\x00\x01\x00\x00\x00\x10\x00\x08\x00\x01\x00\x02\x1f\x90\xc0\x0c", 20);
+    auto r = net::dns_parse(m); CHECK_MSG(bool(r), "%s", r.err.what.c_str()); if (!r) return;
+    CHECK(r->size() == 4); if (r->size() != 4) return;
+    CHECK((*r)[0].name == "a.local" && (*r)[0].type == 1 && (*r)[0].data == "1.2.3.4" && (*r)[0].ttl == 120);
+    CHECK((*r)[1].name == "ptr.local" && (*r)[1].data == "a.local");
+    CHECK((*r)[2].data == "k=v\nx"); CHECK((*r)[3].data == "1 2 8080 a.local");
+    for (std::size_t n = 0; n < m.size(); ++n) { auto t = net::dns_parse(std::string_view(m).substr(0, n)); CHECK(!t || t->size() < 4); }   // truncation never over-reads
+    std::string loop("\x00\x00\x84\x00\x00\x00\x00\x01\x00\x00\x00\x00\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00", 24);
+    CHECK(!net::dns_parse(loop));   // a pointer to itself
+    auto live = net::mdns_query("_services._dns-sd._udp.local", net::dns_type::ptr, 150);
+    std::printf("  mdns: %s\n", live ? (std::to_string(live->size()) + " record(s)").c_str() : live.err.what.c_str());
+}
+TEST(sockopt_happy_eyeballs) {
+    auto l = os::socket::listen("127.0.0.1", 0); CHECK(l); if (!l) return;
+    std::string ip; net::connect_options o; o.timeout_ms = 3000; o.stagger_ms = 50;
+    auto c = net::connect_happy_eyeballs("localhost", l->local_port(), o, &ip);   // ::1 is refused (or absent), 127.0.0.1 wins
+    CHECK_MSG(bool(c), "%s", c.err.what.c_str());
+    if (c) { CHECK(ip == "127.0.0.1"); auto a = l->accept(); CHECK(a); if (a) { CHECK(c->send_all("x", 1)); char b = 0; CHECK(a->recv_all(&b, 1) && b == 'x'); } }
+    int port = l->local_port(); l->close();
+    auto t0 = os::monotonic_ns(); auto f = net::connect_happy_eyeballs("127.0.0.1", port, o); CHECK(!f);
+    CHECK(os::monotonic_ns() - t0 < 2500000000ull);
+    CHECK(!net::connect_happy_eyeballs("no-such-host.invalid", 80, o));
+}
+// ---- network configuration, socket options (netinfo.hpp, sockopt.hpp) (end)
