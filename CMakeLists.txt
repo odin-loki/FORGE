@@ -3,16 +3,14 @@ project(FORGE VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-# clang < 19 reports __cpp_concepts 201907L, so libstdc++ 13/14 hides std::expected (Ubuntu 24.04 clang-18 + g++-14).
-# clang 18 implements what <expected> needs; raise the macro when the plain check fails.
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
-  include(CheckCXXSourceCompiles)
-  set(CMAKE_REQUIRED_FLAGS -std=c++23)
-  check_cxx_source_compiles("#include <expected>\nint main() { std::expected<int, int> e{1}; return *e - 1; }" FORGE_STD_EXPECTED_OK)
-  if(NOT FORGE_STD_EXPECTED_OK)
-    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-Wno-builtin-macro-redefined;-U__cpp_concepts;-D__cpp_concepts=202002L>")
+# clang 18 and older are not supported (their std::expected workaround is gone). CI builds with clang 23; versions
+# 19 to 22 (zig cc, the NDK, FreeBSD's base clang) still configure, with a note.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19)
+    message(FATAL_ERROR "FORGE needs clang 23 (found ${CMAKE_CXX_COMPILER_VERSION}; 18 and older cannot build it). Install clang-23 from apt.llvm.org.")
+  elseif(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 23)
+    message(STATUS "clang ${CMAKE_CXX_COMPILER_VERSION}: FORGE is built and tested with clang 23")
   endif()
-  unset(CMAKE_REQUIRED_FLAGS)
 endif()
 # libc++ < 20 (FreeBSD 14 base clang, older Xcode) keeps std::jthread / std::stop_token behind -fexperimental-library.
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
@@ -280,8 +278,8 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CXX_COMPILER_ID MATCHES "
   find_program(FORGE_GPU_CLANG NAMES clang PATHS ${_host_llvm_bin} NO_DEFAULT_PATH)
   find_program(FORGE_LLD NAMES ld.lld lld PATHS ${_host_llvm_bin} NO_DEFAULT_PATH)
 endif()
-find_program(FORGE_GPU_CLANG NAMES clang-23 clang-22 clang-21 clang-20 clang-19 clang-18 clang)
-find_program(FORGE_LLD NAMES ld.lld ld.lld-23 ld.lld-22 ld.lld-21 ld.lld-20 ld.lld-19 ld.lld-18 lld)
+find_program(FORGE_GPU_CLANG NAMES clang-23 clang)
+find_program(FORGE_LLD NAMES ld.lld ld.lld-23 lld)
 if(NOT FORGE_LLD)
   find_program(FORGE_ZIG NAMES zig)
   if(NOT FORGE_ZIG)
@@ -315,7 +313,7 @@ if(FORGE_GPU_CLANG_IMAGES)
   endif()
 endif()
 # Level Zero wants SPIR-V: OpenCL C -> LLVM IR (clang, spir64) -> SPIR-V (llvm-spirv), when the translator exists.
-find_program(FORGE_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-19 llvm-spirv-18 llvm-spirv-20)
+find_program(FORGE_LLVM_SPIRV NAMES llvm-spirv llvm-spirv-23)
 if(FORGE_GPU_CLANG_IMAGES AND FORGE_LLVM_SPIRV)
   add_custom_command(OUTPUT ${FORGE_GPU_DIR}/kernels.spv
     COMMAND ${FORGE_GPU_CLANG} -x cl -cl-std=CL1.2 --target=spir64 -O2 -emit-llvm -c -o ${FORGE_GPU_DIR}/kernels.cl.bc ${FORGE_GPU_DIR}/kernels.cl
@@ -680,12 +678,12 @@ if(FORGE_BUILD_TESTS)
       target_include_directories(${n} PRIVATE tests)
       add_dependencies(${n} forge_test_fixture)
       target_compile_definitions(${n} PRIVATE FORGE_TEST_FIXTURE_DIR="${PROJECT_BINARY_DIR}/dynlib_fixture")
-      find_program(FORGE_FIXTURE_CLANG NAMES clang clang-23 clang-18)
+      find_program(FORGE_FIXTURE_CLANG NAMES clang clang-23)
       if(FORGE_FIXTURE_CLANG AND NOT CMAKE_CROSSCOMPILING)
-        find_program(FORGE_FIXTURE_LLD_LINK NAMES lld-link lld-link-23 lld-link-18)
-        find_program(FORGE_FIXTURE_LD64 NAMES ld64.lld ld64.lld-23 ld64.lld-18)
-        find_program(FORGE_FIXTURE_LIPO NAMES llvm-lipo llvm-lipo-23 llvm-lipo-18)
-        find_program(FORGE_FIXTURE_OBJCOPY NAMES llvm-objcopy llvm-objcopy-23 llvm-objcopy-18)
+        find_program(FORGE_FIXTURE_LLD_LINK NAMES lld-link lld-link-23)
+        find_program(FORGE_FIXTURE_LD64 NAMES ld64.lld ld64.lld-23)
+        find_program(FORGE_FIXTURE_LIPO NAMES llvm-lipo llvm-lipo-23)
+        find_program(FORGE_FIXTURE_OBJCOPY NAMES llvm-objcopy llvm-objcopy-23)
         set(_xf ${PROJECT_BINARY_DIR}/dynlib_fixture/xfmt)
         add_custom_command(OUTPUT ${_xf}/stamp
           COMMAND ${CMAKE_COMMAND} -DCLANG=${FORGE_FIXTURE_CLANG} -DLLD_LINK=${FORGE_FIXTURE_LLD_LINK} -DLD64=${FORGE_FIXTURE_LD64}
