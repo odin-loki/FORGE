@@ -71,7 +71,7 @@ Programs built by default (`FORGE_BUILD_APPS=ON`):
 ```
 core/ os/ ops/ simd/ gpu/ graph/ modelfile/ inference/ loadbalancer/ script/ support/ verify/   library layers
 apps/                  forge and forge-serve
-import/templates/      blueprint templates used by the importers (llama, mixtral, deepseek_v2, qwen3, qwen3_5)
+import/templates/      blueprint templates used by the importers (llama, qwen2, mixtral, deepseek_v2, qwen3, qwen3_5)
 python/ bindings/      Python (ctypes), Android (Kotlin + JNI) and Apple (Swift) bindings
 examples/              embedding examples (integrations/, built as example_*), script examples, a script plugin
 tests/ fuzz/           unit, differential, script and fuzz tests

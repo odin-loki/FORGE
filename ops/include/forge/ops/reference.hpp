@@ -2,6 +2,7 @@
 // Scalar reference implementations — the oracle. Clarity over speed; computed in double where it matters.
 #include <forge/core/fma.hpp>
 #include <forge/ops/op.hpp>
+#include <forge/ops/rope.hpp>
 #include <cmath>
 #include <limits>
 #include <numbers>
@@ -365,16 +366,20 @@ inline tensor slice(const tv& in, const attrs& a) {
     return o;
 }
 // x[s, h, d], pos[s]. neox=1: rotate halves (HF Llama); neox=0: interleaved pairs (GPT-J / GGUF llama).
+// Frequency scaling (scaling, factor, orig_ctx, ...): forge/ops/rope.hpp.
 inline tensor rope(const tv& in, const attrs& a) {
     const auto& x = in.at(0); const auto& pos = in.at(1);
-    double base = a.num("base", 10000.0); bool neox = a.num("neox", 1) != 0;
+    bool neox = a.num("neox", 1) != 0;
     if (x.shape.size() != 3) raise(errc::shape_mismatch, "rope expects [s,h,d]");
     i64 s = x.shape[0], h = x.shape[1], d = x.shape[2], half = d / 2;
+    if (i64(pos.data.size()) < s) raise(errc::shape_mismatch, "rope: {} positions for {} rows", pos.data.size(), s);
+    // inverse frequencies incl. the scaling variants (linear, dynamic NTK, YaRN, llama3, freq_factors): rope.hpp
+    const auto inv = rope_inv_freq(a, d, rope_seq_len(pos.data.data(), std::size_t(s)));
     tensor o(x.shape);
     for (i64 i = 0; i < s; ++i) for (i64 hh = 0; hh < h; ++hh) {
         const float* src = &x.data[std::size_t((i * h + hh) * d)]; float* dst = &o.data[std::size_t((i * h + hh) * d)];
         for (i64 j = 0; j < half; ++j) {
-            double th = double(pos.data[std::size_t(i)]) * std::pow(base, -2.0 * double(j) / double(d));
+            double th = double(pos.data[std::size_t(i)]) * inv[std::size_t(j)];
             double c = std::cos(th), sn = std::sin(th);
             i64 i0 = neox ? j : 2 * j, i1 = neox ? j + half : 2 * j + 1;
             dst[i0] = float(src[i0] * c - src[i1] * sn);

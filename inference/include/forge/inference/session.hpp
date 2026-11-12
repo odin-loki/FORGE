@@ -99,6 +99,8 @@ public:
         }
         man_ = r_.manifest();
         bp_ = modelfile::parse_blueprint(r_.section_text("blueprint"));
+        try { modelfile::check_opset(bp_); }   // before any plan is built: an opset this engine does not run
+        catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
         if (r_.has_section("tokenizer")) {
             tok_.emplace(r_.section_text("tokenizer"));
             tok_->set_special(int(man_.num_or("bos_token_id", -1)), int(man_.num_or("eos_token_id", -1)));

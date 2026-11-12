@@ -165,6 +165,7 @@ public:
     std::size_t tensor_bytes() const { return dlen_; }
     // the most recently added tensor (offset relative to the data section, which starts at file offset 64)
     const tensor_entry& last() const { if (tensors_.empty()) raise(errc::invalid_argument, "no tensor written"); return tensors_.back(); }
+    const std::vector<tensor_entry>& entries() const { return tensors_; }   // every tensor written so far, in order
     void finish() {
         json::array idx;
         for (auto& t : tensors_) {

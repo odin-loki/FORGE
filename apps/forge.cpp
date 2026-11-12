@@ -63,11 +63,13 @@ int usage() {
         "      --codec keep (default for .gguf and AWQ/GPTQ checkpoints): tensors stay in their stored quantisation; another codec re-quantises them\n"
         "      mixed precision (hf inputs): --codec q4_k_m|q5_k_m [--recipe forge|llama] [--output-tensor-type T] [--token-embedding-type T]\n"
         "      [--tensor-type REGEX=TYPE[,..]] [--pure] [--bf16-head]   (llama.cpp llama-quant.cpp rules; forge adds q6_k DeltaNet/attn_output, q8_0 head)\n"
-        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
+        "      [--allow-unused] import although source tensors are left over (default: error listing them)\n"
+        "      [--ignore-tensor NAME[,NAME..]] leftovers known to be harmless (NAME, prefix* or *suffix)\n"
+        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
-        "      [--codec C (for hf/gguf inputs)]\n"
+        "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "  aot <model.fpk> [-o out] [--aot-mode plan|native]   compile the model's plans ahead of time (docs/aot-models.md)\n"
         "      [--shapes 1,8,16 (sequence lengths; default 1,2,4,...,64)] [--all-rows] [--kv-codec f32,int8] [--ctx N]\n"
@@ -100,7 +102,7 @@ int usage() {
 }
 
 // `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
-std::string resolve_model(const std::string& path, const std::string& codec_opt) {
+std::string resolve_model(const std::string& path, const std::string& codec_opt, bool allow_unused = false) {
     namespace fs = std::filesystem;
     if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
     // `codec_opt` is --codec as given (empty when absent): Hugging Face inputs default to f32, a GGUF keeps its stored
@@ -110,6 +112,7 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt)
     const bool requant = quantised_src && !codec_opt.empty() && codec_opt != "keep";
     const std::string codec = codec_opt.empty() || codec_opt == "keep" ? "f32" : codec_opt;
     std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(modelfile::format_version)) + (requant ? "|requant" : "");
+    if (allow_unused) key += "|allow-unused";
     auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
                                                             (long long)fs::last_write_time(f).time_since_epoch().count()); };
     if (fs::is_directory(path)) { std::vector<fs::path> fl; for (auto& e : fs::directory_iterator(path)) if (e.is_regular_file()) fl.push_back(e.path());
@@ -122,6 +125,7 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt)
     fs::path out = dir / (fs::path(path).filename().string() + "-" + codec + "-" + h + ".fpk");
     if (!fs::exists(out)) {
         import::import_options o; o.codec = codec; if (requant) o.requant = codec;
+        o.allow_unused = allow_unused;
         auto tmp = out.string() + ".partial";
         auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
         fs::rename(tmp, out);
@@ -193,10 +197,20 @@ int cmd_import(const args& a) {
         auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
         tt = c == std::string::npos ? "" : tt.substr(c + 1);
     }
+    o.allow_unused = a.has("allow-unused");
+    for (std::string it = a.get("ignore-tensor"); !it.empty();) {   // NAME[,NAME...]
+        auto c = it.find(','); o.ignore_tensors.push_back(it.substr(0, c));
+        it = c == std::string::npos ? "" : it.substr(c + 1);
+    }
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     for (auto& n : r.notes) std::fprintf(stderr, "forge import: %s\n", n.c_str());
+    std::printf("license   %s\n", r.license.empty() ? "(none found in the source)" : r.license.c_str());
+    if (!r.unused.empty()) {   // only under --allow-unused: without it the import has already failed
+        std::fprintf(stderr, "warning: %zu source tensor(s) not used by the template:\n", r.unused.size());
+        for (auto& u : r.unused) std::fprintf(stderr, "  %s\n", u.c_str());
+    }
     return 0;
 }
 
@@ -209,8 +223,21 @@ int cmd_inspect(const args& a) {
     auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
     std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors\n", bp.name.c_str(), bp.opset,
                 bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size());
+    if (bp.opset < modelfile::opset_min || bp.opset > modelfile::opset_max)
+        std::printf("          opset %d is outside this engine's range %d..%d: the model will not run here\n", bp.opset, modelfile::opset_min, modelfile::opset_max);
+    {   // the model's licence as recorded at import (manifest fields + the optional `license` section)
+        const auto& m = r.manifest();
+        std::string lic = m.str_or("license", ""), ln = m.str_or("license_name", ""), ll = m.str_or("license_link", "");
+        std::string line = !lic.empty() ? lic : !ln.empty() ? ln : std::string();
+        if (!lic.empty() && !ln.empty()) line += " (" + ln + ")";
+        if (!ll.empty()) line += (line.empty() ? "" : " ") + ("<" + ll + ">");
+        if (auto* lf = m.find("license_files"); lf && lf->is_arr()) for (auto& f : lf->arr()) if (f.is_str()) line += (line.empty() ? "" : " ") + ("[" + f.str() + "]");
+        if (r.has_section("license")) line += std::format("{}text: {} bytes (--license prints it)", line.empty() ? "" : ", ", r.section_text("license").size());
+        std::printf("license   %s\n", line.empty() ? "(not recorded)" : line.c_str());
+    }
     if (a.has("tensors")) for (auto& [n, e] : r.tensors()) std::printf("  %-28s %-9s %s\n", n.c_str(), e.codec.c_str(), shape_str(e.shape).c_str());
     if (a.has("blueprint")) std::printf("%.*s\n", int(r.section_text("blueprint").size()), r.section_text("blueprint").data());
+    if (a.has("license") && r.has_section("license")) std::printf("%.*s\n", int(r.section_text("license").size()), r.section_text("license").data());
     if (a.has("verify")) {
         auto bad = r.verify();
         if (bad.empty()) std::puts("verify    ok (all sections and tensors match BLAKE3)");
@@ -342,7 +369,7 @@ int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
     activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
-    inference::session s(resolve_model(a.pos[0], a.get("codec")), so);
+    inference::session s(resolve_model(a.pos[0], a.get("codec"), a.has("allow-unused")), so);
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
@@ -937,7 +964,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);

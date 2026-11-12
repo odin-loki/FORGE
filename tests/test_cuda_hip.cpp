@@ -339,6 +339,48 @@ template<class RT> static int fusion_check(RT& rt, const std::string& api) {
 
 // The executor's fused step pairs (plan.hpp fuse_steps): residual add + rms_norm and QK-norm + rope on the device
 // against the CPU executor.
+// RoPE frequency scaling (ops/rope.hpp) on the device: the host builds the inverse-frequency table for every variant, so
+// the device result must match the scalar reference; dynamic NTK depends on the positions and runs on the CPU. Run
+// through the executor, alone and behind an rms_norm (the fused rms_rope kernel where the device has one).
+static int rope_scaling_check(graph::registry& reg, const std::string& api) {
+    using namespace graph; using ops::op;
+    const i64 S = 9, H = 4, d = 64;
+    auto rnd = [](std::size_t m, float ph) { std::vector<float> v(m); for (std::size_t i = 0; i < m; ++i) v[i] = std::sin(float(i) * 0.37f + ph); return v; };
+    std::vector<float> pos(S); for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = float(i * 5);
+    std::vector<i64> bits; for (i64 j = 0; j < d / 2; ++j) { float f = j < 8 ? 1.f : 0.25f; std::uint32_t u; std::memcpy(&u, &f, 4); bits.push_back(i64(u)); }
+    const std::vector<std::pair<const char*, ops::attrs>> vs = {
+        {"linear", {{"scaling", 1.0}, {"factor", 4.0}}},
+        {"dynamic", {{"scaling", 2.0}, {"factor", 2.0}, {"orig_ctx", 16.0}}},
+        {"yarn", {{"scaling", 3.0}, {"factor", 4.0}, {"orig_ctx", 64.0}}},
+        {"llama3", {{"scaling", 4.0}, {"factor", 8.0}, {"low_freq", 1.0}, {"high_freq", 4.0}, {"orig_ctx", 64.0}}},
+        {"freq_factors", {{"freq_factors", bits}}},
+    };
+    int fails = 0, n = 0;
+    for (auto& [name, extra] : vs) for (double neox : {1.0, 0.0}) {
+        ops::attrs a = extra; a.set("base", 10000.0); a.set("neox", neox);
+        tensor_graph g;
+        auto q = g.input("q", {S, H, d}), qw = g.input("qw", {d}), p = g.input("pos", {S});
+        g.output("r", g.apply(op::rope, {q, p}, a));
+        g.output("nr", g.apply(op::rope, {g.apply(op::rms_norm, {q, qw}, {{"eps", 1e-6}}), p}, a));
+        pass_options po; po.lowerings = &reg; auto pl = compile(g, nullptr, po); executor e(*pl);
+        auto xq = rnd(S * H * d, 4), xw = rnd(d, 5);
+        e.set_input("q", xq); e.set_input("qw", xw); e.set_input("pos", pos); e.run();
+        tensor tq({S, H, d}), tw({d}), tp({S}); tq.data = xq; tw.data = xw; tp.data = pos;
+        auto r_ref = ops::ref::rope({tq, tp}, a), nr_ref = ops::ref::rope({ops::ref::rms_norm({tq, tw}, {{"eps", 1e-6}}), tp}, a);
+        auto plain = ops::ref::rope({tq, tp}, {{"base", 10000.0}, {"neox", neox}});
+        double worst = 0, moved = 0;
+        auto r = e.output("r"), nr = e.output("nr");
+        for (std::size_t i = 0; i < r_ref.data.size(); ++i) {
+            worst = std::max({worst, std::fabs(double(r.data[i]) - r_ref.data[i]), std::fabs(double(nr.data[i]) - nr_ref.data[i])});
+            moved = std::max(moved, std::fabs(double(r_ref.data[i]) - plain.data[i]));
+        }
+        ++n;
+        if (!(worst < 1e-4) || !(moved > 1e-2)) { std::printf("FAIL %s rope scaling %s neox %g: worst abs error %.3g (reference moved %.3g from unscaled)\n", api.c_str(), name, neox, worst, moved); ++fails; }
+    }
+    std::printf("%s %d/%d %s rope scaling variants match the reference\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
 static int fusion_plan_check(graph::registry& reg, const std::string& api, const std::function<std::size_t(const char*)>& disp) {
     if (!reg.hooks || !reg.hooks->fused) return 0;
     for (auto v : {"FORGE_FUSE_ADD_NORM", "FORGE_FUSE_QK_ROPE"}) if (auto* e = std::getenv(v); e && std::string(e) == "0") return 0;
@@ -568,6 +610,7 @@ template<class RT, class Open> static int device_t(Open open) {
     fails += state_ops_check(*reg, api);
     fails += qgather_check(*reg, api);
     fails += moe_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
+    fails += rope_scaling_check(*reg, api);
     if constexpr (requires { shared->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
         fails += fusion_plan_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     return fails ? 1 : 0;
