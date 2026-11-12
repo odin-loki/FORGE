@@ -264,7 +264,7 @@ module. With an active policy:
 | `modelfile::reader` (every `.fpk` opened) | `fs_read` on the path | CAP-1 |
 | importers (`import::safetensors`, `gguf_file`, `import_hf`, `import_gguf`, `import_onnx`) | `fs_read` on inputs (`config.json`, each `.safetensors`, the `.gguf` / `.onnx`), `fs_write` on the output | CAP-1 |
 | `.fsc` script cache (`fsc::load` / `fsc::store`) | `fs_read` / `fs_write` on the cache directory; a denial is audited and the source is parsed as on a miss | CAP-1 |
-| KV spill (`mem::spill_store`, `forge-serve --kv-spill`) | `fs_write` on the directory through `os::check_access` (the gate `set_active_policy` installs; core cannot include `forge::security`); a denial throws. Always: a private directory (a fresh random one by default), 0600 files created exclusively | CAP-1, FIO-1 |
+| KV spill (`mem::spill_store`, `forge-serve --kv-spill`) | `fs_write` on the directory through `os::check_access` (the gate `set_active_policy` installs; core cannot include `forge::security`); a denial throws. Always: a private directory (a fresh random one by default), 0600 files created exclusively, each sealed with XChaCha20-Poly1305 under an in-memory key (off with `FORGE_MEM_SPILL_ENCRYPT=0`) | CAP-1, FIO-1 |
 | key and credential files | see [Private files](#private-files) | FIO-2 |
 | `forge rpc-serve` | `net_listen` on `--bind:--port`; `--allow-scripts` needs `exec` (`policy_violation` otherwise); `lockdown` after the listener is bound, before `run()`; children get `--policy <abs>` | SBX-1 |
 | `forge-serve` | policy active before the model loads; `net_listen` on `--host:--port`; `--watch` needs `exec`; `lockdown` after bind + load, before the first `accept` | SBX-1 |

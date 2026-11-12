@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Regenerate the binary seed corpus (tiny .fpk / .safetensors / .gguf / tokenizer.json). Usage: make_corpus.py <forge>"""
+"""Regenerate the binary seed corpus (tiny .fpk / .safetensors / .gguf / tokenizer.json). Usage: make_corpus.py <forge>
+(make_corpus.py --gguf-types-only rewrites only the hand-written GGUF tensor-type seeds, which need neither forge nor gguf-py)."""
 import json, os, subprocess, sys, tempfile
 import numpy as np
 from safetensors.numpy import save_file
@@ -22,11 +23,37 @@ open(os.path.join(here, "tokenizer", "tok.json"), "w").write(json.dumps(tok) + "
 # The other tokenizer seeds (one per model type and pipeline stage, a SentencePiece model behind a \x02 byte) and the
 # chat_template seeds are copies of the test fixtures: see tests/data/tokenizer and tests/data/chat_template.
 save_file({"a": np.arange(6, dtype=np.float32).reshape(2, 3), "b": np.ones(4, dtype=np.float16)}, os.path.join(here, "safetensors", "small.safetensors"))
-subprocess.run([forge, "import", d, "-o", os.path.join(here, "fpk", "tiny.fpk"), "--codec", "q8_0"], check=True, capture_output=True)
-subprocess.run([forge, "keygen", "-o", os.path.join(d, "k")], check=True, capture_output=True)
-subprocess.run([forge, "sign", os.path.join(here, "fpk", "tiny.fpk"), "--key", os.path.join(d, "k.key"), "-o", os.path.join(here, "fpk", "tiny_signed.fpk")], check=True, capture_output=True)
-import gguf
-w = gguf.GGUFWriter(os.path.join(here, "gguf", "small.gguf"), "llama")
-w.add_block_count(1); w.add_token_list(["a", "b"]); w.add_tensor("t", np.ones((2, 32), np.float32))
-w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+if forge != "--gguf-types-only":   # the seeds below need the forge binary and the gguf package
+    subprocess.run([forge, "import", d, "-o", os.path.join(here, "fpk", "tiny.fpk"), "--codec", "q8_0"], check=True, capture_output=True)
+    subprocess.run([forge, "keygen", "-o", os.path.join(d, "k")], check=True, capture_output=True)
+    subprocess.run([forge, "sign", os.path.join(here, "fpk", "tiny.fpk"), "--key", os.path.join(d, "k.key"), "-o", os.path.join(here, "fpk", "tiny_signed.fpk")], check=True, capture_output=True)
+    import gguf
+    w = gguf.GGUFWriter(os.path.join(here, "gguf", "small.gguf"), "llama")
+    w.add_block_count(1); w.add_token_list(["a", "b"]); w.add_tensor("t", np.ones((2, 32), np.float32))
+    w.write_header_to_file(); w.write_kv_data_to_file(); w.write_tensors_to_file(); w.close()
+
+# GGUF seeds for the tensor-type paths (written by hand, so malformed tables are possible): one valid block or two of
+# every loadable ggml type, then a block count that is not whole, a truncated data section, and dimensions / offsets
+# that overflow.
+import struct
+def raw_gguf(path, tensors, cut=None):
+    """tensors: [(name, ggml type, dims, offset or None, data bytes)]"""
+    b = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 0); off = 0; blob = b""
+    for name, ty, dims, o, data in tensors:
+        b += struct.pack("<Q", len(name)) + name.encode() + struct.pack("<I", len(dims)) + b"".join(struct.pack("<Q", d) for d in dims)
+        b += struct.pack("<IQ", ty, off if o is None else o)
+        blob += data + b"\0" * (-len(data) % 32); off = len(blob)
+    b += b"\0" * (-len(b) % 32) + blob
+    open(path, "wb").write(b if cut is None else b[:cut])
+BLOCKS = {0: (1, 4), 1: (1, 2), 30: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24), 8: (32, 34), 10: (256, 84), 11: (256, 110),
+          12: (256, 144), 13: (256, 176), 14: (256, 210), 15: (256, 292), 20: (32, 18), 23: (256, 136), 24: (1, 1), 25: (1, 2), 26: (1, 4),
+          27: (1, 8), 28: (1, 8), 34: (256, 54), 35: (256, 66)}
+r2 = np.random.default_rng(3)
+def blocks(ty, n): return r2.integers(0, 256, size=n // BLOCKS[ty][0] * BLOCKS[ty][1], dtype=np.uint8).tobytes()
+G = os.path.join(here, "gguf")
+raw_gguf(os.path.join(G, "types.gguf"), [(f"t{ty}", ty, [max(bs, 32), 2], None, blocks(ty, 2 * max(bs, 32))) for ty, (bs, bb) in BLOCKS.items()])
+raw_gguf(os.path.join(G, "types_cut.gguf"), [(f"t{ty}", ty, [256], None, blocks(ty, 256)) for ty in (11, 23, 34, 2)], cut=700)
+raw_gguf(os.path.join(G, "bad_blocks.gguf"), [("a", 12, [300], None, blocks(12, 512)), ("b", 2, [31, 3], None, blocks(2, 96)), ("c", 10, [256, 3], None, blocks(10, 256))])
+raw_gguf(os.path.join(G, "overflow.gguf"), [("a", 2, [1 << 40, 1 << 40, 1 << 40], None, blocks(2, 32)), ("b", 14, [256], (1 << 64) - 64, b""),
+                                            ("c", 27, [(1 << 63) + 5], None, b""), ("d", 16, [256], None, bytes(66)), ("e", 0, [1 << 61, 8], 1 << 62, b"")])
 for k in os.listdir(here): print(k, os.listdir(os.path.join(here, k)))

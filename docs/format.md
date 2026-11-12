@@ -15,7 +15,7 @@ Readers find sections through the table, so section order on disk does not matte
 
 | Name | Required | Contents |
 |------|----------|----------|
-| `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`. GGUF imports add `source: "gguf"`, `template` and the same token/position fields. Both add `add_bos` (bool) when the source says whether prompts start with BOS (GGUF `tokenizer.ggml.add_bos_token`, HF `tokenizer_config.json` `add_bos_token`); without it the tokenizer's post-processor decides if it has one, else Qwen-family models get no BOS and others do. `add_eos` (bool) likewise for a trailing EOS (`add_eos_token`). ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
+| `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`, and `source_quantisation` for AWQ / GPTQ checkpoints. GGUF imports add `source: "gguf"`, `template`, the same token/position fields, `gguf_tensor_types`, and `transcoded` / `codec` / `requantised` when the import changed a tensor's type ([modelfile.md](modelfile.md#gguf-tensor-types)). Both add `add_bos` (bool) when the source says whether prompts start with BOS (GGUF `tokenizer.ggml.add_bos_token`, HF `tokenizer_config.json` `add_bos_token`); without it the tokenizer's post-processor decides if it has one, else Qwen-family models get no BOS and others do. `add_eos` (bool) likewise for a trailing EOS (`add_eos_token`). ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
 | `blueprint` | yes | Graph text (`modelfile/blueprint.hpp`): name, opset, params, states, inputs, graph, outputs and session kind (e.g. `generative_sequence`) |
 | `tokenizer` | text models | Hugging Face style `tokenizer.json`: see [Tokenizer section](#tokenizer-section). HF imports copy it (or convert a SentencePiece `.model`); GGUF imports synthesise one from the GGUF vocabulary |
 | `chat_template` | no | The model's Jinja chat template as UTF-8 text, from `tokenizer_config.json` / `chat_template.jinja` / GGUF `tokenizer.chat_template`. Older readers ignore the section; files without it have no template |
@@ -41,6 +41,13 @@ FORGE's additions to the `tokenizer.json` vocabulary, all optional and only writ
 - `model.token_types`: one SentencePiece / GGUF type per piece (1 normal, 2 unknown, 3 control, 4 user-defined, 5 unused, 6 byte), for `SentencePieceBPE` and `Unigram`. Control, unknown and byte pieces are never produced from text; unused pieces merge but are split again.
 - `"forge_match": "longest"` on a `Precompiled` normalizer: SentencePiece's own charsmap lookup (longest rule at each position) instead of the `tokenizers` crate's.
 - Top-level `bos_id` / `eos_id` (read by version 1 too); the manifest's `bos_token_id` / `eos_token_id` take precedence in a session.
+
+## Codec names
+A tensor's codec is the `codec` string of its `tensors` entry, one of the names in `graph/codecs.hpp` ([graph.md](graph.md#weight-codecs)); there are no numeric codec ids in the file. Adding a codec adds a name and does not change `forge_format_version`:
+- a reader opens files written before the codec existed unchanged;
+- a reader that does not know a codec still opens the file, lists it (`forge inspect`) and checks its hashes and signature, and fails with `unknown codec <name>` when that tensor is loaded or a session is built on it.
+
+`q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0` (the GGUF layouts of the same names) were added after the first files were written; a file that uses them needs a FORGE build that has them.
 
 ## Hashing and signing
 - Each table entry carries the BLAKE3 hash of its section bytes as stored. Each `tensors` entry carries the hash of its (plaintext) bytes.

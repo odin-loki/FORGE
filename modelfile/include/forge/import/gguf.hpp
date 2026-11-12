@@ -1,8 +1,9 @@
 #pragma once
 #include <forge/core/mapped.hpp>
-// GGUF (v2/v3) reader and GGUF -> .fpk importer. Quantised blocks (Q8_0, Q4_K) are copied verbatim:
-// FORGE's codecs use the GGUF block layouts, so no re-quantisation error is introduced.
+// GGUF (v2/v3) reader and GGUF -> .fpk importer. Quantised blocks are copied verbatim: FORGE's codecs use the GGUF
+// block layouts (gguf_file::type_of lists them), so no re-quantisation error is introduced unless --codec asks for it.
 #include <forge/import/hf.hpp>
+#include <map>
 #include <set>
 
 namespace forge::import {
@@ -28,7 +29,9 @@ public:
                 ti.type = rd<std::uint32_t>(); ti.offset = rd<std::uint64_t>();
                 tensors_.push_back(ti);
             }
-            std::size_t align = std::size_t(get("general.alignment") ? get("general.alignment")->num() : 32);
+            double al = get("general.alignment") ? get("general.alignment")->num() : 32;
+            if (!(al >= 1 && al <= double(1u << 30))) raise(errc::format_error, "{}: bad general.alignment", path);
+            std::size_t align = std::size_t(al);
             data_ = (p_ + align - 1) / align * align;
         } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // no dtor on a throwing ctor
     }
@@ -38,16 +41,84 @@ public:
     const json::value& need(std::string_view k) const { if (auto* v = get(k)) return *v; raise(errc::not_found, "{}: missing GGUF key {}", path_, k); }
     const std::vector<tinfo>& tensors() const { return tensors_; }
     const tinfo* find(const std::string& n) const { for (auto& t : tensors_) if (t.name == n) return &t; return nullptr; }
-    static const char* codec_of(std::uint32_t t) {
-        switch (t) { case 0: return "f32"; case 1: return "f16"; case 8: return "q8_0"; case 12: return "q4_k"; case 13: return "q5_k"; case 14: return "q6_k"; case 30: return "bf16"; default: return nullptr; }
+    // ---- tensor types ----
+    // One row per ggml tensor type FORGE knows. `codec`: the FORGE weight codec with the same block layout (the
+    // blocks are stored verbatim). No codec but a block size: a plain numeric or activation type, decoded to f32 at
+    // import ("transcoded"). Neither: recognised but not loadable, with the reason.
+    struct ggml_type { std::uint32_t id; const char* name; const char* codec; std::size_t block, block_bytes; const char* why; };
+    static const ggml_type* type_of(std::uint32_t t) {
+        static const char* const grid = "its codebook grid is not part of FORGE (no table is guessed: re-export the model as IQ4_XS, Q3_K or another supported type)";
+        static const ggml_type tab[] = {
+            {0, "F32", "f32", 1, 4, nullptr}, {1, "F16", "f16", 1, 2, nullptr}, {30, "BF16", "bf16", 1, 2, nullptr},
+            {2, "Q4_0", "q4_0", 32, 18, nullptr}, {3, "Q4_1", "q4_1", 32, 20, nullptr}, {6, "Q5_0", "q5_0", 32, 22, nullptr},
+            {7, "Q5_1", "q5_1", 32, 24, nullptr}, {8, "Q8_0", "q8_0", 32, 34, nullptr},
+            {10, "Q2_K", "q2_k", 256, 84, nullptr}, {11, "Q3_K", "q3_k", 256, 110, nullptr}, {12, "Q4_K", "q4_k", 256, 144, nullptr},
+            {13, "Q5_K", "q5_k", 256, 176, nullptr}, {14, "Q6_K", "q6_k", 256, 210, nullptr},
+            {20, "IQ4_NL", "iq4_nl", 32, 18, nullptr}, {23, "IQ4_XS", "iq4_xs", 256, 136, nullptr},
+            {34, "TQ1_0", "tq1_0", 256, 54, nullptr}, {35, "TQ2_0", "tq2_0", 256, 66, nullptr},
+            // transcoded to f32
+            {15, "Q8_K", nullptr, 256, 292, nullptr}, {24, "I8", nullptr, 1, 1, nullptr}, {25, "I16", nullptr, 1, 2, nullptr},
+            {26, "I32", nullptr, 1, 4, nullptr}, {27, "I64", nullptr, 1, 8, nullptr}, {28, "F64", nullptr, 1, 8, nullptr},
+            // recognised, not loadable
+            {9, "Q8_1", nullptr, 0, 0, "it is an activation format with no reference dequantiser (and two published block sizes)"},
+            {16, "IQ2_XXS", nullptr, 0, 0, grid}, {17, "IQ2_XS", nullptr, 0, 0, grid}, {18, "IQ3_XXS", nullptr, 0, 0, grid},
+            {19, "IQ1_S", nullptr, 0, 0, grid}, {21, "IQ3_S", nullptr, 0, 0, grid}, {22, "IQ2_S", nullptr, 0, 0, grid},
+            {29, "IQ1_M", nullptr, 0, 0, grid},
+            {39, "MXFP4", nullptr, 0, 0, "ggml's MXFP4 block layout differs from FORGE's mxfp4 codec and has no importer yet"},
+        };
+        for (auto& e : tab) if (e.id == t) return &e;
+        return nullptr;
     }
+    static constexpr const char* supported_types = "F32 F16 BF16 F64 I8 I16 I32 I64 Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K Q3_K Q4_K Q5_K Q6_K Q8_K IQ4_NL IQ4_XS TQ1_0 TQ2_0";
+    // The FORGE codec a type is stored as without transcoding, or nullptr.
+    static const char* codec_of(std::uint32_t t) { auto* e = type_of(t); return e ? e->codec : nullptr; }
+    static bool loadable(std::uint32_t t) { auto* e = type_of(t); return e && e->block; }
+    static std::string type_name(std::uint32_t t) { auto* e = type_of(t); return e ? std::string(e->name) : std::format("type {}", t); }
+    // Element count, overflow-checked: no loadable type packs more than 8 elements into a byte, so a count beyond
+    // 8 x the file size cannot be backed by data.
+    std::uint64_t count(const tinfo& t) const {
+        std::uint64_t n = 1;
+        for (auto d : t.shape) if (d == 0) return 0;
+        for (auto d : t.shape) {
+            if (d < 0 || std::uint64_t(d) > std::uint64_t(size_) * 8 / n) raise(errc::format_error, "tensor {}: bad shape or out of bounds", t.name);
+            n *= std::uint64_t(d);
+        }
+        return n;
+    }
+    // The tensor's bytes in the file, bounds-checked (whole blocks of its ggml type).
     std::span<const std::uint8_t> bytes(const tinfo& t) const {
-        auto* c = codec_of(t.type);
-        if (!c) raise(errc::unsupported, "tensor {}: ggml type {} not supported (supported: F32 F16 BF16 Q8_0 Q4_K Q5_K Q6_K)", t.name, t.type);
-        for (auto d : t.shape) if (d < 0 || d > (i64(1) << 40)) raise(errc::format_error, "tensor {}: bad shape", t.name);
-        std::size_t n = graph::codecs::find(c)->bytes(std::size_t(numel(t.shape)));
-        if (t.offset > size_ || n > size_ || data_ + t.offset + n > size_) raise(errc::format_error, "tensor {} out of bounds", t.name);
-        return {map_ + data_ + t.offset, n};
+        auto* ty = type_of(t.type);
+        if (!ty) raise(errc::unsupported, "tensor {}: ggml type {} not supported (supported: {})", t.name, t.type, supported_types);
+        if (!ty->block) raise(errc::unsupported, "tensor {}: ggml type {} is not supported: {}", t.name, ty->name, ty->why);
+        std::uint64_t n = count(t);
+        if (n % ty->block) raise(errc::format_error, "tensor {}: {} elements is not a whole number of {} blocks ({} per block)", t.name, n, ty->name, ty->block);
+        std::uint64_t nb = n / ty->block * ty->block_bytes;   // n <= 8 * size_ and block_bytes <= 292: cannot overflow 64 bits
+        if (data_ > size_ || t.offset > size_ - data_ || nb > size_ - data_ - t.offset) raise(errc::format_error, "tensor {} out of bounds", t.name);
+        return {map_ + data_ + std::size_t(t.offset), std::size_t(nb)};
+    }
+    // A tensor as the importer stores it: the file's blocks under the matching FORGE codec, or, for a transcoded
+    // type, an f32 copy (`own`). I32 / I64 / F64 values round to the nearest f32; Q8_K decodes as d * q.
+    struct stored_tensor { const char* codec; std::span<const std::uint8_t> bytes; std::vector<std::uint8_t> own; const char* type; bool transcoded; };
+    stored_tensor stored(const tinfo& t) const {
+        auto b = bytes(t); auto* ty = type_of(t.type);
+        if (ty->codec) return {ty->codec, b, {}, ty->name, false};
+        std::size_t n = std::size_t(count(t));   // fits: bytes() found that many elements inside the mapping
+        stored_tensor r{"f32", {}, std::vector<std::uint8_t>(n * 4), ty->name, true};
+        auto put = [&](std::size_t i, float v) { std::memcpy(r.own.data() + 4 * i, &v, 4); };
+        auto conv = [&]<class T>(T) { for (std::size_t i = 0; i < n; ++i) { T v; std::memcpy(&v, b.data() + i * sizeof(T), sizeof(T)); put(i, float(v)); } };
+        switch (t.type) {
+            case 24: conv(std::int8_t{}); break; case 25: conv(std::int16_t{}); break; case 26: conv(std::int32_t{}); break;
+            case 27: conv(std::int64_t{}); break; case 28: conv(double{}); break;
+            case 15:   // Q8_K: { f32 d; i8 qs[256]; i16 bsums[16]; }  x = d * q
+                for (std::size_t blk = 0; blk < n / 256; ++blk) {
+                    const std::uint8_t* p = b.data() + blk * 292; float d; std::memcpy(&d, p, 4);
+                    for (std::size_t i = 0; i < 256; ++i) put(blk * 256 + i, d * float(std::int8_t(p[4 + i])));
+                }
+                break;
+            default: raise(errc::unsupported, "tensor {}: no transcoder for ggml type {}", t.name, ty->name);
+        }
+        r.bytes = r.own;
+        return r;
     }
 private:
     template <class T> T rd() { if (p_ + sizeof(T) > size_) raise(errc::format_error, "{}: truncated", path_); T v; std::memcpy(&v, map_ + p_, sizeof(T)); p_ += sizeof(T); return v; }
@@ -130,7 +201,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     }
     std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : arch == "qwen3moe" ? "qwen3_moe"
                       : arch == "qwen35moe" ? "qwen3_5_moe" : q35 ? "qwen3_5" : "llama";
-    auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), json::value(cfg));
+    auto bp_text = instantiate(read_file(template_path(tname)), json::value(cfg));
     auto bp = modelfile::parse_blueprint(bp_text);
 
     // streamed: tensors go straight from the mapped GGUF to disk, so a 20 GB model never sits in memory twice
@@ -138,12 +209,52 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     expert_index xi;
     import_report rep{arch, tname, 0, 0};
     std::set<std::string> used;
+    // ---- tensor types and codecs (docs/modelfile.md) ----
+    // --codec keep (the default): every tensor keeps its stored type. --codec C: the weight matrices are decoded and
+    // re-encoded as C (tok_emb as --emb-codec; q8_0 by default when C is quantised), which quantises an already
+    // quantised model a second time. Norms, biases, routers and the DeltaNet gate / conv tensors keep their type.
+    const std::string rq = opt.requant.empty() || opt.requant == "keep" ? std::string() : opt.requant;
+    if (is_mix_ftype(rq)) raise(errc::unsupported, "--codec {} (mixed precision) applies to Hugging Face inputs; a GGUF takes one codec or 'keep'", rq);
+    const std::string rq_emb = !opt.emb_codec.empty() ? opt.emb_codec : rq == "f32" || rq == "f16" || rq == "bf16" ? rq : std::string("q8_0");
+    if (!rq.empty() && !graph::codecs::find(rq)) raise(errc::unsupported, "unknown codec '{}'", rq);
+    if (!rq.empty() && !graph::codecs::find(rq_emb)) raise(errc::unsupported, "unknown codec '{}'", rq_emb);
+    std::map<std::string, std::size_t> seen, transcoded, requant_from;
+    std::size_t requantised = 0, double_q = 0;
+    auto fetch = [&](const gguf_file::tinfo& t) { auto s = g.stored(t); ++seen[s.type]; if (s.transcoded) ++transcoded[s.type]; return s; };
+    // the codec `dst` is re-encoded as, or empty to keep what is stored (`have`)
+    auto target = [&](const std::string& dst, const shape_t& shape, std::string_view have) -> std::string {
+        static const std::set<std::string_view> mats = {"tok_emb", "lm_head", "wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down", "w_qkv", "w_z"};
+        if (rq.empty() || shape.size() < 2 || dst.starts_with("extra.") || !mats.count(recipe_leaf(dst))) return {};
+        std::string want = dst == "tok_emb" ? rq_emb : rq;
+        if (auto* c = graph::codecs::find(want); c->block > 1 && shape.back() % i64(c->block)) {   // rows must be whole blocks
+            if (shape.back() % 32) return {};
+            want = "q8_0";
+        }
+        return want == have ? std::string() : want;
+    };
+    auto requant_note = [&](const gguf_file::stored_tensor& s, const std::string& want) {
+        ++requantised; ++requant_from[s.type];
+        bool lossy_src = graph::codecs::find(s.codec)->block > 1 || std::string_view(s.type) == "Q8_K";
+        if (lossy_src && want != "f32" && want != "f16" && want != "bf16") ++double_q;
+    };
+    // every tensor is written here: `bytes` are blocks of s.codec (s.bytes, or a permuted copy)
+    auto store = [&](const std::string& dst, const shape_t& shape, const gguf_file::stored_tensor& s, std::span<const std::uint8_t> bytes,
+                     std::size_t align = modelfile::alignment) {
+        ++rep.tensors;
+        auto want = target(dst, shape, s.codec);
+        if (want.empty()) { w.add_raw(dst, shape, s.codec, bytes, align); return; }
+        std::vector<float> x(std::size_t(numel(shape)));
+        if (graph::codecs::find(s.codec)->bytes(x.size()) != bytes.size()) raise(errc::format_error, "tensor {}: {} bytes do not match {} {}", dst, bytes.size(), s.codec, shape_str(shape));
+        graph::codecs::find(s.codec)->decode(bytes.data(), x.size(), x.data());
+        w.add_tensor(dst, shape, x, want, align);
+        requant_note(s, want);
+    };
     auto put = [&](const std::string& dst, const std::string& src) {
         used.insert(src);
         auto* t = g.find(src);
         if (!t) raise(errc::not_found, "{}: missing tensor {}", path, src);
-        w.add_raw(dst, t->shape, gguf_file::codec_of(t->type) ? gguf_file::codec_of(t->type) : "?", g.bytes(*t));
-        ++rep.tensors;
+        auto s = fetch(*t);
+        store(dst, t->shape, s, s.bytes);
     };
     auto need = [&](const std::string& src) -> const gguf_file::tinfo& {
         auto* t = g.find(src);
@@ -156,9 +267,8 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     // copy src with the rows [row0, row0 + lv_heads*rows_per_head) put back in grouped V-head order (raw blocks)
     auto put_vrows = [&](const std::string& dst, const std::string& src, i64 row0, i64 rows_per_head) {
         auto& t = need(src);
-        auto* codec = gguf_file::codec_of(t.type);
-        auto b = g.bytes(t);
-        if (!v_tiled) { w.add_raw(dst, t.shape, codec, b); ++rep.tensors; return; }
+        auto st = fetch(t); auto* codec = st.codec; auto b = st.bytes;
+        if (!v_tiled) { store(dst, t.shape, st, b); return; }
         i64 rows = t.shape.empty() ? 1 : t.shape[0], cols = t.shape.size() > 1 ? numel(t.shape) / rows : 1;
         if (t.shape.size() == 1) { rows = t.shape[0]; cols = 1; }
         auto* c = graph::codecs::find(codec);
@@ -169,23 +279,24 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         for (i64 h = 0; h < lv_heads; ++h)
             std::memcpy(o.data() + std::size_t(row0 + h * rows_per_head) * rb, b.data() + std::size_t(row0 + vhead(h) * rows_per_head) * rb,
                         rb * std::size_t(rows_per_head));
-        w.add_raw(dst, t.shape, codec, o); ++rep.tensors;
+        store(dst, t.shape, st, o);
     };
     // the out projection consumes V heads along its input (column) dimension: blocks straddle heads, so decode,
     // permute and re-encode (q8_0 for quantised sources, which keeps the extra rounding negligible)
     auto put_vcols = [&](const std::string& dst, const std::string& src) {
         auto& t = need(src);
-        auto* codec = gguf_file::codec_of(t.type);
-        if (!v_tiled) { w.add_raw(dst, t.shape, codec, g.bytes(t)); ++rep.tensors; return; }
+        auto st = fetch(t); auto* codec = st.codec;
+        if (!v_tiled) { store(dst, t.shape, st, st.bytes); return; }
         auto* c = graph::codecs::find(codec);
         if (t.shape.size() != 2 || t.shape[1] != lv_heads * lv_dim) raise(errc::shape_mismatch, "tensor {} has shape {}", src, shape_str(t.shape));
         std::size_t n = std::size_t(numel(t.shape));
         std::vector<float> x(n), y(n);
-        c->decode(g.bytes(t).data(), n, x.data());
+        c->decode(st.bytes.data(), n, x.data());
         for (i64 r = 0; r < t.shape[0]; ++r)
             for (i64 h = 0; h < lv_heads; ++h)
                 std::memcpy(&y[std::size_t(r * t.shape[1] + h * lv_dim)], &x[std::size_t(r * t.shape[1] + vhead(h) * lv_dim)], std::size_t(lv_dim) * 4);
         std::string out_codec = c->block > 1 ? "q8_0" : std::string(codec);
+        if (auto want = target(dst, t.shape, {}); !want.empty()) { out_codec = want; requant_note(st, want); }
         w.add_tensor(dst, t.shape, y, out_codec); ++rep.tensors;
     };
     // MoE FFN: the stacked *_exps tensors ([n_experts, rows, k]; one expert = a contiguous run of whole rows) are copied
@@ -198,15 +309,15 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         for (auto& pj : proj) {
             auto& t = need(P + pj[1]);
             if (t.shape.size() != 3) raise(errc::format_error, "{}: {} has shape {}", path, t.name, shape_str(t.shape));
-            w.add_raw(Q + "experts.w_" + pj[0], t.shape, gguf_file::codec_of(t.type) ? gguf_file::codec_of(t.type) : "?", g.bytes(t), modelfile::expert_alignment);
-            xi.add(w.last(), l, pj[0]); ++rep.tensors;
+            { auto s = fetch(t); store(Q + "experts.w_" + pj[0], t.shape, s, s.bytes, modelfile::expert_alignment); }
+            xi.add(w.last(), l, pj[0]);
         }
         if (g.find(P + "ffn_up_shexp.weight")) {
             put(Q + "shared.w_gate", P + "ffn_gate_shexp.weight"); put(Q + "shared.w_up", P + "ffn_up_shexp.weight");
             put(Q + "shared.w_down", P + "ffn_down_shexp.weight");
             auto& gt = need(P + "ffn_gate_inp_shexp.weight");   // [d] -> a one-row linear [1, d]
             shape_t gs = gt.shape; if (gs.size() == 1) gs = {1, gs[0]};
-            w.add_raw(Q + "shared.gate", gs, gguf_file::codec_of(gt.type) ? gguf_file::codec_of(gt.type) : "?", g.bytes(gt)); ++rep.tensors;
+            { auto s = fetch(gt); store(Q + "shared.gate", gs, s, s.bytes); }
         } else if (q35) raise(errc::not_found, "{}: layer {} has no shared expert (ffn_up_shexp)", path, l);
     };
     put("tok_emb", "token_embd.weight");
@@ -247,7 +358,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     // vision tower and multi-token-prediction heads are not part of the text model: never copied
     auto skipped = [&](const std::string& n) { return q35 && (n.starts_with("v.") || n.starts_with("mm.") || n.starts_with("mtp.")); };
     for (auto& t : g.tensors())  // keep everything else (rope freqs, extra heads, ...) addressable
-        if (!used.count(t.name) && !skipped(t.name) && gguf_file::codec_of(t.type)) { w.add_raw("extra." + t.name, t.shape, gguf_file::codec_of(t.type), g.bytes(t)); ++rep.tensors; }
+        if (!used.count(t.name) && !skipped(t.name) && gguf_file::loadable(t.type)) { auto s = fetch(t); store("extra." + t.name, t.shape, s, s.bytes); }
 
     // tokenizer.json synthesised from the GGUF vocabulary (tokenizer_import.hpp): tokenizer.ggml.model gpt2 (byte-level
     // BPE split by the tokenizer.ggml.pre regex), llama (SentencePiece BPE), t5 (Unigram), bert (WordPiece), with the
@@ -267,6 +378,26 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
     if (auto* ae = g.get("tokenizer.ggml.add_eos_token"); ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
     if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
+    {   // tensor types: what the GGUF stored, and what the import changed
+        json::object ty; for (auto& [k, n] : seen) ty.emplace_back(k, double(n));
+        man.emplace_back("gguf_tensor_types", ty);
+        if (!transcoded.empty()) {
+            json::array a;
+            for (auto& [k, n] : transcoded) {
+                a.push_back(json::object{{"from", k}, {"to", "f32"}, {"tensors", double(n)}});
+                rep.notes.push_back(std::format("transcoded {} {} tensor(s) to f32 (FORGE has no codec with that layout)", n, k));
+            }
+            man.emplace_back("transcoded", a);
+        }
+        if (!rq.empty()) {
+            json::object fr; for (auto& [k, n] : requant_from) fr.emplace_back(k, double(n));
+            man.emplace_back("codec", rq);
+            man.emplace_back("requantised", json::object{{"codec", rq}, {"emb_codec", rq_emb}, {"tensors", double(requantised)}, {"from", fr}, {"double_quantised", double(double_q)}});
+            rep.notes.push_back(std::format("re-encoded {} weight tensor(s) as {} (token embedding: {})", requantised, rq, rq_emb));
+            if (double_q) rep.notes.push_back(std::format("warning: {} tensor(s) were already quantised and have been quantised a second time: the error of both formats adds up. "
+                                                          "Import the original (unquantised) weights with --codec {} for best quality", double_q, rq));
+        }
+    }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     w.finish();
