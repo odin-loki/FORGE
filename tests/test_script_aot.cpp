@@ -33,7 +33,10 @@ const std::string& work_dir() {
     static const std::string d = [] { auto t = os::fs::make_temp_dir("forge-aot-test-"); return t ? t.value : std::string("."); }();
     return d;
 }
-struct Cleanup { ~Cleanup() { std::error_code ec; if (work_dir() != ".") fs::remove_all(work_dir(), ec); } } cleanup_at_exit;
+// The work directory goes away on every exit path of the process (normal return, failed checks, the skip exit);
+// FORGE_TEST_KEEP=1 keeps it for a post-mortem.
+void remove_work_dir() { std::error_code ec; if (work_dir() != "." && os::getenv("FORGE_TEST_KEEP").empty()) fs::remove_all(work_dir(), ec); }
+struct Cleanup { ~Cleanup() { remove_work_dir(); } } cleanup_at_exit;
 
 std::vector<std::string> compilers() {
     static const std::vector<std::string> found = [] {
@@ -82,6 +85,7 @@ int g_serial = 0;
 std::vector<std::string> g_built;
 // Delete the executables built so far (an embed-mode binary is a copy of the whole runner stub).
 void purge() { std::error_code ec; for (auto& p : g_built) fs::remove(p, ec); g_built.clear(); }
+struct PurgeAtEnd { ~PurgeAtEnd() { purge(); } };   // first line of every test: nothing built outlives the test, also when it throws
 // Compile; on refusal returns an empty path and fills *why / *exit_code.
 std::string compile(const std::string& src, const std::string& name, script::aot_mode mode, const std::string& cxx, script::aot_options o = {}, std::string* why = nullptr, int* exit_code = nullptr) {
     o.mode = mode; o.cxx = cxx; o.opt_level = "1";
@@ -146,6 +150,7 @@ const bool sweep_only = os::getenv("FORGE_AOT_SWEEP") == "full";
 
 TEST(aot_embed_sweep) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     auto files = corpus(false);
     CHECK(files.size() >= 20);
     for (auto& f : files) check_same(f, script::aot_mode::embed, "");
@@ -153,18 +158,21 @@ TEST(aot_embed_sweep) {
 
 TEST(aot_native_subset) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     if (compilers().empty()) { std::fprintf(stderr, "aot_native_subset: no host C++ compiler, native mode not tested\n"); return; }
     for (auto& f : corpus(true)) check_same(f, script::aot_mode::native, compilers().front());
 }
 
 TEST(aot_native_sweep) {
     if (!sweep_only) return;
-    if (compilers().empty()) { std::fprintf(stderr, "aot_native_sweep: no host C++ compiler found, skipping\n"); std::fflush(stderr); std::_Exit(77); }
+    PurgeAtEnd purge_at_end;
+    if (compilers().empty()) { std::fprintf(stderr, "aot_native_sweep: no host C++ compiler found, skipping\n"); std::fflush(stderr); remove_work_dir(); std::_Exit(77); }
     for (auto& cxx : compilers()) for (auto& f : corpus(false)) check_same(f, script::aot_mode::native, cxx);
 }
 
 TEST(aot_semantics_errors_and_exit_status) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     const char* bounds = "#include <vector>\nint main() {\n    std::vector<int> v{1, 2, 3};\n    std::println(\"before\");\n    int i = 7;\n    std::println(\"{}\", v.at(i));\n    return 0;\n}\n";
     const char* thrown = "struct Bad : std::runtime_error { using std::runtime_error::runtime_error; };\nvoid inner(int n) { if (n == 0) throw Bad(\"deep\"); inner(n - 1); }\nint main() { std::println(\"start\"); inner(3); return 0; }\n";
     const char* exits = "int main() { std::println(\"a\"); std::exit(41); return 1; }\n";
@@ -195,6 +203,7 @@ TEST(aot_semantics_errors_and_exit_status) {
 
 TEST(aot_semantics_limits) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     const char* spin = "int main() { std::println(\"go\"); int n = 0; while (true) { n = n + 1; if (n < 0) break; } return 0; }\n";
     const char* grow = "#include <vector>\n#include <string>\nint main() { std::vector<std::string> v; try { while (true) v.push_back(std::string(4096, 'x')); } catch (const std::bad_alloc& e) { v.clear(); std::println(\"caught oom\"); return 9; } return 0; }\n";
     const char* deep = "int down(int n) { return down(n + 1) + 1; }\nint main() { try { down(0); } catch (const std::exception& e) { std::println(\"recursion stopped\"); return 5; } return 0; }\n";
@@ -237,6 +246,7 @@ TEST(aot_semantics_limits) {
 
 TEST(aot_semantics_capabilities) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     const std::string probe = (fs::path(work_dir()) / "cap-probe.txt").generic_string();
     // Indirect calls: the static checker cannot refuse these, so the run-time check is what is being tested.
     const std::string src =
@@ -293,6 +303,7 @@ TEST(aot_semantics_capabilities) {
 // The OS sandbox is the engine's: a binary with a capability baked off confines itself at start-up.
 TEST(aot_semantics_os_sandbox) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     const char* src = "int main() { auto w = forge::fs::write; try { w(forge::args()[0], \"x\"); } catch (const std::exception& e) { std::println(\"denied\"); } return 0; }\n";
     const std::string probe = (fs::path(work_dir()) / "os-probe.txt").generic_string();
     for (auto& [mode, cxx] : modes()) {
@@ -310,6 +321,7 @@ TEST(aot_semantics_os_sandbox) {
 
 TEST(aot_semantics_plugins) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
 #ifdef FORGE_TEST_PLUGIN
     const std::string src = "int main() {\n    try { auto h = forge::plugin(forge::args()[0]); std::println(\"{}\", h.add(2, 3.5)); }\n    catch (const std::exception& e) { std::println(\"refused\"); return 3; }\n    return 0;\n}\n";
     script::options io; io.argv = {FORGE_TEST_PLUGIN};
@@ -330,6 +342,7 @@ TEST(aot_semantics_plugins) {
 
 TEST(aot_semantics_arguments_and_environment) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     const char* src = "int main() {\n    for (auto a : forge::args()) std::println(\"[{}]\", a);\n    std::println(\"{}\", args.size());\n    std::println(\"{}\", forge::os::env(\"FORGE_AOT_TEST_VALUE\", \"unset\"));\n    return args.size();\n}\n";
     for (auto& [mode, cxx] : modes()) {
         purge();
@@ -345,6 +358,7 @@ TEST(aot_semantics_arguments_and_environment) {
 
 TEST(aot_semantics_embed_integrity) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     std::string exe = compile("int main() { std::println(\"intact\"); return 0; }\n", "t.fs", script::aot_mode::embed, "");
     CHECK(!exe.empty());
     if (exe.empty()) return;
@@ -363,6 +377,7 @@ TEST(aot_semantics_embed_integrity) {
 
 TEST(aot_generated_source_is_deterministic) {
     if (sweep_only) return;
+    PurgeAtEnd purge_at_end;
     for (auto& f : corpus(false)) {
         const std::string name = f.generic_string(), src = slurp(f);
         std::string a, b;

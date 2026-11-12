@@ -30,10 +30,12 @@ void differential(std::string_view src, const std::string& how) {
     o.max_steps = 200000; o.timeout_ms = 5000; o.heap_bytes = 64u << 20;
     std::string want_out;
     forge::script::options io = o; io.out = [&](std::string_view s) { want_out += s; };
-    io.jit_threshold = 1;   // every function on the VM from its first call: native code counts steps exactly like the VM
+    if (how != "embed") io.jit_threshold = 1;   // every function on the VM from its first call: native code counts steps like the VM
     int want_code;
     { forge::script::engine e(io); want_code = e.run(src, "<fuzz>").exit_code; }
     static const std::string dir = [] { auto t = forge::os::fs::make_temp_dir("forge-fuzz-aot-"); return t ? t.value : std::string("."); }();
+    struct Cleanup { ~Cleanup() { std::error_code ec; if (dir != ".") fs::remove_all(dir, ec); } };
+    static Cleanup cleanup_at_exit;   // the directory (program, precompiled header) goes away when the fuzzer exits
     forge::script::aot_options ao; ao.run = o;
     ao.mode = how == "embed" ? forge::script::aot_mode::embed : forge::script::aot_mode::native;
     if (how != "embed") { ao.cxx = how; ao.opt_level = "0"; ao.pch_dir = (fs::path(dir) / "pch").string(); }
@@ -46,6 +48,7 @@ void differential(std::string_view src, const std::string& how) {
     if (want_code == 2) finding("AOT compiled a script the interpreter refuses", src, "");
     forge::os::spawn_spec sp; sp.argv = {exe}; sp.timeout_ms = 60000;
     auto r = forge::os::spawn_wait(sp);
+    { std::error_code ec; fs::remove(exe, ec); }
     if (!r) finding("could not run the AOT binary", src, r.err.what);
     // Step and time limits fire at slightly different points of output only if the program is cut off mid-run by
     // the wall clock; a deterministic step limit cuts both at the same statement.

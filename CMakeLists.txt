@@ -512,6 +512,13 @@ add_library(forge_script_rt STATIC ${_aot_objs})
 set_target_properties(forge_script_rt PROPERTIES LINKER_LANGUAGE CXX)
 add_executable(forge-script-run script/rt/stub_main.cpp)
 target_link_libraries(forge-script-run PRIVATE forge_script)
+# Every embed-mode executable is a copy of this stub, so it is linked without symbols and debug information whatever
+# the build type (MSVC keeps those in the .pdb already).
+if(APPLE)
+  target_link_options(forge-script-run PRIVATE -Wl,-S -Wl,-x)
+elseif(NOT MSVC)
+  target_link_options(forge-script-run PRIVATE -s)
+endif()
 # Headers a generated program includes: forge_aot_rt.hpp, the interpreter's internal headers it builds on, and the
 # core / os headers those need. Build tree: straight from the source tree. Install tree: see the install block.
 set(FORGE_AOT_RT_HEADERS script/rt/forge_aot_rt.hpp script/src/aot.hpp script/src/interp.hpp script/src/ast.hpp script/src/objects.hpp script/src/value.hpp)
