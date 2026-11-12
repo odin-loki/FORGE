@@ -890,6 +890,13 @@ TEST(emit_golden_all_shells) {
             std::string ext = (name == "pwsh" || name == "powershell") ? "ps1" : name;
             auto path = (dir / (std::string(g) + "." + ext)).string();
             { std::ofstream(path, std::ios::binary) << code; }
+#if !defined(_WIN32)
+            // The elvish emitter needs elvish 0.21+ (os:mkdir-all); Ubuntu 24.04 ships 0.20.
+            if (name == "elvish" && sh_capture("\"" + full + "\" -norc -c 'use os; put $os:mkdir-all~' >/dev/null 2>&1").second != 0) {
+                if (refused.find("elvish(older than 0.21)") == std::string::npos) refused += " */elvish(older than 0.21)";
+                continue;
+            }
+#endif
             const char* rn = runner(exe);
             std::string cmdline = rn ? std::string(rn) : "\"" + full + "\"";   // the resolved path: cmd.exe would pick System32\\bash.exe (WSL) first
             if (exe == "busybox") cmdline = "\"" + full + "\" sh";        // ash via busybox: run the binary forge found
