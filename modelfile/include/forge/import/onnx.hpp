@@ -67,7 +67,7 @@ struct tensor_t { std::string name; shape_t dims; int dtype = 0; std::vector<flo
 struct attr_t { std::string name; float f = 0; i64 i = 0; std::string s; std::vector<float> fl; std::vector<i64> il; std::optional<tensor_t> t; int type = 0; };
 struct node_t { std::string op, name, domain; std::vector<std::string> in, out; std::map<std::string, attr_t> attrs; };
 struct vinfo_t { std::string name; int elem = 0; std::vector<i64> dims; std::vector<bool> symbolic; };
-struct model_t { i64 opset = 0; std::string producer; std::vector<node_t> nodes; std::vector<tensor_t> inits; std::vector<vinfo_t> inputs, outputs; };
+struct model_t { i64 opset = 0; std::string producer, doc; std::vector<std::pair<std::string, std::string>> metadata; std::vector<node_t> nodes; std::vector<tensor_t> inits; std::vector<vinfo_t> inputs, outputs; };
 
 inline tensor_t parse_tensor(std::string_view s) {
     tensor_t t; std::string_view raw; std::vector<i64> i32;
@@ -142,7 +142,12 @@ inline model_t parse_model(std::string_view s) {
     model_t m; bool graph = false;
     each(s, [&](const field& f) {
         if (f.num == 2) m.producer = std::string(f.bytes);
-        else if (f.num == 8) {  // opset_import
+        else if (f.num == 6) m.doc = std::string(f.bytes);   // ModelProto.doc_string
+        else if (f.num == 14) {   // metadata_props: StringStringEntryProto {key = 1, value = 2}
+            std::string k, v;
+            each(f.bytes, [&](const field& e) { if (e.num == 1) k = std::string(e.bytes); else if (e.num == 2) v = std::string(e.bytes); });
+            m.metadata.emplace_back(std::move(k), std::move(v));
+        } else if (f.num == 8) {  // opset_import
             std::string dom; i64 ver = 0;
             each(f.bytes, [&](const field& o) { if (o.num == 1) dom = std::string(o.bytes); else if (o.num == 2) ver = i64(o.v); });
             if (dom.empty() || dom == "ai.onnx") m.opset = ver;
@@ -383,6 +388,19 @@ inline import_report import_onnx(const std::string& path, const std::string& out
     json::object man{{"format", "fpk"}, {"forge_format_version", double(modelfile::format_version)}, {"architecture", "onnx"},
                      {"source", "onnx"}, {"producer", m.producer}, {"onnx_opset", double(m.opset)}, {"session", bp.session},
                      {"onnx_inputs", tr.inputs}, {"onnx_outputs", tr.outputs}};
+    {   // licence: metadata_props license / licence (identifier), license_name, license_url / license_link; a
+        // doc_string that mentions a licence is kept as the licence text
+        license_info lic;
+        auto lower = [](std::string s) { for (auto& c : s) c = char(std::tolower((unsigned char)c)); return s; };
+        for (auto& [k, v] : m.metadata) {
+            auto lk = lower(k);
+            if (lk == "license" || lk == "licence") lic.id = v;
+            else if (lk == "license_name" || lk == "licence_name") lic.name = v;
+            else if (lk == "license_url" || lk == "license_link" || lk == "licence_url" || lk == "licence_link") lic.link = v;
+        }
+        if (auto ld = lower(m.doc); ld.find("license") != std::string::npos || ld.find("licence") != std::string::npos) lic.text = m.doc;
+        lic.store(man, w); rep.license = lic.summary();
+    }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", tr.blueprint);
     w.write(out);

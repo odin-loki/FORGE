@@ -20,6 +20,8 @@ tok = {"model": {"type": "BPE", "vocab": {c: i for i, c in enumerate("abcdefghij
        "added_tokens": [{"id": 1, "content": "<s>", "special": True}]}
 json.dump(tok, open(os.path.join(d, "tokenizer.json"), "w"))
 open(os.path.join(here, "tokenizer", "tok.json"), "w").write(json.dumps(tok) + "\x01abcd ab")
+# The other tokenizer seeds (one per model type and pipeline stage, a SentencePiece model behind a \x02 byte) and the
+# chat_template seeds are copies of the test fixtures: see tests/data/tokenizer and tests/data/chat_template.
 save_file({"a": np.arange(6, dtype=np.float32).reshape(2, 3), "b": np.ones(4, dtype=np.float16)}, os.path.join(here, "safetensors", "small.safetensors"))
 if forge != "--gguf-types-only":   # the seeds below need the forge binary and the gguf package
     subprocess.run([forge, "import", d, "-o", os.path.join(here, "fpk", "tiny.fpk"), "--codec", "q8_0"], check=True, capture_output=True)

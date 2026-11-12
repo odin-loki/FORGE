@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <forge/graph/codecs.hpp>
+#include <forge/gpu/determinism.hpp>
 #include <forge/graph/kernels.hpp>
 #include <forge/simd/qdot.hpp>
 #include <forge/simd/qdot_i8.hpp>
@@ -411,14 +412,16 @@ public:
         } catch (...) {}
     }
     bool pinned = false;
-    bool deterministic = true;        // CPU kernels use fixed reduction orders
+    // Determinism mode (gpu/determinism.hpp) at compile time: CPU kernels always use fixed reduction orders; when set,
+    // the device runtimes also take only order-stable paths while the mode stays on (they read it at each launch).
+    bool deterministic = gpu::deterministic();
     // Natively compiled step ranges (aot_native.hpp): native(si) runs the compiled code that starts at step si and
     // returns how many steps it covered (0 = none starts there: the executor interprets the step). CPU plans only.
     std::function<std::size_t(std::size_t)> native;
     bool aot = false;                 // instantiated from a precompiled plan (aot.hpp), not compiled here
     std::string describe() const {
-        std::string s = std::format("plan: {} nodes, {} steps, arena {} bytes (naive {}), {} in-place, {} aliases\n",
-                                    g.size(), steps.size(), mem.arena_bytes, mem.naive_bytes, mem.in_place, mem.aliases);
+        std::string s = std::format("plan: {} nodes, {} steps, arena {} bytes (naive {}), {} in-place, {} aliases{}\n",
+                                    g.size(), steps.size(), mem.arena_bytes, mem.naive_bytes, mem.in_place, mem.aliases, deterministic ? ", deterministic" : "");
         std::map<std::string, int> uses;
         for (auto& st : steps) if (st.low) uses[st.low->name]++;
         for (auto& [k, v] : uses) s += std::format("  {:<16} x{}\n", k, v);
@@ -585,7 +588,12 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
         if (n.kind == node_kind::op) {
             // state views grow at run time; only consumers that read the live length are allowed
             for (auto in : n.inputs)
-                if (G.at(in).kind == node_kind::state_append && n.op != ops::op::attention)
+                if (G.at(in).kind == node_kind::state_append && n.op == ops::op::attention_bias) {
+                    // biased / soft-capped attention reads f32 keys and values only (kernels_ext.hpp)
+                    if (st->slots[G.at(in).name].codec != kv_codec::f32)
+                        raise(errc::unsupported, "state slot '{}' feeds attention_bias: a quantised KV cache is not supported here (use the f32 KV codec)", G.at(in).name);
+                }
+                else if (G.at(in).kind == node_kind::state_append && n.op != ops::op::attention)
                     raise(errc::unsupported, "state slot '{}' feeds '{}': only attention may consume a growing state view",
                           G.at(in).name, ops::info(n.op).name);
             std::vector<shape_t> ins; for (auto in : n.inputs) ins.push_back(G.at(in).shape);
@@ -605,8 +613,9 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
             }
             if (n.op == ops::op::moe_ffn && n.inputs.size() == 5) {
                 bool dev = p->hooks && reg.device_moe;
-                for (std::size_t j = 2; j < 5; ++j) { auto& wn = G.at(n.inputs[j]);
-                    dev = dev && p->views[n.inputs[j]].qdata && std::find(reg.device_moe_codecs.begin(), reg.device_moe_codecs.end(), wn.qcodec) != reg.device_moe_codecs.end(); }
+                for (std::size_t j = 2; j < 5; ++j) { auto& wn = G.at(n.inputs[j]); auto& wv = p->views[n.inputs[j]];   // encoded, or f32 constants ("f32")
+                    const std::string cn = wv.qdata ? std::string(wn.qcodec) : ((wn.kind == node_kind::weight || wn.kind == node_kind::constant) && wv.data ? "f32" : "");
+                    dev = dev && std::find(reg.device_moe_codecs.begin(), reg.device_moe_codecs.end(), cn) != reg.device_moe_codecs.end(); }
                 p->steps.push_back({dev ? &*reg.device_moe : &qweights::moe_lowering(), n.inputs, value_id(i), at, 0});
             }
             else if (n.op == ops::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)

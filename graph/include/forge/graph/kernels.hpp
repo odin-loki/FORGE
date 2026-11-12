@@ -262,10 +262,9 @@ inline kernel_fn attention() {
 inline kernel_fn rope() {
     return [](std::span<const tensor_view> in, tensor_view out, const ops::attrs& a) {
         const auto& x = in[0]; const auto& pos = in[1];
-        double base = a.num("base", 10000.0); bool neox = a.num("neox", 1) != 0;
+        bool neox = a.num("neox", 1) != 0;
         std::size_t s = std::size_t(x.shape[0]), h = std::size_t(x.shape[1]), d = std::size_t(x.shape[2]), half = d / 2;
-        std::vector<double> inv(half);
-        for (std::size_t j = 0; j < half; ++j) inv[j] = std::pow(base, -2.0 * double(j) / double(d));
+        const std::vector<double> inv = ops::rope_inv_freq(a, i64(d), ops::rope_seq_len(pos.data, s));   // as the reference (ops/rope.hpp)
         task::parallel_for(s, 1, [&](std::size_t b, std::size_t e) {
             std::vector<float> c(half), sn(half);
             for (std::size_t i = b; i < e; ++i) {
@@ -298,6 +297,9 @@ inline kernel_fn reshape() {
     };
 }
 } // namespace cpu_kernels
+} // namespace forge::graph
+#include <forge/graph/kernels_ext.hpp>   // spatial + encoder op families: cpu_kernels::add_ext_cpu
+namespace forge::graph {
 
 inline void registry::make_cpu(registry& r) {
     using namespace cpu_kernels;
@@ -320,6 +322,7 @@ inline void registry::make_cpu(registry& r) {
     r.add({"cpu.rope", ops::op::rope, 10, always, rope()});
     r.add({"cpu.gather", ops::op::gather, 10, always, gather()});
     r.add({"cpu.reshape", ops::op::reshape, 10, always, reshape()});
+    add_ext_cpu(r);
 }
 
 } // namespace forge::graph

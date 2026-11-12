@@ -7,6 +7,7 @@
 #include <unistd.h>
 #endif
 #include <fstream>
+#include <random>
 #include "tiny_model.hpp"
 #include <cstring>
 static std::string tmp(const std::string& n) { return (std::filesystem::temp_directory_path() / ("forge_test_pack_" + std::to_string(::getpid()) + "_" + n)).string(); }
@@ -182,6 +183,317 @@ TEST(fpk_encryption_hook) {
     forge_test::set_env("FORGE_MODEL_KEY", modelfile::detail::hex(key.data(), 32).c_str());
     { inference::session s(dst); auto l = s.forward(std::vector<int>{1, 2}); inference::session p(src); CHECK(l == p.forward(std::vector<int>{1, 2})); }
     forge_test::set_env("FORGE_MODEL_KEY", nullptr);
+}
+
+// Composite ops: default and keyword parameters, definitions after the graph block, nesting, the number helpers,
+// and the rejection of recursion (directly, through other composites, and in composites nothing calls).
+TEST(blueprint_composite_defaults_keywords_recursion) {
+    auto src = R"(blueprint "c"
+params { k: 3 }
+input x : f32[4]
+graph {
+  a = scaled(x)
+  b = scaled(x, by: 4)
+  c = scaled(x, 5, bias: 1)
+  d = outer(x) * scalar(2)
+  e = x * mod(7, k) + min(2, max(0, floor(sqrt(17))))
+}
+op scaled(v, by = 2, bias = -0.5) { return v * by + bias }
+op outer(v) { return scaled(v, bias: 0) + inner(v) }
+op inner(v) { return scaled(v, by: k) }
+output a : f32[4]
+output b : f32[4]
+output c : f32[4]
+output d : f32[4]
+output e : f32[4]
+)";
+    auto bp = modelfile::parse_blueprint(src);
+    CHECK(bp.composites.size() == 3 && bp.composites.at("scaled").defaults.size() == 2);
+    auto p = graph::compile(modelfile::build_graph(bp, {})); graph::executor ex(*p);
+    std::vector<float> x = {-2, 0, 0.5f, 3}; ex.set_input("x", x); ex.run();
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK(std::fabs(ex.output_view("a").data[i] - (2 * x[i] - 0.5f)) < 1e-6);
+        CHECK(std::fabs(ex.output_view("b").data[i] - (4 * x[i] - 0.5f)) < 1e-6);
+        CHECK(std::fabs(ex.output_view("c").data[i] - (5 * x[i] + 1)) < 1e-6);
+        CHECK(std::fabs(ex.output_view("d").data[i] - (10 * x[i] - 1)) < 1e-5);   // (2x + 0 + 3x - 0.5) * 2
+        CHECK(std::fabs(ex.output_view("e").data[i] - (x[i] + 2)) < 1e-6);        // mod(7, 3) = 1; min(2, floor(sqrt 17)) = 2
+    }
+    auto bad = [](const char* ops, const char* call, const char* needle) {
+        std::string s = std::string("blueprint \"e\"\n") + ops + "\ninput x : f32[2]\ngraph { y = " + call + " }\noutput y : f32[2]";
+        try { (void)modelfile::build_graph(modelfile::parse_blueprint(s), {}); }
+        catch (const forge_exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+        return false;
+    };
+    CHECK(bad("op f(a, by = 2) { return a * by }", "f(x, nope: 1)", "no parameter 'nope'"));
+    CHECK(bad("op f(a, by = 2) { return a * by }", "f(x, 3, by: 4)", "given twice"));
+    CHECK(bad("op f(a, b) { return a + b }", "f(x)", "missing 'b'"));
+    CHECK(bad("op f(a, b) { return a + b }", "f(x, x, x)", "expects 2 arguments"));
+    CHECK(bad("op f(a = 1, b) { return a + b }", "f(x, x)", "without a default"));
+    CHECK(bad("op f(a, a) { return a }", "f(x, x)", "repeated"));
+    CHECK(bad("op f(a) { return f(a) }", "f(x)", "is recursive (f -> f)"));
+    CHECK(bad("op f(a) { return g(a) }\nop g(a) { return h(a) + 1 }\nop h(a) { return f(a) }", "x + 1", "f -> g -> h -> f"));   // never called: still rejected
+    // a composite named like a spec op is shadowed by the op, so its "self call" is the op, not recursion
+    CHECK(modelfile::parse_blueprint("blueprint \"e\"\nop tanh(a) { return tanh(a) * 2 }\ninput x : f32[2]\ngraph { y = tanh(x) }\noutput y : f32[2]").composites.size() == 1);
+}
+
+// Every shipped template parses once its placeholders are filled (catches a template edit that breaks the grammar).
+TEST(templates_parse_with_placeholder_values) {
+    int n = 0;
+    for (auto& f : std::filesystem::directory_iterator(import::template_dir())) {
+        if (f.path().extension() != ".fbp") continue;
+        auto text = import::read_file(f.path());
+        for (std::size_t p; (p = text.find("{{")) != std::string::npos;) {
+            auto e = text.find("}}", p); auto key = text.substr(p + 2, e - p - 2);
+            std::string v = "4";
+            if (auto bar = key.find('|'); bar != std::string::npos) v = key.substr(bar + 1);   // {{key|default}}
+            else if (key == "act") v = "gelu";
+            else if (key == "rope_fn") v = "rope_part";
+            else if (key == "logits_expr") v = "lg";
+            else if (key == "pool_expr" && f.path().stem() == "bert") v = "masked_mean(x, mask)";
+            else if (key == "pool_expr") v = "map_pool(x)";
+            else if (key == "embed_expr") v = "p + W.pos_emb";
+            else if (key == "pre_expr") v = "x";
+            else if (key == "mla_q_expr") v = "linear(h, W.layer[l].wq)";
+            text.replace(p, e - p + 2, v);
+        }
+        try { (void)modelfile::parse_blueprint(text); ++n; }
+        catch (const std::exception& ex) { CHECK_MSG(false, "%s: %s", f.path().filename().string().c_str(), ex.what()); }
+    }
+    CHECK(n >= 16);
+}
+
+// The fuzz seed for composite ops builds a graph exactly as fuzz/fuzz_blueprint.cpp drives it.
+TEST(fuzz_seed_composites_builds) {
+    auto text = import::read_file(std::filesystem::path(FORGE_SOURCE_DIR) / "fuzz" / "corpus" / "blueprint" / "composites.fbp");
+    auto bp = modelfile::parse_blueprint(text);
+    CHECK(bp.composites.size() == 3 && bp.session == "generative_sequence");
+    modelfile::build_options o; o.dims = {{"seq", 3}};
+    static std::vector<float> zeros(4096, 0.f);
+    o.weight = [](const std::string&) -> std::pair<shape_t, const float*> { return {shape_t{8, 8}, zeros.data()}; };
+    auto g = modelfile::build_graph(bp, o);
+    int biased = 0; for (auto& n : g.nodes()) biased += n.kind == graph::node_kind::op && n.op == ops::op::attention_bias;
+    CHECK(biased == 2 && g.outputs().size() == 1);
+}
+
+// ---- importers: every tensor accounted for, opset range, licence capture ------------------------------------------
+namespace {
+namespace fs = std::filesystem;
+struct hf_opts {
+    std::vector<std::pair<std::string, shape_t>> extra;   // more tensors in model.safetensors
+    std::vector<std::string> drop;                         // tensors left out
+    std::string config_extra;                              // more config.json members (", \"k\": v")
+    std::string arch = "LlamaForCausalLM", readme, license_text;
+    bool biases = false;
+};
+// A random one-layer Llama-shaped Hugging Face directory (config.json + model.safetensors), written in-process.
+std::string make_hf_dir(const std::string& name, const hf_opts& o = {}) {
+    auto dir = tmp(name); fs::remove_all(dir); fs::create_directories(dir);
+    const i64 H = 8, F = 16, V = 16;
+    std::vector<std::pair<std::string, shape_t>> ts = {
+        {"model.embed_tokens.weight", {V, H}}, {"model.norm.weight", {H}}, {"lm_head.weight", {V, H}},
+        {"model.layers.0.input_layernorm.weight", {H}}, {"model.layers.0.post_attention_layernorm.weight", {H}},
+        {"model.layers.0.self_attn.q_proj.weight", {H, H}}, {"model.layers.0.self_attn.k_proj.weight", {H, H}},
+        {"model.layers.0.self_attn.v_proj.weight", {H, H}}, {"model.layers.0.self_attn.o_proj.weight", {H, H}},
+        {"model.layers.0.mlp.gate_proj.weight", {F, H}}, {"model.layers.0.mlp.up_proj.weight", {F, H}}, {"model.layers.0.mlp.down_proj.weight", {H, F}}};
+    if (o.biases) for (const char* x : {"q", "k", "v"}) ts.push_back({std::format("model.layers.0.self_attn.{}_proj.bias", x), {H}});
+    for (auto& e : o.extra) ts.push_back(e);
+    std::string hdr = "{", data; std::mt19937 rng(11); std::uniform_real_distribution<float> U(-0.5f, 0.5f);
+    bool first = true;
+    for (auto& [n, sh] : ts) {
+        if (std::find(o.drop.begin(), o.drop.end(), n) != o.drop.end()) continue;
+        std::string dims; for (auto d : sh) dims += (dims.empty() ? "" : ",") + std::to_string(d);
+        std::size_t cnt = std::size_t(numel(sh)), b = data.size();
+        for (std::size_t i = 0; i < cnt; ++i) { float f = U(rng); data.append(reinterpret_cast<const char*>(&f), 4); }
+        hdr += std::format("{}\"{}\":{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{},{}]}}", first ? "" : ",", n, dims, b, data.size());
+        first = false;
+    }
+    hdr += "}";
+    { std::ofstream f(fs::path(dir) / "model.safetensors", std::ios::binary); std::uint64_t hl = hdr.size(); f.write(reinterpret_cast<const char*>(&hl), 8); f << hdr << data; }
+    { std::ofstream f(fs::path(dir) / "config.json");
+      f << std::format(R"({{"architectures": ["{}"], "hidden_size": 8, "num_hidden_layers": 1, "num_attention_heads": 2, "num_key_value_heads": 2,
+ "intermediate_size": 16, "vocab_size": 16, "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "max_position_embeddings": 64, "bos_token_id": 1, "eos_token_id": 2{}}})", o.arch, o.config_extra); }
+    if (!o.readme.empty()) { std::ofstream f(fs::path(dir) / "README.md", std::ios::binary); f << o.readme; }
+    if (!o.license_text.empty()) { std::ofstream f(fs::path(dir) / "LICENSE", std::ios::binary); f << o.license_text; }
+    return dir;
+}
+// what() of the forge_exception `f` throws ("" when it does not throw)
+template <class F> std::string error_of(F&& f) { try { f(); } catch (const forge_exception& e) { return e.what(); } return ""; }
+bool has(const std::string& hay, std::string_view needle) { return hay.find(needle) != std::string::npos; }
+}
+
+TEST(import_hf_accounts_for_every_tensor) {
+    auto out = tmp("acct.fpk");
+    {   // a clean checkpoint imports with nothing left over, and the blueprint reads exactly the tensors written
+        auto rep = import::import_hf(make_hf_dir("hf_ok"), out);
+        CHECK(rep.unused.empty() && rep.template_name == "llama" && rep.tensors == 12);
+        modelfile::reader r(out); auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
+        CHECK(bp.opset == 1);
+        auto ws = modelfile::blueprint_weights(bp);
+        CHECK(ws.size() == r.tensors().size());
+        for (auto& n : ws) CHECK_MSG(r.tensors().count(n) == 1, "blueprint reads %s", n.c_str());
+        inference::session s(out); CHECK(s.forward(std::vector<int>{1, 3, 5}).size() == 16);
+    }
+    hf_opts stray; stray.extra = {{"model.layers.0.self_attn.q_proj.bias", {8}}, {"model.layers.0.adapter.weight", {4, 8}}};
+    {   // leftovers are an error that lists each with its shape and names the way out
+        auto dir = make_hf_dir("hf_stray", stray);
+        auto msg = error_of([&] { import::import_hf(dir, out); });
+        CHECK_MSG(has(msg, "2 source tensor(s)") && has(msg, "model.layers.0.self_attn.q_proj.bias [8]") && has(msg, "model.layers.0.adapter.weight [4,8]") && has(msg, "--allow-unused"),
+                  "message: %s", msg.c_str());
+        CHECK(!fs::exists(out + ".part"));                       // nothing half-written is left behind
+        import::import_options allow; allow.allow_unused = true;  // the escape hatch imports and reports them
+        auto rep = import::import_hf(dir, out, allow);
+        CHECK(rep.unused.size() == 2 && rep.tensors == 12);
+        import::import_options ign; ign.ignore_tensors = {"model.layers.0.self_attn.q_proj.bias", "*.adapter.weight"};
+        CHECK(import::import_hf(dir, out, ign).unused.empty());
+        ign.ignore_tensors = {"model.layers.0.self_attn.*"};      // prefix form covers one of the two
+        CHECK(has(error_of([&] { import::import_hf(dir, out, ign); }), "1 source tensor(s)"));
+    }
+    {   // buffers no graph reads are ignored without an option
+        hf_opts o; o.extra = {{"model.embed_positions.position_ids", {1, 64}}, {"model.layers.0.self_attn.masked_bias", {1}}, {"model.layers.0.self_attn.rotary_emb.inv_freq", {2}}};
+        CHECK(import::import_hf(make_hf_dir("hf_buffers", o), out).unused.empty());
+    }
+    {   // a tensor the template needs but the checkpoint lacks: an error naming it
+        hf_opts o; o.drop = {"model.layers.0.self_attn.v_proj.weight"};
+        auto msg = error_of([&] { import::import_hf(make_hf_dir("hf_missing", o), out); });
+        CHECK_MSG(has(msg, "self_attn.v_proj.weight") && has(msg, "llama"), "message: %s", msg.c_str());
+    }
+    {   // Qwen2: biases are imported (qwen2 template), and the bias-free llama template refuses the checkpoint
+        hf_opts o; o.arch = "Qwen2ForCausalLM"; o.biases = true;
+        auto dir = make_hf_dir("hf_qwen2", o);
+        auto rep = import::import_hf(dir, out);
+        CHECK(rep.template_name == "qwen2" && rep.tensors == 15 && rep.unused.empty());
+        { modelfile::reader r(out); CHECK(r.tensors().count("layer.0.bq") && r.tensors().count("layer.0.bk") && r.tensors().count("layer.0.bv"));
+          CHECK(r.entry("layer.0.bq").shape == shape_t({8})); }
+        import::import_options as_llama; as_llama.template_name = "llama";
+        CHECK(has(error_of([&] { import::import_hf(dir, out, as_llama); }), "self_attn.q_proj.bias"));
+        o.biases = false;   // and a Qwen2 checkpoint without its biases does not import as if nothing were missing
+        CHECK(has(error_of([&] { import::import_hf(make_hf_dir("hf_qwen2_nobias", o), out); }), "self_attn.q_proj.bias"));
+    }
+    {   // a template that reads tensors the importer does not produce (qwen3's QK-norm on a Llama checkpoint)
+        import::import_options o; o.template_name = "qwen3";
+        CHECK(has(error_of([&] { import::import_hf(make_hf_dir("hf_wrong_tpl"), out, o); }), "q_norm"));
+    }
+}
+
+TEST(import_hf_rope_scaling_config) {
+    auto out = tmp("ropecfg.fpk");
+    auto bp_of = [&](const std::string& extra) {
+        hf_opts o; o.config_extra = extra;
+        import::import_hf(make_hf_dir("hf_rope", o), out);
+        modelfile::reader r(out); return std::string(r.section_text("blueprint"));
+    };
+    auto plain = bp_of("");
+    CHECK(has(plain, "opset 1") && !has(plain, "scaling") && has(plain, "neox: 1)") && has(plain, "groups: n_heads / n_kv)"));
+    CHECK(bp_of(R"(, "rope_scaling": null)") == plain);
+    CHECK(bp_of(R"(, "rope_scaling": {"rope_type": "default"})") == plain);
+    auto lin = bp_of(R"(, "rope_scaling": {"type": "linear", "factor": 2.0})");
+    CHECK(has(lin, "opset 2") && has(lin, "neox: 1, scaling: 1, factor: 2)"));
+    auto l3 = bp_of(R"(, "rope_scaling": {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0, "high_freq_factor": 4.0, "original_max_position_embeddings": 32})");
+    CHECK(has(l3, "scaling: 4, factor: 8, orig_ctx: 32, low_freq: 1, high_freq: 4)"));
+    auto dyn = bp_of(R"(, "rope_scaling": {"rope_type": "dynamic", "factor": 2.0})");
+    CHECK(has(dyn, "scaling: 2, factor: 2, orig_ctx: 64)"));
+    // YaRN: a factor that is not given is max_position_embeddings / original_max_position_embeddings (64 / 16); the
+    // attention factor 0.1 ln(4) + 1 scales q and k, i.e. attention's scale by its square
+    CHECK(has(bp_of(R"(, "rope_scaling": {"rope_type": "yarn", "factor": 9.0, "original_max_position_embeddings": 16})"), "scaling: 3, factor: 9, orig_ctx: 16,"));
+    CHECK(has(bp_of(R"(, "rope_scaling": {"rope_type": "yarn", "factor": 2.0})"), "scaling: 3, factor: 2, orig_ctx: 64,"));
+    CHECK(has(bp_of(R"(, "original_max_position_embeddings": 32, "rope_scaling": {"rope_type": "yarn", "factor": 2.0})"), "scaling: 3, factor: 2, orig_ctx: 32,"));
+    auto yarn = bp_of(R"(, "rope_scaling": {"rope_type": "yarn", "original_max_position_embeddings": 16})");
+    CHECK(has(yarn, "scaling: 3, factor: 4, orig_ctx: 16, beta_fast: 32, beta_slow: 1, truncate: 1)") && has(yarn, "groups: n_heads / n_kv, scale: "));
+    { auto bp = modelfile::parse_blueprint(yarn); CHECK(bp.opset == 2);
+      double af = 0.1 * std::log(4.0) + 1.0, want = af * af / std::sqrt(4.0), got = std::stod(yarn.substr(yarn.find(", scale: ") + 9));
+      CHECK(std::fabs(got - want) < 1e-12);
+      inference::session s(out); CHECK(s.forward(std::vector<int>{1, 3, 5}).size() == 16); }
+    // transformers 5 keeps the type and theta in rope_parameters
+    auto rp = bp_of(R"(, "rope_parameters": {"rope_type": "linear", "factor": 3.0, "rope_theta": 500.0})");
+    CHECK(has(rp, "scaling: 1, factor: 3)") && has(rp, "base: 500"));
+    // refused, with the reason
+    for (auto [cfg, want] : {std::pair<const char*, const char*>{R"(, "rope_scaling": {"rope_type": "longrope", "short_factor": [1.0], "long_factor": [2.0]})", "longrope"},
+                             {R"(, "rope_scaling": {"rope_type": "spiral", "factor": 2.0})", "spiral"},
+                             {R"(, "rope_scaling": {"rope_type": "linear"})", "factor"},
+                             {R"(, "rope_scaling": {"rope_type": "linear", "factor": -1.0})", "factor"}}) {
+        hf_opts o; o.config_extra = cfg;
+        auto msg = error_of([&] { import::import_hf(make_hf_dir("hf_rope_bad", o), out); });
+        CHECK_MSG(has(msg, want), "config %s -> message: %s", cfg, msg.c_str());
+    }
+}
+
+TEST(blueprint_opset_range) {
+    auto src = [](const std::string& head, const std::string& fn = "relu") {
+        return "blueprint \"t\" " + head + "\ninput x : f32[2]\ngraph {\n y = " + fn + "(x)\n}\noutput y : f32[2]";
+    };
+    CHECK(modelfile::opset_min == 1 && modelfile::opset_max >= 2);
+    for (int v = modelfile::opset_min; v <= modelfile::opset_max; ++v) (void)modelfile::build_graph(modelfile::parse_blueprint(src("opset " + std::to_string(v))), {});
+    (void)modelfile::build_graph(modelfile::parse_blueprint(src("")), {});   // no opset clause = opset 1
+    // a newer opset parses (inspect can still show it) but does not build; the message names it and the range
+    auto newer = modelfile::parse_blueprint(src("opset 99")); CHECK(newer.opset == 99);
+    auto msg = error_of([&] { (void)modelfile::build_graph(newer, {}); });
+    CHECK_MSG(has(msg, "opset 99") && has(msg, std::format("{}..{}", modelfile::opset_min, modelfile::opset_max)) && has(msg, "newer FORGE"), "message: %s", msg.c_str());
+    try { modelfile::check_opset(newer); CHECK(false); } catch (const forge_exception& e) { CHECK(e.code == errc::unsupported); }
+    CHECK(has(error_of([&] { (void)modelfile::build_graph(modelfile::parse_blueprint(src("opset 0")), {}); }), "opset 0"));
+    CHECK_THROWS(modelfile::parse_blueprint(src("opset 1.5")));
+    // an op this engine does not have: the message names the op and the blueprint's opset
+    msg = error_of([&] { (void)modelfile::build_graph(modelfile::parse_blueprint(src("opset 2", "warp_drive")), {}); });
+    CHECK_MSG(has(msg, "blueprint:4") && has(msg, "'warp_drive'") && has(msg, "opset 2"), "message: %s", msg.c_str());
+    // a model file whose blueprint is too new does not load: the session names the file and the opset
+    auto ok = forge_test::make_tiny_model(tmp("opset_ok.fpk")), bad = tmp("opset_bad.fpk");
+    {
+        modelfile::reader r(ok); modelfile::writer w;
+        for (auto& [n, e] : r.tensors()) { auto t = r.load(n); w.add_tensor(n, t.shape, t.data, "f32"); }
+        w.set_manifest(r.manifest());
+        std::string bp(r.section_text("blueprint")); auto at = bp.find("opset 1"); CHECK(at != std::string::npos);
+        bp.replace(at, 7, "opset 7");
+        w.set_section("blueprint", bp); w.set_section("tokenizer", std::string(r.section_text("tokenizer")));
+        w.write(bad);
+    }
+    { inference::session s(ok); CHECK(!s.forward(std::vector<int>{1, 2}).empty()); }
+    msg = error_of([&] { inference::session s(bad); });
+    CHECK_MSG(has(msg, "opset_bad.fpk") && has(msg, "opset 7"), "message: %s", msg.c_str());
+}
+
+TEST(licence_is_captured_and_kept) {
+    auto out = tmp("lic.fpk"), sgn = tmp("lic_signed.fpk"), enc = tmp("lic_enc.fpk");
+    hf_opts o;
+    o.readme = "---\nlanguage:\n- en\nlicense: apache-2.0\nlicense_name: \"Apache License 2.0\"\nlicense_link: https://www.apache.org/licenses/LICENSE-2.0\ntags:\n- test\n---\n# A model\nlicense: not-this-one\n";
+    o.license_text = "Apache License\nVersion 2.0, January 2004\n(test text)\n";
+    auto rep = import::import_hf(make_hf_dir("hf_lic", o), out);
+    CHECK(rep.license == "apache-2.0");
+    auto check = [&](const std::string& path, const modelfile::model_key* key = nullptr) {
+        modelfile::reader r(path, key ? std::optional<modelfile::model_key>(*key) : std::nullopt);
+        const auto& m = r.manifest();
+        CHECK(m.str_or("license", "") == "apache-2.0" && m.str_or("license_name", "") == "Apache License 2.0");
+        CHECK(m.str_or("license_link", "") == "https://www.apache.org/licenses/LICENSE-2.0");
+        CHECK(m.find("license_files") && m["license_files"].arr().size() == 1 && m["license_files"][0].str() == "LICENSE");
+        CHECK(r.has_section("license") && r.section_text("license") == o.license_text);
+        CHECK(r.verify().empty());
+    };
+    check(out);
+    // signing and encrypting copy the licence with everything else, and the signature covers it
+    auto kp = modelfile::generate_keypair(); modelfile::sign_file(out, sgn, kp);
+    check(sgn);
+    { modelfile::reader r(sgn); auto v = modelfile::verify_signature(r); CHECK(v.digest_ok && !v.valid_keys.empty()); }
+    auto key = modelfile::generate_model_key(); modelfile::encrypt_file(sgn, enc, key);
+    check(enc, &key);
+    { modelfile::reader locked(enc); CHECK(locked.locked() && locked.section_text("license") == o.license_text); }   // readable without the key
+    modelfile::sign_file(enc, enc, kp);
+    check(enc, &key);
+    // a list-valued licence, two licence files, no front matter, nothing at all
+    {
+        hf_opts l; l.readme = "---\nlicense:\n  - mit\n  - cc-by-4.0\n---\n";
+        auto dir = make_hf_dir("hf_lic2", l);
+        { std::ofstream f(fs::path(dir) / "LICENSE.txt"); f << "MIT text\n"; }
+        { std::ofstream f(fs::path(dir) / "NOTICE"); f << "notice text\n"; }
+        CHECK(import::import_hf(dir, out).license == "mit, cc-by-4.0");
+        modelfile::reader r(out);
+        CHECK(r.manifest()["license_files"].arr().size() == 2);
+        CHECK(r.section_text("license") == "===== LICENSE.txt =====\nMIT text\n===== NOTICE =====\nnotice text\n");
+    }
+    {
+        hf_opts l; l.readme = "# no front matter\nlicense: mit\n";
+        CHECK(import::import_hf(make_hf_dir("hf_lic3", l), out).license.empty());
+        modelfile::reader r(out);
+        CHECK(!r.manifest().find("license") && !r.has_section("license"));
+        inference::session s(out); CHECK(s.forward(std::vector<int>{1, 3}).size() == 16);   // optional: absent is fine
+    }
 }
 
 // ---- GGUF tensor types: sizes are checked before anything is read ----

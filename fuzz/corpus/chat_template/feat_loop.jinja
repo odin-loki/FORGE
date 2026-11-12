@@ -1,0 +1,7 @@
+{% for m in messages %}{{ loop.index }}/{{ loop.length }} {{ loop.index0 }} {{ loop.revindex }} {{ loop.revindex0 }} {{ loop.first }} {{ loop.last }} {{ loop.cycle('a', 'b', 'c') }} prev={{ loop.previtem.role if loop.previtem is defined else '-' }} next={{ loop.nextitem.role if loop.nextitem is defined else '-' }}
+{% else %}none
+{% endfor %}{% for m in messages if m.role == 'user' %}[{{ loop.index }}:{{ m.content|length }}]{% endfor %}
+{% for m in [] %}x{% else %}empty{% endfor %}
+{% for i in range(10) %}{% if i == 2 %}{% continue %}{% endif %}{% if i > 5 %}{% break %}{% endif %}{{ i }}{% endfor %}
+{% for a, b in [[1, 2], [3, 4]] %}{{ a + b }};{% endfor %}{% for k, v in {'x': 1, 'y': [2]}.items() %}{{ k }}={{ v }},{% endfor %}{% for k in {'p': 1, 'q': 2} %}{{ k }}{% endfor %}{% for c in 'héy' %}<{{ c }}>{% endfor %}
+{% for i in range(2) %}{% for j in range(3, 0, -1) %}{{ i }}{{ j }}{{ loop.index }} {% endfor %}{% endfor %}

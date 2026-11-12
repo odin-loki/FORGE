@@ -1,0 +1,13 @@
+# Encoder / embedding-model op family. Append new ops at the end (see ops/README.md).
+op quick_gelu      class elementwise    inputs 1  shape same          tol abs:1e-5  fuse yes cost 12 doc "y = x * sigmoid(1.702 x) (CLIP)"
+op mish            class elementwise    inputs 1  shape same          tol abs:1e-5  fuse yes cost 24 doc "y = x * tanh(softplus(x))"
+op hard_swish      class elementwise    inputs 1  shape same          tol abs:1e-5  fuse yes cost 3  doc "y = x * clamp(x + 3, 0, 6) / 6"
+op floor           class elementwise    inputs 1  shape same          tol exact     fuse yes cost 1  doc "y = floor(x)"
+op attention_bias  class contraction    inputs 4  shape attention     tol abs:1e-5  fuse no  cost 4  attrs "causal,groups,scale,window,softcap" doc "attention with an additive score bias: q[s,hq,d] k[t,hk,d] v[t,hk,dv] bias (broadcast to [hq,s,t]; -inf masks a key); scores = softcap ? softcap * tanh(q.k scale / softcap) : q.k scale, + bias, then the causal / window mask (causal defaults to 0); a row with every key masked gives 0"
+op alibi_bias      class data_movement  inputs 2  shape alibi         tol rel:1e-6  fuse no  cost 2  attrs "heads" doc "ALiBi: bias[h, i, j] = -slope_h * abs(qpos[i] - kpos[j]), slopes 2^(-8 (h + 1) / heads) (the paper's interpolation when heads is not a power of two)"
+op sinusoid_embed  class data_movement  inputs 1  shape embed_dim     tol abs:1e-5  fuse no  cost 12 attrs "dim,max_period,shift,flip" doc "t[...] -> [..., dim]: [sin(t f_i), cos(t f_i)] (flip 1: cos first), f_i = max_period^(-i / (dim / 2 - shift)); an odd dim gets a trailing 0. shift 1 = Whisper positions, shift 0 = diffusion timestep embedding"
+op l2_normalize    class reduction      inputs 1  shape same          tol rel:1e-5  fuse no  cost 3  attrs "eps" doc "x / max(norm2(x), eps) over the last axis (eps default 1e-12)"
+op topk            class reduction      inputs 1  shape topk          tol exact     fuse no  cost 4  attrs "k" doc "the k largest values of the last axis, descending"
+op topk_indices    class reduction      inputs 1  shape topk          tol exact     fuse no  cost 4  attrs "k" doc "indices (as float) of the k largest values of the last axis, descending; ties -> lower index"
+op index_select    class data_movement  inputs 2  shape index_select  tol exact     fuse no  cost 0  attrs "axis" doc "x taken at idx[m] along axis (numpy take); negative indices count from the end"
+op masked_mean     class reduction      inputs 2  shape masked_mean   tol rel:1e-5  fuse no  cost 2  doc "x[s, ...], mask[s] -> mean of the rows whose mask != 0 (sentence-embedding mean pooling); no row kept gives 0"

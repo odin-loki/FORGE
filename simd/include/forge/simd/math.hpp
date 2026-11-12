@@ -92,6 +92,12 @@ template <Target Tg> inline void split_exp(vec<float, Tg> x, vec<float, Tg>& m, 
         mm = __riscv_vmerge_vvm_f32m1(mm, __riscv_vfmul_vf_f32m1(mm, 0.5f, FORGE_RVV_VL), big, FORGE_RVV_VL);
         ee = __riscv_vmerge_vvm_f32m1(ee, __riscv_vfadd_vf_f32m1(ee, 1.0f, FORGE_RVV_VL), big, FORGE_RVV_VL);
         m.r = mm; e.r = ee;)
+    } else if constexpr (vec<float, Tg>::K == 6) {
+        FORGE_IFGN(
+        gn::mant_exp(x.r, m.r, e.r);
+        auto big = gn::lt(gn::splat(1.41421356f), m.r);
+        m.r = gn::select(big, gn::mul(m.r, gn::splat(0.5f)), m.r);
+        e.r = gn::select(big, gn::add(e.r, gn::splat(1.0f)), e.r);)
     } else if constexpr (vec<float, Tg>::K == 3) {
         FORGE_IFNEON(
         uint32x4_t xi = vreinterpretq_u32_f32(x.r);

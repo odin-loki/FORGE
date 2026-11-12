@@ -18,6 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <forge/gpu/determinism.hpp>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -30,6 +31,9 @@ struct session_options {
     i64 page_rows = 256;   // KV page size in rows; 0 = reserve the whole context up front
     std::string kv_codec;  // "", "f32", "int8", "fp8", "tbq4", "tbq3", "tbq4p", "tbq3p" (tbq + QJL residual, CPU only) or "k8v4"; empty = $FORGE_KV_CACHE_TYPE, $FORGE_KV_CODEC or f32
     int kv_offload = -1;   // 1 = keep KV on the host, drop device copies after each attention; -1 = $FORGE_KV_OFFLOAD
+    // Determinism mode (gpu/determinism.hpp): 1 = order-stable device paths only (same device + same build -> bit-identical
+    // results), 0 = off, -1 = $FORGE_DETERMINISTIC. Process-wide: it applies to every runtime in the process.
+    int deterministic = -1;
 };
 
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
@@ -95,11 +99,18 @@ public:
         }
         man_ = r_.manifest();
         bp_ = modelfile::parse_blueprint(r_.section_text("blueprint"));
+        try { modelfile::check_opset(bp_); }   // before any plan is built: an opset this engine does not run
+        catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
         if (r_.has_section("tokenizer")) {
             tok_.emplace(r_.section_text("tokenizer"));
             tok_->set_special(int(man_.num_or("bos_token_id", -1)), int(man_.num_or("eos_token_id", -1)));
-            tok_->set_add_bos(add_bos_default(man_));
+            // BOS / EOS around a prompt: the manifest's add_bos / add_eos when the importer recorded them, else the
+            // tokenizer.json post-processor when it has one, else the per-architecture default.
+            auto* ab = man_.find("add_bos"); auto* ae = man_.find("add_eos");
+            if ((ab && ab->is_bool()) || !tok_->has_post_processor()) tok_->set_add_bos(add_bos_default(man_));
+            if (ae && ae->is_bool()) tok_->set_add_eos(ae->b());
         }
+        if (r_.has_section("chat_template")) chat_template_ = std::string(r_.section_text("chat_template"));
         vocab_ = i64(bp_.param_or("vocab", 0));
         if (lib_ && (strict || r_.has_section("signature")))   // compiled code is not covered by the model's signature
             raise(errc::integrity_error, "{}: a compiled model library cannot be loaded for a signed model or under strict loading", path);
@@ -116,10 +127,16 @@ public:
     // Returns the device actually used. Clears cached plans.
     std::string set_device(const std::string& dev) {
         std::lock_guard lk(run_mu_);
-        std::string why;
-        reg_ = graph::device_registry(dev, &why);
+        std::string why, use = dev;
+        if (dev == "auto") {   // score every device that opens for this model (gpu/select.hpp)
+            gpu::select_request rq; rq.model_bytes = r_.section_bytes("data").size();
+            for (auto& [nm, e] : r_.tensors()) if (std::find(rq.codecs.begin(), rq.codecs.end(), e.codec) == rq.codecs.end()) rq.codecs.push_back(e.codec);
+            std::string table; use = graph::auto_device(rq, &table);
+            log::info("FORGE_DEVICE=auto -> {}\n{}", use, table);
+        }
+        reg_ = graph::device_registry(use, &why);
         if (!reg_ && !why.empty()) log::warn("{}; using cpu", why);
-        device_ = reg_ ? dev : "cpu";
+        device_ = reg_ ? use : "cpu";
         cache_.clear();
         return device_;
     }
@@ -129,7 +146,10 @@ public:
     const modelfile::blueprint& blueprint() const { return bp_; }
     const json::value& manifest() const { return man_; }
     const modelfile::reader& file() const { return r_; }
-    const modelfile::bpe_tokenizer* tokenizer() const { return tok_ ? &*tok_ : nullptr; }
+    const modelfile::tokenizer* tokenizer() const { return tok_ ? &*tok_ : nullptr; }
+    // The model's Jinja chat template (the .fpk "chat_template" section), "" when it has none. Rendered by
+    // inference::apply_chat_template (chat_template.hpp).
+    const std::string& chat_template() const { return chat_template_; }
     i64 vocab() const { return vocab_; }
     i64 max_context() const { return i64(man_.num_or("max_position_embeddings", 2048)); }
     graph::plan_cache& plans() { return cache_; }
@@ -221,7 +241,8 @@ private:
     aot_source aot_;
     json::value man_;
     modelfile::blueprint bp_;
-    std::optional<modelfile::bpe_tokenizer> tok_;
+    std::optional<modelfile::tokenizer> tok_;
+    std::string chat_template_;
     graph::plan_cache cache_;
     std::map<std::string, tensor> weights_;
     std::map<std::string, std::map<std::string, tensor>> adapters_;
@@ -238,6 +259,7 @@ class session {
 public:
     explicit session(const std::string& fpk_path, session_options o = {}) : session(model::open(fpk_path, o.verify), o) {}
     explicit session(std::shared_ptr<model> m, session_options o = {}) : m_(std::move(m)), opt_(o) {
+        if (o.deterministic >= 0) gpu::set_deterministic(o.deterministic != 0);
         st_.capacity = o.context ? o.context : m_->max_context();
         st_.page_rows = o.page_rows;
         std::string kc = o.kv_codec;
@@ -253,7 +275,7 @@ public:
     const modelfile::blueprint& blueprint() const { return m_->blueprint(); }
     const json::value& manifest() const { return m_->manifest(); }
     const modelfile::reader& file() const { return m_->file(); }
-    const modelfile::bpe_tokenizer* tokenizer() const { return m_->tokenizer(); }
+    const modelfile::tokenizer* tokenizer() const { return m_->tokenizer(); }
     i64 vocab() const { return m_->vocab(); }
     i64 position() const { return pos_; }
     i64 context() const { return st_.capacity; }
@@ -440,6 +462,54 @@ public:
         for (auto& o : blueprint().outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
         return out;
     }
+
+    // ---- embedding sessions (`session embedding` in the blueprint) ----
+    // One stateless pass; the first declared output is the result: a pooled sentence or image vector, or an
+    // encoder's state sequence (flattened row-major; embedding_shape() gives its dims).
+    void check_embedding() const {
+        if (blueprint().session != "embedding") raise(errc::unsupported, "session kind '{}' is not an embedding model", blueprint().session);
+    }
+    // Token models (BERT family): feeds the inputs the blueprint declares out of `tokens` (the ids), `positions`
+    // (0 .. n-1), `token_types` (zeros unless given) and `mask` (ones unless given: 0 marks padding).
+    std::vector<float> embed(std::span<const int> ids, std::span<const int> token_types = {}, std::span<const int> mask = {}) {
+        check_embedding();
+        const i64 n = i64(ids.size());
+        if (n == 0) raise(errc::invalid_argument, "embed: no tokens");
+        if (n > m_->max_context()) raise(errc::out_of_memory, "embed: {} tokens exceed the model's {} positions", n, m_->max_context());
+        if ((!token_types.empty() && i64(token_types.size()) != n) || (!mask.empty() && i64(mask.size()) != n))
+            raise(errc::invalid_argument, "embed: token_types / mask must have one entry per token");
+        std::map<std::string, std::vector<float>> in;
+        bool has_tokens = false;
+        for (auto& d : blueprint().inputs) {
+            auto& v = in[d.name]; v.resize(std::size_t(n));
+            if (d.name == "tokens") { std::copy(ids.begin(), ids.end(), v.begin()); has_tokens = true; }
+            else if (d.name == "positions") for (i64 i = 0; i < n; ++i) v[std::size_t(i)] = float(i);
+            else if (d.name == "token_types") { if (!token_types.empty()) std::copy(token_types.begin(), token_types.end(), v.begin()); }
+            else if (d.name == "mask") { if (mask.empty()) std::fill(v.begin(), v.end(), 1.f); else std::copy(mask.begin(), mask.end(), v.begin()); }
+            else raise(errc::unsupported, "embed: model input '{}' is not a token input; use embed_inputs()", d.name);
+        }
+        if (!has_tokens) raise(errc::unsupported, "embed: the model takes no `tokens` input; use embed_inputs()");
+        return embed_inputs(in, n);
+    }
+    // Any embedding model: named f32 inputs as the blueprint declares them (an image [c, h, w], mel frames
+    // [n_mels, frames], or the token inputs above). `seq` binds the symbolic `seq` dimension when there is one.
+    std::vector<float> embed_inputs(const std::map<std::string, std::vector<float>>& in, i64 seq = 1) {
+        check_embedding();
+        auto out = infer(in, seq);
+        return std::move(out.at(blueprint().outputs.front().name));
+    }
+    // Declared shape of the embedding output with `seq` bound (e.g. {384}, or {1500, 384} for encoder states).
+    shape_t embedding_shape(i64 seq = 1) const {
+        check_embedding();
+        shape_t s;
+        for (auto& d : blueprint().outputs.front().dims) {
+            if (d == "seq") s.push_back(seq);
+            else if (auto it = blueprint().params.find(d); it != blueprint().params.end()) s.push_back(i64(it->second));
+            else s.push_back(i64(std::strtoll(d.c_str(), nullptr, 10)));
+        }
+        return s;
+    }
+    // ---- end embedding ----
 private:
     std::vector<float> run(std::span<const int> ids, bool all) { auto v = run_view(ids, all); return {v.begin(), v.end()}; }
     // Runs like run_view and returns the argmax of the last position's logits: on the device when the backend can

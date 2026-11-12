@@ -34,7 +34,8 @@ inline constexpr char magic[9] = "FORGEAOT";
 inline constexpr std::uint32_t format_version = 1;
 // Bump when optimise(), plan_memory() or the lowering selection in lower_plan() change what they produce for the same
 // graph: it is part of every key, so older precompiled plans stop matching and are recompiled.
-inline constexpr std::uint32_t pipeline_version = 1;
+//   2  CPU lowerings for layer_norm, gelu and the spatial / encoder op families (kernels_ext.hpp)
+inline constexpr std::uint32_t pipeline_version = 2;
 inline constexpr std::string_view forge_version = "0.1.0";
 using digest = hash::blake3::digest;
 

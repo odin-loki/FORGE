@@ -5,14 +5,14 @@ Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage t
 ## Concepts
 - `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
-- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
+- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
 - Wherever a model path is taken by `run` and `bench`, it may be a `.fpk`, a Hugging Face directory, a `.gguf` or an `.onnx` file. Non-`.fpk` inputs are imported once into `$FORGE_CACHE` (default `~/.cache/forge`) with `--codec` (default `f32`) and reused while the source files are unchanged.
 
 ## Commands
 
 ### `forge info`
-Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
+Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), every kernel table this CPU can run, preferred first (line `targets`; pass one to `FORGE_SIMD_TARGET`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
 ### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [options]`
 Converts a model to `.fpk`.
@@ -21,17 +21,19 @@ Converts a model to `.fpk`.
 |--------|---------|
 | `--codec C` | Weight codec: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2 q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0`, the mixed-precision presets `q4_k_m` / `q5_k_m` (Hugging Face inputs), or `keep`. Default `f32` for plain Hugging Face checkpoints. For a GGUF file or an AWQ / GPTQ checkpoint the default is `keep`: the tensors stay in the quantisation they are stored in; another value decodes and re-quantises them and prints a double-quantisation warning ([modelfile.md](modelfile.md#gguf-tensor-types)) |
 | `--emb-codec C` | Codec for the token embedding (default `q8_0` when `--codec` is quantised, else the same as `--codec`) |
-| `--template NAME` | Blueprint template from `import/templates/`: `llama`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`. Normally chosen from the model's architecture |
+| `--template NAME` | Blueprint template from `import/templates/`: `llama`, `qwen2`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`, `qwen3_moe`, `qwen3_5_moe`. Normally chosen from the model's architecture |
+| `--allow-unused` | Import although the source has tensors the template does not use. Without it such an import fails and lists them (name and shape). Hugging Face leftovers are left out; GGUF leftovers are kept as `extra.<name>` |
+| `--ignore-tensor NAME[,NAME...]` | Source tensors known to be harmless: a whole name, `prefix*` or `*suffix`. `position_ids`, `masked_bias` and `inv_freq` buffers are always ignored |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
 | `--output-tensor-type T`, `--token-embedding-type T` | Mixed precision: codec for the output head / token embedding |
 | `--tensor-type REGEX=TYPE[,REGEX=TYPE...]` | Mixed precision: per-tensor overrides |
 | `--pure` | Mixed precision: no per-tensor rules, one codec for all |
 | `--bf16-head` | Mixed precision: keep the output head in bf16 |
 
-The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
+`forge import` prints the licence it recorded (`license   apache-2.0`, or `(none found in the source)`); see [modelfile.md](modelfile.md#what-an-import-checks-and-records). The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
 
-### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint]`
-Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a blueprint summary. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
+### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]`
+Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprint summary (with a note when its opset is outside the range this build runs) and a `license` line: the licence recorded at import, or `(not recorded)`. `--license` also prints the stored licence text. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
 
 ### `forge run <model> (--prompt TEXT | --tokens 1,2,3) [options]`
 
@@ -45,6 +47,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--ctx N` | 0 | Context length; 0 = model maximum |
 | `--ids` | off | Print token ids instead of text (always on when the model has no tokenizer) |
 | `--no-bos` | off | Do not prepend the BOS token |
+| `--chat`, `--system TEXT` | off | Treat `--prompt` as a user message (after an optional system message) and render it with the model's chat template; fails when the file has none. The template writes BOS itself |
 | `--logits FILE` | | Write the prefill logits as raw f32 |
 | `--verify` | off | Check BLAKE3 hashes on open |
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
@@ -52,11 +55,31 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
 | `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
 | `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
+| `--allow-unused` | off | On-the-fly import: accept source tensors the template does not use (as `forge import --allow-unused`) |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 
 Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr. When plans came precompiled ([`forge aot`](#forge-aot-modelfpk--o-out---aot-mode-plannative-options)) a second line says how many, how many of them ran as native code, and where they came from; `<model>` may also be a compiled model library (`model.so`).
 
 Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
+
+### `forge embed <model> (--text TEXT | --tokens 1,2,3 | --input name=file.f32 ...) [options]`
+Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `whisper_encoder` templates) once and prints the result vector, or writes it as raw little-endian f32 with `--out file.f32`.
+
+| Option | Meaning |
+|---|---|
+| `--tokens 1,2,3` | Token ids, including the model's special tokens (`[CLS]` ... `[SEP]`) |
+| `--text TEXT` | Tokenise with the model's tokenizer. Only byte-level BPE tokenizers are available at run time; BERT-family (WordPiece) models need `--tokens` |
+| `--token-types 0,0,1` | Segment ids (default all 0) |
+| `--mask 1,1,0` | 1 = real token, 0 = padding (default all 1) |
+| `--input name=file.f32` | Raw f32 for a declared input, repeatable: `image=...` (`[channels, size, size]`, already resized and normalised), `mel=...` (`[n_mels, frames]`) |
+| `--out file.f32` | Write the vector instead of printing it |
+| `--device D`, `--codec C`, `--verify`, `--policy F` | As for `forge run` |
+
+```sh
+forge import ./bge-small-en -o bge.fpk
+forge embed bge.fpk --tokens 101,7592,2088,102
+forge embed vit.fpk --input image=cat.f32 --out cat.emb.f32
+```
 
 ### `forge aot <model.fpk> [-o out] [--aot-mode plan|native] [options]`
 Compiles the model's plans ahead of time. The full description is in [aot-models.md](aot-models.md).
@@ -130,6 +153,7 @@ forge script [options]                        interactive REPL
 forge script --emit <target> <file.cpp> [-o out]   translate to a standalone shell script
 forge script --emit-targets                   list the shells that have an emitter
 forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp>   static checks only
+forge script --aot <out> [--aot-mode native|embed] [--cxx C] [-O<n>] [--target T] <file.cpp>   compile to an executable
 ```
 
 | Option | Meaning |
@@ -146,6 +170,7 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 | `--cache-dir DIR`, `--cache-trust HEX`, `--cache-require-signed`, `--cache-sign-seed HEX` | Compiled-script cache: directory, trusted public keys, refuse unsigned entries, signing seed |
 | `--ask-model M.fpk`, `--ask-max-tokens N` | Run `forge::ask` and related calls on this model in-process (defaults `$FORGE_ASK_MODEL`, `$FORGE_ASK_MAX_TOKENS` or 256) |
 | `--emit TARGET`, `-o FILE` | Translate instead of running. `TARGET` is a shell from `--emit-targets`, `auto` (`$FORGE_SHELL` or the host shell), `android` (mksh), or `ast` |
+| `--aot OUT`, `--aot-mode native\|embed\|auto`, `--cxx C`, `-O<level>`, `--target TRIPLE`, `--aot-runtime DIR`, `--aot-keep-source DIR`, `--aot-pch DIR`, `--aot-cxx-flag F`, `--aot-stub FILE`, `--aot-allow-widen` | Compile the script to an executable instead of running it. The capability, limit, sandbox and policy options above are baked into the binary; it accepts them again at run time as leading `--forge-*` arguments, which can only narrow them. See [aot.md](aot.md) |
 | `--` | End of options; the next argument is the script file |
 
 - Scripts are an interpreted, memory-safe subset of C++23; see [scripting.md](scripting.md). Arguments after the file are available as `forge::args()`.

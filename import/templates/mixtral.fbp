@@ -2,7 +2,8 @@
 # Router: softmax over experts, keep top-k, renormalise (HF MixtralSparseMoeBlock).
 # Sparse: moe_ffn evaluates only each token's k experts. Experts are stored stacked per layer:
 # W.layer[l].experts.w_gate / w_up [n_experts, ffn, d_model], w_down [n_experts, d_model, ffn].
-blueprint "decoder-lm-moe" opset 1
+# The rope_args and attn_args placeholders are empty unless the model scales its RoPE frequencies (opset 2).
+blueprint "decoder-lm-moe" opset {{opset|1}}
 
 params {
   d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
@@ -21,11 +22,11 @@ graph {
   x = embed(W.tok_emb, tokens)
   repeat l in 0..n_layers {
     h = rms_norm(x, W.layer[l].attn_norm, eps)
-    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: {{rope_neox}})
-    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: {{rope_neox}})
+    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: {{rope_neox}}{{rope_args|}})
+    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: {{rope_neox}}{{rope_args|}})
     v = heads(linear(h, W.layer[l].wv), n_kv, head_dim)
     kk, vv = kv[l].append(k, v)
-    a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv)
+    a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv{{attn_args|}})
     x = x + linear(merge(a, n_heads * head_dim), W.layer[l].wo)
     h = rms_norm(x, W.layer[l].ffn_norm, eps)
     x = x + moe_ffn(h, linear(h, W.layer[l].router), W.layer[l].experts.w_gate, W.layer[l].experts.w_up, W.layer[l].experts.w_down,

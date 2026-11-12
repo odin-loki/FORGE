@@ -84,6 +84,22 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 - `grammar_constraint(shared_ptr<const grammar>, tokenizer, vocab, eos)` masks tokens that cannot continue (`apply(logits)`), advances on `accept(token)`, and reports `can_end()` / `finished()`. EOS is allowed only when the grammar can end.
 - `json_schema_to_gbnf(json::value)` (`json_schema.hpp`) converts a JSON Schema subset to GBNF producing compact JSON (no whitespace): `type` (incl. lists), `properties` (declaration order; not in `required` = optional), `items`, `minItems`/`maxItems` ≤ 64, `enum`, `const`, `anyOf`/`oneOf`, `$ref` to `#/$defs/*` or `#/definitions/*`. An empty schema accepts any JSON value. Other keywords are ignored or rejected with `invalid_argument`.
 
+### Chat templates (`chat_template.hpp`)
+`model::chat_template()` is the model's Jinja template (empty when the file has none). `apply_chat_template(model, messages, chat_options)` renders it with `bos_token` / `eos_token` from the tokenizer; tokenize the result with `encode(text)` (no BOS: the template writes it). `render_chat_template(source, messages, options)` and the `chat_template` class (parse once, render many times) work on any template text.
+
+| `chat_options` | Default | Meaning |
+|----------------|---------|---------|
+| `add_generation_prompt` | true | End with the assistant's header |
+| `bos_token`, `eos_token` | from the tokenizer | |
+| `tools` | null | OpenAI-style tool list, visible to the template as `tools` |
+| `extra` | null | Object of further variables (`enable_thinking`, `date_string`, …) |
+| `now` | 0 | Clock for `strftime_now()`; 0 = system time |
+| `limits` | 8 MiB output, 2e7 steps, depth 150, 1 MiB template | Bounds for untrusted templates; exceeding one raises |
+
+The renderer is FORGE's own implementation of the Jinja2 subset chat templates use: `if` / `elif` / `else`, `for` (with `if` filter, `else`, `loop.*`, `break`, `continue`), `set` (also `ns.attr` and block form), `macro`, `raw`, comments, whitespace control, with `trim_blocks` and `lstrip_blocks` on as in transformers; expressions with slices, calls, filters, tests, string / dict methods, `namespace()`, `range()`, `raise_exception()`, `strftime_now()`. `tojson` is transformers' (`json.dumps(..., ensure_ascii=False)`), data is immutable as in its sandbox (`list.append` raises), and JSON numbers without a fraction are integers. Not supported: `include` / `extends` / `import`, `call` and `filter` blocks, `%` string formatting, chained comparisons, and filters outside the list in the header.
+
+It is tested against goldens rendered by jinja2 3.1 (`tests/data/chat_template/make_goldens.py`) for ChatML, Qwen2.5, Qwen3, Llama-2, Llama-3, Llama-3.1, Mistral v0.1 and v0.3, Gemma, Phi-3, DeepSeek, DeepSeek-R1 and Zephyr templates, with and without tools. Those template texts were written from memory of the published ones, so the test shows FORGE renders them as jinja2 does, not that they are byte-for-byte the vendors' files. `fuzz_chat_template` feeds it arbitrary templates.
+
 ### Continuous batching (`batch.hpp`)
 `batch_scheduler(shared_ptr<model>, batch_options)`. Each `step()` admits waiting requests up to `max_active`, prefills newcomers in chunks of `prefill_chunk` tokens and advances every active sequence by one token.
 
@@ -102,6 +118,23 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 Methods: `submit(request)` → id, `cancel(id)`, `step()`, `run_until_idle()`, `start()` / `stop()` (background worker), `request_kv_eviction(keep)` (safe from any thread), `idle()`, `waiting()`, `active_count()`, `spilled()`, `evictions()`, `stats()`. `batch_stats`: `steps`, `completed`, `prefix_hits`, `prefix_tokens_reused`, `peak_active`, `peak_kv_bytes`, `deferred`, `prefix_spills`, `prefix_reloads`, `prefix_reload_failures` (spilled prefixes whose file was unreadable or failed authentication: discarded and recomputed).
 
 A new prompt reuses the longest prefix it shares with a cached (in memory or spilled) sequence, always leaving at least one prompt token to compute.
+
+### Embedding sessions
+A blueprint that ends with `session embedding` is an embedding model: one stateless pass whose first declared output is the result. The same `session` class runs it (BERT-family sentence embeddings, ViT / CLIP / SigLIP image embeddings, Whisper encoder states):
+
+| Member | Meaning |
+|---|---|
+| `embed(ids, token_types = {}, mask = {})` | Token models. Feeds the inputs the blueprint declares out of `tokens`, `positions` (0 .. n-1), `token_types` (zeros unless given) and `mask` (ones unless given; 0 marks padding, which the `bert` template masks out of attention and of mean pooling). Returns the vector |
+| `embed_inputs({name → data}, seq = 1)` | Any embedding model: named f32 inputs as declared (`image` `[channels, size, size]`, `mel` `[n_mels, frames]`, or the token inputs). Returns the first output, flattened row-major |
+| `embedding_shape(seq = 1)` | Declared shape of that output, e.g. `{384}` or `{1500, 384}` |
+
+```cpp
+inference::session s("bge-small.fpk");
+std::vector<int> ids = {101, 7592, 2088, 102};          // [CLS] hello world [SEP]
+std::vector<float> v = s.embed(ids);                    // pooled (and L2-normalised if the model says so)
+```
+
+`generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per call: there is no batch axis, so padding only matters when the caller pads. Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).
 
 ### Other session kinds
 - `diffusion.hpp` (`forge::inference::diffusion`): `noise_scheduler::make(T, beta_schedule, b0, b1)` (linear, scaled_linear, cosine), `options` (`steps`, `kind` = ddim / ddpm / euler_flow, `pred` = epsilon / v / sample, `guidance` (classifier-free, 1 = off), `eta`, `seed`, `cache_at`, `start_step`), `session(scheduler, denoiser).run(x, opt)`. The denoiser is any callable `(x, t, cond) → prediction`. Noise is Philox, so a seed gives the same trajectory on every backend. `cache()` holds latents for `cache_at` steps; resume with `start_step`.

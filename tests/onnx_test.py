@@ -87,4 +87,20 @@ p = os.path.join(d, "conv.onnx"); onnx.save(H.make_model(g, opset_imports=[H.mak
 msg = run("import", p, "-o", os.path.join(d, "conv.fpk"), ok=False)
 if "Conv" not in msg: sys.exit("unsupported-op error does not name the op: " + msg)
 print("unsupported op rejected:", msg.strip().splitlines()[-1])
+# 4. licence: metadata_props license / license_url and a doc_string that states the licence end up in the manifest and
+#    the license section; a model without them records nothing
+g = H.make_graph([H.make_node("Relu", ["x"], ["y"])], "lic", [H.make_tensor_value_info("x", TP.FLOAT, [2, 3])],
+                 [H.make_tensor_value_info("y", TP.FLOAT, [2, 3])])
+m = H.make_model(g, opset_imports=[H.make_opsetid("", 17)], producer_name="forge-test", doc_string="Weights under the MIT License.\nCopyright (c) someone")
+for k, v in (("License", "mit"), ("license_url", "https://opensource.org/license/mit"), ("author", "nobody")):
+    e = m.metadata_props.add(); e.key = k; e.value = v
+p = os.path.join(d, "lic.onnx"); onnx.save(m, p); out = os.path.join(d, "lic.fpk")
+msg = run("import", p, "-o", out)
+if "license   mit" not in msg: sys.exit("import does not report the licence: " + msg)
+ins = run("inspect", out, "--license")
+for want in ('"license":"mit"', '"license_link":"https://opensource.org/license/mit"', "license   mit <https://opensource.org/license/mit>", "Weights under the MIT License.", "Copyright (c) someone"):
+    if want not in ins: sys.exit(f"inspect lacks {want!r}:\n{ins}")
+ins = run("inspect", os.path.join(d, "encoder.fpk"))
+if "license   (not recorded)" not in ins or '"license"' in ins: sys.exit("a model without licence metadata must record none:\n" + ins)
+print("licence metadata captured")
 print("onnx import OK")

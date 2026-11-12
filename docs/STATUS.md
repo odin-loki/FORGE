@@ -23,6 +23,12 @@ CI is `.github/workflows/ci.yml`; it runs on every pull request and every push t
 | Android, physical device | no | never | — |
 | Linux aarch64 (SVE) | locally, zig cross | under qemu-user only (2026-10-31: 50/54, see changelog) | `qemu-aarch64 -cpu max,sveN=on` |
 | Linux riscv64 (RVV) | locally, zig cross | under qemu-user only (same) | `qemu-riscv64 -cpu rv64,v=true,vlen=N` |
+| Linux loongarch64 (LSX, LASX) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-loongarch64 -cpu la464` |
+| Linux ppc64le (VSX) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-ppc64le -cpu power9`, `power8` |
+| Linux s390x (z14 vector) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
+| wasm32-wasi (SIMD128) | simd layer and `test_simd` only, `tests/wasm_simd.sh` | `test_simd` 7/7 under node 22 (2026-11-12) | zig `wasm32-wasi` |
+| Linux mips64el (MSA) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
+| 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: i386 7/7, arm 5/7 with the opt-in `neon` table, 7/7 without it (2026-11-12) | `qemu-i386`, `qemu-arm -cpu cortex-a7` |
 | Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
 Windows emit goldens (`FORGE_TEST_ONLY=emit test_script`, `windows-msvc`): sh, bash, dash, pwsh and PowerShell 5.1
@@ -98,7 +104,54 @@ Greedy output is identical with CUDA graphs on and off.
 
 ## Changelog of checks
 
+### 2026-11-12 (simd tables for more architectures; emulation only)
+New Tier P backend `vec_gn.hpp` and kernel tables `sse2`, `sse4.2`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` and
+(opt-in) 32-bit Arm `neon`. Only `test_simd` (7 cases: detection, tails, two ULP sweeps, special values, two oracle
+comparisons; every usable table in one run) was built for the new architectures. Nothing ran on real hardware other
+than x86_64.
+- x86_64, clang 23: `test_simd`, `test_simd_raw`, `test_graph` pass with `FORGE_SIMD_TARGET` = scalar, sse2, sse4.2,
+  avx2, avx512. `qemu-x86_64 -cpu Nehalem` (active `sse4.2`) and `-cpu core2duo` (active `sse2`): `test_simd` 7/7.
+- zig 0.17.1 (clang 22) musl static builds through CMake and the new toolchain files, `test_simd` under qemu-user:
+  loongarch64 `-cpu la464` 7/7 (also with `lsx` forced), ppc64le `-cpu power9` and `-cpu power8` 7/7, s390x
+  `-cpu max` 7/7, mips64el `-cpu Loongson-3A4000` 7/7. g++ 13 cross builds of the same sources by hand: ppc64le 7/7, s390x 7/7.
+- wasm32-wasi (zig), `tests/wasm_simd.sh`, node 22: 7/7 with `simd128` active.
+- By hand, no CMake configure: 32-bit x86 under
+  `qemu-i386 -cpu Nehalem` / `core2duo` 7/7; 32-bit Arm NEON under `qemu-arm -cpu cortex-a7` 5/7 (`exp-sub`,
+  `cbrt-sub`, `erfc`: AArch32 NEON flushes subnormals), so that table is never selected automatically.
+- zig's clang 22 hangs compiling musl with `-mmsa`, so the CMake probes for these tables compile only (no link).
+- Found on the way: with clang 22 on MSA the and/or form of a vector select gave wrong `expm1`/`log1p`/rounding
+  results; that backend calls `bsel.v` directly.
+- Not done: any other test on these architectures; MSVC, Apple clang, NDK and FreeBSD builds of the new code (CI
+  will be the first); the wasm, 32-bit Arm and 32-bit x86 CMake branches; a z14-only s390x CPU model.
+
 Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-12 (GPU backend parity work; mock drivers only, no hardware)
+Linux x86_64, clang 23, no GPU. Everything below ran against the mock drivers (`tests/mock_cuda.c` as CUDA and HIP,
+`mock_opencl.c`, `mock_ze.c`); real hardware for HIP, OpenCL, Level Zero and Vulkan remains "never", and none of the
+new CUDA code ran on the RTX 3090.
+- Portable kernels for OpenCL and Level Zero (quantised matmul_t / gather / FFN gate-up, one-pass and split-over-keys
+  attention, delta_rule / causal_conv, broadcast): `test_cuda_hip opencl|ze` now runs the same checks as CUDA
+  (14/14 attention shapes, 24/24 quantised matmul cases, 20/20 fused FFN cases, state ops, 4/4 quantised gather).
+  The OpenCL/Level Zero mocks execute the generated `kernels.cl` as C. Not compiled by any real OpenCL C compiler.
+- Device mixture of experts (`run_moe`) on CUDA, HIP, OpenCL, Level Zero: 21/21 cases match the CPU sparse path on
+  each mock. The two kernels compile to PTX (sm_70, sm_80) and AMDGPU code objects. `golden_moe_mla_{cuda,hip,opencl,ze}_mock`
+  (Mixtral and DeepSeek-V2 tiny models, f32 expert weights) pass.
+- Kernel program cache (OpenCL program binaries, Level Zero native binaries): `test_cuda_hip cache opencl|ze` 12/12.
+- Determinism mode: `test_cuda_hip determinism <api>` 6/6 on the four mocks. The mocks run serially, so this shows
+  the kernel selection, not a device's scheduling.
+- Automatic device selection: `test_gpu` scoring test; `test_cuda_hip select <api>` 11/11 with `MOCK_DEVICES=2`.
+- Fixed: plans destroyed on OpenCL, Level Zero and Vulkan left pins and resident constants behind (no
+  `device_hooks::forget`), corrupting later plans (heap corruption / SIGBUS with `FORGE_DEVICE=opencl`). The OpenCL
+  sub-buffer cache also ignored the view size. Regression: `test_cuda_hip stale <api>` 7/7 on the four mocks.
+- Fixed: OpenCL and Level Zero `run_op` bound its inputs before acquiring the output; an output that partly
+  overlapped the resident entry an input lived in (a reused plan arena) dropped that entry and left the input's
+  handle freed. That was the SIGBUS in `forge_matmul_t` with `FORGE_DEVICE=opencl` (DeepSeek-V2 tiny golden; reported
+  for Gemma / Phi-3 plans). `run_op` now settles the residency map first. `golden_moe_mla_opencl_mock` failed before
+  and passes now; the Gemma / Phi-3 goldens of the reporting branch were not run here (not merged yet).
+- Vulkan on lavapipe: `test_vulkan` still passes (the new `forget` hook); no new Vulkan kernels.
+- Not done in this round: Vulkan (GLSL) and Metal (MSL) ports of the kernels above, eviction during captures with
+  buffer generations, the missing `gpu::prims`, `pipe:auto` partitioning, RPC remote weight residency.
 
 ### 2026-11-05 (branch `cuda-mma-prefill`, RTX 3090)
 - CUDA prefill and decode speedups; numbers in [CUDA performance](#cuda-performance-on-rtx-3090-2026-11-05).

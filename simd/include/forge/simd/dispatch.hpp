@@ -2,6 +2,7 @@
 // CPU feature detection (what the OS enables, not just CPUID) + dispatch table resolved once.
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 
 namespace forge::simd {
@@ -18,6 +19,12 @@ struct cpu_features {
     bool neon = false, sve = false, sve2 = false; int sve_bytes = 0, sve_hw_bytes = 0;
     bool dotprod = false, i8mm = false;  // AArch64 sdot/udot (ASIMDDP) and usdot (I8MM)
     bool rvv = false; int rvv_bytes = 0;
+    bool lsx = false, lasx = false;                               // LoongArch
+    bool vsx = false, power8 = false, power9 = false, power10 = false;   // Power (ISA 2.07 / 3.0 / 3.1)
+    bool s390_vx = false, s390_vxe = false, s390_vxe2 = false;    // s390x vector facility (z13 / z14 / z15)
+    bool wasm_simd128 = false;                                    // compile-time on WebAssembly
+    bool msa = false;                                             // MIPS
+    bool vfpv4 = false;                                           // 32-bit Arm (with neon: fused multiply-add)
     bool hybrid = false;                 // P/E-core part
     std::string vendor, brand;
     std::string summary() const;
@@ -54,7 +61,8 @@ struct kernels {
 };
 
 const kernels& active();                // best target for this machine (FORGE_SIMD_TARGET overrides)
-const kernels* by_name(const char* t);  // "scalar", "avx2", "avx512"; nullptr if not built/usable
+const kernels* by_name(const char* t);  // "scalar", "avx2", "sse4.2", "lasx", ...; nullptr if not built/usable
+std::span<const char* const> target_names();   // every table name, preferred first (pass each to by_name)
 
 } // namespace forge::simd
 

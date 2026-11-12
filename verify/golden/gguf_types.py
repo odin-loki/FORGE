@@ -195,7 +195,7 @@ def main():
     probes["probe_Q8_K"] = (q8k, dict(raw_shape=(2, 292), raw_dtype=T.Q8_K)); want["probe_Q8_K"] = ((dk[:, None] * qs.astype(np.float32)).reshape(-1), "d * q computed here (no gguf-py dequantiser)")
     gp = os.path.join(a.work, "probes.gguf"); fp = os.path.join(a.work, "probes.fpk")
     write_model(gp, W, hf, "F32", probes)
-    r = forge("import", gp, "-o", fp)
+    r = forge("import", gp, "-o", fp, "--allow-unused")   # the probes are leftovers: kept as extra.<name>
     cd = codecs(fp); man = manifest(fp)
     for n, (w_, who) in want.items():
         got = dump(fp, "extra." + n)

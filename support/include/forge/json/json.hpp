@@ -173,7 +173,7 @@ inline void dump(std::string& o, const value& v) {
     case 1: o += v.b() ? "true" : "false"; break;
     case 2: {
         double d = v.num();
-        if (d == double(std::int64_t(d)) && std::fabs(d) < 1e15) o += std::to_string(std::int64_t(d));
+        if (std::fabs(d) < 1e15 && d == double(std::int64_t(d))) o += std::to_string(std::int64_t(d));   // range first: converting a huge double is undefined
         else { char b[32]; std::snprintf(b, 32, "%.9g", d); o += b; }
         break;
     }

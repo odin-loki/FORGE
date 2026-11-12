@@ -1,0 +1,38 @@
+# Whisper audio encoder (the encoder half of WhisperForConditionalGeneration; the decoder is not imported).
+#   mel     log-mel spectrogram, f32[n_mels, frames] with frames = 2 * n_ctx (30 s = 3000 frames for the released
+#           models), already padded / normalised as the feature extractor does
+#   stem    conv1d(k 3, pad 1) + GELU, conv1d(k 3, stride 2, pad 1) + GELU, then [d_model, n_ctx] -> [n_ctx, d_model]
+#   pos     the checkpoint's (sinusoidal, frozen) position table is added
+#   blocks  pre-LayerNorm transformer blocks, bidirectional attention; the key projection has no bias
+# The output is the encoder state sequence [n_ctx, d_model] (what a decoder cross-attends to).
+# Double-brace placeholders are substituted by `forge import` from config.json.
+blueprint "audio-encoder" opset 3
+
+params {
+  d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
+  head_dim: {{head_dim}}  ffn: {{intermediate_size}}
+  n_mels: {{num_mel_bins}}  n_ctx: {{max_source_positions}}  frames: {{num_frames}}
+}
+
+input mel : f32[n_mels, frames]
+
+op affine(x, w, b) { return linear(x, w) + b }
+
+graph {
+  c = gelu(conv1d(mel, W.conv1_w, W.conv1_b, pad: 1))
+  c = gelu(conv1d(c, W.conv2_w, W.conv2_b, stride: 2, pad: 1))
+  x = transpose(c, [1, 0]) + W.pos_emb
+  repeat l in 0..n_layers {
+    h = layer_norm(x, W.layer[l].norm1_w, W.layer[l].norm1_b, 1e-5)
+    q = heads(affine(h, W.layer[l].wq, W.layer[l].bq), n_heads, head_dim)
+    k = heads(linear(h, W.layer[l].wk), n_heads, head_dim)
+    v = heads(affine(h, W.layer[l].wv, W.layer[l].bv), n_heads, head_dim)
+    x = x + affine(merge(attention(q, k, v, causal: false), d_model), W.layer[l].wo, W.layer[l].bo)
+    h = layer_norm(x, W.layer[l].norm2_w, W.layer[l].norm2_b, 1e-5)
+    x = x + affine({{act}}(affine(h, W.layer[l].w_in, W.layer[l].b_in)), W.layer[l].w_out, W.layer[l].b_out)
+  }
+  states = layer_norm(x, W.post_norm_w, W.post_norm_b, 1e-5)
+}
+
+output states : f32[n_ctx, d_model]
+session embedding

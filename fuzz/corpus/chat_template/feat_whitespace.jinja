@@ -1,0 +1,19 @@
+line1
+  {% if true %}
+    indented body
+  {% endif %}
+  {{ 'expr keeps indentation' }}
+{%- if true %}   lstrip-minus   {%- endif %}
+A {{- ' glued ' -}} B
+{% if true -%}
+     trimmed after
+{%- endif %}
+  {%+ if true %}plus keeps indentation{% endif %}
+{% if true +%}
+plus keeps newline{% endif %}
+{# comment #}
+  {# indented comment #}
+after comments {#- tight -#} end
+{% raw %}{{ not rendered }} {% neither %}{% endraw %}
+{{ '}}' }} {{ "%}" }} {{ {'a': {'b': 1}}['a'] }}{{ '{{' }}
+tail  

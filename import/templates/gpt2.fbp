@@ -1,0 +1,37 @@
+# GPT-2 decoder (gpt2, distilgpt2, DialoGPT and other GPT2LMHeadModel checkpoints): learned absolute positions,
+# pre-LayerNorm blocks with biases, one fused q/k/v projection, GELU MLP, head tied to the token embedding.
+# The importer transposes the checkpoint's Conv1D weights ([in, out]) to the [out, in] layout of `linear`.
+# Double-brace placeholders are substituted by `forge import` from config.json.
+blueprint "decoder-lm" opset 3
+
+params {
+  d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
+  head_dim: {{head_dim}}  vocab: {{vocab_size}}  eps: {{layer_norm_eps}}
+}
+
+state kv[n_layers] : kv_cache(heads: n_heads, dim: head_dim)
+
+input tokens    : f32[seq]
+input positions : f32[seq]
+
+op affine(x, w, b) { return linear(x, w) + b }
+
+graph {
+  x = embed(W.tok_emb, tokens) + embed(W.pos_emb, positions)
+  repeat l in 0..n_layers {
+    h = layer_norm(x, W.layer[l].ln1_w, W.layer[l].ln1_b, eps)
+    c = affine(h, W.layer[l].w_qkv, W.layer[l].b_qkv)
+    q = heads(slice(c, 1, 0, d_model), n_heads, head_dim)
+    k = heads(slice(c, 1, d_model, 2 * d_model), n_heads, head_dim)
+    v = heads(slice(c, 1, 2 * d_model, 3 * d_model), n_heads, head_dim)
+    kk, vv = kv[l].append(k, v)
+    a = attention(q, kk, vv, causal: true)
+    x = x + affine(merge(a, d_model), W.layer[l].wo, W.layer[l].bo)
+    h = layer_norm(x, W.layer[l].ln2_w, W.layer[l].ln2_b, eps)
+    x = x + affine({{act}}(affine(h, W.layer[l].w_fc, W.layer[l].b_fc)), W.layer[l].w_proj, W.layer[l].b_proj)
+  }
+  logits = linear(layer_norm(last(x, seq), W.out_norm_w, W.out_norm_b, eps), W.lm_head)
+}
+
+output logits : f32[1, vocab]
+session generative_sequence

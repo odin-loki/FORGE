@@ -4,12 +4,12 @@
 A `.fpk` file holds everything needed to run a model:
 - a JSON **manifest**,
 - a **blueprint** (the computation graph as text, `modelfile/blueprint.hpp`),
-- a **tokenizer** (Hugging Face style `tokenizer.json`),
+- a **tokenizer** (Hugging Face style `tokenizer.json`) and, when the source had one, the model's **chat template**,
 - a **tensor index** and the **tensor data**, each tensor in one of the weight codecs of `graph/codecs.hpp`.
 
 Every section and every tensor has a BLAKE3 hash. Files can be **signed** (Ed25519) and their tensor data **encrypted** (XChaCha20-Poly1305), both with the vendored Monocypher. Readers memory-map the file. The byte layout is in [format.md](format.md).
 
-Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`. Language models get their blueprint from a template in `import/templates/` (`llama`, `qwen3`, `qwen3_5`, `qwen3_moe`, `qwen3_5_moe`, `mixtral`, `deepseek_v2`). MoE templates use the sparse `moe_ffn` op over stacked expert tensors (`layer.N.experts.w_gate|w_up|w_down`, `[n_experts, rows, k]`), indexed in the `experts` section ([format.md](format.md)); HF Mixtral, DeepSeek-V2 and Qwen3-MoE experts are stacked at import.
+Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`. Models get their blueprint from a template in `import/templates/`: decoders (`llama`, `qwen2`, `qwen3`, `qwen3_5`, `qwen3_moe`, `qwen3_5_moe`, `mixtral`, `deepseek_v2`, `gpt2`, `gemma`, `gemma2`, `gemma3`, `phi3`) and embedding models (`bert`, `vit`, `whisper_encoder`); see [Template families](#template-families-importtemplatesfbp). MoE templates use the sparse `moe_ffn` op over stacked expert tensors (`layer.N.experts.w_gate|w_up|w_down`, `[n_experts, rows, k]`), indexed in the `experts` section ([format.md](format.md)); HF Mixtral, DeepSeek-V2 and Qwen3-MoE experts are stacked at import.
 
 ## API
 ### `modelfile::writer` (`fpk.hpp`)
@@ -38,19 +38,84 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 
 | Header | Contents |
 |--------|----------|
-| `tokenizer.hpp` | `bpe_tokenizer`: `encode(text)`, `decode(ids)`, `decode_one(id)`, `token_id(str)`, `vocab_size()`, `bos()`, `eos()`, `add_bos()` (whether a prompt starts with BOS) |
+| `tokenizer.hpp` | `tokenizer` (`bpe_tokenizer` is the old name for it): see [Tokenizers](#tokenizers) |
 | `sign.hpp` | `generate_keypair()`, `load_secret_key(path)`, `load_public_key(path)`, `sign_file(in, out, key)`, `verify_signature(reader, trusted_keys)` → `signature_report` (`signed_`, `digest_ok`, `trusted`, `valid_keys`, `message`). With no trusted keys, any valid signature counts (integrity only, not provenance) |
 | `bundle.hpp` | Ed25519 over a directory: `sign_bundle(root, key)` writes `FORGE-SIGNATURE.json` (path, size, BLAKE3 per file); `verify_bundle(root, trusted)` re-hashes and reports modified, missing and extra files. Also detached `sign_bytes` / `verify_bytes` |
-| `blueprint.hpp` | `parse_blueprint(text)`: the blueprint language (params, state slots, `repeat` loops, any spec op by name, composites such as `linear`, `embed`, `heads`, user-defined `op name(args) { ... }`, fixed-size state ops `state[i].conv(...)` / `state[i].delta(...)`) |
+| `blueprint.hpp` | `parse_blueprint(text)`: the blueprint language (params, state slots, `repeat` loops, any spec op by name, composites such as `linear`, `embed`, `heads`, user-defined `op name(args, k = default) { ... }` with keyword arguments (see [Writing a template](#writing-a-template)), fixed-size state ops `state[i].conv(...)` / `state[i].delta(...)`) |
 | `entropy.hpp` | OS randomness for keys and nonces |
 
 ## Importers (`modelfile/include/forge/import/`)
 
 | Source | Function, header | Architectures | Weights |
 |--------|------------------|---------------|---------|
-| Hugging Face directory (`config.json`, `*.safetensors`, `tokenizer.json`) | `import_hf`, `hf.hpp` (+ `safetensors.hpp`, `hf_quant.hpp`) | `llama` template: Llama, Mistral, Qwen2. `qwen3`: Qwen3 (QK-norm). `qwen3_5`: Qwen3.5 dense text models (Gated DeltaNet + gated full attention, partial RoPE). `mixtral`: Mixtral MoE. `deepseek_v2`: DeepSeek-V2/V3 (absorbed MLA) | Encoded with `--codec`; mixed precision with `q4_k_m` / `q5_k_m`. AWQ and GPTQ checkpoints keep their codes: [AWQ and GPTQ checkpoints](#awq-and-gptq-checkpoints) |
-| GGUF v2/v3 | `import_gguf`, `gguf.hpp` | `llama`, `mistral`, `qwen2` → `llama`; `qwen3`; `qwen35` → `qwen3_5`; `qwen3moe` → `qwen3_moe`; `qwen35moe` → `qwen3_5_moe` (untested) | Stored in the type the file uses (`--codec keep`, the default), or re-quantised with `--codec C`: [GGUF tensor types](#gguf-tensor-types) |
+| Hugging Face directory (`config.json`, `*.safetensors`, `tokenizer.json` or a SentencePiece `tokenizer.model`, `tokenizer_config.json`) | `import_hf`, `hf.hpp` (+ `safetensors.hpp`, `hf_quant.hpp`, `tokenizer_import.hpp`, `hf_arch.hpp` for the families under Template families) | `llama` template: Llama, Mistral. `qwen2`: Qwen2 / Qwen2.5 (the llama graph plus biases on the Q, K and V projections). `qwen3`: Qwen3 (QK-norm). `qwen3_5`: Qwen3.5 dense text models (Gated DeltaNet + gated full attention, partial RoPE). `mixtral`: Mixtral MoE. `deepseek_v2`: DeepSeek-V2/V3 (absorbed MLA) | Encoded with `--codec`; mixed precision with `q4_k_m` / `q5_k_m`. AWQ and GPTQ checkpoints keep their codes: [AWQ and GPTQ checkpoints](#awq-and-gptq-checkpoints) |
+| GGUF v2/v3 | `import_gguf`, `gguf.hpp` (+ `gguf_arch.hpp`: `gpt2`, `gemma`, `gemma2`, `gemma3`, `phi3`, `bert`) | `llama`, `mistral` → `llama`; `qwen2` → `qwen2` (`attn_q.bias`, `attn_k.bias`, `attn_v.bias`; a `qwen2` file with no bias tensors → `llama`); `qwen3`; `qwen35` → `qwen3_5`; `qwen3moe` → `qwen3_moe`; `qwen35moe` → `qwen3_5_moe` (untested) | Stored in the type the file uses (`--codec keep`, the default), or re-quantised with `--codec C`: [GGUF tensor types](#gguf-tensor-types) |
 | ONNX | `import_onnx`, `onnx.hpp` | Static-shape inference graphs (MLPs, classifiers, encoder blocks) | Initializers become weights |
+
+### What an import checks and records
+- **Every source tensor is accounted for** (Hugging Face and GGUF). A tensor the template does not consume fails the import with a list of names and shapes, because dropping weights silently gives a model that runs and answers wrongly. `--allow-unused` (`import_options::allow_unused`) imports anyway: Hugging Face leftovers are left out, GGUF leftovers are kept as `extra.<name>`, and both are listed in `import_report::unused`. `--ignore-tensor` (`import_options::ignore_tensors`) names leftovers that are known to be harmless; `position_ids`, `masked_bias` and `inv_freq` buffers and the vision / multi-token-prediction towers of Qwen3.5 checkpoints are always skipped.
+- **Every tensor the template reads exists.** A missing source tensor fails with its name. After the last tensor the importer compares `blueprint_weights(bp)` with what it wrote, in both directions, so a `--template` that does not fit the checkpoint is refused.
+- **RoPE frequency scaling** is read from `config.json` (`rope_scaling`, or `rope_parameters` in transformers 5; types `linear`, `dynamic`, `yarn`, `llama3`) and from GGUF (`<arch>.rope.scaling.type` `linear` / `yarn` with `.factor`, `.original_context_length`, `.attn_factor`, `.yarn_attn_factor`, `.yarn_log_multiplier`, `.yarn_ext_factor`, `.yarn_beta_fast`, `.yarn_beta_slow`; the llama3 factors that llama.cpp's converter stores as the `rope_freqs.weight` tensor). It becomes attrs of the `rope` op and, for YaRN's attention factor, `attention`'s `scale`. LongRoPE and unknown types are refused. Templates `llama`, `qwen2`, `qwen3`, `qwen3_moe` and `mixtral` take scaling; `deepseek_v2`, `qwen3_5` and `qwen3_5_moe` refuse a model that asks for it.
+- **The licence** is recorded: Hugging Face `README.md` front matter (`license`, `license_name`, `license_link`) and the text of `LICENSE*` / `LICENCE*` / `COPYING*` / `NOTICE*` files (up to 1 MiB each); GGUF `general.license`, `general.license.name`, `general.license.link`; ONNX `metadata_props` (`license`, `license_name`, `license_url`) and a `doc_string` that mentions a licence. It goes into the manifest and the `license` section ([format.md](format.md)), `forge inspect` shows it, and signing and encrypting keep it. A source that states no licence gives a file without these fields; the importer does not guess.
+
+### Opsets
+A blueprint declares `opset N` (default 1). This engine runs `modelfile::opset_min` to `opset_max` (1 to 3; 2 added RoPE scaling attrs, 3 the spatial and encoder op families, composite defaults / keyword arguments and `session embedding`). `build_graph` and `inference::model` refuse any other opset with an error that names it and the supported range; an op the engine does not know is reported with its name, line and the blueprint's opset. Opset 2 adds the `rope` attrs `scaling`, `factor`, `orig_ctx`, `low_freq`, `high_freq`, `beta_fast`, `beta_slow`, `truncate` and `freq_factors` (`ops/include/forge/ops/rope.hpp`). The importers write opset 2 only for models that scale their RoPE frequencies; every other import stays opset 1 with the same graph as before. Builds older than this check ignore the opset and unknown attrs, so an opset-2 file gives wrong output there.
+
+Template placeholders are `{{key}}`, or `{{key|default}}` for optional pieces (`{{rope_args|}}`, `{{attn_args|}}`, `{{opset|1}}`).
+
+### Template families (`import/templates/*.fbp`)
+
+| Template | Session | HF `architectures` / `model_type` | GGUF `general.architecture` | What the template encodes |
+|----------|---------|-----------------------------------|-----------------------------|---------------------------|
+| `llama` | generative | `LlamaForCausalLM`, `MistralForCausalLM`, `Qwen2ForCausalLM`, `model_type` `llama` (Llama 2/3, TinyLlama, SmolLM, Yi, Zephyr, Mistral 7B) | `llama`, `mistral`, `qwen2` | RMSNorm, RoPE, GQA, SwiGLU. Mistral 7B v0.1's `sliding_window` is not applied |
+| `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `mixtral`, `deepseek_v2` | generative | see the importer table above | see above | QK-norm; sparse MoE; Gated DeltaNet hybrid; absorbed MLA |
+| `gpt2` | generative | `GPT2LMHeadModel`, `gpt2` | `gpt2` | learned positions, LayerNorm with biases, fused q/k/v projection, Conv1D weights transposed on import, tied head |
+| `gemma` | generative | `GemmaForCausalLM`, `gemma` | `gemma` | RMSNorm `(1 + w)` (stored as `1 + w`), embeddings scaled by `sqrt(d)`, GeGLU (GELU-tanh), tied head |
+| `gemma2` | generative | `Gemma2ForCausalLM`, `gemma2` | `gemma2` | + pre and post norms, `query_pre_attn_scalar`, attention soft-capping (`attention_bias`), sliding window on every other layer, soft-capped logits. Needs the f32 KV cache |
+| `gemma3` | generative | `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` (text tower only), `gemma3_text` | `gemma3` | + QK-norm, sliding-window pattern with a local RoPE base |
+| `phi3` | generative | `Phi3ForCausalLM`, `phi3` (Phi-3 / 3.5 mini, Phi-4-mini) | `phi3` | fused `qkv_proj`, fused `gate_up_proj`, partial RoPE (`partial_rotary_factor`) |
+| `bert` | embedding | `BertModel` and heads, `bert`; `RobertaModel`, `XLMRobertaModel`, `roberta`, `xlm-roberta` (MiniLM, BGE, E5, GTE checkpoints use these) | `bert` | token + position + type embeddings, post-LN blocks, key padding mask, CLS or mean pooling (+ L2) taken from `1_Pooling/config.json` / `modules.json`, or `forge_pooling` / `forge_normalize` in `config.json` |
+| `vit` | embedding | `ViTModel`; `CLIPVisionModel(WithProjection)`, `CLIPModel` (vision tower); `SiglipVisionModel`, `SiglipModel` (vision tower) | none | conv2d patch embedding, class token (ViT, CLIP), pre-LN blocks; output: LayerNorm of the class token (ViT), that times the visual projection (CLIP), or the attention-pooling head (SigLIP) |
+| `whisper_encoder` | embedding | `WhisperForConditionalGeneration`, `WhisperModel`, `whisper` | none | two conv1d + GELU, the checkpoint's sinusoidal positions, pre-LN blocks; output: encoder states `[n_ctx, d_model]`. The decoder is not imported |
+
+`--template NAME` forces a template; `clip_vision`, `siglip_vision` and `roberta` select those variants of `vit` / `bert`.
+
+Not available: Phi-2, Mamba, UNet / DiT denoisers, the Whisper decoder (no template yet); Phi-3 LongRoPE (128k variants) is refused. Tokenizers: the runtime tokenizer is byte-level BPE. A `tokenizer.json` of another kind (WordPiece, Unigram) is stored in the section `tokenizer_json` (manifest `tokenizer_type`) and not used, so such models take token ids (`forge embed --tokens`). SentencePiece-BPE files (Gemma, Phi-3) are stored as the tokenizer but not encoded exactly; use token ids for them too.
+
+### Writing a template
+A template is a blueprint with `{{key}}` placeholders that the importer fills from `config.json` (numbers, or a string such as an op name or a whole expression). The language (`blueprint.hpp`):
+
+```
+blueprint "decoder-lm" opset 1
+params { d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  rope: { base: {{rope_theta}} } }   # numbers, nested groups
+state kv[n_layers] : kv_cache(heads: n_kv, dim: head_dim)        # per-session state slots
+input tokens : f32[seq]                                          # `seq` is bound per run; other dims are params or numbers
+op affine(x, w, b) { return linear(x, w) + b }                   # composite op, see below
+graph {
+  x = embed(W.tok_emb, tokens) * sqrt(d_model)                   # W.<path> names a tensor of the file
+  repeat l in 0..n_layers {                                      # unrolled when the graph is built
+    local = min(1, mod(l + 1, pattern))                          # numbers are folded: per-layer attrs
+    h = rms_norm(x, W.layer[l].attn_norm, eps)                   # any spec op by name; numbers / lists bind to its attrs in order
+    kk, vv = kv[l].append(k, v)
+    a = attention(q, kk, vv, causal: true, window: window * local)   # or by keyword
+  }
+}
+output logits : f32[1, vocab]
+session generative_sequence                                      # or: embedding, one_shot
+```
+
+Built-ins: `linear(x, W)` (`x @ W^T`), `embed(W, ids)`, `heads(x, n, d)`, `merge(x, d)`, `last(x, seq)`, `scalar(v)` (a `[1]` constant tensor), and the number helpers `sqrt floor ceil min max mod` (folded at build time when every argument is a number).
+
+**Composite ops.** `op name(a, b, eps = 1e-6) { t = ...  return expr }` at the top level defines an op as a composition of existing ones; it is called like any op, by position or by keyword (`name(x, y)`, `name(x, y, eps: 1e-5)`). Rules:
+- Composites are inlined into the graph where they are called, so they cost nothing at run time and the optimiser sees through them.
+- Parameters are tensors, weight paths (`W.layer[l].wq`), numbers or lists. A parameter may have a numeric default; parameters without one must come first. A wrong argument count, an unknown or repeated keyword, and a body without `return` are errors that name the op and the line.
+- A body sees its parameters, the blueprint's params and the names in scope at the call; its own assignments are local.
+- Recursion is forbidden: `parse_blueprint` rejects a composite that reaches itself, directly or through other composites (`composite op 'f' is recursive (f -> g -> f)`), whether or not it is called.
+- A spec op or built-in of the same name wins, so a file that defines `op mish(x) { ... }` keeps working on an engine without `mish` and uses the engine's kernel on one that has it.
+- Shapes are checked after inlining, by the graph verifier (`node %12 (matmul_t): ...`), not per composite.
+- The blueprint text is the canonical form: it is stored verbatim in the `.fpk` and parsed again on load, so there is no separate serialised form to keep in step.
+
+To add an architecture: write the template, map its `architectures` / `model_type` to it and its tensors to the template's `W.` names in `hf_arch.hpp` (one short function per family; see `import_gpt2`), and add a `verify/golden/tiny_<arch>.py` that builds a random tiny checkpoint and compares FORGE with a numpy forward pass.
 
 Importer limits that raise an error:
 - HF `deepseek_v2`: no YaRN rope scaling, greedy top-k routing with softmax scoring only.
@@ -100,16 +165,48 @@ A Hugging Face directory whose `config.json` has `quantization_config.quant_meth
 - The manifest gets `source_quantisation` (`{method, bits, group_size, linears, stored_as_grouped_codec, mode}`).
 - **Verified only against a self-written packer.** The layouts above are implemented from the two exporters' documented formats and tested (`golden_hf_quant`, `test_modelfile`) against checkpoints produced by a NumPy packer written from the same description. No checkpoint written by AutoAWQ, AutoGPTQ or GPTQModel has been imported; if either layout is misread, the import still succeeds and the model computes with wrong weights. Compare a few logits with the exporter's own runtime before relying on such an import.
 
+## Tokenizers
+`modelfile::tokenizer` (`tokenizer.hpp`) reads the `tokenizer` section, a Hugging Face `tokenizer.json`, and runs the `tokenizers` pipeline stage by stage:
+
+| Stage | Supported |
+|-------|-----------|
+| Added tokens | `special`, `normalized`, `lstrip`, `rstrip`, `single_word`; leftmost match, the longest at that position. Tokens with `normalized: false` are found in the raw text, the others in the normalized text |
+| Normalizer | `NFC` `NFD` `NFKC` `NFKD` `Lowercase` `Strip` `StripAccents` `Replace` `Prepend` `Nmt` `BertNormalizer` `Precompiled` (SentencePiece charsmap) `Sequence` |
+| Pre-tokenizer | `ByteLevel` (`add_prefix_space`, `use_regex`) `Split` (string or regex, every `behavior`, `invert`) `Whitespace` `WhitespaceSplit` `Punctuation` `Digits` `Metaspace` (`prepend_scheme`, `split`) `BertPreTokenizer` `CharDelimiterSplit` `Sequence` |
+| Model | `BPE` (merges, `unk_token`, `fuse_unk`, `byte_fallback`, `ignore_merges`, `continuing_subword_prefix`, `end_of_word_suffix`), `WordPiece`, `Unigram` (Viterbi, `byte_fallback`), `WordLevel`, and the FORGE model type `SentencePieceBPE` (SentencePiece's score-driven BPE; see [format.md](format.md#tokenizer-section)) |
+| Post-processor | `TemplateProcessing` (single sequence), `BertProcessing`, `RobertaProcessing`, `ByteLevel`, `Sequence` |
+| Decoder | `ByteLevel` `Metaspace` `WordPiece` `BPEDecoder` `ByteFallback` `Fuse` `Strip` `Replace` `Sequence` |
+
+Anything else in a `tokenizer.json` (another component type, a regex the engine cannot compile) raises `unsupported` when the tokenizer is built, with the name of the component; nothing is skipped silently. Patterns are compiled by `forge::os::text::regex` in its Oniguruma dialect, and Unicode classes, normalization forms and grapheme clusters come from the same library (`forge_text`, which `forge_modelfile` links; Unicode 16).
+
+| Member | Notes |
+|--------|-------|
+| `encode(text)` | Ids without BOS / EOS. Added tokens written in the text (`<|im_start|>`) become their ids. Input that is not valid UTF-8 is read with U+FFFD for the bad bytes |
+| `encode(text, true)`, `with_special(ids)` | Also what the model expects around a prompt: BOS / EOS per `add_bos()` / `add_eos()` when the session set them from the manifest, else the `tokenizer.json` post-processor (`[CLS] … [SEP]`, `<s> …`) |
+| `decode(ids, skip_special = false)` | The decoder chain over the whole sequence. Bytes of an incomplete UTF-8 character are passed through, not replaced |
+| `decode_one(id)` | The bytes one token adds in the middle of a text (streaming, grammar masks). It differs from `decode` where the decoder looks at the position: a SentencePiece word keeps its leading space, WordPiece puts a space before each word-initial piece |
+| `token_id(str)`, `id_to_token(id)`, `is_special(id)`, `vocab_size()`, `type()`, `bos()`, `eos()`, `unk()`, `add_bos()`, `add_eos()`, `has_post_processor()` | |
+| `normalize(text)`, `pre_tokenize(text)` | The first two stages on their own, for debugging a mismatch |
+
+Sources other than a ready `tokenizer.json` are converted to one at import (`import/tokenizer_import.hpp`):
+
+- **SentencePiece `.model`** (`tokenizer.model`, `spiece.model`, `sentencepiece.bpe.model` in a Hugging Face directory without `tokenizer.json`): read with a small protobuf reader. BPE models become `SentencePieceBPE`, unigram models `Unigram`; the model's normalization (precompiled charsmap, whitespace collapsing, dummy prefix) becomes the normalizer chain, and control / user-defined pieces plus `tokenizer_config.json`'s `added_tokens_decoder` become added tokens.
+- **GGUF** `tokenizer.ggml.model`: `gpt2` → byte-level BPE split by the regex of `tokenizer.ggml.pre` (`llama-bpe`, `qwen2`, `deepseek-llm`, `deepseek-coder`, `deepseek-v3`, `gpt-2`, `tekken`, `gpt-4o`, `falcon`, `starcoder`, … as in llama.cpp; an unknown name falls back to GPT-2's with a warning); `llama` → `SentencePieceBPE` over `tokenizer.ggml.scores`; `t5` → `Unigram` (with `precompiled_charsmap`, `remove_extra_whitespaces`); `bert` → `WordPiece`. `tokenizer.ggml.token_type` 3 (control) and 2 (unknown) become special added tokens, 4 (user-defined) plain added tokens, 6 (byte) switches byte fallback on. `add_bos_token` / `add_eos_token` go to the manifest, `add_space_prefix` into the normalizer. A `tokenizer.huggingface.json` key is used as it is. Other models (`rwkv`, …) give a file without a tokenizer, with a warning.
+
+How this is tested, and what is not: `tests/test_tokenizer.cpp` compares ids, normalizer and pre-tokenizer output and decoded text with goldens made by the `tokenizers` 0.23 and `sentencepiece` 0.2 packages (`tests/data/tokenizer/make_fixtures.py`) for small tokenizers trained on a multilingual corpus (ASCII, digit runs, CJK, emoji, combining marks, right-to-left text, mixed whitespace, control characters, invalid UTF-8). It has not been run against the tokenizers of full-size published models. The llama.cpp pre-tokenizer regexes and its BERT conventions were written from memory of llama.cpp and are only checked for `llama-bpe`, `qwen2` and `gpt-2` (against `tokenizers`) and on ASCII text for `bert`. llama.cpp's per-model token attributes (`lstrip` / `rstrip` on some special tokens) are not carried over. Unicode tables are FORGE's (Unicode 16); a reference built against another Unicode version can differ on characters assigned in between.
+
+The **chat template** (`tokenizer_config.json` `chat_template`, `chat_template.jinja`, or GGUF `tokenizer.chat_template`) is stored as the `chat_template` section and rendered by `inference::apply_chat_template` ([inference.md](inference.md#chat-templates-chat_templatehpp)).
+
 ### Mixed precision (HF only, `quant_recipe.hpp`)
 `--codec q4_k_m` or `q5_k_m` chooses a type per tensor. `--recipe llama` is a port of llama.cpp's `llama_tensor_get_type()` rules. `--recipe forge` (default) applies the same rules, then puts Gated DeltaNet in/out projections and `attn_output` at q6_k and the head and token embedding at q8_0 (bf16 with `--bf16-head`). Norms, conv weights, A/dt and the a/b gates stay f32. Overrides: `--output-tensor-type`, `--token-embedding-type`, `--tensor-type REGEX=TYPE[,...]` (first match wins), `--pure`.
 
 ### CLI
 ```sh
-forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME] [--emb-codec C]
+forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME] [--emb-codec C] [--allow-unused] [--ignore-tensor NAME[,NAME...]]
 ```
-Codecs: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2 q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0`, or `keep`. With a quantised codec, the token embedding defaults to q8_0 (`--emb-codec` overrides). `--codec` defaults to `f32` for plain Hugging Face checkpoints and to `keep` for GGUF files and AWQ / GPTQ checkpoints. `forge run` also accepts an HF directory or `.gguf` directly and caches the import in `~/.cache/forge`.
+Codecs: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2 q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0`, or `keep`. With a quantised codec, the token embedding defaults to q8_0 (`--emb-codec` overrides). `--codec` defaults to `f32` for plain Hugging Face checkpoints and to `keep` for GGUF files and AWQ / GPTQ checkpoints. `forge run` also accepts an HF directory or `.gguf` directly and caches the import in `~/.cache/forge` (`--allow-unused` applies to that import too).
 
-The importers are tested on small random models built by the test scripts (`verify/golden/tiny_llama.py`, `tiny_moe.py`, `tiny_qwen3.py` (HF and GGUF), `tiny_qwen3_5.py`, `quant_inplace.py`, `gguf_types.py`, `hf_quant.py`, `tests/onnx_test.py`), checked against float64 NumPy or transformers references. `gguf_types.py` imports a model in every loadable GGUF tensor type and compares the tensors with gguf-py's dequantisation and the logits with a forward pass over the dequantised weights. They have not been checked against full-size published checkpoints in the test suite.
+The importers are tested on small random models built by the test scripts (`verify/golden/tiny_llama.py`, `tiny_moe.py`, `tiny_qwen2.py` (HF and GGUF), `tiny_rope.py` (RoPE scaling variants, HF and GGUF), `tiny_qwen3.py` (HF and GGUF), `tiny_qwen3_5.py`, `quant_inplace.py`, `gguf_types.py`, `hf_quant.py`, `tests/onnx_test.py`, and for the template families `tiny_gpt2.py`, `tiny_gemma.py`, `tiny_phi3.py`, `tiny_bert.py` (HF and GGUF each), `tiny_vit.py`, `tiny_whisper.py`), checked against float64 NumPy or transformers references. `gguf_types.py` imports a model in every loadable GGUF tensor type and compares the tensors with gguf-py's dequantisation and the logits with a forward pass over the dequantised weights. They have not been checked against full-size published checkpoints in the test suite. The RoPE scaling references are NumPy transcriptions of `transformers/modeling_rope_utils.py`; they have not been run against transformers or llama.cpp themselves.
 
 ## Examples
 `docs/examples/modelfile_roundtrip.cpp` (ctest `doc_example_modelfile_roundtrip`):

@@ -121,6 +121,26 @@ static void regex() {
     CHECK(rx("[[:alpha:]]+\\d").match("abc1"));
     EQ(rx("").find_all("ab").size(), 3u);
     EQ(rx("x*").replace("abc", "-"), std::string("-a-b-c-"));
+    // scoped inline flags, lookbehind, counted classes, the Ruby dialect and find_spans (what tokenizer.json patterns use)
+    CHECK(rx("(?i:'s|'t)x").match("'Sx") && !rx("(?i:'s|'t)x").match("'SX"));
+    CHECK(rx("a(?i)b").match("aB") && !rx("a(?i)b").match("AB"));
+    CHECK(rx("(a(?i)b)c").match("aBc") && !rx("(a(?i)b)c").match("aBC"));
+    CHECK(rx("(?i)a(?-i)b").match("Ab") && !rx("(?i)a(?-i)b").match("AB"));
+    CHECK(rx("(?<=a)b").search("ab") && !rx("(?<=a)b").search("cb") && rx("(?<!a)b").search("cb") && !rx("(?<!a)b").search("ab"));
+    EQ(rx("(?<=\\d{2})x").search("1x 22x")->begin(), 5u);
+    CHECK(rx("(?>a+)b").match("aab"));
+    {
+        auto sp = rx("\\p{N}{1,3}").find_spans("12345 6");
+        EQ(sp.size(), 3u); EQ(sp[0].second, 3u); EQ(sp[1].second, 5u); EQ(sp[2].first, 6u);
+        auto g = rx("'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+").find_spans("it's  \xC3\xA9t\xC3\xA9 42!");
+        EQ(g.size(), 6u);   // "it" "'s" " " " été" " 42" "!"
+        EQ(g[2].second - g[2].first, 1u); EQ(g[3].first, 5u);
+        EQ(rx("").find_spans("ab").size(), 3u);
+    }
+    EQ(rx("\\s+$", "R").find_spans("a  \nb \n").size(), 2u);
+    CHECK(rx("a.b", "R").match("a\nb") == std::nullopt); CHECK(rx("(?m)a.b", "R").match("a\nb"));
+    CHECK(!t::regex::compile(std::string(400, '(') + std::string(400, ')')));
+    CHECK(!t::regex::compile("(?z)a"));
 }
 static void console() {
     t::text_style st; st.bold = true; st.fg = t::rgb{255, 0, 0};

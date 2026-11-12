@@ -5,6 +5,7 @@
 #include <forge/script/check.hpp>
 #include "vm.hpp"
 #include "fsc.hpp"
+#include "aot.hpp"
 #include <forge/os/fs.hpp>
 #include "monocypher.h"
 #include "monocypher-ed25519.h"
@@ -80,6 +81,7 @@ struct engine::impl {
             if (refuse) { r.ok = false; r.exit_code = 2; r.error_type = "StaticCheckError"; r.line = ds.front().line;
                 r.error = "StaticCheckError: script refused by static checks (forge script --check for details)\n" + to_text(ds); return r; }
         }
+        aot::bind_program(top, name);   // AOT binaries: attach the natively compiled bodies (aot.hpp); a no-op elsewhere
         sh->keep.push_back(top);
         sh->start_ns = os::monotonic_ns();
         in->deadline_ns = sh->limits.timeout_ms ? sh->start_ns + sh->limits.timeout_ms * 1000000 : 0;

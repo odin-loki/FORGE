@@ -74,9 +74,9 @@ TEST(vision_resize_colour_nms) {
     auto k = vision::nms(b, {0.9f, 0.8f, 0.7f, 0.95f}, 0.5f); CHECK((k == std::vector<std::size_t>{3, 2}));
 }
 TEST(prof_chrome_trace) {
-    auto& r = prof::recorder::get(); r.clear(); { FORGE_ZONE("off"); } CHECK(r.ev.empty());
+    auto& r = prof::recorder::get(); r.clear(); { FORGE_ZONE("off"); } CHECK(r.events().empty());
     r.on = true; { FORGE_ZONE("outer"); { FORGE_ZONE("in\"ner"); } } r.on = false;
-    CHECK(r.ev.size() == 2);
+    CHECK(r.events().size() == 2);
     auto j = json::parse(r.chrome_json()); CHECK(j["traceEvents"].arr().size() == 2);
     CHECK(j["traceEvents"][0]["name"].str() == "in\"ner"); CHECK(j["traceEvents"][1]["ph"].str() == "X");
 }

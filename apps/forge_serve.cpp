@@ -1,6 +1,6 @@
 // forge-serve — OpenAI-compatible HTTP server over the continuous-batching scheduler.
 //
-//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill] [--policy F]   (see docs/serve.md)
+//   forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--allow-unused] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill] [--policy F]   (see docs/serve.md)
 //
 //   GET  /health                 -> {"status":"ok"}
 //   GET  /v1/models              -> model list
@@ -157,11 +157,19 @@ private:
         std::vector<int> prompt;
         if (chat) {
             if (!tok) raise(errc::unsupported, "chat needs a tokenizer");
-            std::string text;
-            for (auto& msg : j["messages"].arr()) text += msg.str_or("role", "user") + ": " + msg.str_or("content", "") + "\n";
-            text += "assistant:";
-            prompt = tok->encode(text);
-            if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
+            if (!m_->chat_template().empty()) {   // the model's own chat template; it writes BOS and the role markers itself
+                inference::chat_options co;
+                if (auto* t = j.find("tools"); t && t->is_arr()) co.tools = *t;
+                if (auto* a = j.find("add_generation_prompt"); a && a->is_bool()) co.add_generation_prompt = a->b();
+                if (auto* k = j.find("chat_template_kwargs"); k && k->is_obj()) co.extra = *k;
+                prompt = tok->encode(inference::apply_chat_template(*m_, j["messages"], co));
+            } else {                              // a file without one: "<role>: <content>" lines
+                std::string text;
+                for (auto& msg : j["messages"].arr()) text += msg.str_or("role", "user") + ": " + msg.str_or("content", "") + "\n";
+                text += "assistant:";
+                prompt = tok->encode(text);
+                if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
+            }
         } else {
             auto& p = j["prompt"];
             if (p.is_arr()) for (auto& x : p.arr()) prompt.push_back(int(x.num()));
@@ -341,7 +349,7 @@ int run_proxy(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc >= 2 && std::string(argv[1]) == "proxy") return run_proxy(argc, argv);
     if (argc < 2 || argv[1][0] == '-') {
-        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill] [--policy F]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
+        std::puts("usage: forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx N] [--codec f32] [--allow-unused] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue N] [--kv-spill] [--policy F]\n       forge-serve proxy --backend host:port [...] [--mode l4|l7] [--strategy p2c|rr|wrr|lc|ewma|hash|kv] [--port 8080]");
         return 2;
     }
 #if !defined(_WIN32)
@@ -362,7 +370,7 @@ int main(int argc, char** argv) {
         namespace fs = std::filesystem;
         if (fs::is_directory(path) || path.ends_with(".gguf")) {   // import into a temp .fpk
             auto out = (fs::temp_directory_path() / (fs::path(path).filename().string() + ".serve.fpk")).string();
-            import::import_options o; o.codec = arg(argc, argv, "codec", "f32");
+            import::import_options o; o.codec = arg(argc, argv, "codec", "f32"); o.allow_unused = has_flag(argc, argv, "allow-unused");
             o.requant = arg(argc, argv, "codec", "keep");   // GGUF / AWQ / GPTQ inputs keep their stored quantisation unless a codec is given
             if (o.codec == "keep") o.codec = "f32";
             if (path.ends_with(".gguf")) import::import_gguf(path, out, o); else import::import_hf(path, out, o);

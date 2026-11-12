@@ -14,7 +14,7 @@
 
 ```
 forge-serve <model.fpk|hf_dir|model.gguf> [--host 127.0.0.1] [--port 8080] [--max-active 8] [--ctx 0]
-            [--codec f32] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0] [--kv-spill]
+            [--codec f32] [--allow-unused] [--watch] [--no-pin] [--numa-node N] [--mem-limit 6G|75%|off] [--max-queue 0] [--kv-spill]
             [--policy FILE]
 forge-serve proxy --backend HOST:PORT [...] [--policy FILE]   # see loadbalancer.md
 ```
@@ -25,6 +25,7 @@ forge-serve proxy --backend HOST:PORT [...] [--policy FILE]   # see loadbalancer
 | `--max-active` | 8 | Sequences decoded together (`batch_options::max_active`) |
 | `--ctx` | 0 | KV context per request; 0 = the model's maximum |
 | `--codec` | `f32` | Weight codec for the import of a HF directory or `.gguf`; ignored for `.fpk` |
+| `--allow-unused` | off | Import a HF directory or `.gguf` although it has tensors the template does not use (without it the import fails and lists them; [modelfile.md](modelfile.md#what-an-import-checks-and-records)) |
 | `--mem-limit` | `FORGE_MEM_LIMIT`, else 85% of RAM or the cgroup limit | Host memory budget (`6G`, `512M`, `75%`; `0`/`off` disables). Under it the scheduler reports live KV bytes, evicts cached prefixes, and keeps new requests queued while the budget is over its soft watermark, so a tight limit runs requests one at a time instead of failing. See [memory.md](memory.md) |
 | `--max-queue N` | 0 (no cap) | Once N requests are waiting, new ones get `503` with `Retry-After: 1` |
 | `--kv-spill` | off | Cached prefixes evicted from memory are written to the spill directory (`FORGE_MEM_SPILL_DIR`, capped by `FORGE_MEM_SPILL_MAX`) and read back when a new prompt shares them, instead of being recomputed. Up to 64 prefixes. The files are encrypted under a key held only in memory unless `FORGE_MEM_SPILL_ENCRYPT=0` ([memory.md](memory.md)) |
@@ -69,7 +70,8 @@ The method is only checked on the completion endpoints (`405` otherwise). Other 
 |---|---|---|
 | `prompt` (completions) | required | A string (BOS is prepended if the tokenizer has one) or a list of token ids (sent as is) |
 | `add_bos` (completions) | absent | With a string prompt: `false` skips the BOS |
-| `messages` (chat) | required | `[{role, content}]`. There is no chat template: the prompt is `"<role>: <content>\n"` per message plus `"assistant:"`, with BOS prepended |
+| `messages` (chat) | required | `[{role, content}]` (plus whatever the template reads: `tool_calls`, `tool_call_id`, …). Rendered with the model's own chat template when the file has one (the `chat_template` section, from `tokenizer_config.json` or GGUF `tokenizer.chat_template`); the template writes BOS and the role markers, and special tokens in its output become their ids. A file without a template gets the old prompt: `"<role>: <content>\n"` per message plus `"assistant:"`, with BOS prepended |
+| `tools`, `add_generation_prompt`, `chat_template_kwargs` (chat) | none, true, none | Passed to the template: the OpenAI tool list (templates print it with `tojson`), whether the prompt ends with the assistant header, and an object of extra template variables (`{"enable_thinking": false}`). The reply is plain text: tool calls in it are not parsed back into `tool_calls` |
 | `max_tokens` | 16 | |
 | `temperature` | 0 | Greedy by default |
 | `top_k`, `top_p`, `min_p`, `typical_p` | 0, 1, 0, 1 | |

@@ -8,6 +8,9 @@
 // residency protocol, recorded graphs (replayed by re-appending to the immediate command list), multi-device
 // by ordinal (all devices of all drivers), host-staged copies between runtimes.
 #include <forge/gpu/cuda.hpp>
+#include <forge/gpu/portable_kernels.hpp>
+#include <forge/gpu/kernel_cache.hpp>
+#include <set>
 #include <level-zero/ze_api.h>
 #include <forge/core/dl.hpp>
 #include <cstring>
@@ -21,7 +24,8 @@
 namespace forge::gpu::ze {
 
 using cuda_hip::sig;
-class runtime {
+class runtime : public portable_kernels<runtime> {
+    friend class portable_kernels<runtime>;
 public:
     static int device_count() { runtime p; if (!p.load_lib().empty() || p.f_.init(0) != 0) return 0; return int(p.all_devices().size()); }
     static std::unique_ptr<runtime> open(std::string* why = nullptr, int ordinal = 0) {
@@ -34,6 +38,7 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(ctx_, e.d); res_.clear(); } catch (...) {}
+        for (auto& [k, q] : qres_) f_.free_(ctx_, q.mem);
         for (auto p : keep_) f_.free_(ctx_, p);
         for (auto& [n, k] : kern_) f_.kernel_destroy(k);
         if (mod_) f_.module_destroy(mod_);
@@ -44,9 +49,15 @@ public:
     const char* backend() const { return "level_zero"; }
     int ordinal() const { return ordinal_; }
     const std::string& device_name() const { return name_; }
+    // For automatic device selection (gpu/select.hpp): ze_device_properties_t type and the INTEGRATED flag.
+    gpu::device_class device_class() const { return software_name(name_) || cpu_type_ ? gpu::device_class::software : integrated_ ? gpu::device_class::integrated : gpu::device_class::discrete; }
     const std::string& image_arch() const { static const std::string s = "spirv"; return s; }
     bool has_graphs() const { return true; }
     bool has_streams() const { return true; }
+    // Native module binary cache (gpu/kernel_cache.hpp; $FORGE_GPU_KERNEL_CACHE=0 off): true when open() created the
+    // module from the cached native binary (zeModuleGetNativeBinary) instead of compiling the SPIR-V.
+    bool program_from_cache() const { return from_cache_; }
+    const std::string& kernel_cache_path() const { return cache_path_; }
     std::map<std::string, std::size_t> dispatches() { std::lock_guard lk(mu_); return dispatches_; }
     struct mem_info { std::size_t free = 0, total = 0; };
     mem_info memory() { mem_info m; m.total = total_; m.free = total_ > stats_.resident_bytes ? total_ - stats_.resident_bytes : 0; return m; }
@@ -83,6 +94,20 @@ public:
         std::vector<std::uintptr_t> ks;
         each_overlap(p, n, [&](entry& e) { if (!e.host_valid) download(e); ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         sync(); for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        // the range is going away (or being replaced): its pins go too, or a later buffer at the same address and size
+        // would inherit one and outlive its run as a stale resident entry
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
+    }
+    // [p, p+n) is going away for good (a plan's constants, a state slot): drop every overlapping device copy without
+    // fetching it and the pin records inside the range. Without this a later host buffer at the same address would
+    // inherit the pin or be taken for a sub-range of the stale entry, and that entry's next sync-back would write
+    // its old size over the new buffer (graph::plan::~plan calls it through device_hooks::forget).
+    void forget(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_); sync();
+        std::vector<std::uintptr_t> ks;
+        each_overlap(p, n, [&](entry& e) { ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
+        for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
     }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); if (!n) return;
@@ -109,9 +134,20 @@ public:
     bool run_op(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) {
         std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
         if (!cuda_hip::supports(op, ss, a)) return false;
+        if (op == "attention") if (int r = attention_port(in, a, out); r >= 0) return true;   // one-pass / split-K kernels
         auto L = cuda_hip::kernel_args(op, in, a, out);
         std::lock_guard lk(mu_); begin_op();
         ++dispatches_[op];
+        // Settle the residency map before binding anything: acquiring a range that partly overlaps a resident entry
+        // drops that entry (after syncing it back), and an input bound earlier in this same launch may live inside
+        // it (an activation inside a stale larger entry of the reused arena, then an output that overlaps the same
+        // entry). Its handle would then be freed while the kernel still uses it. After this pass every range has
+        // its entry, so the binds below only hit the cache.
+        if (in_run_) {
+            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+            acquire(out.data, out.size(), true);
+            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+        }
         launch l; l.kernel = kernel("forge_" + op); l.global = L.threads;
         std::vector<void*> temps;
         auto free_temps = [&] { for (auto p : temps) dfree(p); };
@@ -145,6 +181,75 @@ private:
     struct launch { ze_kernel_handle_t kernel = nullptr; std::uint32_t global = 0; std::vector<arg> args; };
     struct entry { float* host; std::size_t count; void* d; bool host_valid = true, pinned = false; std::uint64_t last = 0; };
     struct bound { entry* e; void* ptr; };
+    // ---- kernel-call builder for portable_kernels<> (gpu/portable_kernels.hpp); mu_ held ----
+    struct kcall {
+        launch l; std::vector<void*> temps;
+        struct rd_t { void* d; float* h; std::size_t bytes; }; std::vector<rd_t> rd;   // outputs to read back (outside a run)
+    };
+    struct qentry { void* mem = nullptr; std::size_t bytes = 0; std::uint64_t last = 0; };
+    void k_touch(const float* h, std::size_t cnt, int mode) { if (in_run_) acquire(const_cast<float*>(h), cnt, mode == 1); }
+    entry* k_buf(kcall& c, const float* h, std::size_t cnt, int mode) {   // mode 0 in, 1 out, 2 in/out
+        void* dv; entry* ent = nullptr;
+        if (in_run_) { auto b = acquire(const_cast<float*>(h), cnt, mode == 1); if (mode) b.e->host_valid = false; dv = b.ptr; ent = b.e; }
+        else {
+            dv = alloc(cnt * 4, "scratch"); c.temps.push_back(dv);
+            if (mode != 1) copy(dv, h, cnt * 4);
+            if (mode) c.rd.push_back({dv, const_cast<float*>(h), cnt * 4});
+        }
+        c.l.args.push_back({dv, 0, false}); return ent;
+    }
+    void k_dev(kcall& c, void* p) { c.l.args.push_back({p, 0, false}); }
+    void k_u32(kcall& c, std::uint32_t v) { c.l.args.push_back({nullptr, v, true}); }
+    void k_f32(kcall& c, float v) { arg g{nullptr, 0, true}; std::memcpy(&g.v, &v, 4); c.l.args.push_back(g); }
+    void* k_scratch(kcall& c, std::size_t bytes) { void* p = alloc(bytes, "scratch"); c.temps.push_back(p); return p; }
+    void k_upload(void* p, const void* h, std::size_t bytes) { copy(p, h, bytes); sync(); }
+    void k_launch(kcall& c, const std::string& name, std::size_t global) {
+        c.l.kernel = kernel(name); c.l.global = std::uint32_t(global);
+        if (global) enqueue(c.l);
+        if (capturing_) cur_.push_back(c.l);
+        c.l.args.clear();
+    }
+    void k_done(kcall& c) {
+        for (auto& r : c.rd) copy(r.h, r.d, r.bytes);
+        if (c.temps.empty() && c.rd.empty()) return;
+        sync();
+        if (capturing_) keep_.insert(keep_.end(), c.temps.begin(), c.temps.end());   // a recorded launch still refers to them
+        else for (auto p : c.temps) dfree(p);
+        c.temps.clear();
+    }
+    void k_abort(kcall& c) { try { sync(); } catch (...) {} for (auto p : c.temps) dfree(p); c.temps.clear(); }
+    bool k_has(const std::string& n) {
+        if (kern_.count(n)) return true;
+        if (missing_.count(n)) return false;
+        ze_kernel_desc_t kd{}; kd.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC; kd.pKernelName = n.c_str();
+        ze_kernel_handle_t k = nullptr;
+        if (f_.kernel_create(mod_, &kd, &k) != ZE_RESULT_SUCCESS || !k) { missing_.insert(n); return false; }
+        ck(f_.group_size(k, 64, 1, 1), "zeKernelSetGroupSize");
+        kern_[n] = k; return true;
+    }
+    // An encoded weight (or any read-only blob) uploaded once and kept for the runtime's lifetime, keyed by host address
+    // and size; evictable least recently used first (the host copy is the source of truth, so nothing is synced back).
+    void* qweight(const std::uint8_t* q, std::size_t bytes) {
+        auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(q), bytes);
+        if (auto it = qres_.find(key); it != qres_.end()) { it->second.last = ++clock_; return it->second.mem; }
+        void* p = alloc(bytes, "weights");
+        try { copy(p, q, bytes); sync(); } catch (...) { dfree(p); throw; }
+        qres_[key] = {p, bytes, ++clock_}; ++stats_.uploads; stats_.qweight_bytes += bytes;
+        return p;
+    }
+    // Encoded weights not bound by the op in progress, least recently used first (re-uploaded from the host on next use).
+    std::uint64_t evict_weights(std::uint64_t want) {
+        std::vector<std::pair<std::uint64_t, std::pair<std::uintptr_t, std::size_t>>> vs;
+        for (auto& [k, q] : qres_) if (q.last <= op_mark_) vs.push_back({q.last, k});
+        if (vs.empty()) return 0;
+        std::sort(vs.begin(), vs.end()); sync();
+        std::uint64_t got = 0;
+        for (auto& [last, k] : vs) {
+            if (want && got >= want) break;
+            auto& q = qres_[k]; got += q.bytes; stats_.qweight_bytes -= q.bytes; dfree(q.mem); qres_.erase(k); ++stats_.evictions;
+        }
+        stats_.evicted_bytes += got; return got;
+    }
     struct fns {
         decltype(&::zeInit) init = nullptr;
         decltype(&::zeDriverGet) drivers = nullptr;
@@ -169,6 +274,9 @@ private:
         decltype(&::zeKernelDestroy) kernel_destroy = nullptr;
         decltype(&::zeKernelSetGroupSize) group_size = nullptr;
         decltype(&::zeKernelSetArgumentValue) set_arg = nullptr;
+        // optional (native binary cache): absent entry points only turn the cache off
+        decltype(&::zeModuleGetNativeBinary) native_bin = nullptr;
+        decltype(&::zeDriverGetProperties) drv_props = nullptr;
     };
     template<class F> bool sym(F& f, const char* n) { f = reinterpret_cast<F>(dlsym(lib_, n)); return f != nullptr; }
     void ck(ze_result_t r, const char* what) { if (r != ZE_RESULT_SUCCESS) throw std::runtime_error(std::string("level_zero: ") + what + " failed (" + std::to_string(int(r)) + ")"); }
@@ -194,6 +302,11 @@ private:
     // first; never one the op in progress has bound, and nothing while a graph is being recorded.
     std::uint64_t evict_device(std::uint64_t want, bool external) {
         if (capturing_) return 0;
+        std::uint64_t got = evict_tensors(want, external);
+        if (!want || got < want) got += evict_weights(want ? want - got : 0);
+        return got;
+    }
+    std::uint64_t evict_tensors(std::uint64_t want, bool external) {
         if (external) op_mark_ = clock_;
         std::vector<std::pair<std::uint64_t, std::uintptr_t>> vs;
         for (auto& [k, e] : res_) if (e.last <= op_mark_) vs.push_back({e.last, k});
@@ -262,6 +375,7 @@ private:
                   sym(f_.log_destroy, "zeModuleBuildLogDestroy") && sym(f_.kernel_create, "zeKernelCreate") &&
                   sym(f_.kernel_destroy, "zeKernelDestroy") && sym(f_.group_size, "zeKernelSetGroupSize") &&
                   sym(f_.set_arg, "zeKernelSetArgumentValue");
+        sym(f_.native_bin, "zeModuleGetNativeBinary"); sym(f_.drv_props, "zeDriverGetProperties");
         return ok ? std::string{} : "libze_loader is missing entry points";
     }
     std::vector<std::pair<ze_driver_handle_t, ze_device_handle_t>> all_devices() {
@@ -289,7 +403,7 @@ private:
         if (ordinal_ < 0 || ordinal_ >= int(ds.size())) return "device ordinal " + std::to_string(ordinal_) + " out of range (" + std::to_string(ds.size()) + " devices)";
         auto [drv, dev] = ds[std::size_t(ordinal_)]; dev_ = dev;
         ze_device_properties_t p{}; p.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-        if (f_.props(dev_, &p) == ZE_RESULT_SUCCESS) name_ = p.name;
+        if (f_.props(dev_, &p) == ZE_RESULT_SUCCESS) { name_ = p.name; integrated_ = (p.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED) != 0; cpu_type_ = p.type == ZE_DEVICE_TYPE_CPU; }
         std::uint32_t nm = 1; ze_device_memory_properties_t mp{}; mp.stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
         if (f_.mem_props(dev_, &nm, &mp) == ZE_RESULT_SUCCESS && nm) total_ = mp.totalSize;
         ze_context_desc_t cd{}; cd.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
@@ -298,14 +412,47 @@ private:
         if (f_.list_create(ctx_, dev_, &qd, &list_) != ZE_RESULT_SUCCESS) return "zeCommandListCreateImmediate failed";
         ze_module_desc_t md{}; md.stype = ZE_STRUCTURE_TYPE_MODULE_DESC; md.format = ZE_MODULE_FORMAT_IL_SPIRV;
         md.inputSize = img_size; md.pInputModule = static_cast<const std::uint8_t*>(img); md.pBuildFlags = "";
+        // Native binary cache: keyed by device name, vendor/device id, device UUID, driver version, the image hash and
+        // the build flags. A binary the driver refuses (or that lacks a kernel) falls back to compiling the image.
+        std::string key;
+        {
+            char hx[64]; std::string uu; for (auto b : p.uuid.id) { std::snprintf(hx, sizeof hx, "%02x", unsigned(b)); uu += hx; }
+            ze_driver_properties_t dp{}; dp.stype = ZE_STRUCTURE_TYPE_DRIVER_PROPERTIES;
+            std::uint32_t dver = f_.drv_props && f_.drv_props(drv, &dp) == ZE_RESULT_SUCCESS ? dp.driverVersion : 0;
+            std::snprintf(hx, sizeof hx, "%08x:%08x\n%u\n%016llx", unsigned(p.vendorId), unsigned(p.deviceId), unsigned(dver),
+                          static_cast<unsigned long long>(kernel_cache::fnv({static_cast<const char*>(img), img_size})));
+            key = "level_zero\n" + name_ + "\n" + uu + "\n" + hx + "\n" + (src ? "opencl-c" : "spirv") + "\n" + md.pBuildFlags;
+        }
+        const bool cache = f_.native_bin && kernel_cache::enabled();
+        if (cache) {
+            cache_path_ = kernel_cache::path("ze-module", key);
+            if (auto bin = kernel_cache::load("ze-module", key); !bin.empty()) {
+                ze_module_desc_t nd = md; nd.format = ZE_MODULE_FORMAT_NATIVE; nd.inputSize = bin.size(); nd.pInputModule = bin.data();
+                ze_module_handle_t m = nullptr;
+                if (f_.module_create(ctx_, dev_, &nd, &m, nullptr) == ZE_RESULT_SUCCESS && m) {
+                    ze_kernel_desc_t kd{}; kd.stype = ZE_STRUCTURE_TYPE_KERNEL_DESC; kd.pKernelName = "forge_scale";   // the binary must hold our kernels
+                    ze_kernel_handle_t k = nullptr;
+                    if (f_.kernel_create(m, &kd, &k) == ZE_RESULT_SUCCESS && k) { f_.kernel_destroy(k); mod_ = m; from_cache_ = true; }
+                    else f_.module_destroy(m);
+                }
+            }
+        }
         ze_module_build_log_handle_t log = nullptr;
-        if (f_.module_create(ctx_, dev_, &md, &mod_, &log) != ZE_RESULT_SUCCESS) {
+        if (from_cache_) {}
+        else if (f_.module_create(ctx_, dev_, &md, &mod_, &log) != ZE_RESULT_SUCCESS) {
             std::string s; std::size_t n = 0;
             if (log && f_.log_get(log, &n, nullptr) == ZE_RESULT_SUCCESS && n) { s.resize(n); f_.log_get(log, &n, s.data()); }
             if (log) f_.log_destroy(log);
             mod_ = nullptr; return "zeModuleCreate failed: " + s;
         }
         if (log) f_.log_destroy(log);
+        if (cache && !from_cache_) {
+            std::size_t n = 0;
+            if (f_.native_bin(mod_, &n, nullptr) == ZE_RESULT_SUCCESS && n) {
+                std::vector<std::uint8_t> b(n);
+                if (f_.native_bin(mod_, &n, b.data()) == ZE_RESULT_SUCCESS) kernel_cache::store("ze-module", key, b.data(), n);
+            }
+        }
         dm_.attach("level_zero:" + std::to_string(ordinal_), mu_, [this](std::uint64_t w, bool ext) { return evict_device(w, ext); });
         return {};
     }
@@ -313,7 +460,8 @@ private:
     void* lib_ = nullptr;
     ze_device_handle_t dev_ = nullptr; ze_context_handle_t ctx_ = nullptr; ze_command_list_handle_t list_ = nullptr; ze_module_handle_t mod_ = nullptr;
     fns f_;
-    std::string name_;
+    std::string name_, cache_path_;
+    bool from_cache_ = false, integrated_ = false, cpu_type_ = false;
     std::size_t total_ = 0;
     std::mutex mu_;
     bool in_run_ = false, capturing_ = false;
@@ -323,6 +471,8 @@ private:
     std::vector<std::vector<launch>> graphs_;
     std::vector<void*> keep_;
     std::map<std::string, ze_kernel_handle_t> kern_;
+    std::set<std::string> missing_;
+    std::map<std::pair<std::uintptr_t, std::size_t>, qentry> qres_;
     std::map<std::string, std::size_t> dispatches_;
     residency_stats stats_;
 };

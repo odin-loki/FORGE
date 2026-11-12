@@ -1,0 +1,14 @@
+# Spatial op family (vision, audio, diffusion). One sample, no batch axis: x[c, l] or x[c, h, w].
+# 2-D attrs take one number (both axes) or a list [h, w]. Append new ops at the end (see ops/README.md).
+op conv1d            class contraction    inputs 3  shape conv1d            tol rel:1e-4  fuse no  cost 2  attrs "stride,pad,dilation,groups" doc "x[c, l] * w[o, c/groups, k] + b[o] (b may be [1]); cross-correlation as torch.nn.Conv1d; zero padding"
+op conv2d            class contraction    inputs 3  shape conv2d            tol rel:1e-4  fuse no  cost 2  attrs "stride,pad,dilation,groups" doc "x[c, h, w] * w[o, c/groups, kh, kw] + b[o] (b may be [1]); groups = c is depthwise; zero padding"
+op conv_transpose2d  class contraction    inputs 3  shape conv_transpose2d  tol rel:1e-4  fuse no  cost 2  attrs "stride,pad,output_pad,dilation,groups" doc "transposed convolution, x[c, h, w], w[c, o/groups, kh, kw], b[o] or [1] (torch.nn.ConvTranspose2d)"
+op max_pool2d        class reduction      inputs 1  shape pool2d            tol exact     fuse no  cost 1  attrs "kernel,stride,pad" doc "max over kernel windows of x[c, h, w]; stride defaults to kernel; padding never wins"
+op avg_pool2d        class reduction      inputs 1  shape pool2d            tol rel:1e-5  fuse no  cost 1  attrs "kernel,stride,pad,count_pad" doc "mean over kernel windows; count_pad 1 (default) divides by the kernel area, 0 by the cells inside the image"
+op adaptive_avg_pool2d class reduction    inputs 1  shape adaptive_pool2d   tol rel:1e-5  fuse no  cost 1  attrs "out" doc "x[c, h, w] -> [c, oh, ow]; cell i averages rows floor(i h / oh) .. ceil((i + 1) h / oh)"
+op global_avg_pool   class reduction      inputs 1  shape global_pool       tol rel:1e-5  fuse no  cost 1  doc "x[c, ...] -> [c]: mean over every axis but the first"
+op upsample_nearest  class data_movement  inputs 1  shape upsample2d        tol exact     fuse no  cost 0  attrs "scale" doc "x[c, h, w] -> [c, h sh, w sw], nearest neighbour (integer scale)"
+op upsample_bilinear class data_movement  inputs 1  shape upsample2d        tol rel:1e-5  fuse no  cost 4  attrs "scale,align_corners" doc "bilinear resize by an integer scale; align_corners 0 (default, half-pixel centres) or 1"
+op group_norm        class reduction      inputs 3  shape same              tol rel:1e-5  fuse no  cost 6  attrs "groups,eps" doc "x[c, ...]: normalise each of `groups` channel groups over its channels and positions, then * w[c] + b[c]"
+op batch_norm        class elementwise    inputs 5  shape same              tol rel:1e-5  fuse no  cost 4  attrs "eps" doc "inference form: (x[c, ...] - mean[c]) / sqrt(var[c] + eps) * w[c] + b[c]  (inputs: x, w, b, mean, var)"
+op pad               class data_movement  inputs 1  shape pad               tol exact     fuse no  cost 0  attrs "pads,mode,value" doc "pads = [before, after] pairs from the last axis backwards; mode 0 constant (value), 1 reflect, 2 replicate"

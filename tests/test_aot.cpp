@@ -518,3 +518,50 @@ TEST(aot_startup_and_throughput) {
     std::printf("  start-up to the first decoded token: compiled at run time %.2f ms, precompiled plans %.2f ms\n", best[0], best[1]);
     std::printf("  decode: compiled at run time %.0f tok/s, precompiled plans %.0f tok/s (the same plan either way)\n", tps[0], tps[1]);
 }
+
+// session kind embedding with the spatial / encoder op families (opset 3): conv1d (im2col lowering), gelu, layer_norm,
+// attention_bias with a key mask, masked_mean, l2_normalize, a composite op; session::embed over a precompiled plan.
+TEST(aot_embedding_model_with_spatial_and_encoder_ops) {
+    const char* bp = R"(
+blueprint "emb" opset 3
+params { d: 8  heads: 2  hd: 4  vocab: 12 }
+input tokens    : f32[seq]
+input positions : f32[seq]
+input mask      : f32[seq]
+op affine(x, w, b = 0) { return linear(x, w) + b }
+graph {
+  x = embed(W.tok, tokens) + sinusoid_embed(positions, dim: d, shift: 1)
+  c = gelu(conv1d(transpose(x, [1, 0]), W.conv_w, W.conv_b, pad: 1))
+  x = layer_norm(x + transpose(c, [1, 0]), W.ln_w, W.ln_b, 1e-5)
+  q = heads(affine(x, W.wq, W.bq), heads, hd)
+  k = heads(affine(x, W.wk), heads, hd)
+  a = attention_bias(q, k, k, reshape((mask - 1) * 1e30, [1, 1, seq]), softcap: 4)
+  x = x + hard_swish(merge(a, d))
+  embedding = l2_normalize(masked_mean(x, mask))
+}
+output embedding : f32[d]
+session embedding)";
+    auto src = tmp("embed.fpk");
+    {
+        modelfile::writer w;
+        auto fill = [](std::size_t n, int mul) { std::vector<float> d(n); for (std::size_t i = 0; i < n; ++i) d[i] = float(int(i * std::size_t(mul) % 17) - 8) * 0.07f; return d; };
+        w.add_tensor("tok", {12, 8}, fill(96, 5)); w.add_tensor("conv_w", {8, 8, 3}, fill(192, 7)); w.add_tensor("conv_b", {8}, fill(8, 3));
+        w.add_tensor("ln_w", {8}, std::vector<float>(8, 1.f)); w.add_tensor("ln_b", {8}, fill(8, 11));
+        w.add_tensor("wq", {8, 8}, fill(64, 13)); w.add_tensor("bq", {8}, fill(8, 2)); w.add_tensor("wk", {8, 8}, fill(64, 9));
+        w.set_manifest(json::value(json::object{{"format", "fpk"}, {"session", "embedding"}, {"max_position_embeddings", 16.0}}));
+        w.set_section("blueprint", bp);
+        w.write(src);
+    }
+    auto pl = plans_of(src, {.shapes = {5}});
+    CHECK(pl.targets.size() == 1);
+    auto f = with_plans(src, pl.blob, "embed_aot.fpk");
+    auto ma = model::open(f); auto mr = jit_model(src);
+    session a(ma), r(mr);
+    std::vector<int> ids{1, 7, 3, 11, 0}, mask{1, 1, 1, 0, 0};
+    auto ea = a.embed(ids, {}, mask), er = r.embed(ids, {}, mask);
+    CHECK(same_bits(ea, er) && ea.size() == 8);
+    CHECK_MSG(ma->aot().stats().used == 1, "precompiled plans used: %zu, rejected %zu (%s)", ma->aot().stats().used, ma->aot().stats().rejected, ma->aot().stats().last_reject.c_str());
+    double n2 = 0; for (float v : ea) n2 += double(v) * v;
+    CHECK(std::fabs(n2 - 1.0) < 1e-5);
+    CHECK(same_bits(a.embed(std::vector<int>{2, 4, 6}), r.embed(std::vector<int>{2, 4, 6})));   // a length that was not precompiled
+}
