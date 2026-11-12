@@ -1,6 +1,7 @@
 // forge::os::text: a small backtracking regex engine over code points with Unicode classes.
 #include "internal.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 
 namespace forge::os::text {
@@ -9,13 +10,16 @@ namespace {
 struct cls {
     std::vector<std::pair<cp_t, cp_t>> ranges;
     std::vector<std::pair<std::string, bool>> props;   // name, negated
+    std::vector<std::pair<std::uint32_t, bool>> gcs;   // general-category bit mask, negated (\p{L}, \p{Nd}: no name lookup per character)
     std::vector<std::pair<char, bool>> builtins;       // 'd' 'w' 's', negated
     bool neg = false;
     bool test1(cp_t c) const {
         for (auto& [a, b] : ranges) if (c >= a && c <= b) return true;
+        if (!gcs.empty()) { std::uint32_t bit = 1u << unsigned(general_category(c)); for (auto& [m, ng] : gcs) if (((m & bit) != 0) != ng) return true; }
         for (auto& [n, ng] : props) if (has_property(c, n) != ng) return true;
         for (auto& [k, ng] : builtins) {
-            bool v = k == 'd' ? is_digit(c) : k == 'w' ? is_word_char(c) : is_space(c);
+            // 'o': Oniguruma's \w, which unlike UTS #18's leaves out the join controls U+200C / U+200D
+            bool v = k == 'd' ? is_digit(c) : k == 'w' ? is_word_char(c) : k == 'o' ? is_word_char(c) && c != 0x200C && c != 0x200D : is_space(c);
             if (v != ng) return true;
         }
         return false;
@@ -26,12 +30,32 @@ struct cls {
         return v != neg;
     }
 };
-enum op : std::uint8_t { CHAR, ANY, CLASS, SPLIT, JMP, SAVE, BOL, EOL, SBEG, SEND, SENDNL, WB, NWB, GRAPH, BREF, LOOK, MATCH, SETPOS, CHKPOS, FAIL };
-struct ins { op o; std::uint32_t a = 0, b = 0; bool neg = false; };
+enum op : std::uint8_t { CHAR, ANY, CLASS, SPLIT, JMP, SAVE, BOL, EOL, SBEG, SEND, SENDNL, WB, NWB, GRAPH, BREF, LOOK, MATCH, SETPOS, CHKPOS, FAIL, ATLIMIT };
+// ic: case-insensitive (CHAR, CLASS, BREF), dot matches newline (ANY), lookbehind (LOOK). Flags are per instruction so (?i:...) can be scoped.
+struct ins { op o; std::uint32_t a = 0, b = 0; bool neg = false; bool ic = false; };
+// General-category mask for a \p{..} name that is a category ("L", "Lu", "LC"); 0 when it is some other property.
+std::uint32_t gc_mask(std::string_view n) {
+    static const char* const names[] = {"Cn", "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po",
+                                        "Sm", "Sc", "Sk", "So", "Zs", "Zl", "Zp", "Cc", "Cf", "Cs", "Co"};   // order of enum category
+    std::uint32_t m = 0;
+    if (n == "LC" || n == "L&") return (1u << 1) | (1u << 2) | (1u << 3);
+    for (unsigned i = 0; i < 30; ++i) if ((n.size() == 2 && n == names[i]) || (n.size() == 1 && n[0] == names[i][0])) m |= 1u << i;
+    return m;
+}
+// relaxed-atomic flag that keeps regex::impl copyable (one compiled regex is searched from several threads)
+struct hit_flag {
+    std::atomic<bool> v{false};
+    hit_flag() = default;
+    hit_flag(const hit_flag& o) : v(o.v.load(std::memory_order_relaxed)) {}
+    hit_flag& operator=(const hit_flag& o) { v.store(o.v.load(std::memory_order_relaxed), std::memory_order_relaxed); return *this; }
+    hit_flag& operator=(bool b) { v.store(b, std::memory_order_relaxed); return *this; }
+    operator bool() const { return v.load(std::memory_order_relaxed); }
+};
 
 struct node {
     enum kind { ch, any, klass, bol, eol, sbeg, send, sendnl, wb, nwb, graph, group, concat, alt, rep, bref, look, empty } k;
     cp_t c = 0; int idx = -1; int min = 0, max = 0; bool greedy = true, neg = false;
+    bool ic = false, behind = false;   // ic: case-insensitive / dot-matches-newline for `any`
     std::vector<node> kids;
 };
 }  // namespace
@@ -39,12 +63,13 @@ struct node {
 struct regex::impl {
     std::vector<ins> prog; std::vector<cls> classes; int ngroups = 1; std::vector<std::string> names{""};
     bool icase = false, multiline = false, dotall = false;
-    int nslots = 0; std::uint64_t step_limit = 10'000'000; mutable bool hit = false;
+    int nslots = 0; std::uint64_t step_limit = 10'000'000; mutable hit_flag hit;
 };
 
 namespace {
 struct parser {
     std::u32string p; std::size_t i = 0; bool ext = false; regex::impl& R; std::string err;
+    bool icase = false, dotall = false, ruby = false; int depth = 0;   // flags in force at the parse position
     parser(std::u32string s, regex::impl& r, bool x) : p(std::move(s)), ext(x), R(r) {}
     bool eof() { skip_ws(); return i >= p.size(); }
     void skip_ws() {
@@ -76,15 +101,16 @@ struct parser {
         case 'x': if (i < p.size() && p[i] == '{') { ++i; auto v = hex(8); if (i < p.size() && p[i] == '}') ++i; c = v.value_or(0); } else c = hex(2).value_or(0); return 0;
         case 'u': if (i < p.size() && p[i] == '{') { ++i; auto v = hex(8); if (i < p.size() && p[i] == '}') ++i; c = v.value_or(0); } else c = hex(4).value_or(0); return 0;
         case 'U': c = hex(8).value_or(0); return 0;
-        case 'd': case 'w': case 's': k.builtins.push_back({char(e), false}); return 1;
-        case 'D': case 'W': case 'S': k.builtins.push_back({char(e | 0x20), true}); return 1;
+        case 'd': case 'w': case 's': k.builtins.push_back({ruby && e == 'w' ? 'o' : char(e), false}); return 1;
+        case 'D': case 'W': case 'S': k.builtins.push_back({ruby && e == 'W' ? 'o' : char(e | 0x20), true}); return 1;
         case 'p': case 'P': {
             std::string name;
             if (i < p.size() && p[i] == '{') { ++i; name = braced(); } else if (i < p.size()) append_utf8(name, p[i++]);
             bool neg = e == 'P'; if (!name.empty() && name[0] == '^') { neg = !neg; name.erase(0, 1); }
             bool known = false; has_property('a', name, &known);
             if (!known) { fail("unknown property \\p{" + name + "}"); return -1; }
-            k.props.push_back({name, neg}); return 1; }
+            if (auto m = gc_mask(name)) k.gcs.push_back({m, neg}); else k.props.push_back({name, neg});
+            return 1; }
         default: c = e; return 0;
         }
     }
@@ -125,16 +151,40 @@ struct parser {
         cp_t c = peek();
         ++i;
         switch (c) {
-        case '.': n.k = node::any; return true;
+        case '.': n.k = node::any; n.ic = dotall; return true;
         case '^': n.k = node::bol; return true;
         case '$': n.k = node::eol; return true;
-        case '[': return parse_class(n);
+        case '[': n.ic = icase; return parse_class(n);
         case '(': {
             node g; g.k = node::group;
             if (i < p.size() && p[i] == '?') {
                 ++i;
                 if (i < p.size() && p[i] == ':') { ++i; g.idx = -1; }
+                else if (i < p.size() && p[i] == '>') { ++i; g.idx = -1; }   // atomic group: treated as a plain group
                 else if (i < p.size() && (p[i] == '=' || p[i] == '!')) { g.k = node::look; g.neg = p[i] == '!'; ++i; }
+                else if (i + 1 < p.size() && p[i] == '<' && (p[i + 1] == '=' || p[i + 1] == '!')) { g.k = node::look; g.behind = true; g.neg = p[i + 1] == '!'; i += 2; }
+                else if (i < p.size() && (p[i] == 'i' || p[i] == 'm' || p[i] == 's' || p[i] == 'x' || p[i] == '-')) {
+                    // inline flags: (?i) (?-i) apply up to the end of the enclosing group, (?i:...) to the group itself.
+                    // In the Ruby dialect (compile flag R) m means "dot matches newline".
+                    bool on = true, ic = icase, da = dotall, x = ext;
+                    for (; i < p.size() && p[i] != ':' && p[i] != ')'; ++i) {
+                        if (p[i] == '-') on = false;
+                        else if (p[i] == 'i') ic = on;
+                        else if (p[i] == 's' || (p[i] == 'm' && ruby)) da = on;
+                        else if (p[i] == 'x') x = on;
+                        else if (p[i] == 'm') { if (on) R.multiline = true; }
+                        else return fail("unsupported inline flag");
+                    }
+                    if (i >= p.size()) return fail("unterminated inline flags");
+                    if (p[i++] == ')') { icase = ic; dotall = da; ext = x; n.k = node::empty; return true; }
+                    g.idx = -1;
+                    bool sic = icase, sda = dotall, sx = ext; icase = ic; dotall = da; ext = x;
+                    node body; bool ok = alternation(body);
+                    icase = sic; dotall = sda; ext = sx;
+                    if (!ok) return false;
+                    if (peek() != ')') return fail("missing )");
+                    ++i; g.kids.push_back(std::move(body)); n = std::move(g); return true;
+                }
                 else if (i < p.size() && (p[i] == '<' || p[i] == 'P' || p[i] == '\'')) {
                     if (p[i] == 'P') ++i;
                     cp_t close = p[i] == '\'' ? '\'' : '>'; ++i;
@@ -143,7 +193,11 @@ struct parser {
                     ++i; g.idx = R.ngroups++; R.names.push_back(name);
                 } else return fail("unsupported group syntax");
             } else { g.idx = R.ngroups++; R.names.push_back(""); }
-            node body; if (!alternation(body)) return false;
+            if (++depth > 250) return fail("nesting too deep");
+            bool sic = icase, sda = dotall, sx = ext;
+            node body; bool ok = alternation(body);
+            icase = sic; dotall = sda; ext = sx; --depth;
+            if (!ok) return false;
             if (peek() != ')') return fail("missing )");
             ++i; g.kids.push_back(std::move(body)); n = std::move(g); return true; }
         case ')': --i; return fail("unbalanced )");
@@ -157,17 +211,17 @@ struct parser {
                 if (e == 'z') { ++i; n.k = node::send; return true; }
                 if (e == 'Z') { ++i; n.k = node::sendnl; return true; }
                 if (e == 'X') { ++i; n.k = node::graph; return true; }
-                if (e >= '1' && e <= '9') { int v = 0; while (i < p.size() && p[i] >= '0' && p[i] <= '9') v = v * 10 + int(p[i++] - '0'); n.k = node::bref; n.idx = v; return true; }
+                if (e >= '1' && e <= '9') { int v = 0; while (i < p.size() && p[i] >= '0' && p[i] <= '9') { if (v < 100000) v = v * 10 + int(p[i] - '0'); ++i; } n.k = node::bref; n.idx = v; n.ic = icase; return true; }
                 if (e == 'k' && i + 1 < p.size() && p[i + 1] == '<') {
                     i += 2; std::string name; while (i < p.size() && p[i] != '>') append_utf8(name, p[i++]); ++i;
-                    for (std::size_t g = 0; g < R.names.size(); ++g) if (R.names[g] == name) { n.k = node::bref; n.idx = int(g); return true; }
+                    for (std::size_t g = 0; g < R.names.size(); ++g) if (R.names[g] == name) { n.k = node::bref; n.idx = int(g); n.ic = icase; return true; }
                     return fail("unknown group name " + name);
                 }
             }
             cls k; cp_t lit; int r = escape(lit, k); if (r < 0) return false;
-            if (r == 1) { n.k = node::klass; n.idx = int(R.classes.size()); R.classes.push_back(std::move(k)); return true; }
-            n.k = node::ch; n.c = lit; return true; }
-        default: n.k = node::ch; n.c = c; return true;
+            if (r == 1) { n.k = node::klass; n.ic = icase; n.idx = int(R.classes.size()); R.classes.push_back(std::move(k)); return true; }
+            n.k = node::ch; n.c = lit; n.ic = icase; return true; }
+        default: n.k = node::ch; n.c = c; n.ic = icase; return true;
         }
     }
     bool repeat(node& n) {
@@ -179,10 +233,10 @@ struct parser {
             else if (c == '?') { mn = 0; mx = 1; ++i; }
             else if (c == '{') {
                 std::size_t save = i; ++i; int a = 0, b; bool digits = false;
-                while (i < p.size() && p[i] >= '0' && p[i] <= '9') { a = a * 10 + int(p[i++] - '0'); digits = true; }
+                while (i < p.size() && p[i] >= '0' && p[i] <= '9') { if (a < 100000) a = a * 10 + int(p[i] - '0'); ++i; digits = true; }
                 if (!digits) { i = save; return true; }
                 b = a;
-                if (i < p.size() && p[i] == ',') { ++i; if (i < p.size() && p[i] >= '0' && p[i] <= '9') { b = 0; while (i < p.size() && p[i] >= '0' && p[i] <= '9') b = b * 10 + int(p[i++] - '0'); } else b = -1; }
+                if (i < p.size() && p[i] == ',') { ++i; if (i < p.size() && p[i] >= '0' && p[i] <= '9') { b = 0; while (i < p.size() && p[i] >= '0' && p[i] <= '9') { if (b < 100000) b = b * 10 + int(p[i] - '0'); ++i; } } else b = -1; }
                 if (i >= p.size() || p[i] != '}') { i = save; return true; }
                 ++i; mn = a; mx = b;
                 if (mx >= 0 && mx < mn) return fail("bad repeat range");
@@ -213,9 +267,9 @@ struct compiler {
     bool gen(const node& n) {
         if (R.prog.size() > 200000) { err = "pattern too large"; return false; }
         switch (n.k) {
-        case node::ch: emit({CHAR, std::uint32_t(n.c)}); break;
-        case node::any: emit({ANY}); break;
-        case node::klass: emit({CLASS, std::uint32_t(n.idx)}); break;
+        case node::ch: emit({CHAR, std::uint32_t(n.c), 0, false, n.ic}); break;
+        case node::any: emit({ANY, 0, 0, false, n.ic}); break;
+        case node::klass: emit({CLASS, std::uint32_t(n.idx), 0, false, n.ic}); break;
         case node::bol: emit({BOL}); break;
         case node::eol: emit({EOL}); break;
         case node::sbeg: emit({SBEG}); break;
@@ -224,7 +278,7 @@ struct compiler {
         case node::wb: emit({WB}); break;
         case node::nwb: emit({NWB}); break;
         case node::graph: emit({GRAPH}); break;
-        case node::bref: emit({BREF, std::uint32_t(n.idx)}); break;
+        case node::bref: emit({BREF, std::uint32_t(n.idx), 0, false, n.ic}); break;
         case node::empty: break;
         case node::concat: for (auto& k : n.kids) if (!gen(k)) return false; break;
         case node::group:
@@ -233,8 +287,9 @@ struct compiler {
             if (n.idx >= 0) emit({SAVE, std::uint32_t(2 * n.idx + 1)});
             break;
         case node::look: {
-            auto at = emit({LOOK, 0, 0, n.neg});
+            auto at = emit({LOOK, 0, 0, n.neg, n.behind});
             if (!gen(n.kids[0])) return false;
+            if (n.behind) emit({ATLIMIT});   // a lookbehind body has to end where the lookbehind stands
             emit({MATCH});
             R.prog[at].a = std::uint32_t(at + 1); R.prog[at].b = std::uint32_t(R.prog.size());
             break; }
@@ -282,8 +337,11 @@ struct compiler {
 struct vm {
     const regex::impl& R; const std::u32string& s; std::uint64_t steps = 0;
     std::vector<long> caps, pos_slots;
+    long limit = -1;   // lookbehind: the body must end here
+    int depth = 0;
+    std::uint64_t extra = 0;   // added to the step limit (find_spans: one budget for the whole subject, growing with its length)
     bool word_at(long i) const { return i >= 0 && std::size_t(i) < s.size() && is_word_char(s[std::size_t(i)]); }
-    bool eq(cp_t a, cp_t b) const { return a == b || (R.icase && simple_fold(a) == simple_fold(b)); }
+    static bool eq(cp_t a, cp_t b, bool ic) { return a == b || (ic && simple_fold(a) == simple_fold(b)); }
     // Runs from pc at pos; on success sets end and leaves captures.
     bool run(std::size_t pc0, long pos0, long& end) {
         struct frame { std::uint8_t kind; std::uint32_t pc; long pos; };   // kind 0 branch, 1 restore cap, 2 restore slot
@@ -294,13 +352,13 @@ struct vm {
             if (f.kind == 2) { pos_slots[f.pc] = f.pos; continue; }
             std::size_t pc = f.pc; long pos = f.pos;
             while (true) {
-                if (++steps > R.step_limit) { R.hit = true; return false; }
+                if (++steps > R.step_limit + extra) { R.hit = true; return false; }
                 const ins& x = R.prog[pc];
                 bool ok = true;
                 switch (x.o) {
-                case CHAR: ok = std::size_t(pos) < s.size() && eq(s[pos], cp_t(x.a)); if (ok) { ++pos; ++pc; } break;
-                case ANY: ok = std::size_t(pos) < s.size() && (R.dotall || s[pos] != '\n'); if (ok) { ++pos; ++pc; } break;
-                case CLASS: ok = std::size_t(pos) < s.size() && R.classes[x.a].test(s[pos], R.icase); if (ok) { ++pos; ++pc; } break;
+                case CHAR: ok = std::size_t(pos) < s.size() && eq(s[pos], cp_t(x.a), x.ic); if (ok) { ++pos; ++pc; } break;
+                case ANY: ok = std::size_t(pos) < s.size() && (x.ic || s[pos] != '\n'); if (ok) { ++pos; ++pc; } break;
+                case CLASS: ok = std::size_t(pos) < s.size() && R.classes[x.a].test(s[pos], x.ic); if (ok) { ++pos; ++pc; } break;
                 case BOL: ok = pos == 0 || (R.multiline && s[pos - 1] == '\n'); ++pc; break;
                 case EOL: ok = std::size_t(pos) == s.size() || (R.multiline && s[pos] == '\n') || (!R.multiline && std::size_t(pos) + 1 == s.size() && s[pos] == '\n'); ++pc; break;
                 case SBEG: ok = pos == 0; ++pc; break;
@@ -315,7 +373,7 @@ struct vm {
                 case BREF: {
                     long a = 2 * long(x.a) < long(caps.size()) ? caps[2 * x.a] : -1, b = 2 * long(x.a) + 1 < long(caps.size()) ? caps[2 * x.a + 1] : -1;
                     if (a < 0 || b < 0) { ++pc; break; }   // unset group matches empty
-                    for (long k = a; k < b && ok; ++k, ++pos) ok = std::size_t(pos) < s.size() && eq(s[pos], s[k]);
+                    for (long k = a; k < b && ok; ++k, ++pos) ok = std::size_t(pos) < s.size() && eq(s[pos], s[k], x.ic);
                     ++pc; break; }
                 case SPLIT: st.push_back({0, x.b, pos}); pc = x.a; break;
                 case JMP: pc = x.a; break;
@@ -323,12 +381,19 @@ struct vm {
                 case SETPOS: st.push_back({2, x.a, pos_slots[x.a]}); pos_slots[x.a] = pos; ++pc; break;
                 case CHKPOS: ok = pos_slots[x.a] != pos; ++pc; break;
                 case LOOK: {
-                    vm sub{R, s, 0, caps, pos_slots}; long e;
-                    bool m = sub.run(x.a, pos, e); steps += sub.steps;
+                    if (depth >= 64) { R.hit = true; return false; }   // nested lookarounds recurse on the native stack
+                    vm sub{R, s, steps, caps, pos_slots}; long e = 0; sub.depth = depth + 1; sub.extra = extra;
+                    bool m = false;
+                    if (x.ic) {   // lookbehind: try every start within 255 code points before pos
+                        sub.limit = pos;
+                        for (long k = pos; k >= 0 && pos - k <= 255 && !m && !R.hit; --k) { sub.caps = caps; sub.pos_slots = pos_slots; m = sub.run(x.a, k, e); }
+                    } else m = sub.run(x.a, pos, e);
+                    steps = sub.steps;
                     if (R.hit) return false;
                     ok = m != x.neg;
-                    if (ok && m && !x.neg) caps = sub.caps;
+                    if (ok && m && !x.neg && !x.ic) caps = sub.caps;
                     pc = x.b; break; }
+                case ATLIMIT: ok = pos == limit; ++pc; break;
                 case MATCH: end = pos; return true;
                 case FAIL: ok = false; break;
                 }
@@ -352,13 +417,15 @@ bool regex::step_limit_hit() const { return p_->hit; }
 
 result<regex> regex::compile(std::string_view pattern, std::string_view flags) {
     result<regex> r; auto im = std::make_shared<impl>();
-    bool ext = false;
+    bool ext = false, ruby = false;
     for (char f : flags) {
         if (f == 'i') im->icase = true; else if (f == 'm') im->multiline = true; else if (f == 's') im->dotall = true; else if (f == 'x') ext = true;
+        else if (f == 'R') { ruby = true; im->multiline = true; }   // Ruby / Oniguruma dialect: ^ $ are line anchors, (?m) is dot-all
         else if (f == 'g' || f == 'u') {}
         else { r.err = {EINVAL, std::string("regex: unknown flag '") + f + "'"}; return r; }
     }
     parser ps(to32(pattern), *im, ext);
+    ps.icase = im->icase; ps.dotall = im->dotall; ps.ruby = ruby;
     node root;
     if (!ps.alternation(root) || (!ps.eof() && ps.err.empty() && ps.fail("unexpected )"))) {}
     if (!ps.err.empty()) { r.err = {EINVAL, "regex: " + ps.err}; return r; }
@@ -421,6 +488,22 @@ std::vector<regex_match> regex::find_all(std::string_view s) const {
         std::size_t b = std::lower_bound(off.begin(), off.end(), m->begin()) - off.begin();
         out.push_back(std::move(*m));
         cp = e > b ? e : e + 1;
+    }
+    return out;
+}
+std::vector<std::pair<std::size_t, std::size_t>> regex::find_spans(std::string_view s8) const {
+    std::vector<std::pair<std::size_t, std::size_t>> out; auto s = to32(s8); auto off = cp_byte_offsets(s8);
+    const impl& R = *p_; R.hit = false;
+    vm v{R, s, 0, {}, {}};
+    v.extra = 512 * std::uint64_t(s.size());   // the budget covers all matches: a pattern that backtracks badly cannot stall a long subject
+    std::size_t start = 0;
+    while (start <= s.size()) {
+        v.caps.assign(std::size_t(2 * R.ngroups), -1); v.pos_slots.assign(std::size_t(R.nslots), -1);
+        long end = 0;
+        if (v.run(0, long(start), end)) {
+            out.push_back({off[start], off[std::size_t(end)]});
+            start = std::size_t(end) > start ? std::size_t(end) : start + 1;
+        } else { if (R.hit) break; ++start; }
     }
     return out;
 }
