@@ -26,6 +26,21 @@
 #include <forge/script/aot.hpp>
 #include <forge/security/security.hpp>
 
+// ASan and TSan reserve terabytes of address space for their shadow when a process starts, so an address-space cap
+// (RLIMIT_AS) put on a child that is this same sanitized binary stops it before main(): `forge rpc-serve` scripts
+// all failed with "could not start script child" in the sanitizer CI jobs. Such builds leave that one cap to the
+// child itself (limit_own_memory() counts what is mapped already).
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define FORGE_APP_SANITIZED 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define FORGE_APP_SANITIZED 1
+#endif
+#endif
+#ifndef FORGE_APP_SANITIZED
+#define FORGE_APP_SANITIZED 0
+#endif
+
 using namespace forge;
 
 namespace {
@@ -714,7 +729,9 @@ int cmd_rpc_serve(const args& a) {
 #endif
             sp.argv.push_back("--args"); for (auto& x : argv) sp.argv.push_back(x);
             sp.stdin_data = src; sp.timeout_ms = t + 5000; sp.max_output = 32u << 20;
+#if !FORGE_APP_SANITIZED
             sp.limits.memory_bytes = mem_mb << 20;
+#endif   // (a sanitized child maps its shadow before main(): see FORGE_APP_SANITIZED; --mem-limit above still caps it)
             sp.env_unset = {"FORGE_SCRIPT_CACHE_SIGN_SEED", "FORGE_RPC_TOKEN", "FORGE_RPC_KEY", "FORGE_RPC_TLS_KEY"};
             auto r = os::spawn_wait(sp);
             if (!r) return graph::rpc::server::script_result{false, "RuntimeError", "could not start script child: " + r.err.what, ""};
