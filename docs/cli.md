@@ -19,7 +19,7 @@ Converts a model to `.fpk`.
 
 | Option | Meaning |
 |--------|---------|
-| `--codec C` | Weight codec (default `f32`): `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2`, or the mixed-precision presets `q4_k_m` / `q5_k_m` |
+| `--codec C` | Weight codec: `f32 f16 bf16 fp8_e4m3 fp8_e5m2 q8_0 q4_k q5_k q6_k q4_g32 q8_g32 mxfp8 mxfp6 mxfp4 mxint8 nvfp4 tq2 q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0`, the mixed-precision presets `q4_k_m` / `q5_k_m` (Hugging Face inputs), or `keep`. Default `f32` for plain Hugging Face checkpoints. For a GGUF file or an AWQ / GPTQ checkpoint the default is `keep`: the tensors stay in the quantisation they are stored in; another value decodes and re-quantises them and prints a double-quantisation warning ([modelfile.md](modelfile.md#gguf-tensor-types)) |
 | `--emb-codec C` | Codec for the token embedding (default `q8_0` when `--codec` is quantised, else the same as `--codec`) |
 | `--template NAME` | Blueprint template from `import/templates/`: `llama`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`. Normally chosen from the model's architecture |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
@@ -51,7 +51,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--draft draft.fpk` | | Speculative decoding with a draft model |
 | `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
 | `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
-| `--codec C` | `f32` | Codec for on-the-fly import of non-`.fpk` inputs |
+| `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 
 Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr.
