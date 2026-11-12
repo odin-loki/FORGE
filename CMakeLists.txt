@@ -12,22 +12,15 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     message(STATUS "clang ${CMAKE_CXX_COMPILER_VERSION}: FORGE is built and tested with clang 23")
   endif()
 endif()
-# libc++ < 20 (FreeBSD 14 base clang, older Xcode) keeps std::jthread / std::stop_token behind -fexperimental-library.
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
-  include(CheckCXXSourceCompiles)
-  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)   # compile-only: no -pthread/link needed for the probe
-  set(CMAKE_REQUIRED_FLAGS -std=c++23)
-  check_cxx_source_compiles("#include <stop_token>\n#include <thread>\nint main() { std::stop_source s; std::jthread t([](std::stop_token) {}); return s.stop_requested(); }" FORGE_STD_STOP_TOKEN_OK)
-  if(NOT FORGE_STD_STOP_TOKEN_OK)
-    set(CMAKE_REQUIRED_FLAGS "-std=c++23 -fexperimental-library")
-    check_cxx_source_compiles("#include <stop_token>\n#include <thread>\nint main() { std::stop_source s; std::jthread t([](std::stop_token) {}); return s.stop_requested(); }" FORGE_STD_STOP_TOKEN_EXPERIMENTAL)
-    if(FORGE_STD_STOP_TOKEN_EXPERIMENTAL)
-      add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-fexperimental-library>")
-      add_link_options("$<$<LINK_LANGUAGE:CXX>:-fexperimental-library>")
-    endif()
-  endif()
-  unset(CMAKE_REQUIRED_FLAGS)
-  unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+# libc++ < 20 keeps std::jthread / std::stop_token behind -fexperimental-library: probed in
+# cmake/forge_cxx_compat.cmake. The installed package runs the same probe for its consumers.
+include(cmake/forge_cxx_compat.cmake)
+forge_cxx_compat(_forge_compat_cxx _forge_compat_link)
+if(_forge_compat_cxx)
+  add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:${_forge_compat_cxx}>")
+endif()
+if(_forge_compat_link)
+  add_link_options("$<$<LINK_LANGUAGE:CXX>:${_forge_compat_link}>")
 endif()
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -122,12 +115,25 @@ add_custom_command(
   COMMENT "Generating simd Tier R (x86)")
 add_custom_target(forge_raw_gen DEPENDS ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp)
 
+include(GNUInstallDirs)
+# Include directories of a FORGE library: source/build tree paths while building FORGE, nothing in the installed
+# package (install(TARGETS ... INCLUDES DESTINATION) adds <prefix>/include there), so the exported targets carry no
+# absolute path. Relative directories are relative to the source root.
+function(forge_include_dirs target scope)
+  foreach(d ${ARGN})
+    cmake_path(ABSOLUTE_PATH d BASE_DIRECTORY ${PROJECT_SOURCE_DIR} NORMALIZE)
+    target_include_directories(${target} ${scope} $<BUILD_INTERFACE:${d}>)
+  endforeach()
+endfunction()
+# Vendored headers are installed under <prefix>/include/forge/third_party.
+set(FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR ${CMAKE_INSTALL_INCLUDEDIR}/forge/third_party)
+
 add_library(forge_core INTERFACE)
-target_include_directories(forge_core INTERFACE core/include)
+forge_include_dirs(forge_core INTERFACE core/include)
 add_library(forge::core ALIAS forge_core)
 
 add_library(forge_os INTERFACE)   # unified OS layer
-target_include_directories(forge_os INTERFACE os/include)
+forge_include_dirs(forge_os INTERFACE os/include)
 find_package(Threads)   # FreeBSD/older glibc need -pthread for std::thread users of the OS layer
 if(Threads_FOUND)
   target_link_libraries(forge_os INTERFACE Threads::Threads)
@@ -155,7 +161,7 @@ elseif(NOT _forge_log_min STREQUAL "")
 endif()
 
 add_library(forge_loadbalancer INTERFACE)   # load balancer + L4/L7 proxy
-target_include_directories(forge_loadbalancer INTERFACE loadbalancer/include)
+forge_include_dirs(forge_loadbalancer INTERFACE loadbalancer/include)
 target_link_libraries(forge_loadbalancer INTERFACE forge_os)
 find_package(Threads)
 if(Threads_FOUND)
@@ -170,7 +176,7 @@ if(APPLE)
   list(APPEND FORGE_MOBILE_SRCS os/src/mobile/apple.mm)
 endif()
 add_library(forge_mobile STATIC ${FORGE_MOBILE_SRCS})
-target_include_directories(forge_mobile PUBLIC os/include core/include support/include)
+forge_include_dirs(forge_mobile PUBLIC os/include core/include support/include)
 target_link_libraries(forge_mobile PUBLIC forge_core)
 if(Threads_FOUND)
   target_link_libraries(forge_mobile PUBLIC Threads::Threads)
@@ -200,7 +206,7 @@ if(APPLE)
   set_source_files_properties(os/src/text/locale_apple.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
 endif()
 add_library(forge_text STATIC ${FORGE_TEXT_SRCS})
-target_include_directories(forge_text PUBLIC os/include core/include support/include)
+forge_include_dirs(forge_text PUBLIC os/include core/include support/include)
 target_link_libraries(forge_text PUBLIC forge_core)
 set_target_properties(forge_text PROPERTIES POSITION_INDEPENDENT_CODE ON)
 if(APPLE)
@@ -212,17 +218,17 @@ if(FORGE_FETCH_UCD)
 endif()
 
 add_library(forge_ops INTERFACE)
-target_include_directories(forge_ops INTERFACE ops/include ${FORGE_GEN_DIR})
+forge_include_dirs(forge_ops INTERFACE ops/include ${FORGE_GEN_DIR})
 target_link_libraries(forge_ops INTERFACE forge_core)
 add_dependencies(forge_ops forge_ops_gen)
 
 add_library(forge_simd INTERFACE)
-target_include_directories(forge_simd INTERFACE simd/include ${FORGE_GEN_DIR})
+forge_include_dirs(forge_simd INTERFACE simd/include ${FORGE_GEN_DIR})
 target_link_libraries(forge_simd INTERFACE forge_core)
 add_dependencies(forge_simd forge_raw_gen)
 
 add_library(forge_verify INTERFACE)
-target_include_directories(forge_verify INTERFACE verify/include)
+forge_include_dirs(forge_verify INTERFACE verify/include)
 target_link_libraries(forge_verify INTERFACE forge_ops)
 
 
@@ -365,18 +371,19 @@ add_custom_target(forge_gpu_images ALL DEPENDS ${FORGE_GEN_DIR}/forge/gpu/gpu_im
 add_dependencies(forge_gpu_images forge_gpu_gen)
 message(STATUS "FORGE: CUDA/HIP images: ${FORGE_GPU_IMAGES}")
 add_library(forge_gpu INTERFACE)
-target_include_directories(forge_gpu INTERFACE gpu/include support/include third_party)
-target_include_directories(forge_gpu INTERFACE ${FORGE_GEN_DIR})
+forge_include_dirs(forge_gpu INTERFACE gpu/include support/include third_party)
+forge_include_dirs(forge_gpu INTERFACE ${FORGE_GEN_DIR})
 if(FORGE_HAVE_VULKAN)
-  target_include_directories(forge_gpu INTERFACE ${FORGE_GEN_DIR}/vkinc)
+  forge_include_dirs(forge_gpu INTERFACE ${FORGE_GEN_DIR}/vkinc)
 endif()
+target_include_directories(forge_gpu INTERFACE $<INSTALL_INTERFACE:${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}>)   # <level-zero/ze_api.h>
 add_dependencies(forge_gpu forge_gpu_gen forge_gpu_images)
 if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
   enable_language(OBJCXX)
   add_library(forge_metal STATIC gpu/src/metal.mm)
   target_compile_options(forge_metal PRIVATE -fobjc-arc)
   target_compile_definitions(forge_metal PUBLIC FORGE_GPU_METAL=1)
-  target_include_directories(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
+  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
   add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
   target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
   target_link_libraries(forge_gpu INTERFACE forge_metal)
@@ -384,7 +391,7 @@ endif()
 target_link_libraries(forge_gpu INTERFACE forge_simd)
 
 add_library(forge_graph INTERFACE)
-target_include_directories(forge_graph INTERFACE graph/include)
+forge_include_dirs(forge_graph INTERFACE graph/include)
 target_link_libraries(forge_graph INTERFACE forge_ops forge_simd forge_gpu forge_trust forge_security)   # security: rpc key memory (CRY-2), key file checks (FIO-2)
 # TLS for rpc-serve (graph/rpc.hpp). OpenSSL is optional; without it rpc stays plain TCP (auth still works).
 option(FORGE_TLS "TLS for forge rpc-serve via OpenSSL when available" ON)
@@ -405,22 +412,23 @@ endif()
 
 # Vendored Monocypher 4.0.2 (BSD-2-Clause / CC0): Ed25519 for .fpk signing, XChaCha20-Poly1305 for the os keystore file backend.
 add_library(forge_trust STATIC third_party/monocypher/monocypher.c third_party/monocypher/monocypher-ed25519.c)
-target_include_directories(forge_trust PUBLIC third_party/monocypher)
+forge_include_dirs(forge_trust PUBLIC third_party/monocypher)
+target_include_directories(forge_trust PUBLIC $<INSTALL_INTERFACE:${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/monocypher>)
 set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
 
 add_library(forge_modelfile INTERFACE)
-target_include_directories(forge_modelfile INTERFACE modelfile/include)
+forge_include_dirs(forge_modelfile INTERFACE modelfile/include)
 target_link_libraries(forge_modelfile INTERFACE forge_graph forge_trust)
 
 # forge::security: FORGE Security Standard policy, enforce, audit, lockdown, check (docs/security-api.md). Header-only.
 add_library(forge_security INTERFACE)
-target_include_directories(forge_security INTERFACE security/include support/include)
+forge_include_dirs(forge_security INTERFACE security/include support/include)
 target_link_libraries(forge_security INTERFACE forge_core forge_trust)   # forge_trust: Ed25519 for detached signatures
 
 add_library(forge_inference INTERFACE)
-target_include_directories(forge_inference INTERFACE inference/include)
+forge_include_dirs(forge_inference INTERFACE inference/include)
 target_link_libraries(forge_inference INTERFACE forge_modelfile forge_security)   # FSS model integrity / fs scope at load
-target_include_directories(forge_inference INTERFACE inference/include)
+forge_include_dirs(forge_inference INTERFACE inference/include)
 # forge::script managed scripting runtime (docs/scripting.md). Safe C++23; libc++ hardening when available.
 # Shell backends: one file each in script/src/shells/ defining forge_shell_register_<stem>(); the registry TU is generated.
 file(GLOB FORGE_SHELL_SRCS CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/script/src/shells/*.cpp)
@@ -435,7 +443,8 @@ file(CONFIGURE OUTPUT ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp CONTEN
 "// generated by CMake from script/src/shells/*.cpp\n#include \"shells/shell.hpp\"\n${_shell_decl}namespace forge::script {\nconst shell_registry& shells() {\n    static const shell_registry reg = [] {\n        shell_registry r;\n${_shell_call}        return r;\n    }();\n    return reg;\n}\n}\n")
 add_library(forge_script STATIC ${FORGE_SHELL_SRCS} ${PROJECT_BINARY_DIR}/generated/shells_registry.cpp script/src/heap.cpp script/src/parser.cpp script/src/runtime.cpp script/src/tree.cpp
   script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/ai.cpp script/src/remote.cpp script/src/mobile.cpp script/src/text.cpp script/src/reflect.cpp script/src/emit.cpp script/src/debug.cpp script/src/engine.cpp script/src/fsc.cpp script/src/check.cpp)
-target_include_directories(forge_script PUBLIC script/include PRIVATE script/src)
+forge_include_dirs(forge_script PUBLIC script/include)
+target_include_directories(forge_script PRIVATE script/src)
 target_link_libraries(forge_script PUBLIC forge_modelfile forge_mobile forge_text PRIVATE forge_verify forge_trust forge_security)
 if(TARGET forge_rpc_tls)
   target_link_libraries(forge_script PUBLIC forge_rpc_tls)
@@ -469,7 +478,16 @@ if(FORGE_JNI)
     target_link_libraries(forge_jni PRIVATE log)
   endif()
 endif()
-target_compile_definitions(forge_inference INTERFACE FORGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+# Import templates (forge/import/hf.hpp template_dir()): $FORGE_TEMPLATES, then <exe dir>/<FORGE_TEMPLATES_RELDIR>
+# (an installed tree), then the source tree. The source path is a build-tree definition only: it is not exported.
+target_compile_definitions(forge_inference INTERFACE $<BUILD_INTERFACE:FORGE_SOURCE_DIR="${PROJECT_SOURCE_DIR}">)
+set(FORGE_INSTALL_TEMPLATEDIR ${CMAKE_INSTALL_DATADIR}/forge/templates)
+if(NOT IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}" AND NOT IS_ABSOLUTE "${FORGE_INSTALL_TEMPLATEDIR}")
+  file(RELATIVE_PATH _forge_tpl_rel "/p/${CMAKE_INSTALL_BINDIR}" "/p/${FORGE_INSTALL_TEMPLATEDIR}")
+  if(NOT _forge_tpl_rel STREQUAL "../share/forge/templates")   # the header's default
+    target_compile_definitions(forge_modelfile INTERFACE FORGE_TEMPLATES_RELDIR="${_forge_tpl_rel}")
+  endif()
+endif()
 
 # Multiversioned simd kernels: one TU per target, own flags, own namespace.
 include(CheckCXXSourceCompiles)
@@ -1160,18 +1178,110 @@ if(FORGE_BUILD_EXAMPLES)
 endif()
 
 # ---- Install + packaging (v1.0 release tooling; tools/release.py drives this) -------------------------
-include(GNUInstallDirs)
-install(DIRECTORY core/include/ simd/include/ ops/include/ gpu/include/ graph/include/ modelfile/include/ inference/include/ support/include/ verify/include/
+# Layout under the prefix:
+#   include/                      every public header (forge.h, forge/<layer>/...), the generated *.gen.hpp
+#   include/forge/third_party/    vendored headers the public headers include (monocypher, level-zero)
+#   lib/                          libforge (C ABI) and the static libraries
+#   lib/cmake/forge/              forgeConfig.cmake: find_package(forge CONFIG) -> forge::<name> targets
+#   lib/pkgconfig/forge.pc        the C ABI for pkg-config
+#   share/forge/templates/        import blueprint templates (found relative to the executable at run time)
+#   bin/                          forge, forge-serve
+include(CMakePackageConfigHelpers)
+
+# The generated headers must exist before "install": tie their generators to the default target.
+add_custom_target(forge_gen_headers ALL)
+add_dependencies(forge_gen_headers forge_ops_gen forge_raw_gen forge_gpu_gen forge_gpu_images)
+
+install(DIRECTORY core/include/ os/include/ simd/include/ ops/include/ gpu/include/ graph/include/ modelfile/include/ inference/include/
+                  support/include/ verify/include/ security/include/ loadbalancer/include/ script/include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
-install(TARGETS forge_c LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime)
-install(TARGETS forge_simd_mv forge_trust ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev)
+install(DIRECTORY ${FORGE_GEN_DIR}/forge/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/forge COMPONENT dev
+        FILES_MATCHING PATTERN "*.gen.hpp")
+install(FILES third_party/monocypher/monocypher.h third_party/monocypher/monocypher-ed25519.h
+        DESTINATION ${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/monocypher COMPONENT dev)
+install(FILES third_party/level-zero/ze_api.h DESTINATION ${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/level-zero COMPONENT dev)
+install(FILES third_party/monocypher/LICENCE.md DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party/monocypher COMPONENT runtime)
+
+# Exported targets: forge_<name> here is forge::<name> in the package (and as an alias in this build).
+set(FORGE_EXPORT_TARGETS forge_core forge_os forge_ops forge_simd forge_verify forge_gpu forge_graph forge_modelfile forge_security
+    forge_inference forge_loadbalancer forge_simd_mv forge_trust forge_text forge_mobile forge_script forge_video forge_c)
+foreach(t forge_metal forge_rpc_tls)   # Apple only / OpenSSL found
+  if(TARGET ${t})
+    list(APPEND FORGE_EXPORT_TARGETS ${t})
+  endif()
+endforeach()
+foreach(t ${FORGE_EXPORT_TARGETS})
+  string(REGEX REPLACE "^forge_" "" _n ${t})
+  set_target_properties(${t} PROPERTIES EXPORT_NAME ${_n})
+  if(NOT TARGET forge::${_n})
+    add_library(forge::${_n} ALIAS ${t})
+  endif()
+endforeach()
+install(TARGETS ${FORGE_EXPORT_TARGETS} EXPORT forgeTargets
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT runtime
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT dev
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime
+        INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 foreach(t forge forge-serve)
   if(TARGET ${t})
     install(TARGETS ${t} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT runtime)
   endif()
 endforeach()
+install(DIRECTORY import/templates/ DESTINATION ${FORGE_INSTALL_TEMPLATEDIR} COMPONENT runtime FILES_MATCHING PATTERN "*.fbp")
 install(FILES LICENSE NOTICE COMMERCIAL-LICENCE.md SECURITY.md README.md DESTINATION ${CMAKE_INSTALL_DOCDIR} COMPONENT runtime)
+
+# CMake package.
+set(FORGE_INSTALL_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/forge)
+set(FORGE_PKG_HAVE_THREADS OFF)
+if(Threads_FOUND)
+  set(FORGE_PKG_HAVE_THREADS ON)
+endif()
+set(FORGE_PKG_HAVE_TLS OFF)
+if(TARGET forge_rpc_tls)
+  set(FORGE_PKG_HAVE_TLS ON)
+endif()
+set(FORGE_PKG_HAVE_VULKAN OFF)
+if(FORGE_HAVE_VULKAN)
+  set(FORGE_PKG_HAVE_VULKAN ON)
+endif()
+install(EXPORT forgeTargets NAMESPACE forge:: DESTINATION ${FORGE_INSTALL_CMAKEDIR} COMPONENT dev)
+configure_package_config_file(cmake/forgeConfig.cmake.in ${PROJECT_BINARY_DIR}/forgeConfig.cmake
+  INSTALL_DESTINATION ${FORGE_INSTALL_CMAKEDIR} PATH_VARS CMAKE_INSTALL_INCLUDEDIR FORGE_INSTALL_TEMPLATEDIR)
+# 0.x: a minor release may change the C++ headers.
+write_basic_package_version_file(${PROJECT_BINARY_DIR}/forgeConfigVersion.cmake VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
+install(FILES ${PROJECT_BINARY_DIR}/forgeConfig.cmake ${PROJECT_BINARY_DIR}/forgeConfigVersion.cmake cmake/forge_cxx_compat.cmake
+        DESTINATION ${FORGE_INSTALL_CMAKEDIR} COMPONENT dev)
+
+# pkg-config file for the C ABI (forge.h + libforge). Relocatable when the install directories are relative.
+if(IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" OR IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}")
+  set(FORGE_PC_PREFIX "${CMAKE_INSTALL_PREFIX}")
+  cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_LIBDIR BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" OUTPUT_VARIABLE FORGE_PC_LIBDIR)
+  cmake_path(ABSOLUTE_PATH CMAKE_INSTALL_INCLUDEDIR BASE_DIRECTORY "${CMAKE_INSTALL_PREFIX}" OUTPUT_VARIABLE FORGE_PC_INCLUDEDIR)
+else()
+  file(RELATIVE_PATH _forge_pc_rel "/p/${CMAKE_INSTALL_LIBDIR}/pkgconfig" "/p")
+  string(REGEX REPLACE "/$" "" _forge_pc_rel "${_forge_pc_rel}")
+  set(FORGE_PC_PREFIX "\${pcfiledir}/${_forge_pc_rel}")
+  set(FORGE_PC_LIBDIR "\${prefix}/${CMAKE_INSTALL_LIBDIR}")
+  set(FORGE_PC_INCLUDEDIR "\${prefix}/${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
+configure_file(cmake/forge.pc.in ${PROJECT_BINARY_DIR}/forge.pc @ONLY)
+install(FILES ${PROJECT_BINARY_DIR}/forge.pc DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig COMPONENT dev)
+
+# install_consumer: install into a scratch prefix, then configure, build and run tests/install_consumer against it
+# with find_package(forge). Needs the default target built. Not registered for cross builds (the consumer could not
+# run) or sanitizer builds (the consumer would have to repeat the sanitizer flags).
+if(FORGE_BUILD_TESTS AND NOT CMAKE_CROSSCOMPILING AND NOT FORGE_SANITIZE AND NOT FORGE_TSAN AND NOT FORGE_LIBFUZZER)
+  add_test(NAME install_consumer COMMAND ${CMAKE_COMMAND}
+    -DFORGE_BUILD_DIR=${PROJECT_BINARY_DIR} -DFORGE_SOURCE_DIR=${PROJECT_SOURCE_DIR} -DFORGE_CONFIG=$<CONFIG>
+    -DFORGE_WORK_DIR=${PROJECT_BINARY_DIR}/install_consumer
+    -DFORGE_BINDIR=${CMAKE_INSTALL_BINDIR} -DFORGE_INCLUDEDIR=${CMAKE_INSTALL_INCLUDEDIR} -DFORGE_TEMPLATEDIR=${FORGE_INSTALL_TEMPLATEDIR}
+    -DFORGE_GENERATOR=${CMAKE_GENERATOR} -DFORGE_GENERATOR_PLATFORM=${CMAKE_GENERATOR_PLATFORM} -DFORGE_GENERATOR_TOOLSET=${CMAKE_GENERATOR_TOOLSET}
+    -DFORGE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM} -DFORGE_C_COMPILER=${CMAKE_C_COMPILER} -DFORGE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+    -DFORGE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} -DFORGE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+    -P ${PROJECT_SOURCE_DIR}/tests/install_consumer/run.cmake)
+  set_tests_properties(install_consumer PROPERTIES LABELS "install" TIMEOUT 1800)
+endif()
+
 
 set(CPACK_PACKAGE_NAME forge)
 set(CPACK_PACKAGE_VENDOR "Odin Loch")

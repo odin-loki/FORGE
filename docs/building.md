@@ -71,7 +71,7 @@ Build presets exist for every configure preset except `ios`. Test presets: `dev`
 | `FORGE_IOS_SIMULATOR` | OFF | With `ios.cmake`: build for the simulator (arm64 + x86_64) |
 
 ## Targets
-Header-only INTERFACE targets: `forge_core`, `forge_os`, `forge_ops`, `forge_simd`, `forge_verify`, `forge_gpu`, `forge_graph`, `forge_modelfile`, `forge_inference`, `forge_loadbalancer` (and `forge_rpc_tls` when OpenSSL is found). Compiled targets:
+Header-only INTERFACE targets: `forge_core`, `forge_os`, `forge_ops`, `forge_simd`, `forge_verify`, `forge_gpu`, `forge_graph`, `forge_modelfile`, `forge_inference`, `forge_loadbalancer` `forge_security` (and `forge_rpc_tls` when OpenSSL is found). Each `forge_<name>` library also has the alias `forge::<name>`, the name it is installed under (see [Installing and packaging](#installing-and-packaging)). Compiled targets:
 
 | Target | Output |
 |--------|--------|
@@ -90,9 +90,44 @@ Header-only INTERFACE targets: `forge_core`, `forge_os`, `forge_ops`, `forge_sim
 Generated files go to `build/<dir>/generated/`: the op table (`forge/ops/ops.gen.hpp`, `ops.md`), x86 intrinsic wrappers (`forge/simd/raw/x86.gen.hpp`), GPU kernels (`gpu/*.comp`, `kernels.cu`, `kernels.cl`, `kernels.metal`), the embedded SPIR-V and CUDA/HIP images (`forge/gpu/spirv.gen.hpp`, `forge/gpu/gpu_images.gen.hpp`) and the shell backend registry.
 
 ## Installing and packaging
-`cmake --install build/release --prefix /opt/forge` installs `libforge`, `forge_simd_mv`, `forge_trust`, the apps, the licence files, `README.md`, `SECURITY.md` and headers. CPack (`cpack` in the build directory, or `tools/release.py build`) produces binary and source archives: TGZ (plus DEB on Linux), or ZIP on Windows.
+`cmake --install build/release --prefix /opt/forge` installs (build the default target first; the generated headers are part of it):
 
-**Known gap:** the install rule copies headers from `core`, `simd`, `ops`, `gpu`, `graph`, `modelfile`, `inference`, `support` and `verify`, but not from `os`, `loadbalancer` or `script`, nor the generated headers, and it does not install `forge_text`, `forge_mobile` or `forge_script`. `core` includes `<forge/os/os.hpp>`, so an installed tree cannot yet be used to compile against the C++ headers. Build against the source tree, or use the C ABI. Installed binaries look for import templates in the source tree they were built from unless `FORGE_TEMPLATES` is set.
+| Under the prefix | What |
+|------------------|------|
+| `bin/` | `forge`, `forge-serve` (`forge.dll` on Windows) |
+| `lib/` | `libforge` (the C ABI) and the static libraries `forge_simd_mv`, `forge_trust`, `forge_text`, `forge_mobile`, `forge_script`, `forge_video` (`forge_metal` on Apple) |
+| `include/` | `forge.h` and every public header: `forge/{core,os,simd,ops,gpu,graph,modelfile,import,inference,security,loadbalancer,script,verify}` and the support headers, plus the generated `forge/ops/ops.gen.hpp`, `forge/simd/raw/x86.gen.hpp`, `forge/gpu/gpu_images.gen.hpp` (and `forge/gpu/spirv.gen.hpp` when the build had Vulkan) |
+| `include/forge/third_party/` | Vendored headers the public headers include: `monocypher/`, `level-zero/ze_api.h` |
+| `lib/cmake/forge/` | The CMake package: `forgeConfig.cmake`, `forgeConfigVersion.cmake`, `forgeTargets*.cmake`, `forge_cxx_compat.cmake` |
+| `lib/pkgconfig/forge.pc` | pkg-config file for the C ABI |
+| `share/forge/templates/` | Import blueprint templates (`*.fbp`) |
+| `share/doc/FORGE/` | Licence files, `README.md`, `SECURITY.md` |
+
+The directories follow `GNUInstallDirs` (`CMAKE_INSTALL_LIBDIR` and so on). The installed tree is relocatable: the package files hold no absolute path. CPack (`cpack` in the build directory, or `tools/release.py build`) produces binary and source archives of the same tree: TGZ (plus DEB on Linux), or ZIP on Windows.
+
+### Using the installed package from CMake
+```cmake
+cmake_minimum_required(VERSION 3.25)
+project(app LANGUAGES CXX)
+find_package(forge 0.1 CONFIG REQUIRED)          # -DCMAKE_PREFIX_PATH=/opt/forge
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE forge::inference forge::simd_mv)
+```
+Each build target `forge_<name>` is exported as `forge::<name>` (the same names exist as aliases inside the FORGE build): header-only `forge::core`, `forge::os`, `forge::ops`, `forge::simd`, `forge::verify`, `forge::gpu`, `forge::graph`, `forge::modelfile`, `forge::security`, `forge::inference`, `forge::loadbalancer`; static `forge::simd_mv`, `forge::trust`, `forge::text`, `forge::mobile`, `forge::script`, `forge::video`; shared `forge::c` (the C ABI, usable from a C-only project); `forge::metal` on Apple; `forge::rpc_tls` when FORGE was built with OpenSSL. The package version is compatible within one minor version (`0.1.x`).
+
+`forgeConfig.cmake` gives a C++ consumer what the FORGE build gives its own targets: C++23 (`cxx_std_23`), the libc++ < 20 workaround from `cmake/forge_cxx_compat.cmake` (`-fexperimental-library`) probed with the consumer's compiler, on Windows `NOMINMAX`, `WIN32_LEAN_AND_MEAN`, `_USE_MATH_DEFINES` and `userenv`, and with MSVC `/utf-8 /EHsc /bigobj`. It calls `find_dependency` for Threads, and for OpenSSL when FORGE was built with it. It sets `FORGE_INCLUDE_DIR`, `FORGE_TEMPLATES_DIR`, `FORGE_HAVE_TLS` and `FORGE_HAVE_VULKAN`. When FORGE was built with Vulkan, the consumer also needs `vulkan/vulkan.h`; the package looks for it and, if it is missing, the Vulkan backend is compiled out of the consumer. The hardening flags and `FORGE_LOG_MIN_LEVEL` aside (the latter is exported with `forge::core`), build options of the FORGE build are not passed on. A FORGE built with `FORGE_SANITIZE` or `FORGE_TSAN` needs the same sanitizer flags in the consumer.
+
+### Using the C ABI with pkg-config
+```sh
+cc app.c $(PKG_CONFIG_PATH=/opt/forge/lib/pkgconfig pkg-config --cflags --libs forge) -o app
+```
+`forge.pc` covers `forge.h` and `libforge` only. At run time the loader must find `libforge` (rpath, `LD_LIBRARY_PATH`, or `forge.dll` next to the program).
+
+### Import templates at run time
+The importers look for blueprint templates in this order: the directory in `FORGE_TEMPLATES`; `../share/forge/templates` relative to the directory of the running executable, when it exists (an installed `bin/forge`, or your own program installed in the same `bin/`); `import/templates` in the source tree the binary was built from. A program in another location (for example Python loading `libforge`) sets `FORGE_TEMPLATES`; a CMake consumer can take the path from `FORGE_TEMPLATES_DIR`.
+
+### The `install_consumer` test
+`ctest -R install_consumer` installs the build tree into `<build>/install_consumer/prefix`, checks that the package files name neither the source nor the build tree, runs `pkg-config` on `forge.pc` when available, then configures, builds and runs `tests/install_consumer/` against the prefix: a C++ program that links `forge::inference forge::simd_mv` and checks the template lookup, and a C program that links `forge::c`. Its label is `install`. It is short (one C and one C++ translation unit), so it is not labelled `slow` and runs in every full `ctest` run. It is not registered for cross builds or with `FORGE_SANITIZE`, `FORGE_TSAN` or `FORGE_LIBFUZZER`. It needs the default target built.
 
 ## Windows
 
