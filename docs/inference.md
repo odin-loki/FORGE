@@ -21,7 +21,7 @@ Architectures come from the import templates (Hugging Face: Llama/Mistral/Qwen2,
 | `aot()`, `set_aot(on)` | Precompiled plans ([aot-models.md](aot-models.md)): `aot().stats()` counts plans taken from the file's `aot` section, a sidecar or a compiled library (`used`, `native`), rejections and the last reason. `set_aot(false)` compiles every plan at run time; it clears cached plans, so call it before sessions run |
 | `set_device(name)` | Picks the execution device (`cpu`, `vulkan`, `cuda:0`, ...; see [configuration.md](configuration.md)). An unavailable device falls back to `cpu` with a warning. Returns the device used and clears cached plans. `FORGE_DEVICE` is applied on open |
 | `device()`, `blueprint()`, `manifest()`, `file()` | Accessors |
-| `tokenizer()` | `const modelfile::bpe_tokenizer*`, `nullptr` if the file has none |
+| `tokenizer()` | `const modelfile::tokenizer*`, `nullptr` if the file has none |
 | `vocab()`, `max_context()` | `max_context` is manifest `max_position_embeddings`, 2048 if absent |
 | `add_adapter(name, {weight → {a, b}}, alpha)` | LoRA: `W' = W + (alpha / r) · B·A` (PEFT layout, A `[r, in]`, B `[out, r]`). Only targeted matrices are copied; names are immutable once added |
 | `add_adapter_file(name, path)` | Loads `<weight>.lora_a` / `<weight>.lora_b` tensors from an `.fpk`; alpha from manifest `lora_alpha` (default 1) |
@@ -125,6 +125,7 @@ A blueprint that ends with `session embedding` is an embedding model: one statel
 | Member | Meaning |
 |---|---|
 | `embed(ids, token_types = {}, mask = {})` | Token models. Feeds the inputs the blueprint declares out of `tokens`, `positions` (0 .. n-1), `token_types` (zeros unless given) and `mask` (ones unless given; 0 marks padding, which the `bert` template masks out of attention and of mean pooling). Returns the vector |
+| `embed_text(text, pair = nullptr, n_tokens = nullptr)` | Text through the model's tokenizer (`encode_typed` / `encode_pair`: special tokens and token types from its post-processor), then `embed`. `not_found` when the file has no tokenizer |
 | `embed_inputs({name → data}, seq = 1)` | Any embedding model: named f32 inputs as declared (`image` `[channels, size, size]`, `mel` `[n_mels, frames]`, or the token inputs). Returns the first output, flattened row-major |
 | `embedding_shape(seq = 1)` | Declared shape of that output, e.g. `{384}` or `{1500, 384}` |
 
@@ -132,6 +133,7 @@ A blueprint that ends with `session embedding` is an embedding model: one statel
 inference::session s("bge-small.fpk");
 std::vector<int> ids = {101, 7592, 2088, 102};          // [CLS] hello world [SEP]
 std::vector<float> v = s.embed(ids);                    // pooled (and L2-normalised if the model says so)
+std::vector<float> t = s.embed_text("hello world");     // the same through the model's WordPiece tokenizer
 ```
 
 `generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per call: there is no batch axis, so padding only matters when the caller pads. Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).

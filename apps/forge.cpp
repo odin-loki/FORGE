@@ -71,9 +71,10 @@ int usage() {
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
         "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
-        "  embed <model.fpk> (--text TEXT | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
+        "  embed <model.fpk> (--text TEXT [--text-pair TEXT] [--ids] | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
         "      [--out file.f32] [--device D]     embedding models (BERT family, ViT / CLIP / SigLIP, Whisper encoder):\n"
         "      prints the vector, or writes it as raw f32; --input feeds a declared input (an image, mel frames)\n"
+        "      --text: the model's tokenizer adds its special tokens ([CLS] .. [SEP]) and token types; --ids prints the ids to stderr\n"
         "  aot <model.fpk> [-o out] [--aot-mode plan|native]   compile the model's plans ahead of time (docs/aot-models.md)\n"
         "      [--shapes 1,8,16 (sequence lengths; default 1,2,4,...,64)] [--all-rows] [--kv-codec f32,int8] [--ctx N]\n"
         "      plan:   plans go into the .fpk's \"aot\" section (-o out.fpk, default in place) [--sidecar] [--key name.key | --drop-signature]\n"
@@ -389,14 +390,16 @@ int cmd_embed(const args& a) {
         }
         v = s.embed_inputs(in, seq);
     } else {
-        std::vector<int> ids;
+        std::vector<int> ids, types;
         if (a.kv.count("tokens")) ids = parse_ids(a.get("tokens"));
-        else if (a.kv.count("text")) {
+        else if (a.kv.count("text")) {   // the tokenizer's post-processor adds [CLS] / [SEP] and assigns the token types
             if (!s.tokenizer()) raise(errc::not_found, "model has no tokenizer the runtime can use; pass --tokens");
-            ids = s.tokenizer()->encode(a.get("text"));
+            auto e = a.kv.count("text-pair") ? s.tokenizer()->encode_pair(a.get("text"), a.get("text-pair")) : s.tokenizer()->encode_typed(a.get("text"));
+            ids = std::move(e.ids); types = std::move(e.type_ids);
+            if (a.has("ids")) { for (std::size_t i = 0; i < ids.size(); ++i) std::fprintf(stderr, i ? " %d" : "%d", ids[i]); std::fprintf(stderr, "\n"); }
         } else return usage();
-        v = s.embed(ids, a.kv.count("token-types") ? parse_ids(a.get("token-types")) : std::vector<int>{},
-                    a.kv.count("mask") ? parse_ids(a.get("mask")) : std::vector<int>{});
+        if (a.kv.count("token-types")) types = parse_ids(a.get("token-types"));
+        v = s.embed(ids, types, a.kv.count("mask") ? parse_ids(a.get("mask")) : std::vector<int>{});
     }
     if (a.kv.count("out")) {
         std::ofstream f(a.get("out"), std::ios::binary);

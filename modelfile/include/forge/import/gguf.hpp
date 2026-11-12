@@ -423,12 +423,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     // tokenizer.json synthesised from the GGUF vocabulary (tokenizer_import.hpp): tokenizer.ggml.model gpt2 (byte-level
     // BPE split by the tokenizer.ggml.pre regex), llama (SentencePiece BPE), t5 (Unigram), bert (WordPiece), with the
     // token types as added tokens. The chat template gets its own section.
-    {
-        std::string warn;
-        if (auto tj = gguf_tokenizer_json(g, &warn); !tj.empty()) w.set_section("tokenizer", tj);
-        if (!warn.empty()) std::fprintf(stderr, "warning: %s: %s\n", path.c_str(), warn.c_str());
-        if (auto* ct = g.get("tokenizer.chat_template"); ct && ct->is_str() && !ct->str().empty()) w.set_section("chat_template", ct->str());
-    }
+    store_gguf_tokenizer(g, w, [&](const std::string& m) { rep.notes.push_back("warning: " + m); });
     auto num_or = [&](const char* k, double d) { auto* v = g.get(k); return v ? v->num() : d; };
     json::object man{{"format", "fpk"}, {"forge_format_version", double(modelfile::format_version)}, {"architecture", arch},
                      {"source", "gguf"}, {"template", tname}, {"session", bp.session},

@@ -322,6 +322,40 @@ struct expert_index {
 // Architectures outside the Llama-style decoder path below (defined in hf_arch.hpp, included at the end of this file).
 inline std::optional<import_report> import_hf_extra(const std::filesystem::path& dir, const json::value& cfg, const std::string& out, const import_options& opt);
 
+// The tokenizer and chat template of a Hugging Face checkpoint directory, for every importer (import_hf below and
+// the families of hf_arch.hpp):
+//   "tokenizer" section      tokenizer.json as it is; without one a SentencePiece model (tokenizer.model, spiece.model,
+//                            sentencepiece.bpe.model) or a WordPiece vocab.txt, converted (tokenizer_import.hpp).
+//                            A tokenizer the runtime cannot load is left out with a note: the model then takes ids.
+//   "chat_template" section  chat_template.jinja, else tokenizer_config.json's chat_template, else chat_template.json
+//   manifest add_bos/add_eos tokenizer_config.json's add_bos_token / add_eos_token, unless the importer already set
+//                            them (absent: the session's default, or the tokenizer.json post-processor)
+template <class W> void store_hf_tokenizer(const std::filesystem::path& dir, json::object& man, W& w, import_report& rep) {
+    auto has = [&](const char* k) { for (auto& kv : man) if (kv.first == k) return true; return false; };
+    json::value tok_cfg;
+    std::string chat_tpl;
+    if (std::filesystem::exists(dir / "tokenizer_config.json")) {
+        tok_cfg = json::parse(read_file(dir / "tokenizer_config.json"));
+        if (auto* ab = tok_cfg.find("add_bos_token"); ab && ab->is_bool() && !has("add_bos")) man.emplace_back("add_bos", ab->b());
+        if (auto* ae = tok_cfg.find("add_eos_token"); ae && ae->is_bool() && !has("add_eos")) man.emplace_back("add_eos", ae->b());
+        chat_tpl = chat_template_of(tok_cfg);
+    }
+    if (std::filesystem::exists(dir / "chat_template.jinja")) chat_tpl = read_file(dir / "chat_template.jinja");
+    else if (chat_tpl.empty() && std::filesystem::exists(dir / "chat_template.json")) chat_tpl = chat_template_of(json::parse(read_file(dir / "chat_template.json")));
+    std::string tj, from;
+    if (std::filesystem::exists(dir / "tokenizer.json")) { tj = read_file(dir / "tokenizer.json"); from = "tokenizer.json"; }
+    else {
+        for (auto* spm : {"tokenizer.model", "spiece.model", "sentencepiece.bpe.model"})
+            if (std::filesystem::exists(dir / spm)) { tj = sentencepiece_tokenizer_json(read_file(dir / spm), &tok_cfg); from = spm; break; }
+        if (tj.empty() && std::filesystem::exists(dir / "vocab.txt")) { tj = wordpiece_vocab_tokenizer_json(read_file(dir / "vocab.txt"), &tok_cfg); from = "vocab.txt"; }
+    }
+    if (!tj.empty()) {
+        if (auto why = tokenizer_json_problem(tj); why.empty()) w.set_section("tokenizer", tj);
+        else rep.notes.push_back(std::format("warning: {} is not a tokenizer this build can run ({}); the file gets no tokenizer, pass token ids", from, why));
+    }
+    if (!chat_tpl.empty()) w.set_section("chat_template", chat_tpl);
+}
+
 inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt_in = {}) {
     check_read(dir); check_write(out);
     auto cfg = json::parse(read_file(dir / "config.json"));
@@ -602,19 +636,6 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
                      {"template", tname}, {"codec", opt.codec}, {"session", bp.session},
                      {"bos_token_id", cfg.num_or("bos_token_id", -1)}, {"eos_token_id", cfg.num_or("eos_token_id", -1)},
                      {"max_position_embeddings", cfg.num_or("max_position_embeddings", 2048)}};
-    // tokenizer_config.json's add_bos_token decides whether prompts start with BOS (absent: the old default, BOS added);
-    // add_eos_token likewise for a trailing EOS. Its chat template (or chat_template.jinja, which newer checkpoints
-    // carry instead) becomes the "chat_template" section.
-    json::value tok_cfg;
-    std::string chat_tpl;
-    if (std::filesystem::exists(dir / "tokenizer_config.json")) {
-        tok_cfg = json::parse(read_file(dir / "tokenizer_config.json"));
-        if (auto* ab = tok_cfg.find("add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
-        if (auto* ae = tok_cfg.find("add_eos_token"); ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
-        chat_tpl = chat_template_of(tok_cfg);
-    }
-    if (std::filesystem::exists(dir / "chat_template.jinja")) chat_tpl = read_file(dir / "chat_template.jinja");
-    else if (chat_tpl.empty() && std::filesystem::exists(dir / "chat_template.json")) chat_tpl = chat_template_of(json::parse(read_file(dir / "chat_template.json")));
     if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     auto lic = hf_license(dir);   // README.md front matter + LICENSE* files: manifest fields and the `license` section
     lic.store(man, w); rep.license = lic.summary();
@@ -627,13 +648,9 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         else rep.notes.push_back(std::format("warning: {} quantised Linear layers of this {} checkpoint were decoded and encoded again as {}{}", qck.n_linear, qscheme->method, opt.codec,
                                              opt.codec == "f32" ? "" : " (double quantisation: the error of both formats adds up)"));
     }
+    store_hf_tokenizer(dir, man, w, rep);
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
-    // tokenizer.json as it is; without one, a SentencePiece model (tokenizer.model, ...) is converted
-    if (std::filesystem::exists(dir / "tokenizer.json")) w.set_section("tokenizer", read_file(dir / "tokenizer.json"));
-    else for (auto* spm : {"tokenizer.model", "spiece.model", "sentencepiece.bpe.model"})
-        if (std::filesystem::exists(dir / spm)) { w.set_section("tokenizer", sentencepiece_tokenizer_json(read_file(dir / spm), &tok_cfg)); break; }
-    if (!chat_tpl.empty()) w.set_section("chat_template", chat_tpl);
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

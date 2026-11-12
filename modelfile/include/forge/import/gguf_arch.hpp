@@ -118,26 +118,17 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     check_template_tensors(path, tname, bp, w.entries(), opt);
     if (!opt.codec.empty() && opt.codec != "keep" && opt.codec != "f32") rep.notes.push_back(std::format("--codec {} is not applied to {} files: tensors keep the type the file uses", opt.codec, arch));
 
-    // byte-level BPE vocabularies (tokenizer.ggml.model "gpt2") become a tokenizer section; SentencePiece / WordPiece
-    // vocabularies are not converted, so such files take token ids
-    if (auto* tm = g.get("tokenizer.ggml.model"); tm && tm->is_str() && tm->str() == "gpt2" && g.get("tokenizer.ggml.tokens")) {
-        const auto& toks = g.need("tokenizer.ggml.tokens").arr();
-        json::object vocab; json::array added;
-        const json::array* types = g.get("tokenizer.ggml.token_type") ? &g.need("tokenizer.ggml.token_type").arr() : nullptr;
-        for (std::size_t i = 0; i < toks.size(); ++i) {
-            vocab.emplace_back(toks[i].str(), double(i));
-            if (types && i < types->size() && (*types)[i].num() == 3) added.push_back(json::object{{"id", double(i)}, {"content", toks[i].str()}});
-        }
-        json::array merges; if (auto* m = g.get("tokenizer.ggml.merges")) merges = m->arr();
-        w.set_section("tokenizer", json::dump(json::value(json::object{{"added_tokens", added}, {"model", json::object{{"type", "BPE"}, {"vocab", vocab}, {"merges", merges}}}})));
-    }
+    // tokenizer (tokenizer.ggml.model gpt2 / llama / t5 / bert) and chat template, as import_gguf stores them
+    store_gguf_tokenizer(g, w, [&](const std::string& m) { rep.notes.push_back("warning: " + m); });
     auto num_or = [&](const char* k, double d) { auto* v = g.get(k); return v && v->is_num() ? v->num() : d; };
     json::object man{{"format", "fpk"}, {"forge_format_version", double(modelfile::format_version)}, {"architecture", arch},
                      {"source", "gguf"}, {"template", tname}, {"session", bp.session},
                      {"bos_token_id", num_or("tokenizer.ggml.bos_token_id", -1)}, {"eos_token_id", num_or("tokenizer.ggml.eos_token_id", -1)},
                      {"max_position_embeddings", Kor("context_length", 2048)}};
-    if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
+    // BERT: [CLS] ... [SEP] come from the tokenizer's post-processor, not from add_bos / add_eos
+    if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); arch != "bert" && ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
     else for (auto& kv : extra) if (kv.first == "add_bos") man.push_back(kv);
+    if (auto* ae = g.get("tokenizer.ggml.add_eos_token"); arch != "bert" && ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
     for (auto& kv : extra) if (kv.first != "add_bos") man.push_back(kv);
     {   // licence, as import_gguf records it
         license_info lic;

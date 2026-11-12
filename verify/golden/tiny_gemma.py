@@ -9,6 +9,10 @@ one float64 numpy reference parameterised by generation, and FORGE.
 
   1. HF import (f32, q8_0) -> prefill logits and KV-cached greedy decode against the reference, per generation
   2. GGUF import of the gemma2 model (norm weights stored as 1 + w, as llama.cpp's converter does) -> prefill logits
+  3. text -> ids -> logits: gemma has only a SentencePiece tokenizer.model (the importer converts the protobuf),
+     gemma3 a tokenizer.json as transformers writes one for a SentencePiece BPE model (Prepend / Replace normalizer,
+     byte fallback, "<s> $A" post-processor). `forge run --prompt` must reach the logits of the reference ids
+     (`sentencepiece` / `tokenizers`, from tests/data/tokenizer/goldens.json), BOS included.
 The prompt (13 tokens) is longer than the sliding window, so local and global layers really differ.
 """
 import os
@@ -18,12 +22,15 @@ import golden_util as gu
 BASE = dict(hidden_size=64, num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=16, intermediate_size=96,
             vocab_size=300, rms_norm_eps=1e-6, rope_theta=10000.0, max_position_embeddings=128, bos_token_id=290, eos_token_id=291,
             hidden_activation="gelu_pytorch_tanh")
+# gemma and gemma3 take their vocabulary from a tokenizer fixture (BOS 1, EOS 2); gemma2 keeps the byte-level one
+TOK = {1: "spm_bpe_llama.model", 3: "hf_bpe_llama2.json"}
 CFGS = {
-    1: dict(BASE, architectures=["GemmaForCausalLM"], model_type="gemma"),
+    1: dict(BASE, architectures=["GemmaForCausalLM"], model_type="gemma", vocab_size=560, bos_token_id=1, eos_token_id=2),
     2: dict(BASE, architectures=["Gemma2ForCausalLM"], model_type="gemma2", query_pre_attn_scalar=24, sliding_window=4,
             attn_logit_softcapping=5.0, final_logit_softcapping=3.0),
     3: dict(BASE, architectures=["Gemma3ForCausalLM"], model_type="gemma3_text", query_pre_attn_scalar=24, sliding_window=4,
-            sliding_window_pattern=3, rope_theta=1000000.0, rope_local_base_freq=100.0, attn_logit_softcapping=None, final_logit_softcapping=None),
+            sliding_window_pattern=3, rope_theta=1000000.0, rope_local_base_freq=100.0, attn_logit_softcapping=None, final_logit_softcapping=None,
+            vocab_size=gu.tok_vocab_size("hf_bpe_llama2.json"), bos_token_id=1, eos_token_id=2),
 }
 
 def make_weights(gen, seed):
@@ -90,11 +97,19 @@ def main():
     prompt = [290, 72, 101, 108, 108, 111, 44, 32, 116, 104, 101, 32, 119]
     for gen in (1, 2, 3):
         name = {1: "gemma", 2: "gemma2", 3: "gemma3"}[gen]; hf = os.path.join(a.work, "hf_" + name)
-        W = gu.save_model(hf, make_weights(gen, 100 + gen), CFGS[gen])
+        W = gu.save_model(hf, make_weights(gen, 100 + gen), CFGS[gen], tokenizer=None if gen in TOK else "BPE")
+        if gen in TOK: gu.use_tokenizer(hf, TOK[gen], {"add_bos_token": True, "add_eos_token": False} if gen == 3 else None)
         fwd = lambda ids, gen=gen, W=W: forward(gen, W, ids)
         # gemma2's q/k weights are 3x larger so that soft-capping is active, which also makes its logits the most
         # sensitive to q8_0 rounding: cosine 0.9999 on the CPU and CUDA paths, 0.9984 on the OpenCL path (f32-decoded weights)
-        ck.decoder(hf, name, fwd, prompt, CFGS[gen]["eos_token_id"], q8_cos=0.997 if gen == 2 else 0.999)
+        fp = ck.decoder(hf, name, fwd, prompt, CFGS[gen]["eos_token_id"], q8_cos=0.997 if gen == 2 else 0.999)
+        if gen == 1:   # SentencePiece itself adds no BOS; the session does (manifest bos_token_id, add_bos default)
+            text, ids = gu.tok_golden("spm_bpe_llama")
+            ck.text_logits(fp, text, fwd([1] + ids)[-1], f"gemma tokenizer.model (SentencePiece BPE, BOS + {len(ids)} ids)")
+        if gen == 3:
+            text, ids = gu.tok_golden("hf_bpe_llama2")
+            ck.ok(ids[0] == 1, "gemma3: the reference ids start with BOS (post-processor)")
+            ck.text_logits(fp, text, fwd(ids)[-1], f"gemma3 tokenizer.json (SentencePiece BPE as transformers writes it, {len(ids)} ids)")
         if gen == 2:
             st = []; forward(2, W, prompt, st)
             ck.ok(max(st) > CFGS[2]["attn_logit_softcapping"], f"gemma2: raw attention scores reach {max(st):.1f}, above the cap of 5 (soft-capping is exercised)")

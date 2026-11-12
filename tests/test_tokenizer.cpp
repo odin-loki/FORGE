@@ -351,3 +351,96 @@ TEST(tokenizer_rejects_bad_json) {
     tokenizer t(R"({"model":{"type":"BPE","vocab":{"a":0},"merges":["a a","b"]},"decoder":null,"added_tokens":[{"id":3,"content":""}]})");
     CHECK(t.encode("aa\xFFzz").size() == 2 && t.decode({0, 99, -1}) == "a" && t.decode_one(99).empty() && t.token_id("zz") == -1);
 }
+
+// segment ("token type") ids and sentence pairs through the post-processor: what an embedding session feeds BERT
+TEST(token_types_and_pairs) {
+    auto& all = goldens()["fixtures"];
+    const std::string a = "The quick brown fox", b = "jumps over the lazy dog.";
+    auto cat = [](std::initializer_list<std::vector<int>> parts) { std::vector<int> o; for (auto& p : parts) o.insert(o.end(), p.begin(), p.end()); return o; };
+    {   // BertProcessing: [CLS] A [SEP] B [SEP], the second sequence and its [SEP] in segment 1
+        tokenizer t(fixture_json(all["hf_wordpiece_bert"]));
+        int cls = t.token_id("[CLS]"), sep = t.token_id("[SEP]");
+        auto ia = t.encode(a), ib = t.encode(b);
+        auto one = t.encode_typed(a);
+        CHECK(one.ids == t.encode(a, true) && one.ids.front() == cls && one.ids.back() == sep);
+        CHECK(one.type_ids == std::vector<int>(one.ids.size(), 0));
+        auto two = t.encode_pair(a, b);
+        CHECK(two.ids == cat({{cls}, ia, {sep}, ib, {sep}}));
+        CHECK(two.type_ids == cat({std::vector<int>(ia.size() + 2, 0), std::vector<int>(ib.size() + 1, 1)}));
+    }
+    {   // TemplateProcessing "[CLS] $A [SEP] $B:1 [SEP]:1"
+        tokenizer t(fixture_json(all["hf_wordpiece_cased"]));
+        int cls = t.token_id("[CLS]"), sep = t.token_id("[SEP]");
+        auto ia = t.encode(a), ib = t.encode(b);
+        auto two = t.encode_pair(a, b);
+        CHECK(two.ids == cat({{cls}, ia, {sep}, ib, {sep}}));
+        CHECK(two.type_ids == cat({std::vector<int>(ia.size() + 2, 0), std::vector<int>(ib.size() + 1, 1)}));
+        CHECK(t.encode_typed(a).ids == t.encode(a, true));
+    }
+    {   // RobertaProcessing: <s> A </s></s> B </s>, one segment
+        tokenizer t(fixture_json(all["hf_bpe_roberta"]));
+        int s = t.token_id("<s>"), e = t.token_id("</s>");
+        auto ia = t.encode(a), ib = t.encode(b);
+        auto two = t.encode_pair(a, b);
+        CHECK(two.ids == cat({{s}, ia, {e, e}, ib, {e}}));
+        CHECK(two.type_ids == std::vector<int>(two.ids.size(), 0));
+    }
+    {   // no post-processor: A then B inside the BOS / EOS the session set
+        tokenizer t(fixture_json(all["hf_bpe_gpt2"]));
+        auto ia = t.encode(a), ib = t.encode(b);
+        t.set_special(0, 0); t.set_add_bos(true); t.set_add_eos(true);
+        auto two = t.encode_pair(a, b);
+        CHECK(two.ids == cat({{0}, ia, ib, {0}}));
+        CHECK(two.type_ids == cat({std::vector<int>(ia.size() + 1, 0), std::vector<int>(ib.size() + 1, 1)}));
+        CHECK(t.encode_typed(a).ids == cat({{0}, ia, {0}}));
+    }
+}
+
+// a bare WordPiece vocab.txt (BERT checkpoints without tokenizer.json) gives the ids of the tokenizer.json it came from
+TEST(wordpiece_vocab_txt) {
+    auto& fx = goldens()["fixtures"]["hf_wordpiece_bert"];
+    auto j = json::parse(fixture_json(fx));
+    std::vector<std::string> pieces(j["model"]["vocab"].obj().size());
+    for (auto& [t, id] : j["model"]["vocab"].obj()) pieces.at(std::size_t(id.num())) = t;
+    std::string txt; for (auto& p : pieces) txt += p + "\r\n";   // CRLF line ends, as a Windows clone may have them
+    auto cfg = json::parse(R"({"do_lower_case":true,"cls_token":"[CLS]","sep_token":{"content":"[SEP]"},"unk_token":"[UNK]"})");
+    auto doc = import::wordpiece_vocab_tokenizer_json(txt, &cfg);
+    CHECK(import::tokenizer_json_problem(doc).empty());
+    tokenizer t(doc);
+    CHECK(t.type() == tokenizer::model_type::wordpiece && t.vocab_size() == pieces.size() && t.has_post_processor());
+    auto text = corpus(); auto& cases = fx["cases"].arr();
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        auto valid = os::text::sanitize_utf8(text[i]);
+        CHECK_MSG(t.encode(valid) == ints(cases[i]["ids"]), "line %zu", i);
+        CHECK_MSG(t.encode(valid, true) == ints(cases[i]["ids_special"]), "line %zu (special)", i);
+    }
+    // a cased vocabulary: do_lower_case false keeps case
+    auto cased = json::parse(R"({"do_lower_case":false})");
+    tokenizer c(import::wordpiece_vocab_tokenizer_json("[UNK]\n[CLS]\n[SEP]\nHello\nhello\n", &cased));
+    CHECK(c.encode("Hello hello HELLO", true) == (std::vector<int>{1, 3, 4, 0, 2}));
+    CHECK_THROWS(import::wordpiece_vocab_tokenizer_json(""));
+    CHECK(!import::tokenizer_json_problem(R"({"model":{"type":"NoSuchModel"}})").empty());
+}
+
+// Files written while the runtime only had byte-level BPE keep other tokenizers in a "tokenizer_json" section: such a
+// file still opens, and now tokenizes; a section this build cannot load leaves the model without a tokenizer.
+TEST(legacy_tokenizer_json_section) {
+    auto base = forge_test::make_tiny_model(tmp("legacy_base.fpk").string());
+    auto rewrite = [&](const fs::path& out, const std::string& doc) {
+        modelfile::reader r(base); modelfile::writer w;
+        for (auto& [n, e] : r.tensors()) { auto t = r.load(n); w.add_tensor(n, t.shape, t.data, "f32"); }
+        w.set_manifest(r.manifest());
+        w.set_section("blueprint", std::string(r.section_text("blueprint"))); w.set_section("tokenizer_json", doc);
+        w.write(out.string());
+    };
+    auto wp = tmp("legacy_wp.fpk"), bad = tmp("legacy_bad.fpk");
+    auto doc = fixture_json(goldens()["fixtures"]["hf_wordpiece_bert"]);
+    rewrite(wp, doc); rewrite(bad, R"({"model":{"type":"NoSuchModel"}})");
+    {
+        auto m = inference::model::open(wp.string());
+        CHECK(m->tokenizer() && m->tokenizer()->type() == tokenizer::model_type::wordpiece);
+        if (m->tokenizer()) CHECK(m->tokenizer()->encode("Hello, world!") == tokenizer(doc).encode("Hello, world!"));
+    }
+    { auto m = inference::model::open(bad.string()); CHECK(!m->tokenizer()); }
+    fs::remove(base); fs::remove(wp); fs::remove(bad);
+}

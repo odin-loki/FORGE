@@ -2,7 +2,8 @@
 // Tokenizer sources that are not a ready tokenizer.json:
 //   - a SentencePiece .model protobuf (tokenizer.model / spiece.model next to a Hugging Face checkpoint),
 //   - GGUF metadata (tokenizer.ggml.*),
-// both turned into the tokenizer.json text the .fpk "tokenizer" section holds (modelfile/tokenizer.hpp reads it), and
+//   - a WordPiece vocab.txt (BERT checkpoints saved without tokenizer.json),
+// all turned into the tokenizer.json text the .fpk "tokenizer" section holds (modelfile/tokenizer.hpp reads it), and
 // the chat template that travels with either (tokenizer_config.json / chat_template.jinja / tokenizer.chat_template).
 #include <forge/json/json.hpp>
 #include <forge/modelfile/tokenizer.hpp>
@@ -278,7 +279,16 @@ template <class G> std::string gguf_tokenizer_json(const G& g, std::string* warn
             bool bracket = t.size() > 1 && t.front() == '[' && t.back() == ']';
             vocab.emplace_back(bracket || type_of(i) == T::type_control ? t : t.starts_with(meta) ? t.substr(meta.size()) : "##" + t, double(i));
         }
-        int unk = int(num("tokenizer.ggml.unknown_token_id", -1)), cls = int(num("tokenizer.ggml.bos_token_id", -1)), sep = int(num("tokenizer.ggml.seperator_token_id", -1));
+        // [CLS] / [SEP]: llama.cpp's converter writes them as BOS and the separator; older files have cls_token_id and
+        // only EOS, and a file with neither still has the pieces by name
+        auto first_id = [&](std::initializer_list<const char*> keys, std::initializer_list<const char*> names) {
+            for (auto* k : keys) if (int v = int(num(k, -1)); v >= 0 && std::size_t(v) < toks.size()) return v;
+            for (auto* n : names) for (std::size_t i = 0; i < toks.size(); ++i) if (toks[i].is_str() && toks[i].str() == n) return int(i);
+            return -1;
+        };
+        int unk = int(num("tokenizer.ggml.unknown_token_id", -1));
+        int cls = first_id({"tokenizer.ggml.bos_token_id", "tokenizer.ggml.cls_token_id"}, {"[CLS]", "<s>"});
+        int sep = first_id({"tokenizer.ggml.seperator_token_id", "tokenizer.ggml.separator_token_id", "tokenizer.ggml.eos_token_id"}, {"[SEP]", "</s>"});
         auto name = [&](int id) { return id >= 0 && std::size_t(id) < toks.size() ? toks[std::size_t(id)].str() : std::string(); };
         json::value post = nullptr;
         if (cls >= 0 && sep >= 0 && std::size_t(cls) < toks.size() && std::size_t(sep) < toks.size())
@@ -294,6 +304,67 @@ template <class G> std::string gguf_tokenizer_json(const G& g, std::string* warn
     }
     if (warning) *warning = "tokenizer model '" + model + "' (tokenizer.ggml.model) is not supported; the file gets no tokenizer";
     return "";
+}
+
+// tokenizer.json text for a WordPiece vocab.txt (one piece per line, the line number is the id), which is all an older
+// BERT checkpoint has. tokenizer_config: its tokenizer_config.json (do_lower_case, strip_accents,
+// tokenize_chinese_chars, unk_token / cls_token / sep_token); BertTokenizer's defaults where it says nothing.
+inline std::string wordpiece_vocab_tokenizer_json(std::string_view vocab_txt, const json::value* tokenizer_config = nullptr) {
+    json::object vocab; std::size_t n = 0;
+    for (std::size_t p = 0; p < vocab_txt.size();) {
+        auto e = vocab_txt.find('\n', p); if (e == std::string_view::npos) e = vocab_txt.size();
+        auto line = vocab_txt.substr(p, e - p); if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        p = e + 1;
+        if (n >= (8u << 20)) raise(errc::format_error, "vocab.txt: too many pieces");
+        vocab.emplace_back(std::string(line), double(n++));
+    }
+    if (!n) raise(errc::format_error, "vocab.txt: no pieces");
+    auto cfg_flag = [&](const char* k, bool d) { auto* v = tokenizer_config ? tokenizer_config->find(k) : nullptr; return v && v->is_bool() ? v->b() : d; };
+    auto cfg_tok = [&](const char* k, const char* d) -> std::string {   // "[CLS]" or {"content": "[CLS]", ...}
+        auto* v = tokenizer_config ? tokenizer_config->find(k) : nullptr;
+        if (v && v->is_str()) return v->str();
+        if (v && v->is_obj()) if (auto* c = v->find("content"); c && c->is_str()) return c->str();
+        return d;
+    };
+    auto id_of = [&](const std::string& t) { for (auto& [k, v] : vocab) if (k == t) return int(v.num()); return -1; };
+    bool lower = cfg_flag("do_lower_case", true);
+    json::value strip = nullptr;   // null: accents go when lower-casing, as BertNormalizer does
+    if (auto* v = tokenizer_config ? tokenizer_config->find("strip_accents") : nullptr; v && v->is_bool()) strip = v->b();
+    auto unk = cfg_tok("unk_token", "[UNK]"), cls = cfg_tok("cls_token", "[CLS]"), sep = cfg_tok("sep_token", "[SEP]");
+    json::array added;
+    for (auto& t : {cfg_tok("pad_token", "[PAD]"), unk, cls, sep, cfg_tok("mask_token", "[MASK]")})
+        if (int id = id_of(t); id >= 0)
+            added.push_back(json::object{{"id", double(id)}, {"content", t}, {"special", true}, {"normalized", false}, {"single_word", false}, {"lstrip", false}, {"rstrip", false}});
+    json::value post = nullptr;
+    if (int c = id_of(cls), q = id_of(sep); c >= 0 && q >= 0)
+        post = json::object{{"type", "BertProcessing"}, {"sep", json::array{sep, double(q)}}, {"cls", json::array{cls, double(c)}}};
+    return json::dump(json::object{{"forge_tokenizer_version", double(modelfile::tokenizer_format_version)}, {"added_tokens", added},
+                                   {"normalizer", json::object{{"type", "BertNormalizer"}, {"clean_text", true}, {"handle_chinese_chars", cfg_flag("tokenize_chinese_chars", true)},
+                                                               {"strip_accents", strip}, {"lowercase", lower}}},
+                                   {"pre_tokenizer", json::object{{"type", "BertPreTokenizer"}}}, {"post_processor", post},
+                                   {"decoder", json::object{{"type", "WordPiece"}, {"prefix", "##"}, {"cleanup", true}}},
+                                   {"model", json::object{{"type", "WordPiece"}, {"unk_token", unk}, {"continuing_subword_prefix", "##"}, {"max_input_chars_per_word", 100.0},
+                                                          {"vocab", vocab}}}});
+}
+
+// "" when the runtime tokenizer (modelfile/tokenizer.hpp) can load this tokenizer.json text, else why not. Importers
+// ask before they store a "tokenizer" section: a file whose tokenizer section does not load cannot be opened at all.
+inline std::string tokenizer_json_problem(std::string_view text) {
+    try { modelfile::tokenizer t(text); return ""; }
+    catch (const std::exception& e) { return e.what(); }
+}
+
+// What every GGUF importer (gguf.hpp, gguf_arch.hpp) does with the file's tokenizer: the "tokenizer" section from
+// gguf_tokenizer_json, the "chat_template" section from tokenizer.chat_template. W: modelfile::stream_writer.
+// `warn(text)` hears about a vocabulary that was left out.
+template <class G, class W, class Warn> void store_gguf_tokenizer(const G& g, W& w, Warn&& warn) {
+    std::string note;
+    if (auto tj = gguf_tokenizer_json(g, &note); !tj.empty()) {
+        if (auto why = tokenizer_json_problem(tj); why.empty()) w.set_section("tokenizer", tj);
+        else note = "the tokenizer could not be converted (" + why + "); the file gets no tokenizer, pass token ids";
+    }
+    if (!note.empty()) warn(note);
+    if (auto* ct = g.get("tokenizer.chat_template"); ct && ct->is_str() && !ct->str().empty()) w.set_section("chat_template", ct->str());
 }
 
 // The chat template a tokenizer_config.json carries: a string, or a list of {name, template} of which "default" (else

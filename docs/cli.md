@@ -62,14 +62,15 @@ Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compi
 
 Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
 
-### `forge embed <model> (--text TEXT | --tokens 1,2,3 | --input name=file.f32 ...) [options]`
+### `forge embed <model> (--text TEXT [--text-pair TEXT] | --tokens 1,2,3 | --input name=file.f32 ...) [options]`
 Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `whisper_encoder` templates) once and prints the result vector, or writes it as raw little-endian f32 with `--out file.f32`.
 
 | Option | Meaning |
 |---|---|
 | `--tokens 1,2,3` | Token ids, including the model's special tokens (`[CLS]` ... `[SEP]`) |
-| `--text TEXT` | Tokenise with the model's tokenizer. Only byte-level BPE tokenizers are available at run time; BERT-family (WordPiece) models need `--tokens` |
-| `--token-types 0,0,1` | Segment ids (default all 0) |
+| `--text TEXT` | Tokenise with the model's tokenizer (WordPiece, Unigram, BPE, ...). The tokenizer's post-processor adds the special tokens (`[CLS]` ... `[SEP]`) and sets the token types. `--ids` also prints the ids to stderr |
+| `--text-pair TEXT` | With `--text`: a second sequence (`[CLS] A [SEP] B [SEP]`, B in segment 1 for BERT) |
+| `--token-types 0,0,1` | Segment ids (default all 0; with `--text`, overrides the tokenizer's) |
 | `--mask 1,1,0` | 1 = real token, 0 = padding (default all 1) |
 | `--input name=file.f32` | Raw f32 for a declared input, repeatable: `image=...` (`[channels, size, size]`, already resized and normalised), `mel=...` (`[n_mels, frames]`) |
 | `--out file.f32` | Write the vector instead of printing it |
@@ -77,6 +78,7 @@ Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `w
 
 ```sh
 forge import ./bge-small-en -o bge.fpk
+forge embed bge.fpk --text "hello world"
 forge embed bge.fpk --tokens 101,7592,2088,102
 forge embed vit.fpk --input image=cat.f32 --out cat.emb.f32
 ```

@@ -35,13 +35,39 @@ def attend(q, k, v, mask=None, scale=None, softcap=0.0):
     sc = np.exp(sc - sc.max(-1, keepdims=True)); sc /= sc.sum(-1, keepdims=True)
     return np.einsum("hst,thd->shd", sc, v)
 
+# ---- tokenizer fixtures (tests/data/tokenizer): tiny trained tokenizers with the ids the reference implementations
+# (`tokenizers`, `sentencepiece`) return for a fixed corpus, so that text -> ids -> output is checked without either
+# package being installed.
+TOK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tests", "data", "tokenizer")
+TEXT_LINE = 24   # "The quick brown fox jumps over the lazy dog. The five boxing wizards jump quickly."
+_goldens = None
+
+def tok_golden(fixture, line=TEXT_LINE, special=True):
+    """(text, ids) of corpus line `line` under `fixture`; special: with the post-processor's tokens ("ids_special")."""
+    global _goldens
+    if _goldens is None: _goldens = json.load(open(os.path.join(TOK_DIR, "goldens.json"), encoding="utf-8"))
+    f = _goldens["fixtures"][fixture]; c = f["cases"][line]
+    assert "lines" not in f or line in f["lines"], f"{fixture}: corpus line {line} has no comparable golden"
+    return bytes.fromhex(_goldens["corpus"][line]).decode("utf-8"), list(c["ids_special"] if special and "ids_special" in c else c["ids"])
+
+def tok_vocab_size(fixture_file):
+    """Number of ids a tokenizer.json fixture uses (vocabulary and added tokens)."""
+    j = json.load(open(os.path.join(TOK_DIR, fixture_file), encoding="utf-8")); v = j["model"]["vocab"]
+    ids = [x for x in (v.values() if isinstance(v, dict) else range(len(v)))] + [a["id"] for a in j.get("added_tokens", [])]
+    return max(ids) + 1
+
+def use_tokenizer(d, fixture_file, tokenizer_config=None):
+    """Give the checkpoint directory `d` a fixture as its tokenizer: hf_*.json becomes tokenizer.json, spm_*.model
+    tokenizer.model (and no tokenizer.json, so the importer converts the SentencePiece model itself)."""
+    import shutil
+    for old in ("tokenizer.json", "tokenizer.model", "vocab.txt", "tokenizer_config.json"):
+        if os.path.exists(os.path.join(d, old)): os.remove(os.path.join(d, old))
+    shutil.copyfile(os.path.join(TOK_DIR, fixture_file), os.path.join(d, "tokenizer.json" if fixture_file.endswith(".json") else "tokenizer.model"))
+    if tokenizer_config is not None: json.dump(tokenizer_config, open(os.path.join(d, "tokenizer_config.json"), "w"))
+
 def write_tokenizer(d, kind="BPE"):
-    """tiny_llama's byte-level BPE tokenizer.json (ids < 300), or a WordPiece-typed file the runtime tokenizer skips."""
+    """tiny_llama's byte-level BPE tokenizer.json (ids < 300)."""
     os.makedirs(d, exist_ok=True)
-    if kind != "BPE":
-        vocab = {t: i for i, t in enumerate(["[PAD]", "[UNK]", "[CLS]", "[SEP]"] + [f"tok{i}" for i in range(296)])}
-        json.dump({"version": "1.0", "model": {"type": kind, "vocab": vocab, "unk_token": "[UNK]"}}, open(os.path.join(d, "tokenizer.json"), "w"))
-        return
     b2u = tl.bytes_to_unicode()
     vocab = {b2u[b]: b for b in range(256)}
     merges = [("t", "h"), ("th", "e"), ("Ġ", "t"), ("Ġt", "he"), ("i", "n"), ("Ġ", "a"), ("e", "r"), ("o", "n"),
@@ -61,13 +87,20 @@ def save_model(d, W, cfg, tokenizer="BPE"):
     if tokenizer: write_tokenizer(d, tokenizer)
     return {k: v.astype(np.float64) for k, v in W.items()}
 
-def write_gguf(path, arch, meta, tensors):
-    """A GGUF with `<arch>.<key>` metadata (int -> u32, float -> f32, str, bool) and F32 tensors. None if gguf-py is missing."""
+def write_gguf(path, arch, meta, tensors, tokenizer=None):
+    """A GGUF with `<arch>.<key>` metadata (int -> u32, float -> f32, str, bool) and F32 tensors. None if gguf-py is missing.
+    tokenizer: a tests/data/tokenizer/gguf_*.gguf fixture whose tokenizer.* metadata is copied in."""
     try:
         import gguf
     except ImportError:
         return None
     wr = gguf.GGUFWriter(path, arch)
+    if tokenizer:
+        rd = gguf.GGUFReader(os.path.join(TOK_DIR, tokenizer))
+        for k, f in rd.fields.items():
+            if not k.startswith("tokenizer."): continue
+            if f.types[0] == gguf.GGUFValueType.ARRAY: wr.add_array(k, f.contents())
+            else: wr.add_key_value(k, f.contents(), f.types[0])
     for k, v in meta.items():
         key = k if k.startswith("tokenizer.") or k.startswith("general.") else f"{arch}.{k}"
         if isinstance(v, bool): wr.add_bool(key, v)
@@ -102,6 +135,16 @@ class Checker:
         err = np.abs(got - ref).max(); cos = got @ ref / np.linalg.norm(got) / np.linalg.norm(ref)
         self.ok(cos > cosmin if cosmin else err < tol, f"{label}: prefill logits max|err| {err:.2e}, cosine {cos:.6f}")
         return [int(t) for t in gen.split()]
+
+    def text_logits(self, fpk, text, ref, label, tol=2e-3, extra=()):
+        """`forge run --prompt TEXT`: the file's own tokenizer makes the ids; prefill logits against the reference's
+        last row for the ids the reference tokenizer gives."""
+        lf = fpk + ".text.logits.f32"
+        run([self.forge, "run", fpk, "--prompt", text, "-n", "1", "--ids", "--logits", lf] + list(extra))
+        got = np.fromfile(lf, dtype=np.float32).astype(np.float64)
+        if got.shape != ref.shape: return self.ok(False, f"{label}: {got.shape} logits, expected {ref.shape}")
+        err = np.abs(got - ref).max()
+        return self.ok(err < tol, f"{label}: text -> ids -> logits max|err| {err:.2e}")
 
     def decoder(self, hf, name, forward, prompt, eos, q8=True, gen=16, q8_cos=0.999):
         """HF import in f32 (logits + KV-cached greedy decode vs full recompute) and q8_0 (logits cosine)."""

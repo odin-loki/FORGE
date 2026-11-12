@@ -679,6 +679,33 @@ public:
         for (int t : tmpl_) { if (t >= 0) out.push_back(t); else out.insert(out.end(), ids.begin(), ids.end()); }
         return out;
     }
+    // Ids together with the segment ("token type") id of each: what BERT-family encoders take as a second input.
+    struct encoding { std::vector<int> ids, type_ids; };
+    // One text with the special tokens around it (as encode(text, true)) and the post-processor's segment ids.
+    encoding encode_typed(std::string_view text) const {
+        encoding e; auto ids = encode(text);
+        if (explicit_ || tmpl_.empty()) { e.ids = with_special(std::move(ids)); e.type_ids.assign(e.ids.size(), 0); return e; }
+        for (std::size_t i = 0; i < tmpl_.size(); ++i) {
+            if (tmpl_[i] >= 0) { e.ids.push_back(tmpl_[i]); e.type_ids.push_back(tmpl_type_[i]); }
+            else { e.ids.insert(e.ids.end(), ids.begin(), ids.end()); e.type_ids.insert(e.type_ids.end(), ids.size(), tmpl_type_[i]); }
+        }
+        return e;
+    }
+    // A pair of texts (question / passage, sentence A / B) through the post-processor's pair template:
+    // "[CLS] A [SEP] B [SEP]" with B in segment 1 for BERT. Without a pair template: A then B (segments 0 and 1)
+    // inside the BOS / EOS that one text gets.
+    encoding encode_pair(std::string_view a, std::string_view b) const {
+        encoding e; auto ia = encode(a), ib = encode(b);
+        auto put = [&](const std::vector<int>& v, int type) { e.ids.insert(e.ids.end(), v.begin(), v.end()); e.type_ids.insert(e.type_ids.end(), v.size(), type); };
+        if (explicit_ || pair_.empty()) {
+            if (add_bos()) put({explicit_ || tmpl_.empty() ? bos_ : tmpl_.front()}, 0);
+            put(ia, 0); put(ib, 1);
+            if (add_eos()) put({explicit_ || tmpl_.empty() ? eos_ : tmpl_.back()}, 1);
+            return e;
+        }
+        for (auto& x : pair_) { if (x.id >= 0) put({x.id}, x.type); else put(x.id == -1 ? ia : ib, x.type); }
+        return e;
+    }
     // ids -> text through the tokenizer.json decoder. Special tokens are written out unless skip_special.
     std::string decode(const std::vector<int>& ids, bool skip_special = false) const {
         if (legacy_) { std::string s; for (int i : ids) if (!skip_special || !is_special(i)) s += decode_one(i); return s; }
@@ -746,19 +773,36 @@ private:
         auto t = j.str_or("type", "");
         if (t == "Sequence") { if (auto* ps = j.find("processors"); ps && ps->is_arr()) for (auto& p : ps->arr()) post_processor(p, depth + 1); }
         else if (t == "TemplateProcessing") {
-            tmpl_.clear();
             auto* sp = j.find("special_tokens");
-            for (auto& e : j["single"].arr()) {
-                if (e.find("Sequence")) { tmpl_.push_back(-1); continue; }
-                auto& name = e["SpecialToken"]["id"].str();
-                const json::value* ids = sp && sp->find(name) ? (*sp)[name].find("ids") : nullptr;
-                if (!ids || !ids->is_arr()) raise(errc::format_error, "tokenizer: TemplateProcessing special token {} has no ids", name);
-                for (auto& id : ids->arr()) tmpl_.push_back(checked_id(id.num()));
+            // one template ("single" or "pair"): special token ids, and -1 / -2 where sequence A / B goes
+            auto items = [&](const json::value& list) {
+                std::vector<titem> out;
+                for (auto& e : list.arr()) {
+                    auto type_of = [](const json::value& o) { auto* v = o.find("type_id"); return v && v->is_num() && v->num() >= 0 && v->num() < 256 ? int(v->num()) : 0; };
+                    if (auto* sq = e.find("Sequence")) { auto* id = sq->find("id"); out.push_back({id && id->is_str() && id->str() == "B" ? -2 : -1, type_of(*sq)}); continue; }
+                    auto& st = e["SpecialToken"]; auto& name = st["id"].str();
+                    const json::value* ids = sp && sp->find(name) ? (*sp)[name].find("ids") : nullptr;
+                    if (!ids || !ids->is_arr()) raise(errc::format_error, "tokenizer: TemplateProcessing special token {} has no ids", name);
+                    for (auto& id : ids->arr()) out.push_back({checked_id(id.num()), type_of(st)});
+                    if (out.size() > 64) raise(errc::format_error, "tokenizer: TemplateProcessing template is too long");
+                }
+                return out;
+            };
+            auto single = items(j["single"]);
+            auto count = [](const std::vector<titem>& v, int what) { return std::count_if(v.begin(), v.end(), [&](const titem& x) { return x.id == what; }); };
+            if (count(single, -1) != 1 || count(single, -2) != 0) raise(errc::format_error, "tokenizer: unsupported TemplateProcessing single-sequence template");
+            tmpl_.clear(); tmpl_type_.clear(); pair_.clear();
+            for (auto& x : single) { tmpl_.push_back(x.id); tmpl_type_.push_back(std::uint8_t(x.type)); }
+            if (auto* pr = j.find("pair"); pr && pr->is_arr()) {
+                pair_ = items(*pr);
+                if (count(pair_, -1) != 1 || count(pair_, -2) != 1) pair_.clear();
             }
-            if (std::count(tmpl_.begin(), tmpl_.end(), -1) != 1 || tmpl_.size() > 64) raise(errc::format_error, "tokenizer: unsupported TemplateProcessing single-sequence template");
-            if (tmpl_.size() == 1) tmpl_.clear();
+            if (tmpl_.size() == 1 && tmpl_type_[0] == 0) { tmpl_.clear(); tmpl_type_.clear(); }
         } else if (t == "BertProcessing" || t == "RobertaProcessing") {
-            tmpl_ = {checked_id(tok::at(j["cls"], 1).num()), -1, checked_id(tok::at(j["sep"], 1).num())};
+            int cls = checked_id(tok::at(j["cls"], 1).num()), sep = checked_id(tok::at(j["sep"], 1).num());
+            tmpl_ = {cls, -1, sep}; tmpl_type_ = {0, 0, 0};
+            if (t == "BertProcessing") pair_ = {{cls, 0}, {-1, 0}, {sep, 0}, {-2, 1}, {sep, 1}};        // [CLS] A [SEP] B [SEP], B in segment 1
+            else pair_ = {{cls, 0}, {-1, 0}, {sep, 0}, {sep, 0}, {-2, 0}, {sep, 0}};                    // <s> A </s></s> B </s>
         } else if (t != "ByteLevel") raise(errc::unsupported, "tokenizer: post-processor type '{}' is not supported", t);
     }
     static int checked_id(double v) { if (!(v >= 0) || v > double(max_vocab)) raise(errc::format_error, "tokenizer: special token id {} out of range", v); return int(v); }
@@ -973,7 +1017,10 @@ private:
     std::array<int, 256> byte_tok_{};
     tok::normalizer norm_; tok::pre_tokenizer pre_; tok::decoder dec_;
     std::vector<added> added_; matcher raw_match_, norm_match_; std::vector<bool> special_ids_;
+    struct titem { int id = 0; int type = 0; };   // id >= 0: a special token; -1 / -2: sequence A / B. type: its segment id
     std::vector<int> tmpl_;   // post-processor for one sequence: special token ids, -1 where the text goes
+    std::vector<std::uint8_t> tmpl_type_;   // the segment (token type) id of each tmpl_ entry
+    std::vector<titem> pair_;   // post-processor for a pair of sequences; empty when tokenizer.json has none
     int bos_ = -1, eos_ = -1, unk_ = -1; bool add_bos_ = true, add_eos_ = false, explicit_ = false;
 };
 

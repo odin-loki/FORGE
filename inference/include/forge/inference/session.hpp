@@ -101,8 +101,14 @@ public:
         bp_ = modelfile::parse_blueprint(r_.section_text("blueprint"));
         try { modelfile::check_opset(bp_); }   // before any plan is built: an opset this engine does not run
         catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
-        if (r_.has_section("tokenizer")) {
-            tok_.emplace(r_.section_text("tokenizer"));
+        // Files imported before the runtime had WordPiece / Unigram tokenizers keep such a tokenizer.json in a
+        // "tokenizer_json" section (and no "tokenizer" section): read from there when this build can load it.
+        if (!r_.has_section("tokenizer") && r_.has_section("tokenizer_json")) {
+            try { tok_.emplace(r_.section_text("tokenizer_json")); }
+            catch (const std::exception& e) { tok_.reset(); log::warn("{}: the tokenizer_json section is not usable ({}); the model takes token ids", fpk_path, e.what()); }
+        }
+        if (r_.has_section("tokenizer")) tok_.emplace(r_.section_text("tokenizer"));
+        if (tok_) {
             tok_->set_special(int(man_.num_or("bos_token_id", -1)), int(man_.num_or("eos_token_id", -1)));
             // BOS / EOS around a prompt: the manifest's add_bos / add_eos when the importer recorded them, else the
             // tokenizer.json post-processor when it has one, else the per-architecture default.
@@ -490,6 +496,17 @@ public:
         }
         if (!has_tokens) raise(errc::unsupported, "embed: the model takes no `tokens` input; use embed_inputs()");
         return embed_inputs(in, n);
+    }
+    // Text through the model's tokenizer: the special tokens its post-processor puts around a sequence ([CLS] ... [SEP])
+    // and the segment ids it assigns. `pair`, when given, is the second sequence (query / passage; segment 1 for BERT).
+    // A text longer than the model's positions is an error, not truncated.
+    std::vector<float> embed_text(std::string_view text, const std::string* pair = nullptr, std::size_t* n_tokens = nullptr) {
+        check_embedding();
+        auto* tk = m_->tokenizer();
+        if (!tk) raise(errc::not_found, "embed: the model has no tokenizer; pass token ids");
+        auto e = pair ? tk->encode_pair(text, *pair) : tk->encode_typed(text);
+        if (n_tokens) *n_tokens = e.ids.size();
+        return embed(e.ids, e.type_ids);
     }
     // Any embedding model: named f32 inputs as the blueprint declares them (an image [c, h, w], mel frames
     // [n_mels, frames], or the token inputs above). `seq` binds the symbolic `seq` dimension when there is one.
