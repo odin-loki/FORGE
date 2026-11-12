@@ -21,6 +21,27 @@
 #include <sys/ucred.h>
 #include <sys/mount.h>
 #endif
+#if defined(__linux__)
+#include <sys/ioctl.h>
+#include <sys/xattr.h>
+#elif defined(__APPLE__)
+#include <copyfile.h>
+#include <sys/clonefile.h>
+#if __has_include(<sys/xattr.h>)
+#include <sys/xattr.h>
+#else   // SDKs trimmed for cross-compiling leave the header out; the calls are in libSystem all the same
+extern "C" {
+ssize_t getxattr(const char* path, const char* name, void* value, size_t size, u_int32_t position, int options);
+int setxattr(const char* path, const char* name, const void* value, size_t size, u_int32_t position, int options);
+int removexattr(const char* path, const char* name, int options);
+ssize_t listxattr(const char* path, char* namebuf, size_t size, int options);
+}
+#endif
+#elif defined(__FreeBSD__)
+#include <sys/extattr.h>
+#elif defined(_WIN32)
+#include <winioctl.h>
+#endif
 
 namespace forge::os::fs {
 namespace stdfs = std::filesystem;
@@ -72,6 +93,85 @@ inline std::string current_dir() { std::error_code ec; return u8str(stdfs::curre
 inline status set_current_dir(const std::string& p) { std::error_code ec; stdfs::current_path(u8path(p), ec); if (ec) return {{}, from_ec(ec, "cd " + p)}; return {}; }
 
 // ---------------------------------------------------------------- links
+#if defined(FORGE_OS_WINDOWS)
+namespace detail {
+// Reparse data, laid out by hand (REPARSE_DATA_BUFFER lives in the driver kit headers): tag, data length,
+// reserved, then for mount points and symbolic links four USHORTs (substitute name offset / length, print name
+// offset / length, in bytes into the path buffer); symbolic links add a ULONG of flags before the path buffer.
+inline constexpr DWORD tag_mount_point = 0xA0000003u, tag_symlink = 0xA000000Cu;
+inline HANDLE open_reparse(const std::string& p, DWORD access) {
+    return CreateFileW(wpath(p).c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+}
+}
+// A directory junction: `link` becomes a directory that redirects to `target_dir` (made absolute; junctions hold
+// absolute local paths). Needs no privilege, unlike symbolic links before Windows 10 1703 or without Developer Mode.
+inline status junction(const std::string& target_dir, const std::string& link) {
+    std::wstring full(32768, L'\0'); DWORD n = GetFullPathNameW(widen(target_dir).c_str(), DWORD(full.size()), full.data(), nullptr);
+    if (!n || n >= full.size()) return {{}, last_error("junction " + link)};
+    full.resize(n);
+    for (auto& c : full) if (c == L'/') c = L'\\';
+    std::wstring sub = L"\\??\\" + full;
+    if (!CreateDirectoryW(wpath(link).c_str(), nullptr)) return {{}, last_error("junction " + link)};
+    HANDLE h = detail::open_reparse(link, GENERIC_WRITE);
+    auto fail = [&](const char* what) { auto e = last_error(std::string(what) + " " + link); if (h != INVALID_HANDLE_VALUE) CloseHandle(h); RemoveDirectoryW(wpath(link).c_str()); return status{{}, e}; };
+    if (h == INVALID_HANDLE_VALUE) return fail("junction");
+    const std::size_t sb = sub.size() * sizeof(wchar_t), pb = full.size() * sizeof(wchar_t);
+    const std::size_t path_bytes = sb + sizeof(wchar_t) + pb + sizeof(wchar_t);
+    std::vector<unsigned char> buf(8 + 8 + path_bytes, 0);
+    auto put16 = [&](std::size_t off, std::size_t v) { buf[off] = static_cast<unsigned char>(v & 0xff); buf[off + 1] = static_cast<unsigned char>((v >> 8) & 0xff); };
+    DWORD tag = detail::tag_mount_point; std::memcpy(buf.data(), &tag, 4);
+    put16(4, 8 + path_bytes);                       // ReparseDataLength: everything after the 8-byte header
+    put16(8, 0); put16(10, sb); put16(12, sb + sizeof(wchar_t)); put16(14, pb);
+    std::memcpy(buf.data() + 16, sub.data(), sb); std::memcpy(buf.data() + 16 + sb + sizeof(wchar_t), full.data(), pb);
+    DWORD got = 0;
+    if (!DeviceIoControl(h, FSCTL_SET_REPARSE_POINT, buf.data(), DWORD(buf.size()), nullptr, 0, &got, nullptr)) return fail("FSCTL_SET_REPARSE_POINT");
+    CloseHandle(h); return {};
+}
+// Symbolic link through CreateSymbolicLinkW (libstdc++'s std::filesystem on MinGW cannot create them). Unprivileged
+// creation needs Windows 10 1703+ with Developer Mode; where the privilege is missing a directory target gets a
+// junction instead (same effect for local directories), a file target fails with ERROR_PRIVILEGE_NOT_HELD.
+inline status symlink(const std::string& target, const std::string& link) {
+    // The target is stored as written (it may be relative to the link's directory), with backslashes.
+    std::wstring wt = widen(target); for (auto& c : wt) if (c == L'/') c = L'\\';
+    std::string probe = target;
+    const bool rel = !(target.size() > 1 && (target[1] == ':' || is_sep(target[0])));
+    if (rel) probe = os::join(os::dirname(link), target);
+    DWORD attr = GetFileAttributesW(wpath(probe).c_str());
+    const bool dir = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+    const DWORD fl = dir ? 0x1u /*SYMBOLIC_LINK_FLAG_DIRECTORY*/ : 0u;
+    auto wl = wpath(link);
+    if (CreateSymbolicLinkW(wl.c_str(), wt.c_str(), fl | 0x2u /*SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE*/)) return {};
+    DWORD e = GetLastError();
+    if (e == ERROR_INVALID_PARAMETER) { if (CreateSymbolicLinkW(wl.c_str(), wt.c_str(), fl)) return {}; e = GetLastError(); }   // before 1703: flag unknown
+    if (e == ERROR_PRIVILEGE_NOT_HELD && dir) return junction(probe, link);
+    SetLastError(e); return {{}, last_error("symlink " + link)};
+}
+inline status hardlink(const std::string& target, const std::string& link) {
+    if (!CreateHardLinkW(wpath(link).c_str(), wpath(target).c_str(), nullptr)) return {{}, last_error("hardlink " + link)};
+    return {};
+}
+// The target of a symbolic link or junction (its print name: what the creator wrote, or the absolute path).
+inline result<std::string> read_link(const std::string& p) {
+    HANDLE h = detail::open_reparse(p, FILE_READ_ATTRIBUTES);
+    if (h == INVALID_HANDLE_VALUE) return {{}, last_error("readlink " + p)};
+    std::vector<unsigned char> buf(16 * 1024 + 64); DWORD got = 0;
+    BOOL ok = DeviceIoControl(h, FSCTL_GET_REPARSE_POINT, nullptr, 0, buf.data(), DWORD(buf.size()), &got, nullptr);
+    auto e = ok ? error{} : last_error("readlink " + p); CloseHandle(h);
+    if (!ok) return {{}, e};
+    DWORD tag = 0; std::memcpy(&tag, buf.data(), 4);
+    if ((tag != detail::tag_symlink && tag != detail::tag_mount_point) || got < 16) return {{}, {int(ERROR_NOT_A_REPARSE_POINT), "readlink " + p + ": not a symbolic link or junction"}};
+    auto get16 = [&](std::size_t off) { return std::size_t(buf[off]) | (std::size_t(buf[off + 1]) << 8); };
+    const std::size_t so = get16(8), sl = get16(10), po = get16(12), pl = get16(14), base = tag == detail::tag_symlink ? 20 : 16;
+    auto name = [&](std::size_t off, std::size_t len) { std::wstring w; if (base + off + len <= got) { w.resize(len / sizeof(wchar_t)); std::memcpy(w.data(), buf.data() + base + off, len); } return w; };
+    std::wstring w = name(po, pl);
+    if (w.empty()) { w = name(so, sl); if (w.rfind(L"\\??\\", 0) == 0) w = w.substr(4); }
+    return {narrow(w), {}};
+}
+#else
+// POSIX: `link` -> `target_dir` as a symbolic link to its absolute path (the closest thing to a junction).
+inline status symlink(const std::string& target, const std::string& link);
+inline status junction(const std::string& target_dir, const std::string& link) { return symlink(os::absolute(target_dir), link); }
 inline status symlink(const std::string& target, const std::string& link) {
     std::error_code ec;
     if (is_dir(target)) stdfs::create_directory_symlink(u8path(target), u8path(link), ec);
@@ -81,6 +181,7 @@ inline status symlink(const std::string& target, const std::string& link) {
 }
 inline status hardlink(const std::string& target, const std::string& link) { std::error_code ec; stdfs::create_hard_link(u8path(target), u8path(link), ec); if (ec) return {{}, from_ec(ec, "hardlink " + link)}; return {}; }
 inline result<std::string> read_link(const std::string& p) { std::error_code ec; auto t = stdfs::read_symlink(u8path(p), ec); if (ec) return {{}, from_ec(ec, "readlink " + p)}; return {u8str(t), {}}; }
+#endif
 
 // ---------------------------------------------------------------- permissions, ownership, times
 inline result<unsigned> mode(const std::string& p) { std::error_code ec; auto s = stdfs::status(u8path(p), ec); if (ec) return {0, from_ec(ec, "stat " + p)}; return {unsigned(s.permissions()) & 07777u, {}}; }
@@ -451,6 +552,482 @@ inline status write_file_atomic(const std::string& path, std::string_view data, 
         auto e = last_error("rename " + path); SetFileAttributesW(a.c_str(), FILE_ATTRIBUTE_NORMAL); DeleteFileW(a.c_str()); return {{}, e};
     }
     return {};
+#endif
+}
+
+// ---------------------------------------------------------------- fast copy and clone
+// How copy_file moved the bytes: clone = the new file shares the source's blocks (copy-on-write, no data copied);
+// kernel = copied inside the kernel (copy_file_range / copyfile / CopyFileEx, which may itself clone on ZFS, ReFS
+// and Dev Drive volumes); user = a read / write loop.
+enum class copy_method { clone, kernel, user };
+namespace detail {
+#if defined(FORGE_OS_POSIX)
+inline status copy_loop(int in, int out, const std::string& what) {
+    std::vector<char> buf(1 << 20);
+    for (;;) {
+        ssize_t n = ::read(in, buf.data(), buf.size());
+        if (n < 0) { if (errno == EINTR) continue; return {{}, last_error("read " + what)}; }
+        if (n == 0) return {};
+        for (ssize_t off = 0; off < n;) { ssize_t w = ::write(out, buf.data() + off, std::size_t(n - off)); if (w < 0) { if (errno == EINTR) continue; return {{}, last_error("write " + what)}; } off += w; }
+    }
+}
+#endif
+inline bool cannot_clone(int e) {
+#if defined(FORGE_OS_POSIX)
+    return e == EOPNOTSUPP || e == ENOTSUP || e == EXDEV || e == EINVAL || e == ENOTTY || e == ENOSYS || e == EBADF || e == EPERM || e == ETXTBSY;
+#else
+    (void)e; return true;
+#endif
+}
+}
+// A copy-on-write clone of `from` at `to` (which must not exist): instant and shares storage until either file
+// changes. Linux / Android: FICLONE (Btrfs, XFS with reflink, bcachefs, OCFS2, overlayfs over those). macOS /
+// iOS: clonefile (APFS). FreeBSD and Windows have no call that clones or fails (their copy calls clone on their
+// own where the file system can: ZFS block cloning, ReFS / Dev Drive), so clone_file is unsupported there, as it
+// is on a file system that cannot share blocks. Use copy_file to get the best the system offers.
+inline status clone_file(const std::string& from, const std::string& to) {
+#if defined(__linux__)
+    int in = ::open(from.c_str(), O_RDONLY | O_CLOEXEC); if (in < 0) return {{}, last_error("open " + from)};
+    struct stat st{}; if (::fstat(in, &st)) { auto e = last_error("stat " + from); ::close(in); return {{}, e}; }
+    int out = ::open(to.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, st.st_mode & 0777);
+    if (out < 0) { auto e = last_error("create " + to); ::close(in); return {{}, e}; }
+    const unsigned long ficlone = _IOW(0x94, 9, int);
+    int r = ::ioctl(out, ficlone, in); int en = errno;
+    ::close(in); ::close(out);
+    if (r == 0) return {};
+    ::unlink(to.c_str());
+    if (detail::cannot_clone(en)) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
+    errno = en; return {{}, last_error("clone " + from)};
+#elif defined(__APPLE__)
+    if (::clonefile(from.c_str(), to.c_str(), 0) == 0) return {};
+    if (errno == ENOTSUP || errno == EXDEV) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
+    return {{}, last_error("clonefile " + from)};
+#else
+    (void)from; (void)to; return {{}, unsupported("clone_file")};
+#endif
+}
+// Copy one regular file the fastest way the OS has; overwrite = false fails if `to` exists. The mode bits are
+// copied (POSIX); other metadata is not. Returns how the data was moved.
+inline result<copy_method> copy_file(const std::string& from, const std::string& to, bool overwrite = false) {
+#if defined(FORGE_OS_WINDOWS)
+    if (!CopyFileExW(wpath(from).c_str(), wpath(to).c_str(), nullptr, nullptr, nullptr, overwrite ? 0 : COPY_FILE_FAIL_IF_EXISTS))
+        return {copy_method::kernel, last_error("copy " + from + " -> " + to)};
+    return {copy_method::kernel, {}};
+#else
+#if defined(__APPLE__)
+    if (!overwrite || !os::exists(to)) {
+        if (::clonefile(from.c_str(), to.c_str(), 0) == 0) return {copy_method::clone, {}};
+        if (errno == EEXIST && !overwrite) return {copy_method::clone, last_error("copy " + from + " -> " + to)};
+    }
+#endif
+    int in = ::open(from.c_str(), O_RDONLY | O_CLOEXEC); if (in < 0) return {copy_method::user, last_error("open " + from)};
+    struct stat st{}; if (::fstat(in, &st)) { auto e = last_error("stat " + from); ::close(in); return {copy_method::user, e}; }
+    if (!S_ISREG(st.st_mode)) { ::close(in); return {copy_method::user, errno_error(EINVAL, "copy " + from + ": not a regular file")}; }
+    int out = ::open(to.c_str(), O_WRONLY | O_CREAT | O_CLOEXEC | (overwrite ? O_TRUNC : O_EXCL), st.st_mode & 0777);
+    if (out < 0) { auto e = last_error("create " + to); ::close(in); return {copy_method::user, e}; }
+    auto done = [&](copy_method m, error e) { ::close(in); if (::close(out) != 0 && !e) e = last_error("close " + to); if (e) ::unlink(to.c_str()); return result<copy_method>{m, std::move(e)}; };
+#if defined(__linux__)
+    if (::ioctl(out, _IOW(0x94, 9, int) /*FICLONE*/, in) == 0) return done(copy_method::clone, {});
+#endif
+#if defined(__APPLE__)
+    if (::fcopyfile(in, out, nullptr, COPYFILE_DATA) == 0) return done(copy_method::kernel, {});
+#elif defined(__linux__) || (defined(__FreeBSD__) && __FreeBSD_version >= 1300037)
+    {   // copy_file_range: in-kernel, reflinks or server-side copies where it can (Linux 4.5; across file systems 5.3)
+        std::uint64_t left = std::uint64_t(st.st_size); bool any = false;
+        while (left && android_api_level() >= 34) {
+#if defined(__linux__)
+            ssize_t n = ::syscall(SYS_copy_file_range, in, nullptr, out, nullptr, std::size_t(std::min<std::uint64_t>(left, 1u << 30)), 0u);
+#else
+            ssize_t n = ::copy_file_range(in, nullptr, out, nullptr, std::size_t(std::min<std::uint64_t>(left, 1u << 30)), 0);
+#endif
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;   // error, or a source that reports a size it does not have (procfs): finish below
+            left -= std::uint64_t(n); any = true;
+        }
+        if (!left && (any || st.st_size == 0) && android_api_level() >= 34) return done(copy_method::kernel, {});
+        if (any) {   // partial: continue from where both descriptors stand
+            auto s = detail::copy_loop(in, out, to); return done(copy_method::kernel, s.err);
+        }
+    }
+#endif
+    auto s = detail::copy_loop(in, out, to);
+    return done(copy_method::user, s.err);
+#endif
+}
+
+// ---------------------------------------------------------------- preallocation and sparse files
+// Reserve disk blocks for the first `size` bytes of `f` (growing it to `size` if shorter), so later writes cannot
+// fail for lack of space and the file is laid out in few extents. Linux / Android / FreeBSD: posix_fallocate.
+// macOS / iOS: F_PREALLOCATE (contiguous if possible) then ftruncate. Windows: the allocation size
+// (FileAllocationInfo) and the end of file. A file system that cannot reserve (ZFS, some network mounts)
+// returns unsupported.
+inline status preallocate(file& f, std::uint64_t size) {
+#if defined(FORGE_OS_WINDOWS)
+    auto cur = f.size(); if (!cur) return {{}, cur.err};
+    if (cur.value >= size) return {};   // an allocation size below the end of file would truncate it
+    FILE_ALLOCATION_INFO ai{}; ai.AllocationSize.QuadPart = LONGLONG(size);
+    if (!SetFileInformationByHandle(f.native(), FileAllocationInfo, &ai, sizeof ai)) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED || e == ERROR_CALL_NOT_IMPLEMENTED) return {{}, unsupported("preallocate (this file system cannot reserve space)")};
+        SetLastError(e); return {{}, last_error("preallocate")};
+    }
+    return f.resize(size);
+#elif defined(__APPLE__)
+    auto cur = f.size(); if (!cur) return {{}, cur.err};
+    if (size > cur.value) {
+        fstore_t st{}; st.fst_flags = F_ALLOCATECONTIG | F_ALLOCATEALL; st.fst_posmode = F_PEOFPOSMODE; st.fst_offset = 0; st.fst_length = off_t(size - cur.value);
+        if (::fcntl(f.native(), F_PREALLOCATE, &st) == -1) {
+            st.fst_flags = F_ALLOCATEALL;
+            if (::fcntl(f.native(), F_PREALLOCATE, &st) == -1) { if (errno == ENOTSUP || errno == EINVAL) return {{}, unsupported("preallocate (this file system cannot reserve space)")}; return {{}, last_error("F_PREALLOCATE")}; }
+        }
+        return f.resize(size);
+    }
+    return {};
+#else
+    int e;
+    do e = ::posix_fallocate(f.native(), 0, off_t(size)); while (e == EINTR);
+    if (e == EOPNOTSUPP || e == EINVAL || e == ENOSYS) { if (size == 0) return {}; return {{}, unsupported("preallocate (this file system cannot reserve space)")}; }
+    if (e) return {{}, {e, "posix_fallocate: " + error_text(e)}};
+    return {};
+#endif
+}
+// Give the blocks behind [offset, offset + length) back to the file system; the range then reads as zeros and
+// the file keeps its size. Linux / Android: fallocate(PUNCH_HOLE). macOS / iOS: F_PUNCHHOLE (APFS; offset and
+// length must be multiples of the block size). FreeBSD 14+: fspacectl. Windows: the file is marked sparse, then
+// FSCTL_SET_ZERO_DATA. Unsupported where the file system has no holes.
+inline status punch_hole(file& f, std::uint64_t offset, std::uint64_t length) {
+    if (!length) return {};
+#if defined(FORGE_OS_WINDOWS)
+    DWORD got = 0;
+    if (!DeviceIoControl(f.native(), FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &got, nullptr)) {
+        if (GetLastError() == ERROR_INVALID_FUNCTION || GetLastError() == ERROR_NOT_SUPPORTED) return {{}, unsupported("punch_hole (no sparse files on this file system)")};
+        return {{}, last_error("FSCTL_SET_SPARSE")};
+    }
+    FILE_ZERO_DATA_INFORMATION z{}; z.FileOffset.QuadPart = LONGLONG(offset); z.BeyondFinalZero.QuadPart = LONGLONG(offset + length);
+    if (!DeviceIoControl(f.native(), FSCTL_SET_ZERO_DATA, &z, sizeof z, nullptr, 0, &got, nullptr)) {
+        if (GetLastError() == ERROR_INVALID_FUNCTION || GetLastError() == ERROR_NOT_SUPPORTED) return {{}, unsupported("punch_hole (no sparse files on this file system)")};
+        return {{}, last_error("FSCTL_SET_ZERO_DATA")};
+    }
+    return {};
+#elif defined(__linux__)
+    if (::fallocate(f.native(), 0x02 /*FALLOC_FL_PUNCH_HOLE*/ | 0x01 /*FALLOC_FL_KEEP_SIZE*/, off_t(offset), off_t(length)) == 0) return {};
+    if (errno == EOPNOTSUPP || errno == ENOSYS) return {{}, unsupported("punch_hole (no holes on this file system)")};
+    return {{}, last_error("fallocate(PUNCH_HOLE)")};
+#elif defined(__APPLE__) && defined(F_PUNCHHOLE)
+    fpunchhole_t h{}; h.fp_offset = off_t(offset); h.fp_length = off_t(length);
+    if (::fcntl(f.native(), F_PUNCHHOLE, &h) == 0) return {};
+    if (errno == ENOTSUP || errno == ENOTTY) return {{}, unsupported("punch_hole (no holes on this file system)")};
+    return {{}, last_error("F_PUNCHHOLE")};
+#elif defined(__FreeBSD__) && __FreeBSD_version >= 1400032
+    struct spacectl_range r{}; r.r_offset = off_t(offset); r.r_len = off_t(length);
+    if (::fspacectl(f.native(), SPACECTL_DEALLOC, &r, 0, nullptr) == 0) return {};
+    if (errno == EOPNOTSUPP || errno == ENODEV) return {{}, unsupported("punch_hole (no holes on this file system)")};
+    return {{}, last_error("fspacectl")};
+#else
+    (void)f; (void)offset; return {{}, unsupported("punch_hole")};
+#endif
+}
+// The parts of `f` that hold data, in order; the gaps between them (and after the last one) are holes that read
+// as zeros. Linux, macOS, FreeBSD, Android: lseek SEEK_DATA / SEEK_HOLE. Windows:
+// FSCTL_QUERY_ALLOCATED_RANGES. A file system without hole reporting yields one range covering the file. The
+// granularity is the file system's (whole blocks or clusters).
+struct file_range { std::uint64_t offset = 0, length = 0; };
+inline result<std::vector<file_range>> data_ranges(file& f) {
+    std::vector<file_range> out;
+    auto sz = f.size(); if (!sz) return {{}, sz.err};
+    if (!sz.value) return {std::move(out), {}};
+#if defined(FORGE_OS_WINDOWS)
+    FILE_ALLOCATED_RANGE_BUFFER in{}; in.FileOffset.QuadPart = 0; in.Length.QuadPart = LONGLONG(sz.value);
+    std::vector<FILE_ALLOCATED_RANGE_BUFFER> buf(64);
+    for (;;) {
+        DWORD got = 0;
+        BOOL ok = DeviceIoControl(f.native(), FSCTL_QUERY_ALLOCATED_RANGES, &in, sizeof in, buf.data(), DWORD(buf.size() * sizeof buf[0]), &got, nullptr);
+        const DWORD e = ok ? 0 : GetLastError();
+        if (!ok && e != ERROR_MORE_DATA) {
+            if (out.empty() && (e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED)) { out.push_back({0, sz.value}); return {std::move(out), {}}; }
+            SetLastError(e); return {{}, last_error("FSCTL_QUERY_ALLOCATED_RANGES")};
+        }
+        const std::size_t n = got / sizeof buf[0];
+        for (std::size_t i = 0; i < n; ++i) out.push_back({std::uint64_t(buf[i].FileOffset.QuadPart), std::uint64_t(buf[i].Length.QuadPart)});
+        if (ok || !n) break;
+        const std::uint64_t next = out.back().offset + out.back().length;
+        in.FileOffset.QuadPart = LONGLONG(next); in.Length.QuadPart = LONGLONG(sz.value - next);
+    }
+    return {std::move(out), {}};
+#elif defined(SEEK_DATA) && defined(SEEK_HOLE)
+    const int fd = f.native(); const off_t keep = ::lseek(fd, 0, SEEK_CUR);
+    off_t pos = 0; const off_t end = off_t(sz.value);
+    while (pos < end) {
+        off_t d = ::lseek(fd, pos, SEEK_DATA);
+        if (d < 0) { if (errno == ENXIO) break; out.assign(1, {0, sz.value}); break; }   // ENXIO: only a hole remains; else: no hole reporting
+        off_t h = ::lseek(fd, d, SEEK_HOLE);
+        if (h < 0 || h <= d) h = end;
+        out.push_back({std::uint64_t(d), std::uint64_t(h - d)}); pos = h;
+    }
+    if (keep >= 0) ::lseek(fd, keep, SEEK_SET);
+    return {std::move(out), {}};
+#else
+    out.push_back({0, sz.value}); return {std::move(out), {}};
+#endif
+}
+
+// ---------------------------------------------------------------- file identity
+// Two paths name the same file exactly when device and inode match (Windows: volume serial number and file
+// index). links is the hard-link count. follow = false describes a symbolic link itself.
+struct file_identity {
+    std::uint64_t device = 0, inode = 0, links = 0;
+    bool operator==(const file_identity& o) const { return device == o.device && inode == o.inode; }
+};
+inline result<file_identity> file_id(const std::string& p, bool follow = true) {
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE h = CreateFileW(wpath(p).c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS | (follow ? 0 : FILE_FLAG_OPEN_REPARSE_POINT), nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {{}, last_error("file_id " + p)};
+    BY_HANDLE_FILE_INFORMATION i{}; BOOL ok = GetFileInformationByHandle(h, &i);
+    auto e = ok ? error{} : last_error("file_id " + p); CloseHandle(h);
+    if (!ok) return {{}, e};
+    return {{i.dwVolumeSerialNumber, (std::uint64_t(i.nFileIndexHigh) << 32) | i.nFileIndexLow, i.nNumberOfLinks}, {}};
+#else
+    struct stat st{};
+    if ((follow ? ::stat(p.c_str(), &st) : ::lstat(p.c_str(), &st)) != 0) return {{}, last_error("file_id " + p)};
+    return {{std::uint64_t(st.st_dev), std::uint64_t(st.st_ino), std::uint64_t(st.st_nlink)}, {}};
+#endif
+}
+inline bool same_file(const std::string& a, const std::string& b) { auto x = file_id(a), y = file_id(b); return x && y && x.value == y.value; }
+
+// ---------------------------------------------------------------- extended attributes
+// Small named values attached to a file. Linux / Android: the "user." namespace (the prefix is added and
+// removed here, so names are the same everywhere). macOS / iOS: extended attributes. FreeBSD: the user
+// namespace (extattr). Windows: NTFS alternate data streams ("file:name"). A missing attribute is an error
+// (ENODATA / ENOATTR / ERROR_FILE_NOT_FOUND); a file system without them (tmpfs before Linux 6.6, FAT, some
+// network mounts) returns unsupported.
+namespace detail {
+inline error xattr_error(const std::string& what) {
+#if defined(FORGE_OS_POSIX)
+    if (errno == ENOTSUP || errno == EOPNOTSUPP) return unsupported("extended attributes on this file system");
+#endif
+    return last_error(what);
+}
+#if defined(__linux__)
+inline std::string xname(const std::string& n) { return "user." + n; }
+#endif
+}
+inline status xattr_set(const std::string& path, const std::string& name, std::string_view value) {
+    if (name.empty() || name.find_first_of(":/\\") != std::string::npos) return {{}, errno_error(EINVAL, "xattr: bad name")};
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE h = CreateFileW(wpath(path + ":" + name).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { if (GetLastError() == ERROR_INVALID_NAME || GetLastError() == ERROR_INVALID_PARAMETER) return {{}, unsupported("alternate data streams on this file system")}; return {{}, last_error("xattr set " + path)}; }
+    file f(h); return f.write_all(value.data(), value.size());
+#elif defined(__linux__)
+    if (::setxattr(path.c_str(), detail::xname(name).c_str(), value.data(), value.size(), 0) != 0) return {{}, detail::xattr_error("setxattr " + path)};
+    return {};
+#elif defined(__APPLE__)
+    if (::setxattr(path.c_str(), name.c_str(), value.data(), value.size(), 0, 0) != 0) return {{}, detail::xattr_error("setxattr " + path)};
+    return {};
+#elif defined(__FreeBSD__)
+    if (::extattr_set_file(path.c_str(), EXTATTR_NAMESPACE_USER, name.c_str(), value.data(), value.size()) < 0) return {{}, detail::xattr_error("extattr_set_file " + path)};
+    return {};
+#else
+    (void)path; (void)value; return {{}, unsupported("extended attributes")};
+#endif
+}
+inline result<std::string> xattr_get(const std::string& path, const std::string& name) {
+    if (name.empty() || name.find_first_of(":/\\") != std::string::npos) return {{}, errno_error(EINVAL, "xattr: bad name")};
+#if defined(FORGE_OS_WINDOWS)
+    if (!os::exists(path)) return {{}, {int(ERROR_FILE_NOT_FOUND), "xattr get " + path + ": no such file"}};
+    return os::read_file(path + ":" + name);
+#elif defined(FORGE_OS_POSIX) && (defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__))
+    for (int attempt = 0; attempt < 4; ++attempt) {   // the size can change between the two calls
+#if defined(__linux__)
+        ssize_t n = ::getxattr(path.c_str(), detail::xname(name).c_str(), nullptr, 0);
+#elif defined(__APPLE__)
+        ssize_t n = ::getxattr(path.c_str(), name.c_str(), nullptr, 0, 0, 0);
+#else
+        ssize_t n = ::extattr_get_file(path.c_str(), EXTATTR_NAMESPACE_USER, name.c_str(), nullptr, 0);
+#endif
+        if (n < 0) return {{}, detail::xattr_error("getxattr " + path)};
+        std::string v(std::size_t(n), '\0');
+        if (!n) return {std::move(v), {}};
+#if defined(__linux__)
+        ssize_t m = ::getxattr(path.c_str(), detail::xname(name).c_str(), v.data(), v.size());
+#elif defined(__APPLE__)
+        ssize_t m = ::getxattr(path.c_str(), name.c_str(), v.data(), v.size(), 0, 0);
+#else
+        ssize_t m = ::extattr_get_file(path.c_str(), EXTATTR_NAMESPACE_USER, name.c_str(), v.data(), v.size());
+#endif
+        if (m >= 0) { v.resize(std::size_t(m)); return {std::move(v), {}}; }
+        if (errno != ERANGE) return {{}, detail::xattr_error("getxattr " + path)};
+    }
+    return {{}, errno_error(ERANGE, "getxattr " + path + ": value keeps changing")};
+#else
+    (void)path; return {{}, unsupported("extended attributes")};
+#endif
+}
+inline status xattr_remove(const std::string& path, const std::string& name) {
+    if (name.empty() || name.find_first_of(":/\\") != std::string::npos) return {{}, errno_error(EINVAL, "xattr: bad name")};
+#if defined(FORGE_OS_WINDOWS)
+    if (!DeleteFileW(wpath(path + ":" + name).c_str())) return {{}, last_error("xattr remove " + path)};
+    return {};
+#elif defined(__linux__)
+    if (::removexattr(path.c_str(), detail::xname(name).c_str()) != 0) return {{}, detail::xattr_error("removexattr " + path)};
+    return {};
+#elif defined(__APPLE__)
+    if (::removexattr(path.c_str(), name.c_str(), 0) != 0) return {{}, detail::xattr_error("removexattr " + path)};
+    return {};
+#elif defined(__FreeBSD__)
+    if (::extattr_delete_file(path.c_str(), EXTATTR_NAMESPACE_USER, name.c_str()) != 0) return {{}, detail::xattr_error("extattr_delete_file " + path)};
+    return {};
+#else
+    (void)path; return {{}, unsupported("extended attributes")};
+#endif
+}
+inline result<std::vector<std::string>> xattr_list(const std::string& path) {
+    std::vector<std::string> out;
+#if defined(FORGE_OS_WINDOWS)
+    WIN32_FIND_STREAM_DATA d{};
+    HANDLE h = FindFirstStreamW(wpath(path).c_str(), FindStreamInfoStandard, &d, 0);
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        if (e == ERROR_HANDLE_EOF) return {std::move(out), {}};   // no streams at all (a directory)
+        if (e == ERROR_INVALID_PARAMETER || e == ERROR_INVALID_FUNCTION || e == ERROR_NOT_SUPPORTED) return {{}, unsupported("alternate data streams on this file system")};
+        SetLastError(e); return {{}, last_error("xattr list " + path)};
+    }
+    do {   // ":name:$DATA"; the unnamed stream "::$DATA" is the file's contents
+        std::string n = narrow(d.cStreamName);
+        if (n.size() > 1 && n[0] == ':') { auto e = n.find(':', 1); n = n.substr(1, e == std::string::npos ? std::string::npos : e - 1); if (!n.empty()) out.push_back(n); }
+    } while (FindNextStreamW(h, &d));
+    FindClose(h);
+    return {std::move(out), {}};
+#elif defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
+    ssize_t n = ::listxattr(path.c_str(), nullptr, 0);
+#else
+    ssize_t n = ::listxattr(path.c_str(), nullptr, 0, 0);
+#endif
+    if (n < 0) return {{}, detail::xattr_error("listxattr " + path)};
+    std::string b(std::size_t(n) + 256, '\0');
+#if defined(__linux__)
+    n = ::listxattr(path.c_str(), b.data(), b.size());
+#else
+    n = ::listxattr(path.c_str(), b.data(), b.size(), 0);
+#endif
+    if (n < 0) return {{}, detail::xattr_error("listxattr " + path)};
+    for (std::size_t i = 0; i < std::size_t(n);) {
+        std::string name = b.c_str() + i; i += name.size() + 1;
+#if defined(__linux__)
+        if (name.rfind("user.", 0) != 0) continue;   // security.*, system.*, trusted.*: other namespaces
+        name = name.substr(5);
+#endif
+        if (!name.empty()) out.push_back(std::move(name));
+    }
+    return {std::move(out), {}};
+#elif defined(__FreeBSD__)
+    ssize_t n = ::extattr_list_file(path.c_str(), EXTATTR_NAMESPACE_USER, nullptr, 0);
+    if (n < 0) return {{}, detail::xattr_error("extattr_list_file " + path)};
+    std::string b(std::size_t(n) + 256, '\0');
+    n = ::extattr_list_file(path.c_str(), EXTATTR_NAMESPACE_USER, b.data(), b.size());
+    if (n < 0) return {{}, detail::xattr_error("extattr_list_file " + path)};
+    for (std::size_t i = 0; i < std::size_t(n);) {   // length byte, then the name (no terminator)
+        std::size_t len = static_cast<unsigned char>(b[i]); ++i;
+        if (i + len > std::size_t(n)) break;
+        out.emplace_back(b.data() + i, len); i += len;
+    }
+    return {std::move(out), {}};
+#else
+    (void)path; return {{}, unsupported("extended attributes")};
+#endif
+}
+
+// ---------------------------------------------------------------- renames that do not replace, exchanges
+// Rename that fails (already_exists) instead of replacing `to`, atomically. Linux / Android: renameat2
+// RENAME_NOREPLACE (3.15+). macOS / iOS: renamex_np RENAME_EXCL. Windows: MoveFileEx without REPLACE_EXISTING.
+// FreeBSD, and a Linux file system without the flag: link + unlink, which is atomic for files (both names exist
+// for a moment) and unsupported for directories.
+inline status rename_noreplace(const std::string& from, const std::string& to) {
+#if defined(FORGE_OS_WINDOWS)
+    if (!MoveFileExW(wpath(from).c_str(), wpath(to).c_str(), MOVEFILE_WRITE_THROUGH)) return {{}, last_error("rename " + from + " -> " + to)};
+    return {};
+#else
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (android_api_level() >= 30) {   // renameat2: Android 11
+        if (::syscall(SYS_renameat2, AT_FDCWD, from.c_str(), AT_FDCWD, to.c_str(), 1u /*RENAME_NOREPLACE*/) == 0) return {};
+        if (errno != ENOSYS && errno != EINVAL) return {{}, last_error("rename " + from + " -> " + to)};
+    }
+#elif defined(__APPLE__)
+    if (::renamex_np(from.c_str(), to.c_str(), RENAME_EXCL) == 0) return {};
+    if (errno != ENOTSUP) return {{}, last_error("rename " + from + " -> " + to)};
+#endif
+    if (::link(from.c_str(), to.c_str()) != 0) {
+        if (errno == EPERM || errno == EACCES) { struct stat st{}; if (::lstat(from.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) return {{}, unsupported("rename_noreplace of a directory on this system")}; }
+        return {{}, last_error("rename " + from + " -> " + to)};
+    }
+    if (::unlink(from.c_str()) != 0) return {{}, last_error("unlink " + from)};
+    return {};
+#endif
+}
+// Swap two existing paths atomically (files or directories). Linux / Android: renameat2 RENAME_EXCHANGE.
+// macOS / iOS: renamex_np RENAME_SWAP. Windows and FreeBSD have no atomic exchange: unsupported.
+inline status rename_exchange(const std::string& a, const std::string& b) {
+#if defined(__linux__) && defined(SYS_renameat2)
+    if (android_api_level() < 30) return {{}, unsupported("rename_exchange before Android 11")};
+    if (::syscall(SYS_renameat2, AT_FDCWD, a.c_str(), AT_FDCWD, b.c_str(), 2u /*RENAME_EXCHANGE*/) == 0) return {};
+    if (errno == ENOSYS || errno == EINVAL) return {{}, unsupported("rename_exchange on this kernel or file system")};
+    return {{}, last_error("exchange " + a + " <-> " + b)};
+#elif defined(__APPLE__)
+    if (::renamex_np(a.c_str(), b.c_str(), RENAME_SWAP) == 0) return {};
+    if (errno == ENOTSUP) return {{}, unsupported("rename_exchange on this file system")};
+    return {{}, last_error("exchange " + a + " <-> " + b)};
+#else
+    (void)a; (void)b; return {{}, unsupported("rename_exchange")};
+#endif
+}
+// Flush a directory's entries to disk, so a create / rename / remove inside it survives a power loss. POSIX:
+// fsync of the directory. Windows: FlushFileBuffers on a directory handle (NTFS journals directory updates;
+// this forces the log out).
+inline status sync_dir(const std::string& dir) {
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE h = CreateFileW(wpath(dir).c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return {{}, last_error("sync_dir " + dir)};
+    BOOL ok = FlushFileBuffers(h); auto e = ok ? error{} : last_error("sync_dir " + dir); CloseHandle(h);
+    if (!ok) return {{}, e};
+    return {};
+#else
+    int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return {{}, last_error("sync_dir " + dir)};
+    int r; do r = ::fsync(fd); while (r != 0 && errno == EINTR);
+    int en = errno; ::close(fd);
+    if (r != 0 && en != EINVAL && en != EROFS) { errno = en; return {{}, last_error("sync_dir " + dir)}; }   // EINVAL: nothing to sync there
+    return {};
+#endif
+}
+
+// ---------------------------------------------------------------- anonymous temporary file
+// A read / write file with no name that vanishes when the handle closes, even if the process is killed. Linux /
+// Android: O_TMPFILE in `dir` (never visible). Other POSIX systems, and file systems without O_TMPFILE: an
+// exclusive 0600 file that is unlinked at once. Windows: FILE_FLAG_DELETE_ON_CLOSE (the name exists, privately,
+// until then). dir defaults to temp_dir().
+inline result<file> anonymous_file(const std::string& dir = "") {
+    const std::string base = dir.empty() ? temp_dir() : dir;
+#if defined(FORGE_OS_WINDOWS)
+    for (int i = 0; i < 16; ++i) {
+        auto p = u8str(u8path(base) / u8path("forge-anon-" + random_suffix(12)));
+        detail_priv::private_sa sa(false);
+        HANDLE h = CreateFileW(wpath(p).c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_DELETE, sa.get(), CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+        if (h != INVALID_HANDLE_VALUE) return {file(h), {}};
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return {{}, last_error("anonymous_file")};
+    }
+    return {{}, error{-1, "anonymous_file: could not create a unique file"}};
+#else
+#if defined(__linux__) && defined(O_TMPFILE)
+    { int fd = ::open(base.c_str(), O_TMPFILE | O_RDWR | O_CLOEXEC, 0600); if (fd >= 0) return {file(fd), {}}; }
+#endif
+    for (int i = 0; i < 16; ++i) {
+        auto p = u8str(u8path(base) / u8path("forge-anon-" + random_suffix(12)));
+        int fd = ::open(p.c_str(), O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (fd >= 0) { ::unlink(p.c_str()); return {file(fd), {}}; }
+        if (errno != EEXIST) return {{}, last_error("anonymous_file")};
+    }
+    return {{}, error{-1, "anonymous_file: could not create a unique file"}};
 #endif
 }
 

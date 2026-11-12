@@ -12,10 +12,12 @@ The scripting layer uses these headers for `run`, `proc`, `fs`, `os`, `time`, `n
 ## Module reference
 | Header | Namespace | Main API |
 |---|---|---|
-| `process.hpp` | `forge::os` | `spawn_wait(spawn_spec)` → `proc_result`; `child` (streaming); `wait_any`, `wait_all`; `find_executable`; `apply_limits`; `kill_group`; `list_processes`, `process_info`; `process_caps` |
+| `process.hpp` | `forge::os` | `spawn_wait(spawn_spec)` → `proc_result`; `child` (streaming); `wait_any`, `wait_all`; `wait_for_exit(pid)`; `find_executable`; `apply_limits`; `kill_group`; `list_processes`, `process_info`, `process_descendants`, `kill_tree`; `set_process_priority` / `get_process_priority`, `set_process_affinity` / `get_process_affinity`, `set_io_priority`; `inheritable_handle`; `process_caps` |
+| `pty.hpp` | `forge::os` | `pty::spawn(argv, pty_opts)`, `read(max, timeout_ms)`, `eof`, `write`, `resize`, `wait`, `kill`, `pty::available()` |
+| `sync.hpp` | `forge::os` | `wait_on_address`, `wake_one`, `wake_all`, `address_wait_backend`; `wait_event`; `wait_timer`; `signal_listener` |
 | `pipe.hpp` | `forge::os` | `make_pipe()` → `{read, write}` RAII `pipe_end`s with `write_all`, `read_some(max, timeout_ms)`, `read_all` |
 | `signal.hpp` | `forge::os` | `signal_id` (interrupt, terminate, kill, hangup, quit, user1, user2), `sig_name`, `sig_from_name`, `sig_native`, `send_signal(pid, sig, group)` |
-| `fs.hpp` | `forge::os::fs` | `copy`, `copy_tree`, `move`, `remove_all`, `symlink`, `hardlink`, `read_link`, `mode`, `chmod`, `chown`, `mtime_ns`, `set_mtime_ns`, `touch`, `glob_match`, `glob`, `walk`, `file_lock`, `disk_usage`, `mounts`, `make_temp_file`, `make_temp_dir`, `write_file_atomic` |
+| `fs.hpp` | `forge::os::fs` | `copy`, `copy_tree`, `move`, `remove_all`, `symlink`, `hardlink`, `read_link`, `junction`, `mode`, `chmod`, `chown`, `mtime_ns`, `set_mtime_ns`, `touch`, `glob_match`, `glob`, `walk`, `file_lock`, `disk_usage`, `mounts`, `make_temp_file`, `make_temp_dir`, `write_file_atomic`, `copy_file`, `clone_file`, `preallocate`, `punch_hole`, `data_ranges`, `file_id`, `same_file`, `xattr_get` / `xattr_set` / `xattr_remove` / `xattr_list`, `rename_noreplace`, `rename_exchange`, `sync_dir`, `anonymous_file` |
 | `users.hpp` | `forge::os` | `current_user`, `lookup_user`, `lookup_uid`, `is_elevated`, `user_directory(user_dir)`, `config_dir`, `cache_dir`, `data_dir` |
 | `time.hpp` | `forge::os` | `unix_time_ns`, civil-time conversion, `utc_offset_seconds`, `timezone_name`, `format_iso8601`, `format_local_iso8601`, `parse_iso8601`, `timer_queue`, `stopwatch`, `deadline` |
 | `sysinfo.hpp` | `forge::os` | `release_info`, `uptime_seconds`, `load_average`, `memory()`, `per_cpu_times`, `cpu_usage`, `self_usage`, `current_rss` |
@@ -43,6 +45,7 @@ The scripting layer uses these headers for `run`, `proc`, `fs`, `os`, `time`, `n
 | `max_output` | Per-stream cap (default 64 MiB); `truncated = true` |
 | `limits` | `proc_limits`: `memory_bytes`, `cpu_seconds`, `open_files`, `file_size_bytes`, `no_core` |
 | `stop` | `std::stop_token`; on request the tree is killed, `cancelled = true`, exit code 125 |
+| `inherit` | Native handles the child inherits under the same value besides its std streams (POSIX descriptors, inheritable Windows handles): `shared_memory::share()`, `inheritable_handle(h)` |
 | `new_session` | POSIX `setsid()`; Windows `CREATE_NEW_PROCESS_GROUP` |
 | `watch_memory_bytes` | Kill the tree past this many bytes; `memory_killed = true`, exit code 137 |
 
@@ -68,11 +71,18 @@ How it works per platform:
 
 `list_processes()` and `process_info(pid)` return pid, ppid, RSS, name and command line: `/proc` on Linux and Android; Toolhelp32 + `K32GetProcessMemoryInfo` + `NtQueryInformationProcess` (command line) on Windows; `proc_listpids` / `proc_pid_rusage` / `KERN_PROCARGS2` on macOS; `kern.proc.proc` / `kern.proc.args` on FreeBSD. A field the caller may not read (another user's argv or RSS on macOS, protected processes on Windows) stays empty or 0. Unsupported on iOS.
 
+`wait_for_exit(pid, timeout_ms)` waits for any process, child or not, without polling (pidfd, kqueue `EVFILT_PROC`, a Windows `SYNCHRONIZE` handle); `child::wait(timeout)` sleeps on the same event. `process_descendants(pid)` and `kill_tree(pid)` walk the parent ids of `list_processes()` (on Windows a child must be younger than its parent, so a reused pid is not followed). `set_process_priority` (nice value / priority class), `set_process_affinity` (unsupported on macOS and iOS) and `set_io_priority` (unsupported on FreeBSD and Android) act on whole processes. On Windows `apply_limits` puts the calling process into a Job Object. [os-parity.md](os-parity.md) has the per-OS table.
+
+`pty::spawn(argv, {cols, rows, cwd, env_set})` (`pty.hpp`) runs a program on a pseudo-terminal: `read(max, timeout_ms)` returns the terminal's output (`eof()` once the program is gone and everything was read), `write` sends input, `resize` changes the window size, `wait` / `kill` as for `child`. POSIX uses `posix_openpt` with the slave side as the child's controlling terminal; Windows uses ConPTY (1809+), whose output is UTF-8 with VT sequences. Unsupported on iOS.
+
 `process_caps()` lists what the platform supports: `spawn`, `process.limits.memory`, `process.limits.cpu`, `process.limits.files` (POSIX), `process.tree_kill`, `process.timeout`, `signals` (POSIX). It is empty on iOS. ForgeScript's `os.caps()` returns this list with the platform name and the script's own capabilities.
 
 `mem::spawn_leased` ([memory.md](memory.md)) starts a `child` whose memory cap is a lease on a memory budget.
 
 ## Pipes and signals
+- `sync.hpp`: `wait_on_address(atomic<uint32_t>&, expected, timeout_ns)` / `wake_one` / `wake_all` (futex, `WaitOnAddress`, `_umtx_op`, `os_sync_wait_on_address`); `wait_event` (a flag that stays raised until `reset()`, with a pollable `native()`); `wait_timer` (`arm(first_ns, period_ns)`, `wait()` returns the number of expirations); `signal_listener::instance().listen(sig)` / `wait(timeout_ms)` turns interrupt / terminate / hangup / pipe into a queue (self-pipe; console control events on Windows).
+- `local_stream::send_handle(h)` / `recv_handle()` pass an open handle to the peer (`SCM_RIGHTS`; `DuplicateHandle` into the peer on Windows). `shared_memory::anonymous(n)` has no name: `share()` gives a handle for `spawn_spec::inherit` or `send_handle`, `attach(handle)` maps it, `seal()` fixes its size (Linux, FreeBSD).
+- `crash.hpp`: `set_core_dumps(false)` stops core files (`RLIMIT_CORE`, `PR_SET_DUMPABLE`, `PROC_TRACE_CTL`; on Windows no Windows Error Reporting for the process).
 - `pipe.hpp` works on POSIX and Windows. Pipes are close-on-exec (non-inheritable on Windows, where the read end is an overlapped named pipe so it can time out). `read_some` with a timeout returns an empty string on timeout or EOF; a signal does not cut the wait short.
 - `send_signal(pid, s, group)` delivers any `signal_id` on POSIX (`group = true` signals the process group). Pid 0, pids that do not fit `pid_t` / `DWORD`, and group signals to pid 1 or below are rejected, so a bad pid can never reach our own group or every process. On Windows only `kill` and `terminate` work (`TerminateProcess`); the rest return unsupported (a console control event cannot be aimed at one process).
 - Handler installation is `os::on_signal` in `os.hpp`; on Windows it maps Ctrl-C to `interrupt`, Ctrl-Break / shutdown to `terminate`, and console close / logoff to `hangup` (to `terminate` when no hangup handler is installed).
@@ -91,8 +101,16 @@ How it works per platform:
 | `mounts()` | `/proc/self/mounts` (Linux, Android; `mount_unescape` decodes its `\ooo` escapes), volume enumeration (Windows), `getfsstat` (macOS, FreeBSD) |
 | `make_temp_file`, `make_temp_dir` | created exclusively (`O_EXCL` / `CREATE_NEW`) |
 | `write_file_atomic(path, data, mode)` | temp file (exclusive), fsync / `FlushFileBuffers`, rename, then fsync of the directory (POSIX). Windows honours `mode` only as read-only when it has no write bit |
+| `copy_file(from, to, overwrite)` | One file, the fastest way: a copy-on-write clone (`FICLONE`, `clonefile`), else an in-kernel copy (`copy_file_range`, `fcopyfile`, `CopyFileExW`), else read / write. Returns which (`copy_method`) |
+| `clone_file(from, to)` | Clone or fail: Linux reflink file systems and APFS; unsupported on Windows, FreeBSD and file systems that cannot share blocks |
+| `preallocate(file, size)`, `punch_hole(file, off, len)`, `data_ranges(file)` | Reserve blocks; give a range back (it reads as zeros); list the ranges that hold data. `posix_fallocate` / `F_PREALLOCATE` / `FileAllocationInfo`; `fallocate(PUNCH_HOLE)` / `F_PUNCHHOLE` / `fspacectl` / `FSCTL_SET_ZERO_DATA`; `SEEK_DATA` / `FSCTL_QUERY_ALLOCATED_RANGES`. Unsupported where the file system cannot |
+| `file_id(path, follow)`, `same_file(a, b)` | Device + inode + link count (Windows: volume serial + file index) |
+| `xattr_get` / `xattr_set` / `xattr_remove` / `xattr_list` | Named values on a file: Linux `user.*` (prefix handled here), macOS xattrs, FreeBSD user `extattr`, NTFS alternate data streams |
+| `rename_noreplace(from, to)`, `rename_exchange(a, b)` | Atomic rename that fails if the target exists (`renameat2`, `renamex_np`, `MoveFileEx`; FreeBSD link + unlink, files only); atomic swap (Linux, macOS; unsupported on Windows and FreeBSD) |
+| `sync_dir(dir)`, `anonymous_file(dir)` | fsync of a directory; a nameless read / write file (`O_TMPFILE`, unlink after create, `FILE_FLAG_DELETE_ON_CLOSE`) |
+| `junction(target_dir, link)` | Windows directory junction (no privilege needed); a symlink to the absolute path elsewhere. On Windows `symlink` uses `CreateSymbolicLinkW` and falls back to a junction for directories when the privilege is missing |
 
-Paths are UTF-8 everywhere; on Windows every call converts them to UTF-16, so non-ASCII names work.
+Paths are UTF-8 everywhere; on Windows every call converts them to UTF-16, so non-ASCII names work. `os.hpp`'s file calls and the native `fs` calls above pass paths of 248 or more characters in the `\\?\` form (`os::wpath`), so `MAX_PATH` does not limit them; calls that go through `std::filesystem` (`copy`, `walk`, `glob`) depend on the standard library for that.
 
 ## Users, time, system, console
 - **`users.hpp`.** `current_user()` everywhere. `lookup_user` / `lookup_uid` (with groups) everywhere but iOS. Windows has no numeric ids: `uid` is the last sub-authority (RID) of the account SID and `gid` that of its primary group; `user_info::sid` holds the SID string, the home directory comes from the profile list and full name / groups from netapi32 (loaded at run time). `current_user()` reports the process token's primary group, which can differ from the account's. `is_elevated()` is root or an elevated token. `user_directory(config|cache|data|state|runtime|documents|downloads|desktop)` follows the XDG base directories on Linux and FreeBSD (documents / downloads / desktop from `user-dirs.dirs`, then `XDG_*_DIR`), `~/Library` on Apple, and Known Folders through `SHGetKnownFolderPath` on Windows, so OneDrive and Group Policy redirection are followed. On Windows `current_user()` also fills `groups` from the token and `full_name` from netapi32 or the display name.
@@ -110,6 +128,8 @@ Paths are UTF-8 everywhere; on Windows every call converts them to UTF-16, so no
 
   Windows keeps no run-queue average, so `load_average` emulates Linux's. The first call starts a background thread that never stops. Every 5 s it samples busy CPUs (from `GetSystemTimes` over the tick, times the active processors) plus threads waiting for a CPU (`\System\Processor Queue Length` through PDH; pdh.dll is loaded at run time, and the term is 0 without it). It folds each sample into 1, 5 and 15-minute averages with decay factors `exp(-5/60)`, `exp(-5/300)` and `exp(-5/900)`. The first call measures for 100 ms and seeds all three averages with that value, so early readings follow the current load instead of climbing from 0. Threads blocked on I/O (Linux's D state) are not counted.
 
+- **`time.hpp` clocks.** `boottime_ns()` counts time asleep, `awake_ns()` does not (`CLOCK_BOOTTIME` / `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW` / `CLOCK_UPTIME_RAW`, `QueryInterruptTimePrecise` / `QueryUnbiasedInterruptTime`; FreeBSD has only the first). `os::monotonic_ns()` is whichever the OS treats as its default.
+- **`console.hpp` features.** `set_feature(mouse | bracketed_paste | focus_events | alternate_screen, on)` writes the xterm private-mode sequence when the stream is a terminal (ENOTTY otherwise; Windows turns VT output on first); `resize_watcher::poll()` returns the new size when it changed.
 - **`console.hpp`.** `is_tty` (on Windows a real console, which `NUL` is not, or a mintty / MSYS2 / Cygwin pty pipe), `size` (falls back to `COLUMNS` / `LINES`), `enable_vt` (Windows VT mode), `color_enabled` (honours `NO_COLOR`, `FORCE_COLOR`, `TERM=dumb`), `paint`, RAII `mode_guard` (raw or no-echo; raw also enables VT input on Windows, so keys arrive as escape sequences), `read_password` (UTF-16 console input on Windows, returned as UTF-8), `confirm`.
 
 ## Networking (`net.hpp`)
@@ -206,7 +226,7 @@ int main(int argc, char** argv) {
 - ForgeScript exposes it as `ProcessPool(n, {...})`.
 
 ## Platform notes
-- **iOS.** No spawning: `spawn_wait`, `child` and `os::run` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
+- **iOS.** No spawning: `spawn_wait`, `child`, `os::run`, `run_sandboxed`, `pty::spawn`, `list_processes`, `wait_for_exit` and `kill_tree` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
 - **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control.
 - **Windows.** `CreateProcessW` + Job Objects (`spawn_wait` and `child`), `ReadDirectoryChangesW`, SCM API for system services and Task Scheduler (COM) for per-user ones, registry, event-log service log. `kill_group` and `chown` are POSIX only. `pin_thread_to` uses `SetThreadGroupAffinity`, so CPUs 64 and up work; a set spanning processor groups is an error. CPU ids past what the OS mask holds are `EINVAL` everywhere (Linux allocates a larger set with `CPU_ALLOC` beyond `CPU_SETSIZE`). System DLLs loaded at run time (`iphlpapi`, `setupapi`, `powrprof`, `dxgi`, `dxcore`, `secur32`, `crypt32`) come from System32 only (`LOAD_LIBRARY_SEARCH_SYSTEM32`).
 - **macOS.** `RLIMIT_AS` is ignored by the kernel, so `memory_bytes` uses a resident-size watchdog. kqueue for file watching.
@@ -216,7 +236,7 @@ int main(int argc, char** argv) {
 | Item | Today |
 |---|---|
 | `os::caps()` for the whole OS layer | Only `process_caps()`; ForgeScript `os.caps()` wraps it |
-| Named pipes / FIFOs in `pipe.hpp`, signal-to-fd for event loops | Not present (`local_ipc.hpp` covers named pipes) |
+| Named pipes / FIFOs in `pipe.hpp` | Not present (`local_ipc.hpp` covers named pipes). Signals for event loops: `sync.hpp` `signal_listener` |
 | cgroup v2 limits for spawned processes | rlimits, Job Objects and watchdogs instead |
 | Fuzz target for glob/path parsing | none |
 | `chown` on Windows, signals other than kill/terminate on Windows, `advise_huge` on Windows/macOS, hard CPU affinity on macOS | no OS facility (see the sections above) |

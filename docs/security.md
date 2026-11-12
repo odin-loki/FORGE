@@ -179,11 +179,14 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 
 - RPC: permissions are coarse (`device`, `scripts`); client-certificate rules match only the fingerprint or subject CN
   (no SANs, no revocation list).
-- Windows: no in-process network or file-write denial; scripts there get only the job object plus the
-  interpreter checks (script `ProcessPool` workers do get an AppContainer).
-- `run_sandboxed` does not apply `deny_exec` to the target on macOS, or on Linux without Landlock. With Landlock
-  the target can still run another program by invoking the dynamic loader explicitly (`ld.so prog`), since
-  Landlock does not govern `mmap(PROT_EXEC)`.
+- Windows: no in-process network denial (no unprivileged per-process filter exists; `run_sandboxed` and script
+  `ProcessPool` workers get an AppContainer). In-process file-write denial is the low integrity level
+  (2026-11-12): `%LOCALAPPDATA%Low`, volumes without ACLs (FAT / exFAT) and handles opened before the call stay
+  writable.
+- `run_sandboxed` applies `deny_exec` to the target on macOS (Seatbelt, 2026-11-12; compiled, not yet run) and on
+  Linux through a one-exec seccomp gate (5.5+) and Landlock (5.13+); the gate also refuses `ld.so prog`. A Linux
+  kernel with neither still runs the target without exec denial, and a target can always map code into its own
+  process (`mmap(PROT_EXEC)`), which stays inside the same sandbox.
 - Windows AppContainer pool workers: the ACE added to the worker image stays (it names only the FORGE profile);
   the profiles persist per user like any package profile. Some CI images refuse AppContainer profiles.
 - `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
