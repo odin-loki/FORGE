@@ -117,7 +117,7 @@ What has run, all under emulation except SSE (2026-11-12; details in [STATUS.md]
 | `vsx` | zig 0.17, CMake + toolchain file; g++ 13 by hand | `qemu-ppc64le -cpu power9` and `-cpu power8` | 7/7 |
 | `vxe` | zig 0.17, CMake + toolchain file; g++ 13 by hand | `qemu-s390x -cpu max` | 7/7. Not run on a z14-only CPU model (qemu-user rejects `-cpu z14`) |
 | `simd128` | zig 0.17 `wasm32-wasi`, `tests/wasm_simd.sh` | node 22 (V8) | 7/7 |
-| `msa` | zig 0.17, by hand | `qemu-mips64el -cpu Loongson-3A4000` | 7/7. The MIPS CMake branch and toolchain file have not been configured |
+| `msa` | zig 0.17, CMake + toolchain file | `qemu-mips64el -cpu Loongson-3A4000` | 7/7 |
 | `neon` (32-bit Arm) | zig 0.17 `-mcpu=cortex_a7`, by hand | `qemu-arm -cpu cortex-a7` | 5/7: the three subnormal sweeps fail, hence opt-in. CMake branch not configured |
 
 "By hand" means `kernels_gn.cpp`, `kernels_scalar.cpp`, `dispatch.cpp`, `qi8_dispatch.cpp`, `seq_scalar.cpp`, `seq_dispatch.cpp` and `tests/test_simd.cpp` compiled and linked directly with the flags the CMake branch uses. None of these tables has run on real hardware of its architecture, and no test other than `test_simd` has run on these architectures.

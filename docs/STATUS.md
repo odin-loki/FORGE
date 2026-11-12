@@ -27,7 +27,8 @@ CI is `.github/workflows/ci.yml`; it runs on every pull request and every push t
 | Linux ppc64le (VSX) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-ppc64le -cpu power9`, `power8` |
 | Linux s390x (z14 vector) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
 | wasm32-wasi (SIMD128) | simd layer and `test_simd` only, `tests/wasm_simd.sh` | `test_simd` 7/7 under node 22 (2026-11-12) | zig `wasm32-wasi` |
-| Linux mips64el (MSA), 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: mips64el 7/7, i386 7/7, arm 5/7 with the opt-in `neon` table (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000`, `qemu-i386`, `qemu-arm -cpu cortex-a7` |
+| Linux mips64el (MSA) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
+| 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: i386 7/7, arm 5/7 with the opt-in `neon` table, 7/7 without it (2026-11-12) | `qemu-i386`, `qemu-arm -cpu cortex-a7` |
 | Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
 Windows emit goldens (`FORGE_TEST_ONLY=emit test_script`, `windows-msvc`): sh, bash, dash, pwsh and PowerShell 5.1
@@ -112,15 +113,16 @@ than x86_64.
   avx2, avx512. `qemu-x86_64 -cpu Nehalem` (active `sse4.2`) and `-cpu core2duo` (active `sse2`): `test_simd` 7/7.
 - zig 0.17.1 (clang 22) musl static builds through CMake and the new toolchain files, `test_simd` under qemu-user:
   loongarch64 `-cpu la464` 7/7 (also with `lsx` forced), ppc64le `-cpu power9` and `-cpu power8` 7/7, s390x
-  `-cpu max` 7/7. g++ 13 cross builds of the same sources by hand: ppc64le 7/7, s390x 7/7.
+  `-cpu max` 7/7, mips64el `-cpu Loongson-3A4000` 7/7. g++ 13 cross builds of the same sources by hand: ppc64le 7/7, s390x 7/7.
 - wasm32-wasi (zig), `tests/wasm_simd.sh`, node 22: 7/7 with `simd128` active.
-- By hand, no CMake configure: mips64el MSA under `qemu-mips64el -cpu Loongson-3A4000` 7/7; 32-bit x86 under
+- By hand, no CMake configure: 32-bit x86 under
   `qemu-i386 -cpu Nehalem` / `core2duo` 7/7; 32-bit Arm NEON under `qemu-arm -cpu cortex-a7` 5/7 (`exp-sub`,
   `cbrt-sub`, `erfc`: AArch32 NEON flushes subnormals), so that table is never selected automatically.
+- zig's clang 22 hangs compiling musl with `-mmsa`, so the CMake probes for these tables compile only (no link).
 - Found on the way: with clang 22 on MSA the and/or form of a vector select gave wrong `expm1`/`log1p`/rounding
   results; that backend calls `bsel.v` directly.
 - Not done: any other test on these architectures; MSVC, Apple clang, NDK and FreeBSD builds of the new code (CI
-  will be the first); the wasm, MIPS, 32-bit Arm and 32-bit x86 CMake branches; a z14-only s390x CPU model.
+  will be the first); the wasm, 32-bit Arm and 32-bit x86 CMake branches; a z14-only s390x CPU model.
 
 Newest first. Results are from the date given; later code may differ.
 
