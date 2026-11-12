@@ -726,7 +726,40 @@ static int select_t(const std::string& api) {
     check(want < 2 || graph::auto_device({}) == backend + ":1", "device 0 excluded: auto picks device 1");
     set_env("FORGE_DEVICE_EXCLUDE", backend);
     check(graph::auto_device({}) == "cpu" || graph::auto_device({}).rfind(backend, 0) != 0, "the backend excluded: never picked");
-    set_env("FORGE_DEVICE_EXCLUDE", ""); set_env("FORGE_DEVICE_BENCH", "");
+    set_env("FORGE_DEVICE_EXCLUDE", "");
+    if (want >= 2) {   // "pipe:auto": the layers split over this backend's devices, and the split runs
+        std::string table; const std::string pick = graph::auto_pipeline({}, &table);
+        check(pick.rfind("pipe:" + backend + ":0*", 0) == 0 && pick.find("," + backend + ":1*") != std::string::npos, "pipe:auto splits over both devices: " + pick);
+        std::string w; auto reg = graph::device_registry("pipe:auto", &w);
+        check(reg && reg->stages.size() == 2 && reg->stage_weight.size() == 2 && std::abs(reg->stage_weight[0] - reg->stage_weight[1]) < 1e-3,
+              "device_registry(\"pipe:auto\") builds two stages of equal share (no benchmark: class priors)");
+        if (reg && reg->stages.size() == 2) {
+            using namespace graph;
+            const i64 rows = 6, k = 64; const int layers = 8;
+            std::vector<float> x(std::size_t(rows * k)); for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::sin(float(i) * 0.37f);
+            auto build = [&] {
+                tensor_graph g; auto h = g.input("x", {rows, k});
+                for (int l = 0; l < layers; ++l) {
+                    auto wt = g.constant(tensor({k, k}, 0.f));
+                    for (std::size_t i = 0; i < g.at(wt).constant->data.size(); ++i) g.at(wt).constant->data[i] = std::cos(float(i + std::size_t(l) * 977) * 0.113f) * 0.2f;
+                    h = g.apply(ops::op::tanh, {g.apply(ops::op::matmul_t, {h, wt})});
+                }
+                g.output("y", h); return g; };
+            std::size_t on0 = 0, on1 = 0;
+            auto run = [&](registry* r) {
+                pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po);
+                if (r) for (std::size_t i = 0; i < p->stage_of_node.size(); ++i) if (p->g.nodes()[i].kind == node_kind::op) (p->stage_of_node[i] == 0 ? on0 : on1) += 1;
+                executor e(*p); e.set_input("x", x); e.run(); return e.output("y").data; };
+            auto dev = run(reg.get()), cpu = run(nullptr);
+            double worst = dev.size() == cpu.size() ? 0 : 1e9;
+            for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) worst = std::max(worst, double(std::fabs(dev[i] - cpu[i])));
+            check(on0 > 0 && on1 > 0 && worst < 1e-4, std::format("a {}-layer graph runs split {} + {} ops over the two devices and matches the CPU (worst {:.2g})", layers, on0, on1, worst));
+        }
+        set_env("FORGE_DEVICE_EXCLUDE", backend + ":1");
+        check(graph::auto_pipeline({}) == backend + ":0", "one device left: pipe:auto is that device, not a pipeline");
+        set_env("FORGE_DEVICE_EXCLUDE", "");
+    }
+    set_env("FORGE_DEVICE_BENCH", "");
     {   // the micro-benchmark runs and is cached (kernel cache directory)
         namespace fs = std::filesystem; std::error_code ec;
         const fs::path dir = fs::temp_directory_path() / ("forge-select-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));

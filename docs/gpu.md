@@ -290,6 +290,8 @@ Classes come from the driver: Vulkan `VkPhysicalDeviceType`; OpenCL `CL_DEVICE_T
 
 Tested with synthetic records (`test_gpu`: `device_selection_scoring`) and with the mock drivers at `MOCK_DEVICES=2` (`test_gpu_select_*_mock`). No real multi-GPU machine has run it; the priors are guesses, not measurements.
 
+`FORGE_DEVICE=pipe:auto` uses the same records to split a model over the devices of one backend, by throughput and device memory: see [graph.md](graph.md#automatic-split-pipeauto).
+
 ## Determinism mode
 `FORGE_DETERMINISTIC=1`, `gpu::set_deterministic(true)` or `inference::session_options::deterministic = 1` (`gpu/determinism.hpp`; the explicit calls win over the variable, and the mode is process-wide).
 

@@ -352,8 +352,18 @@ inline gpu::select_request& auto_request() { static gpu::select_request r; retur
 inline std::string auto_device(const gpu::select_request& rq, std::string* why = nullptr) {
     return gpu::select_device(enumerate_devices(), gpu::with_env(rq), why);
 }
+// What "pipe:auto" resolves to for `rq` plus the environment overrides: a "pipe:<dev>*<share>,..." string over the
+// devices of one backend (gpu::plan_pipeline), a single device's name, or "cpu". `why` gets the table.
+inline std::string auto_pipeline(const gpu::select_request& rq, std::string* why = nullptr) {
+    return gpu::pipeline_string(gpu::plan_pipeline(enumerate_devices(), gpu::with_env(rq), why));
+}
 inline std::unique_ptr<registry> device_registry(const std::string& dev, std::string* why, bool resident) {
     if (dev.empty() || dev == "cpu") return nullptr;
+    if (dev == "pipe:auto") {
+        std::string table; const std::string pick = auto_pipeline(auto_request(), &table);
+        log::info("FORGE_DEVICE=pipe:auto -> {}\n{}", pick, table);
+        return pick == "cpu" ? nullptr : device_registry(pick, why, resident);
+    }
     if (dev == "auto") {
         std::string table; const std::string pick = auto_device(auto_request(), &table);
         log::info("FORGE_DEVICE=auto -> {}\n{}", pick, table);

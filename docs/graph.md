@@ -77,8 +77,19 @@ The attention kernels decode quantised slots on the fly. inference selects the c
 | `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]` | `<backend>.<op>` |
 | `rpc:host:port` | ops run by a remote `forge rpc-serve` |
 | `pipe:<dev>[*w],<dev>[*w],...` | Split contiguous layer ranges across devices, balanced by cost × weight `w` (e.g. `pipe:vulkan*3,cpu`, `pipe:cuda:0,cuda:1`) |
+| `pipe:auto` | The same split with the devices and weights chosen from device memory and measured throughput ([below](#automatic-split-pipeauto)) |
 
 Device lowerings have priority 20, above the CPU ones. The backends themselves are described in [gpu.md](gpu.md).
+
+### Automatic split: `pipe:auto`
+`pipe:auto` builds the `pipe:` string itself (`gpu::plan_pipeline` in `gpu/select.hpp`, `graph::auto_pipeline`) from the device records `FORGE_DEVICE=auto` gathers (class, memory, cached micro-benchmark; [gpu.md](gpu.md#automatic-device-selection)):
+
+1. **Devices.** The eligible devices (not in `FORGE_DEVICE_EXCLUDE`, not a software device unless `FORGE_DEVICE_ALLOW_SOFTWARE=1`) of one backend: the first of cuda, hip, metal, level_zero, opencl, vulkan that has any. Other backends' devices are left out, because one GPU is usually listed under several APIs and would be counted twice. A machine with one NVIDIA and one AMD card is therefore not split by `pipe:auto`; write that `pipe:` string by hand.
+2. **Shares.** Proportional to throughput: the micro-benchmark when every chosen device has one, else the class prior.
+3. **Memory.** With a known model size (`inference::model` passes the data section's size) no device gets a larger share than 90% of its memory holds; the excess moves to the devices with room, and what fits on none becomes a last `cpu` stage.
+4. **Result.** Stages in device order with their shares as weights (`pipe:cuda:0*0.7429,cuda:1*0.2571`), a single device's own name when one device takes everything (a plain resident device, not a pipeline), or `cpu`. The choice and the table are logged at info level.
+
+The share is a share of the planner's cost estimate (op cost × tensor size), which the pipeline splits into contiguous node ranges. It tracks weight bytes only for models with uniform layers, so the memory cap is approximate: there is no per-layer byte accounting. As for every `pipe:` device, the stages are non-resident and activations cross a stage boundary through host memory; device-to-device peer copies (`copy_to_peer`) are not used for the hand-off. Tested with synthetic records (`test_gpu`: `pipeline_auto_partition`) and on the mock drivers with `MOCK_DEVICES=2` (`test_gpu_select_{cuda,hip,opencl,ze}_mock`: the split, a graph run over both devices against the CPU, the one-device case; `golden_tiny_llama_pipe_auto_cuda_mock`); the peer copy itself only by `test_gpu_features_*_mock`. No multi-GPU machine has run it.
 
 ### CPU lowerings
 `kernels.hpp` registers the SIMD lowerings of the decoder ops (elementwise strips, softmax, rms_norm, gemm, attention, rope, gather); `kernels_ext.hpp` adds the spatial and encoder families:

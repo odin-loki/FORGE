@@ -1343,6 +1343,11 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_cumock)
       set_tests_properties(golden_tiny_llama_cuda_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
+      # "pipe:auto" over two mock CUDA devices (gpu::plan_pipeline): the layers split over cuda:0 and cuda:1
+      add_test(NAME golden_tiny_llama_pipe_auto_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_pipeauto_cumock)
+      set_tests_properties(golden_tiny_llama_pipe_auto_cuda_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=pipe:auto;MOCK_DEVICES=2;FORGE_DEVICE_ALLOW_SOFTWARE=1;FORGE_DEVICE_BENCH=0;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
       add_test(NAME golden_tiny_llama_opencl_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_clmock)
       set_tests_properties(golden_tiny_llama_opencl_mock PROPERTIES LABELS gpu

@@ -162,6 +162,14 @@ GPU, and nothing was built by a compiler other than clang 23.
   through the generated kernels (`prims_device.hpp`). CPU: 5 new `test_gpu` tests against the float64 references on
   this x86_64 machine only. Device: `prims_check` 22/22 on the CUDA, HIP, OpenCL, Level Zero **mocks**
   and on **lavapipe**; Metal never executed; no GPU. The device epilogue is separate launches, not a fused kernel.
+- **`pipe:auto`** (`gpu::plan_pipeline`): the layer split over the devices of one backend, shares from throughput,
+  capped by device memory, overflow to a CPU stage. Synthetic records in `test_gpu` (`pipeline_auto_partition`);
+  **mock-verified** with `MOCK_DEVICES=2` on CUDA, HIP, OpenCL, Level Zero (`test_gpu_select_*_mock`: the two-stage
+  split, an 8-layer graph running 8 + 8 ops over both devices against the CPU, the one-device case) and
+  `golden_tiny_llama_pipe_auto_cuda_mock`. The mocks report equal priors, so only the 50 / 50 split ran on a driver;
+  the memory-capped and benchmark-weighted splits ran on synthetic records only. Stage hand-off is through host
+  memory: peer copies are not used by the pipeline (the peer-copy API is covered by `test_gpu_features_*_mock` as
+  before). No multi-GPU machine has run it.
 - The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
   tests pass unchanged after the move.
 

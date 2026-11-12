@@ -139,6 +139,10 @@ public:
             for (auto& [nm, e] : r_.tensors()) if (std::find(rq.codecs.begin(), rq.codecs.end(), e.codec) == rq.codecs.end()) rq.codecs.push_back(e.codec);
             std::string table; use = graph::auto_device(rq, &table);
             log::info("FORGE_DEVICE=auto -> {}\n{}", use, table);
+        } else if (dev == "pipe:auto") {   // split the layers over the devices of one backend by throughput and memory (gpu::plan_pipeline)
+            gpu::select_request rq; rq.model_bytes = r_.section_bytes("data").size();
+            std::string table; use = graph::auto_pipeline(rq, &table);
+            log::info("FORGE_DEVICE=pipe:auto -> {}\n{}", use, table);
         }
         reg_ = graph::device_registry(use, &why);
         if (!reg_ && !why.empty()) log::warn("{}; using cpu", why);
