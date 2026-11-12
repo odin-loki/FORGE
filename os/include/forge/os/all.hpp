@@ -33,3 +33,5 @@
 #include <forge/os/devices.hpp>
 #include <forge/os/clipboard.hpp>
 #include <forge/os/dynlib.hpp>
+#include <forge/os/sync.hpp>
+#include <forge/os/pty.hpp>
