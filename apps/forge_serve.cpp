@@ -157,11 +157,19 @@ private:
         std::vector<int> prompt;
         if (chat) {
             if (!tok) raise(errc::unsupported, "chat needs a tokenizer");
-            std::string text;
-            for (auto& msg : j["messages"].arr()) text += msg.str_or("role", "user") + ": " + msg.str_or("content", "") + "\n";
-            text += "assistant:";
-            prompt = tok->encode(text);
-            if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
+            if (!m_->chat_template().empty()) {   // the model's own chat template; it writes BOS and the role markers itself
+                inference::chat_options co;
+                if (auto* t = j.find("tools"); t && t->is_arr()) co.tools = *t;
+                if (auto* a = j.find("add_generation_prompt"); a && a->is_bool()) co.add_generation_prompt = a->b();
+                if (auto* k = j.find("chat_template_kwargs"); k && k->is_obj()) co.extra = *k;
+                prompt = tok->encode(inference::apply_chat_template(*m_, j["messages"], co));
+            } else {                              // a file without one: "<role>: <content>" lines
+                std::string text;
+                for (auto& msg : j["messages"].arr()) text += msg.str_or("role", "user") + ": " + msg.str_or("content", "") + "\n";
+                text += "assistant:";
+                prompt = tok->encode(text);
+                if (tok->add_bos()) prompt.insert(prompt.begin(), tok->bos());
+            }
         } else {
             auto& p = j["prompt"];
             if (p.is_arr()) for (auto& x : p.arr()) prompt.push_back(int(x.num()));

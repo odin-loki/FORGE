@@ -25,8 +25,8 @@ int64_t forge_tokenize(const forge_model* m, const char* text, int add_bos, int3
     try {
         auto* t = m->s.tokenizer();
         if (!t) { g_err = "model has no tokenizer"; return -1; }
-        auto ids = t->encode(text);
-        if (add_bos < 0 ? t->add_bos() : (add_bos && t->bos() >= 0)) ids.insert(ids.begin(), t->bos());   // -1: the model's default
+        auto ids = t->encode(text, add_bos < 0);   // -1: the model's default (BOS / EOS flags or the tokenizer's post-processor)
+        if (add_bos > 0 && t->bos() >= 0) ids.insert(ids.begin(), t->bos());
         for (int64_t i = 0; i < int64_t(ids.size()) && i < cap; ++i) out[i] = ids[std::size_t(i)];
         return int64_t(ids.size());
     } FORGE_TRY(-1)
@@ -36,6 +36,14 @@ int64_t forge_detokenize(const forge_model* m, const int32_t* ids, int64_t n, ch
         auto* t = m->s.tokenizer();
         if (!t) { g_err = "model has no tokenizer"; return -1; }
         std::string s = t->decode(std::vector<int>(ids, ids + n));
+        if (out && cap > 0) { auto k = std::min<std::size_t>(s.size(), std::size_t(cap - 1)); std::memcpy(out, s.data(), k); out[k] = 0; }
+        return int64_t(s.size());
+    } FORGE_TRY(-1)
+}
+int64_t forge_chat_template_apply(const forge_model* m, const char* messages_json, int add_generation_prompt, char* out, int64_t cap) {
+    try {
+        forge::inference::chat_options o; o.add_generation_prompt = add_generation_prompt != 0;
+        std::string s = forge::inference::apply_chat_template(*m->s.shared_model(), forge::json::parse(messages_json), o);
         if (out && cap > 0) { auto k = std::min<std::size_t>(s.size(), std::size_t(cap - 1)); std::memcpy(out, s.data(), k); out[k] = 0; }
         return int64_t(s.size());
     } FORGE_TRY(-1)

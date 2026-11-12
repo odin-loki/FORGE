@@ -69,7 +69,8 @@ The method is only checked on the completion endpoints (`405` otherwise). Other 
 |---|---|---|
 | `prompt` (completions) | required | A string (BOS is prepended if the tokenizer has one) or a list of token ids (sent as is) |
 | `add_bos` (completions) | absent | With a string prompt: `false` skips the BOS |
-| `messages` (chat) | required | `[{role, content}]`. There is no chat template: the prompt is `"<role>: <content>\n"` per message plus `"assistant:"`, with BOS prepended |
+| `messages` (chat) | required | `[{role, content}]` (plus whatever the template reads: `tool_calls`, `tool_call_id`, …). Rendered with the model's own chat template when the file has one (the `chat_template` section, from `tokenizer_config.json` or GGUF `tokenizer.chat_template`); the template writes BOS and the role markers, and special tokens in its output become their ids. A file without a template gets the old prompt: `"<role>: <content>\n"` per message plus `"assistant:"`, with BOS prepended |
+| `tools`, `add_generation_prompt`, `chat_template_kwargs` (chat) | none, true, none | Passed to the template: the OpenAI tool list (templates print it with `tojson`), whether the prompt ends with the assistant header, and an object of extra template variables (`{"enable_thinking": false}`). The reply is plain text: tool calls in it are not parsed back into `tool_calls` |
 | `max_tokens` | 16 | |
 | `temperature` | 0 | Greedy by default |
 | `top_k`, `top_p`, `min_p`, `typical_p` | 0, 1, 0, 1 | |

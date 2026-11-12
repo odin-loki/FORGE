@@ -1071,6 +1071,9 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # forge run --chat and /v1/chat/completions through a model file's own chat template (a checked-in tiny GGUF)
+      add_test(NAME chat_template_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/chat_template_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_SOURCE_DIR}/tests/data/tokenizer/gguf_tiny_llama.gguf ${PROJECT_BINARY_DIR}/chat_template_http)
       add_test(NAME security_cli COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/security_cli_test.py
                $<TARGET_FILE:forge> $<TARGET_FILE:forge-serve> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(security_cli PROPERTIES DEPENDS golden_tiny_llama LABELS security)
@@ -1104,7 +1107,7 @@ endif()
 
 # ---- fuzz targets (fuzz/): libFuzzer entry points + a built-in mutational driver for CI ----
 if(FORGE_BUILD_TESTS)
-  foreach(ft json blueprint fpk safetensors gguf tokenizer grammar onnx)
+  foreach(ft json blueprint fpk safetensors gguf tokenizer chat_template grammar onnx)
     if(FORGE_LIBFUZZER)
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp)
       target_compile_options(fuzz_${ft} PRIVATE -fsanitize=fuzzer)

@@ -1,0 +1,4 @@
+{{ '  x  '.strip() }}|{{ '  x  '.lstrip() }}|{{ '  x  '.rstrip() }}|{{ 'xxaxx'.strip('x') }}|{{ 'abc'.upper() }}|{{ 'ABC'.lower() }}|{{ "they're here".title() }}|{{ 'hELLO'.capitalize() }}
+{{ 'abc'.startswith('ab') }}|{{ 'abc'.endswith('bc') }}|{{ 'abc'.startswith('x') }}|{{ 'a-b'.replace('-', '') }}|{{ 'aXbXc'.split('X') }}|{{ ' a  b '.split() }}|{{ 'a,b,c'.split(',', 1) }}|{{ 'héllo wörld'.find('w') }}|{{ 'abc'.find('z') }}|{{ 'banana'.count('an') }}|{{ ', '.join(['a', 'b']) }}|{{ 'a\nb\n'.splitlines() }}|{{ '12'.isdigit() }}
+{{ {'a': 1}.get('a') }}|{{ {'a': 1}.get('b') }}|{{ {'a': 1}.get('b', 'dflt') }}|{{ {'a': 1, 'b': 2}.keys()|list }}|{{ {'a': 1, 'b': 2}.values()|list }}|{{ {'a': 1}.items()|list }}|{{ dict(a=1, b='x') }}
+{{ messages[0]['content'].split(' ')[0] }}|{{ messages[-1].role.upper() }}|{{ (messages|first).content|length }}

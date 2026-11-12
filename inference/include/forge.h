@@ -52,6 +52,10 @@ FORGE_API int64_t forge_vocab_size(const forge_model* m);
 FORGE_API int64_t forge_tokenize(const forge_model* m, const char* text, int add_bos, int32_t* out, int64_t cap);
 /* Writes NUL-terminated text, returns bytes needed (excluding NUL) or -1. */
 FORGE_API int64_t forge_detokenize(const forge_model* m, const int32_t* ids, int64_t n, char* out, int64_t cap);
+/* Renders the model's own chat template over messages_json, a JSON array [{"role": "user", "content": "..."}, ...].
+   Writes NUL-terminated text, returns bytes needed (excluding NUL), or -1 (no template in the file, bad JSON, or the
+   template rejects the conversation). Tokenize the result with add_bos = 0: the template writes BOS itself. */
+FORGE_API int64_t forge_chat_template_apply(const forge_model* m, const char* messages_json, int add_generation_prompt, char* out, int64_t cap);
 
 /* Runs tokens continuing from the current position; writes last-position logits (vocab floats). */
 FORGE_API int forge_forward(forge_model* m, const int32_t* ids, int64_t n, float* logits, int64_t cap);

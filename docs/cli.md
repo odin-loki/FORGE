@@ -5,7 +5,7 @@ Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage t
 ## Concepts
 - `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
-- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
+- These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
 - Wherever a model path is taken by `run` and `bench`, it may be a `.fpk`, a Hugging Face directory, a `.gguf` or an `.onnx` file. Non-`.fpk` inputs are imported once into `$FORGE_CACHE` (default `~/.cache/forge`) with `--codec` (default `f32`) and reused while the source files are unchanged.
 
@@ -45,6 +45,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--ctx N` | 0 | Context length; 0 = model maximum |
 | `--ids` | off | Print token ids instead of text (always on when the model has no tokenizer) |
 | `--no-bos` | off | Do not prepend the BOS token |
+| `--chat`, `--system TEXT` | off | Treat `--prompt` as a user message (after an optional system message) and render it with the model's chat template; fails when the file has none. The template writes BOS itself |
 | `--logits FILE` | | Write the prefill logits as raw f32 |
 | `--verify` | off | Check BLAKE3 hashes on open |
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
