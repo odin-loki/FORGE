@@ -25,11 +25,12 @@
 | Doc examples | `docs/examples/*` | `doc_example_*` |
 | Integration examples | `examples/integrations/*.cpp` | `example_*`, label `integration` |
 | Docs freshness | `tools/gen_docs.py --check` | `docs_up_to_date` (fails if `docs/reference.md` is stale) |
-| Fuzz | `fuzz/fuzz_*.cpp` (blueprint, fpk, gguf, grammar, json, onnx, safetensors, script, tokenizer) | `fuzz_*`, label `fuzz` |
+| Fuzz | `fuzz/fuzz_*.cpp`: file formats (blueprint, fpk, fsc, gguf, grammar, json, onnx, safetensors, script, tokenizer) and network or request input (serve_http, proxy_http, rpc, json_schema, policy, signature) | `fuzz_*`, label `fuzz` |
+| Lowering table | `tools/coverage_dump.cpp` walks the registries of the built code | `coverage_table`: the op × backend table `tools/gen_docs.py` reads from the sources for `docs/reference.md` must match them |
 | JNI syntax | `bindings/android/jni/forge_jni.c` against a JDK's `jni.h` | `jni_syntax` |
 | Mobile | `tests/mobile_build.sh` | `mobile_android_{arm64-v8a,x86_64}`, `mobile_android_device`, `mobile_ios`, labels `mobile;slow` |
 | Cross compile/link | zig cross builds | `xos_*`, labels `cross;slow` |
-| Scalable vectors under qemu | `test_simd`, `test_tile` | `lane_sve_vl<N>`, `lane_rvv_vl<N>`, `tile_sme_svl<N>` |
+| Scalable vectors under qemu | `test_simd`, `test_tile` | `lane_sve_vl<N>`, `lane_rvv_vl<N>`, `tile_sme_svl<N>`, label `emu` (defined only in the qemu cross builds) |
 | Emulated AMX tiles | Intel SDE | `tile_amx_sde_*`, label `emu` |
 
 The `gpu_compile_*`, `jni_syntax` and `mobile_*` tests are only defined when CMake finds a GPU-capable clang (`FORGE_GPU_CLANG`).
@@ -80,7 +81,28 @@ Only `linux-vulkan` installs `glslangValidator` and the Vulkan headers; every ot
 The full list is in [configuration.md](configuration.md).
 
 ## Fuzzing
-By default each fuzz target links a small built-in mutation driver (`fuzz/driver.cpp`) and runs `FORGE_FUZZ_ITERS` inputs over its corpus in `fuzz/corpus/<name>/`, with a 600 s timeout. With clang and `-DFORGE_LIBFUZZER=ON` they link libFuzzer instead and are not registered with ctest. `fuzz/make_corpus.py` regenerates the seed inputs.
+By default each fuzz target links a small built-in mutation driver (`fuzz/driver.cpp`) and runs `FORGE_FUZZ_ITERS` inputs over its corpus in `fuzz/corpus/<name>/`, with a 600 s timeout. With clang and `-DFORGE_LIBFUZZER=ON` they link libFuzzer instead and are not registered with ctest.
+
+| Target | Input | What counts as a finding besides a crash or sanitizer report |
+|--------|-------|------|
+| `fuzz_serve_http` | forge-serve's HTTP request reader (`apps/serve_http.hpp`), fed in fuzzer-chosen `recv()` sizes | any exception |
+| `fuzz_proxy_http` | the L7 proxy (`loadbalancer/proxy.hpp`): the client loop against an empty pool, then the upstream response parser | any exception |
+| `fuzz_rpc` | `authorized_keys`, token file, client map and permission list parsers; FRPC op frames, FRPS/FRPZ script frames and the FRPH handshake sent to real `rpc::server` instances on 127.0.0.1 | a reply larger than a frame allows |
+| `fuzz_json_schema` | JSON Schema → GBNF (`response_format`) | an accepted schema whose grammar the GBNF parser rejects |
+| `fuzz_policy` | security policy files | `to_json` output that does not parse back to the same policy |
+| `fuzz_signature` | bundle `FORGE-SIGNATURE.json` manifests and detached `.sig` files | a manifest that verifies against a key nobody holds |
+| `fuzz_fpk`, `fuzz_fsc`, `fuzz_gguf`, `fuzz_onnx`, `fuzz_safetensors`, `fuzz_tokenizer`, `fuzz_blueprint`, `fuzz_json`, `fuzz_grammar`, `fuzz_script` | the file formats and the script front end | an exception that is not a `forge_exception` |
+
+Seeds: `fuzz/make_corpus.py <forge>` regenerates the binary model seeds (it needs numpy, safetensors and gguf), `fuzz/make_net_corpus.py` the HTTP, RPC and JSON Schema seeds (standard library only). The policy and signature seeds are written by the code under test (`cmake --build <build> --target fuzz_make_sig_corpus && <build>/fuzz_make_sig_corpus fuzz/corpus`), so they carry real digests and signatures by a fixed throwaway key. An input that found a bug is kept as `fuzz/corpus/<name>/regress_<what>` in the commit that fixes it, so every later build replays it.
+
+libFuzzer with ASan and UBSan, as the `linux-fuzz` CI job runs it:
+```sh
+cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 \
+      -DFORGE_SANITIZE=ON -DFORGE_LIBFUZZER=ON -DFORGE_BUILD_EXAMPLES=OFF
+cmake --build build-fuzz --target fuzz_rpc
+mkdir -p /tmp/rpc-corpus && cp fuzz/corpus/rpc/* /tmp/rpc-corpus/      # libFuzzer adds files to its first corpus directory
+./build-fuzz/fuzz_rpc -max_total_time=300 -timeout=30 /tmp/rpc-corpus
+```
 
 ## Performance tools (not part of ctest)
 - `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T]` runs `forge bench` and records or checks throughput against a stored baseline.

@@ -70,6 +70,106 @@ Every op has a float64 scalar reference that each lowering is tested against.
 | `cumsum` | reduction | 1 | same | rel:1e-5 | no | axis |  | inclusive prefix sum over axis |
 | `moe_gate` | reduction | 1 | same | abs:1e-6 | no | k,norm |  | MoE router: softmax over last axis, keep top-k (ties -> lower index), renormalise if norm |
 
+## Lowering coverage (op × backend)
+
+Generated from the code that registers the lowerings: `registry::make_cpu` and the SIMD registrations (`graph/include/forge/graph/kernels.hpp`), the Vulkan kernel list (`ops/gen/gpu_gen.py`, `vulkan_registry`), and `gpu::cuda_hip::kernel_sig` (`gpu/include/forge/gpu/cuda.hpp`), the one table `graph::gpu_registry` registers from for CUDA, HIP, OpenCL, Level Zero and Metal. The `coverage_table` test compares this table with the registries of the built code (`forge_coverage_dump`).
+
+- Every op has the float64 scalar reference (`ops/`), which runs whenever no lowering applies and is what the oracle compares against.
+- A lowering is used only for the shapes and attributes it supports, and only after it passed the oracle on this machine; this table says which lowerings exist, not that a backend was tested on real hardware (see [STATUS.md](STATUS.md)).
+- `lane.*` lowerings run on the SIMD lane chosen at run time (AVX2, AVX-512, NEON, SVE, RVV, ... or the scalar lane); `cpu.*` lowerings are plain C++.
+- All lowerings in this table take f32 tensors; other dtypes enter as encoded weights (next table).
+- Ops with a lowering: CPU 18/63, Vulkan 34/63, CUDA/HIP/OpenCL/Level Zero/Metal 31/63. `+bcast` = the CUDA/HIP runtime also runs the broadcasting form.
+
+| op | scalar ref | CPU | Vulkan | CUDA / HIP | OpenCL / Level Zero | Metal |
+|---|---|---|---|---|---|---|
+| `matmul` | yes | `lane.gemm_nn` |  |  |  |  |
+| `matmul_t` | yes | `lane.gemm_nt` | `vk.matmul_t` | `cuda.matmul_t` `hip.matmul_t` | `opencl.matmul_t` `level_zero.matmul_t` | `metal.matmul_t` |
+| `attention` | yes | `lane.attention` | `vk.attention` | `cuda.attention` `hip.attention` | `opencl.attention` `level_zero.attention` | `metal.attention` |
+| `moe_ffn` | yes |  |  |  |  |  |
+| `add` | yes | `lane.add` | `vk.add` | `cuda.add` `hip.add` +bcast | `opencl.add` `level_zero.add` | `metal.add` |
+| `sub` | yes | `lane.sub` | `vk.sub` | `cuda.sub` `hip.sub` +bcast | `opencl.sub` `level_zero.sub` | `metal.sub` |
+| `mul` | yes | `lane.mul` | `vk.mul` | `cuda.mul` `hip.mul` +bcast | `opencl.mul` `level_zero.mul` | `metal.mul` |
+| `div` | yes |  | `vk.div` | `cuda.div` `hip.div` +bcast | `opencl.div` `level_zero.div` | `metal.div` |
+| `maximum` | yes |  | `vk.maximum` | `cuda.maximum` `hip.maximum` | `opencl.maximum` `level_zero.maximum` | `metal.maximum` |
+| `minimum` | yes |  | `vk.minimum` | `cuda.minimum` `hip.minimum` | `opencl.minimum` `level_zero.minimum` | `metal.minimum` |
+| `pow` | yes |  |  |  |  |  |
+| `fma` | yes |  |  |  |  |  |
+| `select` | yes |  |  |  |  |  |
+| `neg` | yes |  | `vk.neg` | `cuda.neg` `hip.neg` | `opencl.neg` `level_zero.neg` | `metal.neg` |
+| `abs` | yes |  | `vk.abs` | `cuda.abs` `hip.abs` | `opencl.abs` `level_zero.abs` | `metal.abs` |
+| `sqrt` | yes |  | `vk.sqrt` | `cuda.sqrt` `hip.sqrt` | `opencl.sqrt` `level_zero.sqrt` | `metal.sqrt` |
+| `rsqrt` | yes |  | `vk.rsqrt` | `cuda.rsqrt` `hip.rsqrt` | `opencl.rsqrt` `level_zero.rsqrt` | `metal.rsqrt` |
+| `recip` | yes |  | `vk.recip` | `cuda.recip` `hip.recip` | `opencl.recip` `level_zero.recip` | `metal.recip` |
+| `square` | yes |  | `vk.square` | `cuda.square` `hip.square` | `opencl.square` `level_zero.square` | `metal.square` |
+| `exp` | yes | `lane.exp` | `vk.exp` | `cuda.exp` `hip.exp` | `opencl.exp` `level_zero.exp` | `metal.exp` |
+| `exp2` | yes |  | `vk.exp2` | `cuda.exp2` `hip.exp2` | `opencl.exp2` `level_zero.exp2` | `metal.exp2` |
+| `expm1` | yes |  |  |  |  |  |
+| `log` | yes | `lane.log` | `vk.log` | `cuda.log` `hip.log` | `opencl.log` `level_zero.log` | `metal.log` |
+| `log2` | yes |  | `vk.log2` | `cuda.log2` `hip.log2` | `opencl.log2` `level_zero.log2` | `metal.log2` |
+| `log1p` | yes |  |  |  |  |  |
+| `sin` | yes |  | `vk.sin` |  |  |  |
+| `cos` | yes |  | `vk.cos` |  |  |  |
+| `tan` | yes |  |  |  |  |  |
+| `tanh` | yes | `lane.tanh` | `vk.tanh` | `cuda.tanh` `hip.tanh` | `opencl.tanh` `level_zero.tanh` | `metal.tanh` |
+| `sinh` | yes |  |  |  |  |  |
+| `cosh` | yes |  |  |  |  |  |
+| `asin` | yes |  |  |  |  |  |
+| `acos` | yes |  |  |  |  |  |
+| `atan` | yes |  |  |  |  |  |
+| `erf` | yes |  |  |  |  |  |
+| `erfc` | yes |  |  |  |  |  |
+| `sigmoid` | yes | `lane.sigmoid` | `vk.sigmoid` | `cuda.sigmoid` `hip.sigmoid` | `opencl.sigmoid` `level_zero.sigmoid` | `metal.sigmoid` |
+| `silu` | yes | `lane.silu` | `vk.silu` | `cuda.silu` `hip.silu` | `opencl.silu` `level_zero.silu` | `metal.silu` |
+| `gelu` | yes |  |  |  |  |  |
+| `gelu_tanh` | yes | `lane.gelu_tanh` | `vk.gelu_tanh` | `cuda.gelu_tanh` `hip.gelu_tanh` | `opencl.gelu_tanh` `level_zero.gelu_tanh` | `metal.gelu_tanh` |
+| `relu` | yes |  | `vk.relu` | `cuda.relu` `hip.relu` | `opencl.relu` `level_zero.relu` | `metal.relu` |
+| `softplus` | yes |  | `vk.softplus` | `cuda.softplus` `hip.softplus` | `opencl.softplus` `level_zero.softplus` | `metal.softplus` |
+| `scale` | yes |  | `vk.scale` | `cuda.scale` `hip.scale` | `opencl.scale` `level_zero.scale` | `metal.scale` |
+| `convert` | yes |  |  |  |  |  |
+| `transpose` | yes |  |  |  |  |  |
+| `reshape` | yes | `cpu.reshape` | `vk.reshape` |  |  |  |
+| `gather` | yes | `cpu.gather` | `vk.gather` | `cuda.gather` `hip.gather` | `opencl.gather` `level_zero.gather` | `metal.gather` |
+| `concat` | yes |  |  |  |  |  |
+| `slice` | yes |  | `vk.slice` | `cuda.slice` `hip.slice` | `opencl.slice` `level_zero.slice` | `metal.slice` |
+| `rope` | yes | `cpu.rope` | `vk.rope` | `cuda.rope` `hip.rope` | `opencl.rope` `level_zero.rope` | `metal.rope` |
+| `silu_mul` | yes | `lane.silu_mul` | `vk.silu_mul` | `cuda.silu_mul` `hip.silu_mul` | `opencl.silu_mul` `level_zero.silu_mul` | `metal.silu_mul` |
+| `expand` | yes |  |  |  |  |  |
+| `reduce_sum` | yes |  |  |  |  |  |
+| `reduce_max` | yes |  |  |  |  |  |
+| `reduce_min` | yes |  |  |  |  |  |
+| `reduce_mean` | yes |  |  |  |  |  |
+| `argmax` | yes |  |  |  |  |  |
+| `logsumexp` | yes |  |  |  |  |  |
+| `softmax` | yes | `lane.softmax` | `vk.softmax` | `cuda.softmax` `hip.softmax` | `opencl.softmax` `level_zero.softmax` | `metal.softmax` |
+| `rms_norm` | yes | `lane.rms_norm` | `vk.rms_norm` | `cuda.rms_norm` `hip.rms_norm` | `opencl.rms_norm` `level_zero.rms_norm` | `metal.rms_norm` |
+| `layer_norm` | yes |  |  |  |  |  |
+| `cumsum` | yes |  |  |  |  |  |
+| `moe_gate` | yes |  |  |  |  |  |
+
+### Weight codecs (`matmul_t` over an encoded weight)
+
+Generated from `graph/codecs.hpp` (codec list), `qweights::fmt_of` in `graph/plan.hpp` (codecs with their own SIMD dot kernels; the others are decoded block by block inside `cpu.qgemm_nt`) and the `device_qgemm_codecs` / `device_qglu_codecs` lists in `graph/vulkan.hpp` (weights that stay encoded on a CUDA or HIP device). Vulkan, OpenCL, Level Zero and Metal have no encoded-weight kernels: weights are decoded to f32 before upload.
+
+| codec | block (elements / bytes) | CPU `cpu.qgemm_nt` (weight kept encoded) | CUDA / HIP `qmatmul_t` | CUDA / HIP fused gate-up (`qglu`) |
+|---|---|---|---|---|
+| `f32` | 1 / 4 | decode + f32 dot |  |  |
+| `f16` | 1 / 2 | decode + f32 dot |  |  |
+| `bf16` | 1 / 2 | decode + f32 dot |  |  |
+| `fp8_e4m3` | 1 / 1 | decode + f32 dot |  |  |
+| `q8_0` | 32 / 34 | SIMD dot on the encoded rows | encoded on device | yes |
+| `q4_k` | 256 / 144 | SIMD dot on the encoded rows | encoded on device | yes |
+| `fp8_e5m2` | 1 / 1 | decode + f32 dot |  |  |
+| `q4_g32` | 32 / 20 | decode + f32 dot |  |  |
+| `q8_g32` | 32 / 36 | decode + f32 dot |  |  |
+| `mxfp8` | 32 / 33 | decode + f32 dot |  |  |
+| `mxfp6` | 32 / 25 | decode + f32 dot |  |  |
+| `mxfp4` | 32 / 17 | decode + f32 dot |  |  |
+| `mxint8` | 32 / 33 | decode + f32 dot |  |  |
+| `nvfp4` | 16 / 9 | decode + f32 dot |  |  |
+| `tq2` | 64 / 18 | decode + f32 dot |  |  |
+| `q6_k` | 256 / 210 | SIMD dot on the encoded rows | encoded on device | yes |
+| `q5_k` | 256 / 176 | SIMD dot on the encoded rows | encoded on device |  |
+
 ## C ABI (version 3, `inference/include/forge.h`)
 
 | function | signature | notes |

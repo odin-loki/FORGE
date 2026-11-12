@@ -9,3 +9,5 @@ build-asan/
 build-tsan/
 tests/data/ucd/
 build-fuzz/
+# seed inputs of fuzz_fpk are model files
+!fuzz/corpus/fpk/*.fpk

@@ -2,7 +2,7 @@
 """Regenerate the seed corpus of the network-input fuzz targets (serve_http, proxy_http, rpc, json_schema).
 Standard library only. Usage: make_net_corpus.py   (writes fuzz/corpus/<target>/*; regress_* files are kept)
 
-The policy and signature seeds are written by the tools they test (see docs/testing.md, "Fuzzing")."""
+The policy and signature seeds come from fuzz/make_sig_corpus.cpp (see docs/testing.md, "Fuzzing")."""
 import json, os, struct
 here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "corpus")
 

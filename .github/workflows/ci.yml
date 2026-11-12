@@ -68,33 +68,182 @@ jobs:
       - name: all four Vulkan tests ran
         run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 4
   linux-tsan:
+    # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
+    # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
+    # scripting runtime. The single-threaded suites add build time and nothing TSan can see.
+    # __TSAN_EXCLUDED__
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     env:
-      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/ci/sanitizers/tsan.supp
+      TSAN_TESTS: __TSAN_TESTS__
     steps:
       - uses: actions/checkout@v4
       - name: add the LLVM apt repository (clang 23)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 python3-numpy
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache python3-numpy
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-tsan }
       - run: sudo sysctl vm.mmap_rnd_bits=28
-      - run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
-      - run: cmake --build build-tsan -j4 --target test_script forge
-      - run: ./build-tsan/test_script
+      - run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake --build build-tsan -j4 --target forge forge_script_example_plugin $TSAN_TESTS
+      - name: threaded suites under TSan
+        run: ctest --test-dir build-tsan -R "^($(echo $TSAN_TESTS | tr ' ' '|'))$" -j2 --timeout 3600 --no-tests=error
   linux-asan:
+    # AddressSanitizer + UndefinedBehaviorSanitizer over the whole test suite (Debug), leak detection on.
+    # __ASAN_EXCLUDED__
     runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/sanitizers/lsan.supp
     steps:
       - uses: actions/checkout@v4
       - name: add the LLVM apt repository (clang 23)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 python3-numpy
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors onnx cryptography blake3
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-asan }
       - run: sudo sysctl vm.mmap_rnd_bits=28
-      - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF
-      - run: cmake --build build-asan -j4 --target test_script forge
-      - run: ./build-asan/test_script
+      - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_FUZZ_ITERS=1000
+      - run: cmake --build build-asan -j4
+      - name: whole suite under ASan + UBSan
+        run: ctest --test-dir build-asan -LE "slow|emu" -E "__ASAN_EXCLUDE_RE__" -j2 --timeout 3600
+  linux-fuzz:
+    # Every fuzz target with libFuzzer under ASan + UBSan for a short, fixed time on its seed corpus. A crash
+    # fails the job and its input is uploaded; add it to fuzz/corpus/<target>/ as regress_<what> with the fix.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      FUZZ_SECONDS: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-fuzz }
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_SANITIZE=ON -DFORGE_LIBFUZZER=ON -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF
+      - name: build the fuzz targets
+        run: |
+          ls fuzz/fuzz_*.cpp | xargs -n1 basename | sed 's/\.cpp$//' | sort > fuzz-targets.txt   # one target per fuzz/fuzz_<name>.cpp
+          cat fuzz-targets.txt; test -s fuzz-targets.txt
+          cmake --build build-fuzz -j4 --target $(cat fuzz-targets.txt)
+      - name: fuzz each target for ${{ env.FUZZ_SECONDS }} s
+        run: |
+          mkdir -p fuzz-out; rc=0
+          for t in $(cat fuzz-targets.txt); do
+            n=${t#fuzz_}; mkdir -p fuzz-out/corpus-$n; cp fuzz/corpus/$n/* fuzz-out/corpus-$n/ 2>/dev/null || true
+            echo "::group::$t"
+            ./build-fuzz/$t -max_total_time=$FUZZ_SECONDS -timeout=30 -rss_limit_mb=3072 -print_final_stats=1 -artifact_prefix=fuzz-out/$n- fuzz-out/corpus-$n > fuzz-out/$n.log 2>&1 || { rc=1; echo "::error::$t found something (see the fuzz-findings artefact)"; }
+            tail -n 25 fuzz-out/$n.log
+            echo "::endgroup::"
+            rm -rf fuzz-out/corpus-$n
+          done
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: fuzz-findings, path: fuzz-out }
+  emu:
+    # ctest label `emu` and the SIMD-facing suites under qemu-user: one row per emulated target. A row names the
+    # toolchain file, the Ubuntu cross compiler, the sysroot qemu loads the target's libc from, and the qemu
+    # -cpu models the suites are run under (the lane_*_vl<N> / tile_sme_svl<N> tests, label emu, set their own
+    # and cover more vector lengths). Adding an architecture = adding a row and its toolchain file.
+    name: emu-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64-sve
+            toolchain: aarch64-sve-qemu
+            triple: aarch64-linux-gnu
+            cpus: "max,sve256=on max,sve512=on"
+          - name: riscv64-rvv
+            toolchain: riscv64-rvv-qemu
+            triple: riscv64-linux-gnu
+            cpus: "rv64,v=true,vlen=256"
+    env:
+      QEMU_LD_PREFIX: /usr/${{ matrix.triple }}
+      EMU_TESTS: test_simd test_tile test_dtypes test_graph test_kvquant test_support test_util
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build ccache qemu-user gcc-14-${{ matrix.triple }} g++-14-${{ matrix.triple }}
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: "emu-${{ matrix.name }}" }
+      - name: configure (cross build, tests run under qemu-user)
+        run: |
+          qemu-$(echo ${{ matrix.triple }} | cut -d- -f1) --version | head -1
+          cmake -S . -B build/emu -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }}.cmake -DFORGE_CROSS_CC=${{ matrix.triple }}-gcc-14 -DFORGE_CROSS_CXX=${{ matrix.triple }}-g++-14 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF | tee configure.log
+          grep -E "FORGE: (SVE|RVV) kernel tables: .*FORGE_SIMD_(SVE|RVV)256" configure.log
+      - run: cmake --build build/emu -j4 --target $EMU_TESTS
+      - name: emu-labelled tests (scalable lane active at every vector length)
+        run: |
+          ctest --test-dir build/emu -L emu -j2 --timeout 1800 --no-tests=error
+          test "$(ctest --test-dir build/emu -N -L emu | grep -c 'Test *#')" -ge 4
+      - name: SIMD-facing suites at each -cpu model
+        run: |
+          for cpu in ${{ matrix.cpus }}; do
+            echo "::group::-cpu $cpu"
+            cmake build/emu -DFORGE_QEMU_CPU="$cpu" > /dev/null
+            ctest --test-dir build/emu -R "^($(echo $EMU_TESTS | tr ' ' '|'))$" -j2 --timeout 2400 --no-tests=error
+            echo "::endgroup::"
+          done
+  perf:
+    # forge bench against perf/baseline-x86_64.json. Hosted runners are shared and are not the machine the
+    # baseline was recorded on, so the job never blocks a merge (continue-on-error) and only fails below a quarter
+    # of the baseline; the table goes to the job summary and the numbers to the perf-report artefact.
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 ccache
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: perf }
+      - run: cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DPython3_EXECUTABLE=$(which python)
+      - run: cmake --build build/release -j4 --target forge
+      - name: the bench model (golden_tiny_llama writes build/release/golden/tiny_f32.fpk)
+        run: ctest --test-dir build/release -R "^golden_tiny_llama$" --no-tests=error
+      - name: perf_baseline.py --check
+        env: { FORGE_THREADS: "4" }
+        run: |
+          grep -m1 "model name" /proc/cpuinfo; nproc
+          python tools/perf_baseline.py --forge build/release/forge --model build/release/golden/tiny_f32.fpk --baseline perf/baseline-x86_64.json --check --tolerance 0.75 --allow-missing --reps 5 --report perf-report.json --markdown "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: perf-report, path: perf-report.json, if-no-files-found: warn }
+  repro:
+    # Reproducible builds: two clean Release builds in two directories of different depth must give bit-identical
+    # forge, forge-serve and libforge.so (ci/repro_check.sh; no compiler cache, it would hide a difference).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sh ci/repro_check.sh -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_EXAMPLES=OFF
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: repro-diff, path: repro-diff, if-no-files-found: ignore }
   shells:
     runs-on: ubuntu-24.04
     steps:
