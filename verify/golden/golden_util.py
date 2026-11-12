@@ -103,7 +103,7 @@ class Checker:
         self.ok(cos > cosmin if cosmin else err < tol, f"{label}: prefill logits max|err| {err:.2e}, cosine {cos:.6f}")
         return [int(t) for t in gen.split()]
 
-    def decoder(self, hf, name, forward, prompt, eos, q8=True, gen=16):
+    def decoder(self, hf, name, forward, prompt, eos, q8=True, gen=16, q8_cos=0.999):
         """HF import in f32 (logits + KV-cached greedy decode vs full recompute) and q8_0 (logits cosine)."""
         ref = forward(prompt)[-1]
         fp = self.imp(hf, f"{name}_f32.fpk")
@@ -117,7 +117,7 @@ class Checker:
             i = next((i for i in range(min(len(fg), len(ref_gen))) if fg[i] != ref_gen[i]), None)
             if i is not None: lg = np.sort(forward(prompt + ref_gen[:i])[-1]); same = lg[-1] - lg[-2] < 1e-3
         self.ok(same, f"{name}: greedy decode matches the reference: forge {fg[:8]}... ref {ref_gen[:8]}...")
-        if q8: self.logits(self.imp(hf, f"{name}_q8_0.fpk", "q8_0"), prompt, ref, f"{name} hf q8_0", cosmin=0.999)
+        if q8: self.logits(self.imp(hf, f"{name}_q8_0.fpk", "q8_0"), prompt, ref, f"{name} hf q8_0", cosmin=q8_cos)
         return fp
 
     def embed(self, fpk, args, ref, label, tol=1e-3, cosmin=None):
