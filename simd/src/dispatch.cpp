@@ -263,12 +263,13 @@ static cpu_features do_detect() {
 #elif defined(__powerpc64__)
     f.vendor = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? "ppc64le" : "ppc64";
     { unsigned long hw = hwcap(16), hw2 = hwcap(26);
+      f.altivec = hw & 0x10000000ul;           // PPC_FEATURE_HAS_ALTIVEC
       f.vsx = hw & 0x00000080ul;               // PPC_FEATURE_HAS_VSX
       f.power8 = hw2 & 0x80000000ul;           // PPC_FEATURE2_ARCH_2_07
       f.power9 = hw2 & 0x00800000ul;           // PPC_FEATURE2_ARCH_3_00
       f.power10 = hw2 & 0x00040000ul; }        // PPC_FEATURE2_ARCH_3_1
 #if defined(__VSX__) && defined(_ARCH_PWR8)
-    f.vsx = f.power8 = true;   // baseline of the build (ELFv2 little-endian requires POWER8)
+    f.altivec = f.vsx = f.power8 = true;   // baseline of the build (ELFv2 little-endian requires POWER8)
 #endif
 #elif defined(__s390x__)
     f.vendor = "s390x";
@@ -304,7 +305,7 @@ std::string cpu_features::summary() const {
     add(sve, "sve"); add(sve2, "sve2"); if (sve_bytes) s += std::format("(vl={}b)", sve_bytes * 8);
     if (sve_hw_bytes && sve_hw_bytes != sve_bytes) s += std::format("(hw vl={}b, lowered)", sve_hw_bytes * 8);
     add(rvv, "rvv"); if (rvv_bytes) s += std::format("(vlen={}b)", rvv_bytes * 8);
-    add(lsx, "lsx"); add(lasx, "lasx"); add(vsx, "vsx"); add(power8, "power8"); add(power9, "power9"); add(power10, "power10");
+    add(lsx, "lsx"); add(lasx, "lasx"); add(altivec, "altivec"); add(vsx, "vsx"); add(power8, "power8"); add(power9, "power9"); add(power10, "power10");
     add(s390_vx, "vx"); add(s390_vxe, "vxe"); add(s390_vxe2, "vxe2"); add(wasm_simd128, "simd128"); add(msa, "msa"); add(vfpv4, "vfpv4");
     return s;
 }

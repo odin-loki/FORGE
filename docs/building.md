@@ -87,7 +87,7 @@ Header-only INTERFACE targets: `forge_core`, `forge_os`, `forge_ops`, `forge_sim
 | `forge_script_example_plugin` | `hello_plugin`, an example native script plugin (also used by `test_script`) |
 | `forge`, `forge-serve` | The apps |
 
-Generated files go to `build/<dir>/generated/`: the op table (`forge/ops/ops.gen.hpp`, `ops.md`), x86 intrinsic wrappers (`forge/simd/raw/x86.gen.hpp`), GPU kernels (`gpu/*.comp`, `kernels.cu`, `kernels.cl`, `kernels.metal`), the embedded SPIR-V and CUDA/HIP images (`forge/gpu/spirv.gen.hpp`, `forge/gpu/gpu_images.gen.hpp`) and the shell backend registry.
+Generated files go to `build/<dir>/generated/`: the op table (`forge/ops/ops.gen.hpp`, `ops.md`), the raw intrinsic wrappers of every architecture (`forge/simd/raw/<isa>.gen.hpp`), GPU kernels (`gpu/*.comp`, `kernels.cu`, `kernels.cl`, `kernels.metal`), the embedded SPIR-V and CUDA/HIP images (`forge/gpu/spirv.gen.hpp`, `forge/gpu/gpu_images.gen.hpp`) and the shell backend registry.
 
 ## Installing and packaging
 `cmake --install build/release --prefix /opt/forge` installs (build the default target first; the generated headers are part of it):

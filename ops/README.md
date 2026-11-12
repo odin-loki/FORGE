@@ -15,10 +15,12 @@ The generated op table is [docs/reference.md](../docs/reference.md) (87 ops, 36 
 | `ops/defs/*.fspec` | Op declarations: `elementwise` (40), `reduction` (11), `movement` (8), `contraction` (4), `sequence` (12: encoder / embedding-model ops), `spatial` (12: vision / audio / diffusion ops). The file name is only grouping; the class is declared per op |
 | `ops/include/forge/ops/op.hpp` | Metadata types: `op_class`, `shape_rule`, `tolerance`, `fusion`, `op_info` |
 | `ops/include/forge/ops/reference.hpp`, `reference_ext.hpp` | Scalar references, `forge::ops::ref::<name>` (`reference_ext.hpp`: the `sequence` and `spatial` families) |
-| `ops/intrinsics/x86.json` | Curated x86 intrinsic database (name, types, CPUID feature), maintained with `build_x86_db.py` |
+| `ops/intrinsics/<isa>.json` | Intrinsic databases, one per ISA family: `x86`, `arm` (NEON, SVE/SVE2, SME/SME2), `riscv` and `riscv_policy` (RVV 1.0, vector crypto, scalar bitmanip), `loongarch` (LSX, LASX), `ppc` (AltiVec, VSX), `wasm` (SIMD128, relaxed SIMD), `s390x` (z/Vector), `mips` (MSA). One line per intrinsic: name, return and parameter types (`const T` = immediate operand), required features, the compilers that reject it. See [Intrinsic databases](#intrinsic-databases) |
+| `ops/intrinsics/<isa>.dropped.txt` | Candidates the build script left out of the database, each with the reason (the compiler's diagnostic) |
+| `ops/intrinsics/build_*_db.py`, `intrin_db.py` | Derive the databases from clang's own intrinsic headers and validate every entry by compiling it. Run by hand; the build only reads the JSON |
 | `ops/gen/fspec_gen.py` | Generates `forge/ops/ops.gen.hpp` and `ops.md` in the build tree |
 | `ops/gen/gpu_gen.py` | Generates the GPU kernels: one GLSL compute shader per kernel (Vulkan), `kernels.cu` (CUDA/HIP, plus CUDA/HIP-only quantised, attention and state-op kernels), `kernels.cl` (OpenCL, Level Zero), `kernels.metal` (Metal). Also embeds the compiled images into headers |
-| `ops/gen/intrin_gen.py` | Generates `forge/simd/raw/x86.gen.hpp`: C++ intrinsic wrappers gated by CPU feature. Using an intrinsic the target lacks is a compile error |
+| `ops/gen/intrin_gen.py` | Generates `forge/simd/raw/<isa>.gen.hpp` from each database: C++ intrinsic wrappers gated by CPU feature. Using an intrinsic the target lacks is a compile error |
 | `ops/gen/fit_math.py` | Fits the polynomials behind `simd` erf, erfc and lgamma. Run by hand: `python ops/gen/fit_math.py > simd/include/forge/simd/math_coeffs.hpp` |
 
 ## The .fspec format
@@ -46,7 +48,7 @@ CMake runs the generators at build time:
 |--------|-----------|--------|
 | `forge_ops_gen` | `fspec_gen.py` | `forge/ops/ops.gen.hpp`: `enum class op`, `op_count`, the info table (name, class, arity, shape rule, tolerance, fusion, cost, attrs, doc), `op_from_name`, and the binding of each op to `forge::ops::ref::<name>`. A missing reference is a compile error. Also `ops.md` |
 | `forge_gpu_gen` | `gpu_gen.py` | Kernel sources in the build tree; SPIR-V, PTX and AMDGPU images when the tools exist ([gpu.md](../docs/gpu.md)) |
-| `forge_raw_gen` | `intrin_gen.py` | `forge/simd/raw/x86.gen.hpp` |
+| `forge_raw_gen` | `intrin_gen.py` | `forge/simd/raw/{x86,arm,riscv,riscv_policy,loongarch,ppc,wasm,s390x,mips}.gen.hpp`: Tier R, one header per ISA family, each empty off its architecture. `forge/simd/raw.hpp` includes the current target's ([simd.md](../docs/simd.md)) |
 
 `tools/gen_docs.py` builds `docs/reference.md` from the `.fspec` files, `gpu_gen.py`'s kernel list and the C ABI header. ctest `docs_up_to_date` runs it with `--check`.
 
@@ -59,6 +61,24 @@ CMake runs the generators at build time:
 Already covered by older ops, so not duplicated: `where` is `select(a, b, cond)`; `cast` between float formats is `convert` (to an integer: `floor`); `split` is `slice`; `concat` takes two inputs (chain it); mean pooling over a sequence is `reduce_mean(axis: 0)` or `masked_mean`; `layer_norm`, `gelu`, `gelu_tanh`, `erf` and `argmax` exist.
 
 New ops go at the end of a file (or in a new file that sorts after the existing ones): the generator numbers ops in file-name, then line, order, so appending keeps every existing `enum class op` value.
+
+## Intrinsic databases
+The databases are derived, not typed. Each build script reads the intrinsic headers of the clang named in the database's `source` line (clang 23), compiles every candidate against them and writes the JSON plus a `.dropped.txt` log:
+
+| Script | Databases | Source |
+|--------|-----------|--------|
+| `build_x86_db.py` | `x86.json` | `<immintrin.h>`: functions from clang's AST (signature and target attribute); the immediate-operand macros from the casts in their expansion, return type deduced by the compiler |
+| `build_arm_db.py` | `arm.json` | `<arm_neon.h>`, `<arm_acle.h>`, `<arm_sve.h>`, `<arm_neon_sve_bridge.h>`, `<arm_sme.h>`. SVE/SME declarations carry no feature or streaming information, so it is read from the compiler's diagnostics |
+| `build_riscv_db.py --rvv-doc DIR` | `riscv.json`, `riscv_policy.json` | The compiler declares the RVV builtins itself (no header to read), so the candidates are the prototype lists of [rvv-intrinsic-doc](https://github.com/riscv-non-isa/rvv-intrinsic-doc) (`auto-generated/**/intrinsic_funcs.adoc`), each compiled against clang's builtins. Scalar helpers from `<riscv_bitmanip.h>`, `<riscv_crypto.h>` |
+| `build_misc_db.py [isa…]` | `loongarch.json`, `ppc.json`, `wasm.json`, `s390x.json`, `mips.json` | `<lsxintrin.h>`, `<lasxintrin.h>`, `<altivec.h>`, `<wasm_simd128.h>`, `<vecintrin.h>`, `<msa.h>` |
+
+What the scripts establish for every entry, by compiling it for its target (`clang++ --target=… -ffreestanding`, parse and code generation):
+- **Features.** From the target attribute where the header has one, otherwise from the compiler's "needs target feature" diagnostic, starting from the baseline. The entry is then compiled with exactly those features.
+- **Immediates.** A parameter the compiler only accepts as a constant becomes `const T`, with a valid sample value in `imm`.
+- **Other compilers.** `no` lists the compilers that reject the entry: `gcc13` (the matching cross g++, where one is installed), `clang_old` (an older clang++, when `FORGE_RAW_CLANG_OLD` names one; the database header records which), `a32` (32-bit Arm). The generator turns that into a preprocessor guard; nothing is left out because an older compiler lacks it.
+- **Arm streaming context.** `attr` (`s` = `__arm_streaming`, `sc` = streaming-compatible) and `za` (`za`, `zt0`): the least demanding calling context that compiles.
+
+To regenerate after a compiler update: run the script(s), review the diff of the JSON and the `.dropped.txt`, add any new feature tag to `simd/include/forge/simd/caps.hpp` (the generator maps `features` → `tag`), then run `python3 tools/check_raw_intrinsics.py` (ctest `raw_intrinsics_cross`), which compiles every generated wrapper for every target.
 
 ## Adding an op
 1. Add an `op` line to the right `.fspec` file.

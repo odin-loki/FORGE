@@ -1,0 +1,41 @@
+# Candidates left out of wasm.json by its build script, with the reason.
+#     36  deprecated alias
+#      2  does not compile
+wasm_f16x8_extract_lane	does not compile: use of undeclared identifier 'wasm_f16x8_extract_lane'
+wasm_f16x8_replace_lane	does not compile: use of undeclared identifier 'wasm_f16x8_replace_lane'
+wasm_i16x8_add_saturate	deprecated alias
+wasm_i16x8_any_true	deprecated alias
+wasm_i16x8_load_8x8	deprecated alias
+wasm_i16x8_sub_saturate	deprecated alias
+wasm_i16x8_widen_high_i8x16	deprecated alias
+wasm_i16x8_widen_high_u8x16	deprecated alias
+wasm_i16x8_widen_low_i8x16	deprecated alias
+wasm_i16x8_widen_low_u8x16	deprecated alias
+wasm_i32x4_any_true	deprecated alias
+wasm_i32x4_load_16x4	deprecated alias
+wasm_i32x4_trunc_saturate_f32x4	deprecated alias
+wasm_i32x4_widen_high_i16x8	deprecated alias
+wasm_i32x4_widen_high_u16x8	deprecated alias
+wasm_i32x4_widen_low_i16x8	deprecated alias
+wasm_i32x4_widen_low_u16x8	deprecated alias
+wasm_i64x2_load_32x2	deprecated alias
+wasm_i8x16_add_saturate	deprecated alias
+wasm_i8x16_any_true	deprecated alias
+wasm_i8x16_sub_saturate	deprecated alias
+wasm_u16x8_add_saturate	deprecated alias
+wasm_u16x8_load_8x8	deprecated alias
+wasm_u16x8_sub_saturate	deprecated alias
+wasm_u32x4_load_16x4	deprecated alias
+wasm_u32x4_trunc_saturate_f32x4	deprecated alias
+wasm_u64x2_load_32x2	deprecated alias
+wasm_u8x16_add_saturate	deprecated alias
+wasm_u8x16_sub_saturate	deprecated alias
+wasm_v16x8_load_splat	deprecated alias
+wasm_v16x8_shuffle	deprecated alias
+wasm_v32x4_load_splat	deprecated alias
+wasm_v32x4_shuffle	deprecated alias
+wasm_v64x2_load_splat	deprecated alias
+wasm_v64x2_shuffle	deprecated alias
+wasm_v8x16_load_splat	deprecated alias
+wasm_v8x16_shuffle	deprecated alias
+wasm_v8x16_swizzle	deprecated alias

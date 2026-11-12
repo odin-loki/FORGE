@@ -20,7 +20,7 @@ struct cpu_features {
     bool dotprod = false, i8mm = false;  // AArch64 sdot/udot (ASIMDDP) and usdot (I8MM)
     bool rvv = false; int rvv_bytes = 0;
     bool lsx = false, lasx = false;                               // LoongArch
-    bool vsx = false, power8 = false, power9 = false, power10 = false;   // Power (ISA 2.07 / 3.0 / 3.1)
+    bool altivec = false, vsx = false, power8 = false, power9 = false, power10 = false;   // Power (ISA 2.07 / 3.0 / 3.1)
     bool s390_vx = false, s390_vxe = false, s390_vxe2 = false;    // s390x vector facility (z13 / z14 / z15)
     bool wasm_simd128 = false;                                    // compile-time on WebAssembly
     bool msa = false;                                             // MIPS

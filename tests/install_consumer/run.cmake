@@ -55,6 +55,9 @@ endforeach()
 set(inc "${FORGE_INCLUDEDIR}")
 foreach(f ${inc}/forge.h ${inc}/forge/os/os.hpp ${inc}/forge/loadbalancer ${inc}/forge/script ${inc}/forge/security
           ${inc}/forge/ops/ops.gen.hpp ${inc}/forge/gpu/gpu_images.gen.hpp ${inc}/forge/third_party/monocypher/monocypher.h
+          ${inc}/forge/simd/raw.hpp ${inc}/forge/simd/raw/config.hpp ${inc}/forge/simd/raw/x86.gen.hpp ${inc}/forge/simd/raw/arm.gen.hpp
+          ${inc}/forge/simd/raw/riscv.gen.hpp ${inc}/forge/simd/raw/riscv_policy.gen.hpp ${inc}/forge/simd/raw/loongarch.gen.hpp
+          ${inc}/forge/simd/raw/ppc.gen.hpp ${inc}/forge/simd/raw/wasm.gen.hpp ${inc}/forge/simd/raw/s390x.gen.hpp ${inc}/forge/simd/raw/mips.gen.hpp
           ${inc}/forge/third_party/level-zero/ze_api.h ${FORGE_TEMPLATEDIR}/llama.fbp)
   if(NOT EXISTS "${prefix}/${f}")
     message(FATAL_ERROR "install_consumer: ${prefix}/${f} was not installed")

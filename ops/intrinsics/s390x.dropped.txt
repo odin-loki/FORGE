@@ -1,0 +1,7 @@
+# Candidates left out of s390x.json by its build script, with the reason.
+#      5  type-generic or alias macro without a typed declaration
+vec_convert_from_fp16	type-generic or alias macro without a typed declaration
+vec_convert_to_fp16	type-generic or alias macro without a typed declaration
+vec_extend_to_fp32_hi	type-generic or alias macro without a typed declaration
+vec_extend_to_fp32_lo	type-generic or alias macro without a typed declaration
+vec_round_from_fp32	type-generic or alias macro without a typed declaration
