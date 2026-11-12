@@ -4,7 +4,7 @@
 `forge::gpu` has two parts that are used differently.
 
 1. **Programming model** (`gpu.hpp`, `prims.hpp`). Record copies and kernel launches into a `gpu::graph`, `compile` it once for a device, then `run()` the result as often as needed. Kernels are function objects whose call operator is marked `FORGE_KERNEL`. This part runs on the **CPU only**: `select()` always returns the CPU device, and launches are split across the task pool.
-2. **Op runtimes** (`vulkan.hpp`, `cuda.hpp`, `opencl.hpp`, `levelzero.hpp`, `metal.hpp`). Each runs single spec ops (`run_op`) on a real device. They are what model execution uses: [graph](graph.md) wraps them as lowerings, selected with `FORGE_DEVICE` or `device_registry(name)`.
+2. **Op runtimes** (`vulkan.hpp`, `cuda.hpp`, `opencl.hpp`, `levelzero.hpp`, `metal.hpp`). Each runs single spec ops (`run_op`) on a real device. They are what model execution uses: [graph](graph.md) wraps them as lowerings, selected with `FORGE_DEVICE` or `device_registry(name)`; `FORGE_DEVICE=auto` scores the devices that open ([Automatic device selection](#automatic-device-selection)).
 
 Nothing links against a vendor SDK. Each runtime `dlopen`s its driver library at run time. A runtime that cannot load reports why, and work stays on the CPU.
 
@@ -51,7 +51,7 @@ Verification of the non-CUDA columns is by the mock drivers only (they compile `
 | Level Zero | `gpu/levelzero.hpp` | `ze[:N]` / `level_zero[:N]` | `level_zero:N` | mock driver only |
 | Metal | `gpu/metal.hpp` + `gpu/src/metal.mm` | `metal[:N]` | none | never compiled (no Mac) |
 
-All runtimes except Metal share one contract: `run_op` over host tensor views, and a **residency protocol** (`begin_run`, `end_run`, `pin`, `to_host`, `host_wrote`, `release`, `copy_resident`). Between `begin_run` and `end_run`, buffers stay on the device keyed by host address. Pinned ranges (weights) survive across runs. Metal uses unified memory, so its residency hooks do nothing.
+All runtimes except Metal share one contract: `run_op` over host tensor views, and a **residency protocol** (`begin_run`, `end_run`, `pin`, `to_host`, `host_wrote`, `release`, `forget`, `copy_resident`). `forget(p, n)` drops the device copies and pin records of host memory that is going away; `graph::plan`'s destructor calls it for the plan's constants on every backend. (Until 2026-11-12 only CUDA/HIP had it: on OpenCL, Level Zero and Vulkan a destroyed plan left pins and resident entries behind, and the next plan's buffers at the same addresses read stale device data or were overwritten at sync-back. That was the crash seen with `FORGE_DEVICE=opencl` on plans with host steps; regression test `test_gpu_stale_*_mock`.) Between `begin_run` and `end_run`, buffers stay on the device keyed by host address. Pinned ranges (weights) survive across runs. Metal uses unified memory, so its residency hooks do nothing.
 
 Every driver allocation of Vulkan, CUDA, HIP, OpenCL and Level Zero is charged to the memory pool named above (`gpu/device_memory.hpp`). When an allocation would cross the pool limit (`FORGE_MEM_DEVICE_LIMIT`) or the driver runs out, the runtime evicts: pooled free buffers first, then resident tensors and encoded weights, least recently used first. Device-only data is copied back to the host before it is freed. Buffers used by the op in progress are never evicted. See [memory.md](memory.md).
 
@@ -197,6 +197,28 @@ The whole key is stored in the file and compared, not just its hash. The file al
 
 A program binary is code the driver runs: do not point `FORGE_CACHE_DIR` at a directory other users can write. Metal has no cache (`MTLBinaryArchive` is not used). Tested with the mock drivers only (`test_gpu_kernel_cache_{opencl,ze}_mock`); whether a given real driver accepts its own binaries back has not been checked.
 
+## Automatic device selection
+`FORGE_DEVICE=auto` (or `device_registry("auto")`, `session::set_device("auto")`) opens every device of every backend, builds a capability record for each and picks the best score (`gpu/select.hpp` is the rule, `graph::enumerate_devices` / `graph::auto_device` in `graph/vulkan.hpp` fill it in). The table with every candidate's score is logged at info level. The default without `FORGE_DEVICE` is still the CPU.
+
+Record: backend, ordinal, driver name, class (`discrete`, `integrated`, `virtual`, `software`, `cpu`), device memory, the weight codecs with a device quantised matmul, whether gather / state ops / MoE run on the device, and the micro-benchmark.
+
+Score = throughput × codec coverage × memory fit × preference:
+
+| Factor | Value |
+|---|---|
+| Throughput | the cached micro-benchmark when **every** eligible candidate has one, else the class prior: discrete 200, integrated 20, virtual 10, cpu 4, software 0.5 |
+| Codec coverage | 0.25 + 0.75 × the share of the model's weight codecs the device has a quantised matmul for (unknown model: 1) |
+| Memory fit | 1 if the model's data section fits in 90% of the device memory (or a size is unknown), else 0.01 |
+| Preference | 1000 for a backend or device named in `FORGE_DEVICE_PREFER` |
+
+Hard rules: a backend or device in `FORGE_DEVICE_EXCLUDE` is never chosen; a **software device** (Vulkan `CPU` type such as lavapipe or SwiftShader, an OpenCL CPU runtime, a device whose name says llvmpipe / SwiftShader / PoCL / mock) never wins over the CPU unless `FORGE_DEVICE_ALLOW_SOFTWARE=1`, and then only if it scores higher (in practice: when it is also preferred). Ties go to the backend order cuda, hip, metal, level_zero, opencl, vulkan, then the lower ordinal. Naming a device explicitly (`FORGE_DEVICE=vulkan`) bypasses all of this.
+
+The micro-benchmark is a 128×512 · 512×512 f32 `matmul_t` through the device's own lowering, best of 3, data crossing host memory each time (GFLOP/s). It is measured once per (backend, device name) and stored in the kernel cache directory (`device-bench-<hash>.bin`); `FORGE_DEVICE_BENCH=0` never measures. It is a tie-breaker between real devices, not a model benchmark: it does not exercise the quantised kernels or residency.
+
+Classes come from the driver: Vulkan `VkPhysicalDeviceType`; OpenCL `CL_DEVICE_TYPE` and `CL_DEVICE_HOST_UNIFIED_MEMORY`; Level Zero device type and the `INTEGRATED` flag; CUDA and HIP devices count as discrete; Metal as integrated. Cost: `auto` opens every device once (kernel builds are cached, see above).
+
+Tested with synthetic records (`test_gpu`: `device_selection_scoring`) and with the mock drivers at `MOCK_DEVICES=2` (`test_gpu_select_*_mock`). No real multi-GPU machine has run it; the priors are guesses, not measurements.
+
 ## Determinism mode
 `FORGE_DETERMINISTIC=1`, `gpu::set_deterministic(true)` or `inference::session_options::deterministic = 1` (`gpu/determinism.hpp`; the explicit calls win over the variable, and the mode is process-wide).
 
@@ -218,8 +240,8 @@ The runtimes read the switch at each launch, so it can be changed between runs; 
 
 | Item | Notes |
 |------|-------|
-| `probe_backends()` | One `backend_probe {kind, available, detail}` per `backend_kind` (`cpu`, `cuda`, `hip`, `level_zero`, `vulkan`, `metal`). It only checks that the driver library loads. `metal` is always reported absent. OpenCL is not listed. `name(kind)` gives the string |
-| `select(prefer = prefer::any)`, `all()` | Always the CPU device (`caps().name` is `cpu/<simd target>`) |
+| `probe_backends()` | One `backend_probe {kind, available, detail}` per `backend_kind` (`cpu`, `cuda`, `hip`, `level_zero`, `vulkan`, `metal`, `opencl`). It only checks that the driver library loads. `metal` is always reported absent. `name(kind)` gives the string |
+| `select(prefer = prefer::any)`, `all()` | Always the CPU device (`caps().name` is `cpu/<simd target>`): the programming model executes on the CPU. Devices for model execution are scored by `graph::auto_device` |
 | `device::alloc<T>(n)` → `buffer<T>`; `device::caps()` | Host buffers; capabilities incl. `compute_units` |
 | `graph::copy(src, dst)`, `graph::launch(kernel, extent, args...)`, `graph::host(fn)` | Return a node. Nodes run in recorded order by default; `node.after(other)` adds a dependency |
 | `graph::compile(device)` → `executable` | `run()` replays the flat order; `steps()` counts nodes |
@@ -281,6 +303,10 @@ Running a model on a device goes through graph or inference instead: `FORGE_DEVI
 | `FORGE_GPU_NO_STATE_OPS` | unset | CUDA/HIP, OpenCL, Level Zero | Set: DeltaNet state ops run on the host |
 | `FORGE_GPU_MOE` | on | CUDA/HIP, OpenCL, Level Zero | `0`: `moe_ffn` runs on the host ([Mixture of experts](#mixture-of-experts-on-the-device)) |
 | `FORGE_DETERMINISTIC` | off | all | `1`: [determinism mode](#determinism-mode) |
+| `FORGE_DEVICE_PREFER` | unset | `auto` | Comma list of backends or devices that win whenever eligible (`cuda`, `opencl:1`) |
+| `FORGE_DEVICE_EXCLUDE` | unset | `auto` | Comma list of backends or devices never chosen |
+| `FORGE_DEVICE_ALLOW_SOFTWARE` | off | `auto` | `1`: software devices may be chosen |
+| `FORGE_DEVICE_BENCH` | on | `auto` | `0`: no micro-benchmark; class priors only |
 | `FORGE_GPU_KERNEL_CACHE` | on | OpenCL, Level Zero | `0`: no on-disk [kernel program cache](#kernel-program-cache) |
 | `FORGE_GRAPHS` | on | CUDA | `0`: do not capture decode runs into CUDA graph segments |
 | `FORGE_GRAPH_SEG` | 64 | CUDA | Kernels per captured segment; `0` = unlimited |

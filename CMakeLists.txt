@@ -894,6 +894,9 @@ if(FORGE_BUILD_TESTS)
         set_tests_properties(test_gpu_kernel_cache_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
           ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};MOCK_DEVICES=1;FORGE_ZE_TEST_IMAGE=opencl-c")
       endif()
+      add_test(NAME test_gpu_stale_${m}_mock COMMAND test_cuda_hip stale ${m})   # dead plans leave no device copies / pins
+      set_tests_properties(test_gpu_stale_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+        ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};FORGE_ZE_TEST_IMAGE=opencl-c")
       add_test(NAME test_gpu_select_${m}_mock COMMAND test_cuda_hip select ${m})   # FORGE_DEVICE=auto (gpu/select.hpp)
       set_tests_properties(test_gpu_select_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
         ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};MOCK_DEVICES=2;FORGE_ZE_TEST_IMAGE=opencl-c")

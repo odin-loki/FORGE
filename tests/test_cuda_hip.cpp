@@ -902,6 +902,65 @@ static int select_t(const std::string& api) {
     return fails ? 1 : 0;
 }
 
+// Regression (OpenCL mock crash on plans with a host step before a device matmul_t; heap corruption on OpenCL and
+// Level Zero): device copies are keyed by host address, and a plan pins its constants. When a plan died, its pins
+// and resident constants stayed behind on the runtimes without device_hooks::forget; the next plan's buffers at the
+// same addresses were then taken for (sub-ranges of) the dead plan's entries, so kernels read stale device data and a
+// later sync-back wrote the old entry's size over the new, smaller host buffer. Here plans of different sizes are
+// compiled, run and destroyed in turn, with a host-only op (sin has no kernel on these backends) between two device ops and
+// a constant in the device matmul_t, so freed constants and arenas are reused by the next plan; results must match
+// the CPU and nothing may stay resident. Also the runtime-level contract: forget() drops entries and pins.
+template<class RT, class Open> static int stale_t(Open open) {
+    using namespace graph;
+    std::string why; auto rt0 = open(&why, 0);
+    if (!rt0) { std::printf("SKIP: %s\n", why.c_str()); return 77; }
+    auto rt = std::shared_ptr<RT>(std::move(rt0));
+    const std::string api = rt->backend();
+    auto reg = gpu_registry(rt);
+    int fails = 0;
+    auto check = [&](bool ok, const std::string& what) { std::printf("%s %s stale: %s\n", ok ? "ok  " : "FAIL", api.c_str(), what.c_str()); fails += !ok; };
+    bool match = true, host_step = false;
+    for (int round = 0; round < 3; ++round) for (i64 k : {96, 32, 64, 16, 128, 48}) {
+        const i64 rows = 3 + round, cols = k / 2 + 5;
+        auto build = [&] {
+            tensor_graph g; auto xi = g.input("x", {rows, k});
+            auto w = g.constant(tensor({cols, k}, 0.f)); for (std::size_t i = 0; i < g.at(w).constant->data.size(); ++i) g.at(w).constant->data[i] = std::sin(float(i) * 0.37f + float(k));
+            auto a = g.apply(ops::op::tanh, {xi});                                   // device
+            auto c = g.apply(ops::op::sin, {a});                                      // host: these backends have no sin kernel
+            auto m = g.apply(ops::op::matmul_t, {c, w});                             // device, constant weight (pinned)
+            g.output("y", g.apply(ops::op::neg, {m}));
+            return g; };
+        std::vector<float> x(std::size_t(rows * k)); for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(float(i) * 0.217f + float(round));
+        auto run = [&](registry* r) {
+            pass_options po; po.lowerings = r; auto p = compile(build(), nullptr, po);
+            if (r) for (auto& s : p->steps) if (p->g.at(s.out).kind == node_kind::op && p->g.at(s.out).op == ops::op::sin && !(s.low && s.low->on_device)) host_step = true;
+            executor e(*p); e.set_input("x", x); e.run(); auto y = e.output("y").data;
+            e.set_input("x", x); e.run(); if (e.output("y").data != y) y.clear();
+            return y; };   // the plan (constants, arena) dies here
+        auto dev = run(reg.get()), cpu = run(nullptr);
+        if (dev.size() != cpu.size() || dev.empty()) match = false;
+        for (std::size_t i = 0; i < std::min(dev.size(), cpu.size()); ++i) if (std::fabs(double(dev[i]) - cpu[i]) > 1e-3 * (1 + std::fabs(double(cpu[i])))) match = false;
+    }
+    check(host_step, "the plans have a host step between device steps");
+    check(match, "18 plans compiled, run twice and destroyed in turn match the CPU");
+    check(rt->residency().resident == 0, "nothing of a dead plan stays resident");
+    if constexpr (requires { rt->forget((const float*)nullptr, std::size_t(0)); }) {
+        // runtime level: a pinned buffer survives end_run; forget() drops it and the pin, so a smaller buffer placed at
+        // the same address is uploaded afresh and is not synced back with the old size
+        std::vector<float> big(4096, 1.f), out(4096), small_out(64);
+        rt->pin(big.data(), big.size());
+        rt->begin_run(); rt->run_op("neg", {{big.data(), {4096}}}, {}, {out.data(), {4096}}); rt->end_run();
+        check(rt->residency().resident == 1, "a pinned input stays resident after its run");
+        rt->forget(big.data(), big.size());
+        check(rt->residency().resident == 0, "forget() drops the device copy");
+        for (int i = 0; i < 64; ++i) big[std::size_t(i)] = float(i);   // "a new, smaller buffer at the same address"
+        rt->begin_run(); rt->run_op("neg", {{big.data(), {64}}}, {}, {small_out.data(), {64}}); rt->end_run();
+        bool ok = rt->residency().resident == 0; for (int i = 0; i < 64; ++i) ok = ok && small_out[std::size_t(i)] == -float(i);
+        check(ok, "a smaller buffer at the same address is uploaded afresh and not pinned");
+    }
+    return fails ? 1 : 0;
+}
+
 static int bench_qmm(int argc, char** argv) {
     if (argc < 6) { std::fprintf(stderr, "usage: test_cuda_hip bench <codec> <rows> <cols> <k> [reps] [VAR=a,b,...]\n"); return 2; }
     std::string why; auto rt = cuda_hip::runtime::open(cuda_hip::api::cuda, &why, 0);
@@ -1046,6 +1105,12 @@ int main(int argc, char** argv) {
         return features_t(cu(a), [a] { return cuda_hip::runtime::device_count(a); });
     }
     if (mode == "select") return select_t(argc > 2 ? argv[2] : "cuda");
+    if (mode == "stale") {
+        std::string w = argc > 2 ? argv[2] : "opencl";
+        if (w == "opencl") return stale_t<forge::gpu::ocl::runtime>(cl);
+        if (w == "ze") return stale_t<forge::gpu::ze::runtime>(ze);
+        return stale_t<cuda_hip::runtime>(cu(w == "hip" ? cuda_hip::api::hip : cuda_hip::api::cuda));
+    }
     if (mode == "determinism") {
         std::string w = argc > 2 ? argv[2] : "cuda";
         if (w == "opencl") return determinism_t<forge::gpu::ocl::runtime>(cl);

@@ -103,6 +103,17 @@ public:
         // would inherit one and outlive its run as a stale resident entry
         std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
     }
+    // [p, p+n) is going away for good (a plan's constants, a state slot): drop every overlapping device copy without
+    // fetching it and the pin records inside the range. Without this a later host buffer at the same address would
+    // inherit the pin or be taken for a sub-range of the stale entry, and that entry's next sync-back would write
+    // its old size over the new buffer (graph::plan::~plan calls it through device_hooks::forget).
+    void forget(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_); finish();
+        std::vector<std::uintptr_t> ks;
+        each_overlap(p, n, [&](entry& e) { ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
+        for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
+    }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); if (!n) return;
         begin_op();
@@ -345,8 +356,8 @@ private:
         int err = 0; void* k = f_.create_kernel(prog_, n.c_str(), &err); ck(err, ("clCreateKernel " + n).c_str());
         return kern_[n] = k;
     }
-    void* sub(const bound& b) {   // a sub-range view of a resident buffer (origin must be base-aligned)
-        auto key = std::make_pair(b.e->mem, b.off);
+    void* sub(const bound& b) {   // a sub-range view of a resident buffer (origin must be base-aligned); cached per (parent, origin, size)
+        auto key = std::make_tuple(b.e->mem, b.off, b.bytes);
         if (auto it = subs_.find(key); it != subs_.end()) return it->second;
         std::size_t region[2] = {b.off, b.bytes}; int err = 0;
         void* m = f_.sub_buffer(b.e->mem, 1, 0x1220 /*CL_BUFFER_CREATE_TYPE_REGION*/, region, &err); ck(err, "clCreateSubBuffer");
@@ -358,7 +369,7 @@ private:
     }
     void download(entry& e) { ck(f_.read(q_, e.mem, 0, 0, e.count * 4, e.host, 0, nullptr, nullptr), "clEnqueueReadBuffer"); e.host_valid = true; ++stats_.downloads; }
     void drop(entry& e) {
-        for (auto it = subs_.begin(); it != subs_.end();) if (it->first.first == e.mem) { f_.rel_mem(it->second); it = subs_.erase(it); } else ++it;
+        for (auto it = subs_.begin(); it != subs_.end();) if (std::get<0>(it->first) == e.mem) { f_.rel_mem(it->second); it = subs_.erase(it); } else ++it;
         dfree(e.mem); stats_.resident_bytes -= e.count * 4;
     }
     bound acquire(float* h, std::size_t count, bool is_out) {
@@ -475,7 +486,7 @@ private:
     std::mutex mu_;
     bool in_run_ = false, capturing_ = false;
     std::map<std::uintptr_t, entry> res_;
-    std::map<std::pair<void*, std::size_t>, void*> subs_;
+    std::map<std::tuple<void*, std::size_t, std::size_t>, void*> subs_;
     std::vector<std::pair<const float*, std::size_t>> pinned_;
     std::vector<launch> cur_;
     std::vector<std::vector<launch>> graphs_;

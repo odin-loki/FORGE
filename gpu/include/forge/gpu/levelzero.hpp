@@ -98,6 +98,17 @@ public:
         // would inherit one and outlive its run as a stale resident entry
         std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
     }
+    // [p, p+n) is going away for good (a plan's constants, a state slot): drop every overlapping device copy without
+    // fetching it and the pin records inside the range. Without this a later host buffer at the same address would
+    // inherit the pin or be taken for a sub-range of the stale entry, and that entry's next sync-back would write
+    // its old size over the new buffer (graph::plan::~plan calls it through device_hooks::forget).
+    void forget(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_); sync();
+        std::vector<std::uintptr_t> ks;
+        each_overlap(p, n, [&](entry& e) { ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
+        for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
+    }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); if (!n) return;
         begin_op();

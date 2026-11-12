@@ -196,6 +196,13 @@ public:
             ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         for (auto k : ks) { free_entry(res_[k]); res_.erase(k); }
     }
+    // release() plus the pin records inside the range: for host memory that is going away for good (a plan's constants),
+    // so a later buffer at the same address does not inherit a pin (graph::plan::~plan, device_hooks::forget).
+    void forget(const float* p, std::size_t n) {
+        release(p, n);
+        std::lock_guard lk(mu_);
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first >= p && pr.first + pr.second <= p + n; });
+    }
     // evictions / evicted_bytes: resident buffers dropped to fit the device budget (gpu/device_memory.hpp)
     struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0,
                              evictions = 0, evicted_bytes = 0; };

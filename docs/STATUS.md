@@ -99,6 +99,28 @@ Greedy output is identical with CUDA graphs on and off.
 
 Newest first. Results are from the date given; later code may differ.
 
+### 2026-11-12 (GPU backend parity work; mock drivers only, no hardware)
+Linux x86_64, clang 23, no GPU. Everything below ran against the mock drivers (`tests/mock_cuda.c` as CUDA and HIP,
+`mock_opencl.c`, `mock_ze.c`); real hardware for HIP, OpenCL, Level Zero and Vulkan remains "never", and none of the
+new CUDA code ran on the RTX 3090.
+- Portable kernels for OpenCL and Level Zero (quantised matmul_t / gather / FFN gate-up, one-pass and split-over-keys
+  attention, delta_rule / causal_conv, broadcast): `test_cuda_hip opencl|ze` now runs the same checks as CUDA
+  (14/14 attention shapes, 24/24 quantised matmul cases, 20/20 fused FFN cases, state ops, 4/4 quantised gather).
+  The OpenCL/Level Zero mocks execute the generated `kernels.cl` as C. Not compiled by any real OpenCL C compiler.
+- Device mixture of experts (`run_moe`) on CUDA, HIP, OpenCL, Level Zero: 21/21 cases match the CPU sparse path on
+  each mock. The two kernels compile to PTX (sm_70, sm_80) and AMDGPU code objects. `golden_moe_mla_*_mock` ctests
+  are registered but were **not run** here (the `forge` app was not built: the shared build machine ran out of disk).
+- Kernel program cache (OpenCL program binaries, Level Zero native binaries): `test_cuda_hip cache opencl|ze` 12/12.
+- Determinism mode: `test_cuda_hip determinism <api>` 6/6 on the four mocks. The mocks run serially, so this shows
+  the kernel selection, not a device's scheduling.
+- Automatic device selection: `test_gpu` scoring test; `test_cuda_hip select <api>` 11/11 with `MOCK_DEVICES=2`.
+- Fixed: plans destroyed on OpenCL, Level Zero and Vulkan left pins and resident constants behind (no
+  `device_hooks::forget`), corrupting later plans (heap corruption / SIGBUS with `FORGE_DEVICE=opencl`). The OpenCL
+  sub-buffer cache also ignored the view size. Regression: `test_cuda_hip stale <api>` 6/6 on the four mocks.
+- Vulkan on lavapipe: `test_vulkan` still passes (the new `forget` hook); no new Vulkan kernels.
+- Not done in this round: Vulkan (GLSL) and Metal (MSL) ports of the kernels above, eviction during captures with
+  buffer generations, the missing `gpu::prims`, `pipe:auto` partitioning, RPC remote weight residency.
+
 ### 2026-11-05 (branch `cuda-mma-prefill`, RTX 3090)
 - CUDA prefill and decode speedups; numbers in [CUDA performance](#cuda-performance-on-rtx-3090-2026-11-05).
   A second PTX image for `sm_80` (tried first, `sm_70` fallback) carries int8 tensor-core prefill matmul for

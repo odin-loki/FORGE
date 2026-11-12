@@ -30,6 +30,7 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<gpu::vk::runtim
     h->to_host = [raw](const float* p, std::size_t n) { raw->to_host(p, n); };
     h->host_wrote = [raw](const float* p, std::size_t n) { raw->host_wrote(p, n); };
     h->release = [raw](const float* p, std::size_t n) { raw->release(p, n); };
+    h->forget = [rt](const float* p, std::size_t n) { rt->forget(p, n); };   // owning: plans may outlive the registry
     h->copy = [raw](float* s, std::size_t n, float* d, std::size_t dn, std::size_t off) { raw->copy_resident(s, n, d, dn, off); };
     r->hooks = h;
     for (std::size_t i = 0; i < ops::op_count; ++i) {
@@ -80,6 +81,9 @@ template<class RT> std::unique_ptr<registry> gpu_registry(std::shared_ptr<RT> rt
                         h->replay = [raw](const void* k) { return raw->replay(k); };
                     }
             }
+        // every resident backend: a dying plan drops its constants' device copies and pins (plan::~plan)
+        if constexpr (requires { raw->forget((const float*)nullptr, std::size_t(0)); })
+            if (!h->forget) h->forget = [rt](const float* p, std::size_t n) { rt->forget(p, n); };
         h->pin = [raw](const float* p, std::size_t n) { raw->pin(p, n); };
         h->to_host = [raw](const float* p, std::size_t n) { raw->to_host(p, n); };
         h->host_wrote = [raw](const float* p, std::size_t n) { raw->host_wrote(p, n); };

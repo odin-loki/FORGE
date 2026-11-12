@@ -6,7 +6,7 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
+| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `auto` (scores every device that opens; software devices never beat the CPU), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
 | `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx2`, `avx512`, `neon`, `sve`, `rvv`. Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
 | `FORGE_SVE_KEEP_VL=1` | simd (aarch64 Linux) | Do not change the SVE vector length at start-up when there is no kernel table for the hardware length |
 | `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
@@ -30,6 +30,9 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero | Do not gather from encoded embedding tables on the device |
 | `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
 | `FORGE_DETERMINISTIC=1` | all devices | Determinism mode: only order-stable device paths (no split-K / stream-K matmul, no split-over-keys decode attention, single-block argmax, fixed CPU chunking). Same device + same build gives bit-identical results; see [gpu.md](gpu.md#determinism-mode). `session_options::deterministic` and `gpu::set_deterministic` override it |
+| `FORGE_DEVICE_PREFER`, `FORGE_DEVICE_EXCLUDE` | `FORGE_DEVICE=auto` | Comma lists of backends (`cuda`) or devices (`opencl:1`): preferred ones win whenever eligible, excluded ones are never chosen ([gpu.md](gpu.md#automatic-device-selection)) |
+| `FORGE_DEVICE_ALLOW_SOFTWARE=1` | `FORGE_DEVICE=auto` | Let software devices (lavapipe, SwiftShader, OpenCL CPU runtimes) compete; by default they never win over the CPU |
+| `FORGE_DEVICE_BENCH=0` | `FORGE_DEVICE=auto` | Do not run the per-device micro-benchmark; score by device class only |
 | `FORGE_GPU_KERNEL_CACHE=0` | OpenCL, Level Zero | Disable the on-disk cache of driver-compiled kernel programs ([gpu.md](gpu.md#kernel-program-cache)) |
 | `FORGE_GPU_WEIGHT_BUDGET` | resident backends | f32 bytes of decoded quantised weights mirrored on the device, e.g. `4G`, `512M` (suffix `k`, `m`, `g`; default 8 GiB). The rest stay encoded and run on the CPU. Codecs with a device quantised matmul stay encoded on the device instead |
 | `FORGE_GPU_ARENA_MB` | CUDA, HIP | Largest activation arena held at fixed device addresses as one buffer, in MiB (default 1024; 0 disables) |
