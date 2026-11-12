@@ -82,7 +82,8 @@ TEST(aot_unlisted_shape_compiles_at_run_time) {
 }
 
 TEST(aot_quantised_weights) {
-    for (const char* codec : {"q8_0", "q4_k", "f16"}) {
+    // q3_k (block 256) does not divide the 32-wide rows: those weights take the decoded-f32 path of lower_plan
+    for (const char* codec : {"q8_0", "q4_k", "f16", "q4_0", "q5_1", "iq4_nl", "q3_k", "tq2_0"}) {
         auto src = forge_test::make_tiny_model(tmp(std::string(codec) + ".fpk"), {.codec = codec});
         auto pl = plans_of(src, {.shapes = {1, 6}});
         expect_identical(with_plans(src, pl.blob, std::string(codec) + "_aot.fpk"), src, {6, 1, 1, 6, 1}, {}, 2);

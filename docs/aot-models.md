@@ -121,7 +121,7 @@ At load the engine instantiates the plan from the library's blob exactly as in p
 - KV codec and sequence lengths are per plan (`--kv-codec`, `--shapes`). The weight codec is the model file's.
 
 ## What is bit-identical
-- **Plan mode**: the instantiated plan has the same graph, memory plan and kernels as the plan `compile()` builds, so outputs are equal bit for bit, on every SIMD target. Tested for f32, f16, q8_0 and q4_k weights, KV codecs f32 / int8 / fp8 / tbq4 / k8v4, paged and preallocated KV state, the Qwen3.5-style recurrent model, a `one_shot` model, and the golden Mixtral and DeepSeek-V2 (MLA + MoE) models with f32, q8_0 and q4_k weights.
+- **Plan mode**: the instantiated plan has the same graph, memory plan and kernels as the plan `compile()` builds, so outputs are equal bit for bit, on every SIMD target. Tested for f32, f16, q8_0, q4_k, q4_0, q5_1, iq4_nl, q3_k and tq2_0 weights, KV codecs f32 / int8 / fp8 / tbq4 / k8v4, paged and preallocated KV state, the Qwen3.5-style recurrent model, a `one_shot` model, and the golden Mixtral and DeepSeek-V2 (MLA + MoE) models with f32, q8_0 and q4_k weights.
 - **Native mode**: equal bit for bit to the interpreted plan in the same process environment, when the unit is compiled by the compiler and with the flags of the FORGE build (the default). The direct calls repeat the bodies of the CPU lowerings in `kernels.hpp` (same kernel, same chunking); `tests/test_aot_native.cpp` compares logits and generated tokens.
 - **Another compiler than the one that built FORGE** (`--cxx g++` against a Clang build, for example): the generated unit's generic code (RoPE, the scalar parts of attention, state ops, reference kernels) is then compiled by that compiler, while the SIMD kernels stay the build's object code. Two things can differ between compilers. Floating-point contraction: GCC defaults to `-ffp-contract=fast`, Clang to `on`; `forge aot` therefore adds `-ffp-contract=off` whenever the compiler is not the build's, and prints a note. On x86 that restores the build's behaviour exactly (its generic code is compiled for baseline x86-64, which has no FMA to contract into). On AArch64 and other targets with fused multiply-add in the baseline, the build's own generic code *is* contracted by its compiler, so a foreign compiler with contraction off can differ in the last bit. Vectorisation: neither compiler may reorder floating-point reductions without `-ffast-math`, so auto-vectorisation does not change results. Bit-identity is tested only for the build's compiler (Clang 23 here); with another compiler treat it as unverified and compare outputs yourself.
 - Not guaranteed either: extra floating-point flags via `--cxxflag` (`-ffast-math`, `-ffp-contract=fast`, `-Ofast`).
@@ -159,7 +159,32 @@ No function was added to `forge.h`: `forge_open` accepts a compiled library as i
 A static library (`--emit static`) is used from a program that links FORGE: `auto m = std::make_shared<inference::model>("model.fpk", false, inference::aot_native::library::in_image(forge_aot_model_v1_get()));`.
 
 ## Measured
-MEASURED_PLACEHOLDER
+All numbers are from one machine on 2026-11-12: a 4-core x86-64 VM (AVX-512 target), Clang 23.1.6, `RelWithDebInfo`. The machine was shared with other builds at a load average of 22 to 27 throughout, so wall-clock numbers are noisy; the same plan measured twice differs by up to 30 % below. Read them as "no difference larger than the noise", not as a ranking. Nothing here was measured on a real model or a quiet machine.
+
+Models: random-weight Llama-style models from `tests/tiny_model.hpp`, 12 layers. "small": d = 64, f32, 3 MB. "wide": d = 512, FFN 2048, q8_0 weights, 51 MB. A 12-layer model has the same graph size whatever its width, so the plan work is that of a real 12-layer model; the kernel work is not.
+
+**Getting the plans, in process** (`test_aot`, `aot_startup_and_throughput`; best of 9; two plans: prefill 16 and decode 1, 738 nodes and 512 steps together; plan blob 75 kB):
+
+| | time |
+|---|---|
+| compiled at run time (blueprint build, passes, memory plan, lowering) | 1.36 ms |
+| from precompiled plans (parse, checks, lowering) | 0.46 ms |
+| opening the model (map, manifest, blueprint, tokenizer) | 0.27 ms |
+
+So plan mode removes about 0.9 ms of start-up for these two plans, roughly two thirds of the plan work. FORGE's run-time compile was already cheap.
+
+**Whole process** (`forge run <model> --tokens <16 ids> -n 1` for start-up, best of 25 runs for "small" and 12 for "wide"; `-n 200` for decode, best run):
+
+| | small: start-up | small: decode | wide: start-up | wide: decode |
+|---|---|---|---|---|
+| `forge run model.fpk` (plans compiled at run time) | 6.6 ms | 1608 tok/s | 73 ms | 78 tok/s |
+| `forge run` on the file with precompiled plans | 6.5 ms | 1240 tok/s | 70 ms | 57 tok/s |
+| `forge run model.so` (native library) | 8.0 ms | 1471 tok/s | 56 ms | 82 tok/s |
+| `./model` (native executable) | 5.8 ms | 1332 tok/s | 66 ms | 94 tok/s |
+
+The first two rows run the identical plan through the identical executor, so their decode difference (1608 vs 1240, 78 vs 57) is the measurement noise. Within that noise native code is neither faster nor slower at decoding. This is the expected result for the design described above: the kernels are the same object code, and the per-step overhead that native mode removes is small next to them. The native library's extra start-up on the small model is its own thread pool being created (see limits).
+
+**Build time**: generating the unit takes about 0.1 s; compiling it took 37 to 48 s for a shared library and 133 to 147 s for the executable (which also compiles the tokenizer, samplers and grammar code) on the loaded machine. Sizes: shared library 2.7 MB, executable 7.5 MB, without weights.
 
 ## Limits
 - **CPU only.** A device plan (Vulkan, CUDA, HIP, OpenCL, Level Zero, Metal, RPC, `pipe:`) holds kernels and device hooks that the backend creates per process, and the weight residency decisions depend on the device's memory budget, so device plans are not serialised. `forge aot --device X` and `FORGE_DEVICE=X forge aot` fail with that reason. At run time a model on a device ignores precompiled plans and compiles as before.
@@ -170,6 +195,8 @@ MEASURED_PLACEHOLDER
 - **Embedding weights** needs `.incbin` (GCC or Clang) and stays under `--embed-limit-mb` (default 1 GiB): the embedded file lives in read-only data of the default (small) code model, which cannot address 2 GB. Larger models keep their weights in the `.fpk`. An encrypted model cannot be embedded.
 - **Native mode needs a compiler at build time** and the build description of a FORGE build tree. On iOS, or where a process cannot be spawned, it fails with `errc::unsupported`; plan mode works everywhere. MSVC's `cl.exe` is not driven; use Clang on Windows.
 - The pass pipeline version is a constant that has to be bumped by hand when the passes, the memory planner or the lowering selection change. A stale plan that still validates would run the old (valid) graph, so the FORGE version is part of the key as well.
-- A compiled library has its own copy of the header-only runtime, including its own thread pool.
+- A compiled **shared** library has its own copy of the header-only runtime, including its own thread pool: loading it into a FORGE host creates a second set of worker threads (a few milliseconds once, and two pools in one process). The executable and a static library linked into a FORGE program have one copy.
+- Weight codecs: a plan refers to a weight by name and codec name, so every codec in `graph/codecs.hpp` is handled the same way; which kernels read it is decided by `lower_plan` at load, as at run time. Tested: f32, f16, q8_0, q4_k, q4_0, q5_1, iq4_nl, tq2_0, and q3_k on rows its 256-element block does not divide (the decoded-f32 path).
+- `forge aot` copies every section it does not know through unchanged and at its old offset; only `aot` (replaced) and `signature` (dropped) are touched.
 
-Not run: UNVERIFIED_PLACEHOLDER
+Not run: cross compilation with `--target` (the build description's libraries must be for that target); a compiler other than the one that built FORGE (GCC against a Clang build); Mach-O and PE/COFF output (`--embed-weights` uses different assembler directives there); native mode on AArch64, RISC-V, macOS and Windows; `--emit static` beyond producing the archive (no program was linked against it); native mode against an installed tree (`<prefix>/share/forge/forge_aot_sdk.txt` is installed by the `dev` component with paths relative to the prefix, and found next to `../bin/forge`, but no install was made and tried); embedding a file close to the limit; models larger than the tiny test models; an ASan or UBSan build of the tests and the fuzz target.

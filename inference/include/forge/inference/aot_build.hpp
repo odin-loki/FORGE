@@ -93,6 +93,8 @@ inline aot_sdk aot_load_sdk(const std::string& given = {}) {
         auto eq = line.find('=');
         if (line.empty() || line[0] == '#' || eq == std::string::npos) continue;
         auto key = line.substr(0, eq), val = line.substr(eq + 1);
+        // an installed description names its paths relative to the prefix: <prefix>/share/forge/forge_aot_sdk.txt
+        if (auto at = val.find("${prefix}"); at != std::string::npos) val.replace(at, 9, forge::os::dirname(forge::os::dirname(forge::os::dirname(forge::os::absolute(k.file)))));
         if (key == "cxx") k.cxx = val; else if (key == "cxx_id") k.cxx_id = val; else if (key == "ar") k.ar = val;
         else if (key == "flag") k.flags.push_back(val); else if (key == "include") k.includes.push_back(val);
         else if (key == "define") k.defines.push_back(val); else if (key == "lib") k.libs.push_back(val);
