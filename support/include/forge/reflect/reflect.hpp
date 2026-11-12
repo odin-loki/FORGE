@@ -30,6 +30,7 @@
 // <meta>). Treat it as a sketch to be fixed when one does.
 #include <forge/json/json.hpp>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -168,6 +169,15 @@ template <named_enum E> const char* enum_name(E v) { for (auto& [n, e] : forge_r
 template <named_enum E> std::optional<E> enum_from_name(std::string_view s) { for (auto& [n, e] : forge_reflect_enum(static_cast<const E*>(nullptr))) if (s == n) return e; return std::nullopt; }
 
 // ------------------------------------------------- JSON -------------------------------------------------
+namespace detail {
+// A JSON number as the integer type I; anything that is not finite or does not fit is a parse error
+// (converting an out-of-range double to an integer is undefined behaviour).
+template <class I> I int_from(double d) {
+    const double lo = std::is_signed_v<I> ? -std::ldexp(1.0, int(sizeof(I) * 8 - 1)) : 0.0, hi = std::ldexp(1.0, int(sizeof(I) * 8 - (std::is_signed_v<I> ? 1 : 0)));
+    if (!(d >= lo && d < hi)) raise(errc::parse_error, "reflect: number {} does not fit a {}-bit integer field", d, sizeof(I) * 8);
+    return I(d);
+}
+} // namespace detail
 template <class T> json::value to_json(const T& v) {
     if constexpr (std::is_same_v<T, bool>) return json::value(v);
     else if constexpr (std::is_enum_v<T>) {
@@ -195,8 +205,9 @@ template <class T> T from_json(const json::value& j) {
     if constexpr (std::is_same_v<T, bool>) return j.b();
     else if constexpr (std::is_enum_v<T>) {
         if constexpr (named_enum<T>) if (j.is_str()) { if (auto e = enum_from_name<T>(j.str())) return *e; raise(errc::parse_error, "reflect: unknown enumerator '{}'", j.str()); }
-        return T(std::underlying_type_t<T>(j.num()));
+        return T(detail::int_from<std::underlying_type_t<T>>(j.num()));
     }
+    else if constexpr (std::is_integral_v<T>) return detail::int_from<T>(j.num());
     else if constexpr (std::is_arithmetic_v<T>) return T(j.num());
     else if constexpr (std::is_same_v<T, std::string>) return j.str();
     else if constexpr (is_vec<T>::value) { T out; for (auto& e : j.arr()) out.push_back(from_json<typename T::value_type>(e)); return out; }
@@ -207,7 +218,7 @@ template <class T> T from_json(const json::value& j) {
     }
     else if constexpr (is_opt<T>::value) { if (j.is_null()) return std::nullopt; return T(from_json<typename T::value_type>(j)); }
     else if constexpr (is_var<T>::value) {
-        const std::size_t idx = std::size_t(j["index"].num());
+        const std::size_t idx = detail::int_from<std::size_t>(j["index"].num());
         if (idx >= std::variant_size_v<T>) raise(errc::parse_error, "reflect: variant index {} out of range", idx);
         T out; const json::value& val = j["value"];
         [&]<std::size_t... I>(std::index_sequence<I...>) { ((idx == I ? void(out = T(std::in_place_index<I>, from_json<std::variant_alternative_t<I, T>>(val))) : void()), ...); }(std::make_index_sequence<std::variant_size_v<T>>{});

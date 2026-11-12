@@ -71,6 +71,10 @@ TEST(reflect_json_round_trip_all_shapes) {
     CHECK_THROWS((reflect::from_json<std::variant<int, bool>>(json::parse(R"({"index":2,"value":1})"))));
     CHECK_THROWS((reflect::from_json<std::array<int, 3>>(json::parse("[1,2]"))));
     CHECK_THROWS(reflect::from_json<rt::vec3>(json::parse("[1,2,3]")));
+    // numbers that do not fit the field are errors, not undefined conversions
+    CHECK_THROWS(reflect::from_json<int>(json::parse("1e30"))); CHECK_THROWS(reflect::from_json<std::uint8_t>(json::parse("256"))); CHECK_THROWS(reflect::from_json<unsigned>(json::parse("-1")));
+    CHECK_THROWS(reflect::from_json<std::int64_t>(json::parse("9.3e18"))); CHECK(reflect::from_json<std::int8_t>(json::parse("-128")) == -128);
+    CHECK_THROWS((reflect::from_json<std::variant<int, bool>>(json::parse(R"({"index":-1,"value":1})")))); CHECK_THROWS(reflect::from_json<rt::mode>(json::parse("1e9")));
     auto partial = reflect::from_json<rt::inner>(json::parse(R"({"label":"only","unknown":[1,2]})"));   // missing keys keep defaults, unknown keys are ignored
     CHECK(partial.label == "only" && partial.pts.empty() && !partial.maybe);
     CHECK(std::string(reflect::enum_name(rt::mode::exact)) == "exact" && reflect::enum_name(rt::mode(3)) == nullptr && reflect::enum_from_name<rt::mode>("fast") == rt::mode::fast && !reflect::enum_from_name<rt::mode>("x"));
