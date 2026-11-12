@@ -97,6 +97,7 @@ int main() {
     std::println("{}", grid);
     try { grid[7] += 1; } catch (const std::exception& e) { std::println("index: {}", e.what()); }
     try { std::vector<int> it{1, 2, 3}; for (auto x : it) { if (x == 2) it.push_back(9); } } catch (const std::exception& e) { std::println("borrow: {}", e.what()); }   // forge-check: ignore[iter-mutation]
-    try { throw std::string("plain"); } catch (const std::exception& e) { std::println("string thrown: {}", e.what()); }
+    try { throw std::string("plain"); } catch (const std::exception& e) { std::println("BUG: std::exception caught a string"); } catch (const std::string& s) { std::println("string thrown: {}", s); }
+    try { throw std::runtime_error("rt"); } catch (const PermissionError& e) { std::println("BUG: a bare class name caught another class"); } catch (const std::runtime_error& e) { std::println("typed catch: {}", e.what()); }
     return 0;
 }
