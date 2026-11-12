@@ -337,7 +337,7 @@ New headers: `reactor.hpp`, `process_limits.hpp`, `dbus.hpp`, `desktop_bus.hpp`,
 | Windows, MSVC ABI | **clang-cl 23 against the MSVC STL and Windows SDK 10.0.22621** (fetched with xwin), `/std:c++latest /W4 /permissive-`: every os header on its own and every `test_os*` linked with lld-link (static CRT) | the same tests under wine 9.0: all pass. `cl.exe` itself has still not compiled the code (clang-cl accepts some things cl rejects); real Windows has not run wave 3 or 4 |
 | macOS arm64 / x86_64 | zig 0.17 (`aarch64-macos`, `x86_64-macos`): every header on its own, every test linked | **never run** (kqueue reactor backend, `CFNetworkExecuteProxyAutoConfigurationURL`, CFPreferences appearance, `ntp_adjtime`) |
 | FreeBSD 14 x86_64 | zig 0.17 (`x86_64-freebsd`): every header on its own, every test linked | **never run** (kqueue reactor backend, rctl limit groups, ConsoleKit inhibitor) |
-| Android arm64-v8a, x86_64 | **NDK r27c (clang 18, API 26)**: every os header on its own and every `test_os*` linked | **never run** (no emulator here) |
+| Android arm64-v8a, x86_64 | **NDK r27c (clang 18, API 26)**. arm64-v8a: every os header on its own and every `test_os*` linked. x86_64: the same for everything up to wave 3 plus `reactor`, `process_limits`, `dbus`, `desktop_bus`, `proxy`, `clipboard_x11`, `appearance`; the wave 4 tests and `timesync.hpp` were not reached for x86_64 (the machine ran out of disk and the NDK had to be removed) | **never run** (no emulator here) |
 | iOS | not compiled (no SDK); the iOS branches of wave 3 were re-read against the UIKit / Foundation documentation | **never run** |
 
 ### Event loop (`reactor.hpp`)
