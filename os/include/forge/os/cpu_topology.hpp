@@ -182,6 +182,25 @@ inline cpu_topology cpu_topology_query() {
 #endif
     t.physical = cores > 0 ? unsigned(cores) : n;
     for (unsigned i = 0; i < n; ++i) { logical_cpu c; c.id = i; c.core = unsigned(i / tpc); c.kind = core_kind::performance; t.cpus.push_back(c); }
+#if defined(FORGE_OS_FREEBSD) && defined(FORGE_OS_HAVE_CPUID)
+    // Intel hybrid (CPUID.7:EDX[15]): FreeBSD exports no per-CPU core type, so leaf 0x1A is read on each CPU in turn
+    // (the calling thread is moved there and its affinity restored). 0x20 = Atom (E), 0x40 = Core (P).
+    if (detail::cpuid_max(0) >= 0x1a) {
+        unsigned a = 0, b = 0, c2 = 0, d = 0; detail::cpuid(7, 0, a, b, c2, d);
+        cpuset_t old; CPU_ZERO(&old);
+        if ((d & (1u << 15)) && ::cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof old, &old) == 0) {
+            for (auto& cpu : t.cpus) {
+                if (cpu.id >= CPU_SETSIZE || !CPU_ISSET(cpu.id, &old)) continue;
+                cpuset_t one; CPU_ZERO(&one); CPU_SET(cpu.id, &one);
+                if (::cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof one, &one)) continue;
+                ::sched_yield();
+                detail::cpuid(0x1a, 0, a, b, c2, d);
+                if ((a >> 24) == 0x20) cpu.kind = core_kind::efficiency;
+            }
+            ::cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof old, &old);
+        }
+    }
+#endif
 #if defined(FORGE_OS_HAVE_CPUID)
     detail::cpuid_caches(t.caches);
 #endif

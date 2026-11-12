@@ -176,12 +176,13 @@ inline int fmt_of(const codec* c) {
              : c->name == "q5_k" ? qfmt::q5_k : qfmt::generic);
 }
 // Integer path (simd/qdot_i8.hpp): FORGE_CPU_INT8=0 turns it off, =1 forces it even when only the scalar
-// reference kernels exist (it is on by default when the CPU has a SIMD integer table).
+// reference kernels exist. Default (simd::qi8_default_on): on for x86 with a SIMD integer table, off elsewhere
+// (AArch64 has NEON / dotprod / SVE tables, opt-in with =1 until they have been timed on hardware).
 inline bool int8_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("FORGE_CPU_INT8");
         if (e && *e) return *e != '0';
-        return std::string_view(simd::qi8_active().target) != "scalar";
+        return simd::qi8_default_on();
     }();
     return on;
 }

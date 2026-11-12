@@ -1,10 +1,12 @@
 #pragma once
 // Hugging Face directory (config.json + *.safetensors + tokenizer.json) -> .fpk
 #include <forge/import/safetensors.hpp>
+#include <forge/import/hf_quant.hpp>
 #include <forge/import/quant_recipe.hpp>
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
 #include <forge/security/enforce.hpp>
+#include <forge/security/path.hpp>
 #include <forge/os/fs.hpp>
 #include <filesystem>
 #include <fstream>
@@ -31,9 +33,31 @@ inline std::string read_file(const std::filesystem::path& p) {
 #ifndef FORGE_SOURCE_DIR
 #define FORGE_SOURCE_DIR "."
 #endif
+// Directory of the running executable relative to which an installed tree keeps its templates
+// (<prefix>/bin/forge -> <prefix>/share/forge/templates). The build overrides it for non-default install dirs.
+#ifndef FORGE_TEMPLATES_RELDIR
+#define FORGE_TEMPLATES_RELDIR "../share/forge/templates"
+#endif
+// Blueprint templates (*.fbp): $FORGE_TEMPLATES when set; else <executable dir>/FORGE_TEMPLATES_RELDIR when that
+// directory exists (installed tree); else import/templates in the source tree the binary was built from.
 inline std::filesystem::path template_dir() {
     if (auto* e = std::getenv("FORGE_TEMPLATES")) return e;
+    if (auto exe = os::exe_path(); !exe.empty()) {
+        std::error_code ec;
+        auto d = (os::fs::u8path(exe).parent_path() / FORGE_TEMPLATES_RELDIR).lexically_normal();
+        if (std::filesystem::is_directory(d, ec)) return d;
+    }
     return std::filesystem::path(FORGE_SOURCE_DIR) / "import" / "templates";
+}
+// FSS CAP-3: a blueprint template is looked up by name (`--template`, import_options::template_name), so the name is
+// joined onto template_dir() with security::try_safe_join: `..`, absolute paths, drive letters, ':' and reserved
+// device names are refused, and so is a name that resolves (through a symlink) to a file outside the directory.
+inline std::filesystem::path template_path(const std::string& name) {
+    auto dir = template_dir();
+    if (name.empty()) raise(errc::invalid_argument, "template: empty name");
+    auto j =security::try_safe_join(os::fs::u8str(dir), name + ".fbp");
+    if (!j) raise(errc::invalid_argument, "template '{}': not a file inside the template directory {} ({})", name, dir.string(), j.err.what);
+    return os::fs::u8path(j.value);
 }
 
 // Substitute {{key}} with config values (numbers formatted losslessly). {{key|default}} takes `default` (may be empty)
@@ -60,6 +84,9 @@ inline std::string instantiate(std::string tpl, const json::value& cfg) {
 struct import_options {
     std::string codec = "f32"; std::string template_name;
     std::string emb_codec;   // tok_emb codec; empty = q8_0 when codec is quantised, else f32
+    // Quantised sources (GGUF files, AWQ / GPTQ checkpoints): "" or "keep" stores the quantised tensors as they are;
+    // a codec name decodes and re-quantises them (GGUF: as that codec; AWQ / GPTQ: as `codec`).
+    std::string requant;
     // Mixed precision (codec "q4_k_m"/"q5_k_m", or any override set): per-tensor types from quant_recipe.hpp.
     quant_recipe recipe;
     bool mixed() const { return is_mix_ftype(codec) || !recipe.output_type.empty() || !recipe.token_embedding_type.empty() || !recipe.tensor_types.empty() || recipe.head_bf16; }
@@ -75,6 +102,7 @@ struct import_report {
     std::string arch, template_name; std::size_t tensors = 0, bytes = 0;
     std::vector<std::string> unused;   // "name [shape]" of source tensors left out under allow_unused
     std::string license;               // the licence recorded in the manifest ("" = the source names none)
+    std::vector<std::string> notes{}; // what the import changed (transcoded types, re-quantisation warnings); the CLI prints them
 };
 
 // Buffers that checkpoints carry but no graph reads (position_ids, masked_bias, inv_freq), plus import_options::ignore_tensors.
@@ -290,9 +318,15 @@ struct expert_index {
     }
 };
 
-inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt = {}) {
+inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt_in = {}) {
     check_read(dir); check_write(out);
     auto cfg = json::parse(read_file(dir / "config.json"));
+    // AWQ / GPTQ checkpoint (hf_quant.hpp). keep (the default): quantised Linears are stored as grouped-codec blocks
+    // where they fit, everything else as f16 (these checkpoints are fp16). --codec C: decoded and encoded as C.
+    import_options opt = opt_in;
+    const auto qscheme = quant_scheme_of(cfg);
+    const bool qkeep = qscheme && (opt.requant.empty() || opt.requant == "keep");
+    if (qkeep) opt.codec = "f16";
     std::string arch0 = cfg.find("architectures") ? cfg["architectures"][0].str() : "";
     if (cfg.find("text_config") && cfg["text_config"].is_obj()) {   // multimodal wrapper (Qwen3.5): import the text model
         json::object t = cfg["text_config"].obj();
@@ -335,7 +369,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     set("rms_norm_eps", num("rms_norm_eps", 1e-6));
     set("rope_neox", 1.0);  // HF checkpoints use rotate_half (NeoX) RoPE
     // RoPE frequency scaling (linear, dynamic NTK, YaRN, llama3): rope attrs through {{rope_args|}} / {{attn_args|}}.
-    auto tpl_text = read_file(template_dir() / (tname + ".fbp"));
+    auto tpl_text = read_file(template_path(tname));   // FSS CAP-3: the name is joined safely onto template_dir()
     rope_spec rsp = rope_spec_from_hf(cfg);
     if (tname == "qwen3_5" && rsp.active()) raise(errc::unsupported, "qwen3_5: rope scaling is not supported by the template");
     if (tname != "deepseek_v2") rsp.validate(tname, tpl_text, num("head_dim", hidden / heads));   // deepseek_v2 refuses rope_scaling below
@@ -400,13 +434,20 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         for (const char* p : {"visual.", "model.visual.", "mtp.", "model.mtp."}) if (n.starts_with(p)) return true;
         return false;
     };
+    quantised_checkpoint qck(qscheme, shards);
     std::set<std::string> consumed;   // source tensors the template took: the rest is reported (check_unused)
     auto find = [&](const std::string& n) -> tensor {
         if (skipped(n)) raise(errc::not_found, "tensor {} belongs to a skipped (vision/mtp) tower", n);
+        qck.forget();
         for (auto& s : shards) if (s->has(n)) { consumed.insert(n); return s->load(n); }
+        if (qck.has(n)) {   // <base>.qweight / qzeros / scales (GPTQ: g_idx; an all-zero bias is accepted), decoded
+            auto base = n.substr(0, n.size() - 7);
+            for (const char* sfx : {".qweight", ".qzeros", ".scales", ".g_idx", ".bias"}) consumed.insert(base + sfx);
+            return qck.load(n);
+        }
         raise(errc::not_found, "{}: template '{}' needs tensor {}, which the checkpoint does not have", dir.string(), tname, n);
     };
-    auto has = [&](const std::string& n) { if (skipped(n)) return false; for (auto& s : shards) if (s->has(n)) return true; return false; };
+    auto has = [&](const std::string& n) { if (skipped(n)) return false; for (auto& s : shards) if (s->has(n)) return true; return qck.has(n); };
     // Qwen3.5 multimodal checkpoints keep the text model under model.language_model.
     std::string mp = has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
 
@@ -422,6 +463,8 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     bool in_deltanet = false;
     expert_index xi;
     auto put = [&](const std::string& n, const tensor& t, bool quantisable, std::size_t align = modelfile::alignment) {
+        // an AWQ / GPTQ Linear that fits the grouped codec keeps its codes (the tensor just read by find)
+        if (auto nat = qck.take(); nat && qkeep && quantisable && nat->shape == t.shape) { w.add_raw(n, t.shape, nat->codec, nat->blocks, align); ++rep.tensors; ++qck.n_native; return; }
         std::string c = "f32";
         if (quantisable) {
             if (opt.mixed()) {
@@ -439,14 +482,18 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         const char* src[3] = {g, u, d}; const char* proj[3] = {"gate", "up", "down"};
         for (int j = 0; j < 3; ++j) {
             tensor st;
+            std::vector<std::uint8_t> raw; std::string raw_codec; bool all_raw = qkeep;   // AWQ / GPTQ experts: stack the grouped blocks
             for (i64 e = 0; e < ne; ++e) {
                 auto t = find(std::vformat(Pfmt, std::make_format_args(e)) + src[j] + ".weight");
+                if (auto nat = qck.take(); nat && all_raw && (raw_codec.empty() || raw_codec == nat->codec)) { raw_codec = nat->codec; raw.insert(raw.end(), nat->blocks.begin(), nat->blocks.end()); ++qck.n_native; }
+                else all_raw = false;
                 if (t.shape.size() != 2) raise(errc::shape_mismatch, "expert weight {} has shape {}", src[j], shape_str(t.shape));
                 if (e == 0) { st = tensor(shape_t{ne, t.shape[0], t.shape[1]}); }
                 else if (t.shape[0] != st.shape[1] || t.shape[1] != st.shape[2]) raise(errc::shape_mismatch, "experts of layer {} differ in shape", l);
                 std::copy(t.data.begin(), t.data.end(), st.data.begin() + e * t.shape[0] * t.shape[1]);
             }
-            put(Q + "experts.w_" + proj[j], st, true, modelfile::expert_alignment);
+            if (all_raw && !raw.empty()) { w.add_raw(Q + "experts.w_" + proj[j], st.shape, raw_codec, raw, modelfile::expert_alignment); ++rep.tensors; }
+            else put(Q + "experts.w_" + proj[j], st, true, modelfile::expert_alignment);
             xi.add(w.last(), l, proj[j]);
         }
     };
@@ -557,6 +604,15 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     auto lic = hf_license(dir);   // README.md front matter + LICENSE* files: manifest fields and the `license` section
     lic.store(man, w); rep.license = lic.summary();
+    if (qscheme) {   // what the checkpoint was, and what became of its quantised Linears
+        man.emplace_back("source_quantisation", json::object{{"method", qscheme->method}, {"bits", double(qscheme->bits)}, {"group_size", double(qscheme->group_size)},
+                                                             {"linears", double(qck.n_linear)}, {"stored_as_grouped_codec", double(qck.n_native)},
+                                                             {"mode", std::string(qkeep ? "keep" : "requantised")}});
+        if (qkeep) rep.notes.push_back(std::format("{} checkpoint ({} bits, group {}): {} of {} quantised Linear layers stored as q{}_g32 blocks, the rest decoded to f16",
+                                                   qscheme->method, qscheme->bits, qscheme->group_size, qck.n_native, qck.n_linear, qscheme->bits));
+        else rep.notes.push_back(std::format("warning: {} quantised Linear layers of this {} checkpoint were decoded and encoded again as {}{}", qck.n_linear, qscheme->method, opt.codec,
+                                             opt.codec == "f32" ? "" : " (double quantisation: the error of both formats adds up)"));
+    }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     if (std::filesystem::exists(dir / "tokenizer.json")) w.set_section("tokenizer", read_file(dir / "tokenizer.json"));

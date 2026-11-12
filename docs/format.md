@@ -15,7 +15,7 @@ Readers find sections through the table, so section order on disk does not matte
 
 | Name | Required | Contents |
 |------|----------|----------|
-| `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. Optional licence fields, written when the source states them: `license` (identifier, e.g. `apache-2.0`), `license_name`, `license_link`, `license_files` (names of the files whose text is in the `license` section). HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`. GGUF imports add `source: "gguf"`, `template` and the same token/position fields. Both add `add_bos` (bool) when the source says whether prompts start with BOS (GGUF `tokenizer.ggml.add_bos_token`, HF `tokenizer_config.json` `add_bos_token`); without it, Qwen-family models get no BOS and others do. ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
+| `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. Optional licence fields, written when the source states them: `license` (identifier, e.g. `apache-2.0`), `license_name`, `license_link`, `license_files` (names of the files whose text is in the `license` section). HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`, and `source_quantisation` for AWQ / GPTQ checkpoints. GGUF imports add `source: "gguf"`, `template`, the same token/position fields, `gguf_tensor_types`, and `transcoded` / `codec` / `requantised` when the import changed a tensor's type ([modelfile.md](modelfile.md#gguf-tensor-types)). Both add `add_bos` (bool) when the source says whether prompts start with BOS (GGUF `tokenizer.ggml.add_bos_token`, HF `tokenizer_config.json` `add_bos_token`); without it, Qwen-family models get no BOS and others do. ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
 | `blueprint` | yes | Graph text (`modelfile/blueprint.hpp`): name, opset, params, states, inputs, graph, outputs and session kind (e.g. `generative_sequence`). The engine runs opsets 1 to 2 and refuses any other, naming it; opset 2 adds the `rope` frequency-scaling attrs ([modelfile.md](modelfile.md#opsets)) |
 | `tokenizer` | text models | Hugging Face style `tokenizer.json`. HF imports copy it; GGUF imports synthesise one from the GGUF vocabulary |
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
@@ -24,6 +24,13 @@ Readers find sections through the table, so section order on disk does not matte
 | `license` | no | The model's licence text as UTF-8, copied at import (Hugging Face `LICENSE*`, `LICENCE*`, `COPYING*`, `NOTICE*` files; an ONNX `doc_string` that mentions a licence). With several files each follows a `===== NAME =====` line. Never sealed; covered by the signature like every other section; `forge sign` and `forge encrypt` copy it unchanged. No format revision: readers that predate it ignore the section |
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | `{alg, nonce, mac, key_id}`. `data` is sealed with XChaCha20-Poly1305; the `tensors` JSON is bound as associated data |
+
+## Codec names
+A tensor's codec is the `codec` string of its `tensors` entry, one of the names in `graph/codecs.hpp` ([graph.md](graph.md#weight-codecs)); there are no numeric codec ids in the file. Adding a codec adds a name and does not change `forge_format_version`:
+- a reader opens files written before the codec existed unchanged;
+- a reader that does not know a codec still opens the file, lists it (`forge inspect`) and checks its hashes and signature, and fails with `unknown codec <name>` when that tensor is loaded or a session is built on it.
+
+`q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0` (the GGUF layouts of the same names) were added after the first files were written; a file that uses them needs a FORGE build that has them.
 
 ## Hashing and signing
 - Each table entry carries the BLAKE3 hash of its section bytes as stored. Each `tensors` entry carries the hash of its (plaintext) bytes.

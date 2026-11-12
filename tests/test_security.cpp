@@ -306,6 +306,45 @@ TEST(safe_join_and_canonical_within) {
     os::remove_all(root); os::remove_all(outside);
 }
 
+// CAP-3 in FORGE's own loaders: the importers look a blueprint template up by name through safe_join.
+TEST(import_template_lookup_uses_safe_join) {
+    auto root = scratch("tmpl"), outside = scratch("tmpl_out");
+    os::mkdirs(os::join(root, "vendor"));
+    CHECK(os::write_file(os::join(root, "mine.fbp"), "x")); CHECK(os::write_file(os::join(root, "vendor/v.fbp"), "x"));
+    CHECK(os::write_file(os::join(outside, "secret.fbp"), "outside")); CHECK(os::write_file(os::join(os::absolute(os::join(root, "..")), "forge_sec_tmpl_up.fbp"), "up"));
+    forge_test::set_env("FORGE_TEMPLATES", root.c_str());
+    auto p = import::template_path("mine");
+    CHECK(sec::canonical_within(os::fs::u8str(p), {root}).has_value()); CHECK(p.filename() == "mine.fbp");
+    CHECK(import::template_path("vendor/v").filename() == "v.fbp");   // a sub-directory of the template directory is fine
+    CHECK(import::template_path("not_there_yet").filename() == "not_there_yet.fbp");   // a missing file fails later, at the read
+    std::string abs_out = os::join(outside, "secret");
+    const std::string bad[] = {"../forge_sec_tmpl_up", "..\\forge_sec_tmpl_up", "vendor/../../forge_sec_tmpl_up", abs_out, "/etc/passwd", "\\\\server\\share\\t",
+                               "C:\\templates\\llama", "C:llama", "c:/x", "llama:stream", "CON", "vendor/nul", std::string("a\0b", 3), "a\nb", ""};
+    for (auto& b : bad) {
+        auto m = throws_msg<forge_exception>([&] { (void)import::template_path(b); });
+        CHECK_MSG(!m.empty() && m[0] == '!', "template name '%s' -> '%s'", b.c_str(), m.c_str());
+    }
+    try { (void)import::template_path("../forge_sec_tmpl_up"); CHECK(false); } catch (const forge_exception& e) { CHECK(e.code == errc::invalid_argument); }
+    // a link inside the template directory that points outside it
+    if (os::fs::symlink(outside, os::join(root, "link"))) {
+        CHECK(throws_msg<forge_exception>([&] { (void)import::template_path("link/secret"); })[0] == '!');
+    } else std::printf("  skip symlink case: cannot create symlinks here\n");
+    if (os::fs::symlink(os::join(outside, "secret.fbp"), os::join(root, "alias.fbp"))) {
+        CHECK(throws_msg<forge_exception>([&] { (void)import::template_path("alias"); })[0] == '!');
+    } else std::printf("  skip file symlink case: cannot create symlinks here\n");
+    // through the importers: refused before anything is read from the named file or written to the output
+    auto hf = os::join(root, "hf"); os::mkdirs(hf);
+    CHECK(os::write_file(os::join(hf, "config.json"), R"({"architectures":["LlamaForCausalLM"],"hidden_size":8,"num_attention_heads":2,"num_hidden_layers":1,"intermediate_size":16,"vocab_size":16})"));
+    auto out = os::join(root, "out.fpk");
+    import::import_options o; o.template_name = "../forge_sec_tmpl_up";
+    auto m = throws_msg<forge_exception>([&] { import::import_hf(hf, out, o); });
+    CHECK_MSG(!m.empty() && m[0] == '!' && m.find("not a file inside the template directory") != std::string::npos, "%s", m.c_str());
+    CHECK(!os::exists(out));
+    forge_test::set_env("FORGE_TEMPLATES", nullptr);
+    os::remove(os::join(os::absolute(os::join(root, "..")), "forge_sec_tmpl_up.fbp"));
+    os::remove_all(root); os::remove_all(outside);
+}
+
 // ---------------------------------------------------------------- enforce + audit
 TEST(enforce_allow_deny_and_audit) {
     auto root = scratch("enf");
