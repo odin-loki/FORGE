@@ -87,6 +87,7 @@ int usage() {
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
+        "      [--mem-limit SIZE]  hard memory cap (\"512M\", \"2G\"): managed heap, child processes, and this process at OS level\n"
         "      [--policy F]  FSS policy: capabilities from the policy, lockdown() before the script runs\n"
         "  security check [--policy F] [--json]   FSS controls: state, backend, verdict (exit 1 if a required one cannot be met)\n"
         "  run, bench, script and rpc-serve take --policy F (else $FORGE_SECURITY_POLICY, ./forge-security.json, the config\n"
@@ -610,6 +611,8 @@ int cmd_rpc_serve(const args& a) {
             if (no_proc) sp.argv.push_back("--no-proc");
             if (no_fs) sp.argv.push_back("--no-fs");
             if (no_net) sp.argv.push_back("--no-net");
+            // the same cap inside the interpreter, so a runaway script gets OutOfMemoryError before the OS cap below
+            if (mem_mb) { sp.argv.push_back("--mem-limit"); sp.argv.push_back(std::to_string(mem_mb) + "M"); }
             if (!child_policy.empty()) { sp.argv.push_back("--policy"); sp.argv.push_back(child_policy); }
             // the client's detached signature (FSS INT-2), hex so it survives the command line; the child verifies it
             if (!signature.empty()) { sp.argv.push_back("--rpc-sig"); sp.argv.push_back(security::detail::hex({reinterpret_cast<const std::uint8_t*>(signature.data()), signature.size()})); }
@@ -682,6 +685,38 @@ void script_policy(forge::script::options& o, const std::string& cli_path, const
     security::lockdown(p);
 }
 
+// forge script --mem-limit, OS part: cap this process's memory the way spawn_spec::limits caps a child
+// (os::apply_limits -> RLIMIT_AS; Windows: the job object of os::detail_proc::win_job). RLIMIT_AS counts address
+// space and a job object counts committed memory, both including what the process already uses, so the cap is
+// what is in use now plus `bytes` plus headroom (half of `bytes`, at least 64 MiB). The headroom is for what the
+// managed-heap accounting does not count (allocator overhead and reserves, thread stacks, the interpreter's own
+// structures): without it this cap would fire before the interpreter's, as a bare std::bad_alloc in the middle of
+// native code instead of a clean OutOfMemoryError at an allocation the interpreter accounts for. Returns "" when
+// applied, "unsupported" where no mechanism exists for a running process (macOS, iOS, Android and the BSDs: see
+// docs/scripting.md "Resource limits"), else the failure.
+std::string limit_own_memory(std::uint64_t bytes) {
+    bytes += std::max<std::uint64_t>(bytes / 2, 64ull << 20);
+#if defined(__linux__) && !defined(__ANDROID__)
+    unsigned long long pages = 0;
+    if (std::FILE* f = std::fopen("/proc/self/statm", "r")) { if (std::fscanf(f, "%llu", &pages) != 1) pages = 0; std::fclose(f); }
+    if (!pages) return "cannot read /proc/self/statm";
+    long page = ::sysconf(_SC_PAGESIZE);
+    os::proc_limits lim; lim.memory_bytes = pages * std::uint64_t(page > 0 ? page : 4096) + bytes;
+    return os::apply_limits(lim) ? std::string() : std::string("setrlimit(RLIMIT_AS) failed");
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;
+    std::uint64_t used = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? std::uint64_t(pmc.PagefileUsage) : 0;
+    os::proc_limits lim; lim.memory_bytes = used + bytes;
+    HANDLE job = os::detail_proc::win_job(lim, false);   // kept open for the life of the process
+    if (!job) return "CreateJobObject failed";
+    if (!AssignProcessToJobObject(job, GetCurrentProcess())) { CloseHandle(job); return "AssignProcessToJobObject failed"; }
+    return {};
+#else
+    (void)bytes;
+    return "unsupported";
+#endif
+}
+
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
@@ -710,6 +745,11 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--timeout") o.timeout_ms = std::stoull(val("--timeout"));
         else if (s == "--max-steps") o.max_steps = std::stoull(val("--max-steps"));
         else if (s == "--heap") o.heap_bytes = std::stoull(val("--heap"));
+        else if (s == "--mem-limit") {   // size string, as limit {mem: "2G"}
+            auto v = val("--mem-limit"); std::string why;
+            if (!forge::script::parse_size(v, o.mem_limit_bytes, &why)) throw std::runtime_error("--mem-limit: " + why);
+            if (!o.mem_limit_bytes) throw std::runtime_error("--mem-limit: the limit must be greater than 0");
+        }
         else if (s == "--no-proc") o.allow_proc = false;
         else if (s == "--cache-dir") o.fsc_cache_dir = val("--cache-dir");
         else if (s == "--cache-trust") o.fsc_trusted_keys.push_back(val("--cache-trust"));
@@ -759,6 +799,11 @@ int cmd_script(int argc, char** argv) {
         std::fprintf(stderr, "%s\n%s", t, e.what());
         return 1;
     }
+    // --mem-limit at OS level: after the policy lockdown (which may set its own, lower RLIMIT_AS), before any script
+    // code. The interpreter cap (options::mem_limit_bytes) applies either way.
+    if (o.mem_limit_bytes)
+        if (auto why = limit_own_memory(o.mem_limit_bytes); !why.empty() && why != "unsupported")
+            std::fprintf(stderr, "forge script: --mem-limit: no OS-level cap on this process (%s); the interpreter cap still applies\n", why.c_str());
     if (!rpc_child.empty()) {
         code.assign(std::istreambuf_iterator<char>(std::cin), {});
         o.confirm = nullptr;   // no terminal: AI-drafted code never runs remotely

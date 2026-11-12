@@ -137,6 +137,7 @@ forge script --check [--json] [--strict-check] [--module-dir DIR]... <file.cpp> 
 | `--tree` | Tree-walking interpreter only (default: compile to verified bytecode) |
 | `--debug` | Race detector, lock-order and stall deadlock detection |
 | `--timeout MS`, `--max-steps N`, `--heap BYTES` | Wall-clock limit, instruction budget, managed heap cap |
+| `--mem-limit SIZE` | Hard memory cap (`512M`, `2G`, bytes): managed heap (`OutOfMemoryError`), every child process (OS cap), and on Linux and Windows the `forge script` process itself ([scripting.md](scripting.md), "Resource limits") |
 | `--no-proc`, `--no-fs`, `--no-net` | Capability sandbox |
 | `--os-sandbox off\|best-effort\|require` | How the capability flags are also enforced by the OS sandbox |
 | `--policy FILE` | Security policy: capabilities from the policy, file operations path-scoped to its roots, `lockdown()` before the script runs ([scripting.md](scripting.md), "Security policy") |
