@@ -7,6 +7,7 @@
 // <forge/os/all.hpp> for all of them. Missing OS features return an error where os::is_unsupported(err) is true.
 // Guide: docs/os.md.
 // Errors: calls return os::result<T> (value or a native error code with a message); nothing throws.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -90,6 +91,7 @@
 #define FORGE_OS_EPOLL 1
 #if defined(__ANDROID__)
 #define FORGE_OS_ANDROID 1
+#include <android/api-level.h>
 #else
 #define FORGE_OS_LINUX 1
 #include <sys/random.h>
@@ -217,6 +219,18 @@ constexpr const char* platform_name(platform p = current()) {
                  case platform::macos: return "macos"; case platform::ios: return "ios"; case platform::freebsd: return "freebsd"; default: return "other"; }
 }
 
+// Android apps run under a seccomp policy that kills the process on a system call the platform's own libc did not
+// have yet, so calls newer than the minimum SDK are made only from the API level that introduced them. Elsewhere
+// (and for anything that is not Android) this is "every level".
+inline int android_api_level() {
+#if defined(FORGE_OS_ANDROID)
+    static const int v = android_get_device_api_level();
+    return v;
+#else
+    return 10000;
+#endif
+}
+
 #if defined(FORGE_OS_WINDOWS)
 inline std::wstring widen(std::string_view s) {
     if (s.empty()) return {};
@@ -228,11 +242,27 @@ inline std::string narrow(std::wstring_view w) {
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
     std::string s(std::size_t(n), '\0'); WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr); return s;
 }
+// A path for the W file APIs. Paths that reach MAX_PATH once made absolute are returned in the \\?\ form
+// (absolute, backslashes, \\?\UNC\ for shares), which lifts the 260-character limit without the longPathAware
+// manifest; shorter ones are passed through unchanged.
+inline std::wstring wpath(std::string_view s) {
+    std::wstring w = widen(s);
+    if (w.size() < 100 || w.rfind(L"\\\\?\\", 0) == 0 || w.rfind(L"\\\\.\\", 0) == 0) return w;
+    DWORD n = GetFullPathNameW(w.c_str(), 0, nullptr, nullptr);
+    if (n < 248) return w;   // 248: the limit for directories (MAX_PATH less an 8.3 name)
+    std::wstring full(n, L'\0'); n = GetFullPathNameW(w.c_str(), n, full.data(), nullptr);
+    if (!n || n >= full.size()) return w;
+    full.resize(n);
+    if (full.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + full.substr(2);
+    return L"\\\\?\\" + full;
+}
 // CreateProcessW whose child inherits only si's three std handles (PROC_THREAD_ATTRIBUTE_HANDLE_LIST). Plain
 // bInheritHandles=TRUE also hands the child every inheritable handle other threads hold at that moment, such
 // as another child's pipe ends; that pipe then reports no EOF until the unrelated child exits.
+// `extra`: further handles the child inherits (they must already be inheritable, e.g. from DuplicateHandle with
+// bInheritHandle = TRUE); it sees them under the same handle values.
 inline BOOL create_process_std_only(const wchar_t* app, wchar_t* cmd, DWORD flags, void* env, const wchar_t* cwd,
-                                    const STARTUPINFOW& si, PROCESS_INFORMATION& pi) {
+                                    const STARTUPINFOW& si, PROCESS_INFORMATION& pi, const std::vector<HANDLE>* extra = nullptr) {
     HANDLE self = GetCurrentProcess();
     STARTUPINFOEXW sx{}; sx.StartupInfo = si; sx.StartupInfo.cb = sizeof sx;
     HANDLE* std3[3] = {&sx.StartupInfo.hStdInput, &sx.StartupInfo.hStdOutput, &sx.StartupInfo.hStdError};
@@ -244,13 +274,15 @@ inline BOOL create_process_std_only(const wchar_t* app, wchar_t* cmd, DWORD flag
             if (k == n) { if (!DuplicateHandle(self, *p, self, &dups[n], 0, TRUE, DUPLICATE_SAME_ACCESS)) { *p = nullptr; continue; } orig[n++] = *p; }
             *p = dups[k];
         }
+    std::vector<HANDLE> list(dups, dups + n);
+    if (extra) for (HANDLE h : *extra) if (h && h != INVALID_HANDLE_VALUE && std::find(list.begin(), list.end(), h) == list.end()) list.push_back(h);
     SIZE_T sz = 0; InitializeProcThreadAttributeList(nullptr, 1, 0, &sz);
     std::vector<char> buf(sz ? sz : 1);
     auto* al = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buf.data());
-    bool init = n && InitializeProcThreadAttributeList(al, 1, 0, &sz);
-    bool attr = init && UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, dups, n * sizeof(HANDLE), nullptr, nullptr);
+    bool init = !list.empty() && InitializeProcThreadAttributeList(al, 1, 0, &sz);
+    bool attr = init && UpdateProcThreadAttribute(al, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, list.data(), list.size() * sizeof(HANDLE), nullptr, nullptr);
     if (attr) sx.lpAttributeList = al;
-    BOOL ok = CreateProcessW(app, cmd, nullptr, nullptr, n ? TRUE : FALSE, flags | (attr ? EXTENDED_STARTUPINFO_PRESENT : 0), env, cwd,
+    BOOL ok = CreateProcessW(app, cmd, nullptr, nullptr, list.empty() ? FALSE : TRUE, flags | (attr ? EXTENDED_STARTUPINFO_PRESENT : 0), env, cwd,
                              &sx.StartupInfo, &pi);
     DWORD err = ok ? 0 : GetLastError();
     if (init) DeleteProcThreadAttributeList(al);
@@ -294,7 +326,7 @@ public:
         DWORD disp = (flags & excl) ? CREATE_NEW : (flags & create) ? ((flags & truncate) ? CREATE_ALWAYS : OPEN_ALWAYS)
                    : (flags & truncate) ? TRUNCATE_EXISTING : OPEN_EXISTING;
         const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
-        HANDLE h = CreateFileW(widen(path).c_str(), acc, share, nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
+        HANDLE h = CreateFileW(wpath(path).c_str(), acc, share, nullptr, disp, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) return {{}, last_error("open " + path)};
         if (flags & append) {   // O_APPEND: a handle with FILE_APPEND_DATA but no FILE_WRITE_DATA writes at the end atomically
             DWORD a = (FILE_GENERIC_WRITE & ~DWORD(FILE_WRITE_DATA)) | ((flags & rd) ? FILE_GENERIC_READ : 0);
@@ -401,7 +433,7 @@ inline file_info stat(const std::string& path) {
     // Only symbolic links and junctions are links: other reparse points (OneDrive / cloud placeholders, dedup,
     // WSL, app-exec aliases) are ordinary files and directories. A link whose target cannot be opened (dangling,
     // or a WSL symlink Windows cannot follow) reports the link's own attributes, so it can still be removed.
-    auto w = widen(path);
+    auto w = wpath(path);
     WIN32_FILE_ATTRIBUTE_DATA d{};
     if (!GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &d)) return i;
     auto ft = [](LARGE_INTEGER v) { return (std::int64_t(v.QuadPart) - 116444736000000000LL) * 100; };
@@ -439,7 +471,7 @@ inline file_info stat(const std::string& path) {
 inline bool exists(const std::string& p) { return stat(p).exists; }
 inline status mkdir(const std::string& p) {
 #if defined(FORGE_OS_WINDOWS)
-    if (!CreateDirectoryW(widen(p).c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return {{}, last_error("mkdir " + p)};
+    if (!CreateDirectoryW(wpath(p).c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) return {{}, last_error("mkdir " + p)};
 #else
     if (::mkdir(p.c_str(), 0755) && errno != EEXIST) return {{}, last_error("mkdir " + p)};
 #endif
@@ -463,7 +495,7 @@ inline status mkdirs(const std::string& p) {
 }
 inline status remove(const std::string& p) {
 #if defined(FORGE_OS_WINDOWS)
-    auto w = widen(p);
+    auto w = wpath(p);
     if (stat(p).is_dir ? !RemoveDirectoryW(w.c_str()) : !DeleteFileW(w.c_str())) return {{}, last_error("remove " + p)};
 #else
     if (::remove(p.c_str())) return {{}, last_error("remove " + p)};
@@ -472,7 +504,7 @@ inline status remove(const std::string& p) {
 }
 inline status rename(const std::string& from, const std::string& to) {   // atomic replace where the OS allows
 #if defined(FORGE_OS_WINDOWS)
-    if (!MoveFileExW(widen(from).c_str(), widen(to).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return {{}, last_error("rename " + from)};
+    if (!MoveFileExW(wpath(from).c_str(), wpath(to).c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) return {{}, last_error("rename " + from)};
 #else
     if (::rename(from.c_str(), to.c_str())) return {{}, last_error("rename " + from)};
 #endif
@@ -482,7 +514,7 @@ struct dir_entry { std::string name; bool is_dir = false; };
 inline result<std::vector<dir_entry>> list_dir(const std::string& p) {
     std::vector<dir_entry> out;
 #if defined(FORGE_OS_WINDOWS)
-    WIN32_FIND_DATAW d{}; HANDLE h = FindFirstFileW(widen(p + "\\*").c_str(), &d);
+    WIN32_FIND_DATAW d{}; HANDLE h = FindFirstFileW(wpath(p + "\\*").c_str(), &d);
     if (h == INVALID_HANDLE_VALUE) return {{}, last_error("list " + p)};
     do { std::string n = narrow(d.cFileName); if (n != "." && n != "..") out.push_back({n, bool(d.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)}); } while (FindNextFileW(h, &d));
     FindClose(h);
@@ -1110,7 +1142,7 @@ struct exec_result { int exit_code = -1; std::string out; };
 inline result<exec_result> run(const std::vector<std::string>& argv, bool merge_stderr = false) {
     if (argv.empty()) return {{}, {-1, "run: empty argv"}};
 #if defined(FORGE_OS_IOS)
-    (void)merge_stderr; return {{}, {-1, "run: process spawning is not available on iOS"}};
+    (void)merge_stderr; return {{}, unsupported("run (process spawning on iOS)")};
 #elif defined(FORGE_OS_WINDOWS)
     std::wstring cmd;
     for (auto& a : argv) {
