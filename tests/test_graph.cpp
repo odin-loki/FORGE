@@ -209,6 +209,94 @@ TEST(state_append_symbolic_length) {
     for (float v : y.data) CHECK(std::fabs(v - 0.5f) < 1e-6f);
 }
 
+// Plans of one session share the state store, and the executor writes rows into a slot through raw pointers sized by
+// its own graph. A graph is built from the model file's blueprint, which is untrusted: one whose state row shape
+// depends on the sequence length gives every length bucket's plan another layout for the same slot. Before the
+// check, the second plan below appended 128-float rows to a buffer the first laid out with 8-float rows
+// (state_store::ensure only compared row counts): a heap overflow under ASan, silent corruption without it.
+TEST(state_slot_layout_is_fixed_by_its_first_plan) {
+    auto build = [](i64 d) {
+        tensor_graph g;
+        auto x = g.input("x", {1, 2, d});
+        auto kv = g.state_append("k0", x);
+        g.output("y", g.apply(ops::op::attention, {x, kv, kv}, {{"causal", 1.0}}));
+        return g;
+    };
+    auto run_twice = [](executor& e, i64 d) { std::vector<float> in(std::size_t(2 * d), 0.5f); for (int t = 0; t < 2; ++t) { e.set_input("x", in); e.run(); } };
+    {   // a second plan with another row shape is refused when it is lowered
+        state_store st; st.capacity = 16;
+        auto p4 = compile(build(4), &st);
+        CHECK_THROWS(compile(build(64), &st));
+        executor e(*p4, &st); run_twice(e, 4);                 // the first plan still works
+        CHECK(st.slots["k0"].len == 2);
+        auto same = compile(build(4), &st);                    // and a plan with the same layout shares the slot
+        executor e2(*same, &st); run_twice(e2, 4);
+        CHECK(st.slots["k0"].len == 4);
+    }
+    {   // paged stores allocate less than `capacity`: the same rule holds
+        state_store st; st.capacity = 64; st.page_rows = 2;
+        auto p4 = compile(build(4), &st);
+        CHECK_THROWS(compile(build(64), &st));
+    }
+    {   // the slot changes under a plan that was lowered earlier (another store, a restored prefix): refused at run time
+        state_store a, b; a.capacity = b.capacity = 16;
+        auto p4 = compile(build(4), &a);
+        auto p64 = compile(build(64), &b);
+        executor wrong(*p64, &a);                              // a holds [16, 2, 4] rows
+        std::vector<float> in(128, 0.5f);
+        wrong.set_input("x", in);
+        CHECK_THROWS(wrong.run());
+        CHECK(a.slots["k0"].len == 0);
+        executor right(*p4, &a); run_twice(right, 4);
+        CHECK(a.slots["k0"].len == 2);
+    }
+    {   // one slot, two nodes of one graph
+        state_store st; st.capacity = 16;
+        tensor_graph g;
+        auto x = g.input("x", {1, 2, 4});
+        auto k1 = g.state_append("k0", x), k2 = g.state_append("k0", x);
+        g.output("y", g.apply(ops::op::attention, {x, k1, k2}, {{"causal", 1.0}}));
+        CHECK_THROWS(compile(g, &st));
+    }
+    // one slot used as appended rows by one plan and as recurrent state (state_op) by another, in every order
+    auto conv = [](const char* slot) {
+        tensor_graph g;
+        auto x = g.input("x", {1, 4});
+        auto w = g.constant(tensor({4, 3}, 0.25f));
+        g.output("c", g.state_op(slot, "causal_conv", {x, w}));
+        return g;
+    };
+    auto append = [](const char* slot) {
+        tensor_graph g;
+        auto x = g.input("x", {1, 2, 4});
+        auto kv = g.state_append(slot, x);
+        g.output("y", g.apply(ops::op::attention, {x, kv, kv}, {{"causal", 1.0}}));
+        return g;
+    };
+    {   // appended first
+        state_store st; st.capacity = 16;
+        auto pa = compile(append("s"), &st);
+        CHECK_THROWS(compile(conv("s"), &st));
+    }
+    {   // recurrent state first, run, then an appending plan
+        state_store st; st.capacity = 16;
+        auto pc = compile(conv("s"), &st);
+        executor ec(*pc, &st); std::vector<float> in(4, 1.f); ec.set_input("x", in); ec.run();
+        CHECK(st.slots["s"].fixed);
+        CHECK_THROWS(compile(append("s"), &st));
+    }
+    {   // both lowered before either ran: the state op must not shrink the buffer under the appending plan
+        state_store st; st.capacity = 16;
+        auto pc = compile(conv("s"), &st);
+        auto pa = compile(append("s"), &st);                   // the slot is not recurrent yet: accepted, lays out [16, 2, 4]
+        executor ec(*pc, &st); std::vector<float> in(4, 1.f); ec.set_input("x", in);
+        CHECK_THROWS(ec.run());                                // was: replaced the buffer with a 4x2 one, capacity still 16
+        executor ea(*pa, &st); std::vector<float> rows(8, 0.5f);
+        for (int t = 0; t < 3; ++t) { ea.set_input("x", rows); ea.run(); }
+        CHECK(st.slots["s"].len == 3 && !st.slots["s"].fixed);
+    }
+}
+
 // Fixed-size state ops: prefill in one run == token-by-token runs (state carried in the slot), against a
 // float64 reference of the gated delta rule (l2norm on q/k, GQA-style key head sharing).
 TEST(state_ops_conv_and_delta_rule_streaming) {

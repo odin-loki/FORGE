@@ -22,8 +22,10 @@ using L = diagnostic::level;
 const std::map<std::string, std::string>& err_parent() {
     static const std::map<std::string, std::string> m = [] {
         std::map<std::string, std::string> p;
-        for (auto n : {"IOError", "OSError", "TypeError", "IndexError", "KeyError", "OverflowError", "ObjectDisposedError", "ShellError",
-                       "LimitExceededError", "NameError", "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError",
+        for (auto n : {"ValueError", "IndexError", "LengthError", "DomainError"}) p[n] = "LogicError";
+        for (auto n : {"IOError", "OSError", "OverflowError", "UnderflowError", "RangeError"}) p[n] = "RuntimeError";
+        for (auto n : {"TypeError", "KeyError", "ObjectDisposedError", "ShellError",
+                       "LimitExceededError", "NameError", "AttributeError", "ArithmeticError", "SyntaxError", "ImportError", "HostError", "BadOptionalAccess",
                        "RuntimeError", "LogicError", "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit",
                        "RaceError", "PipelineError", "PluginError", "AIError", "AccessError"}) p[n] = "Error";
         for (auto n : {"PermissionError", "TimeoutError", "OutOfMemoryError", "CancelledError", "DeadlockError", "FileNotFoundError",
@@ -40,7 +42,8 @@ const std::map<std::string, std::string>& err_parent() {
     return m;
 }
 bool err_is_a(std::string c, const std::string& anc) {
-    if (anc.empty() || anc == "..." || anc == "Error" ) return err_parent().count(c) || c == "Error";
+    if (anc.empty() || anc == "...") return true;
+    if (anc == "Error") return err_parent().count(c) || c == "Error";
     for (int g = 0; g < 8 && !c.empty(); ++g) { if (c == anc) return true; auto it = err_parent().find(c); if (it == err_parent().end()) return false; c = it->second; }
     return false;
 }

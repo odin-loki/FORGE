@@ -56,12 +56,26 @@ address-of, `reinterpret_cast`/`const_cast`/C-style casts, pointer arithmetic, e
 Supported:
 
 - Declarations: `int`, `long long`, `double`, `bool`, `char`, `std::string`, `auto`, `const`/`constexpr`, several
-  declarators, brace and paren initialisation, structured bindings `auto [k, v] = ...`. Narrowing (`int x = 3.5;`)
-  and assigning to a `const` are errors.
+  declarators, brace and paren initialisation, structured bindings `auto [k, v] = ...`. Narrowing from a literal
+  (`int x = 3.5;`) and assigning to a `const` are errors.
+- A variable keeps its declared arithmetic type: storing into an `int`, `double`, `bool` or `char` variable (`=`,
+  compound assignment, `++`/`--`) and returning from a function declared with one converts as C++ does
+  (`double x = 7; x = 1;` leaves `1.0`, `int i; i = 2.9;` leaves `2`, `int f() { return 2.7; }` returns `2`). The
+  conversion is added by the parser for named variables and return values; it is not applied to struct members,
+  container elements or values that reach a variable through a reference (see *Differences from C++*).
+- `char` is a character and a small integer: `'a' + 1` is `98`, `c - '0'` is the digit, `char n = c + 1;` and
+  `static_cast<char>(...)` convert back, `s[i]`, `s.at(i)`, `s.front()`, `*it` and `for (char c : s)` yield chars.
+  `const char*` is accepted as a string type.
+- Expressions: every C++ operator on the supported types, with C++ precedence; assignment, compound assignment
+  and `++`/`--` are expressions (`f(i++)`, `while (--n > 0)`, `a = b = c`, `v[i++] = x`); the comma operator inside
+  parentheses; `v.at(i)`, `v.front()`, `v.back()`, `std::get<N>(t)`, `*it` and `it->second` as assignment targets;
+  `std::tie(a, b) = expr;` as a statement.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (with bindings), `switch` with
-  fall-through, `break`/`continue`, `try`/`catch`/`throw`/`throw;`, `catch (...)`. There is no `finally`.
+  fall-through, `if (init; cond)` and `switch (init; value)`, `break`/`continue`,
+  `try`/`catch`/`throw`/`throw;` (see *Catch clauses*). There is no `finally`.
 - Functions with default arguments, by-value and by-reference parameters, recursion, templates (type-erased),
-  lambdas with `[=]`, `[&]`, `[x]`, `[&x]` captures and `mutable`.
+  lambdas with `[=]`, `[&]`, `[x]`, `[&x]`, `[x = expr]` captures and `mutable`. `[=]` and `[x]` copy when the
+  lambda is created; a `std::function` variable may be called from its own initialiser (`[&f]` recursion).
 - Classes and structs with value semantics, constructors with init lists and base-constructor delegation,
   `using Base::Base;`, `virtual`/`override`/pure virtual (abstract classes cannot be instantiated), static members,
   operator overloading (`+`, `==`, `<`, `<=>`, `()`, `= default` comparisons), `friend` free operators.
@@ -73,18 +87,25 @@ Standard library surface (native; the `std::` prefix is optional after `using na
 
 - I/O: `std::cout`/`cerr`/`clog` with `endl`, `flush`, `boolalpha`, `fixed`, `setprecision`, `setw`;
   `std::print`/`println`/`format` (full format specs); `std::println(stderr, ...)`.
-- `std::string` (mutable value type: `size`, `substr`, `find`, `rfind`, `find_first_of`, `push_back`, `append`,
-  `insert`, `erase`, `replace`, `starts_with`, ...), `std::string_view`.
-- Containers: `vector`, `deque`, `list`, `array`, `map`/`unordered_map`/`multimap` (`operator[]` inserts a
-  default), `set`/`unordered_set`, `pair`, `tuple`/`get<N>`/`tie`, `optional`, `any`.
+- `std::string` (mutable value type: `size`, `substr`, `find`, `rfind`, `find_first_of`, `find_last_of`,
+  `find_first_not_of`, `find_last_not_of`, `push_back`, `pop_back`, `append`, `insert`, `erase`, `replace`,
+  `resize`, `assign`, `swap`, `clear`, `compare`, `starts_with`, `ends_with`, `contains`, the substring and
+  iterator-range constructors, ...), `std::string_view`.
+- Containers: `vector`, `deque` (`push_front`, `pop_front`, `emplace_front`), `list` (`sort`, `reverse`), `array`
+  (`fill`), `span` (a read-only copy), `map`/`unordered_map` (`operator[]` inserts a default; `insert`, `emplace`,
+  `try_emplace` and `insert_or_assign` return `{iterator, inserted}`; `lower_bound`/`upper_bound` on ordered ones),
+  `set`/`unordered_set`, `pair`, `tuple`/`get<N>`/`tie`, `optional`, `any`. Vectors, pairs and tuples compare
+  lexicographically; `vector(first, last)`, `insert(pos, n, v)`, `insert(pos, first, last)`, `assign`.
 - Iterators (`begin`/`end`, `find`, `it - v.begin()`, `it->first`, `std::next`/`prev`/`distance`).
-- `<algorithm>`/`<numeric>`: `sort`, `stable_sort`, `reverse`, `find(_if)`, `count(_if)`, `any_of`/`all_of`/
-  `none_of`, `for_each`, `min/max_element`, `fill`, `iota`, `binary_search`, `transform`, `accumulate`, `reduce`,
-  `clamp`, and the `std::ranges::` forms.
+- `<algorithm>`/`<numeric>`: `sort`, `stable_sort`, `is_sorted`, `reverse`, `rotate`, `partition`,
+  `next_permutation`, `find(_if)(_not)`, `count(_if)`, `any_of`/`all_of`/`none_of`, `for_each`,
+  `min/max/minmax_element`, `lower_bound`/`upper_bound`/`binary_search`, `equal`, `fill`, `iota`, `replace`,
+  `copy(_if)`, `transform` (one or two inputs), `remove(_if)`/`unique` with `erase`, `std::erase(_if)`,
+  `back_inserter`, `accumulate`, `reduce`, `partial_sum`, `inner_product`, `gcd`, `lcm`, `min`/`max`/`clamp`, the
+  `std::ranges::` forms, and the function objects `std::less`, `std::greater`, `std::plus`, ...
 - `<cmath>`, `<cctype>`, `to_string`, `stoi`/`stol`/`stoll`/`stod`, `numeric_limits`, `std::getenv`, `std::exit`.
 - Exceptions `std::exception`, `runtime_error`, `logic_error`, `invalid_argument`, `out_of_range`, ... with
-  `what()`. They are aliases of the script error classes (`std::invalid_argument` is `ValueError`,
-  `std::out_of_range` is `IndexError`, `std::bad_alloc` is `OutOfMemoryError`, ...).
+  `what()`. They are aliases of the script error classes (table under *Errors*).
 
 ```cpp
 struct Job { std::string name; std::string cmd; };
@@ -101,6 +122,49 @@ int main() {
     return 0;
 }
 ```
+
+### Differences from C++
+
+`tests/script_conformance` compiles a set of ordinary C++23 programs with the host compiler and requires
+`forge script` (tree-walker and VM) to print exactly what the compiled program prints
+([testing.md](testing.md)). What the programs had to leave out is listed here.
+
+Rejected with a diagnostic that names the construct:
+
+- raw pointers and address-of, `new`/`delete`, `sizeof`, C-style / `reinterpret_cast` / `const_cast`, pointers to
+  members (`&T::member`), `std::stoi(s, &pos)`;
+- designated initialisers (`T{.a = 1}`), `static` local variables, `enum class` declared inside a function, a
+  range-`for` with an init-statement, `continue` inside a `switch`;
+- assignment through a reference returned by a function (`obj.at(i, j) = v`; only the standard element accessors
+  above are assignable), `catch` of a type that cannot be matched (see *Catch clauses*).
+
+Accepted but different, or failing at run time with an `AttributeError` / `TypeError` that names the member:
+
+- Integers are 64-bit and checked: overflow raises `OverflowError`, unsigned types do not wrap, `int` does not
+  truncate to 32 bits.
+- Types are checked dynamically. The parser converts on stores into named `int` / `double` / `bool` / `char`
+  variables and on returns; a `double` struct member or `std::vector<double>` element initialised or assigned from
+  an `int` keeps the `int` (`p.w = 3; p.w / 2` is `1`). Write `3.0`.
+- Functions and constructors are not overloaded on parameter types. Constructors may differ in argument count;
+  a user-defined copy constructor replaces a one-argument constructor (copying is member-wise, done by the
+  runtime). Other overloads (a unary and a binary `operator-` in one class, const / non-const pairs that differ in
+  behaviour) are not distinguished: the last one wins. User `operator++`/`--`, `operator[]`, conversion operators
+  and delegating constructors (`T() : T(0) {}`) are not supported; `<=>` works only as `= default`.
+- A base class with constructors of several argument counts cannot be initialised from a derived constructor's
+  initialiser list, and a vector member cannot be initialised as `rows(n, value)` there (build it in the body).
+- Templates are type-erased: `T x{};` has no value, and a template cannot be specialised.
+- A moved-from variable cannot be read at all (`BorrowError`), not even compared with `nullptr`.
+- `std::optional<int>` holding a value is the value: `o.reset()` and `o.emplace(x)` work on a named variable only
+  as `o.reset()` / `o = x`. `p.use_count()` is not available on class objects.
+- Reverse iterators (`rbegin`/`rend`), `std::multimap` / `std::multiset` (parsed as map / set: one entry per key),
+  map keys other than numbers, bools and strings (no `std::pair` keys), `std::span::subspan`/`first`/`last` and
+  writing through a span, `std::string_view::remove_prefix`/`remove_suffix`, `std::sort` on a string,
+  `std::stoi` with a base, `reserve`/`capacity` on strings, nested brace elision for `std::array<std::array>`.
+- Structured bindings by reference (`auto& [a, b] = s;`) copy scalar members. A reference to an object with a
+  destructor (`Base& b = d;`) can run that destructor twice at scope exit (known bug).
+- The order in which a container destroys its elements is forward (libc++ and libstdc++ destroy a vector in
+  reverse).
+- `throw "text";` throws a string: `catch (const char*)` and `catch (const std::string&)` both match it.
 
 ## Memory model
 
@@ -138,15 +202,75 @@ int main() {
 
 ## Errors
 
-All errors derive from `Error` (fields `message`, `trace`, `line`; `what()` returns the message). User classes may
-derive from `Error` or from the `std::` exception names.
+All built-in errors derive from `Error` (fields `message`, `trace`, `line`; `what()` returns the message). User
+classes may derive from `Error` or from the `std::` exception names; a user class's own `line` or `trace` member is
+left alone.
 
 | group | classes |
 |---|---|
-| general | `IOError`, `OSError`, `TypeError`, `ValueError`, `IndexError`, `KeyError`, `NameError`, `AttributeError`, `ArithmeticError` (also `ZeroDivisionError`), `OverflowError`, `SyntaxError`, `ImportError`, `RuntimeError`, `LogicError`, `RecursionError`, `SystemExit` |
+| general | `TypeError`, `KeyError`, `NameError`, `AttributeError`, `ArithmeticError` (also `ZeroDivisionError`), `SyntaxError`, `ImportError`, `RecursionError`, `BadOptionalAccess`, `SystemExit` |
+| under `LogicError` | `ValueError`, `IndexError`, `LengthError`, `DomainError` |
+| under `RuntimeError` | `IOError`, `OSError`, `OverflowError`, `UnderflowError`, `RangeError` |
 | runtime safety | `BorrowError`, `NullPointerError`, `FrozenError`, `AccessError`, `ObjectDisposedError`, `RaceError` |
 | features | `ShellError`, `LimitExceededError`, `PipelineError`, `PluginError`, `AIError`, `HostError` |
 | under `OSError` | `PermissionError` (subclass `SandboxViolationError`), `TimeoutError`, `OutOfMemoryError`, `CancelledError`, `DeadlockError`, `FileNotFoundError`, `FileExistsError`, `NotADirectoryError`, `IsADirectoryError`, `NotSupportedError`, `InterruptedError`, `BlockingIOError`, `ProcessLookupError`, `NoSpaceError`, `TooManyFilesError`, `BusyError`, `ReadOnlyFileSystemError`, `SignalError`, `ConnectionError` (subclasses `ConnectionRefusedError`, `ConnectionResetError`, `BrokenPipeError`), `SecurityError` (subclasses `IntegrityError`, `PolicyViolation`) |
+
+**The `std::` names** are these classes, and the tree follows `<stdexcept>`: `catch (const std::logic_error&)`
+handles `std::invalid_argument` and `std::out_of_range`, `catch (const std::runtime_error&)` handles
+`std::overflow_error`, `std::system_error` (every `OSError`) and I/O errors.
+
+| C++ name | class | C++ name | class |
+|---|---|---|---|
+| `std::exception`, `forge::error` | `Error` | `std::runtime_error` | `RuntimeError` |
+| `std::logic_error` | `LogicError` | `std::overflow_error` | `OverflowError` |
+| `std::invalid_argument` | `ValueError` | `std::underflow_error` | `UnderflowError` |
+| `std::out_of_range` | `IndexError` | `std::range_error` | `RangeError` |
+| `std::length_error` | `LengthError` | `std::system_error` | `OSError` |
+| `std::domain_error` | `DomainError` | `std::filesystem::filesystem_error`, `std::ios_base::failure` | `IOError` |
+| `std::bad_alloc` | `OutOfMemoryError` | `std::bad_cast`, `std::bad_any_cast` | `TypeError` |
+| `std::bad_optional_access` (`o.value()` on an empty optional) | `BadOptionalAccess` | | |
+
+Differences from C++ that follow from the aliasing: the errors the runtime itself raises are script classes, so
+`std::stoi("x")` is a `ValueError` (`std::invalid_argument`) and `v.at(9)` an `IndexError` (`std::out_of_range`) as
+in C++, but integer overflow is an `OverflowError` and so a `std::runtime_error`, and `OutOfMemoryError` is an
+`OSError` and so also a `std::runtime_error`. Other `std::` exception types (`std::bad_function_call`,
+`std::format_error`, `std::regex_error`, ...) are not supported in a catch clause: the parser says so.
+
+### Catch clauses
+
+`try { ... } catch (T x) { ... }` with any number of clauses; the first clause that matches handles the error.
+`throw expr;` throws any value; `throw;` in a handler rethrows the caught value with its dynamic type. A
+function-try-block (`int f() try { ... } catch (...) { ... }`) is accepted for functions, not for constructors.
+
+| clause | handles |
+|---|---|
+| `catch (...)` | everything catchable |
+| a class: `catch (const E& e)`, `catch (E e)`, `catch (E&)`; qualified (`forge::PermissionError`, `std::out_of_range`) or not (`PermissionError`) | an object of class `E` or of a class derived from it, user-defined or built-in. Nothing else: a class clause is never a catch-all, and `catch (const std::exception&)` does not handle a thrown `int`, string or plain struct |
+| `catch (int)`, `catch (double)`, `catch (bool)`, `catch (char)` | a value of exactly that kind (no arithmetic conversions; every integer type is `int`, enum values are `int`) |
+| `catch (const std::string&)`, `catch (std::string_view)`, `catch (const char*)` | a thrown string (`throw "text";` and `throw std::string("text");` are the same here) |
+| `catch (const std::vector<T>&)`, `catch (const std::map<K, V>&)` | a thrown list / map (element types are not checked) |
+
+By value, by reference and by const reference match the same way; the handler's variable is the thrown object.
+A name the parser does not know as a type is taken as a class name and looked up when the error is matched, so a
+class that does not exist matches nothing. `catch (auto)`, a template parameter, `std::any`, `std::optional`, smart
+pointers and `std::function` are syntax errors that name the type. Local destructors and `defer` blocks run while
+the error unwinds, innermost first, before the handler. The tree-walker and the VM share one implementation
+(`Interp::run_try`, `Interp::catch_matches`). Tests: `tests/script/catch_types.fs`, `catch_clause_types`.
+
+**Errors no clause can handle.** These end the run (or the block), and pass through every catch clause, including
+`catch (...)`, in every function, lambda and task; a script cannot outlive them by catching and carrying on:
+
+| error | when |
+|---|---|
+| `std::exit(n)` (`SystemExit`) | always; from any thread it ends the whole run with status `n` |
+| `TimeoutError`, `LimitExceededError` from the whole-run limits | `--timeout` / `options::timeout_ms`, `--max-steps` / `options::max_steps` |
+| `CancelledError` | SIGINT / SIGTERM / `engine::interrupt()`; a cancelled task (`t.cancel()`) inside that task |
+| `TimeoutError` / `LimitExceededError` of a `limit {.timeout}` / `limit {.cpu_s}` block | inside that block; outside it the error is an ordinary one and can be caught |
+
+Destructors and `defer` blocks still run while such an error unwinds, for at most 100 ms; after that the error is
+raised again inside them. Every other error is catchable, including `OutOfMemoryError` (the heap cap re-arms, so
+catching it does not lift the limit) and the `allocs`, `handles` and `procs` limit errors. Test:
+`fatal_errors_pass_through_catch`.
 
 - `catch (const OSError& e)` catches every OS-level error. OS error codes (errno, GetLastError, WSA, NTSTATUS,
   Mach) map to these classes in `forge/os/oserror.hpp`. `EPERM` becomes `SandboxViolationError` only when the active
@@ -309,7 +433,10 @@ The body sees and changes the enclosing locals. In the statement form `return` i
 cap and the smaller child limits. Each `handles`/`procs` block has its own counter, and an acquisition counts against
 every enclosing block. Tasks started inside a block (`std::async`, `std::thread`, `forge::parallel`) and modules it
 imports share its `handles`/`procs` counters, child limits and deadline; `cpu_s` and `allocs` count only the thread
-that entered the block. A limit that fires is switched off until its block exits, so `catch` code can still run.
+that entered the block. An `allocs`, `handles` or `procs` limit that fires is switched off until its block exits, so
+`catch` code inside the block can still run. A `timeout` or `cpu_s` limit that fires cannot be caught inside its
+block (see *Catch clauses*): the error leaves the block, where it can be caught, and clean-up code on the way out
+gets 100 ms.
 Over `handles` the new resource is closed again before the error; over `procs` nothing is started.
 
 Whole-run limits (`options` / CLI): `max_steps` (`--max-steps`), `timeout_ms` (`--timeout`), `heap_bytes`
@@ -462,7 +589,8 @@ pp.shutdown();                                              // also pp.size(), p
 - **Time limits in the caller**: `f.get(ms)` raises `TimeoutError` after `ms`. A `get` inside a `limit {.timeout}`
   block or a run with `--timeout` raises `TimeoutError` at that deadline. `shutdown()` and closing the pool never
   wait past that deadline: workers still busy are killed.
-- **Errors** keep their type (`ValueError` in the task is `ValueError` in the caller). A crashed worker raises
+- **Errors** keep their type (`ValueError` in the task is `ValueError` in the caller). A task the worker's static
+  checks refuse because it is certain to use a capability the worker lacks raises `PermissionError`. A crashed worker raises
   `SignalError` and is replaced. A task's print output (up to 1 MiB) is replayed in the caller when its result is
   collected.
 - **Limits**: each worker counts against `procs`; the pool and each future count against `handles`.
@@ -498,7 +626,8 @@ int v = forge::remote_call("box2:7000", score, {"a", 5}, {{"token", tok}});     
   variable. Two different values under one captured name, and namespaced names, are refused too.
 - **Sandbox**: the function runs like a `forge::remote` script, with the node's timeout, memory cap and
   capabilities.
-- **Result**: the return value comes back typed. An exception keeps its type (message prefixed `remote: `); the
+- **Result**: the return value comes back typed. An exception keeps its type (message prefixed `remote: `; a
+  function the node's static checks refuse for a denied capability raises `PermissionError`); the
   node's print output is replayed first. Authentication failures raise `PermissionError`, connection failures
   `IOError`.
 
@@ -715,7 +844,7 @@ lambdas, containers and maps, exceptions, floating point, templates, tasks, `def
 | fish | `.fish` | – |
 | pwsh, powershell (output avoids 7-only syntax) | `.ps1` | – (`forge::sh` needs an `sh` on PATH on Windows) |
 | xonsh (plain Python) | `.xsh` | – |
-| elvish | `.elv` | – |
+| elvish (0.20+) | `.elv` | – |
 | nu | `.nu` | functions that read or write script-level variables |
 | tcsh, csh | `.csh` | functions other than `main`, `fs.read`, `forge::sh` results |
 | cmd | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |
@@ -772,7 +901,7 @@ Suppress with `// forge-check: ignore` or `// forge-check: ignore[id,id]` on the
 | `shadow` | warning | local redeclaring a name from an enclosing block of the same function |
 | `missing-return` | warning | non-void function that can fall off its end |
 | `arg-count` | warning | call of a top-level script function with too few or too many arguments |
-| `catch-order` | warning | a catch after `catch (...)` or after a built-in ancestor (e.g. `OSError` before `TimeoutError`) |
+| `catch-order` | warning | a catch after `catch (...)` or after a built-in ancestor (e.g. `OSError` before `TimeoutError`, `std::runtime_error` before `OSError`) |
 | `infinite-loop` | warning | `while (true)`/`for (;;)` with no break, return, throw or exit |
 | `format` | warning | format literal whose placeholder count does not match the arguments |
 | `deprecated` | warning | removed std APIs (`std::random_shuffle`, `std::auto_ptr`, `std::bind1st`, ...) and script functions or methods marked `[[deprecated]]` |
@@ -837,7 +966,8 @@ script but are not asserted individually.
 - **Host bindings**: `define(name, min, max, fn)` adds a native function (`name` may be qualified, e.g.
   `"ui::find"`). Values cross as JSON text. A script function passed as an argument arrives as `{"$callback": id}`;
   call it later with `call(id, args_json)` and free it with `release(id)`. A host function that throws raises
-  `HostError` in the script. Test: `host_bindings`.
+  `HostError` in the script; a `forge::security` or typed OS exception keeps its class (`IntegrityError`,
+  `PermissionError`, `FileNotFoundError`, ...). Test: `host_bindings`.
 
 ## Testing
 

@@ -380,6 +380,144 @@ TEST(limits) {
     r = run1("while (true) { }", true, o); CHECK(r.r.error_type == "TimeoutError");
 }
 
+// Whole-run limits, std::exit and cancellation end the run: no catch clause may swallow them, in any form, at any
+// depth, in handlers, lambdas or tasks. A limit {.timeout / .cpu_s} block that fires cannot be caught inside the
+// block (the body would carry on with the limit switched off) but is an ordinary error outside it.
+TEST(fatal_errors_pass_through_catch) {
+    const char* forms[] = {
+        "catch (...) { std::println(\"swallowed\"); }",
+        "catch (const std::exception& e) { std::println(\"swallowed\"); }",
+        "catch (const TimeoutError& e) { std::println(\"swallowed\"); }",
+        "catch (const forge::TimeoutError& e) { std::println(\"swallowed\"); }",
+        "catch (const LimitExceededError& e) { std::println(\"swallowed\"); }",
+        "catch (const OSError& e) { std::println(\"swallowed\"); }",
+        "catch (const SystemExit& e) { std::println(\"swallowed\"); }",
+        "catch (const CancelledError& e) { std::println(\"swallowed\"); }",
+        "catch (const std::runtime_error& e) { std::println(\"swallowed\"); } catch (...) { std::println(\"swallowed\"); }",
+    };
+    for (bool vm : {false, true}) for (auto* f : forms) {
+        std::string c = f;
+        // scripts that would run for ever if they could catch the error
+        std::string spin = "int n = 0;\nwhile (true) { try { while (true) { n++; } } " + c + " }\n";
+        std::string nested = "void inner() { try { while (true) {} } " + c + " }\nvoid outer() { while (true) { try { inner(); } " + c + " } }\nouter();\n";
+        std::string lambda = "auto f = [] { try { while (true) {} } " + c + " };\nwhile (true) { try { f(); } " + c + " }\n";
+        std::string rethrow = "while (true) { try { try { while (true) {} } catch (...) { std::println(\"swallowed\"); throw; } } " + c + " }\n";
+        for (auto* src : {&spin, &nested, &lambda, &rethrow}) {
+            script::options o; o.timeout_ms = 60;
+            auto r = run1(*src, vm, o);
+            CHECK_MSG(r.r.error_type == "TimeoutError" && r.text == "!TimeoutError", "timeout, vm=%d, %s -> %s", int(vm), f, r.text.c_str());
+            o = {}; o.max_steps = 20000;
+            r = run1(*src, vm, o);
+            CHECK_MSG(r.r.error_type == "LimitExceededError" && r.text == "!LimitExceededError", "steps, vm=%d, %s -> %s", int(vm), f, r.text.c_str());
+        }
+        // std::exit is not an exception: handlers do not run, the exit code is the argument
+        auto r = run1("void quit() { std::exit(7); }\ntry { try { quit(); } " + c + " } " + c + "\nstd::println(\"still running\");\n", vm);
+        CHECK_MSG(r.r.ok && r.r.exit_code == 7 && r.text.empty(), "exit, vm=%d, %s -> %s (%d)", int(vm), f, r.text.c_str(), r.r.exit_code);
+        // a limit block's own timeout: not catchable inside the block, catchable outside it
+        r = run1("int rounds = 0;\ntry { limit {.timeout = \"40ms\"} { while (true) { try { while (true) {} } " + c + " rounds++; } } }\n"
+                 "catch (const TimeoutError& e) { std::println(\"outside: {} rounds\", rounds); }\nstd::println(\"after\");\n", vm);
+        CHECK_MSG(r.r.ok && r.text == "outside: 0 rounds\nafter\n", "limit block, vm=%d, %s -> %s", int(vm), f, r.text.c_str());
+        r = run1("int rounds = 0;\ntry { limit {.cpu_s = \"40ms\"} { while (true) { try { while (true) {} } " + c + " rounds++; } } }\n"
+                 "catch (const LimitExceededError& e) { std::println(\"outside: {} rounds\", rounds); }\nstd::println(\"after\");\n", vm);
+        CHECK_MSG(r.r.ok && r.text == "outside: 0 rounds\nafter\n", "cpu block, vm=%d, %s -> %s", int(vm), f, r.text.c_str());
+    }
+    // nested blocks: the outer block's deadline is fatal through the inner block and its handlers too
+    EXPECT("try { limit {.timeout = \"40ms\"} { try { limit {.timeout = \"10s\"} { while (true) {} } } catch (...) { std::println(\"inner swallowed\"); } while (true) {} } }\n"
+           "catch (const TimeoutError&) { std::println(\"outer\"); }", "outer\n");
+    // an inner block's own deadline is catchable in the outer block, which carries on
+    EXPECT("limit {.timeout = \"10s\"} { try { limit {.timeout = \"30ms\"} { while (true) {} } } catch (const TimeoutError&) { std::println(\"inner timed out\"); } std::println(\"outer goes on\"); }",
+           "inner timed out\nouter goes on\n");
+    // destructors still run while a fatal error unwinds, but cannot keep the run alive
+    {
+        script::options o; o.timeout_ms = 60;
+        std::string src = "struct G { ~G() { std::println(\"~G\"); } };\nvoid f() { G g; while (true) {} }\ntry { f(); } catch (...) { std::println(\"swallowed\"); }\n";
+        for (bool vm : {false, true}) { auto r = run1(src, vm, o); CHECK_MSG(r.text == "~G\n!TimeoutError", "vm=%d: %s", int(vm), r.text.c_str()); }
+        src = "struct G { ~G() { while (true) {} } };\nvoid f() { G g; while (true) {} }\ntry { f(); } catch (...) { std::println(\"swallowed\"); }\n";
+        for (bool vm : {false, true}) { auto r = run1(src, vm, o); CHECK_MSG(r.text == "!TimeoutError", "vm=%d: %s", int(vm), r.text.c_str()); }
+    }
+    // a task that exits ends the whole run; a task cannot outlive the run's timeout by catching it
+    for (bool vm : {false, true}) {
+        auto r = run1("auto t = std::async([] { try { std::exit(5); } catch (...) {} return 1; });\ntry { t.get(); } catch (...) { std::println(\"swallowed\"); }\nwhile (true) {}\n", vm);
+        CHECK_MSG(r.r.ok && r.r.exit_code == 5 && r.text.empty(), "task exit, vm=%d: %s (%d)", int(vm), r.text.c_str(), r.r.exit_code);
+        script::options o; o.timeout_ms = 80;
+        r = run1("auto t = std::async([] { while (true) { try { while (true) {} } catch (...) {} } return 1; });\ntry { t.get(); } catch (...) { std::println(\"swallowed\"); }\n", vm, o);
+        CHECK_MSG(r.text == "!TimeoutError", "task timeout, vm=%d: %s", int(vm), r.text.c_str());
+    }
+    // the next run of the same engine starts clean (REPL: a timed-out line does not poison the session)
+    {
+        std::string out; script::options o; o.timeout_ms = 50; o.out = [&](std::string_view s) { out += s; };
+        script::engine e(o);
+        auto r = e.run("try { while (true) {} } catch (...) {}", "<t>");
+        CHECK(!r.ok && r.error_type == "TimeoutError");
+        r = e.run("try { throw std::runtime_error(\"x\"); } catch (const std::exception& e) { std::println(\"caught {}\", e.what()); }", "<t>");
+        CHECK_MSG(r.ok && out == "caught x\n", "%s / %s", out.c_str(), r.error.c_str());
+    }
+    // ordinary limit errors stay catchable (the heap cap re-arms, so catching does not lift it)
+    EXPECT("try { limit {.mem = \"64K\"} { std::vector<std::string> xs; while (true) xs.push_back(std::string(64, 'x')); } } catch (const std::bad_alloc& e) { std::println(\"oom\"); }", "oom\n");
+}
+
+// Catch clauses, the parts a golden file cannot show: diagnostics for types that cannot be caught, and that a named
+// type never parses as a catch-all (tests/script/catch_types.fs has the matching rules).
+TEST(catch_clause_types) {
+    EXPECT("try { throw std::runtime_error(\"x\"); } catch (const PermissionError& e) { std::println(\"wrong\"); }", "!RuntimeError");
+    EXPECT("try { throw std::runtime_error(\"x\"); } catch (PermissionError) { std::println(\"wrong\"); }", "!RuntimeError");
+    EXPECT("try { throw 1; } catch (const std::exception& e) { std::println(\"wrong\"); }", "!Error");
+    EXPECT("using namespace std;\ntry { throw out_of_range(\"x\"); } catch (const logic_error& e) { println(\"logic {}\", e.what()); }", "logic x\n");
+    EXPECT("using namespace forge;\ntry { fs::read(\"/no/such/file/anywhere\"); } catch (const PermissionError& e) { std::println(\"wrong\"); } catch (const std::exception& e) { std::println(\"other\"); }", "other\n");
+    for (auto* bad : {"catch (auto e) {}", "catch (std::any& a) {}", "catch (const std::bad_function_call& e) {}", "catch (std::optional<int> o) {}", "catch (std::function<void()> f) {}"}) {
+        auto r = run1(std::string("try { throw 1; } ") + bad, true);
+        CHECK_MSG(r.r.error_type == "SyntaxError" && r.r.error.find("catch") != std::string::npos, "%s -> %s", bad, r.r.error.c_str());
+    }
+    { auto r = run1("template <typename T> void f() { try { throw 1; } catch (const T& e) {} }", true); CHECK_MSG(r.r.error_type == "SyntaxError", "%s", r.r.error.c_str()); }
+    // a user exception's own `line` member is not overwritten by the throw site
+    EXPECT("struct E : std::runtime_error { int line; E(const std::string& m, int l) : std::runtime_error(m), line(l) {} };\ntry { throw E(\"m\", 12); } catch (const E& e) { std::println(\"{} {}\", e.what(), e.line); }", "m 12\n");
+    // function-try-block
+    EXPECT("int f(int x) try { if (x > 1) throw std::invalid_argument(\"big\"); return x; } catch (const std::invalid_argument& e) { return -1; }\nstd::println(\"{} {}\", f(1), f(5));", "1 -1\n");
+}
+
+// Holes found by the conformance sweep (tests/script_conformance compares whole programs with the host compiler; these
+// are the same points without needing one).
+TEST(cpp_conformance_holes) {
+    // assignment and ++ / -- are expressions
+    EXPECT("int twice(int x) { return 2 * x; }\nint n = 1;\nstd::println(\"{} {}\", twice(n++), n);\nstd::println(\"{} {}\", twice(++n), n);", "2 2\n6 3\n");
+    EXPECT("std::vector<int> v{10, 20, 30}; int p = 0;\nstd::print(\"{} \", v[p++]); std::print(\"{} \", v[p++]); v[p]++; ++v[0];\nstd::println(\"{} {} {}\", p, v[0], v[2]);", "10 20 2 11 31\n");
+    EXPECT("int c = 0; while (c++ < 3) std::print(\"{} \", c);\nint a, b; a = b = 7; int d = (a += 2) * 2;\nstd::println(\"| {} {} {} {}\", c, a, b, d);", "1 2 3 | 4 9 7 18\n");
+    EXPECT("int k = 5; int old = k--; int now = --k; int m = (1, 2, k + 1);\nstd::println(\"{} {} {} {}\", old, now, k, m);", "5 3 3 4\n");
+    // element references as assignment targets
+    EXPECT("std::vector<int> v{1, 2, 3}; v.at(1) = 20; v.front() += 5; v.back()--;\nauto it = v.begin(); *it = 9; ++*it;\nstd::tuple<int, std::string> t{1, \"a\"}; std::get<0>(t) = 4;\nint x = 0, y = 0; std::tie(x, y) = std::make_pair(7, 8);\nstd::println(\"{} {} {} {} {} {}\", v[0], v[1], v[2], std::get<0>(t), x, y);", "10 20 2 4 7 8\n");
+    EXPECT("std::map<std::string, int> m{{\"a\", 1}}; auto it = m.find(\"a\"); it->second *= 5; std::println(\"{}\", m[\"a\"]);", "5\n");
+    EXPECT("struct M { int at(int i) const { return i; } };\nM m; m.at(1, 2) = 3;", "!SyntaxError");
+    // a variable keeps its declared arithmetic type
+    EXPECT("double x = 7; x = 1; int i = 3; i = 7.9; i += 1.5; double d = 1; d += 1;\nstd::println(\"{} {} {}\", x / 2, i, d / 4);", "0.5 8 0.5\n");
+    EXPECT("int g() { return 2.7; }\ndouble h() { return 1; }\nbool b = 5; int t = b + b;\nstd::println(\"{} {} {} {}\", g(), h() / 2, b, t);", "2 0.5 true 2\n");
+    // char is a character and a small integer
+    EXPECT("char c = 'a'; char n = c + 1; c++; int d = '7' - '0';\nstd::println(\"{} {} {} {} {}\", n, c, d, 'A' + 0, static_cast<char>('A' + 25));", "b b 7 65 Z\n");
+    EXPECT("int s = 0; for (char ch : std::string(\"1234\")) s += ch - '0';\nstd::string w = \"ab\"; w += 'c'; w.push_back(static_cast<char>(w[0] + 3));\nstd::println(\"{} {} {}\", s, w, w[1] == 'b');", "10 abcd true\n");
+    EXPECT("try { throw 'x'; } catch (int) { std::println(\"int\"); } catch (const std::string&) { std::println(\"string\"); } catch (char c) { std::println(\"char {}\", c); }", "char x\n");
+    // members that were missing
+    EXPECT("#include <deque>\nstd::deque<int> d{2}; d.push_front(1); d.emplace_front(0); d.push_back(3); d.pop_front();\nstd::println(\"{} {} {}\", d.front(), d.back(), d.size());", "1 3 3\n");
+    EXPECT("std::string s = \"abcdef\"; s.resize(3); std::string t = s; t.resize(5, '.'); s.assign(2, 'z'); t.insert(0, 2, '>');\nstd::println(\"{} {} {} {}\", s, t, t.find_last_not_of(\".\"), std::string(t, 2, 3));", "zz >>abc.. 4 abc\n");
+    EXPECT("std::vector<int> v{5, 3, 8, 3}; std::vector<int> w(v.begin() + 1, v.end());\nv.erase(std::remove(v.begin(), v.end(), 3), v.end()); w.insert(w.begin(), 2, 0); w.assign({1, 2});\nstd::sort(v.begin(), v.end(), std::greater<int>());\nstd::println(\"{} {} {} {}\", v, w, std::lower_bound(w.begin(), w.end(), 2) - w.begin(), std::gcd(12, 18));", "[8, 5] [1, 2] 1 6\n");
+    EXPECT("std::set<int> s{5, 1}; auto [it, fresh] = s.insert(3); std::map<int, int> m; m[5] = 1; m[2] = 2;\nstd::println(\"{} {} {} {}\", *it, fresh, m.begin()->first, *s.lower_bound(2));", "3 true 2 3\n");
+    EXPECT("std::println(\"[{:{}}] [{:.{}f}]\", 7, 4, 3.14159, 2);\nstd::cout << std::left << std::setw(4) << 42 << '|' << std::right << std::setfill('0') << std::setw(5) << 42 << '|' << std::hex << 255 << '\\n';", "[   7] [3.14]\n42  |00042|ff\n");
+    // [=] copies when the lambda is created; a std::function may call itself; std::optional functions may return {}
+    EXPECT("int main() { int base = 10; auto f = [=] { return base * 2; }; auto g = [&] { return base * 2; }; base = 20; std::println(\"{} {}\", f(), g()); return 0; }", "20 40\n");
+    EXPECT("std::function<int(int)> fact = [&fact](int n) { return n <= 1 ? 1 : n * fact(n - 1); };\nstd::optional<std::string> none() { return {}; }\nstd::println(\"{} {}\", fact(5), none().value_or(\"empty\"));", "120 empty\n");
+    EXPECT("struct P { int v; std::shared_ptr<P> next; };\nauto a = std::make_shared<P>(P{1, nullptr}); auto b = std::make_shared<P>(P{2, a}); auto c = b; c.reset();\nstd::println(\"{} {}\", b->next->v, c == nullptr);", "1 true\n");
+    EXPECT("struct V { int major = 0, minor = 0; auto operator<=>(const V&) const = default; };\nV a{1, 2}, b{1, 10}; std::pair<int, int> p{1, 2}, q{1, 3};\nstd::println(\"{} {} {} {}\", a < b, a >= b, p < q, std::vector<int>{1, 2} < std::vector<int>{1, 3});", "true false true true\n");
+    EXPECT("std::println(\"{} {} {}\", 017, true + true, std::isdigit('7') != 0);", "15 2 true\n");
+    // constructs outside the subset say what they are
+    for (auto [src, word] : std::vector<std::pair<const char*, const char*>>{
+             {"struct C { int a; int b; }; C c{.a = 1, .b = 2};", "designated"},
+             {"int f() { static int n = 0; return ++n; }", "static local"},
+             {"void f() { enum class E { a, b }; }", "enum class"},
+             {"std::vector<int> v{1}; for (int base = 1; int x : v) {}", "range-for with an init"},
+             {"int x = 1; auto p = &x;", "address"}}) {
+        auto r = run1(src, true);
+        CHECK_MSG(r.r.error_type == "SyntaxError" && r.r.error.find(word) != std::string::npos, "%s -> %s", src, r.r.error.c_str());
+    }
+}
+
 TEST(tasks_channels) {
     EXPECT("int sq(int x) { return x * x; }\nauto t = std::async(sq, 7);\nstd::println(\"{}\", t.get());", "49\n");
     EXPECT("int total = 0;\nstd::thread th([](int n) { std::println(\"thread {}\", n); }, 3);\nth.join();", "thread 3\n");
@@ -890,13 +1028,6 @@ TEST(emit_golden_all_shells) {
             std::string ext = (name == "pwsh" || name == "powershell") ? "ps1" : name;
             auto path = (dir / (std::string(g) + "." + ext)).string();
             { std::ofstream(path, std::ios::binary) << code; }
-#if !defined(_WIN32)
-            // The elvish emitter needs elvish 0.21+ (os:mkdir-all); Ubuntu 24.04 ships 0.20.
-            if (name == "elvish" && sh_capture("\"" + full + "\" -norc -c 'use os; put $os:mkdir-all~' >/dev/null 2>&1").second != 0) {
-                if (refused.find("elvish(older than 0.21)") == std::string::npos) refused += " */elvish(older than 0.21)";
-                continue;
-            }
-#endif
             const char* rn = runner(exe);
             std::string cmdline = rn ? std::string(rn) : "\"" + full + "\"";   // the resolved path: cmd.exe would pick System32\\bash.exe (WSL) first
             if (exe == "busybox") cmdline = "\"" + full + "\" sh";        // ash via busybox: run the binary forge found

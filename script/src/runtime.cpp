@@ -128,7 +128,7 @@ bool Interp::iter_next(Obj& o, Value& out, Value* out2) {
               std::size_t n = 1; unsigned char c = static_cast<unsigned char>(s->s[it->i]);
               if (c >= 0xF0) n = 4; else if (c >= 0xE0) n = 3; else if (c >= 0xC0) n = 2;
               n = std::min(n, s->s.size() - it->i);
-              Value ch = new_string(s->s.substr(it->i, n)); it->last = it->i;
+              Value ch = n == 1 ? new_char(s->s[it->i]) : new_string(s->s.substr(it->i, n)); it->last = it->i;
               if (out2) { out = std::int64_t(it->i); *out2 = ch; } else out = ch;
               it->i += n; return true; }
     case 3: { if ((it->stp > 0 && it->a >= it->b) || (it->stp < 0 && it->a <= it->b)) return false;
@@ -218,8 +218,54 @@ Value Interp::make_error(const std::string& type, const std::string& msg) {
     return obj(e);
 }
 void Interp::raise(const std::string& type, const std::string& msg) {
+    if (type == "SystemExit") terminate(type, msg);   // std::exit, also when re-raised from a child: never catchable
     Value e = make_error(type, msg);
     throw ScriptError(e, type + ": " + msg);
+}
+void Interp::raise_fatal(const std::string& type, const std::string& msg) {
+    Heap::exempt no_cap;
+    ScriptError e(make_error(type, msg), type + ": " + msg);
+    e.fatal = true;
+    throw e;
+}
+void Interp::terminate(const std::string& type, const std::string& msg) {
+    std::string t = type, m = msg;
+    {
+        std::lock_guard lk(sh->dead_m);
+        if (!sh->dead.load()) { sh->dead_type = type; sh->dead_msg = msg; sh->dead_grace_ns = os::monotonic_ns() + kGraceNs; sh->dead = true; }
+        else { t = sh->dead_type; m = sh->dead_msg; }
+    }
+    dying = true;
+    raise_fatal(t, m);
+}
+// The run is ending: raise its error once in this interpreter, then let clean-up code run until the grace period ends.
+void Interp::dead_step(std::uint64_t n) {
+    if (dying && ((n & 255) != 0 || os::monotonic_ns() <= sh->dead_grace_ns.load())) return;
+    dying = true;
+    std::string t, m;
+    { std::lock_guard lk(sh->dead_m); t = sh->dead_type; m = sh->dead_msg; }
+    raise_fatal(t, m);
+}
+void Interp::check_deadline(std::uint64_t now) {
+    if (!deadline_ns || now <= deadline_ns) return;
+    if (sh->limits.timeout_ms && now > sh->start_ns + sh->limits.timeout_ms * 1000000) terminate("TimeoutError", "time limit reached");
+    deadline_ns = now + kGraceNs;   // a limit block's deadline: fatal until the block exits; clean-up gets the grace period
+    raise_fatal("TimeoutError", "time limit reached");
+}
+bool Interp::catch_matches(const std::string& tag, const Value& v) const {
+    if (tag.empty()) return true;                                  // catch (...)
+    if (tag[0] == '<') {
+        if (tag == "<int>") return v.index() == 2;
+        if (tag == "<float>") return v.index() == 3;
+        if (tag == "<bool>") return v.index() == 1;
+        if (tag == "<string>") { auto* s = as<String>(v); return s && !s->ch; }
+        if (tag == "<char>") { auto* s = as<String>(v); return s && s->ch; }
+        if (tag == "<list>") return as<List>(v) != nullptr;
+        if (tag == "<map>") return as<Map>(v) != nullptr;
+        return false;
+    }
+    auto* inst = as<Instance>(v);
+    return inst && inst->cls->derives(tag);
 }
 std::string Interp::error_message(const Value& err) {
     if (auto* i = as<Instance>(err)) {
@@ -266,20 +312,49 @@ ScriptError Interp::from_cpp(std::exception_ptr ep) {
     catch (...) { return mk("Error", "unknown native error"); }
 }
 
+// std::map / std::set keep their entries ordered by key (iterators walk `entries`): a key that operator[] just
+// appended out of order is moved into place.
+static void map_keep_order(Interp& in, Map& m) {
+    auto n = m.entries.size();
+    if (!m.sorted || n < 2 || in.compare(m.entries[n - 2].first, m.entries[n - 1].first) <= 0) return;
+    auto es = m.entries;
+    std::stable_sort(es.begin(), es.end(), [&](auto& x, auto& y) { return in.compare(x.first, y.first) < 0; });
+    m.entries.clear(); m.index.clear();
+    for (auto& [k, v] : es) m.set(k, v);
+}
+void static_refusal_type(std::string& type, std::string& msg) {
+    static const std::string cap = "error[capability]";
+    if (type != "StaticCheckError" || msg.find(cap) == std::string::npos) return;
+    for (auto p = msg.find("error["); p != std::string::npos; p = msg.find("error[", p + 1)) if (msg.compare(p, cap.size(), cap) != 0) return;
+    type = "PermissionError";
+    auto p = msg.find(cap + ": ");
+    if (p == std::string::npos) return;
+    msg = msg.substr(p + cap.size() + 2);
+    if (auto nl = msg.find('\n'); nl != std::string::npos) msg.resize(nl);
+}
+
 // ---------------------------------------------------------------- limits
 void Interp::step() {
     if (finalizers_pending()) run_finalizers();
     auto n = sh->steps.fetch_add(1, std::memory_order_relaxed);
-    if (sh->limits.max_steps && n >= sh->limits.max_steps) raise("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
+    // Whole-run limits, std::exit and cancellation end the run: they are fatal (no catch clause, not even
+    // catch (...), handles them), so a script cannot outlive them by catching the error and carrying on.
+    if (sh->dead.load(std::memory_order_relaxed)) { dead_step(n); return; }
+    if (sh->limits.max_steps && n >= sh->limits.max_steps) terminate("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
     if ((n & 255) == 0) {
         if (sh->interrupt.load()) {
             sh->interrupt = false;
             int sig = os::take_cancel_signal();
-            raise("CancelledError", sig ? os::cancellation_exception(sig).what() : std::string("interrupted"));
+            terminate("CancelledError", sig ? os::cancellation_exception(sig).what() : std::string("interrupted"));
         }
-        if (task && task->cancel.load()) raise("CancelledError", "task cancelled");
-        if (deadline_ns && os::monotonic_ns() > deadline_ns) { deadline_ns = 0; raise("TimeoutError", "time limit reached"); }
-        if (cpu_deadline_ns && os::thread_cpu_time_ns() > cpu_deadline_ns) { cpu_deadline_ns = 0; raise("LimitExceededError", "CPU time limit reached"); }
+        if (task && task->cancel.load()) {
+            auto now = os::monotonic_ns();
+            if (!cancel_grace_ns || now > cancel_grace_ns) { cancel_grace_ns = now + kGraceNs; raise_fatal("CancelledError", "task cancelled"); }
+        }
+        if (deadline_ns) check_deadline(os::monotonic_ns());
+        if (cpu_deadline_ns) {
+            if (auto cpu = os::thread_cpu_time_ns(); cpu > cpu_deadline_ns) { cpu_deadline_ns = cpu + kGraceNs; raise_fatal("LimitExceededError", "CPU time limit reached"); }
+        }
     }
 }
 void Interp::charge_process(const std::string& what) {
@@ -406,6 +481,15 @@ bool Interp::equal(const Value& a, const Value& b, int depth) {
 
 Value Interp::binary(Op op, const Value& a, const Value& b) {
     if (a.index() == 4 || b.index() == 4) {
+        // char arithmetic: a char with a number (or another char, except in comparisons, where the strings compare
+        // the same way) is promoted to int. char with a std::string stays string concatenation / comparison.
+        if (op != Op::In) {
+            std::int64_t ca = 0, cb = 0;
+            bool ac = char_code(a, ca), bc = char_code(b, cb);
+            bool an = ac || a.index() == 1 || a.index() == 2 || a.index() == 3, bn = bc || b.index() == 1 || b.index() == 2 || b.index() == 3;
+            bool cmp = op == Op::Eq || op == Op::Ne || op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge;
+            if ((ac || bc) && an && bn && !(cmp && ac && bc)) return binary(op, ac ? Value(ca) : a, bc ? Value(cb) : b);
+        }
         if (auto* os = as<Ostream>(a); os && op == Op::Shl) { stream_write(*os, b); return a; }
         if (auto* pi = as<PosIt>(a)) {   // iterator arithmetic
             if (auto* n = std::get_if<std::int64_t>(&b); n && (op == Op::Add || op == Op::Sub)) return obj(make<PosIt>(pi->c, op == Op::Add ? pi->i + *n : pi->i - *n));
@@ -428,8 +512,24 @@ Value Interp::binary(Op op, const Value& a, const Value& b) {
                     case Op::Eq: return *c == 0; case Op::Ne: return *c != 0; default: break; }
             }
             if (auto it = globals->vars.find(std::string("operator") + op_name(op)); it != globals->vars.end()) { std::vector<Value> args{a, b}; return call(it->second, args); }
+            // `auto operator<=>(const T&) const = default;`: objects of one class order member by member, bases first
+            auto* x = as<Instance>(a); auto* y = as<Instance>(b);
+            if (x && y && x->cls.get() == y->cls.get() && (op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge)) {
+                std::vector<const Class*> chain;
+                for (const Class* c = x->cls.get(); c; c = c->base.get()) chain.push_back(c);
+                int c3 = 0;
+                for (auto k = chain.rbegin(); k != chain.rend() && !c3; ++k)
+                    for (auto& f : (*k)->fields) { auto fa = x->fields.find(f), fb = y->fields.find(f); if (fa == x->fields.end() || fb == y->fields.end()) continue; c3 = compare(fa->second, fb->second); if (c3) break; }
+                return op == Op::Lt ? c3 < 0 : op == Op::Le ? c3 <= 0 : op == Op::Gt ? c3 > 0 : c3 >= 0;
+            }
         }
     }
+    // bool operands are promoted to int in arithmetic, bitwise and ordering operations (true + true == 2)
+    if ((a.index() == 1 || b.index() == 1) && op != Op::Eq && op != Op::Ne && op != Op::In && a.index() >= 1 && a.index() <= 3 && b.index() >= 1 && b.index() <= 3)
+        return binary(op, a.index() == 1 ? Value(std::int64_t(std::get<bool>(a))) : a, b.index() == 1 ? Value(std::int64_t(std::get<bool>(b))) : b);
+    // == / != between a bool and a number compare numerically (flag == 1, std::isdigit(c) != 0)
+    if ((op == Op::Eq || op == Op::Ne) && (a.index() == 1) != (b.index() == 1) && a.index() >= 1 && a.index() <= 3 && b.index() >= 1 && b.index() <= 3)
+        return binary(op, a.index() == 1 ? Value(std::int64_t(std::get<bool>(a))) : a, b.index() == 1 ? Value(std::int64_t(std::get<bool>(b))) : b);
     const auto* ia = std::get_if<std::int64_t>(&a); const auto* ib = std::get_if<std::int64_t>(&b);
     constexpr auto MAX = std::numeric_limits<std::int64_t>::max(), MIN = std::numeric_limits<std::int64_t>::min();
     switch (op) {
@@ -495,10 +595,37 @@ Value Interp::binary(Op op, const Value& a, const Value& b) {
         if (sa || sb) raise("TypeError", "cannot add " + type_of(a) + " and " + type_of(b) + " (use str() or \"${...}\")");
     }
     if (op == Op::Add && sa && b.index() == 2) raise("TypeError", "cannot add string and int (use std::to_string)");
+    if (as<List>(a) && as<List>(b) && (op == Op::Lt || op == Op::Le || op == Op::Gt || op == Op::Ge)) {   // vectors, pairs and tuples compare lexicographically
+        int c = compare(a, b);
+        return op == Op::Lt ? c < 0 : op == Op::Le ? c <= 0 : op == Op::Gt ? c > 0 : c >= 0;
+    }
     raise("TypeError", std::string("no operator") + op_name(op) + " for " + type_of(a) + " and " + type_of(b));
 }
 Value Interp::unary(const std::string& op, const Value& a) {
     if (op == "not") return !truthy(a);
+    // Implicit conversions to a declared arithmetic type (the parser adds them where a value is stored into an
+    // int / double / char variable or returned from such a function). Other values pass through unchanged.
+    if (op == "int") {
+        if (auto* d = std::get_if<double>(&a)) {
+            if (!std::isfinite(*d) || *d >= 9.2233720368547758e18 || *d < -9.2233720368547758e18) raise("OverflowError", "double out of range for int conversion");
+            return std::int64_t(*d);
+        }
+        if (auto* b = std::get_if<bool>(&a)) return std::int64_t(*b);
+        if (std::int64_t c = 0; char_code(a, c)) return c;
+        return a;
+    }
+    if (op == "float") {
+        if (auto* i = std::get_if<std::int64_t>(&a)) return double(*i);
+        if (auto* b = std::get_if<bool>(&a)) return double(*b);
+        if (std::int64_t c = 0; char_code(a, c)) return double(c);
+        return a;
+    }
+    if (op == "char") {
+        if (auto* i = std::get_if<std::int64_t>(&a)) return new_char(char(static_cast<unsigned char>(*i & 0xff)));
+        if (auto* b = std::get_if<bool>(&a)) return new_char(char(*b));
+        return a;
+    }
+    if (std::int64_t c = 0; char_code(a, c)) return unary(op, Value(c));   // -c, ~c: promoted
     if (op == "bool") return truthy(a);
     if (op == "~") { if (auto* i = std::get_if<std::int64_t>(&a)) return ~*i; raise("TypeError", "operator~ needs an int, got " + type_of(a)); }
     if (as<Instance>(a)) { bool f = false; Value r = call_operator(a, "operator-", {}, f); if (f) return r; }
@@ -575,6 +702,24 @@ Value Interp::get_field(const Value& o, const std::string& name, bool optional) 
 }
 void Interp::set_field(const Value& o, const std::string& name, Value v) {
     if (auto* r = std::get_if<Ref<Obj>>(&o)) debug::check_write(*this, r->get());
+    if (auto* pr = as<List>(o); pr && pr->items.size() == 2 && (name == "first" || name == "second")) {   // std::pair members
+        if (pr->frozen) raise("TypeError", "object is frozen");
+        pr->items[name == "first" ? 0 : 1] = share(v); return;
+    }
+    if (auto* pi = as<PosIt>(o)) {   // it->second = v (map value), it->member = v (element object)
+        if (auto* mp = as<Map>(pi->c)) {
+            if (pi->i < 0 || pi->i >= std::int64_t(mp->entries.size())) raise("IndexError", "assigning through an end() iterator");
+            if (name == "first") raise("TypeError", "a map key cannot be assigned through an iterator");
+            if (name == "second") { mp->entries[std::size_t(pi->i)].second = share(v); return; }
+            set_field(mp->entries[std::size_t(pi->i)].second, name, std::move(v)); return;
+        }
+        if (auto* l = as<List>(pi->c)) {
+            if (pi->i < 0 || pi->i >= std::int64_t(l->items.size())) raise("IndexError", "assigning through an end() iterator");
+            Value e = l->items[std::size_t(pi->i)];
+            if (auto* pr = as<List>(e); pr && (name == "first" || name == "second") && pr->items.size() == 2) { pr->items[name == "first" ? 0 : 1] = share(v); return; }
+            set_field(e, name, std::move(v)); return;
+        }
+    }
     if (auto* i = as<Instance>(o)) {
         if (i->frozen) raise("TypeError", "object is frozen");
         if (!i->cls->is_dynamic && !i->cls->has_field(name)) raise("AttributeError", i->cls->name + " has no field '" + name + "' (declare it in the class, or mark the class dynamic)");
@@ -598,11 +743,11 @@ Value Interp::get_index(const Value& o, const Value& i) {
             std::vector<Value> none; Value d = is_nil(m->dflt) ? Value(Nil{}) : call(m->dflt, none);
             if (!key_of(i)) raise("TypeError", "unsupported map key type " + type_of(i));
             if (m->borrows.load() > 0) raise("BorrowError", "operator[] would insert a key into a map while it is being iterated");
-            m->set(i, d); return *m->find(i);
+            m->set(i, d); map_keep_order(*this, *m); return *m->find(i);
         }
         raise("KeyError", "key " + repr(i) + " not found");
     }
-    if (auto* s = as<String>(o)) { auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int"); return new_string(std::string(1, s->s.at(norm_index(*this, *k, s->s.size())))); }
+    if (auto* s = as<String>(o)) { auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int"); return new_char(s->s.at(norm_index(*this, *k, s->s.size()))); }
     if (auto* g = as<Globals>(o)) { if (auto* s = as<String>(i)) return get_field(o, s->s); }
     raise("TypeError", "cannot index " + type_of(o));
 }
@@ -611,7 +756,8 @@ void Interp::set_index(const Value& o, const Value& i, Value v) {
     if (auto* l = as<List>(o)) { if (l->frozen) raise("TypeError", "list is frozen"); auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "list index must be int"); l->items.at(norm_index(*this, *k, l->items.size())) = share(v); return; }
     if (auto* m = as<Map>(o)) { if (m->frozen) raise("TypeError", "map is frozen");
         if (m->borrows.load() > 0 && !m->find(i)) raise("BorrowError", "operator[] would insert a key into a map while it is being iterated");
-        try { m->set(i, share(v)); } catch (const std::invalid_argument& e) { raise("TypeError", e.what()); } return; }
+        try { m->set(i, share(v)); } catch (const std::invalid_argument& e) { raise("TypeError", e.what()); }
+        map_keep_order(*this, *m); return; }
     if (auto* s = as<String>(o)) {   // s[i] = 'c'
         if (s->frozen) raise("TypeError", "string is frozen");
         auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int");
@@ -819,6 +965,14 @@ Value Interp::instantiate(const Ref<Class>& c, std::vector<Value>& args) {
     if (c->is_interface) raise("TypeError", "cannot instantiate interface " + c->name);
     for (const Class* k = c.get(); k; k = k->base.get())
         for (auto& r : k->required) if (!c->find_method(r)) raise("TypeError", "cannot instantiate abstract class " + c->name + " (pure virtual '" + r + "' is not overridden)");
+    // T b(a), T(a), std::make_shared<T>(T{...}): one argument of the class's own type and no constructor taking one
+    // argument is the implicit copy constructor (it used to initialise the first member with the whole object).
+    if (args.size() == 1 && !c->find_method("init") && !c->find_method("init/1"))
+        if (auto* src = as<Instance>(args[0]); src && src->cls.get() == c.get()) {
+            auto own = src->own; src->own = Own::Value;   // copy the object itself, even when a shared_ptr holds it
+            struct Restore { Instance* s; Own o; ~Restore() { s->own = o; } } restore{src, own};
+            return copy_value(args[0]);
+        }
     auto inst = make<Instance>(c);
     std::vector<const Class*> chain; for (const Class* k = c.get(); k; k = k->base.get()) chain.push_back(k);
     for (auto it = chain.rbegin(); it != chain.rend(); ++it)
@@ -935,7 +1089,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
     if (!rp || !*rp) return v;
     const Obj* o = rp->get();
     if (auto it = memo.find(o); it != memo.end()) return it->second;
-    if (auto* s = dynamic_cast<const String*>(o); s && !o->frozen) { Value c = in.new_string(s->s); memo[o] = c; return c; }
+    if (auto* s = dynamic_cast<const String*>(o); s && !o->frozen) { Value c = in.new_string(s->s); as<String>(c)->ch = s->ch; memo[o] = c; return c; }
     if (o->frozen || dynamic_cast<const String*>(o) || dynamic_cast<const Native*>(o) || dynamic_cast<const Range*>(o)) return v;
     if (auto* l = dynamic_cast<const List*>(o)) { auto n = make<List>(); memo[o] = obj(n); for (auto& x : l->items) n->push(deep_copy(in, x, memo)); return obj(n); }
     if (auto* m = dynamic_cast<const Map*>(o)) { auto n = make<Map>(); memo[o] = obj(n); for (auto& [k, x] : m->entries) n->set(deep_copy(in, k, memo), deep_copy(in, x, memo)); return obj(n); }
@@ -944,7 +1098,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         for (std::size_t i = 0; i < e->slots.size(); ++i) {
             // A closure's frame may also hold thread-bound handles it never uses (e.g. the std::future of a
             // sibling task). They are not copied; touching one from the new thread raises BorrowError.
-            if (as<Task>(e->slots[i]) || as<Handle>(e->slots[i])) { n->slots[i] = Value(Ref<Obj>(moved_sentinel())); continue; }
+            if (as<Task>(e->slots[i]) || as<Handle>(e->slots[i]) || as<Moved>(e->slots[i])) { n->slots[i] = Value(Ref<Obj>(moved_sentinel())); continue; }
             n->slots[i] = deep_copy(in, e->slots[i], memo);
         }
         if (e->parent) n->parent = as_ref<Env>(deep_copy(in, obj(e->parent), memo));
@@ -954,7 +1108,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         auto n = make<Globals>(); memo[o] = obj(n); n->consts = g->consts;
         for (auto& [k, x] : g->vars) {
             // Same rule as closure frames: thread-bound globals (handles, tasks) stay behind.
-            if (as<Task>(x) || as<Handle>(x)) { n->vars[k] = Value(Ref<Obj>(moved_sentinel())); continue; }
+            if (as<Task>(x) || as<Handle>(x) || as<Moved>(x)) { n->vars[k] = Value(Ref<Obj>(moved_sentinel())); continue; }
             n->vars[k] = deep_copy(in, x, memo);
         }
         return obj(n);

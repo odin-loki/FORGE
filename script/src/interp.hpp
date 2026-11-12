@@ -27,8 +27,11 @@ struct Interp;
 void enforce_scope(Interp& in, SecScope s, std::string_view target);
 
 // A script-level exception travelling through C++ frames. `v` is the thrown value (usually an Error object).
+// `fatal`: no catch clause may handle it (Interp::run_try rethrows): the run or the enclosing limit block is being
+// ended (whole-run timeout / step limit, std::exit, cancellation, a limit {.timeout/.cpu_s} block that fired). The
+// forge::limit call that owns the limit clears the flag, so the error is catchable outside the block.
 struct ScriptError : std::exception {
-    Value v; std::string msg;
+    Value v; std::string msg; bool fatal = false;
     ScriptError(Value x, std::string m) : v(std::move(x)), msg(std::move(m)) {}
     const char* what() const noexcept override { return msg.c_str(); }
 };
@@ -45,6 +48,10 @@ struct Shared {
     std::function<std::string(const std::string&, const std::string&)> ai;   // (system, prompt) -> completion
     std::string ask_model; int ask_max_tokens = 0;             // in-process model for the AI commands (ai.cpp)
     std::atomic<bool> interrupt{false};
+    // Set once the whole run is ending (Interp::terminate): every interpreter of the engine raises the same fatal
+    // error at its next step, no catch clause runs, and clean-up code (destructors, defer) gets until dead_grace_ns.
+    std::atomic<bool> dead{false};
+    std::mutex dead_m; std::string dead_type, dead_msg; std::atomic<std::uint64_t> dead_grace_ns{0};
     std::atomic<std::uint64_t> steps{0};
     std::uint64_t start_ns = 0;
     std::vector<std::string> argv;
@@ -92,6 +99,15 @@ struct Interp {
 
     // ---- shared runtime (used by both the tree-walker and the VM)
     void step();
+    // Uncatchable errors (see ScriptError::fatal). kGraceNs: how long destructors and defer blocks may run after one.
+    static constexpr std::uint64_t kGraceNs = 100'000'000;
+    bool dying = false;                                        // this interpreter has raised sh->dead's error
+    std::uint64_t cancel_grace_ns = 0;                         // task cancellation already raised; raise again after this
+    [[noreturn]] void raise_fatal(const std::string& type, const std::string& msg);
+    [[noreturn]] void terminate(const std::string& type, const std::string& msg);   // ends the whole run
+    void check_deadline(std::uint64_t now);                    // deadline_ns: whole-run timeout or a limit block's
+    void dead_step(std::uint64_t n);
+    bool catch_matches(const std::string& tag, const Value& thrown) const;   // one catch clause (parser: catch_type)
     void run_finalizers();
     // Non-const reference parameters: call_function leaves (argument index, final value) here for the caller.
     const Function* ref_back_fn = nullptr;
@@ -134,6 +150,7 @@ struct Interp {
     void sort_keys(std::vector<Value>& keys);
     int compare(const Value& a, const Value& b);   // <0, 0, >0 (std::less-like total order)
     Value call_operator(const Value& self, const std::string& op, std::vector<Value> args, bool& found);
+    Value assign_value(const Node& n, const Ref<Env>& env);   // an Assign node used as an expression (x = y, x += y, ++x, x++)
     Flow run_try(const Node& n, const Ref<Env>& env);
     Flow run_using(const Node& n, const Ref<Env>& env);
     void dispose(const Value& v);
@@ -145,6 +162,13 @@ struct Interp {
     std::string repr(const Value& v, int depth = 0);
     static std::string type_of(const Value& v);
     Value new_string(std::string s) { return obj(make<String>(std::move(s))); }
+    static Value new_char(char c) { auto s = make<String>(std::string(1, c)); s->ch = true; return obj(s); }
+    // the code of a char value, for arithmetic; false when v is not a char
+    static bool char_code(const Value& v, std::int64_t& code) {
+        auto* s = as<String>(v);
+        if (!s || !s->ch || s->s.size() != 1) return false;
+        code = static_cast<signed char>(s->s[0]); return true;
+    }
     Value make_error(const std::string& type, const std::string& msg);
     [[noreturn]] void raise(const std::string& type, const std::string& msg);
     ScriptError from_cpp(std::exception_ptr e);  // map any C++ exception to a script exception
@@ -168,6 +192,10 @@ void install_text(Shared& sh);
 void install_reflect(Shared& sh);
 void install_ai(Shared& sh);
 void install_remote(Shared& sh);
+// A script run elsewhere (remote node, ProcessPool worker) that its static checker refused before running: when
+// every error is a `capability` one, the refusal stands for the PermissionError the code was certain to raise, so
+// the caller sees that type (and the first diagnostic as the message) instead of an untyped failure.
+void static_refusal_type(std::string& type, std::string& msg);
 std::vector<std::string> module_search_path(const Interp& in);
 bool is_native_module(const std::string& p);
 std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Value>& args, std::size_t first);

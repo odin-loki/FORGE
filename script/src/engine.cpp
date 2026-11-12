@@ -86,6 +86,7 @@ struct engine::impl {
         sh->start_ns = os::monotonic_ns();
         in->deadline_ns = sh->limits.timeout_ms ? sh->start_ns + sh->limits.timeout_ms * 1000000 : 0;
         sh->interrupt = false;
+        if (in->depth == 0 && in->frames.empty()) { sh->dead = false; in->dying = false; }   // a new top-level run (REPL line)
         // Gap 4: cancellation signals for the top-level run (not for nested runs from host callbacks).
         struct cancel_scope {
             bool on; explicit cancel_scope(bool b, std::atomic<bool>* f) : on(b) { if (on) os::install_cancel_signals(f); }
@@ -98,7 +99,11 @@ struct engine::impl {
             if (top->has_main) { if (auto* c = std::get_if<std::int64_t>(&v)) r.exit_code = int(*c); }
             else if (want_value && !is_nil(v)) r.value = in->repr(v);
         } catch (...) {
-            r = fail(std::current_exception()); r.exit_code = 1;
+            auto ep = std::current_exception();
+            // Destructors of what the error unwound are queued for the next statement boundary, and there is none:
+            // run them now (as after a normal return), so they neither get lost nor run inside a later engine.
+            try { in->run_finalizers(); } catch (...) {}
+            r = fail(ep); r.exit_code = 1;
             if (r.error_type == "SystemExit") {   // std::exit(n)
                 auto p = r.error.find(':'); std::string n = p == std::string::npos ? r.error : r.error.substr(p + 1);
                 try { r.exit_code = std::stoi(n); r.ok = true; r.error.clear(); r.error_type.clear(); } catch (...) {}

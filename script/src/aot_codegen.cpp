@@ -251,6 +251,13 @@ private:
         };
         for (auto& p : f.params) if (p.dflt) poison(*p.dflt, false, 0);   // defaults are evaluated by the tree-walker
         std::function<void(const Node&, bool)> walk = [&](const Node& n, bool tree) {
+            // An assignment used as a value (f(i++), a = b = c, while (--n > 0)) is evaluated by Interp::eval
+            // (assign_value), which stores into the frame: its target cannot live in an unboxed native slot. As a
+            // statement an Assign is a child of a Block (or a loop's step in `extra`).
+            if (n.k != NK::Block)
+                for (auto& k : n.kids)
+                    if (k && k->k == NK::Assign && !k->kids.empty() && k->kids[0] && k->kids[0]->k == NK::Var && !k->kids[0]->var.global() && k->kids[0]->var.depth == 0)
+                        bad.insert(k->kids[0]->var.slot);
             switch (n.k) {
             case NK::Let:
                 if (!n.var.global() && n.var.depth == 0) {
@@ -358,7 +365,9 @@ private:
             char buf[48]; std::snprintf(buf, sizeof buf, "0x%016llxULL", static_cast<unsigned long long>(b));
             auto t = T(); L("Value " + t + " = rt::dbl(" + buf + ");"); return t;
         }
-        case NK::Str: { auto t = T(); L("Value " + t + " = in.new_string(" + N(n) + ".s);   // \"" + comment_safe(n.s, 40) + "\""); return t; }
+        case NK::Str:
+            if (n.flag && n.s.size() == 1) { auto t = T(); L("Value " + t + " = Interp::new_char(" + N(n) + ".s[0]);   // character literal"); return t; }
+            { auto t = T(); L("Value " + t + " = in.new_string(" + N(n) + ".s);   // \"" + comment_safe(n.s, 40) + "\""); return t; }
         case NK::Var: {
             auto t = T();
             if (n.var.global() || tree_) L("Value " + t + " = in.load(" + N(n) + ".var, env);   // " + comment_safe(n.var.name));

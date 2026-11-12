@@ -348,23 +348,28 @@ I64 need_int(Interp& in, const Value& v, const Node& let) {
 
 // tree.cpp, Interp::exec, case NK::Throw
 void throw_value(Interp& in, Value v, int line) {
-    if (auto* s = as<String>(v)) v = in.make_error("Error", s->s);
-    if (auto* i = as<Instance>(v); i && i->cls->derives("Error")) {
-        if (auto it = i->fields.find("trace"); it == i->fields.end() || is_nil(it->second) || (as<String>(it->second) && as<String>(it->second)->s.empty()))
+    if (auto* i = as<Instance>(v); i && i->cls->derives("Error")) {   // a thrown string stays a string, as in tree.cpp
+        auto user_field = [&](const char* f) {   // a user exception's own `trace` / `line` member is the user's
+            for (const Class* c = i->cls.get(); c; c = c->base.get()) {
+                if (auto it = in.sh->errors.find(c->name); it != in.sh->errors.end() && it->second.get() == c) return false;
+                for (auto& x : c->fields) if (x == f) return true;
+            }
+            return false;
+        };
+        if (auto it = i->fields.find("trace"); !user_field("trace") && (it == i->fields.end() || is_nil(it->second) || (as<String>(it->second) && as<String>(it->second)->s.empty())))
             i->fields["trace"] = in.new_string(in.trace_text());
-        i->fields["line"] = std::int64_t(line);
+        if (!user_field("line")) i->fields["line"] = std::int64_t(line);
     }
     throw ScriptError(v, in.error_message(v));
 }
 
 // tree.cpp, Interp::run_try: which catch clause takes this error
-int match_catch(Interp&, const ScriptError& e, const Node& n) {
-    for (std::size_t i = 1; i < n.kids.size(); ++i) {
-        const Node& c = *n.kids[i];
-        if (c.s.empty() || c.s == "Error") return int(i);
-        if (auto* inst = as<Instance>(e.v); inst && inst->cls->derives(c.s)) return int(i);
-        if (Interp::type_of(e.v) == c.s) return int(i);
-    }
+// The same rule as the interpreter, through the same function: a clause handles only its own type
+// (Interp::catch_matches), and a fatal error (whole-run limit, std::exit, cancellation, a limit block's timeout
+// inside the block) is handled by no clause, catch (...) included.
+int match_catch(Interp& in, const ScriptError& e, const Node& n) {
+    if (e.fatal || in.sh->dead.load()) return 0;
+    for (std::size_t i = 1; i < n.kids.size(); ++i) if (in.catch_matches(n.kids[i]->s, e.v)) return int(i);
     return 0;
 }
 
