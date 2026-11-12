@@ -1142,7 +1142,6 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden)
-<<<<<<< HEAD
     # Tiny random models of the other template families (GPT-2, Gemma 1/2/3, Phi-3 / Phi-4-mini, BERT / RoBERTa
     # embedding, ViT / CLIP / SigLIP vision, Whisper encoder) against float64 numpy references.
     set(FORGE_GOLDEN_FAMILIES gpt2 gemma phi3 bert vit whisper)
@@ -1155,7 +1154,6 @@ if(FORGE_BUILD_TESTS)
         set_tests_properties(golden_tiny_${_g} PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner_g}")
       endif()
     endforeach()
-=======
     # GGUF tensor types against gguf-py (exits 77 = skipped without the gguf package); AWQ / GPTQ checkpoints against
     # the packers in the test script.
     add_test(NAME golden_gguf_types
@@ -1165,7 +1163,6 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_hf_quant
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/hf_quant.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hf_quant)
->>>>>>> ccr-54bb5525-7f3iii
     if(FORGE_HAVE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
       # Same goldens with the Vulkan lowerings (ops without a GPU kernel run on the CPU).
       add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
