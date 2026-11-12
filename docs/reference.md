@@ -96,13 +96,13 @@ Every op has a float64 scalar reference that each lowering is tested against.
 
 ## Lowering coverage (op × backend)
 
-Generated from the code that registers the lowerings: `registry::make_cpu` and the SIMD registrations (`graph/include/forge/graph/kernels.hpp`), the Vulkan kernel list (`ops/gen/gpu_gen.py`, `vulkan_registry`), and `gpu::cuda_hip::kernel_sig` (`gpu/include/forge/gpu/cuda.hpp`), the one table `graph::gpu_registry` registers from for CUDA, HIP, OpenCL, Level Zero and Metal. The `coverage_table` test compares this table with the registries of the built code (`forge_coverage_dump`).
+Generated from the code that registers the lowerings: `registry::make_cpu` and the SIMD registrations (`graph/include/forge/graph/kernels.hpp`, `kernels_ext.hpp`), the Vulkan kernel list (`ops/gen/gpu_gen.py`, `vulkan_registry`), and `gpu::cuda_hip::kernel_sig` (`gpu/include/forge/gpu/cuda.hpp`), the one table `graph::gpu_registry` registers from for CUDA, HIP, OpenCL, Level Zero and Metal. The `coverage_table` test compares this table with the registries of the built code (`forge_coverage_dump`).
 
 - Every op has the float64 scalar reference (`ops/`), which runs whenever no lowering applies and is what the oracle compares against.
 - A lowering is used only for the shapes and attributes it supports, and only after it passed the oracle on this machine; this table says which lowerings exist, not that a backend was tested on real hardware (see [STATUS.md](STATUS.md)).
 - `lane.*` lowerings run on the SIMD lane chosen at run time (AVX2, AVX-512, NEON, SVE, RVV, ... or the scalar lane); `cpu.*` lowerings are plain C++.
 - All lowerings in this table take f32 tensors; other dtypes enter as encoded weights (next table).
-- Ops with a lowering: CPU 18/63, Vulkan 34/63, CUDA/HIP/OpenCL/Level Zero/Metal 31/63. `+bcast` = the CUDA/HIP runtime also runs the broadcasting form.
+- Ops with a lowering: CPU 28/87, Vulkan 37/87, CUDA/HIP/OpenCL/Level Zero/Metal 34/87. `+bcast` = the CUDA/HIP runtime also runs the broadcasting form.
 
 | op | scalar ref | CPU | Vulkan | CUDA / HIP | OpenCL / Level Zero | Metal |
 |---|---|---|---|---|---|---|
@@ -144,7 +144,7 @@ Generated from the code that registers the lowerings: `registry::make_cpu` and t
 | `erfc` | yes |  |  |  |  |  |
 | `sigmoid` | yes | `lane.sigmoid` | `vk.sigmoid` | `cuda.sigmoid` `hip.sigmoid` | `opencl.sigmoid` `level_zero.sigmoid` | `metal.sigmoid` |
 | `silu` | yes | `lane.silu` | `vk.silu` | `cuda.silu` `hip.silu` | `opencl.silu` `level_zero.silu` | `metal.silu` |
-| `gelu` | yes |  |  |  |  |  |
+| `gelu` | yes | `cpu.gelu` |  |  |  |  |
 | `gelu_tanh` | yes | `lane.gelu_tanh` | `vk.gelu_tanh` | `cuda.gelu_tanh` `hip.gelu_tanh` | `opencl.gelu_tanh` `level_zero.gelu_tanh` | `metal.gelu_tanh` |
 | `relu` | yes |  | `vk.relu` | `cuda.relu` `hip.relu` | `opencl.relu` `level_zero.relu` | `metal.relu` |
 | `softplus` | yes |  | `vk.softplus` | `cuda.softplus` `hip.softplus` | `opencl.softplus` `level_zero.softplus` | `metal.softplus` |
@@ -166,9 +166,33 @@ Generated from the code that registers the lowerings: `registry::make_cpu` and t
 | `logsumexp` | yes |  |  |  |  |  |
 | `softmax` | yes | `lane.softmax` | `vk.softmax` | `cuda.softmax` `hip.softmax` | `opencl.softmax` `level_zero.softmax` | `metal.softmax` |
 | `rms_norm` | yes | `lane.rms_norm` | `vk.rms_norm` | `cuda.rms_norm` `hip.rms_norm` | `opencl.rms_norm` `level_zero.rms_norm` | `metal.rms_norm` |
-| `layer_norm` | yes |  |  |  |  |  |
+| `layer_norm` | yes | `cpu.layer_norm` |  |  |  |  |
 | `cumsum` | yes |  |  |  |  |  |
 | `moe_gate` | yes |  |  |  |  |  |
+| `quick_gelu` | yes | `cpu.quick_gelu` | `vk.quick_gelu` | `cuda.quick_gelu` `hip.quick_gelu` | `opencl.quick_gelu` `level_zero.quick_gelu` | `metal.quick_gelu` |
+| `mish` | yes | `cpu.mish` | `vk.mish` | `cuda.mish` `hip.mish` | `opencl.mish` `level_zero.mish` | `metal.mish` |
+| `hard_swish` | yes | `cpu.hard_swish` | `vk.hard_swish` | `cuda.hard_swish` `hip.hard_swish` | `opencl.hard_swish` `level_zero.hard_swish` | `metal.hard_swish` |
+| `floor` | yes | `cpu.floor` |  |  |  |  |
+| `attention_bias` | yes | `cpu.attention_bias` |  |  |  |  |
+| `alibi_bias` | yes |  |  |  |  |  |
+| `sinusoid_embed` | yes |  |  |  |  |  |
+| `l2_normalize` | yes | `cpu.l2_normalize` |  |  |  |  |
+| `topk` | yes |  |  |  |  |  |
+| `topk_indices` | yes |  |  |  |  |  |
+| `index_select` | yes |  |  |  |  |  |
+| `masked_mean` | yes |  |  |  |  |  |
+| `conv1d` | yes | `cpu.conv1d.im2col` |  |  |  |  |
+| `conv2d` | yes | `cpu.conv2d.im2col` |  |  |  |  |
+| `conv_transpose2d` | yes |  |  |  |  |  |
+| `max_pool2d` | yes |  |  |  |  |  |
+| `avg_pool2d` | yes |  |  |  |  |  |
+| `adaptive_avg_pool2d` | yes |  |  |  |  |  |
+| `global_avg_pool` | yes |  |  |  |  |  |
+| `upsample_nearest` | yes |  |  |  |  |  |
+| `upsample_bilinear` | yes |  |  |  |  |  |
+| `group_norm` | yes |  |  |  |  |  |
+| `batch_norm` | yes |  |  |  |  |  |
+| `pad` | yes |  |  |  |  |  |
 
 ### Weight codecs (`matmul_t` over an encoded weight)
 
