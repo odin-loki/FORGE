@@ -23,7 +23,9 @@ int main() {
         gpu::cuda_hip::sig s;
         if (gpu::cuda_hip::kernel_sig(name, s)) gpu_j += (gpu_j.empty() ? "\"" : ", \"") + name + "\"";
 #ifdef FORGE_GPU_VULKAN
-        if (gpu::vk::runtime::has_kernel(name)) vk_j += (vk_j.empty() ? "\"" : ", \"") + name + "\"";
+        // a spec shader of the op's name, or the GLSL port of an encoder / vision kernel (vulkan_registry, run_nn)
+        const bool nn = gpu::cuda_hip::kernel_sig(name, s) && gpu::cuda_hip::nn_sig(s) && gpu::vk::runtime::has_kernel("forge_" + name);
+        if (gpu::vk::runtime::has_kernel(name) || nn) vk_j += (vk_j.empty() ? "\"" : ", \"") + name + "\"";
 #endif
     }
     for (auto& c : graph::codecs::all()) codec_j += (codec_j.empty() ? "\"" : ", \"") + std::string(c.name) + "\"";

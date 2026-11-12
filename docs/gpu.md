@@ -13,12 +13,12 @@ Nothing links against a vendor SDK. Each runtime `dlopen`s its driver library at
 
 | Output | Used by | Built with |
 |--------|---------|------------|
-| one GLSL compute shader per kernel (33 spec kernels as listed below, plus the encoder activations and 11 ports of the portable kernels) | Vulkan | `glslangValidator` → SPIR-V, embedded |
+| one GLSL compute shader per kernel (37 spec kernels, 11 ports of the portable kernels, 7 encoder / vision kernels) | Vulkan | `glslangValidator` → SPIR-V, embedded |
 | `kernels.cu` | CUDA, HIP | clang, no SDK: two PTX images, `sm_70` and `sm_80` (JIT-compiled by the driver; the `sm_80` one adds the tensor-core kernels); AMDGPU code objects for `FORGE_HIP_ARCHS` (default `gfx90a gfx942 gfx1100`, needs lld) |
 | `kernels.cl` | OpenCL (built by the driver at open, then loaded from the [kernel program cache](#kernel-program-cache)), Level Zero (offline to SPIR-V with clang + `llvm-spirv`; the driver's native binary is cached the same way) | |
 | `kernels.metal` | Metal (compiled at open with `newLibraryWithSource`) | |
 
-The 33 spec kernels are: 18 unary (`neg abs sqrt rsqrt recip square exp exp2 log log2 sin cos tanh sigmoid silu relu softplus gelu_tanh`), 6 binary (`add sub mul div maximum minimum`) and `scale softmax rms_norm matmul_t silu_mul rope gather attention slice`. CUDA, HIP, OpenCL, Level Zero and Metal have no `sin`/`cos`, so they register **31** lowerings. [reference.md](reference.md) marks which ops have a GPU kernel.
+The 37 spec kernels are: 22 unary (`neg abs sqrt rsqrt recip square exp exp2 log log2 sin cos tanh sigmoid silu relu softplus gelu gelu_tanh quick_gelu mish hard_swish`), 6 binary (`add sub mul div maximum minimum`) and `scale softmax rms_norm matmul_t silu_mul rope gather attention slice`. On top of them every backend has the 7 [encoder and vision kernels](#encoder-and-vision-kernels) (`layer_norm group_norm conv1d conv2d max_pool2d avg_pool2d attention_bias`). CUDA, HIP, OpenCL, Level Zero and Metal have no `sin`/`cos`, so they register **42** lowerings; Vulkan registers 45 (`vk.reshape` included). [reference.md](reference.md) marks which ops have a GPU kernel.
 
 `rope` with frequency scaling (`scaling`, `freq_factors`; `ops/include/forge/ops/rope.hpp`): the CUDA, HIP, OpenCL, Level Zero and Metal kernels read the inverse frequencies from a table the host builds, so they run every variant unchanged except dynamic NTK, whose table depends on the positions of each call and runs on the CPU. The Vulkan kernel computes `base^(-2j/d)` itself and hands any scaled `rope` to the CPU. The mock drivers cover the CUDA, HIP, OpenCL and Level Zero paths; the Metal and Vulkan paths for scaled `rope` have not been run.
 
@@ -36,7 +36,8 @@ Beyond the spec kernels. "tuned" = the block / shared-memory / tensor-core kerne
 | Attention, decode (split over keys) | `forge_attention_dec` + `_comb` | – (`forge_attention_fa`) | portable `forge_attention_dec` + `_comb` | portable | GLSL port (KV codecs: spec kernel) | MSL translation, never executed (KV codecs: spec kernel) |
 | Gated DeltaNet state ops | `forge_delta_rule*`, `forge_causal_conv*` | `forge_delta_rule`, `forge_causal_conv*` | portable `forge_delta_rule`, `forge_causal_conv` | portable | GLSL port (needs 7 storage buffers per stage) | MSL translation, never executed |
 | Sparse mixture of experts (`moe_ffn`) | `forge_moe_hidden` + `forge_moe_down` | same | same | same | GLSL port (needs 5 storage buffers per stage) | MSL translation, never executed |
-| Broadcast add/sub/mul/div | `forge_bcast` | `forge_bcast` | portable `forge_bcast` | portable | GLSL port | MSL translation, never executed |
+| Broadcast add/sub/mul/div (suffix shapes, or a single-element operand) | `forge_bcast` | `forge_bcast` | portable `forge_bcast` | portable | GLSL port | MSL translation, never executed |
+| Encoder / vision ops: `gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d`, `attention_bias` | one portable source (`PORT_NN`), CUDA dialect | same | same source | same source | GLSL ports (`attention_bias` needs 5 storage buffers per stage) | MSL translation, never executed |
 | q8_1 / q8r activation fusions, add+rms_norm, rms+rope | yes | – | – | – | – | – |
 | Device concat (`forge_copy2d`), device argmax | yes | yes | – | – | – | – |
 
@@ -205,6 +206,24 @@ A quantised `matmul_t` has two families of kernels, and they give slightly diffe
 `tests/test_cuda_hip.cpp` (`exact_reference_check`) holds every backend to one reference, the float64 dot product of the f32 activations with the codec-decoded weights: within 2e-5 of the largest output for the exact backends (measured on the OpenCL mock: 1e-6), within 3e-2 for the int8-activation ones (CUDA / HIP mocks: 1.6e-2).
 
 This is what was behind a q8_0 logit cosine of 0.9984 on the OpenCL mock against 0.9990 on the CPU and the CUDA mock for the Gemma-2 model of `verify/golden/tiny_gemma.py`. The OpenCL run was bit-for-bit the exact path (cosine 1.000000 with `FORGE_CPU_INT8=0` on the CPU); soft-capping, scale rounding and intermediates in the portable kernels were not involved. That model's attention scores reached 28 against a soft-cap of 5, which made its logits so sensitive to q8_0 weight rounding that over 12 prompts the cosine against the unquantised reference ran from 0.945 to 0.9995 on the int8 path and from 0.979 to 0.9995 on the exact one (the exact path was the closer one for 11 of the 12; the golden's prompt was the twelfth). The golden now uses weights whose scores pass the cap by a factor of 3 (6.4 against 2), and its bound is 0.999 for every generation on every path (measured: 0.99936 CPU and CUDA mock, 0.99977 OpenCL mock).
+
+## Encoder and vision kernels
+`gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d` and `attention_bias` ran on the host on every backend until 2026-11-12; a BERT, ViT, Whisper-encoder, GPT-2 or Gemma-2/3 plan fetched its activations back for each of them. They now have device kernels on every backend, as ordinary lowerings (`cuda.layer_norm`, `vk.conv2d`, ...) that the oracle checks against the op's float64 reference like any other.
+
+| Op | Kernel | Work items | Notes |
+|---|---|---|---|
+| `gelu` | unary `forge_gelu` / `gelu.comp` | elements | `0.5 x erfc(-x / √2)` with `erfc` by Abramowitz & Stegun 7.1.26 (absolute error 1.5e-7): no `erf` builtin is needed (the CUDA / HIP images link no math library), and the negative tail is a product instead of `1 + erf` |
+| `layer_norm` | `forge_layer_norm` | rows | mean and variance in 4 partial sums; safe in place |
+| `group_norm` | `forge_group_norm` | groups | `x[c, ...]`; one work item reduces a whole group, so few groups over a large image is one long work item |
+| `conv1d`, `conv2d` | `forge_conv1d`, `forge_conv2d` | output elements | direct convolution (no im2col buffer): groups and depthwise, stride / pad / dilation per axis, a bias of `[o]` or `[1]`; `fma` accumulation over `c/groups × k` in index order |
+| `max_pool2d`, `avg_pool2d` | `forge_max_pool2d`, `forge_avg_pool2d` | output elements | padding never wins a max (an all-padding window is −inf); `count_pad` 0 and 1 |
+| `attention_bias` | `forge_attention_bias` | (row, head) | one pass with an online softmax; the bias dims (right-aligned to `[hq, s, t]`) must each be 1 or the full size; −inf masks a key, a fully masked row gives zeros; soft-cap, causal and two-sided window; plain f32 K/V only (a graph that feeds it from a quantised KV state is refused at plan time anyway) |
+
+The seven non-unary kernels are written once in the portable OpenCL C dialect (`PORT_NN` in `gpu_gen.py`). `kernels.cl` takes that text, `kernels.cu` a dialect change of it (`cu_nn`), `kernels.metal` the `msl_port` translation, and Vulkan hand-written GLSL ports (`VK_PORT_NN`: the norms and the attention scores in `vec4` partial sums, −inf tested as "below every finite float"). Their arguments are (inputs, output, scalars) exactly as `cuda_hip::kernel_args` lays them out, so OpenCL, Level Zero and Metal run them through their generic `run_op`; CUDA / HIP through `run_nn` in `cuda.hpp`; Vulkan through `portable_kernels<>::run_nn`.
+
+They are correct-first kernels with no tiling or shared memory: a convolution reads its window per output element, and nothing is fused with the neighbouring ops. No timing exists for any of them.
+
+Verification: every lowering through the oracle on the CUDA, HIP, OpenCL and Level Zero mocks (42/42 each) and on lavapipe (all `vk.*`), plus `nn_ops_check` (`tests/gpu_checks.hpp`: 26 cases over groups, depthwise, per-axis stride / pad / dilation, shared bias, padded pooling, every bias broadcast, −inf masks, soft-cap, window, scalar broadcast) on the same five. For CUDA and HIP the mock (`tests/mock_cuda.c`) compiles the generated portable source as C instead of a hand copy, so the kernel text itself is what runs; the PTX and AMDGPU builds of the same text are only compiled. `FORGE_PLAN_TRACE` on the family goldens shows what is left on the host: `transpose`, `l2_normalize`, `masked_mean` and the other ops without a kernel. Not run on any GPU; the Metal versions have never been executed.
 
 ## Mixture of experts on the device
 `moe_ffn` runs on CUDA, HIP, OpenCL, Level Zero, Vulkan and (never executed) Metal when the three stacked expert weights are encoded (q8_0, q4_k, q5_k, q6_k) or f32 constants (`registry::device_moe`, `run_moe`; `FORGE_GPU_MOE=0` keeps it on the host):

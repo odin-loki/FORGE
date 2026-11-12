@@ -139,6 +139,17 @@ GPU, and nothing was built by a compiler other than clang 23.
   check found that `forge_metal` lacked the `third_party/monocypher` include directory `core/memory.hpp` needs since
   the 2026-11-12 merges (not verified on macOS, but the include path was missing from the target); added. `test_gpu_metal` now runs the attention, quantised,
   state-op and MoE checks too, so the macOS CI job is the first place any of this runs.
+- **Device kernels for `gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d`,
+  `attention_bias`** on every backend (one portable source, `PORT_NN`). **Mock-verified** on CUDA, HIP, OpenCL, Level
+  Zero: `test_gpu_{cuda,hip,opencl,ze}_mock` 42/42 lowerings through the oracle (34 before) and 26/26 cases of the new
+  `nn_ops_check`. The CUDA / HIP mock now compiles the generated portable source as C for these kernels (no hand
+  copy); the PTX (sm_70, sm_80) and AMDGPU builds of that text compile and have not run. **Lavapipe-verified** on
+  Vulkan: `gelu.comp` and the seven GLSL ports pass the oracle and the same 26 cases, also with
+  `FORGE_VK_SSBO_ALIGN=256`. **Metal: never executed** (`msl_port` translation, C++ syntax check only). Goldens of the
+  six template families pass on the CUDA mock, the OpenCL mock and lavapipe; with `FORGE_PLAN_TRACE` the OpenCL-mock
+  runs show no `attention_bias`, `layer_norm`, `gelu` or convolution left on the host (remaining: `transpose`,
+  `l2_normalize`, `masked_mean`). A broadcast with a single-element operand (`x * [1]`) now also stays on the device.
+  No GPU has run any of it and nothing was timed.
 - The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
   tests pass unchanged after the move.
 

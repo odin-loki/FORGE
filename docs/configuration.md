@@ -25,10 +25,10 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 |----------|-----------|--------|
 | `FORGE_GPU_NO_RESIDENCY` | CUDA, HIP, OpenCL, Level Zero, Metal | If set, tensors are not kept on the device between ops; every op uploads and downloads. Vulkan always keeps tensors resident |
 | `FORGE_GPU_EAGER_SYNC` | CUDA, HIP | If set, every run ends by syncing all resident buffers to the host; turns off the fixed arena and whole-run replay |
-| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP, OpenCL, Level Zero | If set, Gated DeltaNet state ops run on the host instead of the device |
-| `FORGE_GPU_QMATMUL=0` | CUDA, HIP, OpenCL, Level Zero | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
-| `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero | Do not gather from encoded embedding tables on the device |
-| `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
+| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | If set, Gated DeltaNet state ops run on the host instead of the device |
+| `FORGE_GPU_QMATMUL=0` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
+| `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
 | `FORGE_DETERMINISTIC=1` | all devices | Determinism mode: only order-stable device paths (no split-K / stream-K matmul, no split-over-keys decode attention, single-block argmax, fixed CPU chunking). Same device + same build gives bit-identical results; see [gpu.md](gpu.md#determinism-mode). `session_options::deterministic` and `gpu::set_deterministic` override it |
 | `FORGE_DEVICE_PREFER`, `FORGE_DEVICE_EXCLUDE` | `FORGE_DEVICE=auto` | Comma lists of backends (`cuda`) or devices (`opencl:1`): preferred ones win whenever eligible, excluded ones are never chosen ([gpu.md](gpu.md#automatic-device-selection)) |
 | `FORGE_DEVICE_ALLOW_SOFTWARE=1` | `FORGE_DEVICE=auto` | Let software devices (lavapipe, SwiftShader, OpenCL CPU runtimes) compete; by default they never win over the CPU |

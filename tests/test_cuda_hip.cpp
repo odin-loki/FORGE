@@ -24,7 +24,8 @@ using namespace forge_test::gpu_checks;   // the checks shared with test_vulkan.
 
 static const char* kernel_ops[] = {"neg", "abs", "sqrt", "rsqrt", "recip", "square", "exp", "exp2", "log", "log2", "tanh", "sigmoid",
     "silu", "relu", "softplus", "gelu_tanh", "add", "sub", "mul", "div", "maximum", "minimum", "silu_mul", "scale", "softmax",
-    "rms_norm", "matmul_t", "rope", "gather", "slice", "attention", "qmatmul_t", "quick_gelu", "mish", "hard_swish"};
+    "rms_norm", "matmul_t", "rope", "gather", "slice", "attention", "qmatmul_t", "quick_gelu", "mish", "hard_swish",
+    "gelu", "layer_norm", "group_norm", "conv1d", "conv2d", "max_pool2d", "avg_pool2d", "attention_bias"};
 
 static bool has(std::string_view hay, const std::string& needle) { return hay.find(needle) != std::string_view::npos; }
 
@@ -332,6 +333,7 @@ template<class RT, class Open> static int device_t(Open open) {
     fails += qgather_check(*reg, api);
     fails += moe_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     fails += rope_scaling_check(*reg, api);
+    fails += nn_ops_check(*reg, api);
     if constexpr (requires { shared->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
         fails += fusion_plan_check(*reg, api, [&](const char* k) -> std::size_t { auto d = shared->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; });
     return fails ? 1 : 0;

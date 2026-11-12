@@ -255,7 +255,7 @@ set(FORGE_GPU_SOURCES)
 foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
-add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels.metal
+add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels_nn_mock.inc ${FORGE_GPU_DIR}/kernels.metal
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
   DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
@@ -1282,6 +1282,8 @@ if(FORGE_BUILD_TESTS)
     add_library(mock_cuda SHARED tests/mock_cuda.c)
     set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockcuda)
     target_link_libraries(mock_cuda PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+    target_include_directories(mock_cuda PRIVATE ${FORGE_GPU_DIR})   # kernels_nn_mock.inc (generated)
+    add_dependencies(mock_cuda forge_gpu_gen)
     add_test(NAME test_gpu_cuda_mock COMMAND test_cuda_hip cuda)
     set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda" LABELS gpu SKIP_RETURN_CODE 77)
     add_dependencies(test_cuda_hip mock_cuda)
@@ -1289,6 +1291,8 @@ if(FORGE_BUILD_TESTS)
     target_compile_definitions(mock_hip PRIVATE MOCK_HIP)
     set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockhip)
     target_link_libraries(mock_hip PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+    target_include_directories(mock_hip PRIVATE ${FORGE_GPU_DIR})
+    add_dependencies(mock_hip forge_gpu_gen)
     add_dependencies(test_cuda_hip mock_hip)
     foreach(m opencl ze)
       if(m STREQUAL "opencl")
@@ -1362,8 +1366,9 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip")
-      # Device fallback: the other template families use ops with no device kernel (attention_bias over the KV state,
-      # conv1d / conv2d, layer_norm, gelu); those steps must run on the CPU between device steps and give the same result.
+      # The other template families: attention_bias over the KV state, conv1d / conv2d, layer_norm and gelu run on the
+      # device (the PORT_NN kernels); what has no device kernel (transpose, l2_normalize, masked_mean, ...) must run on
+      # the CPU between device steps and give the same result.
       foreach(_g gpt2 gemma phi3 bert vit whisper)
         add_test(NAME golden_tiny_${_g}_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py
                  --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_cumock)

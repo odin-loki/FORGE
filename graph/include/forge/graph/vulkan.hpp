@@ -150,6 +150,17 @@ inline std::unique_ptr<registry> vulkan_registry(std::shared_ptr<gpu::vk::runtim
                 gpu::vk::push pc; pc.n = std::uint32_t(out.size()); pc.alpha = 1.f;
                 std::vector<gpu::vk::hbuf> b{{in[0].data, in[0].size()}, {out.data, out.size()}};
                 if (rt->resident()) rt->run_resident("scale", b, pc, pc.n); else rt->run("scale", b, pc, pc.n); }, -1, true});
+    // The encoder / vision ops (layer_norm, group_norm, conv1d, conv2d, pooling, attention_bias): GLSL ports of the
+    // PORT_NN kernels, shapes as the other device backends take them (cuda_hip::supports), run through run_nn.
+    for (auto nm : {"layer_norm", "group_norm", "conv1d", "conv2d", "max_pool2d", "avg_pool2d", "attention_bias"}) {
+        const std::string name = nm; auto o = ops::op_from_name(name);
+        if (!o || !rt->has_function("forge_" + name)) continue;
+        r->add({"vk." + name, *o, 20,
+                [name](std::span<const shape_t> in, const shape_t&, const ops::attrs& a) { return gpu::cuda_hip::supports(name, std::vector<shape_t>(in.begin(), in.end()), a); },
+                [rt, name](std::span<const tensor_view> in, tensor_view out, const ops::attrs& a) {
+                    if (!rt->run_nn(name, std::vector<tensor_view>(in.begin(), in.end()), a, out)) raise(errc::unsupported, "vulkan: {} rejected its inputs", name); },
+                -1, true});
+    }
     add_encoded_lowerings(*r, rt, "vk", resident);
     return r;
 }

@@ -39,7 +39,7 @@ struct hbuf { float* data; std::size_t count; };
 // (ops/gen/gpu_gen.py VK_PORT) their own block of up to 9 words.
 inline constexpr std::uint32_t push_bytes = 64;
 // The ported kernels that bind more than 4 storage buffers (the Vulkan minimum for maxPerStageDescriptorStorageBuffers).
-inline std::uint32_t port_bindings(const std::string& n) { return n == "forge_delta_rule" ? 7u : n == "forge_moe_hidden" ? 5u : 4u; }
+inline std::uint32_t port_bindings(const std::string& n) { return n == "forge_delta_rule" ? 7u : n == "forge_moe_hidden" || n == "forge_attention_bias" ? 5u : 4u; }
 
 // Besides the spec kernels the runtime has the portable kernel families of OpenCL / Level Zero (quantised matmul_t /
 // gather / FFN gate-up over encoded weights, one-pass and split-over-keys attention, the Gated DeltaNet state ops,

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -400,6 +401,71 @@ template<class RT> int exact_reference_check(graph::registry& reg, const std::st
     }
     std::printf("%s %d/%d %s quantised cases within the %s bound of the decoded-weight reference (worst: device %.2g, CPU f32 kernel %.2g of the largest output)\n",
                 fails ? "FAIL" : "ok  ", n - fails, n, api.c_str(), exact ? "exact (f32 rounding)" : "int8-activation", worst_dev, worst_cpu);
+    return fails;
+}
+
+// The encoder / vision kernels (gelu, layer_norm, group_norm, conv1d, conv2d, max / avg pooling, attention_bias;
+// gpu_gen.py PORT_NN) through the backend's own lowerings against the op references, over the attribute combinations the
+// oracle's single case per op does not reach: groups and depthwise, stride / pad / dilation per axis, a shared bias,
+// padded pooling windows with and without count_pad, every bias broadcast of attention_bias, -inf masks including a
+// fully masked row, soft-capping, causal and window masks, GQA. Each case must be taken by a device lowering (name
+// prefix `api`), and is compared under the op's declared tolerance.
+inline int nn_ops_check(graph::registry& reg, const std::string& api) {
+    int fails = 0, n = 0;
+    std::uint32_t seed = 4242;
+    auto rnd = [&](shape_t sh, float lo, float hi) { tensor t(sh); for (auto& v : t.data) { seed = seed * 1664525u + 1013904223u; v = lo + (hi - lo) * float(seed >> 8) / float(1u << 24); } return t; };
+    auto run = [&](const char* opn, std::vector<tensor> in, ops::attrs a, const char* what) {
+        auto o = ops::op_from_name(opn); ++n;
+        if (!o) { std::printf("FAIL %s: unknown op %s\n", api.c_str(), opn); ++fails; return; }
+        tensor ref = ops::reference(*o)(in, a), got(ref.shape);
+        for (auto& v : got.data) v = -77.f;
+        std::vector<shape_t> ss; std::vector<tensor_view> vs;
+        for (auto& t : in) { ss.push_back(t.shape); vs.push_back({t.data.data(), t.shape}); }
+        const graph::lowering* low = nullptr;
+        for (auto& l : reg.lowerings(*o)) if (l.name.rfind(api + ".", 0) == 0 && (!l.supports || l.supports(ss, ref.shape, a))) low = &l;
+        if (!low) { std::printf("FAIL %s.%s (%s): no device lowering takes the case\n", api.c_str(), opn, what); ++fails; return; }
+        low->fn(vs, got.view(), a);
+        auto r = verify::compare(got, ref, ops::info(*o).tol);
+        if (!r.ok) { std::printf("FAIL %s.%s (%s): max abs %.3g, max rel %.3g at %zu (got %g, ref %g)\n", api.c_str(), opn, what, r.max_abs, r.max_rel, r.worst,
+                                 double(got.data[r.worst]), double(ref.data[r.worst])); ++fails; }
+    };
+    using iv = std::vector<i64>;
+    run("gelu", {rnd({3, 257}, -9.f, 9.f)}, {}, "[-9, 9]");
+    run("mul", {rnd({13, 64}, -2.f, 2.f), rnd({1}, 2.f, 3.f)}, {}, "scalar operand [1]");
+    run("sub", {rnd({1}, 2.f, 3.f), rnd({26}, -2.f, 2.f)}, {}, "scalar operand first");
+    run("div", {rnd({1, 300}, -2.f, 2.f), rnd({1}, 2.f, 3.f)}, {}, "[1, n] / [1]");
+    run("layer_norm", {rnd({5, 33}, -2.f, 2.f), rnd({33}, 0.5f, 1.5f), rnd({33}, -1.f, 1.f)}, {{"eps", 1e-5}}, "5x33");
+    run("layer_norm", {rnd({2, 3, 64}, 3.f, 5.f), rnd({64}, 0.5f, 1.5f), rnd({64}, -1.f, 1.f)}, {{"eps", 1e-12}}, "2x3x64, offset mean");
+    run("group_norm", {rnd({8, 5, 7}, -2.f, 2.f), rnd({8}, 0.5f, 1.5f), rnd({8}, -1.f, 1.f)}, {{"groups", 4.0}, {"eps", 1e-5}}, "8 channels, 4 groups");
+    run("group_norm", {rnd({6, 10}, 1.f, 3.f), rnd({6}, 0.5f, 1.5f), rnd({6}, -1.f, 1.f)}, {{"groups", 6.0}}, "one channel per group");
+    run("group_norm", {rnd({6, 4, 4}, -1.f, 1.f), rnd({6}, 0.5f, 1.5f), rnd({6}, -1.f, 1.f)}, {{"groups", 1.0}}, "one group");
+    run("conv1d", {rnd({4, 37}, -1.f, 1.f), rnd({6, 4, 3}, -1.f, 1.f), rnd({6}, -1.f, 1.f)}, {{"pad", 1.0}}, "k3 pad 1");
+    run("conv1d", {rnd({6, 40}, -1.f, 1.f), rnd({4, 3, 5}, -1.f, 1.f), rnd({1}, -1.f, 1.f)}, {{"stride", 2.0}, {"pad", 3.0}, {"dilation", 2.0}, {"groups", 2.0}}, "2 groups, stride 2, dilation 2, shared bias");
+    run("conv2d", {rnd({3, 11, 13}, -1.f, 1.f), rnd({5, 3, 3, 3}, -1.f, 1.f), rnd({5}, -1.f, 1.f)}, {{"stride", 2.0}, {"pad", 1.0}}, "3x3 stride 2 pad 1");
+    run("conv2d", {rnd({6, 9, 8}, -1.f, 1.f), rnd({6, 1, 3, 3}, -1.f, 1.f), rnd({6}, -1.f, 1.f)}, {{"pad", 1.0}, {"groups", 6.0}}, "depthwise");
+    run("conv2d", {rnd({4, 12, 10}, -1.f, 1.f), rnd({6, 2, 2, 3}, -1.f, 1.f), rnd({1}, -1.f, 1.f)},
+        {{"stride", iv{2, 1}}, {"pad", iv{0, 2}}, {"dilation", iv{1, 2}}, {"groups", 2.0}}, "2 groups, 2x3 kernel, per-axis stride / pad / dilation, shared bias");
+    run("conv2d", {rnd({3, 16, 16}, -1.f, 1.f), rnd({7, 3, 4, 4}, -1.f, 1.f), rnd({7}, -1.f, 1.f)}, {{"stride", 4.0}}, "patch embedding 4x4 stride 4");
+    run("max_pool2d", {rnd({3, 9, 10}, -3.f, 3.f)}, {{"kernel", 3.0}, {"stride", 2.0}, {"pad", 1.0}}, "3x3 stride 2 pad 1");
+    run("max_pool2d", {rnd({2, 8, 8}, -3.f, -1.f)}, {{"kernel", iv{2, 3}}}, "2x3, stride = kernel, negative values");
+    run("avg_pool2d", {rnd({3, 9, 10}, -3.f, 3.f)}, {{"kernel", 3.0}, {"stride", 2.0}, {"pad", 1.0}}, "count_pad");
+    run("avg_pool2d", {rnd({3, 9, 10}, -3.f, 3.f)}, {{"kernel", 3.0}, {"stride", 2.0}, {"pad", 1.0}, {"count_pad", 0.0}}, "count_pad 0");
+    {
+        const i64 s = 5, t = 9, hq = 4, hk = 2, d = 16, dv = 12;
+        auto q = rnd({s, hq, d}, -1.f, 1.f), k = rnd({t, hk, d}, -1.f, 1.f), v = rnd({t, hk, dv}, -1.f, 1.f);
+        const float ninf = -std::numeric_limits<float>::infinity();
+        run("attention_bias", {q, k, v, rnd({t}, -1.f, 1.f)}, {}, "bias [t]");
+        run("attention_bias", {q, k, v, rnd({s, t}, -1.f, 1.f)}, {{"causal", 1.0}}, "bias [s, t], causal");
+        run("attention_bias", {q, k, v, rnd({hq, s, t}, -1.f, 1.f)}, {{"softcap", 2.0}, {"scale", 3.0}}, "bias [hq, s, t], softcap");
+        run("attention_bias", {q, k, v, rnd({hq, 1, 1}, -1.f, 1.f)}, {{"window", 3.0}}, "bias [hq, 1, 1], window on both sides");
+        run("attention_bias", {q, k, v, tensor({1}, 0.f)}, {{"causal", 1.0}, {"window", 2.0}, {"softcap", 5.0}}, "zero bias [1], causal + window + softcap");
+        auto mask = rnd({s, t}, -0.5f, 0.5f);
+        for (i64 j = 0; j < t; ++j) { mask.data[std::size_t(2 * t + j)] = ninf; if (j % 3 == 1) mask.data[std::size_t(j)] = ninf; }   // row 2 fully masked
+        run("attention_bias", {q, k, v, mask}, {}, "-inf masks, one row fully masked");
+        auto pad = tensor({t}, 0.f); for (i64 j = 6; j < t; ++j) pad.data[std::size_t(j)] = ninf;   // BERT-style key padding mask
+        run("attention_bias", {rnd({t, hq, d}, -1.f, 1.f), k, v, pad}, {}, "key padding mask, s = t");
+    }
+    std::printf("%s %d/%d %s encoder / vision cases (gelu, norms, conv, pooling, attention_bias) match the references\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails;
 }
 

@@ -1873,7 +1873,7 @@ FORGE_K void forge_causal_conv(G const float* x, G const float* w, G float* st, 
 """
 
 def cl_port():
-    return PORT_HELPERS + PORT_SHARED + PORT_KERNELS
+    return PORT_HELPERS + PORT_SHARED + PORT_KERNELS + PORT_NN   # PORT_NN: the encoder / vision ops (defined further down)
 
 def cu_port():
     """PORT_SHARED in the CUDA/HIP dialect (the codec helpers of the same names already exist in CU_QUANT)."""
@@ -2141,6 +2141,235 @@ def msl(names):
     body = re.sub(r"(?<![\w>])float\* (yr|yp)\b", r"device float* \1", body)
     return MSL_PRELUDE + body + msl_port()
 
+# ==== BEGIN device kernels for the encoder / vision ops (gelu, layer_norm, group_norm, conv1d, conv2d, pooling,
+# attention_bias) =====================================================================================================
+# gelu is a unary kernel on every backend (fgelu below). The others are written once in the portable OpenCL C dialect
+# (PORT_NN): kernels.cl takes them as they are, kernels.cu through cu_nn(), kernels.metal through msl_port(), Vulkan as
+# the GLSL ports in VK_PORT_NN, and tests/mock_cuda.c runs this very text as C (nn_mock_dispatch). Every kernel is one
+# work item per output element (per row / group for the norms), arguments are (inputs..., output, scalars...) in the
+# order gpu::cuda_hip::kernel_args lays them out, and each is checked against the op's float64 reference by the oracle.
+NN_OPS = ["layer_norm", "group_norm", "conv1d", "conv2d", "max_pool2d", "avg_pool2d", "attention_bias"]
+
+# 0.5 x erfc(-x / sqrt 2) with erfc by Abramowitz & Stegun 7.1.26 (absolute error 1.5e-7): no erf builtin is needed,
+# and the negative tail is a product, not 1 + erf with its cancellation.
+_GELU_BODY = """ {
+  float z = fabs_(x) * 0.70710678118654752f, t = 1.0f / (1.0f + 0.3275911f * z);
+  float p = t * (0.254829592f + t * (-0.284496736f + t * (1.421413741f + t * (-1.453152027f + t * 1.061405429f))));
+  float c = 0.5f * p * fexp(-z * z);
+  return x < 0.0f ? x * c : x * (1.0f - c); }
+"""
+CU_PRELUDE += "FORGE_DEV float fgelu(float x)" + _GELU_BODY
+CL_PRELUDE += "static inline float fgelu(float x)" + _GELU_BODY
+MSL_PRELUDE += "static inline float fgelu(float x)" + _GELU_BODY
+GLSL_HEAD = GLSL_HEAD.replace("layout(push_constant)", """float fgelu(float x) {
+  float z = abs(x) * 0.70710678118654752, t = 1.0 / (1.0 + 0.3275911 * z);
+  float q = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+  float c = 0.5 * q * fexp(-z * z);
+  return x < 0.0 ? x * c : x * (1.0 - c); }
+layout(push_constant)""", 1)
+UNARY["gelu"] = ("fgelu(x)", "fgelu(x)")
+
+PORT_NN = r"""// ---- encoder / vision ops (ops/gen/gpu_gen.py PORT_NN); contracts as ops/include/forge/ops/reference*.hpp ----
+// layer_norm over the last axis: a work item per row; mean and variance in 4 partial sums. In place is fine.
+FORGE_K void forge_layer_norm(G const float* x, G const float* w, G const float* b, G float* y, unsigned rows, unsigned cols, float eps) {
+  unsigned r = gid(); if (r >= rows) return; G const float* xr = x + (size_t)r * cols; G float* yr = y + (size_t)r * cols;
+  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f; unsigned j = 0;
+  for (; j + 4u <= cols; j += 4u) { s0 += xr[j]; s1 += xr[j + 1u]; s2 += xr[j + 2u]; s3 += xr[j + 3u]; }
+  for (; j < cols; ++j) s0 += xr[j];
+  float m = ((s0 + s1) + (s2 + s3)) / (float)cols;
+  s0 = 0.0f; s1 = 0.0f; s2 = 0.0f; s3 = 0.0f;
+  for (j = 0; j + 4u <= cols; j += 4u) { float d0 = xr[j] - m, d1 = xr[j + 1u] - m, d2 = xr[j + 2u] - m, d3 = xr[j + 3u] - m;
+    s0 = fma_(d0, d0, s0); s1 = fma_(d1, d1, s1); s2 = fma_(d2, d2, s2); s3 = fma_(d3, d3, s3); }
+  for (; j < cols; ++j) { float d0 = xr[j] - m; s0 = fma_(d0, d0, s0); }
+  float inv = 1.0f / fsqrt(((s0 + s1) + (s2 + s3)) / (float)cols + eps);
+  for (j = 0; j < cols; ++j) yr[j] = (xr[j] - m) * inv * w[j] + b[j]; }
+// group_norm: x[C, n] in `groups` groups of C / groups channels; a work item per group, then * w[c] + b[c]
+FORGE_K void forge_group_norm(G const float* x, G const float* w, G const float* b, G float* y, unsigned C, unsigned n, unsigned groups, float eps) {
+  unsigned gi = gid(); if (gi >= groups) return; unsigned cg = C / groups, m = cg * n;
+  G const float* xr = x + (size_t)gi * m; G float* yr = y + (size_t)gi * m;
+  float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f; unsigned j = 0;
+  for (; j + 4u <= m; j += 4u) { s0 += xr[j]; s1 += xr[j + 1u]; s2 += xr[j + 2u]; s3 += xr[j + 3u]; }
+  for (; j < m; ++j) s0 += xr[j];
+  float mu = ((s0 + s1) + (s2 + s3)) / (float)m;
+  s0 = 0.0f; s1 = 0.0f; s2 = 0.0f; s3 = 0.0f;
+  for (j = 0; j + 4u <= m; j += 4u) { float d0 = xr[j] - mu, d1 = xr[j + 1u] - mu, d2 = xr[j + 2u] - mu, d3 = xr[j + 3u] - mu;
+    s0 = fma_(d0, d0, s0); s1 = fma_(d1, d1, s1); s2 = fma_(d2, d2, s2); s3 = fma_(d3, d3, s3); }
+  for (; j < m; ++j) { float d0 = xr[j] - mu; s0 = fma_(d0, d0, s0); }
+  float inv = 1.0f / fsqrt(((s0 + s1) + (s2 + s3)) / (float)m + eps);
+  for (j = 0; j < m; ++j) { unsigned c = gi * cg + j / n; yr[j] = (xr[j] - mu) * inv * w[c] + b[c]; } }
+// conv1d: x[C, L] * w[O, cg, k] + b (bn = 1: one shared bias), zero padding; a work item per output element
+FORGE_K void forge_conv1d(G const float* x, G const float* w, G const float* b, G float* y, unsigned C, unsigned L, unsigned O, unsigned cg, unsigned k,
+                          unsigned ol, unsigned st, unsigned pd, unsigned dl, unsigned bn) {
+  unsigned i = gid(); if (i >= O * ol) return; unsigned p = i % ol, oc = i / ol, og = O / (C / cg), c0 = (oc / og) * cg;
+  float s = b[bn == 1u ? 0u : oc];
+  for (unsigned c = 0; c < cg; ++c) for (unsigned j = 0; j < k; ++j) {
+    int ix = (int)(p * st + j * dl) - (int)pd; if (ix < 0 || ix >= (int)L) continue;
+    s = fma_(x[(size_t)(c0 + c) * L + (unsigned)ix], w[((size_t)oc * cg + c) * k + j], s); }
+  y[i] = s; }
+// conv2d: x[C, H, W] * w[O, cg, kh, kw] + b, groups = C / cg (cg = 1: depthwise), zero padding; a work item per output
+FORGE_K void forge_conv2d(G const float* x, G const float* w, G const float* b, G float* y, unsigned C, unsigned H, unsigned W, unsigned O, unsigned cg,
+                          unsigned kh, unsigned kw, unsigned oh, unsigned ow, unsigned sh, unsigned sw, unsigned ph, unsigned pw, unsigned dh, unsigned dw, unsigned bn) {
+  unsigned i = gid(); if (i >= O * oh * ow) return;
+  unsigned xx = i % ow, yy = (i / ow) % oh, oc = i / (ow * oh), og = O / (C / cg), c0 = (oc / og) * cg;
+  float s = b[bn == 1u ? 0u : oc];
+  for (unsigned c = 0; c < cg; ++c) for (unsigned p = 0; p < kh; ++p) {
+    int iy = (int)(yy * sh + p * dh) - (int)ph; if (iy < 0 || iy >= (int)H) continue;
+    for (unsigned q = 0; q < kw; ++q) {
+      int ix = (int)(xx * sw + q * dw) - (int)pw; if (ix < 0 || ix >= (int)W) continue;
+      s = fma_(x[((size_t)(c0 + c) * H + (unsigned)iy) * W + (unsigned)ix], w[(((size_t)oc * cg + c) * kh + p) * kw + q], s); } }
+  y[i] = s; }
+// pooling over kernel windows of x[C, H, W]: mode 0 max (padding never wins: an all-padding window gives -inf),
+// 1 mean over the kernel area, 2 mean over the cells inside the image
+static inline float pool2d_at(G const float* x, unsigned i, unsigned H, unsigned W, unsigned oh, unsigned ow, unsigned kh, unsigned kw,
+                              unsigned sh, unsigned sw, unsigned ph, unsigned pw, unsigned mode) {
+  unsigned xx = i % ow, yy = (i / ow) % oh, c = i / (ow * oh), cnt = 0u; float s = 0.0f, m = -INFINITY;
+  for (unsigned p = 0; p < kh; ++p) {
+    int iy = (int)(yy * sh + p) - (int)ph; if (iy < 0 || iy >= (int)H) continue;
+    for (unsigned q = 0; q < kw; ++q) {
+      int ix = (int)(xx * sw + q) - (int)pw; if (ix < 0 || ix >= (int)W) continue;
+      float v = x[((size_t)c * H + (unsigned)iy) * W + (unsigned)ix]; s += v; m = v > m ? v : m; ++cnt; } }
+  if (mode == 0u) return m;
+  return s / (float)(mode == 1u ? kh * kw : (cnt ? cnt : 1u)); }
+FORGE_K void forge_max_pool2d(G const float* x, G float* y, unsigned C, unsigned H, unsigned W, unsigned oh, unsigned ow, unsigned kh, unsigned kw,
+                              unsigned sh, unsigned sw, unsigned ph, unsigned pw, unsigned mode) {
+  unsigned i = gid(); if (i >= C * oh * ow || mode != 0u) return; y[i] = pool2d_at(x, i, H, W, oh, ow, kh, kw, sh, sw, ph, pw, 0u); }
+FORGE_K void forge_avg_pool2d(G const float* x, G float* y, unsigned C, unsigned H, unsigned W, unsigned oh, unsigned ow, unsigned kh, unsigned kw,
+                              unsigned sh, unsigned sw, unsigned ph, unsigned pw, unsigned mode) {
+  unsigned i = gid(); if (i >= C * oh * ow || mode == 0u) return; y[i] = pool2d_at(x, i, H, W, oh, ow, kh, kw, sh, sw, ph, pw, mode); }
+// attention with an additive score bias, one pass with an online softmax. bias is broadcast to [hq, s, t]: (b0, b1, b2)
+// are its dims right-aligned, each 1 or the full size. softcap c > 0: scores -> c tanh(scores / c) before the bias. A
+// bias of -inf masks a key; flags bit 0 = causal, flags >> 7 = window w (keys w or more positions away on either side
+// are masked). A row with every key masked gives zeros. Plain f32 K/V.
+FORGE_K void forge_attention_bias(G const float* q, G const float* k, G const float* v, G const float* bias, G float* y, unsigned s, unsigned hq, unsigned d,
+                                  unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale, float softcap, unsigned b0, unsigned b1, unsigned b2) {
+  unsigned id = gid(); if (id >= s * hq) return;
+  unsigned i = id / hq, h = id % hq, kh = h / (hq / hk), causal = flags & 1u, window = flags >> 7;
+  int pos = (int)t - (int)s + (int)i;
+  G const float* qp = q + (size_t)id * d; G float* yp = y + (size_t)id * dv;
+  G const float* bp = bias + ((size_t)(b0 > 1u ? h : 0u) * b1 + (b1 > 1u ? i : 0u)) * b2;
+  for (unsigned e = 0; e < dv; ++e) yp[e] = 0.0f;
+  float m = -INFINITY, ls = 0.0f;
+  for (unsigned j = 0; j < t; ++j) {
+    if (causal && (int)j > pos) continue;
+    if (window && (pos - (int)j >= (int)window || (int)j - pos >= (int)window)) continue;
+    float bv = bp[b2 > 1u ? j : 0u]; if (bv == -INFINITY) continue;
+    G const float* kp = k + ((size_t)j * hk + kh) * d; G const float* vp = v + ((size_t)j * hk + kh) * dv; float dot = 0.0f;
+    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kp[e], dot);
+    float sc = dot * scale; if (softcap > 0.0f) sc = softcap * ftanh(sc / softcap);
+    sc += bv;
+    float mn = sc > m ? sc : m, rs = m == -INFINITY ? 0.0f : fexp(m - mn), pw = fexp(sc - mn);
+    ls = ls * rs + pw; m = mn;
+    for (unsigned e = 0; e < dv; ++e) yp[e] = fma_(pw, vp[e], yp[e] * rs); }
+  float inv = ls > 0.0f ? 1.0f / ls : 0.0f; for (unsigned e = 0; e < dv; ++e) yp[e] *= inv; }
+"""
+
+def cu_nn():
+    """PORT_NN in the CUDA/HIP dialect."""
+    b = PORT_NN.replace("G ", "").replace("FORGE_K void", "FORGE_GLOBAL void").replace("static inline", "FORGE_DEV")
+    return b.replace("(size_t)", "(unsigned long long)").replace("-INFINITY", "-__builtin_inff()")
+
+def nn_mock_dispatch():
+    """tests/mock_cuda.c: PORT_NN as C (the OpenCL C text through the host shim, with the C prelude it needs) and
+    trampolines over the CUDA launch arguments (8-byte device pointers, 4-byte scalars)."""
+    import re
+    out = ["// generated by ops/gen/gpu_gen.py -- do not edit", CL_PRELUDE, PORT_NN, "typedef void (*forge_nn_tramp)(void** a);"]
+    table = []
+    for m in re.finditer(r"FORGE_K void (forge_\w+)\(([^)]*)\)", PORT_NN):
+        fn, params = m.group(1), [p.strip() for p in m.group(2).split(",")]
+        args = []
+        for i, p in enumerate(params):
+            if "*" in p: args.append(f"(float*)(uintptr_t)*(uint64_t*)a[{i}]")
+            elif p.startswith("float"): args.append(f"*(float*)a[{i}]")
+            else: args.append(f"*(unsigned*)a[{i}]")
+        out.append(f"static void tn_{fn}(void** a) {{ {fn}({', '.join(args)}); }}")
+        table.append(f'  {{"{fn}", tn_{fn}, {len(params)}}},')
+    out.append("static const struct { const char* name; forge_nn_tramp f; int nargs; } forge_nn_tramps[] = {")
+    out += table + ["  {0, 0, 0}};"]
+    return "\n".join(out) + "\n"
+
+# GLSL ports of PORT_NN (same form as VK_PORT: bindings and push constants in the argument order). The norms and the
+# attention scores use 4 partial sums as above / as VK_PORT_QK; -inf is tested as "below every finite float".
+VK_PORT_NN = {
+    "forge_layer_norm": ([("readonly", "float", "x_"), ("readonly", "float", "w_"), ("readonly", "float", "b_"), ("writeonly", "float", "y_")],
+        "uint rows; uint cols; float eps;", "",
+        """  uint r = gid(); if (r >= p.rows) return; uint o = r * p.cols;
+  vec4 s = vec4(0.0); uint j = 0u;
+  for (; j + 4u <= p.cols; j += 4u) s += vec4(x_[o + j], x_[o + j + 1u], x_[o + j + 2u], x_[o + j + 3u]);
+  for (; j < p.cols; ++j) s.x += x_[o + j];
+  float m = ((s.x + s.y) + (s.z + s.w)) / float(p.cols);
+  s = vec4(0.0);
+  for (j = 0u; j + 4u <= p.cols; j += 4u) { vec4 d = vec4(x_[o + j], x_[o + j + 1u], x_[o + j + 2u], x_[o + j + 3u]) - vec4(m); s = fma(d, d, s); }
+  for (; j < p.cols; ++j) { float d0 = x_[o + j] - m; s.x = fma(d0, d0, s.x); }
+  float inv = inversesqrt(((s.x + s.y) + (s.z + s.w)) / float(p.cols) + p.eps);
+  for (j = 0u; j < p.cols; ++j) y_[o + j] = (x_[o + j] - m) * inv * w_[j] + b_[j];"""),
+    "forge_group_norm": ([("readonly", "float", "x_"), ("readonly", "float", "w_"), ("readonly", "float", "b_"), ("writeonly", "float", "y_")],
+        "uint C; uint n; uint groups; float eps;", "",
+        """  uint gi = gid(); if (gi >= p.groups) return; uint cg = p.C / p.groups, m = cg * p.n, o = gi * m;
+  vec4 s = vec4(0.0); uint j = 0u;
+  for (; j + 4u <= m; j += 4u) s += vec4(x_[o + j], x_[o + j + 1u], x_[o + j + 2u], x_[o + j + 3u]);
+  for (; j < m; ++j) s.x += x_[o + j];
+  float mu = ((s.x + s.y) + (s.z + s.w)) / float(m);
+  s = vec4(0.0);
+  for (j = 0u; j + 4u <= m; j += 4u) { vec4 d = vec4(x_[o + j], x_[o + j + 1u], x_[o + j + 2u], x_[o + j + 3u]) - vec4(mu); s = fma(d, d, s); }
+  for (; j < m; ++j) { float d0 = x_[o + j] - mu; s.x = fma(d0, d0, s.x); }
+  float inv = inversesqrt(((s.x + s.y) + (s.z + s.w)) / float(m) + p.eps);
+  for (j = 0u; j < m; ++j) { uint c = gi * cg + j / p.n; y_[o + j] = (x_[o + j] - mu) * inv * w_[c] + b_[c]; }"""),
+    "forge_conv1d": ([("readonly", "float", "x_"), ("readonly", "float", "w_"), ("readonly", "float", "b_"), ("writeonly", "float", "y_")],
+        "uint C; uint L; uint O; uint cg; uint k; uint ol; uint st; uint pd; uint dl; uint bn;", "",
+        """  uint i = gid(); if (i >= p.O * p.ol) return; uint q = i % p.ol, oc = i / p.ol, og = p.O / (p.C / p.cg), c0 = (oc / og) * p.cg;
+  float s = b_[p.bn == 1u ? 0u : oc];
+  for (uint c = 0u; c < p.cg; ++c) for (uint j = 0u; j < p.k; ++j) {
+    int ix = int(q * p.st + j * p.dl) - int(p.pd); if (ix < 0 || ix >= int(p.L)) continue;
+    s = fma(x_[(c0 + c) * p.L + uint(ix)], w_[(oc * p.cg + c) * p.k + j], s); }
+  y_[i] = s;"""),
+    "forge_conv2d": ([("readonly", "float", "x_"), ("readonly", "float", "w_"), ("readonly", "float", "b_"), ("writeonly", "float", "y_")],
+        "uint C; uint H; uint W; uint O; uint cg; uint kh; uint kw; uint oh; uint ow; uint sh; uint sw; uint ph; uint pw; uint dh; uint dw; uint bn;", "",
+        """  uint i = gid(); if (i >= p.O * p.oh * p.ow) return;
+  uint xx = i % p.ow, yy = (i / p.ow) % p.oh, oc = i / (p.ow * p.oh), og = p.O / (p.C / p.cg), c0 = (oc / og) * p.cg;
+  float s = b_[p.bn == 1u ? 0u : oc];
+  for (uint c = 0u; c < p.cg; ++c) for (uint u = 0u; u < p.kh; ++u) {
+    int iy = int(yy * p.sh + u * p.dh) - int(p.ph); if (iy < 0 || iy >= int(p.H)) continue;
+    for (uint q = 0u; q < p.kw; ++q) {
+      int ix = int(xx * p.sw + q * p.dw) - int(p.pw); if (ix < 0 || ix >= int(p.W)) continue;
+      s = fma(x_[((c0 + c) * p.H + uint(iy)) * p.W + uint(ix)], w_[((oc * p.cg + c) * p.kh + u) * p.kw + q], s); } }
+  y_[i] = s;"""),
+    "forge_attention_bias": ([("readonly", "float", "q_"), ("readonly", "float", "k_"), ("readonly", "float", "v_"), ("readonly", "float", "bias_"), ("", "float", "y_")],
+        "uint s; uint hq; uint d; uint t; uint hk; uint dv; uint flags; float scale; float softcap; uint b0; uint b1; uint b2;", VK_PORT_QK,
+        """  uint id = gid(); if (id >= p.s * p.hq) return;
+  uint i = id / p.hq, h = id % p.hq, kh = h / (p.hq / p.hk), causal = p.flags & 1u, window = p.flags >> 7;
+  int pos = int(p.t) - int(p.s) + int(i);
+  uint qo = id * p.d, yo = id * p.dv, bo = ((p.b0 > 1u ? h : 0u) * p.b1 + (p.b1 > 1u ? i : 0u)) * p.b2;
+  for (uint e = 0u; e < p.dv; ++e) y_[yo + e] = 0.0;
+  float m = 0.0, ls = 0.0; bool have = false;
+  for (uint j = 0u; j < p.t; ++j) {
+    if (causal != 0u && int(j) > pos) continue;
+    if (window != 0u && (pos - int(j) >= int(window) || int(j) - pos >= int(window))) continue;
+    float bv = bias_[bo + (p.b2 > 1u ? j : 0u)]; if (bv < -3.0e38) continue;
+    uint ko = (j * p.hk + kh) * p.d, vo = (j * p.hk + kh) * p.dv; float sc = qkdot(qo, ko) * p.scale;
+    if (p.softcap > 0.0) sc = p.softcap * tanh(sc / p.softcap);
+    sc += bv;
+    float mn = (!have || sc > m) ? sc : m, rs = have ? fexp(m - mn) : 0.0, pw = fexp(sc - mn);
+    ls = ls * rs + pw; m = mn; have = true;
+    for (uint e = 0u; e < p.dv; ++e) y_[yo + e] = fma(pw, v_[vo + e], y_[yo + e] * rs); }
+  float inv = ls > 0.0 ? 1.0 / ls : 0.0; for (uint e = 0u; e < p.dv; ++e) y_[yo + e] *= inv;"""),
+}
+_VK_POOL = """float pool2d_at(uint i, uint mode) {
+  uint xx = i % p.ow, yy = (i / p.ow) % p.oh, c = i / (p.ow * p.oh), cnt = 0u; float s = 0.0, m = 0.0;
+  for (uint u = 0u; u < p.kh; ++u) {
+    int iy = int(yy * p.sh + u) - int(p.ph); if (iy < 0 || iy >= int(p.H)) continue;
+    for (uint q = 0u; q < p.kw; ++q) {
+      int ix = int(xx * p.sw + q) - int(p.pw); if (ix < 0 || ix >= int(p.W)) continue;
+      float v = x_[(c * p.H + uint(iy)) * p.W + uint(ix)]; s += v; m = (cnt == 0u || v > m) ? v : m; ++cnt; } }
+  if (mode == 0u) return cnt != 0u ? m : uintBitsToFloat(0xff800000u);   // an all-padding window: -inf
+  return s / float(mode == 1u ? p.kh * p.kw : (cnt != 0u ? cnt : 1u)); }
+"""
+for _n, _m in (("forge_max_pool2d", "if (i >= p.C * p.oh * p.ow || p.mode != 0u) return; y_[i] = pool2d_at(i, 0u);"),
+               ("forge_avg_pool2d", "if (i >= p.C * p.oh * p.ow || p.mode == 0u) return; y_[i] = pool2d_at(i, p.mode);")):
+    VK_PORT_NN[_n] = ([("readonly", "float", "x_"), ("writeonly", "float", "y_")],
+        "uint C; uint H; uint W; uint oh; uint ow; uint kh; uint kw; uint sh; uint sw; uint ph; uint pw; uint mode;", _VK_POOL, "  uint i = gid(); " + _m)
+VK_PORT.update(VK_PORT_NN)
+# ==== END device kernels for the encoder / vision ops ==============================================================
+
 # ==== BEGIN Metal (MSL) translation of the portable device kernels =================================================
 # kernels.metal takes PORT_HELPERS + PORT_SHARED + PORT_KERNELS through a textual translation, so the arithmetic is the
 # OpenCL C's token for token: address-space qualifiers (G -> device, pointers to locals -> thread), integer type names,
@@ -2171,7 +2400,7 @@ def msl_port():
         out.append("uint _gid [[thread_position_in_grid]]")
         return f"kernel void {m.group(1)}({', '.join(out)})"
     b, n = re.subn(r"FORGE_K void (forge_\w+)\(([^)]*)\)", sig, b, flags=re.S)
-    assert n == 11 and "FORGE_K" not in b and " G " not in b
+    assert n == 18 and "FORGE_K" not in b and " G " not in b
     return b
 # ==== END Metal (MSL) translation ===================================================================================
 
@@ -2186,7 +2415,7 @@ def main():
     a = ap.parse_args()
     spec = {o["name"] for f in a.ops for o in parse(f)}
     names = sorted(UNARY) + sorted(BINARY) + OTHER
-    missing = [n for n in names if n not in spec]
+    missing = [n for n in names + NN_OPS if n not in spec]
     if missing: sys.exit(f"gpu_gen: kernels for ops not in the spec: {missing}")
     vk_names = names + sorted(VK_PORT)   # Vulkan also builds the GLSL ports of the portable kernels
     if a.list: print(";".join(vk_names)); return
@@ -2197,7 +2426,8 @@ def main():
         if not os.path.exists(path) or open(path, encoding="utf-8").read() != text: open(path, "w", encoding="utf-8", newline="\n").write(text)
     for n in names: put(os.path.join(a.out, n + ".comp"), glsl_folded(n))
     for n in sorted(VK_PORT): put(os.path.join(a.out, n + ".comp"), glsl_port(n))
-    put(os.path.join(a.out, "kernels.cu"), cuda(names) + "\n" + CU_QUANT + cu_port())   # CUDA/HIP only (not OpenCL/Metal)
+    put(os.path.join(a.out, "kernels.cu"), cuda(names) + "\n" + CU_QUANT + cu_port() + cu_nn())   # CU_QUANT: CUDA/HIP only (not OpenCL/Metal)
+    put(os.path.join(a.out, "kernels_nn_mock.inc"), nn_mock_dispatch())
     put(os.path.join(a.out, "kernels.cl"), opencl(names))
     put(os.path.join(a.out, "kernels.metal"), msl(names))
     put(os.path.join(a.out, "kernels_cl_mock.inc"), cl_mock_dispatch(names))
