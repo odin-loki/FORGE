@@ -8,14 +8,14 @@
 
 ## Requirements
 - CMake **3.25+**. The presets use Ninja; `ios` uses Xcode.
-- A **C++23** compiler and a C compiler. CI builds with g++-14, clang-18, AppleClang (macos-latest), MSVC (windows-latest), MinGW-w64 GCC (MSYS2 UCRT64) and FreeBSD 14.3's base clang. Clang older than 19 and libc++ older than 20 get configure-time workarounds (`std::expected`, `-fexperimental-library`).
+- A **C++23** compiler and a C compiler. CI builds with g++-14, clang-23 (apt.llvm.org), AppleClang (macos-latest), MSVC (windows-latest), MinGW-w64 GCC (MSYS2 UCRT64) and FreeBSD 14.3's base clang. Clang older than 19 and libc++ older than 20 get configure-time workarounds (`std::expected`, `-fexperimental-library`).
 - **Python 3** at configure time (required).
 - Optional, each enabling more:
 
 | Tool | Enables |
 |------|---------|
 | `glslangValidator` + `vulkan/vulkan.h` | SPIR-V kernels embedded in the binary, and the Vulkan backend. `spirv-val` also validates them |
-| `clang` with the NVPTX / AMDGPU backends (`clang-19`, `clang-18`, `clang-20` or `clang`; the host compiler's own clang when the host compiler is clang) | Embedded CUDA PTX (`sm_70`) and HIP code objects. Override with `-DFORGE_GPU_CLANG=...` |
+| `clang` with the NVPTX / AMDGPU backends (`clang-23` down to `clang-18`, or `clang`; the host compiler's own clang when the host compiler is clang) | Embedded CUDA PTX (`sm_70`) and HIP code objects. Override with `-DFORGE_GPU_CLANG=...` |
 | `ld.lld` / `lld`, or `zig` (also found through the `ziglang` Python package) | Linking the HIP code objects. Override with `-DFORGE_LLD=...` |
 | `llvm-spirv` | SPIR-V for Level Zero |
 | OpenSSL | TLS for `forge rpc-serve` (`FORGE_TLS`, on by default when OpenSSL is found). Pass `-DOPENSSL_ROOT_DIR=<prefix>` if needed |

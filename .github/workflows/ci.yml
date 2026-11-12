@@ -19,10 +19,14 @@ jobs:
       matrix:
         include:
           - { cc: gcc,   cxx: g++-14,     c: gcc-14 }
-          - { cc: clang, cxx: clang++-18, c: clang-18 }
+          - { cc: clang, cxx: clang++-23, c: clang-23 }
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 clang-18 ccache
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 clang-23 ccache
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: python -m pip install numpy safetensors onnx cryptography blake3
@@ -69,18 +73,26 @@ jobs:
       TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 python3-numpy
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 python3-numpy
       - run: sudo sysctl vm.mmap_rnd_bits=28
-      - run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
       - run: cmake --build build-tsan -j4 --target test_script forge
       - run: ./build-tsan/test_script
   linux-asan:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-18 python3-numpy
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 python3-numpy
       - run: sudo sysctl vm.mmap_rnd_bits=28
-      - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_C_COMPILER=clang-18 -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF
       - run: cmake --build build-asan -j4 --target test_script forge
       - run: ./build-asan/test_script
   shells:

@@ -54,9 +54,9 @@ Wine, the Android emulator and qemu: see [building.md](building.md). Results per
 
 | Job | Runner | What it does |
 |-----|--------|--------------|
-| `linux-gcc`, `linux-clang` | ubuntu-24.04 | `dev` preset with g++-14 / clang-18 and ccache; `ctest -LE "slow|emu"` |
+| `linux-gcc`, `linux-clang` | ubuntu-24.04 | `dev` preset with g++-14 / clang-23 (from apt.llvm.org) and ccache; `ctest -LE "slow|emu"` |
 | `linux-vulkan` | ubuntu-24.04 | g++-14 with glslang, Vulkan headers and Mesa lavapipe; builds `forge` and `test_vulkan`, checks `test_vulkan` reports an `llvmpipe` device (a skip fails the job), then `ctest -R vulkan` (both `test_vulkan` runs and the two Vulkan goldens) |
-| `linux-asan`, `linux-tsan` | ubuntu-24.04 | clang-18 with `FORGE_SANITIZE` (Debug) / `FORGE_TSAN`; builds and runs `test_script` only |
+| `linux-asan`, `linux-tsan` | ubuntu-24.04 | clang-23 with `FORGE_SANITIZE` (Debug) / `FORGE_TSAN`; builds and runs `test_script` only |
 | `shells` | ubuntu-24.04 | Installs many shells; runs `FORGE_TEST_ONLY=emit test_script` |
 | `macos` | macos-latest | `dev` preset; `ctest -LE "slow|emu"` |
 | `ios` | macos-latest | Xcode device build of `forge_c`, `forge_mobile`, `forge_text` with `ios.cmake`; then a Ninja arm64 simulator build of `test_os`, `test_text`, `test_locale`, `test_mobile`, `test_util`, run in a booted iPhone simulator with `xcrun simctl spawn` (`.github/ios_sim_check.sh`) |
