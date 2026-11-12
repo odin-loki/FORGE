@@ -38,11 +38,9 @@
 #include <forge/os/detail.hpp>
 #include <forge/os/process.hpp>   // find_executable, detail_proc::win_cmdline
 #if defined(_WIN32)
-#include <userenv.h>   // CreateAppContainerProfile (link userenv)
 #include <psapi.h>     // K32EnumProcessModules (kernel32): the DLLs a worker of this image needs
 #include <aclapi.h>    // SetEntriesInAcl (advapi32): grant the container read+execute on a worker image
 #if defined(_MSC_VER)
-#pragma comment(lib, "userenv.lib")
 #pragma comment(lib, "advapi32.lib")
 #endif
 #endif
@@ -249,10 +247,23 @@ inline const wchar_t* profile_name(const sandbox_policy& p) {
 }
 inline error profile_sid(const sandbox_policy& p, PSID* sid) {
     const wchar_t* name = profile_name(p); *sid = nullptr;
-    HRESULT hr = CreateAppContainerProfile(name, name, L"FORGE sandboxed child", nullptr, 0, sid);
-    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) hr = DeriveAppContainerSidFromAppContainerName(name, sid);
+    // userenv.dll is loaded at run time (System32 only), so nothing links against it.
+    using create_fn = HRESULT(WINAPI*)(PCWSTR, PCWSTR, PCWSTR, PSID_AND_ATTRIBUTES, DWORD, PSID*);
+    using derive_fn = HRESULT(WINAPI*)(PCWSTR, PSID*);
+    static HMODULE ue = LoadLibraryExW(L"userenv.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/);
+    static auto create = ue ? reinterpret_cast<create_fn>(reinterpret_cast<void*>(GetProcAddress(ue, "CreateAppContainerProfile"))) : nullptr;
+    static auto derive = ue ? reinterpret_cast<derive_fn>(reinterpret_cast<void*>(GetProcAddress(ue, "DeriveAppContainerSidFromAppContainerName"))) : nullptr;
+    if (!create || !derive) return unsupported("AppContainer profiles (userenv.dll, Windows 8+)");
+    HRESULT hr = create(name, name, L"FORGE sandboxed child", nullptr, 0, sid);
+    if (hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) hr = derive(name, sid);
     if (FAILED(hr) || !*sid) return {FAILED(hr) ? int(hr) : int(E_FAIL), "AppContainer profile failed"};
     return {};
+}
+// Removes a profile created by profile_sid (tests, uninstallers). Missing userenv or profile: not an error.
+inline void delete_profile(const wchar_t* name) {
+    using fn = HRESULT(WINAPI*)(PCWSTR);
+    HMODULE ue = LoadLibraryExW(L"userenv.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/);
+    if (auto f = ue ? reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(ue, "DeleteAppContainerProfile"))) : nullptr) f(name);
 }
 // Give the container read + execute on a file outside the places it may read by default (the user's own
 // directories are not readable by AppContainers; system directories are). An existing grant is left alone.
