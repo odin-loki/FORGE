@@ -60,7 +60,10 @@ inline ops::attrs get_attrs(reader& r) {
     ops::attrs a; auto n = r.u32(); if (n > 4096) { r.ok = false; return a; }
     for (std::uint32_t i = 0; i < n && r.ok; ++i) {
         auto k = r.str(); auto tag = r.u32();
-        if (tag == 0) { double d; r.raw(&d, 8); a.v[k] = d; }
+        if (tag == 0) {   // ops cast number attrs to i64: no NaN, infinity or out-of-range value from the wire
+            double d = 0; r.raw(&d, 8); if (!(d >= -0x1p53 && d <= 0x1p53)) { r.ok = false; break; }
+            a.v[k] = d;
+        }
         else if (tag == 1) { auto m = r.u32(); if (m > (1u << 20)) { r.ok = false; break; } std::vector<i64> iv(m); for (auto& x : iv) x = r.i64(); a.v[k] = iv; }
         else if (tag == 2) a.v[k] = r.str();
         else r.ok = false;
@@ -71,6 +74,27 @@ inline bool valid_shape(const shape_t& s, i64 cap = i64(1) << 32) { i64 n = 1; f
 inline int op_index(std::string_view name) {
     for (std::size_t i = 0; i < ops::op_count; ++i) if (ops::info(ops::op(i)).name == name) return int(i);
     return -1;
+}
+// A frame is run only if it is a well-formed call of the op: the declared number of inputs, operands the op's
+// shape rule accepts, and an output of the size that rule gives. Lowerings index their inputs and write the
+// output without checks of their own (the planner guarantees them locally; a peer does not).
+inline void check_call(ops::op o, const std::vector<shape_t>& in, const shape_t& out, const ops::attrs& a) {
+    const auto& inf = ops::info(o);
+    if (inf.shape == ops::shape_rule::concat ? in.size() < 2 : in.size() != std::size_t(inf.inputs))
+        raise(errc::invalid_argument, "{} takes {} inputs, got {}", inf.name, inf.inputs, in.size());
+    for (auto& s : in) if (numel(s) == 0) raise(errc::shape_mismatch, "{}: empty input", inf.name);
+    auto want = ops::infer_shape(inf.shape, in, a);
+    if (!valid_shape(want) || numel(want) != numel(out))
+        raise(errc::shape_mismatch, "{}: output shape {} does not fit the inputs (expected {})", inf.name, shape_str(out), shape_str(want));
+    auto rank = [&](std::size_t i) { return in[i].size(); };
+    bool ok = true;   // operands of the ops whose shape rule only says "same as input 0"
+    if (inf.name == "rms_norm") ok = rank(0) >= 1 && rank(1) == 1 && in[1][0] == in[0].back();
+    else if (inf.name == "layer_norm") ok = rank(0) >= 1 && rank(1) == 1 && rank(2) == 1 && in[1][0] == in[0].back() && in[2][0] == in[0].back();
+    else if (inf.name == "softmax" || inf.name == "moe_gate") ok = rank(0) >= 1;
+    else if (inf.name == "rope") ok = rank(0) == 3 && in[0][2] % 2 == 0 && numel(in[1]) == in[0][0];
+    else if (inf.name == "moe_ffn") ok = rank(0) == 2 && rank(1) == 2 && rank(2) == 3 && rank(4) == 3 && in[3] == in[2] && in[1][0] == in[0][0] &&
+                                         in[1][1] == in[2][0] && in[2][2] == in[0][1] && in[4] == shape_t{in[2][0], in[0][1], in[2][1]};
+    if (!ok) raise(errc::shape_mismatch, "{}: operand shapes do not fit together", inf.name);
 }
 } // namespace detail
 
@@ -260,7 +284,13 @@ private:
             std::vector<tensor> ins; std::vector<tensor_view> views; std::vector<shape_t> shapes;
             for (std::uint32_t i = 0; i < n && r.ok; ++i) {
                 auto sh = r.shape(); if (!detail::valid_shape(sh, i64(max_tensor_elems))) return;
-                ins.emplace_back(sh); r.raw(ins.back().data.data(), ins.back().data.size() * 4);
+                // grow with the bytes that actually arrive: a 40-byte frame may name a 16 GiB tensor
+                tensor t; t.shape = sh; const std::size_t want = std::size_t(numel(sh));
+                while (r.ok && t.data.size() < want) {
+                    const std::size_t at = t.data.size(), step = std::min<std::size_t>(want - at, std::size_t(1) << 22);
+                    t.data.resize(at + step); r.raw(t.data.data() + at, step * 4);
+                }
+                ins.push_back(std::move(t));
             }
             auto os = r.shape(); if (!r.ok || !detail::valid_shape(os, i64(max_tensor_elems))) return;
             for (auto& t : ins) { views.push_back({t.data.data(), t.shape}); shapes.push_back(t.shape); }
@@ -269,6 +299,7 @@ private:
             try {
                 if (!(peer.perms & perm_device)) { say("denied device op " + name + " for " + peer.who); raise(errc::unsupported, "permission denied: {} may not run device ops (allow=)", peer.who); }
                 if (oi < 0) raise(errc::unsupported, "unknown op '{}'", name);
+                detail::check_call(ops::op(oi), shapes, os, a);
                 tensor out(os);
                 auto& l = reg_->select(ops::op(oi), shapes, os, a);
                 auto* h = l.on_device ? reg_->hooks.get() : nullptr;
