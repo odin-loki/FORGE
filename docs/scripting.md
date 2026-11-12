@@ -131,7 +131,9 @@ int main() {
 - **Memory budget.** Script heap memory is reserved from the process `forge::mem` budget (tag `script`; see
   [memory.md](memory.md), `FORGE_MEM_LIMIT`). `--heap BYTES`, `options::heap_bytes` and `limit {.mem = ...}` set a
   tighter cap. Over the cap the runtime runs the cycle collector, then throws a catchable `OutOfMemoryError`. Handlers
-  get about 4 MiB of grace to run before a second error.
+  get about 4 MiB of grace to run before a second error; the cap is enforced again once the heap is 16 KiB below it.
+  Building the error object itself is exempt from the cap. Growth in place (`push_back`, `insert`, `append`, `resize`
+  on containers and strings) is charged like a new object.
 
 ## Errors
 
@@ -333,7 +335,8 @@ committed memory (Windows), not resident memory, so thread stacks and allocator 
 at a small `SIZE` may fail to start. macOS, iOS, Android and the BSDs get no OS cap on the `forge script` process (no usable mechanism for a
 running process; the heap and child caps still apply). An embedder's process is never capped: the engine applies
 only the heap and child parts. Children are capped one by one, not as a sum. `forge rpc-serve` passes
-`--script-mem-mb` to its script children as `--mem-limit` too, on top of the OS cap it already set.
+`--script-mem-mb` to its script children as `--mem-limit` too, on top of the OS cap it already set; that OS cap has
+no headroom, so there it usually fires first (`OutOfMemoryError: out of memory`).
 
 Tests: `tests/script/limits.fs`, `limit_block.fs`, `limit_counts.fs`, `mem_containers.fs` (heap accounting per
 container kind); `mem_limit_whole_run`, `mem_limit_size_strings`, `mem_limit_children` in `tests/test_script.cpp`.

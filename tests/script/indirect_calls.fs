@@ -11,7 +11,8 @@ forge::fs::write(path, "data");
 
 void attempt(const std::string& route, std::function<void()> f) {
     try { f(); std::println("ran: {}", route); }
-    catch (const PermissionError& e) { std::println("denied: {}", route); }
+    catch (const forge::PermissionError& e)   // qualified: a bare PermissionError here would be parsed as catch-all
+    { std::println("denied: {}", route); }
 }
 
 // ---- capability-needing callables

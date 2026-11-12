@@ -1014,12 +1014,12 @@ TEST(mem_limit_whole_run) {
     };
     grows("vector<string>", "std::vector<std::string> v; while (true) v.push_back(std::string(256, 'x'));");
     grows("vector<int>", "std::vector<int> v; while (true) v.push_back(1);");
-    grows("deque", "std::deque<int> d; while (true) d.push_front(1);");
-    grows("list", "std::list<int> l; while (true) l.push_back(1);");
+    grows("deque", "#include <deque>\nstd::deque<int> d; while (true) d.push_back(1);");
+    grows("list", "#include <list>\nstd::list<int> l; while (true) l.push_back(1);");
     grows("map", "std::map<int, int> m; int i = 0; while (true) { m[i] = i; ++i; }");
     grows("unordered_map", "std::unordered_map<std::string, int> m; int i = 0; while (true) { m[std::to_string(i)] = i; ++i; }");
-    grows("set", "std::set<int> s; int i = 0; while (true) s.insert(i++);");
-    grows("unordered_set", "std::unordered_set<int> s; int i = 0; while (true) s.insert(i++);");
+    grows("set", "#include <set>\nstd::set<int> s; int i = 0; while (true) { s.insert(i); ++i; }");
+    grows("unordered_set", "#include <unordered_set>\nstd::unordered_set<int> s; int i = 0; while (true) { s.insert(i); ++i; }");
     grows("string +=", "std::string s = \"x\"; while (true) s += s;");
     grows("string append", "std::string s; while (true) s.append(4096, 'x');");
     grows("string push_back", "std::string s; while (true) s.push_back('x');");
@@ -1029,18 +1029,18 @@ TEST(mem_limit_whole_run) {
     { auto a = run1("std::vector<int> v; while (true) v.push_back(1);", true, o);
       CHECK_MSG(a.r.error.find("limit of 4194304 bytes exceeded (--mem-limit)") != std::string::npos, "%s", a.r.error.c_str()); }
     // catchable, like the other heap limits; once the memory is released the script carries on
-    CHECK(run("try { std::vector<std::string> v; while (true) v.push_back(std::string(256, 'x')); } catch (const OutOfMemoryError& e) { std::println(\"caught\"); }\n"
+    CHECK(run("try { std::vector<std::string> v; while (true) v.push_back(std::string(256, 'x')); } catch (const forge::OutOfMemoryError& e) { std::println(\"caught\"); }\n"
               "std::vector<int> w; for (int i = 0; i < 1000; ++i) w.push_back(i); std::println(\"{}\", w.size());", o) == "caught\n1000\n");
     CHECK(run("try { std::string s = \"x\"; while (true) s += s; } catch (const std::bad_alloc& e) { std::println(\"bad_alloc\"); }", o) == "bad_alloc\n");
     // still over the cap after the catch: raised again (the handler only gets the usual grace)
-    CHECK(run("std::vector<std::string> v;\ntry { while (true) v.push_back(std::string(256, 'x')); } catch (const OutOfMemoryError& e) { std::println(\"caught\"); }\n"
+    CHECK(run("std::vector<std::string> v;\ntry { while (true) v.push_back(std::string(256, 'x')); } catch (const forge::OutOfMemoryError& e) { std::println(\"caught\"); }\n"
               "while (true) v.push_back(std::string(256, 'x'));", o) == "caught\n!OutOfMemoryError");
     // below the limit nothing fires
     CHECK(run("std::vector<std::string> v; for (int i = 0; i < 2000; ++i) v.push_back(std::string(256, 'x'));\n"
               "std::map<int, int> m; for (int i = 0; i < 2000; ++i) m[i] = i; std::println(\"{} {}\", v.size(), m.size());", o) == "2000 2000\n");
     // a limit block can narrow the cap but not widen it
     CHECK(run("limit {.mem = \"1G\"} { std::vector<int> v; while (true) v.push_back(1); }", o) == "!OutOfMemoryError");
-    CHECK(run("try { limit {.mem = \"64K\"} { std::vector<int> v; for (int i = 0; i < 100000; ++i) v.push_back(1); } } catch (const OutOfMemoryError& e) { std::println(\"inner\"); }\n"
+    CHECK(run("try { limit {.mem = \"64K\"} { std::vector<int> v; for (int i = 0; i < 100000; ++i) v.push_back(1); } } catch (const forge::OutOfMemoryError& e) { std::println(\"inner\"); }\n"
               "std::vector<int> w; for (int i = 0; i < 50000; ++i) w.push_back(i); std::println(\"{}\", w.size());", o) == "inner\n50000\n");
     // with --heap as well, the lower of the two applies
     { script::options both = o; both.heap_bytes = 256u << 10;
