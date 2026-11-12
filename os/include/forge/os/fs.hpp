@@ -582,9 +582,10 @@ inline bool cannot_clone(int e) {
 }
 // A copy-on-write clone of `from` at `to` (which must not exist): instant and shares storage until either file
 // changes. Linux / Android: FICLONE (Btrfs, XFS with reflink, bcachefs, OCFS2, overlayfs over those). macOS /
-// iOS: clonefile (APFS). FreeBSD and Windows have no call that clones or fails (their copy calls clone on their
-// own where the file system can: ZFS block cloning, ReFS / Dev Drive), so clone_file is unsupported there, as it
-// is on a file system that cannot share blocks. Use copy_file to get the best the system offers.
+// iOS: clonefile (APFS). Windows: FSCTL_DUPLICATE_EXTENTS_TO_FILE on a volume with block reference counting
+// (ReFS, Dev Drive; Server 2016 / Windows 10 1607+), both files on that volume. FreeBSD has no call that clones
+// or fails (copy_file_range clones on ZFS on its own), so clone_file is unsupported there, as it is on a file
+// system that cannot share blocks. Use copy_file to get the best the system offers.
 inline status clone_file(const std::string& from, const std::string& to) {
 #if defined(__linux__)
     int in = ::open(from.c_str(), O_RDONLY | O_CLOEXEC); if (in < 0) return {{}, last_error("open " + from)};
@@ -602,6 +603,42 @@ inline status clone_file(const std::string& from, const std::string& to) {
     if (::clonefile(from.c_str(), to.c_str(), 0) == 0) return {};
     if (errno == ENOTSUP || errno == EXDEV) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
     return {{}, last_error("clonefile " + from)};
+#elif defined(FORGE_OS_WINDOWS)
+    HANDLE in = CreateFileW(wpath(from).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (in == INVALID_HANDLE_VALUE) return {{}, last_error("open " + from)};
+    DWORD fsflags = 0;
+    if (!GetVolumeInformationByHandleW(in, nullptr, 0, nullptr, nullptr, &fsflags, nullptr, 0) || !(fsflags & 0x08000000 /*FILE_SUPPORTS_BLOCK_REFCOUNTING*/)) {
+        CloseHandle(in); return {{}, unsupported("clone_file (the file system cannot share blocks)")};
+    }
+    LARGE_INTEGER size{}; BY_HANDLE_FILE_INFORMATION bi{};
+    if (!GetFileSizeEx(in, &size) || !GetFileInformationByHandle(in, &bi)) { auto e = last_error("stat " + from); CloseHandle(in); return {{}, e}; }
+    HANDLE out = CreateFileW(wpath(to).c_str(), GENERIC_READ | GENERIC_WRITE | DELETE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (out == INVALID_HANDLE_VALUE) { auto e = last_error("create " + to); CloseHandle(in); return {{}, e}; }
+    auto fail = [&](error e) -> status {   // remove the half-made target
+        FILE_DISPOSITION_INFO di{}; di.DeleteFile = TRUE; SetFileInformationByHandle(out, FileDispositionInfo, &di, sizeof di);
+        CloseHandle(out); CloseHandle(in); return {{}, std::move(e)};
+    };
+    DWORD ret = 0;
+    // The target must match the source: sparse flag, integrity streams, and its final size before any extent is shared.
+    if (bi.dwFileAttributes & FILE_ATTRIBUTE_SPARSE_FILE) DeviceIoControl(out, 0x000900C4 /*FSCTL_SET_SPARSE*/, nullptr, 0, nullptr, 0, &ret, nullptr);
+    struct { WORD algorithm, reserved; DWORD flags, chunk, cluster; } gi{};   // FSCTL_GET_INTEGRITY_INFORMATION_BUFFER
+    if (DeviceIoControl(in, 0x0009027C /*FSCTL_GET_INTEGRITY_INFORMATION*/, nullptr, 0, &gi, sizeof gi, &ret, nullptr)) {
+        struct { WORD algorithm, reserved; DWORD flags; } si{gi.algorithm, 0, gi.flags};   // FSCTL_SET_INTEGRITY_INFORMATION_BUFFER
+        DeviceIoControl(out, 0x0009C280 /*FSCTL_SET_INTEGRITY_INFORMATION*/, &si, sizeof si, nullptr, 0, &ret, nullptr);
+    }
+    FILE_END_OF_FILE_INFO eof{}; eof.EndOfFile = size;
+    if (!SetFileInformationByHandle(out, FileEndOfFileInfo, &eof, sizeof eof)) return fail(last_error("resize " + to));
+    struct { HANDLE file; LARGE_INTEGER src, dst, count; } dup{};   // DUPLICATE_EXTENTS_DATA
+    const LONGLONG chunk = 1ll << 30;   // cluster-aligned for every cluster size; only the last piece may end unaligned (at end of file)
+    for (LONGLONG off = 0; off < size.QuadPart; off += chunk) {
+        dup.file = in; dup.src.QuadPart = dup.dst.QuadPart = off; dup.count.QuadPart = std::min<LONGLONG>(chunk, size.QuadPart - off);
+        if (!DeviceIoControl(out, 0x00098344 /*FSCTL_DUPLICATE_EXTENTS_TO_FILE*/, &dup, sizeof dup, nullptr, 0, &ret, nullptr)) {
+            DWORD en = GetLastError();
+            if (en == ERROR_NOT_SUPPORTED || en == ERROR_INVALID_FUNCTION || en == ERROR_NOT_SAME_DEVICE) return fail(unsupported("clone_file (the file system cannot share blocks)"));
+            SetLastError(en); return fail(last_error("clone " + from));
+        }
+    }
+    CloseHandle(out); CloseHandle(in); return {};
 #else
     (void)from; (void)to; return {{}, unsupported("clone_file")};
 #endif
@@ -1030,5 +1067,91 @@ inline result<file> anonymous_file(const std::string& dir = "") {
     return {{}, error{-1, "anonymous_file: could not create a unique file"}};
 #endif
 }
+
+// ---------------------------------------------------------------- mapped_file
+// A file mapped whole into memory that can change size: resize() sets the file's length and remaps, keeping the
+// contents up to the smaller of the two sizes (new bytes read as zero). data() may move across a resize.
+// Linux / Android: ftruncate + mremap(MREMAP_MAYMOVE). Other POSIX: munmap + ftruncate + mmap. Windows: the view
+// and its section are dropped, the file length is set, and a new section is mapped (documented calls only; a
+// section cannot shrink a file while views exist). An empty file has no mapping (data() == nullptr).
+class mapped_file {
+public:
+    mapped_file() = default;
+    mapped_file(const mapped_file&) = delete; mapped_file& operator=(const mapped_file&) = delete;
+    mapped_file(mapped_file&& o) noexcept : f_(std::move(o.f_)), p_(std::exchange(o.p_, nullptr)), n_(std::exchange(o.n_, 0)), wr_(o.wr_) {}
+    mapped_file& operator=(mapped_file&& o) noexcept { if (this != &o) { close(); f_ = std::move(o.f_); p_ = std::exchange(o.p_, nullptr); n_ = std::exchange(o.n_, 0); wr_ = o.wr_; } return *this; }
+    ~mapped_file() { close(); }
+    // Opens (flags: os::rd or os::rdwr, plus os::create / os::truncate) and maps the whole file; writes through a
+    // read-write mapping reach the file.
+    static result<mapped_file> open(const std::string& path, unsigned flags = rdwr) {
+        auto f = file::open(path, flags); if (!f) return {{}, f.err};
+        mapped_file m; m.f_ = std::move(f.value); m.wr_ = (flags & wr) != 0;
+        auto sz = m.f_.size(); if (!sz) return {{}, sz.err};
+        if (sz.value > std::uint64_t(SIZE_MAX)) return {{}, errno_error(EFBIG, "map " + path + ": too large")};
+        if (auto e = m.map_(std::size_t(sz.value))) return {{}, e};
+        return {std::move(m), {}};
+    }
+    std::uint8_t* data() const { return static_cast<std::uint8_t*>(p_); }
+    std::size_t size() const { return n_; }
+    bool valid() const { return f_.valid(); }
+    file& backing() { return f_; }
+    status resize(std::uint64_t new_size) {
+        if (!f_.valid()) return {{}, errno_error(EBADF, "mapped_file: closed")};
+        if (!wr_) return {{}, errno_error(EACCES, "mapped_file: opened read-only")};
+        if (new_size > std::uint64_t(SIZE_MAX)) return {{}, errno_error(EFBIG, "mapped_file: too large")};
+        if (new_size == n_) return {};
+#if defined(__linux__)
+        if (p_ && new_size) {
+            if (auto st = f_.resize(new_size); !st) return st;
+            void* q = ::mremap(p_, n_, std::size_t(new_size), MREMAP_MAYMOVE);
+            if (q == MAP_FAILED) { auto e = last_error("mremap"); (void)f_.resize(n_); return {{}, e}; }
+            p_ = q; n_ = std::size_t(new_size); return {};
+        }
+#endif
+        const std::size_t old = n_;
+        unmap_();
+        if (auto st = f_.resize(new_size); !st) { (void)map_(old); return st; }
+        if (auto e = map_(std::size_t(new_size))) return {{}, e};
+        return {};
+    }
+    // Write dirty pages back (and wait for it).
+    status flush() {
+        if (!p_) return {};
+#if defined(FORGE_OS_WINDOWS)
+        if (!FlushViewOfFile(p_, n_)) return {{}, last_error("flush")};
+        return f_.sync();
+#else
+        if (::msync(p_, n_, MS_SYNC)) return {{}, last_error("msync")};
+        return {};
+#endif
+    }
+    void close() { unmap_(); f_.close(); }
+private:
+    void unmap_() {
+        if (!p_) return;
+#if defined(FORGE_OS_WINDOWS)
+        if (wr_) FlushViewOfFile(p_, n_);   // hand the dirty pages to the cache before the section goes away
+        UnmapViewOfFile(p_);
+#else
+        ::munmap(p_, n_);
+#endif
+        p_ = nullptr; n_ = 0;
+    }
+    error map_(std::size_t n) {
+        p_ = nullptr; n_ = 0; if (!n) return {};
+#if defined(FORGE_OS_WINDOWS)
+        HANDLE h = CreateFileMappingW(f_.native(), nullptr, wr_ ? PAGE_READWRITE : PAGE_READONLY, 0, 0, nullptr);
+        if (!h) return last_error("CreateFileMapping");
+        void* p = MapViewOfFile(h, wr_ ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, n);
+        error e = p ? error{} : last_error("MapViewOfFile"); CloseHandle(h);
+        if (!p) return e;
+#else
+        void* p = ::mmap(nullptr, n, PROT_READ | (wr_ ? PROT_WRITE : 0), MAP_SHARED, f_.native(), 0);
+        if (p == MAP_FAILED) return last_error("mmap");
+#endif
+        p_ = p; n_ = n; return {};
+    }
+    file f_; void* p_ = nullptr; std::size_t n_ = 0; bool wr_ = false;
+};
 
 } // namespace forge::os::fs

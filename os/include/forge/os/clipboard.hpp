@@ -1,6 +1,8 @@
 #pragma once
 // forge::os::clipboard: get / set plain UTF-8 text. Windows uses the Win32 clipboard (CF_UNICODETEXT); macOS
-// runs pbcopy / pbpaste; Linux/FreeBSD run wl-copy / wl-paste under Wayland, else xclip or xsel under X11.
+// runs pbcopy / pbpaste; Linux/FreeBSD speak the X11 selection protocol themselves when DISPLAY is set
+// (clipboard_x11.hpp, libxcb at run time: also under Wayland through XWayland), preferring wl-copy / wl-paste in
+// a Wayland session that has them, and fall back to xclip or xsel.
 // No display or helper → unsupported(). iOS: UIPasteboard.generalPasteboard through the Objective-C runtime (the
 // system may show its paste banner). Android: the ClipboardManager is Java-only, so app glue installs
 // set_backend(); unsupported without it. A backend installed with set_backend() takes over on every OS.
@@ -8,6 +10,10 @@
 #include <forge/os/process.hpp>
 #if defined(__APPLE__)
 #include <forge/os/detail.hpp>
+#endif
+#include <forge/os/clipboard_x11.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
 #endif
 
 namespace forge::os::clipboard {
@@ -35,6 +41,14 @@ inline std::pair<std::vector<std::string>, std::vector<std::string>> helpers_() 
 #endif
 }
 #endif
+#if defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
+// The X11 protocol is spoken directly whenever a display is there, except in a Wayland session whose own tools
+// (wl-copy / wl-paste) were found: those reach clients XWayland does not bridge.
+inline bool native_x11_(const std::vector<std::string>& helper) {
+    if (getenv("DISPLAY").empty()) return false;
+    return helper.empty() || helper[0].rfind("wl-", 0) != 0;
+}
+#endif
 inline bool available() {
     if (auto b = backend_(); b.get && b.set) return true;
 #if defined(FORGE_OS_WINDOWS)
@@ -42,7 +56,12 @@ inline bool available() {
 #elif defined(FORGE_OS_IOS)
     return pasteboard_() != nullptr;
 #elif defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS) && !defined(FORGE_OS_ANDROID)
-    return !helpers_().first.empty();
+    if (!helpers_().first.empty()) return true;
+#if defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
+    return x11::available();
+#else
+    return false;
+#endif
 #else
     return false;
 #endif
@@ -88,7 +107,11 @@ inline result<std::string> get() {
     }
     CloseClipboard(); return {out, {}};
 #elif defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS) && !defined(FORGE_OS_ANDROID)
-    auto h = helpers_(); if (h.first.empty()) return {{}, unsupported("clipboard (no display or clipboard helper)")};
+    auto h = helpers_();
+#if defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
+    if (native_x11_(h.first)) { auto n = x11::get(); if (n || !is_unsupported(n.err)) return n; }
+#endif
+    if (h.first.empty()) return {{}, unsupported("clipboard (no display, or neither libxcb nor a clipboard helper)")};
     spawn_spec s; s.argv = h.first; s.timeout_ms = 5000; helper_env_(s); auto r = spawn_wait(s);
     if (!r) return {{}, r.err};
     if (r->exit_code) { if (empty_selection_(r->err)) return {std::string(), {}}; return {{}, {r->exit_code, "clipboard read: " + r->err}}; }
@@ -114,7 +137,11 @@ inline status set(const std::string& text) {
     if (!SetClipboardData(CF_UNICODETEXT, g)) { auto e = last_error("SetClipboardData"); CloseClipboard(); GlobalFree(g); return {{}, e}; }
     CloseClipboard(); return {};
 #elif defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS) && !defined(FORGE_OS_ANDROID)
-    auto h = helpers_(); if (h.second.empty()) return {{}, unsupported("clipboard (no display or clipboard helper)")};
+    auto h = helpers_();
+#if defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
+    if (native_x11_(h.second)) { auto n = x11::set(text); if (n || !is_unsupported(n.err)) return n; }
+#endif
+    if (h.second.empty()) return {{}, unsupported("clipboard (no display, or neither libxcb nor a clipboard helper)")};
     spawn_spec s; s.argv = h.second; s.stdin_data = text; s.timeout_ms = 5000; helper_env_(s);
     s.capture_stdout = false; s.capture_stderr = false;   // xclip/wl-copy fork a server that keeps the clipboard alive
     auto r = spawn_wait(s); if (!r) return {{}, r.err}; if (r->exit_code) return {{}, {r->exit_code, "clipboard write failed"}};

@@ -177,7 +177,7 @@ TEST(pp_windows_sandbox_appcontainer) {
     os::sandbox_policy x; x.deny_exec = true;
     { process_pool px({.workers = 1, .sandbox = x}); CHECK(px.submit("square", "4").get() == "16"); }
     os::remove_all(dir);
-    for (const wchar_t* n : {L"forge.sandbox.nonet", L"forge.sandbox.nofs", L"forge.sandbox.nonet.nofs"}) DeleteAppContainerProfile(n);
+    for (const wchar_t* n : {L"forge.sandbox.nonet", L"forge.sandbox.nofs", L"forge.sandbox.nonet.nofs"}) os::detail::wsbx::delete_profile(n);
 }
 TEST(pp_windows_fork_rejected) {
     try { process_pool pp({.workers = 1, .mode = process_pool::spawn_mode::fork}); CHECK(false); }

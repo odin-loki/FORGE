@@ -14,6 +14,9 @@
 //             (forge_mobile's device::display() does this natively); unsupported without it.
 // A machine with no monitor (servers, CI) gives an empty list, not an error.
 #include <forge/os/detail.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
+#endif
 
 namespace forge::os {
 struct display_info {

@@ -225,6 +225,71 @@ int main(int argc, char** argv) {
 - **Sandbox.** `options.sandbox` applies `os::apply_sandbox` in every worker before its first task (Linux: seccomp, plus Landlock where the kernel has it). On Windows, workers whose policy denies network or file writes start in an AppContainer (no network capability; writes only to the container folder), and the pool grants the container read + execute on the worker image. A worker that cannot apply its policy exits with 70 and the task fails (`os_errc::io`, "sandbox could not be applied"). See security.md.
 - ForgeScript exposes it as `ProcessPool(n, {...})`.
 
+## Event loop (`reactor.hpp`)
+```cpp
+os::reactor r;
+auto ls = os::socket::listen("127.0.0.1", 8080);
+r.accept(*ls, [&](const os::error& e, os::socket s) { /* runs on the loop thread */ });
+auto t = r.every(1'000'000'000, [&](const os::error& e) { if (!e) tick(); });   // cancel(t) -> one callback with is_cancelled
+r.on_exit(child.pid(), [&](const os::error&) { code = child.wait(); });
+r.on_signal(os::sig::terminate, [&](os::sig) { r.stop(); });
+std::thread([&] { r.post([&] { /* back on the loop thread */ }); }).detach();
+r.run();                                   // until stop(), or until nothing is pending
+os::reactor::task echo(os::reactor& r, os::socket& s) { char b[512]; for (;;) { auto in = co_await r.async_read(s, b, sizeof b); if (!in || !in.n) break; co_await r.async_write(s, b, in.n); } }
+```
+- Every operation completes exactly once, on the loop thread, never inside the call that started it. `cancel(id)` and
+  `cancel_all()` complete with `os::is_cancelled(err)`. Buffers and handles must stay valid until the callback ran.
+- `post`, `stop`, `hold`, `unhold` are the only calls allowed from other threads.
+- `read` returns at least one byte or 0 at end of stream; `read_exact` and `write` move everything or report the count
+  with an error. Handles given to the reactor become non-blocking.
+- Files go through `os::async_file_io` on a service thread (`read_file`, `write_file`); a submission made while another
+  is in flight is picked up within 2 ms.
+- Windows: sockets use `WSAEventSelect` (call `forget(socket)` before handing a socket to another event loop); pipes
+  and other handles start on helper threads (at most 16 blocking calls at once on synchronous handles); file watchers
+  are polled every 20 ms; timer waits round up to 1 ms. Documented Win32 only.
+- Destroying a reactor waits for in-flight OS calls and drops pending callbacks without calling them.
+
+## Limit groups (`process_limits.hpp`)
+```cpp
+os::process_limits lim; lim.memory_bytes = 2ull << 30; lim.cpus = 1.5; lim.max_processes = 64;
+auto g = os::limit_group::create(lim, "build");          // g->backend(): cgroup2 / job / rctl / rlimit
+auto r = g->run({.argv = {"make", "-j8"}});               // spawn_wait inside the group
+auto c = g->start(spec);  g->usage();  g->kill();         // a child, its group's memory / CPU / count, kill everything
+```
+`enforced()` says which caps the backend applies and whether they count the group as a whole (`limit_group_wide`).
+Linux needs a writable cgroup v2 subtree (a systemd user session, a container, root): the group is created next to
+the caller's cgroup, or below it with `move_self` (which moves the calling process into a leaf first). Without one,
+and on FreeBSD without `kern.racct.enable=1` + root, `allow_fallback` gives `RLIMIT_AS` per process, or `create`
+returns unsupported when it is off. macOS, iOS and Android have no mechanism for an application.
+
+## Mapped files that grow, FIFOs
+`fs::mapped_file::open(path, os::rdwr | os::create)` maps the whole file; `resize(n)` changes the file length and the
+mapping (`data()` may move). `os::fifo::create(name)`, `open_read(name, timeout_ms)`, `open_write(name, timeout_ms)`
+give `pipe_end`s over `mkfifo` (POSIX) or a named pipe (Windows, where the reader must open first).
+
+## D-Bus (`dbus.hpp`, `desktop_bus.hpp`)
+```cpp
+namespace db = os::dbus;
+auto c = db::connection::open(db::bus::session);                    // unsupported when there is no bus
+auto r = c->call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "ListNames");
+for (auto& n : r->body[0].items) use(n.s);
+c->add_match("type='signal',interface='org.freedesktop.portal.Settings'"); auto sig = c->next_signal(1000);
+```
+Values are `db::value` trees (`value::str`, `u32`, `array`, `dict`, `variant`, `strukt` ...). A missing service reads as
+`unsupported`; other D-Bus errors keep their name (`last_error_name()`). `db::decode` is safe on hostile bytes
+(`db::limits` caps size, node count and depth). `os::desktop_bus` wraps the services the layer uses; its
+`set_addresses()` points both buses at a test server (`tests/dbus_mock.hpp`).
+
+## Proxy resolution (`proxy.hpp`)
+`net::resolve_proxy(url)` returns the proxies to try. With a PAC script: Windows and Apple evaluate it through the OS
+(`pac_evaluated`), every other OS returns `pac_url_present == true`, `pac_evaluated == false`, no proxies and a
+`note`: the caller decides. `net::desktop_proxy()` reads GNOME's dconf database and KDE's `kioslaverc` directly.
+
+## Appearance, sleep, time
+`os::system_appearance()` (scheme, high contrast, reduced motion, accent) and `os::appearance_watcher`;
+`os::power::inhibit_sleep(reason)` (RAII, `kind()` says what holds the machine awake); `os::power::profile()`;
+`os::time_sync_status()`; `os::sntp_query(server)` (offset, delay, stratum; one UDP exchange, validated).
+
 ## Platform notes
 - **iOS.** No spawning: `spawn_wait`, `child`, `os::run`, `run_sandboxed`, `pty::spawn`, `list_processes`, `wait_for_exit` and `kill_tree` return unsupported; `process_pool` throws. No service control. Paths come from the app container.
 - **Android.** Spawning works (fork/exec). `RLIMIT_AS` is not used because bionic reserves far more address space than it uses; `memory_bytes` uses a resident-size watchdog. No service control.
@@ -236,8 +301,8 @@ int main(int argc, char** argv) {
 | Item | Today |
 |---|---|
 | `os::caps()` for the whole OS layer | Only `process_caps()`; ForgeScript `os.caps()` wraps it |
-| Named pipes / FIFOs in `pipe.hpp` | Not present (`local_ipc.hpp` covers named pipes). Signals for event loops: `sync.hpp` `signal_listener` |
-| cgroup v2 limits for spawned processes | rlimits, Job Objects and watchdogs instead |
+| I/O limits in `limit_group` (`io.max`, job I/O rate) | not present |
+| Native Wayland clipboard | wl-copy / wl-paste, or X11 through XWayland |
 | Fuzz target for glob/path parsing | none |
 | `chown` on Windows, signals other than kill/terminate on Windows, `advise_huge` on Windows/macOS, hard CPU affinity on macOS | no OS facility (see the sections above) |
 
@@ -249,6 +314,10 @@ int main(int argc, char** argv) {
 | `test_os_net` | net, local HTTP servers (injection, cross-origin redirects, truncated bodies, deadline, `Set-Cookie`); a local HTTPS server (OpenSSL server mode with `tests/fixtures/tls`; on Windows Git for Windows' libssl, on macOS Homebrew's, or `FORGE_TEST_LIBSSL` / `FORGE_TEST_LIBCRYPTO`): default verification fails, `ca_file` / `ca_pem` succeed, wrong host name fails, `insecure_skip_verify`, https → http redirect drops credentials; a non-TLS peer fails fast; `https://example.com` with `FORGE_NET_TESTS=1` or `CI` set (skipped without a route); native and polling tree watch (80 directories, overflow, symlink/junction loop, kqueue cap, FSEvents events deep in a tree on macOS), service units in a temp dir |
 | `test_os_dev` | devices, FreeBSD GEOM partition fixture, clipboard |
 | `test_os_dynlib` | loads `tests/dynlib_fixture.c` through search dirs and an env var, calls it through `get<>` and through enumerated addresses, enumerates libm; when clang + lld are installed, parses fixtures cross-linked by `cmake/dynlib_fixtures.cmake` (PE32/PE32+ with a forwarder, arm64/x86_64/exports-trie/fat Mach-O, ELF32, big-endian ELF, section-stripped ELF, versions + IFUNC + TLS), plus ~14k truncated and mutated inputs |
+| `test_os_reactor` | timer order, periodic timers, cancellation, cross-thread posts, 48 TCP connections, pipes, local IPC, readiness waits, child exit, events, signals, file I/O, file watching, coroutines, destruction with pending operations (TSan-clean) |
+| `test_os_limits` | `limit_group` (real backend plus the cgroup v2 file protocol against a stand-in hierarchy), `mapped_file::resize`, FIFOs, `clone_file` on Windows |
+| `test_os_dbus`, `test_os_desktop` | D-Bus golden bytes, round trips, hostile input, the client against `tests/dbus_mock.hpp` and against `dbus-daemon` when installed; `desktop_bus`, `notify`, `reveal_path`, `open_url`, `screen_locked`, `power::inhibit_sleep` against the mock |
+| `test_os_proxy`, `test_os_clipboard`, `test_os_misc` | dconf (a database written by gsettings) and kioslaverc, static and PAC resolution with a local PAC server; X11 clipboard against a private Xvfb, cross-checked with xsel; appearance, power profile, clock sync, SNTP against a local server |
 | `test_process_pool` | fork and spawn modes, crash recovery, typed task errors, grow/shrink, shutdown, `terminate`, sandboxed workers, Windows spawn |
 | `test_script` `os_phase2_surface`, `os_phase3_surface`; `test_script_oserror` `script_process_pool` | script bindings |
 

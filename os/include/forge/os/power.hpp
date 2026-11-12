@@ -194,3 +194,59 @@ inline power_state power_status() {
     return p;
 }
 } // namespace forge::os
+
+#include <forge/os/background.hpp>
+namespace forge::os::power {
+// Holds the machine awake (no idle sleep) while it lives. What holds it: Windows a power request
+// (PowerCreateRequest + SystemRequired), macOS an IOPMAssertion (PreventUserIdleSystemSleep), Linux a logind
+// block inhibitor ("sleep:idle"), FreeBSD a ConsoleKit2 inhibitor when present, iOS a background task, Android the
+// app's foreground-service / wake-lock hooks (background::set_hooks). kind() names it; "not_required" means the
+// OS has nothing that would put the machine to sleep on its own (containers, servers without a session manager).
+class sleep_inhibitor {
+public:
+    sleep_inhibitor() = default;
+    sleep_inhibitor(const sleep_inhibitor&) = delete; sleep_inhibitor& operator=(const sleep_inhibitor&) = delete;
+    sleep_inhibitor(sleep_inhibitor&& o) noexcept : token_(std::exchange(o.token_, 0)), kind_(std::move(o.kind_)) {}
+    sleep_inhibitor& operator=(sleep_inhibitor&& o) noexcept { if (this != &o) { release(); token_ = std::exchange(o.token_, 0); kind_ = std::move(o.kind_); } return *this; }
+    ~sleep_inhibitor() { release(); }
+    bool active() const { return token_ != 0; }
+    const std::string& kind() const { return kind_; }
+    void release() { if (token_) { background::end(token_); token_ = 0; } }
+private:
+    friend result<sleep_inhibitor> inhibit_sleep(const std::string&);
+    std::uint64_t token_ = 0; std::string kind_;
+};
+// `reason` is shown by the OS where it lists what keeps the machine awake (powercfg /requests, pmset -g
+// assertions, systemd-inhibit --list).
+inline result<sleep_inhibitor> inhibit_sleep(const std::string& reason) {
+    auto t = background::begin(reason.empty() ? std::string("forge") : reason);
+    if (!t) return {{}, t.err};
+    sleep_inhibitor s; s.token_ = t.value; s.kind_ = background::kind(t.value);
+    return {std::move(s), {}};
+}
+// The machine's power profile: "power-saver", "balanced" or "performance" ("custom" for a Windows scheme that is
+// none of the three). Linux: power-profiles-daemon over D-Bus (os::desktop_bus), else the ACPI platform profile
+// in sysfs. Windows: PowerGetActiveScheme. macOS / iOS: low-power mode on or off. Elsewhere unsupported.
+inline result<std::string> profile() {
+#if defined(FORGE_OS_WINDOWS)
+    static HMODULE h = LoadLibraryExW(L"powrprof.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/);
+    auto f = h ? reinterpret_cast<DWORD(WINAPI*)(HKEY, GUID**)>(reinterpret_cast<void*>(GetProcAddress(h, "PowerGetActiveScheme"))) : nullptr;
+    if (!f) return {{}, unsupported("power profile (powrprof.dll)")};
+    GUID* g = nullptr; DWORD e = f(nullptr, &g);
+    if (e != ERROR_SUCCESS || !g) { if (e == ERROR_CALL_NOT_IMPLEMENTED || e == ERROR_SUCCESS) return {{}, unsupported("power profile")}; return {{}, error{int(e), "PowerGetActiveScheme: " + error_text(int(e))}}; }
+    const unsigned long d1 = g->Data1; LocalFree(g);
+    return {d1 == 0xa1841308ul ? "power-saver" : d1 == 0x381b4222ul ? "balanced" : d1 == 0x8c5e7fdaul ? "performance" : "custom", {}};
+#elif defined(__APPLE__)
+    return {power_status().low_power_mode ? "power-saver" : "balanced", {}};
+#elif defined(FORGE_OS_LINUX)
+    if (auto p = desktop_bus::power_profile()) return p;
+    std::string prof = detail::trim(detail::slurp("/sys/firmware/acpi/platform_profile"));
+    if (prof == "low-power" || prof == "quiet" || prof == "cool") return {"power-saver", {}};
+    if (prof == "balanced") return {"balanced", {}};
+    if (prof == "performance" || prof == "balanced-performance") return {"performance", {}};
+    return {{}, unsupported("power profile (no power-profiles-daemon and no ACPI platform profile)")};
+#else
+    return {{}, unsupported("power profile")};
+#endif
+}
+} // namespace forge::os::power

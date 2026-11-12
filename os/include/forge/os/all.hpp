@@ -51,3 +51,11 @@
 #include <forge/os/shell_open.hpp>
 #include <forge/os/notification.hpp>
 #include <forge/os/trash.hpp>
+// One event loop, process limit groups, D-Bus and what is built on it.
+#include <forge/os/reactor.hpp>
+#include <forge/os/process_limits.hpp>
+#include <forge/os/dbus.hpp>
+#include <forge/os/desktop_bus.hpp>
+#include <forge/os/proxy.hpp>
+#include <forge/os/appearance.hpp>
+#include <forge/os/timesync.hpp>

@@ -288,21 +288,35 @@ inline result<std::vector<cpu_times>> per_cpu_times() {
     return {std::move(out), {}};
 #elif defined(FORGE_OS_WINDOWS)
     // NtQuerySystemInformationEx(SystemProcessorPerformanceInformation = 8) per processor group (100 ns units;
-    // kernel time includes idle). ntdll is always loaded.
+    // kernel time includes idle). ntdll is always loaded. Where the Ex call is missing or refuses the class
+    // (Windows 7 before SP1, wine), NtQuerySystemInformation answers for the caller's group.
     struct sppi { LARGE_INTEGER idle, kernel, user, dpc, interrupt; ULONG interrupts; };
     using fn = LONG(WINAPI*)(int, void*, ULONG, void*, ULONG, ULONG*);
-    auto q = reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformationEx")));
-    if (!q) return {{}, unsupported("per_cpu_times (NtQuerySystemInformationEx)")};
-    WORD groups = GetActiveProcessorGroupCount(); if (!groups) groups = 1;
-    for (WORD g = 0; g < groups; ++g) {
-        USHORT grp = g; DWORD c = GetActiveProcessorCount(g); std::vector<sppi> b(c ? c : 1); ULONG got = 0;
-        LONG st = q(8, &grp, sizeof grp, b.data(), ULONG(b.size() * sizeof(sppi)), &got);
-        if (st < 0) return {{}, error{int(st), "NtQuerySystemInformationEx(SystemProcessorPerformanceInformation) failed"}};
+    using fn0 = LONG(WINAPI*)(int, void*, ULONG, ULONG*);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    auto q = nt ? reinterpret_cast<fn>(reinterpret_cast<void*>(GetProcAddress(nt, "NtQuerySystemInformationEx"))) : nullptr;
+    auto q0 = nt ? reinterpret_cast<fn0>(reinterpret_cast<void*>(GetProcAddress(nt, "NtQuerySystemInformation"))) : nullptr;
+    if (!q && !q0) return {{}, unsupported("per_cpu_times (NtQuerySystemInformation)")};
+    auto add = [&](const std::vector<sppi>& b, ULONG got) {
         for (std::size_t i = 0; i < got / sizeof(sppi) && i < b.size(); ++i) {
             cpu_times t; t.idle = double(b[i].idle.QuadPart) / 1e7; t.user = double(b[i].user.QuadPart) / 1e7;
-            t.system = double(b[i].kernel.QuadPart - b[i].idle.QuadPart) / 1e7; out.push_back(t);
+            t.system = double(b[i].kernel.QuadPart - b[i].idle.QuadPart) / 1e7; if (t.system < 0) t.system = 0; out.push_back(t);
         }
+    };
+    WORD groups = GetActiveProcessorGroupCount(); if (!groups) groups = 1;
+    LONG st = -1;
+    for (WORD g = 0; q && g < groups; ++g) {
+        USHORT grp = g; DWORD c = GetActiveProcessorCount(g); std::vector<sppi> b(c ? c : 1); ULONG got = 0;
+        st = q(8, &grp, sizeof grp, b.data(), ULONG(b.size() * sizeof(sppi)), &got);
+        if (st < 0) { out.clear(); break; }
+        add(b, got);
     }
+    if (out.empty() && q0) {
+        SYSTEM_INFO si{}; GetSystemInfo(&si); std::vector<sppi> b(si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1); ULONG got = 0;
+        st = q0(8, b.data(), ULONG(b.size() * sizeof(sppi)), &got);
+        if (st >= 0) add(b, got);
+    }
+    if (out.empty() && st < 0) return {{}, error{int(st), "NtQuerySystemInformation(SystemProcessorPerformanceInformation) failed"}};
     if (out.empty()) return {{}, error{-1, "per_cpu_times: no processors reported"}};
     return {std::move(out), {}};
 #else

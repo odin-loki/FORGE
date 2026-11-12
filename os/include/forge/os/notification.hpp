@@ -11,6 +11,10 @@
 // A hook installed with set_notification_hook() takes over on every OS.
 #include <forge/os/detail.hpp>
 #include <forge/os/process.hpp>
+#include <forge/os/desktop_bus.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
+#endif
 #if defined(FORGE_OS_WINDOWS)
 #include <shellapi.h>   // NOTIFYICONDATAW (types only)
 #endif
@@ -137,7 +141,7 @@ inline bool notifications_available() {
 #elif defined(FORGE_OS_MACOS)
     return stat("/usr/bin/osascript").exists;
 #elif defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
-    return !notification_command({}).empty();
+    return desktop_bus::has_bus(dbus::bus::session) || !notification_command({}).empty();   // the native client needs no helper
 #else
     return false;
 #endif
@@ -149,8 +153,21 @@ inline status notify(const notification& n) {
 #if defined(FORGE_OS_WINDOWS)
     return detail_notify::tray::instance().show(n);
 #elif defined(FORGE_OS_MACOS) || defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
+#if !defined(FORGE_OS_MACOS)
+    // org.freedesktop.Notifications over the session bus, spoken directly; the helper programs are the fallback.
+    error native;
+    {
+        int u = n.urgency == notification_urgency::low ? 0 : n.urgency == notification_urgency::critical ? 2 : 1;
+        auto r = desktop_bus::notify(detail_notify::no_ctl(n.app_name), detail_notify::no_ctl(n.title), detail_notify::no_ctl(n.body), u, n.timeout_ms);
+        if (r) return {};
+        native = r.err;
+    }
+#endif
     auto cmd = notification_command(n);
-    if (cmd.empty()) return {{}, unsupported("notifications (no session bus, or neither notify-send nor gdbus)")};
+#if !defined(FORGE_OS_MACOS)
+    if (cmd.empty() && !is_unsupported(native)) return {{}, native};
+#endif
+    if (cmd.empty()) return {{}, unsupported("notifications (no session bus or no notification service)")};
     spawn_spec sp; sp.argv = std::move(cmd); sp.timeout_ms = 10000;
     auto r = spawn_wait(sp); if (!r) return {{}, r.err};
     if (r->exit_code != 0) return {{}, error{r->exit_code, "notify: " + sp.argv[0] + " failed: " + detail::trim(r->err)}};

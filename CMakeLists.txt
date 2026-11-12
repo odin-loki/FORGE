@@ -1177,19 +1177,52 @@ if(FORGE_BUILD_TESTS)
   endif()
   # forge::os / forge::loadbalancer cross-OS compile+link checks (zig ships FreeBSD, macOS and MinGW libcs).
   find_program(FORGE_ZIG NAMES zig HINTS $ENV{ZIG_PATH})
+  if(NOT FORGE_ZIG)   # the ziglang wheel (pip install ziglang) carries the binary inside the package
+    find_package(Python3 QUIET COMPONENTS Interpreter)
+    if(Python3_EXECUTABLE)
+      execute_process(COMMAND ${Python3_EXECUTABLE} -c "import ziglang, os; print(os.path.join(os.path.dirname(ziglang.__file__), 'zig'))"
+                      OUTPUT_VARIABLE _zig OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE _zr)
+      if(_zr EQUAL 0 AND EXISTS "${_zig}")
+        set(FORGE_ZIG ${_zig} CACHE FILEPATH "zig (cross-OS checks)" FORCE)
+      endif()
+    endif()
+  endif()
   if(FORGE_ZIG)
+    # Every os test (tests/test_os*.cpp) and the load balancer test, compiled and linked per target. The C source
+    # (Monocypher) is compiled separately: cmake/xos_link.cmake.
+    file(GLOB _xos_tests ${PROJECT_SOURCE_DIR}/tests/test_os*.cpp)
+    list(APPEND _xos_tests ${PROJECT_SOURCE_DIR}/tests/test_loadbalancer.cpp)
     foreach(tg x86_64-freebsd aarch64-macos x86_64-macos x86_64-windows-gnu aarch64-linux-musl)
-      foreach(src test_os test_loadbalancer test_os_ext test_os_process test_os_sys test_os_net test_os_dev test_os_dynlib)
-        set(_lib)
-        if(tg MATCHES windows)
-          set(_lib -lws2_32 -lbcrypt)
-        endif()
-        add_test(NAME xos_${src}_${tg} COMMAND ${FORGE_ZIG} c++ -target ${tg} -std=c++20 -O1 -I${PROJECT_SOURCE_DIR}/os/include
-                 -I${PROJECT_SOURCE_DIR}/loadbalancer/include -I${PROJECT_SOURCE_DIR}/tests -I${PROJECT_SOURCE_DIR}/third_party/monocypher
-                 ${PROJECT_SOURCE_DIR}/tests/${src}.cpp ${PROJECT_SOURCE_DIR}/third_party/monocypher/monocypher.c ${_lib}
-                 -o ${PROJECT_BINARY_DIR}/xos/${src}.${tg})
+      set(_lib "")
+      if(tg MATCHES windows)
+        set(_lib "-lws2_32|-lbcrypt|-ladvapi32")
+      endif()
+      foreach(t ${_xos_tests})
+        get_filename_component(src ${t} NAME_WE)
+        add_test(NAME xos_${src}_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DSRC=${t}
+                 -DCSRCS=${PROJECT_SOURCE_DIR}/third_party/monocypher/monocypher.c -DOUT=${PROJECT_BINARY_DIR}/xos/${src}.${tg}
+                 "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/loadbalancer/include|-I${PROJECT_SOURCE_DIR}/tests|-I${PROJECT_SOURCE_DIR}/third_party/monocypher"
+                 "-DLIBS=${_lib}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_link.cmake)
         set_tests_properties(xos_${src}_${tg} PROPERTIES LABELS "cross;slow")
       endforeach()
+    endforeach()
+    # Every os header on its own (one translation unit each), so no header leans on what another one included.
+    file(GLOB _xos_hdrs RELATIVE ${PROJECT_SOURCE_DIR}/os/include ${PROJECT_SOURCE_DIR}/os/include/forge/os/*.hpp)
+    set(_xos_hdr_srcs "")
+    foreach(h ${_xos_hdrs})
+      get_filename_component(hn ${h} NAME_WE)
+      set(_hsrc ${PROJECT_BINARY_DIR}/xos/hdr/${hn}.cpp)
+      if(NOT EXISTS ${_hsrc})
+        file(WRITE ${_hsrc} "#include <${h}>\n")
+      endif()
+      list(APPEND _xos_hdr_srcs ${_hsrc})
+    endforeach()
+    string(REPLACE ";" "|" _xos_hdr_list "${_xos_hdr_srcs}")
+    foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu)
+      add_test(NAME xos_headers_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/hdr_${tg}
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include|-I${PROJECT_SOURCE_DIR}/third_party/monocypher"
+               "-DSRCS=${_xos_hdr_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
+      set_tests_properties(xos_headers_${tg} PROPERTIES LABELS "cross;slow" TIMEOUT 7200)
     endforeach()
     # The script emitter + shell backends (host_shell() has per-OS branches): syntax-checked for every target.
     file(GLOB _emit_srcs ${PROJECT_SOURCE_DIR}/script/src/emit.cpp ${PROJECT_SOURCE_DIR}/script/src/shells/*.cpp)
@@ -1204,7 +1237,7 @@ if(FORGE_BUILD_TESTS)
     set(_mob_list "${PROJECT_SOURCE_DIR}/os/src/mobile/mobile.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/services.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/linux.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/windows.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/freebsd.cpp|${PROJECT_SOURCE_DIR}/os/src/mobile/android.cpp")
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
       add_test(NAME xos_mobile_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/mobile_${tg}
-               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include"
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include|-I${PROJECT_SOURCE_DIR}/third_party/monocypher"
                "-DSRCS=${_mob_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_mobile_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
@@ -1213,7 +1246,7 @@ if(FORGE_BUILD_TESTS)
     string(REPLACE ";" "|" _text_list "${_text_srcs}")
     foreach(tg x86_64-freebsd aarch64-macos x86_64-windows-gnu aarch64-linux-musl)
       add_test(NAME xos_text_${tg} COMMAND ${CMAKE_COMMAND} -DZIG=${FORGE_ZIG} -DTARGET=${tg} -DOUT=${PROJECT_BINARY_DIR}/xos/text_${tg}
-               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include"
+               "-DINCS=-I${PROJECT_SOURCE_DIR}/os/include|-I${PROJECT_SOURCE_DIR}/core/include|-I${PROJECT_SOURCE_DIR}/support/include|-I${PROJECT_SOURCE_DIR}/third_party/monocypher"
                "-DSRCS=${_text_list}" -P ${PROJECT_SOURCE_DIR}/cmake/xos_compile_each.cmake)
       set_tests_properties(xos_text_${tg} PROPERTIES LABELS "cross;slow")
     endforeach()
@@ -1720,7 +1753,7 @@ endif()
 
 # ---- fuzz targets (fuzz/): libFuzzer entry points + a built-in mutational driver for CI ----
 if(FORGE_BUILD_TESTS)
-  foreach(ft json blueprint fpk safetensors gguf tokenizer chat_template grammar onnx aot png bmp pnm inflate reflect)
+  foreach(ft json blueprint fpk safetensors gguf tokenizer chat_template grammar onnx aot png bmp pnm inflate reflect dbus)
     if(FORGE_LIBFUZZER)
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp)
       target_compile_options(fuzz_${ft} PRIVATE -fsanitize=fuzzer)
@@ -1728,7 +1761,11 @@ if(FORGE_BUILD_TESTS)
     else()
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp fuzz/driver.cpp)
     endif()
-    target_link_libraries(fuzz_${ft} PRIVATE forge_inference forge_verify forge_simd_mv)
+    if(ft STREQUAL "dbus")   # the os::dbus codec is header-only: no need to build the inference library for it
+      target_link_libraries(fuzz_${ft} PRIVATE forge_core)
+    else()
+      target_link_libraries(fuzz_${ft} PRIVATE forge_inference forge_verify forge_simd_mv)
+    endif()
     if(NOT FORGE_LIBFUZZER)
       add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${FORGE_FUZZ_ITERS} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
                WORKING_DIRECTORY ${PROJECT_BINARY_DIR})

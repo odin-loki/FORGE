@@ -121,7 +121,7 @@ implements the call; macOS, FreeBSD, iOS and Android were cross-compiled only (s
 | P8 | Process priority, affinity, I/O priority, tree listing and kill, `apply_limits` on Windows | fixed 2026-11-12 (`process.hpp`) |
 | P9 | Pseudo-terminals | fixed 2026-11-12: `pty.hpp` (`posix_openpt`, ConPTY) |
 | P10 | Console mouse / paste / focus / alternate screen, resize; boot and awake clocks; core-dump control | fixed 2026-11-12 (`console.hpp`, `time.hpp`, `crash.hpp`) |
-| P11 | cgroup v2 / `rctl` limits, ReFS `clone_file`, one reactor over all waitables, `mremap` | open |
+| P11 | cgroup v2 / `rctl` limits, ReFS `clone_file`, one reactor over all waitables, `mremap` | done 2026-11-12 (wave 4 below) |
 
 ## Wave 3 (2026-11-12): parity, system / hardware / network / services half
 The per-function matrix is [os-parity.md](os-parity.md). Run on Linux (clang 23) and, for Windows, as MinGW builds
@@ -140,10 +140,30 @@ faked platform macros.
 | S8 | A | No user / group enumeration, admin check, sessions, elevation; registry is Windows-only | fixed 2026-11-12: `users.hpp`, `sessions.hpp`, `preferences.hpp` |
 | S9 | C | `service_control.hpp` used `fs::` without including `fs.hpp` (compiled only after another header) | fixed 2026-11-12 |
 | S10 | A | Missing on every OS: volumes, displays, idle / lock state, single instance, autostart, open URL / file, notifications, trash | added 2026-11-12, one header each |
-| S11 | B | Linux clipboard, `open_url`, `notify` need helper programs (wl-clipboard / xclip / xsel, xdg-open / gio, notify-send / gdbus); no native X11 / Wayland / D-Bus client | open: a wire-protocol client is a large addition; calls return `unsupported` without the helper |
+| S11 | B | Linux clipboard, `open_url`, `notify` need helper programs (wl-clipboard / xclip / xsel, xdg-open / gio, notify-send / gdbus); no native X11 / Wayland / D-Bus client | open: a wire-protocol client is a large addition; calls return `unsupported` without the helper. **Wave 4 (2026-11-12): done for D-Bus and X11; Wayland clipboard still open** |
 | S12 | B | Rename events are not paired (old → new) on any backend | won't fix: kqueue and FSEvents cannot pair; all backends report `renamed` + `created` |
-| S13 | B | `system_proxy` does not evaluate PAC scripts or read KDE settings | open |
-| S14 | D | The Android and iOS branches added here have never been compiled by a real toolchain; MSVC has not built them | open: first CI run |
+| S13 | B | `system_proxy` does not evaluate PAC scripts or read KDE settings | done 2026-11-12 (`proxy.hpp`, wave 4 below) |
+| S14 | D | The Android and iOS branches added here have never been compiled by a real toolchain; MSVC has not built them | partly closed 2026-11-12 (NDK and MSVC-ABI compiles, wave 4 below); iOS and real-device runs open |
+
+## Wave 4 (2026-11-12): breakage from wave 3, open items, additions
+Per-call table: the "Wave 4" section of [os-parity.md](os-parity.md), which also says what was compiled and run
+where. Toolchains obtained for this wave: zig 0.17.1 (pip `ziglang`), MinGW-w64 g++ 13 + wine 9.0, the Android NDK
+r27c, and the MSVC STL + Windows SDK through xwin (used with clang-cl 23; `cl.exe` itself is not available on Linux).
+
+| ID | Item | Status |
+|---|---|---|
+| X1 | `xos_*` ctests failed with zig 0.17 (`-std=c++20` on a C input; `-luserenv`) | fixed 2026-11-12: `cmake/xos_link.cmake` compiles Monocypher with `zig cc`, links with `zig c++ -std=c++23`; all `tests/test_os*.cpp` covered; `xos_headers_<target>` compiles every os header on its own; zig found through the `ziglang` wheel |
+| X2 | MinGW link of `test_os_ext` needed userenv | fixed 2026-11-12: `sandbox.hpp` loads `userenv.dll` at run time (no link dependency) |
+| X3 | `test_os_sys` under wine: three failures and a crash | fixed 2026-11-12: the crash was the test indexing the empty result of a failed `per_cpu_times` (not the layer); `per_cpu_times` now falls back to `NtQuerySystemInformation` and works under wine; tests skip what wine lacks |
+| X4 | Complete os test set under wine; MSVC ABI | done 2026-11-12: every `test_os*` passes under wine built with MinGW and with clang-cl + MSVC STL (static CRT). Found that way: MSVC consumers of clipboard / display / idle / notification / sessions / shell_open needed `user32` (now `#pragma comment(lib)`). Older Windows-only tests that need real `cmd`, `sort`, Task Scheduler, PDH or a TPM skip under wine |
+| X5 | Android NDK build | done 2026-11-12: NDK r27c, API 26: every os header and test compiles and links for arm64-v8a; for x86_64 everything up to wave 3 and most wave 4 headers (see os-parity.md); no source change was needed. Not run (no emulator). iOS: not compiled |
+| P11 | cgroup v2 / rctl limits, ReFS `clone_file`, reactor, `mremap`, FIFOs | **done 2026-11-12**: `process_limits.hpp` (`limit_group`), `fs::clone_file` on Windows, `reactor.hpp`, `fs::mapped_file`, `os::fifo`. Not run: cgroup v2 on a real v2 hierarchy, rctl, ReFS, kqueue backend |
+| S11 | Helper programs for Linux desktop features | **done 2026-11-12** for D-Bus (`dbus.hpp`, `desktop_bus.hpp`: notifications, portal OpenURI, FileManager1, login1, ScreenSaver, inhibitors) and the X11 clipboard (`clipboard_x11.hpp`). **Open**: native Wayland clipboard (see os-parity.md "Still not built"), portal `OpenFile`, Secret Service |
+| S13 | PAC and KDE proxy settings | **done 2026-11-12**: `proxy.hpp`: PAC through WinHTTP / CFNetwork; Linux / FreeBSD / Android report `pac_url_present` + `pac_evaluated == false`; dconf database and kioslaverc read directly |
+| S14 | Android / iOS / MSVC branches never compiled | **partly closed 2026-11-12**: Android compiled with the NDK, MSVC ABI compiled with clang-cl + MSVC headers and run under wine. Still open: `cl.exe`, the iOS SDK, and a run on real Android / iOS / macOS / FreeBSD / Windows for waves 3 and 4 |
+| W4-1 | Sleep inhibition as one call | added 2026-11-12: `power::inhibit_sleep` (power request, IOPMAssertion, logind / ConsoleKit inhibitor, iOS background task, Android hook) |
+| W4-2 | Appearance, power profile, clock sync | added 2026-11-12: `appearance.hpp`, `power::profile`, `timesync.hpp` (`time_sync_status`, `sntp_query`) |
+| W4-3 | D-Bus decoding of untrusted data | `fuzz/fuzz_dbus.cpp` (decode, re-encode, decode again must agree); 300 000 inputs clean under ASan + UBSan |
 
 ## Inherent limits (not fixed)
 Windows: `chown`, POSIX signals beyond kill/terminate, user-mode PMCs, THP, per-process open-file/file-size limits,

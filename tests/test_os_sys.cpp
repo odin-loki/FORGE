@@ -15,6 +15,13 @@
 #include "check.hpp"
 using namespace forge;
 namespace fs = forge::os::fs;
+static bool wine_host() {   // wine lacks some APIs real Windows always has
+#if defined(_WIN32)
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != nullptr;
+#else
+    return false;
+#endif
+}
 // ---- machine identity, budgets, virtualization, account database, sessions, scheduler, service logs (begin)
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/virtualization.hpp>
@@ -229,9 +236,11 @@ TEST(users_dirs) {
     std::printf("  full name '%s', %zu groups\n", u.full_name.c_str(), u.groups.size()); CHECK(!u.groups.empty());
     {   // Known Folders, as the shell resolves them (OneDrive / GPO redirection included)
         auto r = os::run({"powershell", "-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; foreach ($f in 'Desktop','MyDocuments','ApplicationData','LocalApplicationData') { [Environment]::GetFolderPath($f) }"});
-        CHECK(r); std::vector<std::string> want; std::string cur;
-        if (r) for (char c : r->out) { if (c == '\n') { if (!cur.empty()) want.push_back(cur); cur.clear(); } else if (c != '\r') cur += c; }
-        CHECK(want.size() == 4);
+        std::vector<std::string> want; std::string cur;
+        bool no_ps = wine_host() && (!r || r->exit_code != 0 || r->out.empty());   // wine ships no powershell
+        if (no_ps) std::printf("  skip known-folder cross-check: no powershell under wine\n"); else CHECK(r);
+        if (r && !no_ps) for (char c : r->out) { if (c == '\n') { if (!cur.empty()) want.push_back(cur); cur.clear(); } else if (c != '\r') cur += c; }
+        if (!no_ps) CHECK(want.size() == 4);
         if (want.size() == 4) {
             CHECK_MSG(os::user_directory(os::user_dir::desktop) == want[0], "%s vs %s", os::user_directory(os::user_dir::desktop).c_str(), want[0].c_str());
             CHECK(os::user_directory(os::user_dir::documents) == want[1]); CHECK(os::config_dir() == want[2]); CHECK(os::user_directory(os::user_dir::state) == want[3]);
@@ -291,7 +300,10 @@ TEST(sysinfo_ext) {
     if (os::stat("/sys/fs/cgroup/cgroup.controllers").exists) { auto d = os::detail::cgroup2_dir(); CHECK(!d.empty()); CHECK(os::stat(d).is_dir); }
 #endif
     auto u = os::self_usage(); CHECK(u);
-    CHECK(u->max_rss > 0); CHECK(u->minor_faults + u->major_faults > 0);
+    if (!u) return;
+    CHECK(u->max_rss > 0);
+    if (wine_host() && u->minor_faults + u->major_faults == 0) std::printf("  skip fault counters: wine reports none\n");
+    else CHECK(u->minor_faults + u->major_faults > 0);
     {   // current_rss grows with touched memory, on every OS
         std::uint64_t r0 = os::current_rss(); CHECK(r0 > 0);
         std::vector<char> big(64u << 20); volatile char* vp = big.data(); for (std::size_t i = 0; i < big.size(); i += 4096) vp[i] = char(i | 1);
@@ -299,13 +311,15 @@ TEST(sysinfo_ext) {
     }
     CHECK(*os::uptime_seconds() > 0); CHECK(m.available > 0);
     CHECK(os::load_average());
-    auto a = os::per_cpu_times(); CHECK(a); CHECK(!a->empty()); CHECK(a->size() >= 1u);
+    auto a = os::per_cpu_times();
+    if (!a && wine_host()) { std::printf("  skip per_cpu_times: wine: %s\n", a.err.what.c_str()); return; }
+    CHECK(a); if (!a || a->empty()) { CHECK_MSG(false, "per_cpu_times returned no CPUs"); return; }
     double x = os::cpu_usage((*a)[0], (*a)[0]); CHECK(x == 0);
     {   // the counters advance, and a busy loop shows up as busy time somewhere
         double busy0 = 0, all0 = 0; for (auto& t : *a) { CHECK(t.idle >= 0 && t.user >= 0 && t.system >= 0); busy0 += t.total() - t.idle; all0 += t.total(); }
         CHECK(all0 > 0);
         volatile std::uint64_t spin = 0; auto t0 = os::unix_time_ns(); while (os::unix_time_ns() - t0 < 300'000'000) spin = spin + 1;
-        auto b = os::per_cpu_times(); CHECK(b); CHECK(b->size() == a->size());
+        auto b = os::per_cpu_times(); CHECK(b); if (!b) return; CHECK(b->size() == a->size());
         double busy1 = 0, all1 = 0; for (auto& t : *b) { busy1 += t.total() - t.idle; all1 += t.total(); }
         CHECK(all1 > all0); CHECK(busy1 > busy0);
     }
@@ -321,7 +335,7 @@ TEST(fs_non_ascii_paths) {
     CHECK(fs::exists(*d + "/l\xC3\xA9.lock"));   // created under its real (UTF-8) name, not a byte-widened one
     auto t = fs::make_temp_file("t\xC3\xA9-", ".tmp"); CHECK(t); if (t) { CHECK(os::stat(*t).is_file); CHECK(t->find("t\xC3\xA9-") != std::string::npos); fs::remove_all(*t); }
 #if defined(FORGE_OS_WINDOWS)
-    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0444)); CHECK(!os::file::open(*d + "/ro.txt", os::wr));
+    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0444)); CHECK(wine_host() || !os::file::open(*d + "/ro.txt", os::wr));   // wine as root opens read-only files
     SetFileAttributesW(os::widen(*d + "/ro.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
 #else
     CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0600)); CHECK((*fs::mode(*d + "/ro.txt") & 0077) == 0);
@@ -475,6 +489,7 @@ TEST(service_windows_scm_query) {   // read-only SCM paths (no admin needed); in
     fs::remove_all(*d);
 }
 TEST(service_windows_task) {   // a real per-user scheduled task: install, start, query, stop, env + exit code, remove
+    if (wine_host()) { std::printf("  skip under wine: its Task Scheduler cannot run tasks (E_NOTIMPL)\n"); return; }
     std::mt19937_64 rng(std::random_device{}() ^ os::monotonic_ns());
     svc::service_spec s; s.name = "forge-test-" + std::to_string(rng() % 1000000000ull); s.description = "FORGE test task (safe to delete)";
     s.argv = {"PING.EXE", "-n", "30", "127.0.0.1"}; s.start_at_login = false; s.working_dir = os::getenv("SystemRoot", "C:\\Windows");
@@ -519,6 +534,7 @@ TEST(load_average_emulation) {   // Windows: sampler started by the first call; 
     auto b = os::load_average(); stop = true; for (auto& t : spin) t.join();
     CHECK(b); if (!b) return;
     CHECK(b->one >= 0 && b->five >= 0 && b->fifteen >= 0);
+    if (wine_host() && b->one <= a->one + 0.05 * n) { std::printf("  skip under wine: no PDH queue length, busy time does not move the estimate\n"); return; }
     CHECK_MSG(b->one > a->one + 0.05 * n,"before %.2f after %.2f (n=%u)", a->one, b->one, n);
     CHECK(b->one - a->one > b->fifteen - a->fifteen);   // the 1-minute average reacts fastest
 #endif

@@ -92,6 +92,18 @@ inline bool apply_limits(const proc_limits& lim) noexcept {
 }
 #endif
 
+// Where a new process is placed before it runs its first instruction. Filled in by os::limit_group::attach()
+// (process_limits.hpp); the group must outlive the spawn call.
+struct spawn_attach {
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE job = nullptr;            // assigned while the process is still suspended (nested under the spawn's own job)
+#else
+    int cgroup_procs_fd = -1;        // Linux: the child writes itself into this cgroup.procs before exec
+    bool use_rlimits = false;        // fallback backends: `rlimits` is applied in the child, like spawn_spec::limits
+    proc_limits rlimits;
+#endif
+};
+
 struct spawn_spec {
     std::vector<std::string> argv;
     std::string cwd;                                   // empty = inherit
@@ -122,6 +134,8 @@ struct spawn_spec {
     // (close-on-exec is cleared in the child only), Windows HANDLEs that are already inheritable. Tell the child
     // the values through argv or the environment. shared_memory::share() and inheritable_handle() produce them.
     std::vector<std::intptr_t> inherit;
+    // Start the process inside a limit group (os::limit_group::attach()); null = none.
+    const spawn_attach* attach = nullptr;
 };
 
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
@@ -485,8 +499,8 @@ inline HANDLE win_job(const proc_limits& lim, bool kill_on_close) {
 }
 // Put a suspended process into its job; on failure (a parent job that forbids nesting or breakaway) it is
 // terminated: running it without its limits and tree kill would be silently weaker than asked.
-inline error win_assign(HANDLE job, const PROCESS_INFORMATION& pi) {
-    if (AssignProcessToJobObject(job, pi.hProcess)) return {};
+inline error win_assign(HANDLE job, const PROCESS_INFORMATION& pi, const spawn_attach* att = nullptr) {
+    if (AssignProcessToJobObject(job, pi.hProcess) && (!att || !att->job || AssignProcessToJobObject(att->job, pi.hProcess))) return {};
     error e = last_error("AssignProcessToJobObject");
     TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000);
     return e;
@@ -497,6 +511,12 @@ inline error win_assign(HANDLE job, const PROCESS_INFORMATION& pi) {
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 namespace detail_proc {
 inline void set_nonblock(int fd) { int fl = ::fcntl(fd, F_GETFL); ::fcntl(fd, F_SETFL, fl | O_NONBLOCK); }
+// In the forked child, before exec (async-signal-safe): join the limit group.
+inline void child_attach(const spawn_attach* a) noexcept {
+    if (!a) return;
+    if (a->cgroup_procs_fd >= 0) (void)!::write(a->cgroup_procs_fd, "0\n", 2);   // "0": the writing process
+    if (a->use_rlimits) (void)apply_limits(a->rlimits);
+}
 inline void cloexec(int fd) { ::fcntl(fd, F_SETFD, FD_CLOEXEC); }
 // In a forked child: make `from` the descriptor `to` (0/1/2), inheritable across exec. Pipes are close-on-exec
 // (detail::pipe_cloexec); dup2 clears the flag on the copy, but dup2(fd, fd) is a no-op that would leave it set.
@@ -582,7 +602,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
                                       envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi, &extra);
     closeh(in_r); closeh(out_w); closeh(err_w); closeh(fin); closeh(fout); closeh(ferr);
     if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); CloseHandle(job); return fail(e); }
-    if (auto e = detail_proc::win_assign(job, pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); return fail(e); }
+    if (auto e = detail_proc::win_assign(job, pi, sp.attach)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); return fail(e); }
     ResumeThread(pi.hThread);
     // The stdin writer and the stdout/stderr readers run on threads of their own: a child that never reads its
     // stdin cannot stall the wait loop below, which keeps the timeout, stop token and watchdog live.
@@ -696,6 +716,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         if (sp.merge_stderr && o1 >= 0) dup_to(o1, 2); else if (ferr >= 0) dup_to(ferr, 2); else if (perr[1] >= 0) dup_to(perr[1], 2);
         for (std::intptr_t h : inherit) if (h > 2) ::fcntl(int(h), F_SETFD, 0);
         (void)apply_limits(lim);
+        detail_proc::child_attach(sp.attach);
         if (cwd && ::chdir(cwd) != 0) { int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127); }
         ::execve(exe.c_str(), av.data(), ev.data());
         int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127);
@@ -885,6 +906,7 @@ public:
             dup_to(po[1], 1); if (merge) dup_to(po[1], 2); else if (ferr >= 0) dup_to(ferr, 2);
             for (std::intptr_t h : sp.inherit) if (h > 2) ::fcntl(int(h), F_SETFD, 0);
             (void)apply_limits(lim);
+            detail_proc::child_attach(sp.attach);
             if (wd && ::chdir(wd) != 0) { int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127); }
             ::execve(exe.c_str(), av.data(), ev.data());
             int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127);
@@ -1060,7 +1082,7 @@ private:
                                           envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi, &extra);
         closeh(out_w); closeh(fin); closeh(ferr);
         if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); closeh(out_r); closeh(job); return {{}, e}; }
-        if (auto e = detail_proc::win_assign(job, pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); closeh(out_r); closeh(job); return {{}, e}; }
+        if (auto e = detail_proc::win_assign(job, pi, sp.attach)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); closeh(out_r); closeh(job); return {{}, e}; }
         ResumeThread(pi.hThread); CloseHandle(pi.hThread);
         c.pid_ = static_cast<long long>(pi.dwProcessId); c.proc_ = pi.hProcess; c.job_ = job; c.hout_ = out_r;
         return {std::move(c), {}};

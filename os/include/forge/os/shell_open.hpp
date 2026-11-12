@@ -14,6 +14,10 @@
 // Nothing here blocks on the opened application: helpers are waited for at most 10 s (they return at once).
 #include <forge/os/detail.hpp>
 #include <forge/os/process.hpp>
+#include <forge/os/desktop_bus.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
+#endif
 
 namespace forge::os {
 enum class open_kind { url, path, reveal };
@@ -127,7 +131,17 @@ inline status open_target(const std::string& target, open_kind kind) {
 #elif defined(FORGE_OS_ANDROID)
     (void)kind; return {{}, unsupported("open (install set_open_hook from JNI: startActivity(Intent.ACTION_VIEW))")};
 #else
-    (void)kind; auto cmd = opener_command(target);
+    auto cmd = opener_command(target);
+#if defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
+    // The desktop portal over D-Bus: the only way out of a Flatpak / Snap sandbox, and the fallback when no
+    // opener program is installed. It takes URIs (files need a descriptor: those keep using the helper).
+    const bool sandboxed = stat("/.flatpak-info").exists || has_env("SNAP");
+    if (kind == open_kind::url && (cmd.empty() || sandboxed) && desktop_session()) {
+        auto r = desktop_bus::open_uri(target);
+        if (r || cmd.empty()) { if (!r && is_unsupported(r.err)) return {{}, unsupported("open (no xdg-open / gio and no desktop portal)")}; return r; }
+    }
+#endif
+    (void)kind;
     if (cmd.empty()) return {{}, unsupported("open (no desktop session or no xdg-open / gio)")};
     return run_helper(std::move(cmd), "open");
 #endif
@@ -158,6 +172,7 @@ inline status reveal_path(const std::string& path) {
     return detail_open::run_helper({"/usr/bin/open", "-R", abs}, "reveal_path");
 #elif defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
     if (!detail_open::desktop_session()) return {{}, unsupported("reveal_path (no desktop session)")};
+    if (desktop_bus::show_items({detail_open::file_uri(abs)})) return {};   // org.freedesktop.FileManager1, spoken directly
     if (has_env("DBUS_SESSION_BUS_ADDRESS") && !find_executable("gdbus").empty()) {
         std::string uri = detail_open::file_uri(abs);   // percent-encoded: no quote can end the GVariant string
         auto r = detail_open::run_helper({"gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1", "--object-path", "/org/freedesktop/FileManager1",

@@ -6,6 +6,13 @@
 #include <forge/os/oserror.hpp>
 #include <atomic>
 using namespace forge;
+static bool wine_host() {   // wine lacks some APIs and tools real Windows always has
+#if defined(_WIN32)
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != nullptr;
+#else
+    return false;
+#endif
+}
 
 static std::string scratch(const char* tag) { auto d = os::join(os::temp_dir(), std::string("forge_osx_") + tag + "_" + std::to_string(os::pid())); os::remove_all(d); os::mkdirs(d); return d; }
 static void skip(const char* what, const std::string& why) { std::printf("  skip %s: %s\n", what, why.c_str()); }
@@ -595,7 +602,8 @@ TEST(key_storage) {
         auto ta = os::keystore::tpm_available(); std::printf("  TPM wrapping: %s\n", ta ? "available" : ta.err.what.c_str());
         auto td = scratch("keys_tpm"); os::setenv("FORGE_KEYSTORE_DIR", td); os::setenv("FORGE_KEYSTORE_TPM", "1");
         auto mp = os::join(td, ".master"), tp = os::join(td, ".master.tpm");
-        if (!ta) { auto r = os::keystore::put(svc, "t", "x"); CHECK(!r); CHECK(os::is_unsupported(r.err)); CHECK(os::keystore::backend() == "file"); }
+        if (ta && wine_host()) std::printf("  skip TPM: wine's Platform Crypto Provider opens but cannot encrypt\n");
+        else if (!ta) { auto r = os::keystore::put(svc, "t", "x"); CHECK(!r); CHECK(os::is_unsupported(r.err)); CHECK(os::keystore::backend() == "file"); }
         else {
             os::setenv("FORGE_KEYSTORE_TPM_KEY_PREFIX", "forge-test-"); CHECK(os::keystore::set_kdf({8192, 2, 1}));
             CHECK(os::keystore::backend() == "file+tpm");

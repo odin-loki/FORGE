@@ -12,6 +12,7 @@
 //   end(); without logind (containers, non-systemd) nothing idle-suspends the machine and kind is "not_required".
 //   FreeBSD: no system idle-suspend policy exists (suspend is explicit: acpiconf/zzz), so kind is "not_required".
 #include <forge/os/detail.hpp>
+#include <forge/os/desktop_bus.hpp>
 
 namespace forge::os {
 class background {
@@ -45,7 +46,8 @@ public:
         auto& p = power_api_::get(); if (!p.ok()) return {0, unsupported("PowerCreateRequest")};
         std::wstring why = widen(name.empty() ? std::string("forge") : name);
         power_api_::reason_t rc{}; rc.version = 0; rc.flags = 0x1 /*POWER_REQUEST_CONTEXT_SIMPLE_STRING*/; rc.simple = why.data();
-        HANDLE h = p.create(&rc); if (h == INVALID_HANDLE_VALUE || !h) return {0, last_error("PowerCreateRequest")};
+        HANDLE h = p.create(&rc);
+        if (h == INVALID_HANDLE_VALUE || !h) { if (GetLastError() == ERROR_CALL_NOT_IMPLEMENTED) return {0, unsupported("PowerCreateRequest")}; return {0, last_error("PowerCreateRequest")}; }
         if (!p.set(h, 1 /*PowerRequestSystemRequired*/)) { auto e = last_error("PowerSetRequest"); CloseHandle(h); return {0, e}; }
         t.native = reinterpret_cast<std::uintptr_t>(h); t.kind = "power-request";
 #elif defined(FORGE_OS_MACOS)
@@ -62,6 +64,11 @@ public:
         auto fd = logind_inhibit_(name.empty() ? std::string("forge") : name);
         if (!fd) return {0, fd.err};
         if (fd.value >= 0) { t.native = std::uintptr_t(fd.value); t.kind = "logind-inhibit"; } else t.kind = "not_required";
+#elif defined(FORGE_OS_FREEBSD)
+        (void)title; (void)text;
+        // ConsoleKit2 offers logind's Inhibit; without it nothing idle-suspends a FreeBSD machine on its own.
+        if (auto fd = desktop_bus::inhibit_sleep_fd("sleep:idle", "forge", name.empty() ? std::string("forge") : name)) { t.native = std::uintptr_t(fd.value); t.kind = "consolekit-inhibit"; }
+        else t.kind = "not_required";
 #else
         (void)title; (void)text; t.kind = "not_required";
 #endif
@@ -93,7 +100,7 @@ private:
         if (t.kind == "iopm-assertion") if (void* io = ::dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY))
             if (auto rel = reinterpret_cast<int (*)(std::uint32_t)>(::dlsym(io, "IOPMAssertionRelease"))) rel(std::uint32_t(t.native));
 #elif defined(FORGE_OS_LINUX)
-        if (t.kind == "logind-inhibit") ::close(int(t.native));   // closing the fd releases the inhibitor
+        if (t.kind == "logind-inhibit" || t.kind == "consolekit-inhibit") ::close(int(t.native));   // closing the fd releases the inhibitor
 #else
         (void)t;
 #endif
@@ -121,6 +128,12 @@ private:
     // logind Inhibit("sleep:idle", ..., "block") through sd-bus. Returns the inhibitor fd, -1 when there is no
     // logind to inhibit (no libsystemd, no system bus, login1 not running), or an error when logind refused.
     static result<int> logind_inhibit_(const std::string& why) {
+        {   // The native D-Bus client first (no libsystemd needed); sd-bus below is the fallback.
+            auto fd = desktop_bus::inhibit_sleep_fd("sleep:idle", "forge", why);
+            if (!fd && !is_unsupported(fd.err)) fd = desktop_bus::inhibit_sleep_fd("idle", "forge", why);
+            if (fd) return {fd.value, {}};
+            if (!desktop_bus::has_bus(dbus::bus::system)) return {-1, {}};   // no system bus: nothing to inhibit
+        }
         struct bus_error { const char* name; const char* message; int need_free; };
         struct api {
             int (*open_system)(void**) = nullptr; int (*call)(void*, const char*, const char*, const char*, const char*, bus_error*, void**, const char*, ...) = nullptr;
