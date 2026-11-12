@@ -65,6 +65,9 @@ int usage() {
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
         "      [--codec C (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
+        "  embed <model.fpk> (--text TEXT | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
+        "      [--out file.f32] [--device D]     embedding models (BERT family, ViT / CLIP / SigLIP, Whisper encoder):\n"
+        "      prints the vector, or writes it as raw f32; --input feeds a declared input (an image, mel frames)\n"
         "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512  |  bench --kernels 1024 (MB, quantised matvec GB/s)\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
@@ -308,6 +311,47 @@ int run_one_shot(inference::session& s, const args& a) {
         if (prefix.empty()) { std::printf("%s:", k.c_str()); for (auto x : v) std::printf(" %.6g", x); std::printf("\n"); continue; }
         std::ofstream f(prefix + "." + k + ".f32", std::ios::binary);
         f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+    }
+    return 0;
+}
+
+// `forge embed`: one pass of an embedding model (blueprint `session embedding`); prints or writes the result vector.
+int cmd_embed(const args& a) {
+    if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
+    inference::session_options so; so.verify = a.has("verify");
+    inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
+    if (a.kv.count("device")) s.shared_model()->set_device(a.get("device"));
+    std::vector<float> v;
+    if (!a.all("input").empty()) {   // named raw-f32 inputs: an image, mel frames, or the token inputs themselves
+        std::map<std::string, std::vector<float>> in; i64 seq = 1;
+        for (auto& spec : a.all("input")) {
+            auto eq = spec.find('=');
+            if (eq == std::string::npos) raise(errc::invalid_argument, "--input expects name=file, got '{}'", spec);
+            auto bytes = import::read_file(spec.substr(eq + 1));
+            if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", spec.substr(eq + 1));
+            std::vector<float> x(bytes.size() / 4); std::memcpy(x.data(), bytes.data(), bytes.size());
+            for (auto& d : s.blueprint().inputs) if (d.name == spec.substr(0, eq) && d.dims.size() == 1 && d.dims[0] == "seq") seq = i64(x.size());
+            in[spec.substr(0, eq)] = std::move(x);
+        }
+        v = s.embed_inputs(in, seq);
+    } else {
+        std::vector<int> ids;
+        if (a.kv.count("tokens")) ids = parse_ids(a.get("tokens"));
+        else if (a.kv.count("text")) {
+            if (!s.tokenizer()) raise(errc::not_found, "model has no tokenizer the runtime can use; pass --tokens");
+            ids = s.tokenizer()->encode(a.get("text"));
+        } else return usage();
+        v = s.embed(ids, a.kv.count("token-types") ? parse_ids(a.get("token-types")) : std::vector<int>{},
+                    a.kv.count("mask") ? parse_ids(a.get("mask")) : std::vector<int>{});
+    }
+    if (a.kv.count("out")) {
+        std::ofstream f(a.get("out"), std::ios::binary);
+        f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+        if (!f) raise(errc::io_error, "cannot write {}", a.get("out"));
+    } else {
+        for (std::size_t i = 0; i < v.size(); ++i) std::printf(i ? " %.6g" : "%.6g", double(v[i]));
+        std::printf("\n");
     }
     return 0;
 }
@@ -756,6 +800,7 @@ int main(int argc, char** argv) {
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
         if (c == "run") return cmd_run(a);
+        if (c == "embed") return cmd_embed(a);
         if (c == "bench") return cmd_bench(a);
         if (c == "dump") return cmd_dump(a);
         if (c == "keygen") return cmd_keygen(a);
