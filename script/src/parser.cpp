@@ -524,9 +524,10 @@ private:
         static const std::unordered_map<std::string, std::string> m = {
             {"std::exception", "Error"}, {"std::runtime_error", "RuntimeError"}, {"std::logic_error", "LogicError"},
             {"std::invalid_argument", "ValueError"}, {"std::out_of_range", "IndexError"}, {"std::overflow_error", "OverflowError"},
-            {"std::range_error", "ValueError"}, {"std::length_error", "ValueError"}, {"std::domain_error", "ValueError"},
-            {"std::bad_alloc", "OutOfMemoryError"}, {"std::bad_optional_access", "ValueError"}, {"std::system_error", "OSError"},
-            {"std::filesystem::filesystem_error", "IOError"}, {"forge::error", "Error"}};
+            {"std::range_error", "RangeError"}, {"std::length_error", "LengthError"}, {"std::domain_error", "DomainError"},
+            {"std::underflow_error", "UnderflowError"}, {"std::bad_cast", "TypeError"}, {"std::bad_any_cast", "TypeError"},
+            {"std::bad_alloc", "OutOfMemoryError"}, {"std::bad_optional_access", "NullPointerError"}, {"std::system_error", "OSError"},
+            {"std::filesystem::filesystem_error", "IOError"}, {"std::ios_base::failure", "IOError"}, {"forge::error", "Error"}};
         if (auto it = m.find(w); it != m.end()) return it->second;
         if (w.rfind("forge::", 0) == 0) return w.substr(7);
         return w;
@@ -535,7 +536,7 @@ private:
     // Parses a declaration type: specifiers, a (possibly templated) type name and trailing & / &&.
     // Raw pointers are rejected: the language is memory safe.
     TI parse_type() {
-        TI ti;
+        TI ti; bool c_char = false;
         for (;;) {
             if (accept_kw("const") || accept_kw("constexpr") || accept_kw("constinit") || accept_kw("consteval")) { ti.cnst = true; continue; }
             if (accept_kw("static")) { ti.is_static = true; continue; }
@@ -549,6 +550,7 @@ private:
         else {
             if (!at(T::Ident)) fail("expected a type, got '" + cur().s + "'");
             std::string w = canon_type_name(take().s);
+            c_char = w == "char";
             // multi-word builtins: unsigned long long, long double, ...
             static const std::unordered_set<std::string> mw = {"unsigned", "signed", "long", "short"};
             if (mw.count(w)) { while (at(T::Ident) && (mw.count(cur().s) || cur().s == "int" || cur().s == "char" || cur().s == "double")) { if (cur().s == "double") w = "double"; take(); } }
@@ -598,6 +600,8 @@ private:
             if (w == "std::map" || w == "std::set" || w == "std::multimap") ti.sorted = true;
         }
         while (accept_kw("const") || accept_kw("volatile")) ti.cnst = true;
+        // `const char*` is a C string: a string value here (what a literal is, and what what() returns)
+        if (ti.k == TK::String && ti.cnst && c_char && is_op("*")) { take(); while (accept_kw("const")) {} }
         if (is_op("*")) fail("raw pointers are not allowed in FORGE scripts; use std::shared_ptr / std::unique_ptr or a reference");
         if (accept_op("&")) ti.ref = true; else if (accept_op("&&")) ti.ref = false;
         while (accept_kw("const")) ti.cnst = true;
@@ -996,7 +1000,8 @@ private:
         fn_qualifiers(&r, &cq);
         fd->ret_name = tname(r); fd->is_const = cq;
         fns_.back().ret = std::make_shared<TI>(r);
-        fd->body = block_body(line, false);
+        if (is_kw("try")) { auto b = mk(NK::Block, line); b->kids.push_back(try_stmt()); fd->body = b; }   // function-try-block
+        else fd->body = block_body(line, false);
         fd->nslots = fns_.back().nslots;
         pop_fn();
         return fd;
@@ -1191,6 +1196,37 @@ private:
         outer->kids.push_back(loop);
         return outer;
     }
+    // The exception declaration of a catch clause -> the tag stored in the clause's Node::s and matched by
+    // Interp::catch_matches: a class name (the thrown object's class or one of its bases), or "<int>", "<float>",
+    // "<bool>", "<string>", "<list>", "<map>" for values of exactly that kind. Only `catch (...)` (tag "") is a
+    // catch-all: a name the parser does not know as a type (a built-in error class written without forge::, such
+    // as PermissionError, or a class defined elsewhere) is matched by class name at run time and never widens.
+    std::string catch_type() {
+        std::size_t b = i_;
+        TI ti = parse_type();   // `const char*` (what a thrown string literal is in C++) parses as a string
+        std::string word;
+        for (std::size_t k = b; k < i_; ++k) if (t_[k].t == T::Ident) { word = canon_type_name(t_[k].s); break; }
+        if (ti.smart || ti.nullable) fail("catch: std::optional and smart pointer types cannot be caught; catch the class by reference");
+        switch (ti.k) {
+        case TK::Class: return ti.name;
+        case TK::Int: case TK::Enum: return "<int>";
+        case TK::Float: return "<float>";
+        case TK::Bool: return "<bool>";
+        case TK::String: return "<string>";
+        case TK::List: case TK::Pair: return "<list>";
+        case TK::Map: case TK::Set: return "<map>";
+        case TK::Auto: fail("catch (auto) is not C++: write catch (...) or name the exception type");
+        case TK::Any:
+            if (!word.empty() && !tparams_.count(word) && !builtin_types().count(word)) {
+                std::string cls = exception_class(word);
+                if (cls.rfind("std::", 0) == 0) fail("catch: '" + word + "' is not a supported exception type (see docs/scripting.md, Errors)");
+                return cls;
+            }
+            [[fallthrough]];
+        default:
+            fail("catch: values of type '" + (word.empty() ? std::string("this type") : word) + "' cannot be caught by type; use a class, int, double, bool, std::string or catch (...)");
+        }
+    }
     NodeP try_stmt() {
         int line = take().line; auto n = mk(NK::Try, line);
         n->kids.push_back(block_body(line));
@@ -1203,8 +1239,7 @@ private:
             std::string vname;
             if (accept_op("...")) c->s = "";
             else {
-                TI ti = parse_type();
-                c->s = ti.k == TK::Class ? ti.name : ti.k == TK::String ? "String" : "";
+                c->s = catch_type();
                 if (at(T::Ident)) vname = take().s;
             }
             expect_op(")");
@@ -1919,7 +1954,8 @@ private:
         while (accept_kw("mutable") || accept_kw("constexpr") || accept_kw("static")) {}
         fn_qualifiers(&r);
         fns_.back().ret = std::make_shared<TI>(r);
-        fd->body = block_body(line, false);
+        if (is_kw("try")) { auto b = mk(NK::Block, line); b->kids.push_back(try_stmt()); fd->body = b; }   // function-try-block
+        else fd->body = block_body(line, false);
         fd->nslots = fns_.back().nslots;
         pop_fn();
         keep_source(*fd, sb);

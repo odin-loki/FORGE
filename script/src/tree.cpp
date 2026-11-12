@@ -45,12 +45,9 @@ Flow Interp::run_try(const Node& n, const Ref<Env>& env) {
     catch (...) {
         ScriptError e = from_cpp(std::current_exception());
         const Node* handler = nullptr;
-        for (std::size_t i = 1; i < n.kids.size(); ++i) {
-            const Node& c = *n.kids[i];
-            if (c.s.empty() || c.s == "Error") { handler = &c; break; }
-            if (auto* inst = as<Instance>(e.v); inst && inst->cls->derives(c.s)) { handler = &c; break; }
-            if (type_of(e.v) == c.s) { handler = &c; break; }
-        }
+        // A fatal error (ScriptError::fatal, or the whole run ending) is handled by no clause, catch (...) included.
+        if (!e.fatal && !sh->dead.load())
+            for (std::size_t i = 1; i < n.kids.size() && !handler; ++i) if (catch_matches(n.kids[i]->s, e.v)) handler = n.kids[i].get();
         if (handler) {
             store(handler->var, env, e.v);
             try { f = exec_block(*handler->kids[0], env); }
@@ -158,12 +155,20 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
     case NK::Break: return Flow::Break;
     case NK::Continue: return Flow::Continue;
     case NK::Throw: {
-        Value v = eval(*n.kids[0], env);
-        if (auto* s = as<String>(v)) v = make_error("Error", s->s);
+        Value v = eval(*n.kids[0], env);   // any value can be thrown; a string stays a string (catch (const std::string&))
         if (auto* i = as<Instance>(v); i && i->cls->derives("Error")) {
-            if (auto it = i->fields.find("trace"); it == i->fields.end() || is_nil(it->second) || (as<String>(it->second) && as<String>(it->second)->s.empty()))
+            // `trace` and `line` are the built-in Error's fields; a user exception class may declare members of
+            // the same names (`int line;` in a parse error is common C++), and those are the user's.
+            auto user_field = [&](const char* f) {
+                for (const Class* c = i->cls.get(); c; c = c->base.get()) {
+                    if (auto it = sh->errors.find(c->name); it != sh->errors.end() && it->second.get() == c) return false;
+                    for (auto& x : c->fields) if (x == f) return true;
+                }
+                return false;
+            };
+            if (auto it = i->fields.find("trace"); !user_field("trace") && (it == i->fields.end() || is_nil(it->second) || (as<String>(it->second) && as<String>(it->second)->s.empty())))
                 i->fields["trace"] = new_string(trace_text());
-            i->fields["line"] = std::int64_t(n.line);
+            if (!user_field("line")) i->fields["line"] = std::int64_t(n.line);
         }
         throw ScriptError(v, error_message(v));
     }

@@ -338,8 +338,10 @@ std::string script_process_task(std::string payload) {
     if (r.ok && got) { res.emplace_back("ok", true); res.emplace_back("value", json::parse(result)); }
     else {
         res.emplace_back("ok", false);
-        res.emplace_back("type", r.error_type.empty() ? std::string("RuntimeError") : r.error_type);
-        std::string m = r.error; if (auto c = m.find(": "); c != std::string::npos && m.compare(0, c, r.error_type) == 0) m = m.substr(c + 2);
+        std::string et = r.error_type.empty() ? std::string("RuntimeError") : r.error_type, m = r.error;
+        if (auto c = m.find(": "); c != std::string::npos && m.compare(0, c, r.error_type) == 0) m = m.substr(c + 2);
+        static_refusal_type(et, m);   // a task the worker's static checks refused for a denied capability: PermissionError
+        res.emplace_back("type", et);
         res.emplace_back("msg", r.ok ? std::string("task(arg) was not called; define task(arg) in the source") : m);
     }
     res.emplace_back("out", out_text);
@@ -379,9 +381,15 @@ void install_builtins(Shared& sh) {
         return c;
     };
     auto err = mkclass("Error", {});
-    for (auto n : {"IOError", "OSError", "TypeError", "IndexError", "KeyError", "OverflowError",
+    // The std:: exception names are these classes (cppstd.cpp), so the tree follows <stdexcept>: catching
+    // std::logic_error gets invalid_argument (ValueError) and out_of_range (IndexError), catching std::runtime_error
+    // gets overflow_error, range_error, system_error (OSError and everything under it) and I/O errors.
+    auto logic = mkclass("LogicError", err), runtime = mkclass("RuntimeError", err);
+    for (auto n : {"ValueError", "IndexError", "LengthError", "DomainError"}) mkclass(n, logic);
+    for (auto n : {"IOError", "OSError", "OverflowError", "UnderflowError", "RangeError"}) mkclass(n, runtime);
+    for (auto n : {"TypeError", "KeyError",
                    "ObjectDisposedError", "ShellError", "LimitExceededError", "NameError",
-                   "AttributeError", "ValueError", "ArithmeticError", "SyntaxError", "ImportError", "RuntimeError", "LogicError",
+                   "AttributeError", "ArithmeticError", "SyntaxError", "ImportError", "HostError",
                    "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "PipelineError", "PluginError", "AIError", "AccessError"})
         mkclass(n, err);
     // As in Python, OS-level conditions are OSError subclasses: catch (const OSError& e) gets all of them.
@@ -582,7 +590,14 @@ void install_builtins(Shared& sh) {
         }
         if (hd) in.handle_quota = std::make_shared<Quota>(n_hd, in.handle_quota);
         if (pr) in.proc_quota = std::make_shared<Quota>(n_pr, in.proc_quota);
-        Args none; return in.call(a[1], none);
+        Args none;
+        try { return in.call(a[1], none); }
+        catch (ScriptError& e) {
+            // A timeout / CPU limit that fired is fatal inside the block (no catch clause in the body can swallow it
+            // and keep running). It becomes an ordinary error here, unless an enclosing block's limit has expired too.
+            if (e.fatal && !in.sh->dead.load() && !(s.dl && os::monotonic_ns() > s.dl) && !(s.cdl && os::thread_cpu_time_ns() > s.cdl)) e.fatal = false;
+            throw;
+        }
     });
     B["sandbox"] = native("sandbox", 2, 2, [](Interp& in, Args& a) -> Value {
         Scope s(in);
@@ -999,7 +1014,7 @@ void install_builtins(Shared& sh) {
                 in.step();   // CancelledError / limits while waiting
                 // step() reads the clock only every 256 calls, which is 5 s or more of these waits
                 auto now = os::monotonic_ns();
-                if (in.deadline_ns && now > in.deadline_ns) { in.deadline_ns = 0; in.raise("TimeoutError", "time limit reached"); }
+                in.check_deadline(now);
                 if (end && now > end) in.raise("TimeoutError", "ProcessPool future: timed out waiting for the worker");
             }
             try { fb.got = fb.f.get(); } catch (...) { fb.err = std::current_exception(); }
@@ -1285,6 +1300,8 @@ Value host_native(Shared& sh, const std::string& name, int lo, int hi, std::func
         std::string res;
         try { res = fn(json::dump(json::value(std::move(arr)))); }
         catch (const ScriptError&) { throw; }
+        catch (const security::security_error&) { throw; }   // typed errors keep their class (Interp::from_cpp)
+        catch (const os::os_exception&) { throw; }
         catch (const std::exception& e) { in.raise("HostError", name + ": " + e.what()); }
         if (res.empty()) return Nil{};
         try { return from_json(json::parse(res)); }

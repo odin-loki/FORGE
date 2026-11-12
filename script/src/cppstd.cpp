@@ -604,15 +604,17 @@ void install_cpp_std(Shared& sh) {
     def("std::chrono::seconds", 1, 1, [](Interp& in, Args& a) -> Value { return iv(in, a[0], "seconds") * 1000; });
     def("std::this_thread::sleep_for", 1, 1, [&sh](Interp& in, Args& a) -> Value { Args x{a[0]}; return in.call(sh.builtins["sleep"], x); });
     def("std::this_thread::yield", 0, 0, [](Interp& in, Args&) -> Value { in.step(); std::this_thread::yield(); return Nil{}; });
-    def("std::exit", 1, 1, [](Interp& in, Args& a) -> Value { in.raise("SystemExit", std::to_string(iv(in, a[0], "exit"))); });
+    def("std::exit", 1, 1, [](Interp& in, Args& a) -> Value { in.terminate("SystemExit", std::to_string(iv(in, a[0], "exit"))); });
     def("std::swap", 2, 2, [](Interp& in, Args&) -> Value { in.raise("TypeError", "std::swap must be used as a statement: std::swap(a, b);"); });
 
     // ---- exceptions: std::runtime_error etc. are the script error classes
     const std::pair<const char*, const char*> errs[] = {
         {"std::exception", "Error"}, {"std::runtime_error", "RuntimeError"}, {"std::logic_error", "LogicError"},
-        {"std::invalid_argument", "ValueError"}, {"std::out_of_range", "IndexError"}, {"std::length_error", "ValueError"},
-        {"std::domain_error", "ValueError"}, {"std::range_error", "ValueError"}, {"std::overflow_error", "OverflowError"},
-        {"std::bad_alloc", "OutOfMemoryError"}, {"std::system_error", "OSError"}};
+        {"std::invalid_argument", "ValueError"}, {"std::out_of_range", "IndexError"}, {"std::length_error", "LengthError"},
+        {"std::domain_error", "DomainError"}, {"std::range_error", "RangeError"}, {"std::overflow_error", "OverflowError"},
+        {"std::underflow_error", "UnderflowError"}, {"std::bad_alloc", "OutOfMemoryError"}, {"std::system_error", "OSError"},
+        {"std::bad_cast", "TypeError"}, {"std::bad_any_cast", "TypeError"}, {"std::bad_optional_access", "NullPointerError"},
+        {"std::filesystem::filesystem_error", "IOError"}, {"std::ios_base::failure", "IOError"}};   // keep in step with parser.cpp exception_class
     for (auto& [cpp, ours] : errs) if (auto e = sh.errors.find(ours); e != sh.errors.end()) B[cpp] = obj(e->second);
     if (auto e = sh.errors.find("Error"); e != sh.errors.end())
         e->second->methods["what"] = nat("what", 1, 1, [](Interp& in, Args& a) -> Value { return in.get_field(a[0], "message"); });

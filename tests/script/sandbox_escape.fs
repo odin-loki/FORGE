@@ -6,8 +6,12 @@ std::string path = forge::fs::temp_file("forge-escape-");
 forge::fs::write(path, "secret");
 
 void attempt(const std::string& route, std::function<void()> f) {
+    // Only a PermissionError counts as denied: an operation that fails some other way (or a handler that would
+    // accept any error, as the unqualified name once did) must not pass for a capability check.
     try { f(); std::println("ESCAPED: {}", route); }
     catch (const PermissionError& e) { std::println("denied: {}", route); }
+    catch (const std::exception& e) { std::println("WRONG ERROR {} ({}): {}", forge::typeof(e), e.what(), route); }
+    catch (...) { std::println("WRONG ERROR (not an exception): {}", route); }
 }
 const std::map<std::string, bool> no_fs{{"fs", false}}, no_net{{"net", false}}, no_proc{{"proc", false}}, no_env{{"env", false}};
 

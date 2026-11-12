@@ -279,6 +279,7 @@ void install_remote(Shared& sh) {
         if (!out.empty() && in.sh->out) in.sh->out(out);
         if (!r.ok) {
             std::string type = r.error_type.empty() ? "RuntimeError" : r.error_type, msg = r.error;
+            static_refusal_type(type, msg);
             if (auto p = msg.find(type + ": "); p != std::string::npos) msg = msg.substr(p + type.size() + 2);
             if (auto p = msg.find("\n  at "); p != std::string::npos) msg.resize(p);   // the node's traceback is in generated code
             in.raise(in.sh->errors.count(type) ? type : std::string("RuntimeError"), "remote: " + msg);

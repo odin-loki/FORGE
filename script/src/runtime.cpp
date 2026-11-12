@@ -217,8 +217,53 @@ Value Interp::make_error(const std::string& type, const std::string& msg) {
     return obj(e);
 }
 void Interp::raise(const std::string& type, const std::string& msg) {
+    if (type == "SystemExit") terminate(type, msg);   // std::exit, also when re-raised from a child: never catchable
     Value e = make_error(type, msg);
     throw ScriptError(e, type + ": " + msg);
+}
+void Interp::raise_fatal(const std::string& type, const std::string& msg) {
+    Heap::exempt no_cap;
+    ScriptError e(make_error(type, msg), type + ": " + msg);
+    e.fatal = true;
+    throw e;
+}
+void Interp::terminate(const std::string& type, const std::string& msg) {
+    std::string t = type, m = msg;
+    {
+        std::lock_guard lk(sh->dead_m);
+        if (!sh->dead.load()) { sh->dead_type = type; sh->dead_msg = msg; sh->dead_grace_ns = os::monotonic_ns() + kGraceNs; sh->dead = true; }
+        else { t = sh->dead_type; m = sh->dead_msg; }
+    }
+    dying = true;
+    raise_fatal(t, m);
+}
+// The run is ending: raise its error once in this interpreter, then let clean-up code run until the grace period ends.
+void Interp::dead_step(std::uint64_t n) {
+    if (dying && ((n & 255) != 0 || os::monotonic_ns() <= sh->dead_grace_ns.load())) return;
+    dying = true;
+    std::string t, m;
+    { std::lock_guard lk(sh->dead_m); t = sh->dead_type; m = sh->dead_msg; }
+    raise_fatal(t, m);
+}
+void Interp::check_deadline(std::uint64_t now) {
+    if (!deadline_ns || now <= deadline_ns) return;
+    if (sh->limits.timeout_ms && now > sh->start_ns + sh->limits.timeout_ms * 1000000) terminate("TimeoutError", "time limit reached");
+    deadline_ns = now + kGraceNs;   // a limit block's deadline: fatal until the block exits; clean-up gets the grace period
+    raise_fatal("TimeoutError", "time limit reached");
+}
+bool Interp::catch_matches(const std::string& tag, const Value& v) const {
+    if (tag.empty()) return true;                                  // catch (...)
+    if (tag[0] == '<') {
+        if (tag == "<int>") return v.index() == 2;
+        if (tag == "<float>") return v.index() == 3;
+        if (tag == "<bool>") return v.index() == 1;
+        if (tag == "<string>") return as<String>(v) != nullptr;
+        if (tag == "<list>") return as<List>(v) != nullptr;
+        if (tag == "<map>") return as<Map>(v) != nullptr;
+        return false;
+    }
+    auto* inst = as<Instance>(v);
+    return inst && inst->cls->derives(tag);
 }
 std::string Interp::error_message(const Value& err) {
     if (auto* i = as<Instance>(err)) {
@@ -265,20 +310,39 @@ ScriptError Interp::from_cpp(std::exception_ptr ep) {
     catch (...) { return mk("Error", "unknown native error"); }
 }
 
+void static_refusal_type(std::string& type, std::string& msg) {
+    static const std::string cap = "error[capability]";
+    if (type != "StaticCheckError" || msg.find(cap) == std::string::npos) return;
+    for (auto p = msg.find("error["); p != std::string::npos; p = msg.find("error[", p + 1)) if (msg.compare(p, cap.size(), cap) != 0) return;
+    type = "PermissionError";
+    auto p = msg.find(cap + ": ");
+    if (p == std::string::npos) return;
+    msg = msg.substr(p + cap.size() + 2);
+    if (auto nl = msg.find('\n'); nl != std::string::npos) msg.resize(nl);
+}
+
 // ---------------------------------------------------------------- limits
 void Interp::step() {
     if (finalizers_pending()) run_finalizers();
     auto n = sh->steps.fetch_add(1, std::memory_order_relaxed);
-    if (sh->limits.max_steps && n >= sh->limits.max_steps) raise("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
+    // Whole-run limits, std::exit and cancellation end the run: they are fatal (no catch clause, not even
+    // catch (...), handles them), so a script cannot outlive them by catching the error and carrying on.
+    if (sh->dead.load(std::memory_order_relaxed)) { dead_step(n); return; }
+    if (sh->limits.max_steps && n >= sh->limits.max_steps) terminate("LimitExceededError", "step limit of " + std::to_string(sh->limits.max_steps) + " reached");
     if ((n & 255) == 0) {
         if (sh->interrupt.load()) {
             sh->interrupt = false;
             int sig = os::take_cancel_signal();
-            raise("CancelledError", sig ? os::cancellation_exception(sig).what() : std::string("interrupted"));
+            terminate("CancelledError", sig ? os::cancellation_exception(sig).what() : std::string("interrupted"));
         }
-        if (task && task->cancel.load()) raise("CancelledError", "task cancelled");
-        if (deadline_ns && os::monotonic_ns() > deadline_ns) { deadline_ns = 0; raise("TimeoutError", "time limit reached"); }
-        if (cpu_deadline_ns && os::thread_cpu_time_ns() > cpu_deadline_ns) { cpu_deadline_ns = 0; raise("LimitExceededError", "CPU time limit reached"); }
+        if (task && task->cancel.load()) {
+            auto now = os::monotonic_ns();
+            if (!cancel_grace_ns || now > cancel_grace_ns) { cancel_grace_ns = now + kGraceNs; raise_fatal("CancelledError", "task cancelled"); }
+        }
+        if (deadline_ns) check_deadline(os::monotonic_ns());
+        if (cpu_deadline_ns) {
+            if (auto cpu = os::thread_cpu_time_ns(); cpu > cpu_deadline_ns) { cpu_deadline_ns = cpu + kGraceNs; raise_fatal("LimitExceededError", "CPU time limit reached"); }
+        }
     }
 }
 void Interp::charge_process(const std::string& what) {
@@ -939,7 +1003,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         for (std::size_t i = 0; i < e->slots.size(); ++i) {
             // A closure's frame may also hold thread-bound handles it never uses (e.g. the std::future of a
             // sibling task). They are not copied; touching one from the new thread raises BorrowError.
-            if (as<Task>(e->slots[i]) || as<Handle>(e->slots[i])) { n->slots[i] = Value(Ref<Obj>(moved_sentinel())); continue; }
+            if (as<Task>(e->slots[i]) || as<Handle>(e->slots[i]) || as<Moved>(e->slots[i])) { n->slots[i] = Value(Ref<Obj>(moved_sentinel())); continue; }
             n->slots[i] = deep_copy(in, e->slots[i], memo);
         }
         if (e->parent) n->parent = as_ref<Env>(deep_copy(in, obj(e->parent), memo));
@@ -949,7 +1013,7 @@ Value deep_copy(Interp& in, const Value& v, std::unordered_map<const Obj*, Value
         auto n = make<Globals>(); memo[o] = obj(n); n->consts = g->consts;
         for (auto& [k, x] : g->vars) {
             // Same rule as closure frames: thread-bound globals (handles, tasks) stay behind.
-            if (as<Task>(x) || as<Handle>(x)) { n->vars[k] = Value(Ref<Obj>(moved_sentinel())); continue; }
+            if (as<Task>(x) || as<Handle>(x) || as<Moved>(x)) { n->vars[k] = Value(Ref<Obj>(moved_sentinel())); continue; }
             n->vars[k] = deep_copy(in, x, memo);
         }
         return obj(n);
