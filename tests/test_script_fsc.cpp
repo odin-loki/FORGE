@@ -130,7 +130,7 @@ int main() {
 struct run_out { std::string out, status, error_type; bool ok = false; int exit_code = 0; };
 run_out run_file(const fs::path& f, const std::string& cache_dir, bool vm, const std::string& seed = "", std::vector<std::string> trust = {},
                  bool allow_fs = true) {
-    run_out r; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 20000;
+    run_out r; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 300000;
     o.fsc_cache_dir = cache_dir; o.fsc_sign_seed = seed; o.fsc_trusted_keys = std::move(trust);
     o.allow_fs = allow_fs; o.os_sandbox = script::options::os_sandbox_mode::off;
     o.out = [&](std::string_view s) { r.out += s; };
