@@ -123,7 +123,8 @@ private:
                 if (ch == '\\') { o += escape(line); continue; }
                 o += ch;
             }
-            return {T::Str, o, line};
+            Tok t{T::Str, o, line}; t.i = o.size() == 1;   // a character literal: a char value
+            return t;
         }
         static const char* ops[] = {"<<=", ">>=", "...", "<=>", "->*", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=", "&&", "||",
                                     "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "::",
@@ -140,7 +141,11 @@ private:
         std::string num;
         if (s_[p_] == '0' && (peek(1) == 'x' || peek(1) == 'X')) { base = 16; p_ += 2; }
         else if (s_[p_] == '0' && (peek(1) == 'b' || peek(1) == 'B')) { base = 2; p_ += 2; }
-        auto digit = [&](char ch) { return base == 16 ? std::isxdigit(static_cast<unsigned char>(ch)) != 0 : base == 2 ? (ch == '0' || ch == '1') : std::isdigit(static_cast<unsigned char>(ch)) != 0; };
+        else if (s_[p_] == '0' && std::isdigit(static_cast<unsigned char>(peek(1)))) {   // 017: octal, unless it turns out to be a float (010.5, 09e1)
+            std::size_t q = p_; while (q < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[q])) || s_[q] == '\'')) ++q;
+            if (q >= s_.size() || (s_[q] != '.' && s_[q] != 'e' && s_[q] != 'E')) base = 8;
+        }
+        auto digit = [&](char ch) { return base == 8 ? (ch >= '0' && ch <= '7') : base == 16 ? std::isxdigit(static_cast<unsigned char>(ch)) != 0 : base == 2 ? (ch == '0' || ch == '1') : std::isdigit(static_cast<unsigned char>(ch)) != 0; };
         for (;;) {
             char ch = peek();
             if (digit(ch)) { num += ch; ++p_; continue; }
@@ -208,6 +213,9 @@ struct TI {
     bool nullable = false;     // std::optional<T>, smart pointers
     int smart = 0;             // 1 shared_ptr, 2 unique_ptr
     bool ref = false, cnst = false, is_static = false;
+    bool is_char = false;      // `char`: a String that converts from int and takes part in arithmetic
+    // implicit conversion applied to a value stored into a variable of this type: 'i' int, 'f' double, 'c' char
+    char conv() const { if (nullable || smart) return 0; return k == TK::Int ? 'i' : k == TK::Float ? 'f' : k == TK::Bool ? 'b' : (k == TK::String && is_char) ? 'c' : 0; }
     std::shared_ptr<TypeAnn> ann() const {
         auto t = std::make_shared<TypeAnn>();
         switch (k) {
@@ -238,6 +246,8 @@ struct FnScope {
     std::string cls;            // enclosing class for member functions
     bool is_static = false;     // static member function: no `this`
     std::shared_ptr<TI> ret;    // declared return type (brace-init returns)
+    std::unordered_map<int, char> kinds;   // slot -> 'i' / 'f' / 'c': locals declared int / double / char (TI::conv)
+    std::unordered_set<int> ptrs;          // slots declared std::optional / shared_ptr / unique_ptr: p.reset() is p = nullptr
     bool limit_stmt = false;    // body of a `limit {...} { }` statement: `return` would only leave the block
 };
 
@@ -426,6 +436,55 @@ private:
         if (is_const) f.consts.insert(name + "#" + std::to_string(slot)); else f.consts.erase(name + "#" + std::to_string(slot));
         return VarRef{name, 0, slot};
     }
+    // ---- declared arithmetic types. C++ converts on every store into an int / double / char variable (`double x = 7;
+    // x = 1;` leaves 1.0, `int i; i = 2.9;` leaves 2, `char c = 'a'; c += 1;` leaves 'b'); values here carry their
+    // own type, so the parser adds the conversion where the stored expression may be of another kind.
+    void set_kind(const VarRef& v, char k) {
+        if (v.global()) { if (k) global_kinds_[v.name] = k; else global_kinds_.erase(v.name); }
+        else if (k) fns_.back().kinds[v.slot] = k;
+    }
+    char kind_of(const VarRef& v) const {
+        if (v.global()) { auto it = global_kinds_.find(v.name); return it == global_kinds_.end() ? 0 : it->second; }
+        if (v.depth < 0 || std::size_t(v.depth) >= fns_.size()) return 0;
+        auto& f = fns_[fns_.size() - 1 - std::size_t(v.depth)];
+        auto it = f.kinds.find(v.slot); return it == f.kinds.end() ? 0 : it->second;
+    }
+    // The kind an expression certainly has: 'i', 'f', 'c', 'b' (bool), or 0 when the parser cannot tell.
+    char static_kind(const NodeP& e) const {
+        switch (e->k) {
+        case NK::Int: return 'i';
+        case NK::Float: return 'f';
+        case NK::True: case NK::False: case NK::And: case NK::Or: return 'b';
+        case NK::Str: return e->flag ? 'c' : 0;
+        case NK::Var: return kind_of(e->var);
+        case NK::Assign: return e->kids[0]->k == NK::Var ? kind_of(e->kids[0]->var) : 0;
+        case NK::Ternary: { char a = static_kind(e->kids[1]), b = static_kind(e->kids[2]); return a == b ? a : 0; }
+        case NK::Unary:
+            if (e->s == "not" || e->s == "bool") return 'b';
+            if (e->s == "int") return 'i'; if (e->s == "float") return 'f'; if (e->s == "char") return 'c';
+            { char a = static_kind(e->kids[0]); return a == 'f' ? 'f' : a ? 'i' : 0; }
+        case NK::Binary: {
+            Op o = Op(e->i);
+            if (o == Op::Eq || o == Op::Ne || o == Op::Lt || o == Op::Le || o == Op::Gt || o == Op::Ge || o == Op::In) return 'b';
+            char a = static_kind(e->kids[0]), b = static_kind(e->kids[1]);
+            if (!a || !b) return 0;
+            return a == 'f' || b == 'f' ? 'f' : 'i';
+        }
+        default: return 0;
+        }
+    }
+    void param_kinds(const std::vector<Param>& ps) {   // the kinds params() recorded for the list just declared
+        for (auto& p : ps) if (auto it = pkinds_.find(p.name); it != pkinds_.end() && it->second) set_kind(VarRef{p.name, 0, p.slot}, it->second);
+        pkinds_.clear();
+    }
+    NodeP convert(char k, NodeP e, int line) {
+        if (!k) return e;
+        char have = static_kind(e);
+        if (have == k) return e;
+        if (k == 'f' && e->k == NK::Int) { auto f = mk(NK::Float, line); f->d = double(e->i); return f; }
+        auto u = mk(NK::Unary, line); u->s = k == 'i' ? "int" : k == 'f' ? "float" : k == 'b' ? "bool" : "char"; u->kids.push_back(std::move(e));
+        return u;
+    }
     VarRef lookup(const std::string& name) const {
         int depth = 0;
         for (auto f = fns_.rbegin(); f != fns_.rend(); ++f, ++depth)
@@ -494,7 +553,7 @@ private:
             "int", "long", "short", "unsigned", "signed", "char", "bool", "double", "float", "size_t", "ptrdiff_t",
             "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t", "uint32_t", "uint64_t", "intptr_t", "uintptr_t",
             "wchar_t", "char8_t", "char16_t", "char32_t", "ssize_t",
-            "std::size_t", "std::ptrdiff_t", "std::int8_t", "std::int16_t", "std::int32_t", "std::int64_t", "std::uint8_t",
+            "std::size_t", "std::ptrdiff_t", "std::string::size_type", "std::string_view::size_type", "std::int8_t", "std::int16_t", "std::int32_t", "std::int64_t", "std::uint8_t",
             "std::uint16_t", "std::uint32_t", "std::uint64_t", "std::intmax_t", "std::uintmax_t",
             "std::string", "std::string_view", "std::vector", "std::array", "std::deque", "std::list", "std::span",
             "std::map", "std::unordered_map", "std::multimap", "std::set", "std::unordered_set", "std::pair", "std::tuple",
@@ -526,7 +585,7 @@ private:
             {"std::invalid_argument", "ValueError"}, {"std::out_of_range", "IndexError"}, {"std::overflow_error", "OverflowError"},
             {"std::range_error", "RangeError"}, {"std::length_error", "LengthError"}, {"std::domain_error", "DomainError"},
             {"std::underflow_error", "UnderflowError"}, {"std::bad_cast", "TypeError"}, {"std::bad_any_cast", "TypeError"},
-            {"std::bad_alloc", "OutOfMemoryError"}, {"std::bad_optional_access", "NullPointerError"}, {"std::system_error", "OSError"},
+            {"std::bad_alloc", "OutOfMemoryError"}, {"std::bad_optional_access", "BadOptionalAccess"}, {"std::system_error", "OSError"},
             {"std::filesystem::filesystem_error", "IOError"}, {"std::ios_base::failure", "IOError"}, {"forge::error", "Error"}};
         if (auto it = m.find(w); it != m.end()) return it->second;
         if (w.rfind("forge::", 0) == 0) return w.substr(7);
@@ -570,7 +629,7 @@ private:
                 {"int", TK::Int}, {"long", TK::Int}, {"short", TK::Int}, {"unsigned", TK::Int}, {"signed", TK::Int}, {"size_t", TK::Int},
                 {"ptrdiff_t", TK::Int}, {"ssize_t", TK::Int}, {"int8_t", TK::Int}, {"int16_t", TK::Int}, {"int32_t", TK::Int}, {"int64_t", TK::Int},
                 {"uint8_t", TK::Int}, {"uint16_t", TK::Int}, {"uint32_t", TK::Int}, {"uint64_t", TK::Int}, {"intptr_t", TK::Int}, {"uintptr_t", TK::Int},
-                {"std::size_t", TK::Int}, {"std::ptrdiff_t", TK::Int}, {"std::int8_t", TK::Int}, {"std::int16_t", TK::Int}, {"std::int32_t", TK::Int},
+                {"std::size_t", TK::Int}, {"std::ptrdiff_t", TK::Int}, {"std::string::size_type", TK::Int}, {"std::string_view::size_type", TK::Int}, {"std::int8_t", TK::Int}, {"std::int16_t", TK::Int}, {"std::int32_t", TK::Int},
                 {"std::int64_t", TK::Int}, {"std::uint8_t", TK::Int}, {"std::uint16_t", TK::Int}, {"std::uint32_t", TK::Int}, {"std::uint64_t", TK::Int},
                 {"std::intmax_t", TK::Int}, {"std::uintmax_t", TK::Int},
                 {"double", TK::Float}, {"float", TK::Float}, {"bool", TK::Bool},
@@ -601,7 +660,8 @@ private:
         }
         while (accept_kw("const") || accept_kw("volatile")) ti.cnst = true;
         // `const char*` is a C string: a string value here (what a literal is, and what what() returns)
-        if (ti.k == TK::String && ti.cnst && c_char && is_op("*")) { take(); while (accept_kw("const")) {} }
+        if (ti.k == TK::String && c_char) ti.is_char = true;
+        if (ti.k == TK::String && ti.cnst && c_char && is_op("*")) { take(); ti.is_char = false; while (accept_kw("const")) {} }
         if (is_op("*")) fail("raw pointers are not allowed in FORGE scripts; use std::shared_ptr / std::unique_ptr or a reference");
         if (accept_op("&")) ti.ref = true; else if (accept_op("&&")) ti.ref = false;
         while (accept_kw("const")) ti.cnst = true;
@@ -712,6 +772,8 @@ private:
     std::vector<NodeP> brace_list() {
         expect_op("{"); std::vector<NodeP> v;
         while (!is_op("}")) {
+            if (is_op(".") && ahead(1).t == T::Ident && ahead_op(2, "="))
+                fail("designated initialisers (." + ahead(1).s + " = ...) are not supported; list the values in member order");
             if (is_op("{")) { auto l = mk(NK::List, cur().line); for (auto& x : brace_list()) l->kids.push_back(x); v.push_back(l); }
             else v.push_back(copy_of(assign_expr()));
             if (!accept_op(",")) break;
@@ -846,7 +908,7 @@ private:
         if (accept_kw("requires")) { while (!is_kw("auto") && !starts_type() && !is_kw("class") && !is_kw("struct")) take(); }
     }
     NodeP expr_stmt(NodeP e, int line) {
-        if (e->k == NK::Assign) return e;
+        if (e->k == NK::Assign || e->k == NK::Let) return e;   // Let: std::tie(a, b) = expr;
         if (e->k == NK::Call && e->kids[0]->k == NK::Var && (e->kids[0]->s == "std::swap" || e->kids[0]->s == "std::ranges::swap") && e->kids.size() == 3) {
             NodeP a = e->kids[1], b = e->kids[2];
             if (!is_lvalue(a) || !is_lvalue(b)) fail_at(line, "std::swap needs two assignable operands");
@@ -911,6 +973,10 @@ private:
                 let->kids.push_back(builtin_call("std::vector", {n, default_value(el, line)}, line)); return let; }
         }
         NodeP init;
+        std::optional<VarRef> early;   // std::function<R(A)> f = [&f](A a) { ... f(a) ... }: recursion through its own name
+        if (ti.k == TK::Fn && is_op("=")) early = declare(name, ti.cnst);
+        if (ti.is_static && !ti.cnst && !fns_.back().top && fns_.back().cls.empty())
+            fail_at(line, "static local variables are not supported (the variable would be initialised on every call); use a global variable");
         if (accept_op("=")) init = initializer(ti, line);
         else if (is_op("{")) init = construct(ti, brace_list(), true, line);
         else if (is_op("(")) init = construct(ti, paren_args(), false, line);
@@ -924,7 +990,14 @@ private:
         let->s = name; let->flag = ti.cnst; let->ref = ti.ref;
         let->kids.push_back(init);
         if (ti.k != TK::Auto && ti.k != TK::Any && ti.k != TK::Fn && ti.k != TK::Class && ti.k != TK::Enum) let->type = ti.ann();
-        let->var = declare(name, ti.cnst);   // declared after the initialiser: `int x = x;` refers to an outer x
+        char kind = ti.k == TK::Auto ? static_kind(init) : ti.conv();
+        if (ti.conv() == 'c' || ti.conv() == 'b') let->kids[0] = convert(ti.conv(), let->kids[0], line);   // char c = 'a' + 1; bool b = n;
+        let->var = early ? *early : declare(name, ti.cnst);   // declared after the initialiser: `int x = x;` refers to an outer x
+        set_kind(let->var, kind);
+        const Node* src = init.get();
+        while (src && (src->k == NK::Copy || src->k == NK::Move) && !src->kids.empty()) src = src->kids[0].get();   // auto q = p; auto q = std::move(p);
+        bool ptr = ti.smart || ti.nullable || (ti.k == TK::Auto && src && ((src->k == NK::Call && src->kids[0]->k == NK::Var && src->kids[0]->s == "forge::__own") || (src->k == NK::Var && is_ptr_var(src->var))));
+        if (ptr) { if (let->var.global()) global_ptrs_.insert(let->var.name); else fns_.back().ptrs.insert(let->var.slot); }
         return let;
     }
     NodeP structured_binding(const TI& ti, int line) {
@@ -960,6 +1033,7 @@ private:
             p.name = at(T::Ident) ? take().s : "_" + std::to_string(ps.size());
             while (accept_op("[")) { if (!is_op("]")) expr(); expect_op("]"); ti = TI{TK::List}; ti.ref = true; }
             if (!ti.ref && (ti.k == TK::Int || ti.k == TK::Float)) p.conv = ti.k == TK::Int ? 'i' : 'f';
+            pkinds_[p.name] = ti.conv();
             p.by_ref = ti.ref;   // const T& binds without copying (const-ness is not enforced at run time)
             p.out = ti.ref && !ti.cnst;
             if (ti.k != TK::Auto && ti.k != TK::Any && ti.k != TK::Fn && ti.k != TK::Class && ti.k != TK::Enum && ti.k != TK::Float && ti.k != TK::Int) p.type = ti.ann();
@@ -995,6 +1069,7 @@ private:
         if (!cls.empty() && !is_static) { fd->is_method = true; declare("self", false); }
         std::vector<Param> ps = pre_params ? std::move(*pre_params) : params();
         for (auto& p : ps) { if (p.name == "...") { p.name = "__va"; } p.slot = declare(p.name, false).slot; }
+        param_kinds(ps);
         fd->params = std::move(ps);
         TI r = ret; bool cq = false;
         fn_qualifiers(&r, &cq);
@@ -1026,12 +1101,15 @@ private:
         if (fns_.back().limit_stmt) fail_at(line, "'return' inside a limit block statement would only leave the block; write `auto r = limit {...} { return x; };` to get a value out");
         if (accept_op(";")) return n;
         std::shared_ptr<TI> fret = fns_.back().ret;   // copy: parsing a lambda below may grow fns_
-        if (is_op("{")) {
+        if (is_op("{") && ahead_op(1, "}") && fret && fret->nullable) {   // return {}; from a std::optional / smart pointer function: empty
+            take(); take(); n->kids.push_back(mk(NK::Nil, line));
+        } else if (is_op("{")) {
             if (!fret) fail_at(line, "brace-initialised return needs a declared return type");
             n->kids.push_back(construct(*fret, brace_list(), true, line));
         } else {
             NodeP e = expr();
             if (fret && fret->k == TK::Float && e->k == NK::Int) { auto d = mk(NK::Float, line); d->d = double(e->i); e = d; }
+            if (fret && !fret->ref && fret->conv() && fret->conv() != 'b' && e->k != NK::Nil) e = convert(fret->conv(), e, line);   // int f() { return 2.7; } returns 2
             if (fret && fret->k == TK::Weak) e = builtin_call("forge::__weak", {e}, line);
             n->kids.push_back(e->k == NK::Var && !e->var.global() ? e : copy_of(e));   // returning a local moves it (NRVO)
         }
@@ -1088,7 +1166,19 @@ private:
             if (t.t == T::Op) {
                 if (t.s == "(" || t.s == "[" || t.s == "{") ++depth;
                 else if (t.s == ")" || t.s == "]" || t.s == "}") { if (depth == 0) return false; --depth; }
-                else if (depth == 0 && t.s == ";") return false;
+                else if (depth == 0 && t.s == ";") {   // for (init; T x : range): C++20, not supported; say so instead of a stray ';' error
+                    int d2 = 0;
+                    for (std::size_t j = k + 1; j < t_.size(); ++j) {
+                        const Tok& u = t_[j];
+                        if (u.t != T::Op) continue;
+                        if (u.s == "(" || u.s == "[" || u.s == "{") ++d2;
+                        else if (u.s == ")" || u.s == "]" || u.s == "}") { if (d2 == 0) break; --d2; }
+                        else if (d2 == 0 && u.s == ";") break;
+                        else if (d2 == 0 && u.s == ":") fail_at(u.line, "a range-for with an init-statement (for (init; x : range)) is not supported; declare the variable before the loop");
+                        else if (d2 == 0 && u.s == "?") break;
+                    }
+                    return false;
+                }
                 else if (depth == 0 && t.s == ":") return true;
             }
         }
@@ -1143,6 +1233,11 @@ private:
         expect_op("(");
         auto outer = mk(NK::Block, line);
         BlockGuard g(*this, &outer->locals);
+        if (auto ti = try_decl_type()) {   // switch (init; value)
+            std::string name = ident();
+            outer->kids.push_back(declarator(*ti, name, line)); flush_extra(*outer);
+            expect_op(";");
+        }
         NodeP subj = expr();
         expect_op(")");
         VarRef sv = hidden("switch", line), st = hidden("case", line);
@@ -1212,7 +1307,7 @@ private:
         case TK::Int: case TK::Enum: return "<int>";
         case TK::Float: return "<float>";
         case TK::Bool: return "<bool>";
-        case TK::String: return "<string>";
+        case TK::String: return ti.is_char ? "<char>" : "<string>";
         case TK::List: case TK::Pair: return "<list>";
         case TK::Map: case TK::Set: return "<map>";
         case TK::Auto: fail("catch (auto) is not C++: write catch (...) or name the exception type");
@@ -1318,6 +1413,12 @@ private:
             skip_attributes();
             if (accept_op(";")) continue;
             if ((is_kw("public") || is_kw("private") || is_kw("protected")) && ahead_op(1, ":")) { access = take().s; take(); continue; }
+            if (is_kw("using") && ahead(1).t == T::Ident && ahead_op(2, ";")) {   // using Base::Base; constructors are inherited anyway
+                const std::string& q = ahead(1).s; auto p2 = q.rfind("::");
+                auto p1 = p2 == std::string::npos || p2 == 0 ? std::string::npos : q.rfind("::", p2 - 1);
+                std::string last = p2 == std::string::npos ? q : q.substr(p2 + 2), prev = p2 == std::string::npos ? "" : q.substr(p1 == std::string::npos ? 0 : p1 + 2, p2 - (p1 == std::string::npos ? 0 : p1 + 2));
+                if (last == prev) { take(); take(); take(); continue; }   // (as a statement it would alias Base to Base::Base)
+            }
             if (is_kw("using") || is_kw("typedef")) { auto s = statement(); (void)s; continue; }
             if (accept_kw("friend")) {
                 if (is_kw("class") || is_kw("struct")) { while (!accept_op(";")) take(); continue; }
@@ -1438,6 +1539,7 @@ private:
         declare("self", false);
         auto ps = params();
         for (auto& p : ps) { if (p.name == "...") p.name = "__va"; p.slot = declare(p.name, false).slot; }
+        param_kinds(ps);
         fd->params = std::move(ps);
         fn_qualifiers(nullptr);
         std::vector<NodeP> inits;
@@ -1513,6 +1615,7 @@ private:
         std::string name = at(T::Ident) ? take().s : "<enum" + std::to_string(line) + ">";
         if (accept_op(":")) parse_type();
         if (accept_op(";")) return nullptr;
+        if (scoped && !top_level_global()) fail_at(line, "an enum class declared inside a function is not supported; declare '" + name + "' at file or namespace scope");
         enums_.insert(name); types_.insert(name);
         expect_op("{");
         auto m = mk(NK::Map, line);
@@ -1571,8 +1674,42 @@ private:
 
     // ---------------------------------------------------------------- expressions
     NodeP expr() { return assign_expr(); }
-    void no_assign(const NodeP& e) const {
-        if (e && e->k == NK::Assign) fail_at(e->line, "assignment / increment used as a value is not supported; make it a separate statement");
+    // Assignments and ++ / -- are expressions, as in C++ (`f(i++)`, `while (--n > 0)`, `a = b = c`): an Assign node in
+    // expression position is evaluated by Interp::assign_value.
+    void no_assign(const NodeP&) const {}
+    // No side effects and cheap: may be evaluated twice when a target is rewritten (v.back() += 1).
+    static bool pure(const NodeP& e) { return e->k == NK::Var || e->k == NK::Self || (e->k == NK::Field && pure(e->kids[0])); }
+    // C++ expressions that yield a reference to an element and so may be assigned to: v.at(i), v.front(), v.back(),
+    // std::get<N>(t). They become the Index node the runtime assigns through (bounds-checked like at()).
+    NodeP as_target(NodeP e, int line) {
+        if (is_lvalue(e) || e->k != NK::Call || e->kids.empty()) return e;
+        const NodeP& f = e->kids[0];
+        auto index = [&](NodeP c, NodeP i) { auto n = mk(NK::Index, line); n->kids = {std::move(c), std::move(i)}; return NodeP(n); };
+        if (f->k == NK::Field && f->s == "at" && e->kids.size() == 2) return index(f->kids[0], e->kids[1]);
+        if (f->k == NK::Field && (f->s == "front" || f->s == "back") && e->kids.size() == 1) {
+            if (!pure(f->kids[0])) fail_at(line, "assigning through ." + f->s + "() of a computed container is not supported; name the container first");
+            if (f->s == "front") return index(f->kids[0], int_node(0, line));
+            auto sz = mk(NK::Field, line); sz->s = "size"; sz->kids = {f->kids[0]};
+            auto last = mk(NK::Binary, line); last->s = "-"; last->i = std::int64_t(Op::Sub); last->kids = {call_node(sz, {}, line), int_node(1, line)};
+            return index(f->kids[0], last);
+        }
+        if (f->k == NK::Var && f->s == "forge::__get" && e->kids.size() == 3) return index(e->kids[1], e->kids[2]);
+        return e;
+    }
+    static bool is_deref(const NodeP& e) { return e->k == NK::Call && e->kids.size() == 2 && e->kids[0]->k == NK::Var && e->kids[0]->s == "forge::__deref"; }
+    // *it = v, *it += v, ++*it: written through the iterator (or shared_ptr<int> box) by forge::__deref_set.
+    NodeP deref_assign(const NodeP& target, const std::string& o, NodeP rhs, int line) {
+        NodeP it = target->kids[1];
+        if (o != "=") {
+            if (!pure(it)) fail_at(line, "'" + o + "' through a computed iterator is not supported; name the iterator first");
+            auto b = mk(NK::Binary, line); b->s = o.substr(0, o.size() - 1); b->i = std::int64_t(op_of(o)); b->kids = {target, rhs};
+            rhs = b;
+        }
+        return builtin_call("forge::__deref_set", {it, rhs}, line);
+    }
+    [[noreturn]] void not_assignable(const NodeP& e, const std::string& o, int line) const {
+        if (e->k == NK::Call) fail_at(line, "left side of '" + o + "' is a function call: assigning through a returned reference is not supported (only v.at(i), v.front(), v.back(), std::get<N>(t) and *it are)");
+        fail_at(line, "left side of '" + o + "' is not assignable");
     }
     NodeP assign_expr() {
         int line = cur().line;
@@ -1581,19 +1718,47 @@ private:
         for (const char* o : aops) {
             if (is_op(o)) {
                 take();
-                if (!is_lvalue(lhs)) fail_at(line, "left side of '" + std::string(o) + "' is not assignable");
+                if (std::string(o) == "=" && lhs->k == NK::List && lhs->s == "tie") {   // std::tie(a, b) = expr;  (a statement)
+                    VarRef tmp = hidden("tie", line);
+                    auto let = mk(NK::Let, line); let->var = tmp; let->s = tmp.name; let->kids.push_back(assign_expr());
+                    for (std::size_t k = 0; k < lhs->kids.size(); ++k) {
+                        if (lhs->kids[k]->k == NK::Var && lhs->kids[k]->s == "std::ignore") continue;
+                        if (!is_lvalue(lhs->kids[k])) fail_at(line, "std::tie needs assignable operands");
+                        auto a = mk(NK::Assign, line); a->s = "="; a->i = std::int64_t(Op::None);
+                        a->kids = {lhs->kids[k], builtin_call("forge::__get", {hidden_ref(tmp, line), int_node(std::int64_t(k), line)}, line)};
+                        typed_store(*a, line);
+                        extra_.push_back(a);
+                    }
+                    return let;
+                }
+                lhs = as_target(lhs, line);
+                if (is_deref(lhs)) return deref_assign(lhs, o, assign_expr(), line);
+                if (!is_lvalue(lhs)) not_assignable(lhs, o, line);
                 check_assignable(lhs, line);
                 NodeP rhs;
                 if (is_op("{")) { auto l = mk(NK::List, line); for (auto& x : brace_list()) l->kids.push_back(x); rhs = l; }
                 else rhs = assign_expr();
-                no_assign(rhs);
                 auto a = mk(NK::Assign, line); a->s = o;
                 a->i = std::int64_t(std::string(o) == "=" ? Op::None : op_of(o));
                 a->kids = {lhs, std::string(o) == "=" ? copy_of(rhs) : rhs};
+                typed_store(*a, line);
                 return a;
             }
         }
         return lhs;
+    }
+    // Store into a variable declared int / double / char: keep the variable's type (see set_kind). A compound
+    // assignment whose result may be of another kind becomes `x = (T)(x op y)`.
+    void typed_store(Node& a, int line) {
+        if (a.kids[0]->k != NK::Var) return;
+        char k = kind_of(a.kids[0]->var);
+        if (!k) return;
+        Op op = Op(a.i);
+        if (op == Op::None) { a.kids[1] = convert(k, a.kids[1], line); return; }
+        char r = static_kind(a.kids[1]);
+        if (k == 'f' || (k == 'i' && r && r != 'f')) return;   // double op x is a double; int op int is an int
+        auto b = mk(NK::Binary, line); b->s = op_name(op); b->i = a.i; b->kids = {a.kids[0], a.kids[1]};
+        a.kids[1] = convert(k, b, line); a.i = std::int64_t(Op::None); a.s = "=";
     }
     void check_assignable(const NodeP& t, int line) const {
         if (t->k == NK::Var && is_const_var(t->var)) fail_at(line, "cannot assign to const '" + t->s + "'");
@@ -1630,11 +1795,15 @@ private:
         }
         return lhs;
     }
-    NodeP incdec(NodeP target, const std::string& o, int line) {
-        if (!is_lvalue(target)) fail_at(line, "operand of " + o + " is not assignable");
+    NodeP incdec(NodeP target, const std::string& o, int line, bool postfix = false) {
+        target = as_target(target, line);
+        if (is_deref(target)) return deref_assign(target, o == "++" ? "+=" : "-=", int_node(1, line), line);
+        if (!is_lvalue(target)) not_assignable(target, o, line);
         check_assignable(target, line);
         auto a = mk(NK::Assign, line); a->s = o == "++" ? "+=" : "-="; a->i = std::int64_t(o == "++" ? Op::Add : Op::Sub);
         a->kids = {target, int_node(1, line)};
+        a->flag = postfix;   // as a value: the old value
+        typed_store(*a, line);
         return a;
     }
     NodeP unary() {
@@ -1663,7 +1832,12 @@ private:
     NodeP postfix(NodeP e) {
         for (;;) {
             int line = cur().line;
-            if (is_op("(")) { auto args = paren_args(); e = call_node(e, args, line); continue; }
+            if (is_op("(")) {
+                auto args = paren_args();
+                // p.reset() on a std::optional / smart pointer variable empties the variable
+                if (args.empty() && e->k == NK::Field && e->s == "reset" && e->kids[0]->k == NK::Var && is_ptr_var(e->kids[0]->var)) { e = assign_node(e->kids[0], mk(NK::Nil, line), line); continue; }
+                e = call_node(e, args, line); continue;
+            }
             if (accept_op("[")) { auto i = expr(); expect_op("]"); auto n = mk(NK::Index, line); n->kids = {deref_target(e), i}; e = n; continue; }
             if (accept_op(".") || accept_op("->")) {
                 accept_kw("template");
@@ -1674,7 +1848,7 @@ private:
                 auto n = mk(NK::Field, line); n->s = m; n->kids.push_back(deref_target(e));
                 e = n; continue;
             }
-            if (is_op("++") || is_op("--")) { std::string o = take().s; e = incdec(e, o, line); continue; }
+            if (is_op("++") || is_op("--")) { std::string o = take().s; e = incdec(e, o, line, true); continue; }
             break;
         }
         return e;
@@ -1708,10 +1882,13 @@ private:
         case T::Int: { take(); return int_node(t.i, line); }
         case T::Float: { take(); auto n = mk(NK::Float, line); n->d = t.d; return n; }
         case T::Str: {
+            bool chr = cur().i == 1;
             std::string s = take().s;
-            while (at(T::Str)) s += take().s;   // adjacent literals concatenate
-            if (at(T::Ident) && (cur().s == "s" || cur().s == "sv")) take();   // "..."s
-            return str_node(s, line);
+            while (at(T::Str)) { s += take().s; chr = false; }   // adjacent literals concatenate
+            if (at(T::Ident) && (cur().s == "s" || cur().s == "sv")) { take(); chr = false; }   // "..."s
+            auto n = str_node(s, line);
+            if (chr) { auto c = std::make_shared<Node>(*n); c->flag = true; return c; }
+            return n;
         }
         case T::End: fail("unexpected end of input");
         default: break;
@@ -1720,7 +1897,15 @@ private:
         if (accept_kw("false")) return mk(NK::False, line);
         if (accept_kw("nullptr")) return mk(NK::Nil, line);
         if (accept_kw("this")) return self_node(line);
-        if (is_op("(")) { take(); auto e = expr(); expect_op(")"); return e; }
+        if (is_op("(")) {
+            take(); auto e = expr();
+            if (is_op(",")) {   // comma operator: every operand is evaluated in order, the value is the last one
+                std::vector<NodeP> seq{e};
+                while (accept_op(",")) seq.push_back(expr());
+                e = builtin_call("forge::__comma", seq, line);
+            }
+            expect_op(")"); return e;
+        }
         if (is_op("[")) return lambda();
         if (is_op("{")) { auto l = mk(NK::List, line); for (auto& x : brace_list()) l->kids.push_back(x); return l; }
         if (is_kw("static_cast") || is_kw("dynamic_cast")) {
@@ -1766,6 +1951,9 @@ private:
             if (!targs || targs->size() != 1 || args.size() != 1) fail_at(line, "bad " + w);
             const TI& ti = (*targs)[0];
             return builtin_call("forge::__downcast", {ti.k == TK::Class ? var_node(ti.name, line) : NodeP(mk(NK::Nil, line)), args[0]}, line);
+        }
+        if (w == "std::tie") {   // references to its operands: assignable (assign_expr), comparable
+            auto args = paren_args(); auto l = mk(NK::List, line); l->s = "tie"; for (auto& a : args) l->kids.push_back(a); return l;
         }
         if (w == "std::make_pair" || w == "std::make_tuple" || w == "std::tie" || w == "std::forward_as_tuple") {
             auto args = paren_args(); auto l = mk(NK::List, line); for (auto& a : args) l->kids.push_back(copy_of(a)); return l;
@@ -1844,7 +2032,7 @@ private:
         case TK::Int: case TK::Enum: return builtin_call("forge::__cast", {str_node("int", line), e}, line);
         case TK::Float: return builtin_call("forge::__cast", {str_node("float", line), e}, line);
         case TK::Bool: return builtin_call("forge::__cast", {str_node("bool", line), e}, line);
-        case TK::String: return builtin_call("forge::__cast", {str_node("string", line), e}, line);
+        case TK::String: return builtin_call("forge::__cast", {str_node(ti.is_char ? "char" : "string", line), e}, line);
         default: return e;
         }
     }
@@ -1918,10 +2106,12 @@ private:
         int line = cur().line;
         expect_op("[");
         std::vector<std::pair<std::string, NodeP>> copies;   // by-value captures: name, initial value
+        bool copy_default = false; std::unordered_set<std::string> by_ref;
         while (!is_op("]")) {
-            if (accept_op("=") || accept_kw("this")) {}
+            if (accept_op("=")) copy_default = true;
+            else if (accept_kw("this")) {}
             else if (is_op("*") && ahead(1).t == T::Kw && ahead(1).s == "this") { take(); take(); }
-            else if (accept_op("&")) { if (at(T::Ident)) { std::string n = take().s; if (accept_op("=")) fail_at(line, "reference init-captures are not supported"); (void)n; } }
+            else if (accept_op("&")) { if (at(T::Ident)) { std::string n = take().s; if (accept_op("=")) fail_at(line, "reference init-captures are not supported"); by_ref.insert(n); } }
             else {
                 std::string n = ident();
                 accept_op("...");
@@ -1932,6 +2122,31 @@ private:
             if (!accept_op(",")) break;
         }
         expect_op("]");
+        if (copy_default) {
+            // [=] captures by copy when the lambda is created: every local of the enclosing functions that the
+            // lambda's tokens name is copied now (a name the body re-declares costs one unused copy). Without this
+            // the lambda saw later changes to the variable, which [=] must not.
+            std::unordered_set<std::string> have;
+            for (auto& c : copies) have.insert(c.first);
+            std::size_t open = i_; int par = 0;
+            for (; open < t_.size(); ++open) {
+                const Tok& t = t_[open];
+                if (t.t == T::End) break;
+                if (t.t != T::Op) continue;
+                if (t.s == "(" || t.s == "[") ++par; else if (t.s == ")" || t.s == "]") --par;
+                else if (par == 0 && (t.s == "{" || t.s == ";")) break;
+            }
+            int depth = 0;
+            for (std::size_t j = i_; j < t_.size() && t_[j].t != T::End; ++j) {
+                const Tok& t = t_[j];
+                if (j >= open && t.t == T::Op) { if (t.s == "{") ++depth; else if (t.s == "}" && --depth <= 0) break; else if (depth == 0 && t.s == ";") break; }
+                if (t.t != T::Ident || t.s.find("::") != std::string::npos) continue;
+                if (j > 0 && t_[j - 1].t == T::Op && (t_[j - 1].s == "." || t_[j - 1].s == "->")) continue;
+                if (have.count(t.s) || by_ref.count(t.s) || !is_local(t.s)) continue;
+                have.insert(t.s);
+                copies.emplace_back(t.s, copy_of(var_node(t.s, line)));
+            }
+        }
         std::size_t sb = cur().off;   // source after the capture list (forge::remote_call re-captures by name)
         if (is_op("<")) template_params();
         // copy captures: an immediately-invoked outer function binds the copies, the lambda closes over them
@@ -1948,6 +2163,7 @@ private:
         if (is_op("(")) {
             auto ps = params();
             for (auto& p : ps) { if (p.name == "...") p.name = "__va"; p.slot = declare(p.name, false).slot; }
+            param_kinds(ps);
             fd->params = std::move(ps);
         }
         TI r; r.k = TK::Auto;
@@ -1989,6 +2205,13 @@ private:
     std::string ns_;
     std::unordered_set<std::string> types_, enums_, tparams_, declared_globals_;
     std::unordered_map<std::string, TI> typedefs_;
+    std::unordered_map<std::string, char> global_kinds_, pkinds_;
+    std::unordered_set<std::string> global_ptrs_;
+    bool is_ptr_var(const VarRef& v) const {
+        if (v.global()) return global_ptrs_.count(v.name) > 0;
+        if (v.depth < 0 || std::size_t(v.depth) >= fns_.size()) return false;
+        return fns_[fns_.size() - 1 - std::size_t(v.depth)].ptrs.count(v.slot) > 0;
+    }
     std::unordered_map<std::string, std::string> aliases_, aliases_ns_;
     std::unordered_map<std::string, std::set<std::string>> ns_members_;
     std::vector<std::string> using_ns_;

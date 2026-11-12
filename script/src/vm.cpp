@@ -159,12 +159,12 @@ private:
         case NK::False: emit(Opc::False); return;
         case NK::Int: emit(Opc::Const, konst(n.i)); return;
         case NK::Float: emit(Opc::Const, konst(n.d)); return;
-        case NK::Str: { auto s = make<String>(n.s); s->frozen = true; emit(Opc::Const, konst(obj(s))); return; }
+        case NK::Str: { auto s = make<String>(n.s); s->frozen = true; s->ch = n.flag; emit(Opc::Const, konst(obj(s))); return; }
         case NK::Interp: for (auto& k : n.kids) expr(*k); emit(Opc::Interp, int(n.kids.size())); return;
         case NK::Var: load(n.var, line); return;
         case NK::List: for (auto& k : n.kids) expr(*k); emit(Opc::MakeList, int(n.kids.size())); return;
         case NK::Map: for (auto& k : n.kids) expr(*k); emit(Opc::MakeMap, int(n.kids.size() / 2)); return;
-        case NK::Unary: expr(*n.kids[0]); emit(Opc::Unary, n.s == "not" ? 1 : n.s == "~" ? 3 : n.s == "bool" ? 2 : 0); return;
+        case NK::Unary: expr(*n.kids[0]); emit(Opc::Unary, n.s == "not" ? 1 : n.s == "~" ? 3 : n.s == "bool" ? 2 : n.s == "int" ? 4 : n.s == "float" ? 5 : n.s == "char" ? 6 : 0); return;
         case NK::Ternary: {
             expr(*n.kids[0]); int jf = emit(Opc::JumpIfFalse);
             expr(*n.kids[1]); int je = emit(Opc::Jump); patch(jf, here());
@@ -335,7 +335,7 @@ Value vm_run(Interp& in, const Chunk& c, const Ref<Env>& env) {
         const Instr& i = c.code[pc];
         ++pc;
         switch (i.op) {
-        case Opc::Const: { const Value& k = c.consts[std::size_t(i.a)]; if (auto* ks = as<String>(k)) st.push_back(in.new_string(ks->s)); else st.push_back(k); break; }
+        case Opc::Const: { const Value& k = c.consts[std::size_t(i.a)]; if (auto* ks = as<String>(k)) { st.push_back(in.new_string(ks->s)); as<String>(st.back())->ch = ks->ch; } else st.push_back(k); break; }
         case Opc::Nil: st.emplace_back(Nil{}); break;
         case Opc::True: st.emplace_back(true); break;
         case Opc::False: st.emplace_back(false); break;
@@ -358,7 +358,7 @@ Value vm_run(Interp& in, const Chunk& c, const Ref<Env>& env) {
         case Opc::DefineGlobal: in.store(VarRef{c.names[std::size_t(i.a)], -1, -1}, env, pop(), true, false); break;
         case Opc::DefineConst: in.store(VarRef{c.names[std::size_t(i.a)], -1, -1}, env, pop(), true, true); break;
         case Opc::Binary: { Value b = pop(); Value a = pop(); in.line = c.lines[pc - 1]; st.push_back(in.binary(Op(i.a), a, b)); break; }
-        case Opc::Unary: { Value a = pop(); st.push_back(i.a == 2 ? Value(Interp::truthy(a)) : in.unary(i.a == 1 ? "not" : i.a == 3 ? "~" : "-", a)); break; }
+        case Opc::Unary: { Value a = pop(); st.push_back(i.a == 2 ? Value(Interp::truthy(a)) : in.unary(i.a == 1 ? "not" : i.a == 3 ? "~" : i.a == 4 ? "int" : i.a == 5 ? "float" : i.a == 6 ? "char" : "-", a)); break; }
         case Opc::Jump: pc = std::size_t(i.a); break;
         case Opc::JumpIfFalse: { Value v = pop(); if (!Interp::truthy(v)) pc = std::size_t(i.a); break; }
         case Opc::JumpIfFalseKeep: if (!Interp::truthy(st.back())) pc = std::size_t(i.a); else st.pop_back(); break;

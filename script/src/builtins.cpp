@@ -389,7 +389,7 @@ void install_builtins(Shared& sh) {
     for (auto n : {"IOError", "OSError", "OverflowError", "UnderflowError", "RangeError"}) mkclass(n, runtime);
     for (auto n : {"TypeError", "KeyError",
                    "ObjectDisposedError", "ShellError", "LimitExceededError", "NameError",
-                   "AttributeError", "ArithmeticError", "SyntaxError", "ImportError", "HostError",
+                   "AttributeError", "ArithmeticError", "SyntaxError", "ImportError", "HostError", "BadOptionalAccess",
                    "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit", "RaceError", "PipelineError", "PluginError", "AIError", "AccessError"})
         mkclass(n, err);
     // As in Python, OS-level conditions are OSError subclasses: catch (const OSError& e) gets all of them.

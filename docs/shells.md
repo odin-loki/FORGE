@@ -54,5 +54,10 @@ that it is false for powershell and cmd. Off Windows, `powershell` falls back to
 - ctest adds `FORGE_TEST_SHELL_PATH` (CMake cache variable; default `../opt/shells/bin` when that directory exists)
   to `PATH`, so shells installed outside the system paths are found.
 
+Versions: the emitted elvish script needs elvish 0.20 or newer (the `os`, `path` and `str` modules; it carries its
+own `mkdir -p`, since `os:mkdir-all` only arrived in 0.21). Checked against elvish 0.20.1 (Ubuntu 24.04). xonsh
+0.14 on Python 3.12+ prints its own parser's DeprecationWarnings to stderr when it first compiles a script; the
+emitted script's stdout is unaffected.
+
 Which shells a given machine or CI job actually has installed decides which of these run; the `tested` flag says
 that the backend is expected to pass where the shell exists.

@@ -475,6 +475,49 @@ TEST(catch_clause_types) {
     EXPECT("int f(int x) try { if (x > 1) throw std::invalid_argument(\"big\"); return x; } catch (const std::invalid_argument& e) { return -1; }\nstd::println(\"{} {}\", f(1), f(5));", "1 -1\n");
 }
 
+// Holes found by the conformance sweep (tests/script_conformance compares whole programs with the host compiler; these
+// are the same points without needing one).
+TEST(cpp_conformance_holes) {
+    // assignment and ++ / -- are expressions
+    EXPECT("int twice(int x) { return 2 * x; }\nint n = 1;\nstd::println(\"{} {}\", twice(n++), n);\nstd::println(\"{} {}\", twice(++n), n);", "2 2\n6 3\n");
+    EXPECT("std::vector<int> v{10, 20, 30}; int p = 0;\nstd::print(\"{} \", v[p++]); std::print(\"{} \", v[p++]); v[p]++; ++v[0];\nstd::println(\"{} {} {}\", p, v[0], v[2]);", "10 20 2 11 31\n");
+    EXPECT("int c = 0; while (c++ < 3) std::print(\"{} \", c);\nint a, b; a = b = 7; int d = (a += 2) * 2;\nstd::println(\"| {} {} {} {}\", c, a, b, d);", "1 2 3 | 4 9 7 18\n");
+    EXPECT("int k = 5; int old = k--; int now = --k; int m = (1, 2, k + 1);\nstd::println(\"{} {} {} {}\", old, now, k, m);", "5 3 3 4\n");
+    // element references as assignment targets
+    EXPECT("std::vector<int> v{1, 2, 3}; v.at(1) = 20; v.front() += 5; v.back()--;\nauto it = v.begin(); *it = 9; ++*it;\nstd::tuple<int, std::string> t{1, \"a\"}; std::get<0>(t) = 4;\nint x = 0, y = 0; std::tie(x, y) = std::make_pair(7, 8);\nstd::println(\"{} {} {} {} {} {}\", v[0], v[1], v[2], std::get<0>(t), x, y);", "10 20 2 4 7 8\n");
+    EXPECT("std::map<std::string, int> m{{\"a\", 1}}; auto it = m.find(\"a\"); it->second *= 5; std::println(\"{}\", m[\"a\"]);", "5\n");
+    EXPECT("struct M { int at(int i) const { return i; } };\nM m; m.at(1, 2) = 3;", "!SyntaxError");
+    // a variable keeps its declared arithmetic type
+    EXPECT("double x = 7; x = 1; int i = 3; i = 7.9; i += 1.5; double d = 1; d += 1;\nstd::println(\"{} {} {}\", x / 2, i, d / 4);", "0.5 8 0.5\n");
+    EXPECT("int g() { return 2.7; }\ndouble h() { return 1; }\nbool b = 5; int t = b + b;\nstd::println(\"{} {} {} {}\", g(), h() / 2, b, t);", "2 0.5 true 2\n");
+    // char is a character and a small integer
+    EXPECT("char c = 'a'; char n = c + 1; c++; int d = '7' - '0';\nstd::println(\"{} {} {} {} {}\", n, c, d, 'A' + 0, static_cast<char>('A' + 25));", "b b 7 65 Z\n");
+    EXPECT("int s = 0; for (char ch : std::string(\"1234\")) s += ch - '0';\nstd::string w = \"ab\"; w += 'c'; w.push_back(static_cast<char>(w[0] + 3));\nstd::println(\"{} {} {}\", s, w, w[1] == 'b');", "10 abcd true\n");
+    EXPECT("try { throw 'x'; } catch (int) { std::println(\"int\"); } catch (const std::string&) { std::println(\"string\"); } catch (char c) { std::println(\"char {}\", c); }", "char x\n");
+    // members that were missing
+    EXPECT("#include <deque>\nstd::deque<int> d{2}; d.push_front(1); d.emplace_front(0); d.push_back(3); d.pop_front();\nstd::println(\"{} {} {}\", d.front(), d.back(), d.size());", "1 3 3\n");
+    EXPECT("std::string s = \"abcdef\"; s.resize(3); std::string t = s; t.resize(5, '.'); s.assign(2, 'z'); t.insert(0, 2, '>');\nstd::println(\"{} {} {} {}\", s, t, t.find_last_not_of(\".\"), std::string(t, 2, 3));", "zz >>abc.. 4 abc\n");
+    EXPECT("std::vector<int> v{5, 3, 8, 3}; std::vector<int> w(v.begin() + 1, v.end());\nv.erase(std::remove(v.begin(), v.end(), 3), v.end()); w.insert(w.begin(), 2, 0); w.assign({1, 2});\nstd::sort(v.begin(), v.end(), std::greater<int>());\nstd::println(\"{} {} {} {}\", v, w, std::lower_bound(w.begin(), w.end(), 2) - w.begin(), std::gcd(12, 18));", "[8, 5] [1, 2] 1 6\n");
+    EXPECT("std::set<int> s{5, 1}; auto [it, fresh] = s.insert(3); std::map<int, int> m; m[5] = 1; m[2] = 2;\nstd::println(\"{} {} {} {}\", *it, fresh, m.begin()->first, *s.lower_bound(2));", "3 true 2 3\n");
+    EXPECT("std::println(\"[{:{}}] [{:.{}f}]\", 7, 4, 3.14159, 2);\nstd::cout << std::left << std::setw(4) << 42 << '|' << std::right << std::setfill('0') << std::setw(5) << 42 << '|' << std::hex << 255 << '\\n';", "[   7] [3.14]\n42  |00042|ff\n");
+    // [=] copies when the lambda is created; a std::function may call itself; std::optional functions may return {}
+    EXPECT("int main() { int base = 10; auto f = [=] { return base * 2; }; auto g = [&] { return base * 2; }; base = 20; std::println(\"{} {}\", f(), g()); return 0; }", "20 40\n");
+    EXPECT("std::function<int(int)> fact = [&fact](int n) { return n <= 1 ? 1 : n * fact(n - 1); };\nstd::optional<std::string> none() { return {}; }\nstd::println(\"{} {}\", fact(5), none().value_or(\"empty\"));", "120 empty\n");
+    EXPECT("struct P { int v; std::shared_ptr<P> next; };\nauto a = std::make_shared<P>(P{1, nullptr}); auto b = std::make_shared<P>(P{2, a}); auto c = b; c.reset();\nstd::println(\"{} {}\", b->next->v, c == nullptr);", "1 true\n");
+    EXPECT("struct V { int major = 0, minor = 0; auto operator<=>(const V&) const = default; };\nV a{1, 2}, b{1, 10}; std::pair<int, int> p{1, 2}, q{1, 3};\nstd::println(\"{} {} {} {}\", a < b, a >= b, p < q, std::vector<int>{1, 2} < std::vector<int>{1, 3});", "true false true true\n");
+    EXPECT("std::println(\"{} {} {}\", 017, true + true, std::isdigit('7') != 0);", "15 2 true\n");
+    // constructs outside the subset say what they are
+    for (auto [src, word] : std::vector<std::pair<const char*, const char*>>{
+             {"struct C { int a; int b; }; C c{.a = 1, .b = 2};", "designated"},
+             {"int f() { static int n = 0; return ++n; }", "static local"},
+             {"void f() { enum class E { a, b }; }", "enum class"},
+             {"std::vector<int> v{1}; for (int base = 1; int x : v) {}", "range-for with an init"},
+             {"int x = 1; auto p = &x;", "address"}}) {
+        auto r = run1(src, true);
+        CHECK_MSG(r.r.error_type == "SyntaxError" && r.r.error.find(word) != std::string::npos, "%s -> %s", src, r.r.error.c_str());
+    }
+}
+
 TEST(tasks_channels) {
     EXPECT("int sq(int x) { return x * x; }\nauto t = std::async(sq, 7);\nstd::println(\"{}\", t.get());", "49\n");
     EXPECT("int total = 0;\nstd::thread th([](int n) { std::println(\"thread {}\", n); }, 3);\nth.join();", "thread 3\n");

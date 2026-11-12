@@ -17,6 +17,9 @@ struct Interp;
 
 struct String final : Obj {
     std::string s;
+    // A `char` value: a one-byte string that takes part in arithmetic as its code ('a' + 1 == 98, c - '0'), as in
+    // C++. Set for character literals, s[i], s.at(i), s.front(), *it over a string and static_cast<char>.
+    bool ch = false;
     explicit String(std::string v) : s(std::move(v)) { Heap::instance().charge(*this, s.size()); }
     const char* type_name() const override { return "string"; }
 };
@@ -247,6 +250,7 @@ struct Adaptor final : Obj {
 // std::cout / std::cerr: `os << x` formats x and writes it.
 struct Ostream final : Obj {
     bool err = false, boolalpha = false, fixed = false; int precision = -1, width = 0;
+    bool left = false; char fill = ' '; int base = 10;   // std::left / std::right, std::setfill, std::hex / std::oct / std::dec
     explicit Ostream(bool e) : err(e) {}
     const char* type_name() const override { return "ostream"; }
 };

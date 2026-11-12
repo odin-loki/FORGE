@@ -25,7 +25,7 @@ const std::map<std::string, std::string>& err_parent() {
         for (auto n : {"ValueError", "IndexError", "LengthError", "DomainError"}) p[n] = "LogicError";
         for (auto n : {"IOError", "OSError", "OverflowError", "UnderflowError", "RangeError"}) p[n] = "RuntimeError";
         for (auto n : {"TypeError", "KeyError", "ObjectDisposedError", "ShellError",
-                       "LimitExceededError", "NameError", "AttributeError", "ArithmeticError", "SyntaxError", "ImportError", "HostError",
+                       "LimitExceededError", "NameError", "AttributeError", "ArithmeticError", "SyntaxError", "ImportError", "HostError", "BadOptionalAccess",
                        "RuntimeError", "LogicError", "BorrowError", "NullPointerError", "FrozenError", "RecursionError", "SystemExit",
                        "RaceError", "PipelineError", "PluginError", "AIError", "AccessError"}) p[n] = "Error";
         for (auto n : {"PermissionError", "TimeoutError", "OutOfMemoryError", "CancelledError", "DeadlockError", "FileNotFoundError",

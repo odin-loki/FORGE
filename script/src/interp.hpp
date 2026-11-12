@@ -150,6 +150,7 @@ struct Interp {
     void sort_keys(std::vector<Value>& keys);
     int compare(const Value& a, const Value& b);   // <0, 0, >0 (std::less-like total order)
     Value call_operator(const Value& self, const std::string& op, std::vector<Value> args, bool& found);
+    Value assign_value(const Node& n, const Ref<Env>& env);   // an Assign node used as an expression (x = y, x += y, ++x, x++)
     Flow run_try(const Node& n, const Ref<Env>& env);
     Flow run_using(const Node& n, const Ref<Env>& env);
     void dispose(const Value& v);
@@ -161,6 +162,13 @@ struct Interp {
     std::string repr(const Value& v, int depth = 0);
     static std::string type_of(const Value& v);
     Value new_string(std::string s) { return obj(make<String>(std::move(s))); }
+    static Value new_char(char c) { auto s = make<String>(std::string(1, c)); s->ch = true; return obj(s); }
+    // the code of a char value, for arithmetic; false when v is not a char
+    static bool char_code(const Value& v, std::int64_t& code) {
+        auto* s = as<String>(v);
+        if (!s || !s->ch || s->s.size() != 1) return false;
+        code = static_cast<signed char>(s->s[0]); return true;
+    }
     Value make_error(const std::string& type, const std::string& msg);
     [[noreturn]] void raise(const std::string& type, const std::string& msg);
     ScriptError from_cpp(std::exception_ptr e);  // map any C++ exception to a script exception

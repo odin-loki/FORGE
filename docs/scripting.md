@@ -55,12 +55,26 @@ address-of, `reinterpret_cast`/`const_cast`/C-style casts, pointer arithmetic, e
 Supported:
 
 - Declarations: `int`, `long long`, `double`, `bool`, `char`, `std::string`, `auto`, `const`/`constexpr`, several
-  declarators, brace and paren initialisation, structured bindings `auto [k, v] = ...`. Narrowing (`int x = 3.5;`)
-  and assigning to a `const` are errors.
+  declarators, brace and paren initialisation, structured bindings `auto [k, v] = ...`. Narrowing from a literal
+  (`int x = 3.5;`) and assigning to a `const` are errors.
+- A variable keeps its declared arithmetic type: storing into an `int`, `double`, `bool` or `char` variable (`=`,
+  compound assignment, `++`/`--`) and returning from a function declared with one converts as C++ does
+  (`double x = 7; x = 1;` leaves `1.0`, `int i; i = 2.9;` leaves `2`, `int f() { return 2.7; }` returns `2`). The
+  conversion is added by the parser for named variables and return values; it is not applied to struct members,
+  container elements or values that reach a variable through a reference (see *Differences from C++*).
+- `char` is a character and a small integer: `'a' + 1` is `98`, `c - '0'` is the digit, `char n = c + 1;` and
+  `static_cast<char>(...)` convert back, `s[i]`, `s.at(i)`, `s.front()`, `*it` and `for (char c : s)` yield chars.
+  `const char*` is accepted as a string type.
+- Expressions: every C++ operator on the supported types, with C++ precedence; assignment, compound assignment
+  and `++`/`--` are expressions (`f(i++)`, `while (--n > 0)`, `a = b = c`, `v[i++] = x`); the comma operator inside
+  parentheses; `v.at(i)`, `v.front()`, `v.back()`, `std::get<N>(t)`, `*it` and `it->second` as assignment targets;
+  `std::tie(a, b) = expr;` as a statement.
 - Control flow: `if`/`else`, `while`, `do`/`while`, `for(;;)`, range-`for` (with bindings), `switch` with
-  fall-through, `break`/`continue`, `try`/`catch`/`throw`/`throw;`, `catch (...)`. There is no `finally`.
+  fall-through, `if (init; cond)` and `switch (init; value)`, `break`/`continue`,
+  `try`/`catch`/`throw`/`throw;` (see *Catch clauses*). There is no `finally`.
 - Functions with default arguments, by-value and by-reference parameters, recursion, templates (type-erased),
-  lambdas with `[=]`, `[&]`, `[x]`, `[&x]` captures and `mutable`.
+  lambdas with `[=]`, `[&]`, `[x]`, `[&x]`, `[x = expr]` captures and `mutable`. `[=]` and `[x]` copy when the
+  lambda is created; a `std::function` variable may be called from its own initialiser (`[&f]` recursion).
 - Classes and structs with value semantics, constructors with init lists and base-constructor delegation,
   `using Base::Base;`, `virtual`/`override`/pure virtual (abstract classes cannot be instantiated), static members,
   operator overloading (`+`, `==`, `<`, `<=>`, `()`, `= default` comparisons), `friend` free operators.
@@ -72,14 +86,22 @@ Standard library surface (native; the `std::` prefix is optional after `using na
 
 - I/O: `std::cout`/`cerr`/`clog` with `endl`, `flush`, `boolalpha`, `fixed`, `setprecision`, `setw`;
   `std::print`/`println`/`format` (full format specs); `std::println(stderr, ...)`.
-- `std::string` (mutable value type: `size`, `substr`, `find`, `rfind`, `find_first_of`, `push_back`, `append`,
-  `insert`, `erase`, `replace`, `starts_with`, ...), `std::string_view`.
-- Containers: `vector`, `deque`, `list`, `array`, `map`/`unordered_map`/`multimap` (`operator[]` inserts a
-  default), `set`/`unordered_set`, `pair`, `tuple`/`get<N>`/`tie`, `optional`, `any`.
+- `std::string` (mutable value type: `size`, `substr`, `find`, `rfind`, `find_first_of`, `find_last_of`,
+  `find_first_not_of`, `find_last_not_of`, `push_back`, `pop_back`, `append`, `insert`, `erase`, `replace`,
+  `resize`, `assign`, `swap`, `clear`, `compare`, `starts_with`, `ends_with`, `contains`, the substring and
+  iterator-range constructors, ...), `std::string_view`.
+- Containers: `vector`, `deque` (`push_front`, `pop_front`, `emplace_front`), `list` (`sort`, `reverse`), `array`
+  (`fill`), `span` (a read-only copy), `map`/`unordered_map` (`operator[]` inserts a default; `insert`, `emplace`,
+  `try_emplace` and `insert_or_assign` return `{iterator, inserted}`; `lower_bound`/`upper_bound` on ordered ones),
+  `set`/`unordered_set`, `pair`, `tuple`/`get<N>`/`tie`, `optional`, `any`. Vectors, pairs and tuples compare
+  lexicographically; `vector(first, last)`, `insert(pos, n, v)`, `insert(pos, first, last)`, `assign`.
 - Iterators (`begin`/`end`, `find`, `it - v.begin()`, `it->first`, `std::next`/`prev`/`distance`).
-- `<algorithm>`/`<numeric>`: `sort`, `stable_sort`, `reverse`, `find(_if)`, `count(_if)`, `any_of`/`all_of`/
-  `none_of`, `for_each`, `min/max_element`, `fill`, `iota`, `binary_search`, `transform`, `accumulate`, `reduce`,
-  `clamp`, and the `std::ranges::` forms.
+- `<algorithm>`/`<numeric>`: `sort`, `stable_sort`, `is_sorted`, `reverse`, `rotate`, `partition`,
+  `next_permutation`, `find(_if)(_not)`, `count(_if)`, `any_of`/`all_of`/`none_of`, `for_each`,
+  `min/max/minmax_element`, `lower_bound`/`upper_bound`/`binary_search`, `equal`, `fill`, `iota`, `replace`,
+  `copy(_if)`, `transform` (one or two inputs), `remove(_if)`/`unique` with `erase`, `std::erase(_if)`,
+  `back_inserter`, `accumulate`, `reduce`, `partial_sum`, `inner_product`, `gcd`, `lcm`, `min`/`max`/`clamp`, the
+  `std::ranges::` forms, and the function objects `std::less`, `std::greater`, `std::plus`, ...
 - `<cmath>`, `<cctype>`, `to_string`, `stoi`/`stol`/`stoll`/`stod`, `numeric_limits`, `std::getenv`, `std::exit`.
 - Exceptions `std::exception`, `runtime_error`, `logic_error`, `invalid_argument`, `out_of_range`, ... with
   `what()`. They are aliases of the script error classes (table under *Errors*).
@@ -99,6 +121,49 @@ int main() {
     return 0;
 }
 ```
+
+### Differences from C++
+
+`tests/script_conformance` compiles a set of ordinary C++23 programs with the host compiler and requires
+`forge script` (tree-walker and VM) to print exactly what the compiled program prints
+([testing.md](testing.md)). What the programs had to leave out is listed here.
+
+Rejected with a diagnostic that names the construct:
+
+- raw pointers and address-of, `new`/`delete`, `sizeof`, C-style / `reinterpret_cast` / `const_cast`, pointers to
+  members (`&T::member`), `std::stoi(s, &pos)`;
+- designated initialisers (`T{.a = 1}`), `static` local variables, `enum class` declared inside a function, a
+  range-`for` with an init-statement, `continue` inside a `switch`;
+- assignment through a reference returned by a function (`obj.at(i, j) = v`; only the standard element accessors
+  above are assignable), `catch` of a type that cannot be matched (see *Catch clauses*).
+
+Accepted but different, or failing at run time with an `AttributeError` / `TypeError` that names the member:
+
+- Integers are 64-bit and checked: overflow raises `OverflowError`, unsigned types do not wrap, `int` does not
+  truncate to 32 bits.
+- Types are checked dynamically. The parser converts on stores into named `int` / `double` / `bool` / `char`
+  variables and on returns; a `double` struct member or `std::vector<double>` element initialised or assigned from
+  an `int` keeps the `int` (`p.w = 3; p.w / 2` is `1`). Write `3.0`.
+- Functions and constructors are not overloaded on parameter types. Constructors may differ in argument count;
+  a user-defined copy constructor replaces a one-argument constructor (copying is member-wise, done by the
+  runtime). Other overloads (a unary and a binary `operator-` in one class, const / non-const pairs that differ in
+  behaviour) are not distinguished: the last one wins. User `operator++`/`--`, `operator[]`, conversion operators
+  and delegating constructors (`T() : T(0) {}`) are not supported; `<=>` works only as `= default`.
+- A base class with constructors of several argument counts cannot be initialised from a derived constructor's
+  initialiser list, and a vector member cannot be initialised as `rows(n, value)` there (build it in the body).
+- Templates are type-erased: `T x{};` has no value, and a template cannot be specialised.
+- A moved-from variable cannot be read at all (`BorrowError`), not even compared with `nullptr`.
+- `std::optional<int>` holding a value is the value: `o.reset()` and `o.emplace(x)` work on a named variable only
+  as `o.reset()` / `o = x`. `p.use_count()` is not available on class objects.
+- Reverse iterators (`rbegin`/`rend`), `std::multimap` / `std::multiset` (parsed as map / set: one entry per key),
+  map keys other than numbers, bools and strings (no `std::pair` keys), `std::span::subspan`/`first`/`last` and
+  writing through a span, `std::string_view::remove_prefix`/`remove_suffix`, `std::sort` on a string,
+  `std::stoi` with a base, `reserve`/`capacity` on strings, nested brace elision for `std::array<std::array>`.
+- Structured bindings by reference (`auto& [a, b] = s;`) copy scalar members. A reference to an object with a
+  destructor (`Base& b = d;`) can run that destructor twice at scope exit (known bug).
+- The order in which a container destroys its elements is forward (libc++ and libstdc++ destroy a vector in
+  reverse).
+- `throw "text";` throws a string: `catch (const char*)` and `catch (const std::string&)` both match it.
 
 ## Memory model
 
@@ -142,7 +207,7 @@ left alone.
 
 | group | classes |
 |---|---|
-| general | `TypeError`, `KeyError`, `NameError`, `AttributeError`, `ArithmeticError` (also `ZeroDivisionError`), `SyntaxError`, `ImportError`, `RecursionError`, `SystemExit` |
+| general | `TypeError`, `KeyError`, `NameError`, `AttributeError`, `ArithmeticError` (also `ZeroDivisionError`), `SyntaxError`, `ImportError`, `RecursionError`, `BadOptionalAccess`, `SystemExit` |
 | under `LogicError` | `ValueError`, `IndexError`, `LengthError`, `DomainError` |
 | under `RuntimeError` | `IOError`, `OSError`, `OverflowError`, `UnderflowError`, `RangeError` |
 | runtime safety | `BorrowError`, `NullPointerError`, `FrozenError`, `AccessError`, `ObjectDisposedError`, `RaceError` |
@@ -162,7 +227,7 @@ handles `std::invalid_argument` and `std::out_of_range`, `catch (const std::runt
 | `std::length_error` | `LengthError` | `std::system_error` | `OSError` |
 | `std::domain_error` | `DomainError` | `std::filesystem::filesystem_error`, `std::ios_base::failure` | `IOError` |
 | `std::bad_alloc` | `OutOfMemoryError` | `std::bad_cast`, `std::bad_any_cast` | `TypeError` |
-| `std::bad_optional_access` | `NullPointerError` | | |
+| `std::bad_optional_access` (`o.value()` on an empty optional) | `BadOptionalAccess` | | |
 
 Differences from C++ that follow from the aliasing: the errors the runtime itself raises are script classes, so
 `std::stoi("x")` is a `ValueError` (`std::invalid_argument`) and `v.at(9)` an `IndexError` (`std::out_of_range`) as
@@ -180,7 +245,7 @@ function-try-block (`int f() try { ... } catch (...) { ... }`) is accepted for f
 |---|---|
 | `catch (...)` | everything catchable |
 | a class: `catch (const E& e)`, `catch (E e)`, `catch (E&)`; qualified (`forge::PermissionError`, `std::out_of_range`) or not (`PermissionError`) | an object of class `E` or of a class derived from it, user-defined or built-in. Nothing else: a class clause is never a catch-all, and `catch (const std::exception&)` does not handle a thrown `int`, string or plain struct |
-| `catch (int)`, `catch (double)`, `catch (bool)` | a value of exactly that kind (no arithmetic conversions; every integer type is `int`, enum values are `int`) |
+| `catch (int)`, `catch (double)`, `catch (bool)`, `catch (char)` | a value of exactly that kind (no arithmetic conversions; every integer type is `int`, enum values are `int`) |
 | `catch (const std::string&)`, `catch (std::string_view)`, `catch (const char*)` | a thrown string (`throw "text";` and `throw std::string("text");` are the same here) |
 | `catch (const std::vector<T>&)`, `catch (const std::map<K, V>&)` | a thrown list / map (element types are not checked) |
 
@@ -776,7 +841,7 @@ lambdas, containers and maps, exceptions, floating point, templates, tasks, `def
 | fish | `.fish` | – |
 | pwsh, powershell (output avoids 7-only syntax) | `.ps1` | – (`forge::sh` needs an `sh` on PATH on Windows) |
 | xonsh (plain Python) | `.xsh` | – |
-| elvish | `.elv` | – |
+| elvish (0.20+) | `.elv` | – |
 | nu | `.nu` | functions that read or write script-level variables |
 | tcsh, csh | `.csh` | functions other than `main`, `fs.read`, `forge::sh` results |
 | cmd | `.cmd` | functions, `.size()`, string ordering, loops inside if/for blocks, break/continue in range-for, `fs.read`, `forge::sh` |

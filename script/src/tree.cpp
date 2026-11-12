@@ -64,6 +64,31 @@ Flow Interp::run_try(const Node& n, const Ref<Env>& env) {
     return f;
 }
 
+// Assignment as an expression. Its value is the target's new value (C++ yields the target itself; as an rvalue that
+// is the same), or the old value for postfix ++ / -- (Node::flag). The target's sub-expressions are evaluated once.
+Value Interp::assign_value(const Node& n, const Ref<Env>& env) {
+    const Node& t = *n.kids[0];
+    Op op = Op(n.i);
+    Value old, v;
+    if (t.k == NK::Var) {
+        v = eval(*n.kids[1], env);
+        if (op != Op::None) { old = load(t.var, env); v = binary(op, old, v); }
+        else if (n.flag) old = load(t.var, env);   // c++ on a char / typed variable is rewritten to c = (char)(c + 1)
+        store(t.var, env, v);
+    } else if (t.k == NK::Field) {
+        Value o = eval(*t.kids[0], env);
+        v = eval(*n.kids[1], env);
+        if (op != Op::None) { old = get_field(o, t.s); v = binary(op, old, v); }
+        set_field(o, t.s, v);
+    } else {
+        Value o = eval(*t.kids[0], env), i = eval(*t.kids[1], env);
+        v = eval(*n.kids[1], env);
+        if (op != Op::None) { old = get_index(o, i); v = binary(op, old, v); }
+        set_index(o, i, v);
+    }
+    return n.flag ? old : v;
+}
+
 Flow Interp::run_using(const Node& n, const Ref<Env>& env) {
     Value v = eval(*n.kids[0], env);
     store(n.var, env, v);
@@ -191,11 +216,12 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
 Value Interp::eval(const Node& n, const Ref<Env>& env) {
     switch (n.k) {
     case NK::Nil: return Nil{};
+    case NK::Assign: return assign_value(n, env);
     case NK::True: return true;
     case NK::False: return false;
     case NK::Int: return n.i;
     case NK::Float: return n.d;
-    case NK::Str: return new_string(n.s);
+    case NK::Str: { Value s = new_string(n.s); if (n.flag) as<String>(s)->ch = true; return s; }
     case NK::Interp: { std::vector<Value> parts; for (auto& k : n.kids) parts.push_back(eval(*k, env)); return interpolate(parts); }
     case NK::Var: return load(n.var, env);
     case NK::List: { auto l = make<List>(); for (auto& k : n.kids) l->push(share(eval(*k, env))); return obj(l); }
