@@ -61,6 +61,19 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 ### Opsets
 A blueprint declares `opset N` (default 1). This engine runs `modelfile::opset_min` to `opset_max` (1 to 3; 2 added RoPE scaling attrs, 3 the spatial and encoder op families, composite defaults / keyword arguments and `session embedding`). `build_graph` and `inference::model` refuse any other opset with an error that names it and the supported range; an op the engine does not know is reported with its name, line and the blueprint's opset. Opset 2 adds the `rope` attrs `scaling`, `factor`, `orig_ctx`, `low_freq`, `high_freq`, `beta_fast`, `beta_slow`, `truncate` and `freq_factors` (`ops/include/forge/ops/rope.hpp`). The importers write opset 2 only for models that scale their RoPE frequencies; every other import stays opset 1 with the same graph as before. Builds older than this check ignore the opset and unknown attrs, so an opset-2 file gives wrong output there.
 
+The declaration is enforced in both directions: a blueprint has to declare at least the opset of the newest thing it uses. The parser and `build_graph` refuse a use below its opset with a `parse_error` that gives the line, the feature and the opset it needs (`blueprint:12: op 'conv2d' needs opset 3, but blueprint "x" declares opset 1 (write `blueprint "x" opset 3`)`), so a file that says `opset 1` cannot carry something an opset-1 engine lacks. What is checked:
+
+| Needs | Feature | Checked in |
+|---|---|---|
+| opset 2 | the `rope` scaling attrs listed above (`attr_min_opset`) | `build_graph` |
+| opset 3 | the 24 ops of the spatial and encoder families (`op_min_opset`: `conv1d`, `conv2d`, `conv_transpose2d`, the pooling and resize ops, `group_norm`, `batch_norm`, `pad`, `quick_gelu`, `mish`, `hard_swish`, `floor`, `attention_bias`, `alibi_bias`, `sinusoid_embed`, `l2_normalize`, `topk`, `topk_indices`, `index_select`, `masked_mean`) | `build_graph` |
+| opset 3 | `scalar()`; the number helpers `sqrt floor ceil min max mod` called on numbers | `build_graph` |
+| opset 3 | a default value in a composite's signature (`op f(x, eps = 1e-6)`) | `parse_blueprint` |
+| opset 3 | a keyword argument to a composite (`f(x, eps: 1e-5)`); keyword attrs of spec ops are opset 1 | `build_graph` |
+| opset 3 | `session embedding` | `parse_blueprint` |
+
+Below opset 3, `sqrt(4)` on a number keeps its old meaning (the `sqrt` op on a constant) instead of being folded. A new op or attr gets a line in `op_min_opset` / `attr_min_opset` (`blueprint.hpp`) with the opset that adds it. Every shipped template declares the opset it needs: the families with `session embedding`, composite defaults or opset-3 ops are `opset 3`; the Llama-style templates take `{{opset|1}}` (2 with RoPE scaling); `tests/test_modelfile.cpp` (`blueprint_opset_enforced_per_feature`, `shipped_templates_declare_their_opset`) and the per-family goldens build each of them. A model file written by an earlier build of this session's importers with a too-low opset would be refused at load; none of the shipped templates produced one.
+
 Template placeholders are `{{key}}`, or `{{key|default}}` for optional pieces (`{{rope_args|}}`, `{{attn_args|}}`, `{{opset|1}}`).
 
 ### Template families (`import/templates/*.fbp`)
@@ -86,7 +99,7 @@ Not available: Phi-2, Mamba, UNet / DiT denoisers, the Whisper decoder (no templ
 A template is a blueprint with `{{key}}` placeholders that the importer fills from `config.json` (numbers, or a string such as an op name or a whole expression). The language (`blueprint.hpp`):
 
 ```
-blueprint "decoder-lm" opset 1
+blueprint "decoder-lm" opset 3                                   # the newest feature used below (min / mod) is opset 3
 params { d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  rope: { base: {{rope_theta}} } }   # numbers, nested groups
 state kv[n_layers] : kv_cache(heads: n_kv, dim: head_dim)        # per-session state slots
 input tokens : f32[seq]                                          # `seq` is bound per run; other dims are params or numbers

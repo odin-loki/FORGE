@@ -188,7 +188,7 @@ TEST(fpk_encryption_hook) {
 // Composite ops: default and keyword parameters, definitions after the graph block, nesting, the number helpers,
 // and the rejection of recursion (directly, through other composites, and in composites nothing calls).
 TEST(blueprint_composite_defaults_keywords_recursion) {
-    auto src = R"(blueprint "c"
+    auto src = R"(blueprint "c" opset 3
 params { k: 3 }
 input x : f32[4]
 graph {
@@ -219,7 +219,7 @@ output e : f32[4]
         CHECK(std::fabs(ex.output_view("e").data[i] - (x[i] + 2)) < 1e-6);        // mod(7, 3) = 1; min(2, floor(sqrt 17)) = 2
     }
     auto bad = [](const char* ops, const char* call, const char* needle) {
-        std::string s = std::string("blueprint \"e\"\n") + ops + "\ninput x : f32[2]\ngraph { y = " + call + " }\noutput y : f32[2]";
+        std::string s = std::string("blueprint \"e\" opset 3\n") + ops + "\ninput x : f32[2]\ngraph { y = " + call + " }\noutput y : f32[2]";
         try { (void)modelfile::build_graph(modelfile::parse_blueprint(s), {}); }
         catch (const forge_exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
         return false;
@@ -670,4 +670,84 @@ TEST(blueprint_state_rows_depending_on_seq_are_refused) {
         auto again = graph::compile(graph_for(1), &st);   // the same bucket again shares the slot
         CHECK(again != nullptr);
     }
+}
+
+// A blueprint must declare the opset of the newest thing it uses: an op, an attr, a language feature or a session kind
+// below its opset is refused with the feature and the opset it needs.
+TEST(blueprint_opset_enforced_per_feature) {
+    // (opset, declarations before the graph, graph body, what follows) -> ok, or the two things the message must name
+    struct probe { const char* what; int needs; std::string pre, body, post; const char* names; };
+    const std::string out_y = "output y : f32[2]";
+    std::vector<probe> probes = {
+        {"spec op of opset 3 (mish)", 3, "", "y = mish(x)", out_y, "op 'mish'"},
+        {"spec op of opset 3 (l2_normalize)", 3, "", "y = l2_normalize(x)", out_y, "op 'l2_normalize'"},
+        {"scalar()", 3, "", "y = x + scalar(1)", out_y, "scalar()"},
+        {"number helper min", 3, "", "y = x * min(2, 3)", out_y, "number helper min()"},
+        {"number helper mod", 3, "", "y = x * mod(7, 4)", out_y, "number helper mod()"},
+        {"number helper floor", 3, "", "y = x * floor(2.5)", out_y, "number helper floor()"},
+        {"composite default", 3, "op f(a, k = 2) { return a * k }\n", "y = f(x)", out_y, "default value for parameter 'k' of the composite op 'f'"},
+        {"composite keyword argument", 3, "op f(a, k) { return a * k }\n", "y = f(x, k: 2)", out_y, "keyword argument to the composite op 'f'"},
+        {"session embedding", 3, "", "y = relu(x)", out_y + "\nsession embedding", "`session embedding`"},
+        {"rope scaling attr", 2, "input p : i32[2]\n", "q = reshape(x, shape: [2, 1, 1])\n y = reshape(rope(reshape(concat(q, q, axis: 2), shape: [2, 1, 2]), p, base: 10000, neox: 1, scaling: 1, factor: 2), shape: [4])",
+         "output y : f32[4]", "RoPE frequency scaling (rope attr '"},
+    };
+    for (auto& p : probes) {
+        auto src = [&](int opset) { return std::format("blueprint \"t\" opset {}\ninput x : f32[2]\n{}graph {{\n {}\n}}\n{}", opset, p.pre, p.body, p.post); };
+        auto build = [&](int opset) { (void)modelfile::build_graph(modelfile::parse_blueprint(src(opset)), {}); };
+        for (int v = p.needs; v <= modelfile::opset_max; ++v) {
+            auto msg = error_of([&] { build(v); });
+            CHECK_MSG(msg.empty(), "%s at opset %d: %s", p.what, v, msg.c_str());
+        }
+        for (int v = modelfile::opset_min; v < p.needs; ++v) {
+            auto msg = error_of([&] { build(v); });
+            CHECK_MSG(has(msg, p.names) && has(msg, std::format("needs opset {}", p.needs)) && has(msg, std::format("declares opset {}", v)) && has(msg, "blueprint:"),
+                      "%s at opset %d: message '%s'", p.what, v, msg.c_str());
+            try { build(v); CHECK(false); } catch (const forge_exception& e) { CHECK(e.code == errc::parse_error); }
+        }
+    }
+    // what opset 1 always had still builds at opset 1: composites with positional arguments, keyword attrs of an op,
+    // sqrt of a number as the spec op it was before the helpers, plain rope
+    auto ok = error_of([&] {
+        (void)modelfile::build_graph(modelfile::parse_blueprint(
+            "blueprint \"t\"\ninput x : f32[2]\nop f(a, k) { return a * k }\ngraph {\n y = f(softmax(x, axis: 0), 2) + sqrt(4)\n}\noutput y : f32[2]\nsession one_shot"), {});
+    });
+    CHECK_MSG(ok.empty(), "%s", ok.c_str());
+    // the tables: every op has an opset in range; attrs that came later than their op are listed
+    for (auto name : {"relu", "matmul_t", "rope", "attention"}) CHECK(modelfile::op_min_opset(name) == 1);
+    for (auto name : {"conv2d", "attention_bias", "masked_mean", "pad"}) CHECK(modelfile::op_min_opset(name) == 3 && ops::op_from_name(name));
+    CHECK(modelfile::attr_min_opset("rope", "freq_factors") == 2 && modelfile::attr_min_opset("rope", "base") == 1 && modelfile::attr_min_opset("attention", "scale") == 1);
+}
+
+// Every shipped template, instantiated the way the importers do, declares an opset that its body builds under: the
+// text is put through the parser and builder with zero weights. (A template that used an opset-3 op under
+// "opset 1" would fail here, not at a user's import.)
+TEST(shipped_templates_declare_their_opset) {
+    namespace fs = std::filesystem;
+    std::size_t seen = 0;
+    for (auto& f : fs::directory_iterator(fs::path(FORGE_SOURCE_DIR) / "import" / "templates")) {
+        if (f.path().extension() != ".fbp") continue;
+        ++seen;
+        auto text = import::read_file(f.path());
+        auto head = text.substr(text.find("\nblueprint ") + 1); head = head.substr(0, head.find('\n'));
+        // the declared opset: a number, or the {{opset|1}} placeholder the importer fills with 1 or 2
+        bool placeholder = has(head, "{{opset|1}}");
+        int declared = placeholder ? 1 : std::atoi(head.substr(head.find("opset ") + 6).c_str());
+        CHECK_MSG(has(head, "opset ") && declared >= modelfile::opset_min && declared <= modelfile::opset_max, "%s: '%s'", f.path().filename().string().c_str(), head.c_str());
+        // features that need a later opset, looked for in the template text
+        int needs = 1;
+        if (has(text, "\nsession embedding") || has(text, "scalar(")) needs = 3;
+        for (std::size_t p = 0; (p = text.find("\nop ", p)) != std::string::npos; ++p) {   // a composite with a default value
+            auto sig = text.substr(p, text.find('{', p) - p);
+            if (has(sig, "=")) needs = 3;
+        }
+        for (std::size_t p = 0; (p = text.find('(', p)) != std::string::npos; ++p) {
+            std::size_t b = p; while (b > 0 && (std::isalnum(static_cast<unsigned char>(text[b - 1])) || text[b - 1] == '_')) --b;
+            auto name = text.substr(b, p - b);
+            if (!name.empty() && ops::op_from_name(name)) needs = std::max(needs, modelfile::op_min_opset(name));
+        }
+        CHECK_MSG(declared >= needs, "%s declares opset %d but uses opset-%d features", f.path().filename().string().c_str(), declared, needs);
+        // templates that can carry RoPE scaling take the opset from the importer
+        if (has(text, "{{rope_args")) CHECK_MSG(placeholder, "%s takes rope_args but has a fixed opset", f.path().filename().string().c_str());
+    }
+    CHECK(seen >= 16);
 }
