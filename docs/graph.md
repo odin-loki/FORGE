@@ -105,7 +105,7 @@ Every other op of those families (`conv_transpose2d`, pooling, resize, `group_no
 
 `FORGE_FUSE=0` turns off all but the first. The last two do not rewrite anything: the step list, the lowerings and the buffers stay as they are and steps are only marked (`step::chain`, `step::qact`; `plan::describe()` prints `fused: …` lines). That is why they cannot interfere with the other paths:
 
-- **Devices.** They are applied only to plans without device hooks and without pipeline stages. On a device, and in every stage of a `pipe:` split (CPU stages included), each op lowers and runs exactly as before; the device-side pair fusions (`fuse_steps`, below) are separate and unchanged.
+- **Devices.** They are applied only to plans lowered from the CPU registry (no device hooks, no pipeline stages). On a device, over RPC, and in every stage of a `pipe:` split (CPU stages included), each op lowers and runs exactly as before; the device-side pair fusions (`fuse_steps`, below) are separate and unchanged.
 - **Precompiled plans** (`forge aot`) store the same steps with or without them; `aot::pipeline_version` is 3 because of the new lowerings and the conv folding. Natively compiled plans run their steps unfused (the compiled code is a kernel call per step).
 - **Memory.** The memory plan was made for the unfused order. A chain interleaves its steps, so it is formed only when every pair of buffers it touches is disjoint or the same buffer used row for row (an in-place step).
 

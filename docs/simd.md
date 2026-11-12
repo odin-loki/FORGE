@@ -187,7 +187,7 @@ The exact semantics of each operation are at the top of the header.
 | Masked load / store | AVX-512 (`vmovdqu8/16/32/64` with a mask register), AVX2 for 32/64-bit lanes (`vpmaskmov`), SVE (`svld1` / `svst1` with a predicate), RVV (`vle` / `vse` with a mask) | Lane by lane, active lanes only |
 | Gather | AVX2 and AVX-512 (32/64-bit lanes), SVE (32/64-bit lanes), RVV (every lane width, `vluxei32`) | Lane by lane |
 | Scatter | AVX-512, SVE (32/64-bit lanes), RVV (`vsoxei32`, ordered) | Lane by lane |
-| Streaming store | x86 `movntdq` / `vmovntdq`; Clang's non-temporal store hint on other ISAs (AArch64 `stnp`) | An aligned store (GCC off x86) |
+| Streaming store | x86 `movntdq` / `vmovntdq`; Clang's non-temporal store hint on other ISAs (meant for AArch64 `stnp`; that form has not been compiled here, the AArch64 build used GCC) | An aligned store (GCC off x86) |
 | Saturating add / sub, popcount | Clang: `__builtin_elementwise_add_sat` / `_sub_sat` / `_popcount` (native `padds`, `sqadd`, `vsadd`, `cnt`, …) | GCC: compare-and-select and bit-trick formulas on vectors |
 | f16 | F16C (`vcvtph2ps`), AVX-512, AArch64 NEON (`fcvtl` / `fcvtn`) | `forge::f16` per lane (SSE, SVE, RVV, LSX/LASX, VSX, VXE, SIMD128, MSA) |
 | bf16 | — | Integer shifts and the `forge::bf16` rounding on every ISA (AVX512-BF16's `vcvtneps2bf16` is not used: the kernel tables are not built with it) |
@@ -268,7 +268,7 @@ The companion tables (Tier A, `seq`, int8) and `vec_types.hpp`, per ISA (2026-11
 
 | ISA / table | Compiled with | Run on | Tables | Tier A | Types |
 |-------------|---------------|--------|--------|--------|-------|
-| x86_64 `sse2`, `sse4.2`, `avx2`, `avx512`; int8 also `avxvnni`, `avx512vnni` | clang 23 | the build machine (a Xeon with AVX-512 and AVX-VNNI), all tables in one run and each lower one forced | 3/3 | 14/14 | `scalar`, `emulated`, `sse2`, `sse4.2`, `avx2`, `avx512`: 0 failed |
+| x86_64 `sse2`, `sse4.2`, `avx2`, `avx512`; int8 also `avxvnni`, `avx512vnni` | clang 23; also g++ 13 by hand for the `sse2` / `sse4.2` companion tables (3/3) and the `sse4.2`, `avx2`, `avx512` types checks (0 failed) | the build machine (a Xeon with AVX-512 and AVX-VNNI), all tables in one run and each lower one forced | 3/3 | 14/14 | `scalar`, `emulated`, `sse2`, `sse4.2`, `avx2`, `avx512`: 0 failed |
 | AArch64 `neon` | g++ 13 cross | `qemu-aarch64 -cpu cortex-a57` and `-cpu max,sve=off` | 3/3 each | 14/14 each | 0 failed (GCC: the formula forms of saturation and popcount) |
 | AArch64 `sve` (tables for 128, 256, 512, 1024 bits) | g++ 13 cross | `qemu-aarch64 -cpu max,sve<N>=on` at 128, 256, 384, 512, 640, 1024, 1536, 2048 bits (384 and 640 are lowered to the next table; above 1024 to 1024) | 3/3 at all 8 | 14/14 at all 8 | 128, 256, 512, 1024: 0 failed (predicated loads / stores, gathers, scatters through the SVE intrinsics) |
 | riscv64 `rvv` (tables for VLEN 128, 256, 512, 1024) | zig 0.17 (clang 22) | `qemu-riscv64 -cpu rv64,v=true,vlen=<N>` at all four | 3/3 at all 4 | 14/14 at all 4 | 0 failed at all 4 (masked loads / stores, `vluxei32` gathers, `vsoxei32` scatters) |
@@ -304,7 +304,7 @@ cmake --preset dev                                  # generated headers
 CXX="zig c++ -target wasm32-wasi" tests/wasm_simd.sh      # runs under node; WASM_RUN="wasmtime run --dir=." for wasmtime
 ```
 
-A module is validated as a whole, so SIMD128 is a build-time choice: with `-msimd128` the `simd128` table is compiled in and active, with `WASM_SIMD=0` (CMake: `-DFORGE_WASM_SIMD=OFF`) only `scalar` exists. zig's wasi C++ runtime has no exception support; the script links `tests/wasm_no_exceptions.cpp`, which aborts on a throw. Not run: wasmtime, a browser, Emscripten, the `WASM_SIMD=0` build, and the `wasm` branch of `CMakeLists.txt` (written, never configured).
+A module is validated as a whole, so SIMD128 is a build-time choice: with `-msimd128` the `simd128` table is compiled in and active, with `WASM_SIMD=0` (CMake: `-DFORGE_WASM_SIMD=OFF`) only `scalar` exists. zig's wasi C++ runtime has no exception support; the script links `tests/wasm_no_exceptions.cpp`, which aborts on a throw. The `WASM_SIMD=0` build (scalar tables only) ran the same tests on 2026-11-12. Not run: wasmtime, a browser, Emscripten, and the `wasm` branch of `CMakeLists.txt` (written, never configured).
 
 ## Platform notes and limits
 - Link `forge_simd_mv` whenever you use simd, directly or through gpu, graph or inference.

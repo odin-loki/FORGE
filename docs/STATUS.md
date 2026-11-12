@@ -156,7 +156,9 @@ ran under qemu-user 8.2 or node 22 only; nothing ran on real non-x86 hardware an
   / 1536 / 2048 bits; riscv64 (zig 0.17) VLEN 128 / 256 / 512 / 1024; loongarch64 `la464` (`lasx`, `lsx`); ppc64le
   `power9`; s390x `max`; mips64el `Loongson-3A4000`; wasm32 under node (Tier A one test per process: node segfaults on
   the whole binary). The int8 reference hash of fixed blocks equals x86's on every little-endian target; s390x is
-  only compared with its own scalar reference. No timing anywhere; the new int8 tables are off by default.
+  only compared with its own scalar reference. g++ 13, by hand on x86_64: the `sse2` / `sse4.2` companion tables
+  3/3 and the `sse4.2` / `avx2` / `avx512` `vec_types` checks 0 failed. No timing anywhere; the new int8 tables are
+  off by default.
 - **`vec_types.hpp`** (`vec<T>` for double and the integers): about 25.5 million checks per register width, exhaustive
   for 8-bit binary and 16-bit unary operations. 0 failed: x86 `scalar`, `emulated`, `sse2`, `sse4.2`, `avx2`, `avx512`
   natively; `neon`, `sve` 128 / 256 / 512 / 1024, `rvv` 128 / 256 / 512 / 1024, `lsx`, `lasx`, `vsx`, `vxe`, `msa`, `simd128`

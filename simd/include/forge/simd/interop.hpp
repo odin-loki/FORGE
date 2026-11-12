@@ -15,6 +15,7 @@
 // the same register when the ABI the library deduces for N lanes is the native one.
 #include <forge/simd/tier_a.hpp>
 #include <forge/simd/vec_types.hpp>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -98,11 +99,12 @@ template <class M, class F> inline void for_each_index(const M& m, F&& f) {   //
     const std::size_t n = std::size_t(m.size());
     if constexpr (M::rank() == 1) { for (std::size_t i = 0; i < n; ++i) f(m[typename M::index_type(i)]); }
     else if constexpr (M::rank() == 2) {
-        for (std::size_t i = 0; i < std::size_t(m.extent(0)); ++i) for (std::size_t j = 0; j < std::size_t(m.extent(1)); ++j) f(m[typename M::index_type(i), typename M::index_type(j)]);
+        using I = typename M::index_type;   // the array form of operator[]: no multidimensional subscript needed
+        for (std::size_t i = 0; i < std::size_t(m.extent(0)); ++i) for (std::size_t j = 0; j < std::size_t(m.extent(1)); ++j) f(m[std::array<I, 2>{I(i), I(j)}]);
     } else {
         static_assert(M::rank() == 3, "forge::simd::md: non-contiguous views are supported up to rank 3");
         for (std::size_t i = 0; i < std::size_t(m.extent(0)); ++i) for (std::size_t j = 0; j < std::size_t(m.extent(1)); ++j)
-            for (std::size_t k = 0; k < std::size_t(m.extent(2)); ++k) f(m[typename M::index_type(i), typename M::index_type(j), typename M::index_type(k)]);
+            for (std::size_t k = 0; k < std::size_t(m.extent(2)); ++k) { using I = typename M::index_type; f(m[std::array<I, 3>{I(i), I(j), I(k)}]); }
     }
 }
 // read access: the view's own storage, or a row-major copy

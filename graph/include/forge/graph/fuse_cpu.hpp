@@ -3,7 +3,8 @@
 //
 // Both work on the lowered step list and leave it as it is: every step keeps its lowering, inputs, output and
 // buffer, and is only marked. So the device paths never see them (they are applied to plans without device hooks
-// and without pipeline stages only: on a device every op lowers and runs exactly as before), a precompiled plan
+// and without pipeline stages, lowered from the CPU registry, only: on a device, over RPC and in a pipeline split
+// every op lowers and runs exactly as before), a precompiled plan
 // (aot.hpp) lists the same steps, natively compiled code runs the steps unfused, and turning a fusion off
 // changes nothing but the order in which the same kernels are called.
 //
@@ -95,7 +96,9 @@ inline void run_shared_qgemm(plan& p, const step& s) {
 inline void fuse_cpu(plan& p, registry& reg, const pass_options& po) {
     p.chains.clear(); p.qacts.clear();
     for (auto& s : p.steps) { s.chain = 0; s.qact = -1; }
-    if (p.hooks || !reg.stages.empty() || reg.hooks) return;   // host plans only
+    // Host plans only: the CPU registry itself. Any other registry (a resident device, a non-resident one, RPC,
+    // a pipeline split) keeps every step as its own call.
+    if (&reg != &registry::cpu() || p.hooks || !reg.stages.empty() || reg.hooks) return;
     auto& G = p.g;
     // ---- shared int8 activations ----
     if (fusion::on(po.fuse_qact, "FORGE_FUSE_QACT") && qweights::int8_enabled()) {

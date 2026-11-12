@@ -94,7 +94,7 @@ TEST(mdspan_overloads_match_the_tables) {
     CHECK(md::min(every2) == mn && md::max(every2) == mx);
     std::mdspan<const float, std::dextents<std::size_t, 2>, std::layout_left> left(x.data(), 4, 6);
     std::vector<float> rowmajor;
-    for (std::size_t i = 0; i < 4; ++i) for (std::size_t j = 0; j < 6; ++j) rowmajor.push_back(left[i, j]);
+    for (std::size_t i = 0; i < 4; ++i) for (std::size_t j = 0; j < 6; ++j) rowmajor.push_back(left[std::array<std::size_t, 2>{i, j}]);
     CHECK(md::argmax(left) == k.argmax_f32(rowmajor.data(), rowmajor.size()));
     // clamp and scan into a strided output: only the viewed elements change
     std::vector<float> y(24, -99.f);
