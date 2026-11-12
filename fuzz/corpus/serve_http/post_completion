@@ -1,0 +1,6 @@
+ÈPOST /v1/completions HTTP/1.1
+Host: x
+Content-Type: application/json
+Content-Length: 50
+
+{"prompt": "hi", "max_tokens": 4, "stream": false}

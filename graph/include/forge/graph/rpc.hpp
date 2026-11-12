@@ -67,7 +67,7 @@ inline ops::attrs get_attrs(reader& r) {
     }
     return a;
 }
-inline bool valid_shape(const shape_t& s) { i64 n = 1; for (auto d : s) { if (d < 0 || d > (i64(1) << 32)) return false; n *= std::max<i64>(d, 1); if (n > (i64(1) << 32)) return false; } return true; }
+inline bool valid_shape(const shape_t& s, i64 cap = i64(1) << 32) { i64 n = 1; for (auto d : s) { if (d < 0 || d > cap) return false; n *= std::max<i64>(d, 1); if (n > cap) return false; } return true; }
 inline int op_index(std::string_view name) {
     for (std::size_t i = 0; i < ops::op_count; ++i) if (ops::info(ops::op(i)).name == name) return int(i);
     return -1;
@@ -177,6 +177,9 @@ public:
     // Security log (optional): authentications with the principal and its permissions, refusals, permission denials.
     // Called from connection threads.
     std::function<void(const std::string&)> log;
+    // Largest tensor, in elements, a request may name (inputs and the output); a frame naming a larger one is
+    // dropped before anything is allocated for it. Set before start().
+    std::uint64_t max_tensor_elems = std::uint64_t(1) << 32;
     server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1", server_security sec = {}) : reg_(reg ? reg : &registry::cpu()), sec_(std::move(sec)) {
         detail::wsa();
         if (!sec_.tls.client_ca_file.empty() && sec_.tls.cert_file.empty()) raise(errc::invalid_argument, "rpc: client certificates (mTLS) need TLS (a server certificate and key)");
@@ -256,10 +259,10 @@ private:
             auto n = r.u32(); if (n > 64) return;
             std::vector<tensor> ins; std::vector<tensor_view> views; std::vector<shape_t> shapes;
             for (std::uint32_t i = 0; i < n && r.ok; ++i) {
-                auto sh = r.shape(); if (!detail::valid_shape(sh)) return;
+                auto sh = r.shape(); if (!detail::valid_shape(sh, i64(max_tensor_elems))) return;
                 ins.emplace_back(sh); r.raw(ins.back().data.data(), ins.back().data.size() * 4);
             }
-            auto os = r.shape(); if (!r.ok || !detail::valid_shape(os)) return;
+            auto os = r.shape(); if (!r.ok || !detail::valid_shape(os, i64(max_tensor_elems))) return;
             for (auto& t : ins) { views.push_back({t.data.data(), t.shape}); shapes.push_back(t.shape); }
             detail::writer w;
             int oi = detail::op_index(name);

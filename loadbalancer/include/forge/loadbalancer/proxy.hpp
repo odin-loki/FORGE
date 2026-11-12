@@ -69,6 +69,7 @@ public:
     std::uint64_t errors() const { return errors_; }
 
 private:
+    friend struct proxy_test_access;   // fuzz/fuzz_proxy_http.cpp
     struct conn { std::shared_ptr<os::socket> client; os::thread t; };
     void accept_loop_() {
         while (running_) {
@@ -120,7 +121,8 @@ private:
     static std::string lower(std::string s) { for (auto& ch : s) ch = char(std::tolower((unsigned char)ch)); return s; }
     static const std::string* header(const std::vector<std::pair<std::string, std::string>>& h, const std::string& k) { for (auto& [a, b] : h) if (a == k) return &b; return nullptr; }
     // Read until "\r\n\r\n"; leftover bytes stay in buf.
-    bool read_head_(os::socket& s, std::string& buf, std::string& head) {
+    // (Sock is os::socket; a template so fuzz/fuzz_proxy_http.cpp can drive the parser from a buffer.)
+    template <class Sock> bool read_head_(Sock& s, std::string& buf, std::string& head) {
         for (;;) {
             auto e = buf.find("\r\n\r\n");
             if (e != std::string::npos) { head = buf.substr(0, e + 4); buf.erase(0, e + 4); return true; }
@@ -139,7 +141,7 @@ private:
         }
     }
     // Body by Content-Length or chunked (de-chunked into body).
-    bool read_body_(os::socket& s, std::string& buf, const std::vector<std::pair<std::string, std::string>>& h, std::string& body) {
+    template <class Sock> bool read_body_(Sock& s, std::string& buf, const std::vector<std::pair<std::string, std::string>>& h, std::string& body) {
         auto need = [&](std::size_t n) { while (buf.size() < n) { if (!s.wait_readable(cfg_.idle_timeout_ms)) return false; char t[65536]; long r = s.recv(t, sizeof t); if (r <= 0) return false; buf.append(t, std::size_t(r)); } return true; };
         if (auto te = header(h, "transfer-encoding"); te && lower(*te).find("chunked") != std::string::npos) {
             for (;;) {
@@ -157,12 +159,12 @@ private:
         for (auto& r : cfg_.routes) if (target.compare(0, r.path_prefix.size(), r.path_prefix) == 0 && r.path_prefix.size() >= blen) { best = r.target; blen = r.path_prefix.size(); }
         return best;
     }
-    static void reply(os::socket& c, int code, const char* msg) {
+    template <class Sock> static void reply(Sock& c, int code, const char* msg) {
         std::string b = std::string(msg) + "\n";
         std::string r = "HTTP/1.1 " + std::to_string(code) + " " + msg + "\r\nContent-Length: " + std::to_string(b.size()) + "\r\nContent-Type: text/plain\r\n\r\n" + b;
         c.send_all(r.data(), r.size());
     }
-    void serve_l7_(os::socket& c) {
+    template <class Sock> void serve_l7_(Sock& c) {
         std::string buf;
         while (running_) {
             request rq; std::string first;

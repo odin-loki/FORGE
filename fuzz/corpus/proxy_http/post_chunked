@@ -1,0 +1,11 @@
+ÈPOST /v1/completions HTTP/1.1
+Host: x
+Transfer-Encoding: chunked
+X-Session-Id: s1
+
+5
+hello
+10
+0123456789abcdef
+0
+

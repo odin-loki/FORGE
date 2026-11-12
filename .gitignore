@@ -8,3 +8,4 @@ bindings/android/**/.cxx/
 build-asan/
 build-tsan/
 tests/data/ucd/
+build-fuzz/
