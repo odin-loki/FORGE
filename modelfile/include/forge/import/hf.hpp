@@ -5,6 +5,7 @@
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
 #include <forge/security/enforce.hpp>
+#include <forge/security/path.hpp>
 #include <forge/os/fs.hpp>
 #include <filesystem>
 #include <fstream>
@@ -30,6 +31,16 @@ inline std::string read_file(const std::filesystem::path& p) {
 inline std::filesystem::path template_dir() {
     if (auto* e = std::getenv("FORGE_TEMPLATES")) return e;
     return std::filesystem::path(FORGE_SOURCE_DIR) / "import" / "templates";
+}
+// FSS CAP-3: a blueprint template is looked up by name (`--template`, import_options::template_name), so the name is
+// joined onto template_dir() with security::try_safe_join: `..`, absolute paths, drive letters, ':' and reserved
+// device names are refused, and so is a name that resolves (through a symlink) to a file outside the directory.
+inline std::filesystem::path template_path(const std::string& name) {
+    auto dir = template_dir();
+    if (name.empty()) raise(errc::invalid_argument, "template: empty name");
+    auto j =security::try_safe_join(os::fs::u8str(dir), name + ".fbp");
+    if (!j) raise(errc::invalid_argument, "template '{}': not a file inside the template directory {} ({})", name, dir.string(), j.err.what);
+    return os::fs::u8path(j.value);
 }
 
 // Substitute {{key}} with config values (numbers formatted losslessly).
@@ -160,7 +171,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         set("linear_conv_kernel_dim", num("linear_conv_kernel_dim", 4));
     }
     json::value cv(c);
-    auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), cv);
+    auto bp_text = instantiate(read_file(template_path(tname)), cv);
     auto bp = modelfile::parse_blueprint(bp_text);  // validate before writing anything
 
     // gather safetensors shards

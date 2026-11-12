@@ -192,10 +192,14 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 - Keystore file backend: unless a passphrase or the TPM wraps the store key, same-user code can read it. TPM
   sealing has no PCR policy, so it binds the key to the machine but not to a boot state, and a process running as
   the same user can still ask the TPM to unseal it.
-- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) unencrypted to disk: 0600 files created
+- `forge-serve --kv-spill` writes KV-cache data (derived from prompts) to disk: 0600 files created
   exclusively in a private (0700 / owner-only DACL) directory, `FORGE_MEM_SPILL_DIR` or a fresh
   `<tmp>/forge-spill-<pid>-<random>`, capped by `FORGE_MEM_SPILL_MAX`, deleted when the spill store is destroyed.
-  Root / Administrators and a crash that leaves the files behind still expose them.
+  Each file is sealed with XChaCha20-Poly1305 under a random key that exists only in the server's memory (locked
+  and wiped like other keys, FSS-CRY-2), so files left by a crash cannot be decrypted, and a modified, truncated or
+  swapped file is refused and the prefix recomputed. Still exposed: the number, sizes and times of the files; the
+  key and the decrypted KV to anything that can read the process's memory (root / Administrators, a debugger, swap
+  if the key could not be locked); and everything when `FORGE_MEM_SPILL_ENCRYPT=0` turns the encryption off.
 - Key memory (FSS-CRY-2): locking is best effort (RLIMIT_MEMLOCK, working-set quota) and reported; macOS has no
   per-range core-dump exclusion and Windows excludes the pages only from WER reports, not from debuggers or
   `MiniDumpWriteDump`. The TLS private key lives in OpenSSL's memory, `model_key` (`.fpk` encryption) and the keystore

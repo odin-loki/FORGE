@@ -90,6 +90,7 @@ See [memory.md](memory.md) for how the budget is used.
 | `FORGE_MEM_DEVICE_LIMIT` | Limit for device memory pools (default: accounting only) |
 | `FORGE_MEM_PRESSURE=0` | Ignore OS memory-pressure signals |
 | `FORGE_MEM_SPILL_DIR`, `FORGE_MEM_SPILL_MAX` | Spill-store directory (default `<tmp>/forge-spill-<pid>`) and size cap |
+| `FORGE_MEM_SPILL_ENCRYPT` | `0` turns off the spill files' XChaCha20-Poly1305 encryption (default on; [memory.md](memory.md)) |
 
 ## Models and security
 
@@ -101,7 +102,7 @@ See [memory.md](memory.md) for how the budget is used.
 | `FORGE_SECURITY_POLICY` | Policy file for `forge::security::load_policy` and `forge security check` (an error if it cannot be read). See [security-api.md](security-api.md) |
 | `FORGE_SECURITY_PROFILE` | Base FSS profile: `strict`, `standard` or `permissive` (audited). Without it and without a policy file no FSS profile is active |
 | `FORGE_CACHE` | Where `forge run` / `forge bench` cache models imported on the fly (default `~/.cache/forge`) |
-| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `import/templates` in the source tree the binary was built from) |
+| `FORGE_TEMPLATES` | Directory of import blueprint templates (default: `import/templates` in the source tree the binary was built from). A template name must resolve to a file inside it (`safe_join`; a symlink that leads out of the directory is refused) |
 
 ## RPC clients
 

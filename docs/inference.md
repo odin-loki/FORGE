@@ -98,7 +98,7 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 
 `request` fields: `prompt`, `max_new` (64), `sampling`, `grammar` (`shared_ptr<const grammar>`), `stop_tokens` (in addition to EOS), `priority` (higher first, FIFO within a priority), `on_token(int)` (return `false` to cancel), `on_done(tokens, finish_reason)`. `finish_reason` is `stop`, `length`, `grammar` (sampled token rejected), `cancelled`, or `error: <message>`.
 
-Methods: `submit(request)` → id, `cancel(id)`, `step()`, `run_until_idle()`, `start()` / `stop()` (background worker), `request_kv_eviction(keep)` (safe from any thread), `idle()`, `waiting()`, `active_count()`, `spilled()`, `evictions()`, `stats()`. `batch_stats`: `steps`, `completed`, `prefix_hits`, `prefix_tokens_reused`, `peak_active`, `peak_kv_bytes`, `deferred`, `prefix_spills`, `prefix_reloads`.
+Methods: `submit(request)` → id, `cancel(id)`, `step()`, `run_until_idle()`, `start()` / `stop()` (background worker), `request_kv_eviction(keep)` (safe from any thread), `idle()`, `waiting()`, `active_count()`, `spilled()`, `evictions()`, `stats()`. `batch_stats`: `steps`, `completed`, `prefix_hits`, `prefix_tokens_reused`, `peak_active`, `peak_kv_bytes`, `deferred`, `prefix_spills`, `prefix_reloads`, `prefix_reload_failures` (spilled prefixes whose file was unreadable or failed authentication: discarded and recomputed).
 
 A new prompt reuses the longest prefix it shares with a cached (in memory or spilled) sequence, always leaving at least one prompt token to compute.
 

@@ -27,7 +27,7 @@ forge-serve proxy --backend HOST:PORT [...] [--policy FILE]   # see loadbalancer
 | `--codec` | `f32` | Weight codec for the import of a HF directory or `.gguf`; ignored for `.fpk` |
 | `--mem-limit` | `FORGE_MEM_LIMIT`, else 85% of RAM or the cgroup limit | Host memory budget (`6G`, `512M`, `75%`; `0`/`off` disables). Under it the scheduler reports live KV bytes, evicts cached prefixes, and keeps new requests queued while the budget is over its soft watermark, so a tight limit runs requests one at a time instead of failing. See [memory.md](memory.md) |
 | `--max-queue N` | 0 (no cap) | Once N requests are waiting, new ones get `503` with `Retry-After: 1` |
-| `--kv-spill` | off | Cached prefixes evicted from memory are written to the spill directory (`FORGE_MEM_SPILL_DIR`, capped by `FORGE_MEM_SPILL_MAX`) and read back when a new prompt shares them, instead of being recomputed. Up to 64 prefixes |
+| `--kv-spill` | off | Cached prefixes evicted from memory are written to the spill directory (`FORGE_MEM_SPILL_DIR`, capped by `FORGE_MEM_SPILL_MAX`) and read back when a new prompt shares them, instead of being recomputed. Up to 64 prefixes. The files are encrypted under a key held only in memory unless `FORGE_MEM_SPILL_ENCRYPT=0` ([memory.md](memory.md)) |
 | `--watch` | off | Watches the model path. On change: waits 0.5 s, sends systemd `RELOADING=1`, closes the listener and re-execs itself with the same arguments. POSIX only; on Windows it logs that a restart is needed |
 | `--no-pin` | pinning on | On hybrid CPUs forge-serve pins itself (and the threads it starts) to performance cores. This turns that off |
 | `--numa-node N` | none | Binds to NUMA node N before loading, so weights and KV are first-touched there |
@@ -88,7 +88,7 @@ Streaming sends `data: {...}` events: completion chunks carry `choices[0].text` 
 Errors are JSON `{"error":{"message","type":"invalid_request_error"}}`: `400` for bad requests, `503` for a full queue or an out-of-memory error while handling the request.
 
 ### Metrics
-`forge_steps`, `forge_completed`, `forge_prefix_hits`, `forge_prefix_tokens_reused`, `forge_peak_active`, `forge_peak_kv_bytes`, `forge_queue_waiting`, `forge_queue_active`, `forge_admission_deferred_total`, `forge_rejected_total`, `forge_kv_evictions_total`, `forge_kv_spills_total`, `forge_kv_reloads_total`, `forge_kv_spilled`, then the memory governor's `forge_mem_*` series ([memory.md](memory.md)).
+`forge_steps`, `forge_completed`, `forge_prefix_hits`, `forge_prefix_tokens_reused`, `forge_peak_active`, `forge_peak_kv_bytes`, `forge_queue_waiting`, `forge_queue_active`, `forge_admission_deferred_total`, `forge_rejected_total`, `forge_kv_evictions_total`, `forge_kv_spills_total`, `forge_kv_reloads_total`, `forge_kv_reload_failures_total`, `forge_kv_spilled`, then the memory governor's `forge_mem_*` series ([memory.md](memory.md)).
 
 ## Examples
 

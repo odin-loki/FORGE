@@ -130,7 +130,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     }
     std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : arch == "qwen3moe" ? "qwen3_moe"
                       : arch == "qwen35moe" ? "qwen3_5_moe" : q35 ? "qwen3_5" : "llama";
-    auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), json::value(cfg));
+    auto bp_text = instantiate(read_file(template_path(tname)), json::value(cfg));
     auto bp = modelfile::parse_blueprint(bp_text);
 
     // streamed: tensors go straight from the mapped GGUF to disk, so a 20 GB model never sits in memory twice
