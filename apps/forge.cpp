@@ -502,7 +502,8 @@ int cmd_bench(const args& a) {
 
 // forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]
 //   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]...
-//   [--tls-cert C --tls-key K [--tls-client-ca CA [--tls-client-map FILE]...]] [--quiet]
+//   [--tls-cert C --tls-key K [--tls-client-ca CA [--tls-client-map FILE]... [--tls-crl PEM]... [--tls-revoked SHA256|FILE]...]]
+//   [--quiet]
 //   [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
 // Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
@@ -515,14 +516,14 @@ int cmd_rpc_serve(const args& a) {
     graph::rpc::server_security sec;
     auto toks = a.all("token"); if (toks.empty() && a.has("token")) toks.push_back(a.get("token"));
     for (auto& t : toks) {   // "--token T" (full access) or "--token 'allow=device T'" (a token-file line)
-        if (!t.starts_with("allow=")) { sec.tokens.push_back(t); continue; }
+        if (!graph::rpc::sec::is_option(t)) { sec.tokens.push_back(t); continue; }
         for (auto& e : graph::rpc::parse_tokens(t, "--token")) sec.tokens.push_back(std::move(e));
     }
     auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
     // FSS-FIO-2: secrets (token files, the TLS key) must be owner-only and trusted lists (authorized keys, client
     // maps) writable only by their owner; profile strict refuses otherwise, other profiles warn (audit).
     for (auto& f : files) security::require_private_file(pol, "--token-file", f, security::file_kind::secret);
-    for (auto& f : files) {   // "[allow=device,scripts] <token> [name]" per line (graph/rpc_secure.hpp)
+    for (auto& f : files) {   // "[allow=...] [ops=...] [max-bytes=N] [script-timeout=MS] <token> [name]" per line (graph/rpc_secure.hpp)
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         struct wipe_on_exit { std::string& s; ~wipe_on_exit() { if (!s.empty()) crypto_wipe(s.data(), s.size()); } } w{r.value};
         auto ts = graph::rpc::parse_tokens(r.value, f);
@@ -530,7 +531,7 @@ int cmd_rpc_serve(const args& a) {
         for (auto& e : ts) sec.tokens.push_back(std::move(e));
     }
     auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
-    for (auto& f : keyfiles) {   // "[allow=device,scripts] <hex> [comment]" per line (graph/rpc_secure.hpp)
+    for (auto& f : keyfiles) {   // "[options] <hex> [comment]" per line, options as for tokens (graph/rpc_secure.hpp)
         security::require_private_file(pol, "--authorized-keys", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         try { for (auto& k : graph::rpc::parse_authorized_keys(r.value)) sec.authorized_keys.push_back(std::move(k)); }
@@ -543,7 +544,7 @@ int cmd_rpc_serve(const args& a) {
     security::require_private_file(pol, "--tls-key", sec.tls.key_file, security::file_kind::secret);
     if (!sec.tls.client_ca_file.empty() && sec.tls.cert_file.empty()) throw std::runtime_error("--tls-client-ca needs --tls-cert and --tls-key");
     auto maps = a.all("tls-client-map"); if (maps.empty() && a.has("tls-client-map")) maps.push_back(a.get("tls-client-map"));
-    for (auto& f : maps) {   // "[allow=...] sha256:<hex>|cn:<name> [comment]" per line (graph/rpc_secure.hpp)
+    for (auto& f : maps) {   // "[options] sha256:<hex> | san:<type>:<value> | cn:<name> [comment]" per line (graph/rpc_secure.hpp)
         security::require_private_file(pol, "--tls-client-map", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         auto rs = graph::rpc::parse_client_map(r.value, f);
@@ -551,6 +552,21 @@ int cmd_rpc_serve(const args& a) {
         for (auto& x : rs) sec.client_map.push_back(std::move(x));
     }
     if (!sec.client_map.empty() && sec.tls.client_ca_file.empty()) throw std::runtime_error("--tls-client-map needs --tls-client-ca");
+    // Revocation of client certificates: PEM CRLs checked in the TLS handshake, and a deny-list of SHA-256 certificate
+    // fingerprints (a fingerprint, or a file of them). The server re-reads the files when they change.
+    sec.tls.crl_files = a.all("tls-crl"); if (sec.tls.crl_files.empty() && a.has("tls-crl")) sec.tls.crl_files.push_back(a.get("tls-crl"));
+    auto revoked = a.all("tls-revoked"); if (revoked.empty() && a.has("tls-revoked")) revoked.push_back(a.get("tls-revoked"));
+    for (auto& r : revoked) {
+        if (!os::exists(r)) {   // not a file: one fingerprint
+            try { auto one = graph::rpc::parse_revoked(r, "--tls-revoked"); if (one.size() != 1) throw std::runtime_error("empty"); sec.revoked_certs.push_back(one[0]); }
+            catch (const std::exception&) { throw std::runtime_error("--tls-revoked wants a SHA-256 certificate fingerprint (64 hex) or a file of them: " + r); }
+            continue;
+        }
+        security::require_private_file(pol, "--tls-revoked", r, security::file_kind::trusted);
+        sec.revoked_files.push_back(r);
+    }
+    for (auto& f : sec.tls.crl_files) security::require_private_file(pol, "--tls-crl", f, security::file_kind::trusted);
+    if ((!sec.tls.crl_files.empty() || !revoked.empty()) && sec.tls.client_ca_file.empty()) throw std::runtime_error("--tls-crl and --tls-revoked need --tls-client-ca");
     sec.allow_scripts = a.has("allow-scripts");
     std::string bind = a.get("bind", "127.0.0.1");
     if (pol.active()) {
@@ -574,9 +590,12 @@ int cmd_rpc_serve(const args& a) {
         // Each remote script runs in its own child process (`forge script --rpc-child`), so ForgeScript's OS sandbox
         // (seccomp / Capsicum / pledge / sandbox_init / restricted token) applies to the script without touching the
         // server's own sockets, and a crash, leak or runaway loop dies with the child. The source goes over stdin.
-        srv.signed_script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo,
-                                                                                                const std::string& signature) {
-            auto t = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
+        // The peer's permissions can only take capabilities away: a script keeps fs / net / proc when the server
+        // flags allow it and its token or key (and client certificate) has scripts.fs / scripts.net / scripts.proc.
+        srv.script_request_handler = [self, def_tmo, mem_mb, srv_no_proc = no_proc, srv_no_fs = no_fs, srv_no_net = no_net, child_policy](const graph::rpc::server::script_request& q) {
+            const auto& src = q.source; const auto& name = q.name; const auto& argv = q.argv; const auto& signature = q.signature;
+            const bool no_proc = srv_no_proc || !q.allow_proc, no_fs = srv_no_fs || !q.allow_fs, no_net = srv_no_net || !q.allow_net;
+            auto t = q.timeout_ms ? std::min<std::uint64_t>(q.timeout_ms, def_tmo) : def_tmo;
             os::spawn_spec sp;
             sp.argv = {self, "script", "--rpc-child", name.empty() ? "<remote>" : name, "--timeout", std::to_string(t)};
             if (no_proc) sp.argv.push_back("--no-proc");
@@ -613,8 +632,9 @@ int cmd_rpc_serve(const args& a) {
         };
     }
     server_lockdown(pol, "forge rpc", bind + ":" + std::to_string(srv.port()));
-    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
+    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
                 srv.tls() ? " tls" : "", sec.tls.client_ca_file.empty() ? "" : " mtls", sec.client_map.empty() ? "" : " cert-map",
+                sec.tls.crl_files.empty() && revoked.empty() ? "" : " revocation",
                 sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
     std::fflush(stdout);
     srv.run();
