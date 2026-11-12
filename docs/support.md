@@ -126,6 +126,46 @@ write(r.perfetto_json()); std::puts(r.summary_table().c_str());
 - **Not verified.** `perfetto_json()` follows the documented legacy JSON format and is checked for structure by `test_prof`, but was not loaded into Perfetto. On the machine the tests ran on, `perf_event` was unavailable, so `hw_zone` only exercised the cycle-counter fallback.
 - Tests: `test_prof`, `test_prof_off`, `test_prof_tracy_stub`, and `prof_chrome_trace` in `test_support`.
 
+## Vision (`forge::vision`)
+`vision.hpp` (older helpers) works on `image`, an HWC float image. `transform.hpp` adds pre-processing and `codec.hpp` reads and writes image files. Tests: `test_vision`; fuzz targets `fuzz_png`, `fuzz_bmp`, `fuzz_pnm`, `fuzz_inflate`.
+
+| Area | Functions (`transform.hpp`) |
+|---|---|
+| Formats, layouts | `to_float` (u8 or a decoded `raster` → float), `to_u8`, `to_raster`, `hwc_to_chw`, `chw_to_hwc` |
+| Normalisation | `normalize(img, mean, std)` per channel, `imagenet_mean()` / `imagenet_std()`, `standardize(img)` (zero mean, unit variance per channel), `preprocess_chw` (u8 HWC → normalised float CHW in one pass) |
+| Resize | `resize(img, H, W, interp, antialias = true)` with `interp::nearest`, `bilinear`, `bicubic` (Keys, a = −0.5), `area` (box). Antialiasing widens the filter when shrinking, as Pillow does; the 4×3 reference values in the test come from Pillow 12.3. `resize_bilinear` is the same as `bilinear` without antialiasing |
+| Geometry | `crop`, `pad` (`constant`, `edge`, `reflect`), `letterbox` (aspect-preserving fit with fill; returns scale and offsets) |
+| Colour | `swap_rb`, `rgb_to_gray`, `gray_to_rgb`, `yuv420_to_rgb`, `nv12_to_rgb`, `rgb_to_yuv420`, `rgb_to_nv12` (8-bit, BT.601 or BT.709, limited or full range; chroma is replicated on the way up and box-averaged on the way down) |
+
+Image files (`codec.hpp`) decode to a `raster` (8- or 16-bit interleaved samples; 1–4 channels):
+
+| Format | Decode | Encode |
+|---|---|---|
+| PNG | All colour types, bit depths 1/2/4/8/16, palettes, `tRNS` (palette alpha and colour keys become an alpha channel), Adam7 interlace. Chunk CRCs and the zlib Adler-32 are verified; unknown critical chunks are errors | 8/16-bit, 1–4 channels, adaptive row filters, not interlaced. Deflate uses fixed Huffman codes over a greedy LZ77 parse (or stored blocks), so files are larger than zlib's |
+| BMP | Uncompressed 1/4/8-bit palette, 16/24/32-bit, `BI_BITFIELDS` masks, top-down and bottom-up, core/info/V4/V5 headers. RLE is reported as unsupported. 5- and 6-bit channels are scaled by rounding (`v·255/31`), which differs by at most 1 from decoders that replicate bits (Pillow) | 8-bit grey palette, 24-bit, 32-bit with alpha |
+| PNM | `P2`/`P3`/`P5`/`P6`, maxval ≤ 65535, samples rescaled to the full 8- or 16-bit range. `P1`/`P4`/`P7` unsupported | Binary PGM/PPM |
+| JPEG | Not implemented (`decode_image` reports it as unsupported) | – |
+
+- `decode_image` picks the decoder from the first bytes. `inflate`, `zlib_decompress`, `zlib_compress`, `crc32` and `adler32` are usable on their own.
+- **Untrusted input.** Malformed data raises `forge_exception` (`errc::format_error`, or `errc::unsupported`). `decode_limits::max_pixels` (default 2²⁶) is checked before anything is allocated, and the inflate output is capped at the size the header implies. A decoded 16-bit RGBA image at the default limit still needs about 1 GiB for the raw and converted buffers together; lower the limit for small devices.
+- **Test vectors.** `tools/gen_vision_vectors.py` writes `tests/data/vision/*` (99 files with the expected pixels) and the fuzz seeds with an independent Python encoder (every filter type, split IDAT, Adam7, palettes, low bit depths) and cross-checks them with Pillow when it is installed. Files written by the C++ encoders were read back with Pillow once by hand (30 files, no differences); that check is not part of ctest.
+- The inflate decoder reads codes bit by bit (simple, not fast); no throughput was measured.
+
+## Reflection (`forge::reflect`)
+```cpp
+struct cfg { int w = 0; std::string name; std::vector<float> v; std::optional<inner> in; mode m{}; };
+FORGE_REFLECT(cfg, w, name, v, in, m)        // up to 64 fields
+FORGE_REFLECT_ENUM(mode, fast, exact)        // optional: enumerators by name
+auto j = reflect::to_json(c);                auto c2 = reflect::from_json<cfg>(j);
+auto b = reflect::to_binary(c);              auto c3 = reflect::from_binary<cfg>(b);
+```
+- **Types:** bool, integers, `float`/`double`, enums, `std::string`, `vector`, `array`, `optional`, `variant`, `map`/`unordered_map` with string keys, nested reflected structs. `for_each_field(obj, f)` and `field_count<T>()` expose the field list.
+- **JSON:** objects by field name; missing keys keep defaults, unknown keys are ignored; named enums as strings; `optional` as null; `variant` as `{"index", "value"}`. Numbers go through `double`, so integers beyond 2⁵³ are not exact, and `json::dump` writes non-integers with 9 significant digits, so a `double` does not survive a trip through JSON text exactly (it does through the binary form).
+- **Binary (`FRB1`):** a header with the writer's schema hash, then the value. Struct fields are tagged with a hash of their name and a length, so a reader skips fields it does not have and keeps defaults for fields the writer did not have (add, remove and reorder are tolerated in both directions; a field that keeps its name but changes type is an error). `from_binary` bounds-checks everything and reports `binary_info::schema_matches`.
+- **Schema:** `schema_string<T>()` (for example `{x:f32,y:f32,z:f32,}`) and `schema_hash<T>()`.
+- **C++26 static reflection:** a branch behind `FORGE_REFLECT_STATIC` and `__cpp_impl_reflection` enumerates aggregate members with `std::meta`. It has never been compiled: clang 23 here has no `<meta>`. Expect to fix it when a compiler that supports P2996 is available.
+- Tests: `test_reflect`, and `reflect_round_trip` in `test_support2`.
+
 ## Processes
 - `os::spawn_spec` and `spawn_wait` (argv, env, cwd, limits, output cap): see [os-wrapper.md](os-wrapper.md#processes-processhpp).
 - `os::wait_any(children, timeout_ms)` returns the index of the first `child` to exit (reaped), or `nullopt` on timeout. `os::wait_all(children, timeout_ms)` returns false on timeout. Both poll with a 1–10 ms back-off and never reap another waiter's child.
@@ -174,8 +214,9 @@ auto t = kTimeout.get();          // parsed and defaulted; re-parsed when the va
 | `mem/tlsf.hpp` | `forge::mem` | Fixed-block `pool` and O(1) `tlsf` allocator over a caller region, with stats and `leak_report` |
 | `prof/prof.hpp`, `prof/hw.hpp` | `forge::prof` | Zones, counters, gauges, allocation and GPU-zone hooks, statistics, trace exports: see [Profiler](#profiler-forgeprof) |
 | `rand/philox.hpp` | `forge::rand` | Counter-based `philox4x32` (10 rounds) and `threefry4x32` (20 rounds) |
-| `reflect/reflect.hpp` | `forge::reflect` | `FORGE_REFLECT(T, fields...)` (up to 12 fields), `to_json`, `from_json` |
+| `reflect/reflect.hpp` | `forge::reflect` | `FORGE_REFLECT` (up to 64 fields), JSON and binary serialisation, schema hashes: see [Reflection](#reflection-forgereflect) |
 | `signal/fft.hpp` | `forge::signal` | FFT (radix-2, Bluestein for other lengths), `rfft`, Hann window, STFT power, Slaney mel filterbank |
 | `signal/audio.hpp` | `forge::signal` | Windowed-sinc `resample`, RBJ `biquad` filters |
 | `vision/vision.hpp` | `forge::vision` | Bilinear resize, RGB↔YUV (BT.601 full range), IoU, greedy NMS, `roi_align` |
+| `vision/transform.hpp`, `vision/codec.hpp` | `forge::vision` | Pre-processing and image file codecs: see [Vision](#vision-forgevision) |
 | `vision/video.hpp` | `forge::vision::video` | Hardware decode interface (NVDEC, MediaCodec, VideoToolbox; VA-API probe only), Annex-B and H.264 SPS parsing. Only the parsing is tested; the decoders have not run on hardware |
