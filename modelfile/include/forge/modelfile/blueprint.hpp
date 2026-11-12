@@ -67,6 +67,13 @@ inline std::vector<bp_token> bp_lex(std::string_view s) {
     return t;
 }
 
+// Opsets this engine runs (FORGE_PLAN D.3). A blueprint declares the opset it was written for; build_graph refuses one
+// outside the range and names it, and an op the engine does not know is reported with the blueprint's opset.
+//   1  the first op set
+//   2  rope frequency scaling attrs (scaling, factor, orig_ctx, low_freq, high_freq, beta_fast, beta_slow, truncate,
+//      freq_factors). An opset-1 engine would ignore them and rotate by the wrong angles.
+inline constexpr int opset_min = 1, opset_max = 2;
+
 struct bp_state_decl { std::string name; i64 count = 1; std::string kind; std::map<std::string, double> args; };
 struct bp_io_decl { std::string name, dtype; std::vector<std::string> dims; };
 
@@ -319,7 +326,9 @@ private:
         auto o = ops::op_from_name(fn);
         if (!o) {
             auto cit = bp_.composites.find(fn);
-            if (cit == bp_.composites.end()) raise(errc::parse_error, "blueprint:{}: unknown function '{}'", line, fn);
+            if (cit == bp_.composites.end())
+                raise(errc::parse_error, "blueprint:{}: unknown op '{}' (blueprint \"{}\" declares opset {}; this engine supports opsets {}..{})",
+                      line, fn, bp_.name, bp_.opset, opset_min, opset_max);
             return expand_composite(fn, cit->second, pos, line);
         }
         const auto& inf = ops::info(*o);
@@ -411,7 +420,11 @@ inline blueprint parse_blueprint(std::string_view src) {
     ps.expect("blueprint");
     if (ps.cur().kind != bp_token::k_str) ps.fail("expected blueprint name string");
     bp.name = ps.next().text;
-    if (ps.accept("opset")) bp.opset = int(ps.number());
+    if (ps.accept("opset")) {
+        double v = ps.number();
+        if (!(v >= 0 && v <= 1e6) || v != std::floor(v)) raise(errc::parse_error, "blueprint '{}': bad opset {}", bp.name, v);
+        bp.opset = int(v);
+    }
     bool have_graph = false;
     while (ps.cur().kind != bp_token::k_end) {
         if (ps.accept("params")) detail::parse_params(ps, bp, "");
@@ -456,11 +469,31 @@ inline blueprint parse_blueprint(std::string_view src) {
     return bp;
 }
 
+// Refuses a blueprint whose opset this engine does not run (unsupported; the message names the opset and the range).
+inline void check_opset(const blueprint& bp) {
+    if (bp.opset < opset_min || bp.opset > opset_max)
+        raise(errc::unsupported, "blueprint \"{}\" declares opset {}; this engine supports opsets {}..{}{}", bp.name, bp.opset, opset_min, opset_max,
+              bp.opset > opset_max ? " (it needs a newer FORGE)" : "");
+}
+
 inline graph::tensor_graph build_graph(const blueprint& bp, const build_options& o) {
+    check_opset(bp);
     graph::tensor_graph g;
     detail::bp_builder b(bp, o, g);
     b.run();
     return g;
+}
+
+// The names of every weight the graph references (W.<path>), in first-use order, without touching any tensor data:
+// the graph is built with one-element placeholder shapes. Importers compare this list with the tensors they wrote.
+inline std::vector<std::string> blueprint_weights(const blueprint& bp) {
+    std::vector<std::string> names;
+    build_options o;
+    for (auto& in : bp.inputs) for (auto& d : in.dims)
+        if (!bp.params.count(d) && !(!d.empty() && std::isdigit((unsigned char)d[0]))) o.dims[d] = 2;   // symbolic lengths
+    o.weight = [&](const std::string& n) { names.push_back(n); return std::pair<shape_t, const float*>(shape_t{1}, nullptr); };
+    (void)build_graph(bp, o);
+    return names;
 }
 
 } // namespace forge::modelfile
