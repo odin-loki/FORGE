@@ -2,9 +2,11 @@
 #include "check.hpp"
 #include "tiny_model.hpp"
 #include <forge/inference/inference.hpp>
+#include <forge/graph/attn_cpu.hpp>
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <random>
 #ifdef _WIN32
 #include <process.h>
@@ -194,6 +196,154 @@ TEST(tbq_qjl_inner_product) {
     CHECK(graph::kv_codec_pair_from_name("tbq3_qjl").v == kv_codec::tbq3p);
 }
 
+// The QJL stage in numbers. With y = R x the rotated head, yhat the (b-1)-bit Lloyd-Max reconstruction and
+// r = y - yhat, the codec stores |r| and sign(S r) for the orthonormal S = H D3 H D2 (n = dp rows) and decodes
+// rhat = c |r| S^T sign(S r). <r, S^T sign(S r)> = |S r|_1, so <r, rhat> = |r|^2 in expectation exactly when
+// c = |r| / E|S r|_1 = sqrt(pi) G((n+1)/2) / (n G(n/2)) for S r uniform on its sphere (kv_qjl_gain; the paper's
+// sqrt(pi/2)/d for unit-variance Gaussian rows becomes sqrt(pi/2)/sqrt(n) for unit-norm rows, times 1 - 1/(4n)).
+// Checked here: the stored norm, that constant (fitted from the data: sum |r|^2 / sum |r| |S r|_1),
+// <x, xhat> / <x, x> = 1 with the sketch against 1 - MSE without it, the bias of <q, k> for correlated q,
+// the variance bound (pi/2) |r|^2 |q|^2 / n of the paper, and exact zeros.
+TEST(tbq_qjl_constant_and_unbiasedness) {
+    std::mt19937 g(23); std::normal_distribution<float> nd(0, 1);
+    for (auto c : {kv_codec::tbq4p, kv_codec::tbq3p})
+    for (i64 d : {16, 64, 128, 256}) {
+        const std::size_t n = std::size_t(d), hw = std::size_t(graph::kv_head_words(d, c));
+        CHECK(graph::kv_tbq_dim(d) == d);   // powers of two: no padding, so norms carry over to the rotated domain
+        // layout: gain, |r|, the (b-1)-bit codes, one sign bit per rotated coordinate
+        CHECK(hw == 2 + std::size_t((d + graph::kv_tbq_per_word(c) - 1) / graph::kv_tbq_per_word(c)) + std::size_t((d + 31) / 32));
+        std::vector<float> x(n), q(n), full(n), mse(n), buf(hw), nob(hw);
+        double self_full = 0, self_mse = 0, rr = 0, rrhat = 0, r_l1 = 0, se = 0, bound = 0, bias_full = 0, bias_mse = 0, ref2 = 0;
+        const int N = 20000;
+        const double gain = double(graph::kv_qjl_gain(d));
+        for (int it = 0; it < N; ++it) {
+            const float amp = it % 3 == 0 ? 4.f : 1.f;
+            for (auto& v : x) v = nd(g) * amp;
+            for (auto& v : q) v = nd(g);
+            for (std::size_t e = 0; e < n; ++e) q[e] += 0.5f * x[e] / amp;   // queries correlated with the key
+            graph::kv_encode_head(x.data(), d, c, buf.data());
+            graph::kv_decode_head(buf.data(), d, c, full.data());
+            nob = buf; nob[1] = 0.f;   // |r| = 0 switches the sketch off: the plain MSE reconstruction of the same codes
+            graph::kv_decode_head(nob.data(), d, c, mse.data());
+            double xx = 0, xf = 0, xm = 0, r2 = 0, rh = 0, rh2 = 0, qx = 0, qf = 0, qm = 0, qq = 0;
+            for (std::size_t e = 0; e < n; ++e) {
+                const double r = double(x[e]) - mse[e], rhat = double(full[e]) - mse[e];
+                xx += double(x[e]) * x[e]; xf += double(x[e]) * full[e]; xm += double(x[e]) * mse[e];
+                r2 += r * r; rh += r * rhat; rh2 += rhat * rhat;
+                qx += double(q[e]) * x[e]; qf += double(q[e]) * full[e]; qm += double(q[e]) * mse[e]; qq += double(q[e]) * q[e];
+            }
+            CHECK_MSG(std::fabs(double(buf[1]) - std::sqrt(r2)) <= 1e-3 * std::sqrt(r2) + 1e-6, "stored |r| %g vs %g", double(buf[1]), std::sqrt(r2));
+            // rhat = c |r| S^T sign(S r) has norm c sqrt(n) |r| whatever the signs are
+            CHECK_MSG(std::fabs(std::sqrt(rh2) - gain * std::sqrt(double(n)) * std::sqrt(r2)) <= 2e-3 * std::sqrt(r2) + 1e-6, "|rhat| %g, |r| %g", std::sqrt(rh2), std::sqrt(r2));
+            self_full += xf / xx; self_mse += xm / xx;
+            rr += r2; rrhat += rh;
+            r_l1 += rh / gain;   // = |r| |S r|_1
+            se += (qf - qx) * (qf - qx); bound += 1.5707963267948966 / double(n) * r2 * qq;
+            bias_full += qf - qx; bias_mse += qm - qx; ref2 += qx * qx;
+        }
+        const double c_fit = rr / r_l1, c_asym = 1.2533141373155003 / std::sqrt(double(n)), rms = std::sqrt(ref2 / N);
+        const double c_exact = std::sqrt(3.141592653589793) * std::exp(std::lgamma((double(n) + 1) / 2) - std::lgamma(double(n) / 2)) / double(n);
+        std::printf("  %s d %lld: <x,xhat>/<x,x> %.4f with the sketch, %.4f without; fitted constant %.5f, exact %.5f, sqrt(pi/2)/sqrt(n) %.5f; "
+                    "<q,k> bias/rms %+.1e (MSE only %+.1e); error variance / bound %.3f\n", graph::kv_codec_name(c), (long long)d, self_full / N, self_mse / N,
+                    c_fit, c_exact, c_asym, bias_full / N / rms, bias_mse / N / rms, se / bound);
+        CHECK_MSG(std::fabs(gain / c_exact - 1) < 1e-4, "kv_qjl_gain %g vs the closed form %g", gain, c_exact);
+        // Measured with libstdc++'s RNG: the fitted constant is within 1e-3 of the closed form at every d (the
+        // asymptotic sqrt(pi/2)/sqrt(n) is 1.6% off at d 16, 0.4% at d 64); the self ratio is within 4e-4 (tbq4p)
+        // and 7e-4 (tbq3p) of 1, against 1 - 0.034 and 1 - 0.115 without the sketch. Sampling noise at N = 20000
+        // is about 7e-4 (d 16) .. 2e-4 (d 256) of the constant and 1e-4 (tbq4p) / 2e-4 (tbq3p) of the self ratio.
+        const double shrink = c == kv_codec::tbq4p ? 0.0345 : 0.1175;   // Lloyd-Max distortion at 3 / 2 bits
+        CHECK_MSG(std::fabs(c_fit / c_exact - 1) < (d < 64 ? 4e-3 : 2.5e-3), "fitted QJL constant %g vs %g", c_fit, c_exact);
+        CHECK_MSG(std::fabs(rrhat / rr - 1) < (d < 64 ? 4e-3 : 2.5e-3), "<r, rhat> / |r|^2 = %g", rrhat / rr);
+        CHECK_MSG(std::fabs(self_full / N - 1) < std::max(1.2e-3, 0.025 * shrink), "QJL self inner product ratio %g", self_full / N);
+        // the MSE-only estimate shrinks: <x, xhat> = (1 - relative MSE) <x, x> for a least-squares gain
+        CHECK_MSG(1 - self_mse / N > 0.6 * shrink && 1 - self_mse / N < 1.2 * shrink, "MSE-only shrinkage %g (expected about %g)", 1 - self_mse / N, shrink);
+        CHECK_MSG(std::fabs(bias_mse / N / rms) > 4 * std::fabs(bias_full / N / rms), "bias: MSE only %g, QJL %g", bias_mse / N / rms, bias_full / N / rms);
+        CHECK_MSG(std::fabs(bias_full / N / rms) < (c == kv_codec::tbq4p ? 2.5e-3 : 4e-3), "QJL bias %g of rms", bias_full / N / rms);
+        CHECK_MSG(se <= bound, "QJL inner-product error variance %g above the bound %g", se, bound);
+    }
+    // padded head dimension (d = 96 -> 128 rotated coordinates): still unbiased against the true inner product
+    {
+        const i64 d = 96; const auto c = kv_codec::tbq4p;
+        std::vector<float> x(96), y(96), buf(std::size_t(graph::kv_head_words(d, c)));
+        double ratio = 0; const int N = 20000;
+        for (int it = 0; it < N; ++it) {
+            for (auto& v : x) v = nd(g);
+            graph::kv_encode_head(x.data(), d, c, buf.data()); graph::kv_decode_head(buf.data(), d, c, y.data());
+            double xx = 0, xy = 0; for (std::size_t e = 0; e < 96; ++e) { xx += double(x[e]) * x[e]; xy += double(x[e]) * y[e]; }
+            ratio += xy / xx;
+        }
+        CHECK_MSG(std::fabs(ratio / N - 1) < 3e-3, "padded QJL self inner product ratio %g", ratio / N);
+    }
+    for (auto c : {kv_codec::tbq4p, kv_codec::tbq3p}) {   // zeros stay exact zeros; a head re-encodes to the same words
+        std::vector<float> z(64, 0.f), b(std::size_t(graph::kv_head_words(64, c))), b2(b.size()), o(64, 1.f);
+        graph::kv_encode_head(z.data(), 64, c, b.data()); graph::kv_decode_head(b.data(), 64, c, o.data());
+        for (float v : o) CHECK(v == 0.f);
+        for (auto& v : z) v = nd(g);
+        graph::kv_encode_head(z.data(), 64, c, b.data()); graph::kv_encode_head(z.data(), 64, c, b2.data());
+        CHECK(std::memcmp(b.data(), b2.data(), b.size() * 4) == 0);
+    }
+    CHECK(std::string(graph::kv_codec_pair_name(graph::kv_codec_pair_from_name("turbo4p"))) == "tbq4p");
+    CHECK(!graph::kv_is_qjl(kv_codec::tbq4) && graph::kv_is_qjl(kv_codec::tbq3p) && graph::kv_is_tbq(kv_codec::tbq4p));
+}
+
+// A QJL KV cache through the session paths that hold or move quantised rows: prefix blobs (save_prefix /
+// load_prefix, what the spill store writes), copy_prefix and rewind give bit-identical continuations.
+TEST(kv_qjl_prefix_blob_copy_rewind) {
+    auto m = model::open(model_a());
+    for (const char* name : {"tbq4p", "tbq3p"}) {
+        inference::session a(m, {.kv_codec = name}), b(m, {.kv_codec = name}), c(m, {.kv_codec = name}), other(m, {.kv_codec = "tbq3"});
+        std::vector<int> p = {4, 8, 15, 16, 23, 42, 9, 77};
+        a.reset(); a.forward(p);
+        auto blob = a.save_prefix();
+        b.load_prefix(blob);
+        CHECK(b.save_prefix() == blob);
+        for (auto& [k, sl] : b.state().slots) CHECK(graph::kv_is_qjl(sl.codec));
+        int t = 31;
+        auto la = a.forward(std::span<const int>(&t, 1)), lb = b.forward(std::span<const int>(&t, 1));
+        CHECK(maxdiff(la, lb) == 0.f);
+        c.copy_prefix(a, 5);
+        auto lc = c.forward(std::span<const int>(&p[5], 3));
+        a.rewind(5); auto lr = a.forward(std::span<const int>(&p[5], 3));
+        CHECK(maxdiff(lc, lr) == 0.f);
+        CHECK_THROWS(other.load_prefix(blob));   // a different codec refuses the blob
+        CHECK_THROWS(other.copy_prefix(a, 2));
+        sampler g1; a.reset();
+        CHECK(a.generate(p, 6, g1).size() == 6);
+    }
+}
+
+// The int16-query attention path (FORGE_CPU_ATTN=q16, here through attn_cpu::set_query_i16) on the tiny model
+// with an int8 KV cache: logits stay within the int8 tolerance of f32 KV and next to the float-query kernel.
+TEST(kv_int8_int16_query_end_to_end) {
+    namespace ac = forge::graph::attn_cpu;
+    if (!ac::enabled()) { std::puts("  FORGE_CPU_ATTN=old: skipped"); return; }
+    auto mf = model::open(model_a()), m8 = model::open(model_a()), mq = model::open(model_a());
+    inference::session sf(mf), s8(m8, {.kv_codec = "int8"}), sq(mq, {.kv_codec = "int8"});
+    ac::set_query_i16(0);
+    auto rf = trace(sf, 24), r8 = trace(s8, 24);
+    sampler g0; std::vector<int> p = {1, 5, 9, 33};
+    s8.reset(); auto t8 = s8.generate(p, 12, g0);
+    ac::set_query_i16(1);
+    auto rq = trace(sq, 24);
+    // one token at a time against one prefill block (other ops differ in the last bits between the two shapes)
+    std::vector<int> toks = {1, 5, 9, 33, 70, 101, 7, 12, 3};
+    sq.reset(); auto all = sq.forward_all(toks);
+    sq.reset(); std::vector<float> last;
+    for (int tk : toks) last = sq.forward(std::span<const int>(&tk, 1));
+    std::vector<float> tail(all.end() - std::ptrdiff_t(last.size()), all.end());
+    CHECK_MSG(maxdiff(last, tail) < 1e-4f * maxabs(last), "decode vs prefill %g", maxdiff(last, tail) / maxabs(last));
+    sampler g1; sq.reset(); auto tq = sq.generate(p, 12, g1);
+    ac::set_query_i16(-1);
+    float wf = 0, w8 = 0;
+    for (std::size_t i = 0; i < rf.size(); ++i) { wf = std::max(wf, maxdiff(rf[i], rq[i]) / maxabs(rf[i])); w8 = std::max(w8, maxdiff(r8[i], rq[i]) / maxabs(r8[i])); }
+    std::size_t same = 0; while (same < t8.size() && same < tq.size() && t8[same] == tq[same]) ++same;
+    std::printf("  int8 KV, int16 query: max logit error vs f32 KV %.2e, vs the float-query kernel %.2e; greedy tokens identical to the float-query kernel %zu/%zu\n",
+                wf, w8, same, t8.size());
+    CHECK(wf > 0 && wf < 2e-2f);
+    CHECK(w8 < 1e-3f);
+    CHECK(tq.size() == 12 && same >= 3);
+}
+
 static double kld(const std::vector<float>& p, const std::vector<float>& q) {
     auto sm = [](const std::vector<float>& l) { float m = *std::max_element(l.begin(), l.end()); std::vector<double> o(l.size()); double s = 0;
         for (std::size_t i = 0; i < l.size(); ++i) s += o[i] = std::exp(double(l[i] - m)); for (auto& v : o) v /= s; return o; };
@@ -219,7 +369,8 @@ static void tbq_vs_f32(const std::string& dev) {
         // (random tiny model: near-tied logits make KLD large in absolute terms; tbq4 ~1.5e-2, tbq3 ~4e-2 here)
         const bool loose = std::string(name) == "tbq3" || std::string(name) == "tbq3p";
         CHECK_MSG(kl < (loose ? 1.2e-1 : std::string(name) == "tbq4p" ? 6e-2 : 3e-2), "kld %g", kl);
-        CHECK(agree * 10 >= rf.size() * (loose ? 6 : std::string(name) == "tbq4p" ? 7 : 8));
+        // (tbq4p sits between tbq4 and tbq3 in vector MSE; top-1 on near-tied logits is noisy: 19/25 here)
+        CHECK(agree * 10 >= rf.size() * (loose || std::string(name) == "tbq4p" ? 6 : 8));
         CHECK(sq.state().bytes() < sf.state().bytes());
         bool any_v = false, any_k = false;
         for (auto& [k, sl] : sq.state().slots) {

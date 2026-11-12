@@ -9,6 +9,7 @@
 // deletes anything but a stale socket at the path.
 #include <forge/os/detail.hpp>
 #if defined(FORGE_OS_POSIX)
+#include <sys/uio.h>
 #include <sys/un.h>
 #endif
 #if defined(__APPLE__) || defined(FORGE_OS_FREEBSD)
@@ -102,6 +103,71 @@ public:
         auto* b = static_cast<char*>(p);
         while (n) { auto r = read(b, n); if (!r) return {{}, r.err}; if (!r.value) return {{}, {-1, "local_stream: eof"}}; b += r.value; n -= r.value; }
         return {};
+    }
+    // Pass an open handle (file, pipe, socket, shared_memory::native()) to the process at the other end, which
+    // gets its own handle to the same object from recv_handle(). The sender keeps its handle.
+    //   POSIX    SCM_RIGHTS: the kernel installs a new descriptor in the receiver (close-on-exec).
+    //   Windows  DuplicateHandle into the peer process (found through the pipe; it must be a process this user may
+    //            open with PROCESS_DUP_HANDLE, i.e. normally the same user), then the handle value travels in-band.
+    //            The receiver must trust the sender: a stream cannot verify the value it reads.
+    // Both ends must agree on the order of send_handle / recv_handle among their other messages.
+    status send_handle(std::intptr_t h) {
+#if defined(FORGE_OS_WINDOWS)
+        auto pc = peer(); if (!pc) return {{}, pc.err};
+        HANDLE proc = OpenProcess(PROCESS_DUP_HANDLE, FALSE, DWORD(pc.value.pid));
+        if (!proc) return {{}, last_error("OpenProcess(peer)")};
+        HANDLE remote = nullptr;
+        BOOL ok = DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(h), proc, &remote, 0, FALSE, DUPLICATE_SAME_ACCESS);
+        auto e = ok ? error{} : last_error("DuplicateHandle(peer)"); CloseHandle(proc);
+        if (!ok) return {{}, e};
+        unsigned char msg[9] = {'H'}; std::uint64_t v = std::uint64_t(reinterpret_cast<std::uintptr_t>(remote)); std::memcpy(msg + 1, &v, 8);
+        return write_all(msg, sizeof msg);
+#else
+        char b = 'H'; iovec io{&b, 1};
+        alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(int))] = {};
+        msghdr m{}; m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
+        cmsghdr* c = CMSG_FIRSTHDR(&m); c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+        int fd = int(h); std::memcpy(CMSG_DATA(c), &fd, sizeof fd);
+        for (;;) {
+#if defined(MSG_NOSIGNAL)
+            auto n = ::sendmsg(h_, &m, MSG_NOSIGNAL);
+#else
+            auto n = ::sendmsg(h_, &m, 0);
+#endif
+            if (n == 1) return {};
+            if (n < 0 && errno == EINTR) continue;
+            return {{}, last_error("sendmsg(SCM_RIGHTS)")};
+        }
+#endif
+    }
+    result<std::intptr_t> recv_handle() {
+#if defined(FORGE_OS_WINDOWS)
+        unsigned char msg[9] = {};
+        if (auto s = read_exact(msg, sizeof msg); !s) return {0, s.err};
+        if (msg[0] != 'H') return {0, {int(ERROR_INVALID_DATA), "recv_handle: the peer sent something else"}};
+        std::uint64_t v = 0; std::memcpy(&v, msg + 1, 8);
+        return {std::intptr_t(v), {}};
+#else
+        char b = 0; iovec io{&b, 1};
+        alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(int))] = {};
+        msghdr m{}; m.msg_iov = &io; m.msg_iovlen = 1; m.msg_control = ctl; m.msg_controllen = sizeof ctl;
+        ssize_t n;
+#if defined(MSG_CMSG_CLOEXEC)
+        do n = ::recvmsg(h_, &m, MSG_CMSG_CLOEXEC); while (n < 0 && errno == EINTR);
+#else
+        do n = ::recvmsg(h_, &m, 0); while (n < 0 && errno == EINTR);
+#endif
+        if (n < 0) return {-1, last_error("recvmsg")};
+        if (n == 0) return {-1, {-1, "local_stream: eof"}};
+        int fd = -1;
+        for (cmsghdr* c = CMSG_FIRSTHDR(&m); c; c = CMSG_NXTHDR(&m, c))
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS && fd < 0) std::memcpy(&fd, CMSG_DATA(c), sizeof fd);
+        if (b != 'H' || fd < 0) { if (fd >= 0) ::close(fd); return {-1, errno_error(EPROTO, "recv_handle: the peer sent something else")}; }
+#if !defined(MSG_CMSG_CLOEXEC)
+        ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+#endif
+        return {fd, {}};
+#endif
     }
     // Who is at the other end (either side may ask).
     result<peer_credentials> peer() const {

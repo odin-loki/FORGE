@@ -234,8 +234,11 @@ the library `forge_script_rt`, and the system libraries to link. The driver look
 
 - CMake builds `forge_script_rt` (target of the same name) and writes `<build>/aot-runtime/forge-aot-runtime.cfg`
   pointing at the source tree's headers.
-- `cmake --install` puts a self-contained copy under `<prefix>/lib/forge/aot`: `libforge_script_rt.a`,
-  `forge-script-run`, `forge-aot-runtime.cfg` and `include/`. An installed `forge` finds it there.
+- `cmake --install` puts the runtime under `<prefix>/lib/forge/aot`: `libforge_script_rt.a`, `forge-script-run`,
+  `forge-aot-runtime.cfg` and `include/` (`forge_aot_rt.hpp` and the interpreter's internal headers it builds on).
+  The `forge/core` and `forge/os` headers come from the package's own include directory, which the installed
+  file names relative to itself. An installed `forge` (in `<prefix>/bin`) finds the runtime there. The library is
+  also part of the CMake package as `forge::script_rt`.
 
 The file is `key=value` lines; `include`, `lib`, `cxxflag`, `ldflag`, `define` repeat; relative paths are relative
 to the file. `ldflag` entries are what the build that produced the library linked (for example the absolute paths

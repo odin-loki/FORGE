@@ -245,7 +245,7 @@ TEST(aot_semantics_capabilities) {
         "    std::string path = forge::args()[0];\n"
         "    try { w(path, \"data\"); std::println(\"fs ok\"); } catch (const PermissionError& x) { std::println(\"fs denied\"); }\n"
         "    try { e(\"HOME\", \"\"); std::println(\"env ok\"); } catch (const PermissionError& x) { std::println(\"env denied\"); }\n"
-        "    try { r(\"forge-aot-test-no-such-program\"); std::println(\"proc ok\"); } catch (const std::exception& x) { std::string m = x.what(); std::println(m.find(\"sandbox\") < m.size() ? \"proc denied\" : \"proc ok\"); }\n"
+        "    try { r(\"forge-aot-test-no-such-program\"); std::println(\"proc ok\"); } catch (const std::exception& x) { std::string m = x.what(); std::println(m.starts_with(\"spawn\") ? \"proc ok\" : \"proc denied\"); }\n"
         "    forge::sandbox(std::map<std::string, bool>{{\"fs\", false}}, [&] { try { w(path, \"again\"); std::println(\"sandbox fs ok\"); } catch (const PermissionError& x) { std::println(\"sandbox fs denied\"); } });\n"
         "    return 0;\n}\n";
     for (auto& [mode, cxx] : modes()) {

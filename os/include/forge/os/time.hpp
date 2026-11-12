@@ -154,6 +154,54 @@ inline result<std::int64_t> parse_iso8601(std::string_view s) {
     return {unix_ns_from_civil(c), {}};
 }
 
+// ---------------------------------------------------------------- clocks across suspend
+// os::monotonic_ns() is each system's default monotonic clock, and those disagree about time spent suspended
+// (Linux and macOS stop it, Windows and FreeBSD keep counting). These two say which they mean:
+//   boottime_ns()  nanoseconds since boot including time asleep: Linux / Android CLOCK_BOOTTIME, macOS / iOS
+//                  CLOCK_MONOTONIC_RAW (mach_continuous_time), FreeBSD CLOCK_MONOTONIC, Windows
+//                  QueryInterruptTimePrecise (GetTickCount64 before Windows 10).
+//   awake_ns()     nanoseconds the system has been running, not counting suspend: Linux / Android CLOCK_MONOTONIC,
+//                  macOS / iOS CLOCK_UPTIME_RAW, Windows QueryUnbiasedInterruptTime. FreeBSD keeps no such
+//                  clock (CLOCK_UPTIME counts suspend too), so there it equals boottime_ns().
+#if defined(FORGE_OS_WINDOWS)
+namespace detail_time {
+using interrupt_time_fn = void (WINAPI*)(PULONGLONG);
+inline interrupt_time_fn precise_fn(const char* name) {
+    HMODULE m = GetModuleHandleW(L"kernelbase.dll");
+    return m ? reinterpret_cast<interrupt_time_fn>(reinterpret_cast<void*>(GetProcAddress(m, name))) : nullptr;
+}
+}
+#endif
+inline std::uint64_t boottime_ns() {
+#if defined(FORGE_OS_WINDOWS)
+    static const auto f = detail_time::precise_fn("QueryInterruptTimePrecise");
+    if (f) { ULONGLONG t = 0; f(&t); return std::uint64_t(t) * 100ull; }
+    return std::uint64_t(GetTickCount64()) * 1000000ull;
+#elif defined(__APPLE__)
+    return clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW);
+#else
+    timespec ts{};
+#if defined(CLOCK_BOOTTIME) && defined(__linux__)
+    if (::clock_gettime(CLOCK_BOOTTIME, &ts) != 0)
+#endif
+        ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return std::uint64_t(ts.tv_sec) * 1000000000ull + std::uint64_t(ts.tv_nsec);
+#endif
+}
+inline std::uint64_t awake_ns() {
+#if defined(FORGE_OS_WINDOWS)
+    static const auto f = detail_time::precise_fn("QueryUnbiasedInterruptTimePrecise");
+    ULONGLONG t = 0;
+    if (f) f(&t); else QueryUnbiasedInterruptTime(&t);
+    return std::uint64_t(t) * 100ull;
+#elif defined(__APPLE__)
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+#else
+    timespec ts{}; ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return std::uint64_t(ts.tv_sec) * 1000000000ull + std::uint64_t(ts.tv_nsec);
+#endif
+}
+
 // ---------------------------------------------------------------- timer queue
 // One worker thread; callbacks run on it in deadline order. after()/every() return an id for cancel().
 class timer_queue {

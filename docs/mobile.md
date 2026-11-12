@@ -46,6 +46,11 @@ App glue: `feed_touch`, `feed_sensor`, `provide_sensor(kind)`, `feed_lifecycle`,
 | FreeBSD | Temperature from `dev.cpu.0.temperature` or the ACPI thermal zone, ACPI battery, evdev touchscreens (`INPUT_PROP_DIRECT`, monotonic clock, scaled once `report_display` gives the size), brightness through backlight(9) (`/dev/backlight/backlight*`, `BACKLIGHTGETSTATUS` / `BACKLIGHTUPDATESTATUS`, FreeBSD 13+; writing needs access to the node). `keep_awake`: FreeBSD has no idle inhibitor, so only under X11 (`DISPLAY` set, `xset` installed) the screen saver and DPMS are switched off and the earlier `xset q` settings restored afterwards (a crash leaves them off until X restarts); unsupported otherwise | Display through `report_display`; devd hot-plug forwarded by the app |
 | null | — | Everything unsupported |
 
+Header-only counterparts in `forge::os` (no `forge_mobile` needed) take the same glue through hooks:
+`clipboard::set_backend`, `set_open_hook`, `set_notification_hook`, `set_display_hook`, `net::set_proxy_hook`,
+`set_machine_id`. On iOS `os::clipboard` (UIPasteboard) and `os::open_url` work without glue. See
+[os-parity.md](os-parity.md).
+
 ## Simulator (JSON trace)
 `device::simulated(json)`, `simulated_file(path)` or `FORGE_MOBILE_TRACE=<file>`. Keys:
 
