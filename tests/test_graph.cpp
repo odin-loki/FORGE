@@ -271,6 +271,16 @@ TEST(codecs_exact_and_layout) {
     rt("q4_g32", g);                                                  // 16 levels, step 0.125, min -1
     CHECK(codecs::find("mxfp8")->bytes(64) == 66 && codecs::find("nvfp4")->bytes(16) == 9 && codecs::find("q4_g32")->bytes(33) == 40);
     for (auto& c : codecs::all()) CHECK(dtype_from_name(c.name) == c.tag);
+    // GGUF block formats added for the importer: data on the codec's own grid survives, block sizes as in GGUF
+    std::vector<float> q40(32), q51(32), nl(32), t256(256);
+    const int iq4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+    for (int i = 0; i < 32; ++i) { q40[i] = float(i % 16 - 8) * 0.25f; q51[i] = float(i) * 0.125f - 1.f; nl[i] = float(iq4[(i * 5) % 16]) * 0.0078125f; }
+    for (int i = 0; i < 256; ++i) t256[i] = float((i * 7 % 3) - 1) * 0.5f;
+    rt("q4_0", q40); rt("q5_0", q40); rt("q4_1", q40); rt("q5_1", q51); rt("iq4_nl", nl); rt("tq1_0", t256); rt("tq2_0", t256);
+    const std::pair<const char*, std::size_t> sizes[] = {{"q4_0", 18}, {"q4_1", 20}, {"q5_0", 22}, {"q5_1", 24}, {"iq4_nl", 18}};
+    for (auto& [n, b] : sizes) CHECK(codecs::find(n)->block == 32 && codecs::find(n)->block_bytes == b);
+    const std::pair<const char*, std::size_t> sizes_k[] = {{"q2_k", 84}, {"q3_k", 110}, {"iq4_xs", 136}, {"tq1_0", 54}, {"tq2_0", 66}};
+    for (auto& [n, b] : sizes_k) CHECK(codecs::find(n)->block == 256 && codecs::find(n)->block_bytes == b);
 }
 
 TEST(codecs_roundtrip) {
@@ -285,7 +295,9 @@ TEST(codecs_roundtrip) {
         static const std::map<std::string_view, double> bounds = {
             {"f32", 0}, {"f16", 2e-3}, {"bf16", 2e-2}, {"fp8_e4m3", 0.13}, {"fp8_e5m2", 0.26}, {"q8_0", 0.013}, {"q4_k", 0.25},
             {"q4_g32", 0.21}, {"q8_g32", 0.013}, {"mxfp8", 0.126}, {"mxfp6", 0.126}, {"mxfp4", 0.51}, {"mxint8", 0.016},
-            {"nvfp4", 0.51}, {"tq2", 3.0}, {"q6_k", 0.07}, {"q5_k", 0.13}};
+            {"nvfp4", 0.51}, {"tq2", 3.0}, {"q6_k", 0.07}, {"q5_k", 0.13},
+            {"q4_0", 0.4}, {"q4_1", 0.21}, {"q5_0", 0.2}, {"q5_1", 0.11}, {"q2_k", 1.25}, {"q3_k", 0.9}, {"iq4_nl", 0.45}, {"iq4_xs", 0.5},
+            {"tq1_0", 3.0}, {"tq2_0", 3.0}};
         CHECK_MSG(bounds.count(c.name), "no bound for %s", std::string(c.name).c_str());
         double bound = bounds.count(c.name) ? bounds.at(c.name) : 0;
         std::printf("  %-9s %5zu bytes  max err %.5f\n", std::string(c.name).c_str(), buf.size(), maxe);
@@ -304,7 +316,7 @@ TEST(qdot_matches_decode_exactly) {
     for (const char* tgt : {"scalar", "avx2", "avx512"}) {
         const auto* ker = simd::by_name(tgt);
         if (!ker) { std::printf("  qdot: target %s not available\n", tgt); continue; }
-        for (const char* cn : {"q8_0", "q4_k", "q6_k", "q5_k", "f16", "q8_g32"}) {
+        for (const char* cn : {"q8_0", "q4_k", "q6_k", "q5_k", "f16", "q8_g32", "q4_0", "q5_1", "q2_k", "q3_k", "iq4_nl", "iq4_xs", "tq1_0", "tq2_0"}) {
             const auto* c = codecs::find(cn);
             for (std::size_t k : {std::size_t(256), std::size_t(1024), std::size_t(768 + (c->block == 32 ? 96 : 0))}) {
                 auto w = verify::random_tensor({i64(k)}, r, -2, 2); auto x = verify::random_tensor({i64(k)}, r, -1, 1);
@@ -319,7 +331,7 @@ TEST(qdot_matches_decode_exactly) {
                 CHECK_MSG(std::memcmp(&a, &b, 4) == 0, "%s/%s k=%zu: qdot %.9g vs dot %.9g", tgt, cn, k, double(b), double(a));
             }
         }
-        std::printf("  qdot: %s exact for q8_0 q4_k q6_k q5_k f16 q8_g32\n", tgt);
+        std::printf("  qdot: %s exact for q8_0 q4_k q6_k q5_k f16 q8_g32 and the GGUF legacy / low-bit codecs (generic path)\n", tgt);
     }
 }
 
