@@ -326,11 +326,22 @@ TEST(qdot_matches_decode_exactly) {
 // Integer matvec (simd/qdot_i8.hpp): every ISA table this machine runs gives the scalar reference's bits, for
 // quantisation and products, and a vector's result does not depend on how many vectors ran with it. The
 // result stays close to the f32 product of the decoded weights (int8 activations: ~0.5% of sum |x*w|).
+static const char* const qi8_targets[] = {"scalar", "avx2", "avxvnni", "avx512vnni", "neon", "dotprod", "sve"};
+// FNV-1a of the scalar reference results on fixed raw blocks and fixed activations: one value for every platform.
+static constexpr std::uint64_t QI8_REF_HASH = 0xc763b823f7512501ull;
 TEST(qdot_i8_matches_reference_on_every_isa) {
     std::mt19937 r(5);
     const auto* ref = simd::qi8_by_name("scalar");
     CHECK(ref != nullptr);
-    std::printf("  qi8 active: %s\n", simd::qi8_active().target);
+    {
+        std::string have;
+        for (const char* tgt : qi8_targets) if (simd::qi8_by_name(tgt)) { have += ' '; have += tgt; }
+        std::printf("  qi8 active: %s, tables run:%s\n", simd::qi8_active().target, have.c_str());
+        CHECK(simd::qi8_by_name(simd::qi8_active().target) == &simd::qi8_active());
+#if defined(__aarch64__) || defined(_M_ARM64)
+        CHECK(simd::qi8_by_name("neon") != nullptr);   // mandatory: AArch64 always has a SIMD integer table
+#endif
+    }
     for (const char* cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) {
         const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
         for (std::size_t k : {std::size_t(256), std::size_t(1280)}) {
@@ -357,7 +368,7 @@ TEST(qdot_i8_matches_reference_on_every_isa) {
                               double(yref[v * rows + j]), exact, mag);
                 }
             }
-            for (const char* tgt : {"scalar", "avx2", "avxvnni", "avx512vnni"}) {
+            for (const char* tgt : qi8_targets) {
                 const auto* ker = simd::qi8_by_name(tgt);
                 if (!ker) continue;
                 for (std::size_t v = 0; v < nvmax; ++v) ker->quantize(fmt, X.data.data() + v * k, k, aq + v * ab);
@@ -374,6 +385,53 @@ TEST(qdot_i8_matches_reference_on_every_isa) {
             }
         }
     }
+    // Raw blocks at the ends of every integer range: all-ones weight bytes (largest K-quant values, sub-scales and
+    // mins; q8_0 weights -1), 0x80 (q8_0 weights -128, q6_k scales -128), 0x7f, and random bytes, against
+    // activations saturated at +127 / -127 / alternating, one with a NaN, and random ones. Intermediate int16 /
+    // int32 sums of a SIMD table must not wrap or saturate. The f16 scale fields are set finite.
+    std::uint64_t ref_hash = 1469598103934665603ull;
+    for (const char* cn : {"q8_0", "q4_k", "q5_k", "q6_k"}) {
+        const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
+        const std::size_t k = 512, rows = 9, nv = 8, rb = c->bytes(k), ab = simd::qi8::act_bytes(fmt, k), bb = simd::qi8::block_bytes(fmt);
+        std::vector<float> X(nv * k);
+        for (std::size_t v = 0; v < nv; ++v)
+            for (std::size_t i = 0; i < k; ++i)
+                X[v * k + i] = v == 0 ? 1.f : v == 1 ? -1.f : v == 2 ? (i & 1 ? 1.f : -1.f) : v == 3 ? (i % 3 ? -1.f : 1.f)
+                             : v == 4 ? (i == 7 ? std::numeric_limits<float>::quiet_NaN() : i & 2 ? 0.5f : -1.f)
+                             : std::uniform_real_distribution<float>(-1, 1)(r);
+        std::vector<simd::qi8::act_k> abuf_ref((nv * ab) / sizeof(simd::qi8::act_k) + 1), abuf((nv * ab) / sizeof(simd::qi8::act_k) + 1);
+        auto* aref = reinterpret_cast<u8*>(abuf_ref.data()); auto* aq = reinterpret_cast<u8*>(abuf.data());
+        for (std::size_t v = 0; v < nv; ++v) ref->quantize(fmt, X.data() + v * k, k, aref + v * ab);
+        for (int pat = 0; pat < 5; ++pat) {
+            std::vector<u8> enc(rows * rb);
+            for (auto& b : enc) b = pat == 0 ? u8(0xFF) : pat == 1 ? u8(0x80) : pat == 2 ? u8(0x7F) : u8(r());
+            const std::uint16_t fin = 0x2000;   // a small finite f16
+            for (std::size_t blk = 0; blk < rows * rb / bb; ++blk) {
+                u8* p = enc.data() + blk * bb;
+                if (std::string_view(cn) == "q6_k") std::memcpy(p + 208, &fin, 2);
+                else { std::memcpy(p, &fin, 2); if (std::string_view(cn) != "q8_0") std::memcpy(p + 2, &fin, 2); }
+            }
+            std::vector<float> yref(nv * rows), y(nv * rows);
+            ref->matvec(fmt, enc.data(), rb, rows, aref, ab, k, nv, yref.data(), rows);
+            if (pat < 3)   // fixed inputs (vectors 0..4): the same bits on every architecture and standard library
+                for (std::size_t i = 0; i < 5 * rows * 4; ++i) ref_hash = (ref_hash ^ reinterpret_cast<const u8*>(yref.data())[i]) * 1099511628211ull;
+            for (const char* tgt : qi8_targets) {
+                const auto* ker = simd::qi8_by_name(tgt);
+                if (!ker) continue;
+                if (pat == 0) {
+                    for (std::size_t v = 0; v < nv; ++v) ker->quantize(fmt, X.data() + v * k, k, aq + v * ab);
+                    CHECK_MSG(std::memcmp(aq, aref, nv * ab) == 0, "%s/%s: quantised saturated / NaN activations differ", tgt, cn);
+                }
+                for (std::size_t n : {std::size_t(1), nv}) {
+                    std::fill(y.begin(), y.end(), -1.f);
+                    ker->matvec(fmt, enc.data(), rb, rows, aref, ab, k, n, y.data(), rows);
+                    CHECK_MSG(std::memcmp(y.data(), yref.data(), n * rows * 4) == 0, "%s/%s pattern %d nv=%zu: extreme values differ from the scalar reference", tgt, cn, pat, n);
+                }
+            }
+        }
+    }
+    std::printf("  qi8 reference hash (fixed raw blocks): %016llx\n", static_cast<unsigned long long>(ref_hash));
+    CHECK_MSG(ref_hash == QI8_REF_HASH, "the scalar integer reference gives other bits here than on x86-64 / AArch64");
     // the whole graph path: a batch of activation rows gives each row's single-row bits
     for (const char* cn : {"q4_k", "q6_k", "q8_0"}) {
         const auto* c = codecs::find(cn); int fmt = qweights::fmt_of(c);
