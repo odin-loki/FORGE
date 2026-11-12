@@ -21,6 +21,7 @@
 | Vulkan | `tests/test_vulkan.cpp` | `test_vulkan`, `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`), label `gpu` |
 | GPU compile checks | generated kernels compiled with clang | `gpu_compile_{cuda,hip,opencl,opencl_nofp64,metal_syntax}`, and `gpu_compile_metal` with `xcrun`; label `gpu` |
 | Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` (`tools/sbom.py`: the SPDX 2.3 and the CycloneDX 1.5 output) |
+| Server API | `tests/serve_api_test.py`: request fields (`n`, `logprobs`, `logit_bias`, stop ids, ...), end-of-turn stops, tool calling, keep-alive / pipelining / chunked bodies / limits, graceful shutdown, `--lora`. `tests/serve_auth_test.py`: API keys, rate limits, quotas, TLS and mutual TLS (certificates from the `openssl` command; the TLS part is skipped, with a message, when forge-serve has no OpenSSL) | `serve_api`, `serve_auth` (need `golden_tiny_llama` to have run) |
 | Embedding server | `tests/serve_embeddings_test.py`: `/v1/embeddings` on the tiny BERT of the bert golden against `forge embed`, 400 on a generative model | `serve_embeddings` (needs `golden_tiny_bert` and `golden_tiny_llama` to have run) |
 | C ABI | `tests/capi_smoke.c` | `capi_smoke` (not built when cross-compiling) |
 | Installed package | `tests/install_consumer/` (install to a scratch prefix, then `find_package(forge)` from a C++ and a C program; see [building.md](building.md#the-install_consumer-test)) | `install_consumer`, label `install` (not for cross or sanitizer builds) |
@@ -113,7 +114,7 @@ By default each fuzz target links a small built-in mutation driver (`fuzz/driver
 
 | Target | Input | What counts as a finding besides a crash or sanitizer report |
 |--------|-------|------|
-| `fuzz_serve_http` | forge-serve's HTTP request reader (`apps/serve_http.hpp`), fed in fuzzer-chosen `recv()` sizes | any exception |
+| `fuzz_serve_http` | forge-serve's HTTP request reader (`apps/serve_http.hpp`), fed in fuzzer-chosen `recv()` sizes as a kept-alive connection: pipelined requests, `Content-Length` and chunked bodies, `Expect: 100-continue`, with small limits | any exception; a body over the limit, a body without framing, both framings accepted, a malformed method / target / header name accepted |
 | `fuzz_proxy_http` | the L7 proxy (`loadbalancer/proxy.hpp`): the client loop against an empty pool, then the upstream response parser | any exception |
 | `fuzz_rpc` | `authorized_keys`, token file, client map and permission list parsers; FRPC op frames, FRPS/FRPZ script frames and the FRPH handshake sent to real `rpc::server` instances on 127.0.0.1 | a reply larger than a frame allows |
 | `fuzz_json_schema` | JSON Schema → GBNF (`response_format`) | an accepted schema whose grammar the GBNF parser rejects |

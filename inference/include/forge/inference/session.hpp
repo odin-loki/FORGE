@@ -5,6 +5,7 @@
 // session : one sequence's mutable state (KV state store, position). Many sessions may share a model;
 //           runs are serialised on the model (plans own a scratch arena), state is per session.
 #include <forge/graph/graph.hpp>
+#include <forge/import/safetensors.hpp>
 #include <forge/inference/aot.hpp>
 #include <forge/inference/sampler.hpp>
 #include <forge/modelfile/blueprint.hpp>
@@ -185,7 +186,20 @@ public:
         if (!adapters_.emplace(name, std::move(merged)).second) raise(errc::invalid_argument, "adapter '{}' already loaded", name);
     }
     // Load an adapter from a .fpk holding "<weight>.lora_a" / "<weight>.lora_b" tensors; alpha from the manifest.
+    // A .safetensors file with the same tensor names works too (f32 / f16 / bf16 data); its alpha is the optional
+    // one-element tensor "lora_alpha" (default 1).
     void add_adapter_file(const std::string& name, const std::string& path) {
+        if (path.size() > 12 && path.compare(path.size() - 12, 12, ".safetensors") == 0) {
+            import::safetensors st(path); std::map<std::string, lora> d; float alpha = 1.f;
+            for (auto& [n, e] : st.entries()) {
+                if (n == "lora_alpha") { auto t = st.load(n); if (!t.data.empty()) alpha = t.data[0]; continue; }
+                auto cut = n.rfind(".lora_"); if (cut == std::string::npos) continue;
+                auto& l = d[n.substr(0, cut)]; (n.substr(cut) == ".lora_a" ? l.a : l.b) = st.load(n);
+            }
+            if (d.empty()) raise(errc::invalid_argument, "adapter {}: {} holds no <weight>.lora_a / <weight>.lora_b tensors", name, path);
+            add_adapter(name, d, alpha);
+            return;
+        }
         modelfile::reader ar(path); std::map<std::string, lora> d;
         for (auto& [n, e] : ar.tensors()) {
             auto cut = n.rfind(".lora_"); if (cut == std::string::npos) continue;
@@ -193,7 +207,8 @@ public:
         }
         add_adapter(name, d, float(ar.manifest().num_or("lora_alpha", 1)));
     }
-    bool has_adapter(const std::string& n) const { return n.empty() || adapters_.count(n); }
+    bool has_adapter(const std::string& n) const { if (n.empty()) return true; std::lock_guard lk(w_mu_); return adapters_.count(n) != 0; }
+    std::vector<std::string> adapter_names() const { std::lock_guard lk(w_mu_); std::vector<std::string> v; for (auto& [k, a] : adapters_) v.push_back(k); return v; }
     std::size_t loaded_weights() const { return weights_.size(); }
 
     // plan for `n` new tokens; all_rows keeps logits for every position
@@ -252,7 +267,7 @@ private:
     graph::plan_cache cache_;
     std::map<std::string, tensor> weights_;
     std::map<std::string, std::map<std::string, tensor>> adapters_;
-    std::mutex w_mu_, run_mu_;
+    mutable std::mutex w_mu_; std::mutex run_mu_;
     std::unique_ptr<graph::registry> reg_;
     std::string device_ = "cpu";
     i64 vocab_ = 0;
@@ -507,6 +522,25 @@ public:
         auto e = pair ? tk->encode_pair(text, *pair) : tk->encode_typed(text);
         if (n_tokens) *n_tokens = e.ids.size();
         return embed(e.ids, e.type_ids);
+    }
+    // Several token sequences in one call: one vector per input, in input order. The graph has no batch axis, so this
+    // is a loop with shared setup, not one batched pass: every input is checked before anything runs (a bad one fails
+    // the call without partial work), and the inputs run shortest first so each sequence length compiles its plan and
+    // builds its executor once (both are cached per length on the model / session and reused by later calls).
+    // `types`, when not empty, holds one token-type list per input (an empty list = zeros).
+    std::vector<std::vector<float>> embed_batch(std::span<const std::vector<int>> ids, std::span<const std::vector<int>> types = {}) {
+        check_embedding();
+        if (!types.empty() && types.size() != ids.size()) raise(errc::invalid_argument, "embed_batch: token types must be given for every input or for none");
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i].empty()) raise(errc::invalid_argument, "embed_batch: input {} has no tokens", i);
+            if (i64(ids[i].size()) > m_->max_context()) raise(errc::invalid_argument, "embed_batch: input {} is {} tokens, more than the model's {} positions", i, ids[i].size(), m_->max_context());
+            if (!types.empty() && !types[i].empty() && types[i].size() != ids[i].size()) raise(errc::invalid_argument, "embed_batch: input {} has {} tokens but {} token types", i, ids[i].size(), types[i].size());
+        }
+        std::vector<std::size_t> order(ids.size()); std::iota(order.begin(), order.end(), std::size_t(0));
+        std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) { return ids[a].size() < ids[b].size(); });
+        std::vector<std::vector<float>> out(ids.size());
+        for (auto i : order) out[i] = embed(ids[i], types.empty() ? std::span<const int>{} : std::span<const int>(types[i]));
+        return out;
     }
     // Any embedding model: named f32 inputs as the blueprint declares them (an image [c, h, w], mel frames
     // [n_mels, frames], or the token inputs above). `seq` binds the symbolic `seq` dimension when there is one.

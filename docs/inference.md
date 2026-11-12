@@ -24,7 +24,8 @@ Architectures come from the import templates (Hugging Face: Llama/Mistral/Qwen2,
 | `tokenizer()` | `const modelfile::tokenizer*`, `nullptr` if the file has none |
 | `vocab()`, `max_context()` | `max_context` is manifest `max_position_embeddings`, 2048 if absent |
 | `add_adapter(name, {weight → {a, b}}, alpha)` | LoRA: `W' = W + (alpha / r) · B·A` (PEFT layout, A `[r, in]`, B `[out, r]`). Only targeted matrices are copied; names are immutable once added |
-| `add_adapter_file(name, path)` | Loads `<weight>.lora_a` / `<weight>.lora_b` tensors from an `.fpk`; alpha from manifest `lora_alpha` (default 1) |
+| `add_adapter_file(name, path)` | Loads `<weight>.lora_a` / `<weight>.lora_b` tensors from an `.fpk` (alpha from manifest `lora_alpha`, default 1) or from a `.safetensors` (alpha from a one-element tensor `lora_alpha`) |
+| `adapter_names()` | The loaded adapters, sorted |
 | `has_adapter(name)` | `""` (base) is always present |
 
 Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>...]` make `model` refuse files without a valid (trusted) signature, whatever `verify` says.
@@ -68,6 +69,7 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 | `presence_penalty`, `frequency_penalty` | 0, 0 | OpenAI-style, subtracted from logits |
 | `repetition_window` | 64 | History length all three penalties look at |
 | `seed` | 0 | `mt19937_64` seed |
+| `logit_bias` | empty | `{token id, bias}` pairs added to the raw logits before everything else; ids outside the vocabulary are ignored. Non-empty turns plain-greedy device argmax off |
 
 `sampler` also has `probs(logits, history)` (full distribution after the chain), `draw(p)` and a public `filter` hook (`std::function<void(std::span<float>)>`).
 
@@ -81,8 +83,8 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 
 ### Grammars and JSON Schema
 - `grammar(src, root = "root")` (`grammar.hpp`) parses GBNF in the llama.cpp dialect: rules, literals with `\n \t \r \\ \" \xHH`, byte classes with ranges and `^`, grouping, `|`, `* + ?`, `#` comments. Matching is byte-level. Left recursion is rejected.
-- `grammar_constraint(shared_ptr<const grammar>, tokenizer, vocab, eos)` masks tokens that cannot continue (`apply(logits)`), advances on `accept(token)`, and reports `can_end()` / `finished()`. EOS is allowed only when the grammar can end.
-- `json_schema_to_gbnf(json::value)` (`json_schema.hpp`) converts a JSON Schema subset to GBNF producing compact JSON (no whitespace): `type` (incl. lists), `properties` (declaration order; not in `required` = optional), `items`, `minItems`/`maxItems` ≤ 64, `enum`, `const`, `anyOf`/`oneOf`, `$ref` to `#/$defs/*` or `#/definitions/*`. An empty schema accepts any JSON value. Other keywords are ignored or rejected with `invalid_argument`.
+- `grammar_constraint(shared_ptr<const grammar>, tokenizer, vocab, eos, ends = {})` masks tokens that cannot continue (`apply(logits)`), advances on `accept(token)`, and reports `can_end()` / `finished()`. EOS is allowed only when the grammar can end. `ends` are further token ids treated like EOS (a chat model's end-of-turn tokens); the scheduler passes a request's `stop_tokens`.
+- `json_schema_to_gbnf(json::value)` (`json_schema.hpp`) converts a JSON Schema subset to GBNF producing compact JSON (no whitespace): `type` (incl. lists), `properties` (declaration order; not in `required` = optional), `items`, `minItems`/`maxItems` ≤ 64, `enum`, `const`, `anyOf`/`oneOf`, `$ref` to `#/$defs/*` or `#/definitions/*`. An empty schema accepts any JSON value. Other keywords are ignored or rejected with `invalid_argument`. `json_schema_rules(schema, prefix, rules)` appends one schema's rules under prefixed names and returns its root expression, for grammars that hold several schemas (tool calls); such a grammar also needs `json_schema_base_rules()`.
 
 ### Chat templates (`chat_template.hpp`)
 `model::chat_template()` is the model's Jinja template (empty when the file has none). `apply_chat_template(model, messages, chat_options)` renders it with `bos_token` / `eos_token` from the tokenizer; tokenize the result with `encode(text)` (no BOS: the template writes it). `render_chat_template(source, messages, options)` and the `chat_template` class (parse once, render many times) work on any template text.
@@ -100,6 +102,20 @@ The renderer is FORGE's own implementation of the Jinja2 subset chat templates u
 
 It is tested against goldens rendered by jinja2 3.1 (`tests/data/chat_template/make_goldens.py`) for ChatML, Qwen2.5, Qwen3, Llama-2, Llama-3, Llama-3.1, Mistral v0.1 and v0.3, Gemma, Phi-3, DeepSeek, DeepSeek-R1 and Zephyr templates, with and without tools. Those template texts were written from memory of the published ones, so the test shows FORGE renders them as jinja2 does, not that they are byte-for-byte the vendors' files. `fuzz_chat_template` feeds it arbitrary templates.
 
+### Chat tools (`chat_tools.hpp`)
+What a chat front end needs besides the template. forge-serve ([serve.md](serve.md#chat-models-end-of-turn-and-tool-calls)), `forge run --chat` and the C ABI use it.
+
+| Function | Meaning |
+|---|---|
+| `end_of_turn_tokens(model, chat = true)` | Token ids that end an assistant turn: EOS, the manifest's `eos_token_ids`, and (with `chat`) the end-of-turn markers that are tokens of the model and appear in its chat template (`<\|im_end\|>`, `<\|eot_id\|>`, `<end_of_turn>`, ...). At most 64 |
+| `detect_tool_format(template)` | `tool_format::hermes`, `mistral`, `llama3` or `generic`, read off the template text |
+| `tool_decls(tools)` | The function tools of an OpenAI `tools` array (`name`, `parameters`); raises on a malformed list |
+| `tool_call_grammar(format, tools, only = "", parallel = false)` | GBNF that forces a call in that format; the arguments follow each function's `parameters` schema. `only` restricts it to one function, `parallel` allows several calls (hermes, mistral) |
+| `tool_call_parser(format, names)` | `update(text, final)` with the whole text so far; `content_end()` is how much of it is ordinary content, `calls()` the calls seen (name, arguments so far, `done`), `finished()` the completed ones with normalised arguments. Iterative scanner: no recursion, at most 64 calls, never throws on malformed output |
+| `normalize_tool_messages(messages)` | Assistant `tool_calls[].function.arguments` given as JSON strings become objects (what templates expect) |
+
+Tests: `tests/test_chat_tools.cpp` (all four formats, byte-by-byte parsing, grammar and parser agree, hostile inputs).
+
 ### Continuous batching (`batch.hpp`)
 `batch_scheduler(shared_ptr<model>, batch_options)`. Each `step()` admits waiting requests up to `max_active`, prefills newcomers in chunks of `prefill_chunk` tokens and advances every active sequence by one token.
 
@@ -113,9 +129,13 @@ It is tested against goldens rendered by jinja2 3.1 (`tests/data/chat_template/m
 | `spill` | `nullptr` | `mem::spill_store`: evicted prefixes are written to disk (`save_prefix`) and read back on a hit instead of recomputed |
 | `spill_entries` | 64 | Maximum prefixes kept in the spill store |
 
-`request` fields: `prompt`, `max_new` (64), `sampling`, `grammar` (`shared_ptr<const grammar>`), `stop_tokens` (in addition to EOS), `priority` (higher first, FIFO within a priority), `on_token(int)` (return `false` to cancel), `on_done(tokens, finish_reason)`. `finish_reason` is `stop`, `length`, `grammar` (sampled token rejected), `cancelled`, or `error: <message>`.
+`request` fields: `prompt`, `max_new` (64), `sampling`, `grammar` (`shared_ptr<const grammar>`), `stop_tokens` (in addition to EOS; with a grammar they are allowed where the grammar can end), `priority` (higher first, FIFO within a priority), `adapter` (a LoRA adapter of the model, `""` = base), `top_logprobs` (-1 = off) with `on_logprobs(token_logprob)` (the sampled token's log-probability and the `top_logprobs` likeliest tokens under the model's raw distribution; called before `on_token` for the same token), `on_token(int)` (return `false` to cancel), `on_done(tokens, finish_reason)`. `finish_reason` is `stop`, `length`, `grammar` (sampled token rejected), `cancelled`, or `error: <message>`.
 
-Methods: `submit(request)` → id, `cancel(id)`, `step()`, `run_until_idle()`, `start()` / `stop()` (background worker), `request_kv_eviction(keep)` (safe from any thread), `idle()`, `waiting()`, `active_count()`, `spilled()`, `evictions()`, `stats()`. `batch_stats`: `steps`, `completed`, `prefix_hits`, `prefix_tokens_reused`, `peak_active`, `peak_kv_bytes`, `deferred`, `prefix_spills`, `prefix_reloads`, `prefix_reload_failures` (spilled prefixes whose file was unreadable or failed authentication: discarded and recomputed).
+**Adapters.** Requests with different adapters run in the same batch: each sequence has its own session, which selects its adapter's plans. A cached prefix (in memory or spilled) records the adapter its KV rows were computed with and is only matched by requests naming the same one.
+
+**Failures stay with their request.** A request that cannot be admitted (unknown adapter, empty prompt, a prompt that leaves no room for a new token in the context, a grammar on a model without a tokenizer) or whose step throws gets `on_done` with `error: <message>` and is counted in `batch_stats::failed`; the other requests continue. Its KV state is not put in the prefix cache.
+
+Methods: `submit(request)` → id, `cancel(id)`, `step()`, `run_until_idle()`, `start()` / `stop()` (background worker), `request_kv_eviction(keep)` (safe from any thread), `idle()`, `waiting()`, `active_count()`, `spilled()`, `evictions()`, `stats()`. `batch_stats`: `steps`, `completed`, `prefix_hits`, `prefix_tokens_reused`, `peak_active`, `peak_kv_bytes`, `deferred`, `prefix_spills`, `prefix_reloads`, `prefix_reload_failures` (spilled prefixes whose file was unreadable or failed authentication: discarded and recomputed), `failed`.
 
 A new prompt reuses the longest prefix it shares with a cached (in memory or spilled) sequence, always leaving at least one prompt token to compute.
 
@@ -125,6 +145,7 @@ A blueprint that ends with `session embedding` is an embedding model: one statel
 | Member | Meaning |
 |---|---|
 | `embed(ids, token_types = {}, mask = {})` | Token models. Feeds the inputs the blueprint declares out of `tokens`, `positions` (0 .. n-1), `token_types` (zeros unless given) and `mask` (ones unless given; 0 marks padding, which the `bert` template masks out of attention and of mean pooling). Returns the vector |
+| `embed_batch(ids_list, types_list = {})` | Several token sequences, one vector each, in input order. **A loop with shared setup, not a batch axis**: every input is checked before anything runs, inputs run shortest first, and the plan and executor of each sequence length are built once and reused. Used by `/v1/embeddings` |
 | `embed_text(text, pair = nullptr, n_tokens = nullptr)` | Text through the model's tokenizer (`encode_typed` / `encode_pair`: special tokens and token types from its post-processor), then `embed`. `not_found` when the file has no tokenizer |
 | `embed_inputs({name → data}, seq = 1)` | Any embedding model: named f32 inputs as declared (`image` `[channels, size, size]`, `mel` `[n_mels, frames]`, or the token inputs). Returns the first output, flattened row-major |
 | `embedding_shape(seq = 1)` | Declared shape of that output, e.g. `{384}` or `{1500, 384}` |
@@ -175,7 +196,7 @@ bs.run_until_idle();
 
 - CPU attention (`graph/attn_cpu.hpp`, kernels in `simd/seq.hpp`) cuts positions into absolute 256-position chunks; a work item (KV head, query-token block, chunk) serves every query head of the GQA group, so each K/V row (f32 or int8) is converted once per item. Chunk partials (max, sum of exponentials, weighted V) merge in chunk order (flash-decoding), so a token gets identical bits alone or inside a prefill block, and the scalar, AVX2 and AVX-512 tables agree bit for bit (own exp, fixed reduction trees, no contraction). It is the default with an int8 KV cache (Qwen3.5 9B, 1K tokens, 32 threads: prefill 3.2 → 6.4 tok/s, decode 0.6 → 2.2 on a loaded machine); with f32 KV the previous kernel stays the default until the chunked one is shown faster there (`FORGE_CPU_ATTN=new` opts in, `old` restores the previous kernel everywhere). The int16-query path from the janas study is opt-in (`FORGE_CPU_ATTN=q16`): with int8 keys each query row is quantised to int16 codes with one scale (amax / 32767; fewer levels above head dim 512 so an int32 cannot overflow) and q·k is an exact int32 sum of int16 × int8 products (`pmaddwd` on x86, plain integer code elsewhere), so the tables still agree bit for bit and a token still gets identical bits alone or inside a block. Against the float-query kernel the attention output moves by about 1e-5 (N(0,1) values) and the tiny test model's logits by 4e-4 of the largest logit. Time of one `attn_chunk` call (int8 K and V, head dim 64 / 128 / 256, 256 positions, scoring + softmax + values) against the float-query kernel, on a 4-core AVX-512 VM under heavy load from other jobs, best of 25, two runs: with 1–2 query rows per item (decode) 1.07–1.36× faster on both AVX2 and AVX-512; with 8 or 64 rows AVX2 1.03–1.2×, AVX-512 0.8–1.45× (about level, sometimes slower); scalar 1.2–3×. Those timings are too noisy to change a default, and no model-level run has been made. A head-major int8 KV layout is not implemented.
 - CPU delta_rule works per (value head, 32 value columns): one visit to the state slice per token, all tokens of a call walked with the slice in L1. The state stays f32 `[Hv, dk, dv]` (shared with the GPU kernels); `FORGE_CPU_DELTA=old` restores the previous kernel.
-- Tests: `tests/test_inference.cpp` covers paged KV, `forward_all`, rewind / `copy_prefix`, speculative and lookup decoding (planner, n-gram index, seed-exact lookup, recurrent rollback), penalties, grammars, JSON Schema, batching (priority, cancel, threaded), typical / Mirostat and LoRA. Prefix spill is covered in `tests/test_memory.cpp`.
+- Tests: `tests/test_inference.cpp` covers paged KV, `forward_all`, rewind / `copy_prefix`, speculative and lookup decoding (planner, n-gram index, seed-exact lookup, recurrent rollback), penalties, grammars, JSON Schema, batching (priority, cancel, threaded), typical / Mirostat and LoRA. `tests/test_chat_tools.cpp` covers per-request adapters and the adapter-keyed prefix cache (in memory and spilled), failure isolation, log-probabilities, logit bias, stop tokens with a grammar, and `.safetensors` adapters. Prefix spill is covered in `tests/test_memory.cpp`.
 - The golden test models have random weights, so their text is meaningless. Tests compare numerics against references (`verify/golden/*.py`), not text quality.
 - Recurrent state (e.g. Qwen3.5's Gated DeltaNet layers) cannot be cut: plain `rewind`, `copy_prefix` / `save_prefix` with fewer tokens than held raise `unsupported` (speculative decoding uses `forward_spec` / `spec_rewind` or a checkpoint instead). In `batch_scheduler` a partial prefix-cache hit on such a model raises inside `step()`, which ends the active requests with `error: ...` (read from the code; no test covers it).
 - Runs on one `model` are serialised. Many sessions on one model do not run in parallel; `batch_scheduler` interleaves them step by step.

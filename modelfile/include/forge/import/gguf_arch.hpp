@@ -130,6 +130,7 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     else for (auto& kv : extra) if (kv.first == "add_bos") man.push_back(kv);
     if (auto* ae = g.get("tokenizer.ggml.add_eos_token"); arch != "bert" && ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
     for (auto& kv : extra) if (kv.first != "add_bos") man.push_back(kv);
+    if (arch != "bert") gguf_eos_ids(g, man);
     {   // licence, as import_gguf records it
         license_info lic;
         auto gs = [&](const char* k) { auto* v = g.get(k); return v && v->is_str() ? v->str() : std::string(); };

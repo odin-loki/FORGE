@@ -936,6 +936,9 @@ if(FORGE_BUILD_APPS)
   target_link_libraries(forge PRIVATE forge_security)   # forge security check
   add_executable(forge-serve apps/forge_serve.cpp)
   target_link_libraries(forge-serve PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
+  if(TARGET forge_rpc_tls)   # --tls-cert / --tls-key / --tls-client-ca; without OpenSSL forge-serve is plain HTTP only
+    target_link_libraries(forge-serve PRIVATE forge_rpc_tls)
+  endif()
 endif()
 
 if(FORGE_BUILD_TESTS)
@@ -1574,6 +1577,14 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # request fields, tool calling, HTTP behaviour (keep-alive, chunked bodies, limits, shutdown) and --lora
+      add_test(NAME serve_api COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_api_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden/hf ${PROJECT_BINARY_DIR}/serve_api)
+      set_tests_properties(serve_api PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 600)
+      # API keys, rate limits and quotas; TLS and mutual TLS (skipped parts are printed when the build has no OpenSSL)
+      add_test(NAME serve_auth COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_auth_test.py
+               $<TARGET_FILE:forge-serve> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/serve_auth)
+      set_tests_properties(serve_auth PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 300)
       # /v1/embeddings on a `session embedding` model (the tiny BERT the bert golden imports), 400 on a generative one
       add_test(NAME serve_embeddings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_embeddings_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk
@@ -1605,7 +1616,7 @@ if(FORGE_BUILD_TESTS)
       golden_gguf_types golden_hf_quant
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
-      capi_smoke python_bindings serve_http security_cli modelfile_signing)
+      capi_smoke python_bindings serve_http serve_api serve_auth security_cli modelfile_signing)
     foreach(_g ${FORGE_GOLDEN_FAMILIES})   # the family goldens (and the mock-device runs of them, where defined)
       forge_py_needs("numpy;safetensors" golden_tiny_${_g} golden_tiny_${_g}_cuda_mock golden_tiny_${_g}_opencl_mock)
     endforeach()
