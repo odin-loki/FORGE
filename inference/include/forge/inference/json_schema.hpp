@@ -22,9 +22,13 @@ inline std::string lit(const std::string& s) {      // GBNF literal for raw byte
 }
 struct conv {
     const json::value& root; std::string out; std::map<std::string, std::string> refs; int n = 0;
+    // Schemas come from requests. A "type" list is expanded once per listed type, so nesting such lists costs
+    // 2^depth visits from a few hundred bytes; the conversion stops at this many subschema visits.
+    int budget = 20000;
     std::string fresh(const std::string& base) { return base + std::to_string(n++); }
     void def(const std::string& name, const std::string& body) { out += name + " ::= " + body + "\n"; }
     std::string visit(const json::value& s) {
+        if (--budget < 0) return throw_bad("schema too complex (more than 20000 subschema visits)");
         if (s.is_bool()) return s.b() ? "value" : throw_bad("false schema");
         if (!s.is_obj()) return throw_bad("schema must be an object");
         if (auto* r = s.find("$ref")) {
@@ -39,8 +43,12 @@ struct conv {
         for (auto k : {"anyOf", "oneOf"}) if (auto* a = s.find(k)) { std::string b; for (auto& v : a->arr()) b += (b.empty() ? "" : " | ") + visit(v); return "(" + b + ")"; }
         auto* t = s.find("type");
         if (!t) return s.find("properties") ? object(s) : "value";
-        if (t->is_arr()) { std::string b; for (auto& v : t->arr()) { json::object o = s.obj(); for (auto& [k, x] : o) if (k == "type") x = v; b += (b.empty() ? "" : " | ") + visit(json::value(o)); } return "(" + b + ")"; }
-        auto& ty = t->str();
+        // A list of types: the schema once per type (no copy of the schema: nested lists cost 2^depth visits)
+        if (t->is_arr()) { std::string b; for (auto& v : t->arr()) b += (b.empty() ? "" : " | ") + typed(s, v.str()); return "(" + b + ")"; }
+        return typed(s, t->str());
+    }
+    std::string typed(const json::value& s, const std::string& ty) {
+        if (--budget < 0) return throw_bad("schema too complex (more than 20000 subschema visits)");
         if (ty == "string") return "string";
         if (ty == "number") return "number";
         if (ty == "integer") return "integer";
@@ -49,8 +57,11 @@ struct conv {
         if (ty == "object") return object(s);
         if (ty == "array") {
             std::string it = s.find("items") ? visit(s["items"]) : "value";
-            std::string nm = fresh("arr"); long lo = long(s.num_or("minItems", 0)), hi = long(s.num_or("maxItems", -1));
-            if (lo > 64 || hi > 64) return throw_bad("minItems/maxItems above 64");
+            // Bounds are checked as doubles before the conversion (long(1e300) is undefined); a negative minItems
+            // means none, a negative maxItems unbounded.
+            double dlo = s.num_or("minItems", 0), dhi = s.num_or("maxItems", -1);
+            if (!(dlo <= 64) || !(dhi <= 64)) return throw_bad("minItems/maxItems above 64");
+            std::string nm = fresh("arr"); long lo = dlo < 0 ? 0 : long(dlo), hi = dhi < 0 ? -1 : long(dhi);
             std::string b = "\"[\"";
             if (hi == 0) { def(nm, "\"[]\""); return nm; }
             std::string req; for (long i = 0; i < lo; ++i) req += (i ? " \",\" " : " ") + it;
