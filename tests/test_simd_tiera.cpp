@@ -21,7 +21,8 @@ using namespace forge::simd;
 namespace {
 std::vector<const tier_a_kernels*> tables() {
     std::vector<const tier_a_kernels*> v;
-    for (const char* t : {"scalar", "avx2", "avx512"}) if (auto* k = tier_a_by_name(t)) v.push_back(k);
+    v.push_back(tier_a_by_name("scalar"));
+    for (const char* t : target_names()) if (auto* k = tier_a_by_name(t)) if (k != v[0]) v.push_back(k);   // every table usable on this CPU
     return v;
 }
 struct rng {

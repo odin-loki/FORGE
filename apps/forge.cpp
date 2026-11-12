@@ -519,7 +519,7 @@ int cmd_bench_kernels(int mb) {
     using namespace forge::graph;
     const std::size_t k = 4096;
     std::mt19937 rng(1);
-    std::printf("quantised matvec, k=%zu, %d MB matrix, %u threads, integer kernels: %s, prefetch %d B\n", k, mb, task::pool::global().size(),
+    std::printf("quantised matvec, k=%zu, %d MB matrix, %u threads, integer kernels: %s, prefetch %d B\n", k, mb, task::engine_threads(),
                 simd::qi8_active().target, simd::qi8_prefetch_bytes);
     for (const char* cn : {"q4_k", "q5_k", "q6_k", "q8_0"}) {
         const auto* c = codecs::find(cn); const int fmt = qweights::fmt_of(c);

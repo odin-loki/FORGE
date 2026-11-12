@@ -1,6 +1,7 @@
 #pragma once
 // task::scheduler: a work-stealing scheduler with task graphs. It sits next to task::pool (pool.hpp), which
-// keeps its API and behaviour; nothing in the engine was moved onto the scheduler.
+// keeps its API and behaviour. The engine's task::parallel_for runs on the pool by default and on a scheduler
+// with FORGE_TASK_SCHEDULER=sched (engine.hpp).
 //
 //   scheduler s({.threads = 8});
 //   auto a = s.spawn([] { return 6; });                         // task<int>
@@ -32,7 +33,9 @@
 #include <forge/os/cpu_topology.hpp>
 #include <forge/os/numa.hpp>
 #include <forge/os/sync.hpp>
+#define FORGE_TASK_POOL_FROM_SCHED 1   // pool.hpp must not pull in engine.hpp before the scheduler is defined
 #include <forge/task/pool.hpp>
+#undef FORGE_TASK_POOL_FROM_SCHED
 #include <deque>
 #include <map>
 #include <optional>
@@ -608,3 +611,5 @@ private:
 };
 
 } // namespace forge::task
+
+#include <forge/task/engine.hpp>   // task::parallel_for on the pool or on a scheduler (FORGE_TASK_SCHEDULER)

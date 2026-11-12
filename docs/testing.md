@@ -39,6 +39,8 @@
 | Mobile | `tests/mobile_build.sh` | `mobile_android_{arm64-v8a,x86_64}`, `mobile_android_device`, `mobile_ios`, labels `mobile;slow` |
 | Cross compile/link | zig cross builds (`zig` on PATH, `ZIG_PATH`, or the `ziglang` Python wheel): every `tests/test_os*.cpp` and `test_loadbalancer` linked per target through `cmake/xos_link.cmake` (C sources compiled separately); `xos_headers_<target>` compiles each os header as its own translation unit | `xos_*`, labels `cross;slow` |
 | Scalable vectors under qemu | `test_simd`, `test_tile` | `lane_sve_vl<N>`, `lane_rvv_vl<N>`, `tile_sme_svl<N>`, label `emu` (defined only in the qemu cross builds) |
+| simd companion tables and element types | `test_simd_tables` (seq and int8 tables against scalar, bit for bit), `test_simd_tiera`, `test_simd_types` and the per-table `test_simd_types_<table>` (`vec_types.hpp`, exhaustive for 8-bit binary and 16-bit unary operations), `test_simd_std` / `test_simd_std_libcxx` (`interop.hpp`). They link only the simd library; the CMake target `forge_simd_tests` builds all of them | natively `types_<table>` (skipped when the CPU lacks the ISA), `tiera_sse2`, `tiera_sse4.2`, `tiera_avx2`; in the qemu cross builds `tables_*`, `tiera_*`, `types_*` per CPU model or vector length, label `emu` |
+| Engine executor | `test_engine` | `engine_pool`, `engine_sched`; `sched_test_graph`, `sched_test_inference`, `sched_test_kvquant`, `sched_test_sessions`, `sched_test_aot` (the engine's tests under `FORGE_TASK_SCHEDULER=sched`, label `sched`) |
 | Emulated AMX tiles | Intel SDE | `tile_amx_sde_*`, label `emu` |
 
 The `gpu_compile_*`, `jni_syntax` and `mobile_*` tests are only defined when CMake finds a GPU-capable clang (`FORGE_GPU_CLANG`).

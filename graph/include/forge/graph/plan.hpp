@@ -212,20 +212,30 @@ inline bool int8_enabled() {
 // y[m, n] = x[m, k] . W[n, k]^T for q8_0 / q4_k / q5_k / q6_k rows, on int8 activations. Each activation row is
 // quantised once (on the pool when there are many); weights are read once per group of up to 8 activation rows.
 // The result for one activation row does not depend on m (or on which thread computed which weight rows).
-inline void gemm_nt_i8(int fmt, const std::uint8_t* w, std::size_t rb, std::size_t n, const float* x, std::size_t m,
-                       std::size_t k, float* y) {
+// The two halves of gemm_nt_i8: quantise m activation rows into `act` (grown as needed), and multiply.
+inline void quantize_acts(int fmt, const float* x, std::size_t m, std::size_t k, std::vector<simd::qi8::act_k>& act) {
     const auto& qk = simd::qi8_active();
     const std::size_t ab = simd::qi8::act_bytes(fmt, k);
-    thread_local std::vector<simd::qi8::act_k> act;   // reused across calls (caller thread); 32-byte aligned
     if (act.size() * sizeof(simd::qi8::act_k) < m * ab) act.resize((m * ab + sizeof(simd::qi8::act_k) - 1) / sizeof(simd::qi8::act_k));
     auto* a = reinterpret_cast<std::uint8_t*>(act.data());
     if (m * k <= 32768) for (std::size_t i = 0; i < m; ++i) qk.quantize(fmt, x + i * k, k, a + i * ab);
     else task::parallel_for(m, 1, [&](std::size_t b, std::size_t e) { for (std::size_t i = b; i < e; ++i) qk.quantize(fmt, x + i * k, k, a + i * ab); });
+}
+inline void gemm_nt_i8_acts(int fmt, const std::uint8_t* w, std::size_t rb, std::size_t n, const std::uint8_t* a, std::size_t m,
+                            std::size_t k, float* y) {
+    const auto& qk = simd::qi8_active();
+    const std::size_t ab = simd::qi8::act_bytes(fmt, k);
     if (m <= 8) {   // decode / small batches: stream the weights once, long claims first, short ones last
         task::parallel_for(n, 16, 256, [&](std::size_t b, std::size_t e) { qk.matvec(fmt, w + b * rb, rb, e - b, a, ab, k, m, y + b, n); });
     } else {        // prefill: 16-row blocks stay in L2 while every group of 8 activation rows passes over them
         task::parallel_for(n, 16, 16, [&](std::size_t b, std::size_t e) { qk.matvec(fmt, w + b * rb, rb, e - b, a, ab, k, m, y + b, n); });
     }
+}
+inline void gemm_nt_i8(int fmt, const std::uint8_t* w, std::size_t rb, std::size_t n, const float* x, std::size_t m,
+                       std::size_t k, float* y) {
+    thread_local std::vector<simd::qi8::act_k> act;   // reused across calls (caller thread); 32-byte aligned
+    quantize_acts(fmt, x, m, k, act);
+    gemm_nt_i8_acts(fmt, w, rb, n, reinterpret_cast<const std::uint8_t*>(act.data()), m, k, y);
 }
 // Few input rows (decode): fused tile decode + dot per (row, weight row). Many rows (prefill): decode each weight
 // row once (SIMD decoders) and reuse it. Both are bit-identical to dot(x, codec.decode(row)).
@@ -379,13 +389,33 @@ struct step {
     // fattrs are the fused kernel's attributes (see fuse_steps)
     int fuse = 0;
     const ops::attrs* fattrs = nullptr;
+    // host plans (fuse_cpu.hpp): chain > 0: steps [this, this + plan::chains[chain - 1].count) are one row-local
+    // chain, run block by block; qact >= 0: this quantised matmul_t shares the int8 quantisation of its
+    // activation input with the other steps of plan::qacts[qact]. The steps themselves are unchanged, so a
+    // precompiled plan (aot.hpp) and natively compiled code describe the same step list either way.
+    int chain = 0;
+    int qact = -1;
 };
+// A run of adjacent CPU steps that each compute a row of their output from the same row of their inputs
+// (elementwise ops, bias adds, rms_norm / layer_norm). See fuse_cpu.hpp.
+struct cpu_chain {
+    std::size_t first = 0, count = 0;      // steps [first, first + count)
+    std::size_t unit = 1, units = 0;       // floats per row, rows
+    std::size_t block = 1;                 // rows per block
+    std::vector<std::uint32_t> full;       // per step: bit j set = input j is a whole tensor (sliced by rows); clear = a row vector or scalar
+};
+// One activation value that several int8 quantised matmul_t steps multiply: quantised by whichever of them runs
+// first in a run (plan::run_id), reused by the others.
+struct qact_slot { std::vector<simd::qi8::act_k> act; std::uint64_t run = 0; std::size_t rows = 0; bool q8 = false; };
 
 class plan {
 public:
     tensor_graph g;
     memory_plan mem;
     std::vector<step> steps;
+    std::vector<cpu_chain> chains;    // fuse_cpu.hpp
+    std::vector<qact_slot> qacts;
+    std::uint64_t run_id = 0;         // bumped by every executor run
     std::deque<ops::attrs> attr_store;
     std::vector<std::shared_ptr<tensor>> decoded_weights;   // f32 fallbacks for quantised weights   // per-step attribute overrides (stable addresses)
     std::vector<tensor_view> views;   // per value
@@ -425,11 +455,14 @@ public:
         std::map<std::string, int> uses;
         for (auto& st : steps) if (st.low) uses[st.low->name]++;
         for (auto& [k, v] : uses) s += std::format("  {:<16} x{}\n", k, v);
+        if (!chains.empty()) { std::size_t n = 0; for (auto& c : chains) n += c.count; s += std::format("  fused: {} row chain(s) over {} steps\n", chains.size(), n); }
+        if (!qacts.empty()) { std::size_t n = 0; for (auto& st : steps) n += st.qact >= 0; s += std::format("  fused: {} shared int8 activation(s) for {} matmul_t steps\n", qacts.size(), n); }
         return s;
     }
 };
 
 inline void fuse_steps(plan& p);
+inline void fuse_cpu(plan& p, registry& reg, const pass_options& po);
 // FFN gate/up fusion ($FORGE_FUSE_GLU=0 off): silu_mul(matmul_t(x, Wg), matmul_t(x, Wu)) whose two device quantised
 // matmuls are the two steps right before it (so x is still live there), read the same x, have weights of one codec
 // (registry::device_qglu_codecs) and shape, and feed nothing else, becomes one registry::device_qglu step with inputs
@@ -631,6 +664,7 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
     }
     fuse_glu(*p, reg);   // first: it removes steps; fuse_steps then pairs adjacent steps of the final list
     fuse_steps(*p);
+    fuse_cpu(*p, reg, po);   // host plans: row chains and shared int8 activations (fuse_cpu.hpp)
 }
 
 // Elementwise fusions for device runs: mark adjacent device step pairs that the backend may run as one kernel
@@ -657,6 +691,10 @@ inline void fuse_steps(plan& p) {
         }
     }
 }
+
+} // namespace forge::graph
+#include <forge/graph/fuse_cpu.hpp>
+namespace forge::graph {
 
 class executor {
 public:
@@ -792,11 +830,23 @@ private:
     }
     void run_steps(device_hooks* h) {
         std::vector<tensor_view> ins;
+        ++p_.run_id;
         for (std::size_t si = 0; si < p_.steps.size(); ++si) {
             auto& s = p_.steps[si];
             if (p_.native && !h && !op_time::on()) if (std::size_t k = p_.native(si)) { si += k - 1; continue; }
             std::optional<op_time> timer;
+            if (!h && s.chain > 0) {   // a fused row chain (fuse_cpu.hpp): all of its steps, block by block
+                const cpu_chain& c = p_.chains[std::size_t(s.chain - 1)];
+                if (op_time::on()) timer.emplace("chain(" + std::to_string(c.count) + ")." + op_key(p_.steps[si + c.count - 1]));
+                run_chain(p_, c);
+                si += c.count - 1;
+                continue;
+            }
             if (op_time::on()) timer.emplace(op_key(s));
+            if (!h && s.qact >= 0) {   // quantised matmul_t on an activation other steps multiply too: quantise once per run
+                run_shared_qgemm(p_, s);
+                continue;
+            }
             ins.clear();
             for (auto v : s.in) ins.push_back(p_.views[v]);
             auto& out = p_.views[s.out];

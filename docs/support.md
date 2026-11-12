@@ -7,6 +7,7 @@ Utilities used across FORGE. All are header-only.
 | `core/include/forge/core/log.hpp` | `forge::log` | Logger | `test_log`, `test_log_strip`, `log_min_level_cmake` |
 | `support/include/forge/task/pool.hpp` | `forge::task` | Thread pool | `test_pool` |
 | `support/include/forge/task/sched.hpp` | `forge::task` | Work-stealing scheduler, task graphs, frame pacing | `test_sched` |
+| `support/include/forge/task/engine.hpp` | `forge::task` | `task::parallel_for` for the engine, on the pool or on a scheduler (`FORGE_TASK_SCHEDULER`) | `test_engine` (ctest `engine_pool`, `engine_sched`), `sched_test_*` |
 | `os/include/forge/os/process_pool.hpp` | `forge::os` | Process pool (see [os-wrapper.md](os-wrapper.md#process-pools-process_poolhpp)) | `test_process_pool` |
 | `os/include/forge/os/process.hpp`, `core/include/forge/core/memory.hpp` | `forge::os`, `forge::mem` | Waiting on processes, leased children | `test_os_process`, `test_memory` |
 | `support/include/forge/cache/cache.hpp` | `forge::cache` | Content-addressed disk cache | `test_cache` |
@@ -41,15 +42,43 @@ FORGE_LOG_DEBUG("graph", "fused {} ops", k);              // arguments not evalu
 | API | Meaning |
 |---|---|
 | `pool(n)` | `n = 0` uses `FORGE_THREADS`, then `hardware_concurrency()` |
-| `pool::global()`, `task::parallel_for`, `task::submit` | One shared pool for every layer, so nothing oversubscribes |
+| `pool::global()`, `task::submit` | One shared pool for every layer, so nothing oversubscribes |
+| `task::parallel_for(n, grain, f)`, `task::parallel_for(n, lo, hi, f)`, `task::engine_threads()` | The engine's entry points ([below](#engine-executor-taskenginehpp)): the pool's `parallel_for` unless `FORGE_TASK_SCHEDULER=sched` |
 | `parallel_for(n, grain, f(begin, end))` | Data-parallel loop; the caller participates. These jobs run before queued tasks |
 | `submit(f, {priority, stop_token})` | Returns a `std::future`. Higher priority first, FIFO within a priority. A task whose token is triggered before it starts is skipped and its future throws `task::cancelled`; a running task sees the token if `f` takes a `std::stop_token` |
 | `pending()`, `wait_idle()`, `size()` | Queue length, wait for an empty queue, worker count |
 
 The destructor still runs (or skips, if cancelled) queued tasks before the workers exit.
 
+## Engine executor (`task/engine.hpp`)
+graph, inference and gpu run their data-parallel loops through two free functions, `task::parallel_for(n, grain, f)` and `task::parallel_for(n, lo, hi, f)`, and ask `task::engine_threads()` for the thread count. `engine.hpp` (included by both `pool.hpp` and `sched.hpp`) puts them on one of two executors, chosen once per process:
+
+| `FORGE_TASK_SCHEDULER` | Executor | Threads |
+|---|---|---|
+| unset or `pool` (default) | `task::pool::global()` | `FORGE_THREADS`, else the physical cores the process may use; the caller is one of them |
+| `sched` | a `task::scheduler` owned by the engine (`task::engine_scheduler()`) | The same count: `n − 1` workers and the caller. The pool's threads are never created, so there is one thread set either way |
+
+The contract is the pool's on both: `f(begin, end)` is called for disjoint ranges covering `[0, n)`, each of at least `lo` and at most `hi` items except possibly the last; the caller runs ranges too; `n <= lo`, a single thread, or a call from inside another engine `parallel_for` runs `f(0, n)` on the caller; the first exception is rethrown. What differs is where the range boundaries fall: the pool hands out ranges of `max(lo, remaining / (2·threads))` items as threads ask (so the boundaries depend on timing), the scheduler cuts `[0, n)` into fixed ranges of `clamp(n / (4·threads), lo, hi)` items that idle workers claim (and steal work for). Neither is something a kernel may depend on: every engine kernel computes each item (row, block, head) independently of how items are grouped, which is why the two executors give the same bits. `task::submit` stays on the pool; nothing in the engine uses it.
+
+Checked: `test_engine` under both settings (ctest `engine_pool`, `engine_sched`: coverage, range bounds, nested calls, exceptions, a row-wise softmax + dot against one serial pass), and the engine's own tests rerun with `FORGE_TASK_SCHEDULER=sched` (ctest `sched_test_graph`, `sched_test_inference`, `sched_test_kvquant`, `sched_test_sessions`, `sched_test_aot`, label `sched`): their determinism checks (a batch against single rows, prefill against decode, the golden logits of the tiny models) hold on the scheduler as on the pool, and `forge run` prints the same token ids on both for the synthetic models below.
+
+**Measured** (2026-11-12; `forge bench`, 4 threads; a 4-core VM shared with four other build jobs, so the numbers are noisy: runs of one configuration differed by up to 40 %; the gaps reported below are larger than that except where stated):
+
+| Model (`forge bench -p 32 -n 32`, 9 interleaved runs each) | | `pool` best / median | `sched` best / median |
+|---|---|---|---|
+| wide (synthetic, 50 MB f32) | prefill, tok/s | 1472 / 1325 | 1458 / 1387 |
+| | decode, tok/s | 678 / 621 | 418 / 386 |
+| deep (synthetic, 3 MB f32) | prefill, tok/s | 28260 / 27616 | 13800 / 12412 |
+| | decode, tok/s | 5719 / 5333 | 2197 / 2089 |
+
+`forge run --tokens … -n 48 --ids` prints the same 48 token ids on both executors for both models.
+
+So on this machine `sched` matches the pool where a few large loops dominate (prefill of the wide model) and is 1.6 to 2.6 times slower where many short loops do (decode, and the small model throughout). The cause was not profiled; the likely one is the cost of starting a loop: the pool publishes a job to workers that are spinning on a ticket, while `scheduler::parallel_for` allocates a job and spawns one helper task per worker through the deques and wakes parked workers each time.
+
+`pool` stays the default: `sched` is slower here wherever loops are short, and it has only been compared on this one loaded 4-core machine. Not measured: more cores, NUMA or hybrid machines, device plans, a quiet machine.
+
 ## Work-stealing scheduler (`forge::task::scheduler`, `task/sched.hpp`)
-A second executor next to `task::pool`. The engine (graph, inference, gpu) still uses `task::pool`; nothing was moved onto the scheduler, so the two have separate threads. Tests: `test_sched` (also run under TSan).
+A second executor next to `task::pool`. The engine (graph, inference, gpu) runs on `task::pool` by default and on a scheduler with `FORGE_TASK_SCHEDULER=sched` ([above](#engine-executor-taskenginehpp)). Tests: `test_sched` (also run under TSan).
 
 ```cpp
 task::scheduler s({.threads = 8});
@@ -80,7 +109,7 @@ s.parallel_for(n, grain, [&](std::size_t lo, std::size_t hi) { ... });
 - **Waiting helps.** `get`, `wait`, `wait_idle` and `parallel_for` run queued tasks while they wait, so nested `parallel_for` and tasks that wait on tasks do not deadlock when every worker is busy. Consequences: do not hold a lock across these calls (the helper may run a task that takes the same lock), and deep chains of waits use stack.
 - **P/E cores.** `plan_workers(topology, n, numa_nodes)` assigns CPUs: one logical CPU per performance core, then one per efficiency core, then SMT siblings. `placement::performance` tasks run only on workers planned for performance cores (and on outside threads that are waiting); `placement::efficiency` tasks go to efficiency workers first, and performance workers take them only when idle. On a machine with one core class both marks are ignored. Without `pin` the marks choose a worker, not a CPU: the OS may still run that thread anywhere.
 - **Frame pacing.** `frame_pacer(sched, budget_ns, clock)`: between `begin_frame()` and `end_frame()`, `run(f)` queues work that must finish in the frame (high priority, performance placement) and `defer(f, est_ns)` queues work that may slip. `end_frame` waits for the `run` tasks, then starts deferred tasks oldest first, at most one per worker at a time, while `elapsed + estimate <= budget`; the rest stay queued. An estimate of 0 uses a running average of measured deferred-task times. A started task is not interrupted, so a frame can overrun by one deferred task. After `starve_frames` (4) consecutive frames that started no deferred task, the next frame runs the oldest one regardless, so a task that never fits the budget is not starved. `frame_stats` reports counts, elapsed time and `over_budget`; `pace()` sleeps out the remainder.
-- **Not done / not measured.** No performance comparison against `task::pool` was made. Pinning and NUMA binding were only exercised on a 4-CPU single-node x86 VM (calls succeed or are counted in `pin_failures()`); placement was tested with injected topologies, not on hybrid hardware.
+- **Not done / not measured.** The comparison against `task::pool` is the one table above (4 cores, loaded machine). Pinning and NUMA binding were only exercised on a 4-CPU single-node x86 VM (calls succeed or are counted in `pin_failures()`); placement was tested with injected topologies, not on hybrid hardware.
 
 ## Linear algebra (`forge::linalg`)
 Row-major `mat<T>` for `T` = `float` or `double`. Meant for small and medium problems (the factorisations are unblocked O(n³) loops); it is not a LAPACK replacement. Link `forge_simd_mv` when you call `matmul`, `matvec` or `transpose`. Tests: `test_linalg` (analytic cases and reconstruction residuals such as ‖A − QR‖, each with its tolerance stated in the test), plus the older cases in `test_support` and `test_support2`.

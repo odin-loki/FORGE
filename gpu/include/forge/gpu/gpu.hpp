@@ -187,7 +187,7 @@ inline std::vector<device> all() {
     capabilities c;
     c.kind = backend_kind::cpu;
     c.name = std::string("cpu/") + simd::active().target;
-    c.compute_units = int(task::pool::global().size());
+    c.compute_units = int(task::engine_threads());
     c.subgroup_width = std::string_view(simd::active().target) == "avx512" ? 16 : (std::string_view(simd::active().target) == "avx2" ? 8 : 4);
     c.fp16 = true; c.bf16 = true;
     c.score = c.compute_units * c.subgroup_width;

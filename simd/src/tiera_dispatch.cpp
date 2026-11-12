@@ -1,6 +1,7 @@
 // tier_a_kernels dispatch: the same target names and usability rules as the lane kernel tables (dispatch.cpp).
 #include <forge/simd/dispatch.hpp>
 #include <forge/simd/tier_a.hpp>
+#include "isa_tables.hpp"
 #include <cstdlib>
 #include <string_view>
 
@@ -18,6 +19,7 @@ const tier_a_kernels* tier_a_by_name(const char* t) {
     if (n == "avx2") return by_name("avx2") ? &tiera_avx2::table : nullptr;
     if (n == "avx512") return by_name("avx512") ? &tiera_avx512::table : nullptr;
 #endif
+    if (const isa_tables* e = isa_extra_by_name(t)) return e->tiera;   // neon, sve, rvv, sse4.2, sse2, lasx, lsx, vsx, vxe, simd128, msa
     return nullptr;
 }
 
@@ -26,7 +28,7 @@ const tier_a_kernels& tier_a_active() {
         for (const char* var : {"FORGE_SIMD_TARGET", "FORGE_LANE_TARGET"})
             if (const char* e = std::getenv(var))
                 if (auto* p = tier_a_by_name(e)) return p;
-        for (const char* t : {"avx512", "avx2"}) if (auto* p = tier_a_by_name(t)) return p;
+        for (const char* t : target_names()) if (auto* p = tier_a_by_name(t)) return p;   // preferred first, scalar last
         return &tiera_scalar::table;
     }();
     return *k;

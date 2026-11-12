@@ -87,7 +87,7 @@ inline void attention(const float* q, std::size_t s, std::size_t hq, std::size_t
                 sl.q.push_back(q + (i * hq + h) * d); sl.lo.push_back(lo_of(i)); sl.hi.push_back(hi_of(i)); sl.row.push_back(i * hq + h);
             }
     };
-    const std::size_t threads = std::max<std::size_t>(1, task::pool::global().size());
+    const std::size_t threads = std::max<std::size_t>(1, task::engine_threads());
     const std::size_t part_floats = s * hq * nch * (dv + 2);
     const bool split = nch > 1 && hk * ntb < 2 * threads && part_floats <= (std::size_t(64) << 20);
     if (split) {

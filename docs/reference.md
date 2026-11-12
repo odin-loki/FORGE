@@ -102,7 +102,7 @@ Generated from the code that registers the lowerings: `registry::make_cpu` and t
 - A lowering is used only for the shapes and attributes it supports, and only after it passed the oracle on this machine; this table says which lowerings exist, not that a backend was tested on real hardware (see [STATUS.md](STATUS.md)).
 - `lane.*` lowerings run on the SIMD lane chosen at run time (AVX2, AVX-512, NEON, SVE, RVV, ... or the scalar lane); `cpu.*` lowerings are plain C++.
 - All lowerings in this table take f32 tensors; other dtypes enter as encoded weights (next table).
-- Ops with a lowering: CPU 28/87, Vulkan 37/87, CUDA/HIP/OpenCL/Level Zero/Metal 34/87. `+bcast` = the CUDA/HIP runtime also runs the broadcasting form.
+- Ops with a lowering: CPU 30/87, Vulkan 37/87, CUDA/HIP/OpenCL/Level Zero/Metal 34/87. `+bcast` = the CUDA/HIP runtime also runs the broadcasting form.
 
 | op | scalar ref | CPU | Vulkan | CUDA / HIP | OpenCL / Level Zero | Metal |
 |---|---|---|---|---|---|---|
@@ -110,9 +110,9 @@ Generated from the code that registers the lowerings: `registry::make_cpu` and t
 | `matmul_t` | yes | `lane.gemm_nt` | `vk.matmul_t` | `cuda.matmul_t` `hip.matmul_t` | `opencl.matmul_t` `level_zero.matmul_t` | `metal.matmul_t` |
 | `attention` | yes | `lane.attention` | `vk.attention` | `cuda.attention` `hip.attention` | `opencl.attention` `level_zero.attention` | `metal.attention` |
 | `moe_ffn` | yes |  |  |  |  |  |
-| `add` | yes | `lane.add` | `vk.add` | `cuda.add` `hip.add` +bcast | `opencl.add` `level_zero.add` | `metal.add` |
-| `sub` | yes | `lane.sub` | `vk.sub` | `cuda.sub` `hip.sub` +bcast | `opencl.sub` `level_zero.sub` | `metal.sub` |
-| `mul` | yes | `lane.mul` | `vk.mul` | `cuda.mul` `hip.mul` +bcast | `opencl.mul` `level_zero.mul` | `metal.mul` |
+| `add` | yes | `lane.add` `lane.add_row` `lane.add_row_l` | `vk.add` | `cuda.add` `hip.add` +bcast | `opencl.add` `level_zero.add` | `metal.add` |
+| `sub` | yes | `lane.sub` `lane.sub_row` `lane.sub_row_l` | `vk.sub` | `cuda.sub` `hip.sub` +bcast | `opencl.sub` `level_zero.sub` | `metal.sub` |
+| `mul` | yes | `lane.mul` `lane.mul_row` `lane.mul_row_l` | `vk.mul` | `cuda.mul` `hip.mul` +bcast | `opencl.mul` `level_zero.mul` | `metal.mul` |
 | `div` | yes |  | `vk.div` | `cuda.div` `hip.div` +bcast | `opencl.div` `level_zero.div` | `metal.div` |
 | `maximum` | yes |  | `vk.maximum` | `cuda.maximum` `hip.maximum` | `opencl.maximum` `level_zero.maximum` | `metal.maximum` |
 | `minimum` | yes |  | `vk.minimum` | `cuda.minimum` `hip.minimum` | `opencl.minimum` `level_zero.minimum` | `metal.minimum` |
@@ -146,9 +146,9 @@ Generated from the code that registers the lowerings: `registry::make_cpu` and t
 | `silu` | yes | `lane.silu` | `vk.silu` | `cuda.silu` `hip.silu` | `opencl.silu` `level_zero.silu` | `metal.silu` |
 | `gelu` | yes | `cpu.gelu` |  |  |  |  |
 | `gelu_tanh` | yes | `lane.gelu_tanh` | `vk.gelu_tanh` | `cuda.gelu_tanh` `hip.gelu_tanh` | `opencl.gelu_tanh` `level_zero.gelu_tanh` | `metal.gelu_tanh` |
-| `relu` | yes |  | `vk.relu` | `cuda.relu` `hip.relu` | `opencl.relu` `level_zero.relu` | `metal.relu` |
+| `relu` | yes | `cpu.relu` | `vk.relu` | `cuda.relu` `hip.relu` | `opencl.relu` `level_zero.relu` | `metal.relu` |
 | `softplus` | yes |  | `vk.softplus` | `cuda.softplus` `hip.softplus` | `opencl.softplus` `level_zero.softplus` | `metal.softplus` |
-| `scale` | yes |  | `vk.scale` | `cuda.scale` `hip.scale` | `opencl.scale` `level_zero.scale` | `metal.scale` |
+| `scale` | yes | `cpu.scale` | `vk.scale` | `cuda.scale` `hip.scale` | `opencl.scale` `level_zero.scale` | `metal.scale` |
 | `convert` | yes |  |  |  |  |  |
 | `transpose` | yes |  |  |  |  |  |
 | `reshape` | yes | `cpu.reshape` | `vk.reshape` |  |  |  |
