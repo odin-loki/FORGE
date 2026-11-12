@@ -15,6 +15,8 @@
 #include <limits>
 #if defined(FORGE_SEQ_AVX512) || defined(FORGE_SEQ_AVX2)
 #include <immintrin.h>
+#elif defined(FORGE_SEQ_TG)
+#include <forge/simd/vec.hpp>
 #endif
 
 #ifndef FORGE_SEQ_NS
@@ -246,6 +248,124 @@ inline void idot16(const unsigned char* q, const std::int8_t* const* k, std::siz
         c = _mm_add_epi32(c, _mm_shuffle_epi32(c, 0x4E));
         c = _mm_add_epi32(c, _mm_shuffle_epi32(c, 0xB1));
         t[p] = _mm_cvtsi128_si32(c);
+    }
+}
+constexpr int k_vgroup = 4;
+#elif defined(FORGE_SEQ_TG)
+// ------------------------------------------------ any Tier P backend (vec<float, FORGE_SEQ_TG>) ------------------------------------------------
+// 16 lanes as 16 / N native vectors (N = 4, 8 or 16), or the low 16 lanes of one wider vector (N = 32: loads
+// and stores are masked, the upper lanes stay zero). Every operation used is exactly rounded on every backend
+// (add, sub, mul, fused multiply-add, compare / select, int -> float); the ISAs without a fused multiply-add
+// instruction (SSE, WebAssembly: FORGE_SEQ_SOFT_FMA) take forge::fmaf_exact per lane, because Tier P's fma
+// there rounds twice. Horizontal sums use the scalar table's tree.
+using TG = FORGE_SEQ_TG;
+using VT = forge::simd::vec<float, TG>;
+constexpr int VN = VT::N;
+constexpr int NP = VN >= 16 ? 1 : 16 / VN;
+static_assert(VN == 4 || VN == 8 || VN == 16 || VN == 32, "seq_impl.hpp: unsupported Tier P width");
+struct V { VT p[NP]; };
+inline V load(const float* x) {
+    V r;
+    if constexpr (VN > 16) r.p[0] = forge::simd::load(x, forge::simd::mask<float, TG>::first_n(16));
+    else for (int i = 0; i < NP; ++i) r.p[i] = forge::simd::load<TG>(x + i * VN);
+    return r;
+}
+inline void store(float* x, V a) {
+    if constexpr (VN > 16) forge::simd::store(x, a.p[0], forge::simd::mask<float, TG>::first_n(16));
+    else for (int i = 0; i < NP; ++i) forge::simd::store(x + i * VN, a.p[i]);
+}
+inline V zero() { V r; for (auto& x : r.p) x = forge::simd::splat<TG>(0.f); return r; }
+inline V splat(float a) {
+    V r;
+    if constexpr (VN > 16) { float t[16]; for (auto& x : t) x = a; return load(t); }   // upper lanes stay zero
+    else for (auto& x : r.p) x = forge::simd::splat<TG>(a);
+    return r;
+}
+inline V loadn(const float* p, std::size_t n) { float t[16] = {}; std::memcpy(t, p, n * 4); return load(t); }
+inline void storen(float* p, V a, std::size_t n) { float t[16]; store(t, a); std::memcpy(p, t, n * 4); }
+inline V load_i8(const std::int8_t* p) { float t[16]; for (int i = 0; i < 16; ++i) t[i] = float(p[i]); return load(t); }
+inline V load_i8n(const std::int8_t* p, std::size_t n) { float t[16] = {}; for (std::size_t i = 0; i < n; ++i) t[i] = float(p[i]); return load(t); }
+inline V add(V a, V b) { for (int i = 0; i < NP; ++i) a.p[i] = forge::simd::add(a.p[i], b.p[i]); return a; }
+inline V sub(V a, V b) { for (int i = 0; i < NP; ++i) a.p[i] = forge::simd::sub(a.p[i], b.p[i]); return a; }
+inline V mul(V a, V b) { for (int i = 0; i < NP; ++i) a.p[i] = forge::simd::mul(a.p[i], b.p[i]); return a; }
+inline V fma(V a, V b, V c) {
+#if defined(FORGE_SEQ_SOFT_FMA)
+    float x[16], y[16], z[16]; store(x, a); store(y, b); store(z, c);
+    for (int i = 0; i < 16; ++i) z[i] = forge::fmaf_exact(x[i], y[i], z[i]);
+    return load(z);
+#else
+    for (int i = 0; i < NP; ++i) c.p[i] = forge::simd::fma(a.p[i], b.p[i], c.p[i]);
+    return c;
+#endif
+}
+inline V vmax(V a, V b) { for (int i = 0; i < NP; ++i) a.p[i] = forge::simd::max(a.p[i], b.p[i]); return a; }
+inline float hmax(V a) { float t[16]; store(t, a); float m = t[0]; for (int i = 1; i < 16; ++i) m = std::max(m, t[i]); return m; }
+// the scalar table's tree: (v[i] + v[i+8]), then + [i+4], + [i+2], + [i+1]
+inline float hsum(V a) {
+    float c[4];
+    if constexpr (NP == 4) {
+        float t[4]; forge::simd::store(t, forge::simd::add(forge::simd::add(a.p[0], a.p[2]), forge::simd::add(a.p[1], a.p[3])));
+        for (int i = 0; i < 4; ++i) c[i] = t[i];
+    } else if constexpr (NP == 2) {
+        float t[8]; forge::simd::store(t, forge::simd::add(a.p[0], a.p[1]));
+        for (int i = 0; i < 4; ++i) c[i] = t[i] + t[i + 4];
+    } else {
+        float t[16], b[8]; store(t, a);
+        for (int i = 0; i < 8; ++i) b[i] = t[i] + t[i + 8];
+        for (int i = 0; i < 4; ++i) c[i] = b[i] + b[i + 4];
+    }
+    return (c[0] + c[2]) + (c[1] + c[3]);
+}
+inline V reduce16(const V* a) { float t[16]; for (int p = 0; p < 16; ++p) t[p] = hsum(a[p]); return load(t); }
+inline V keep_range(V a, std::size_t lo, std::size_t hi, float fill) {
+    float t[16]; store(t, a);
+    for (std::size_t p = 0; p < 16; ++p) if (p < lo || p >= hi) t[p] = fill;
+    return load(t);
+}
+inline VT exp_n(VT x) {
+    using forge::simd::splat;
+    VT v = forge::simd::min(forge::simd::max(x, forge::simd::splat<TG>(-87.0f)), forge::simd::splat<TG>(88.0f));
+    VT t = forge::simd::mul(v, forge::simd::splat<TG>(1.44269504088896341f));
+    VT n = forge::simd::add(t, forge::simd::splat<TG>(12582912.0f));
+    n = forge::simd::sub(n, forge::simd::splat<TG>(12582912.0f));
+    VT r = forge::simd::fma(n, forge::simd::splat<TG>(-0.693359375f), v);
+    r = forge::simd::fma(n, forge::simd::splat<TG>(2.12194440e-4f), r);
+    VT p = forge::simd::splat<TG>(1.9875691500e-4f);
+    p = forge::simd::fma(p, r, forge::simd::splat<TG>(1.3981999507e-3f));
+    p = forge::simd::fma(p, r, forge::simd::splat<TG>(8.3334519073e-3f));
+    p = forge::simd::fma(p, r, forge::simd::splat<TG>(4.1665795894e-2f));
+    p = forge::simd::fma(p, r, forge::simd::splat<TG>(1.6666665459e-1f));
+    p = forge::simd::fma(p, r, forge::simd::splat<TG>(5.0000001201e-1f));
+    VT r2 = forge::simd::mul(r, r);
+    VT y = forge::simd::fma(p, r2, r);
+    y = forge::simd::add(y, forge::simd::splat<TG>(1.0f));
+    return forge::simd::ldexp_int(y, n);   // y * 2^n, n integral in [-126, 127]: exact scaling on every backend
+}
+inline V exp_v(V x) {
+#if defined(FORGE_SEQ_SOFT_FMA)
+    float t[16]; store(t, x); for (auto& e : t) e = exp_s(e); return load(t);
+#else
+    for (int i = 0; i < NP; ++i) x.p[i] = exp_n(x.p[i]);
+    return x;
+#endif
+}
+inline V exp_cut(V x) {
+#if defined(FORGE_SEQ_SOFT_FMA)
+    float t[16]; store(t, x); for (auto& e : t) e = e < -80.0f ? 0.0f : exp_s(e); return load(t);
+#else
+    const VT c = forge::simd::splat<TG>(-80.0f), z = forge::simd::splat<TG>(0.0f);
+    for (int i = 0; i < NP; ++i) x.p[i] = forge::simd::select(forge::simd::lt(x.p[i], c), z, exp_n(x.p[i]));
+    return x;
+#endif
+}
+inline V cvt_i32(const std::int32_t* p) { float t[16]; for (int i = 0; i < 16; ++i) t[i] = float(p[i]); return load(t); }
+// exact int32 sums: a plain loop the compiler vectorises with the TU's flags
+inline void idot16(const unsigned char* q, const std::int8_t* const* k, std::size_t d, std::int32_t* t) {
+    for (int p = 0; p < 16; ++p) {
+        const std::int8_t* kr = k[p];
+        std::int32_t a = 0;
+        for (std::size_t e = 0; e < d; ++e) { std::int16_t v; std::memcpy(&v, q + 2 * e, 2); a += std::int32_t(v) * std::int32_t(kr[e]); }
+        t[p] = a;
     }
 }
 constexpr int k_vgroup = 4;

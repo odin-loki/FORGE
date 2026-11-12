@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(root, "ops", "gen"))
 import fspec_gen, gpu_gen  # noqa: E402
 
 def gpu_names():
-    return set(gpu_gen.UNARY) | set(gpu_gen.BINARY) | set(gpu_gen.OTHER)
+    return set(gpu_gen.UNARY) | set(gpu_gen.BINARY) | set(gpu_gen.OTHER) | set(gpu_gen.NN_OPS)
 
 def src(*rel):
     return open(os.path.join(root, *rel), encoding="utf-8").read()
@@ -29,6 +29,7 @@ def coverage():
         cpu.setdefault(m.group(2), []).append(m.group(1))
     vsrc = src("graph", "include", "forge", "graph", "vulkan.hpp")
     vk = {n: ["vk." + n] for n in sorted(gpu_gen.UNARY) + sorted(gpu_gen.BINARY) + gpu_gen.OTHER}
+    for n in gpu_gen.NN_OPS: vk[n] = ["vk." + n]   # GLSL ports of the encoder / vision kernels (vulkan_registry, run_nn)
     for m in re.finditer(r'r->add\(\{"(vk\.\w+)",\s*ops::op::(\w+)', vsrc): vk.setdefault(m.group(2), []).append(m.group(1))
     csrc = src("gpu", "include", "forge", "gpu", "cuda.hpp")
     body = re.search(r"inline bool kernel_sig\(.*?\n\}", csrc, re.S).group(0)
@@ -69,7 +70,7 @@ def render_coverage(ops):
            "`cpu.*` lowerings are plain C++.",
            "- All lowerings in this table take f32 tensors; other dtypes enter as encoded weights (next table).",
            f"- Ops with a lowering: CPU {n_cpu}/{len(names)}, Vulkan {n_vk}/{len(names)}, CUDA/HIP/OpenCL/Level Zero/Metal {n_gpu}/{len(names)}. "
-           "`+bcast` = the CUDA/HIP runtime also runs the broadcasting form.", "",
+           "`+bcast` = the device runtimes (Vulkan included) also run the broadcasting form (`forge_bcast`).", "",
            "| op | scalar ref | CPU | Vulkan | CUDA / HIP | OpenCL / Level Zero | Metal |", "|---|---|---|---|---|---|---|"]
     for n in names:
         g = n in c["gpu"]

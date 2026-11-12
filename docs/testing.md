@@ -21,6 +21,8 @@
 | Vulkan | `tests/test_vulkan.cpp` | `test_vulkan`, `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`), label `gpu` |
 | GPU compile checks | generated kernels compiled with clang | `gpu_compile_{cuda,hip,opencl,opencl_nofp64,metal_syntax}`, and `gpu_compile_metal` with `xcrun`; label `gpu` |
 | Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` (`tools/sbom.py`: the SPDX 2.3 and the CycloneDX 1.5 output) |
+| JNI bridge | `tests/jni/JniSmoke.java` on a host JVM with `-Xcheck:jni`: every native of `bindings/android/jni/forge_jni.c`, through `tests/jni/dev/forge/ForgeNative.java` (generated from the Kotlin externals by `tests/jni_decl_check.py --write`). `jni_decl_matches` compares the Kotlin, Java and C declarations. The Kotlin classes are not compiled by either | `jni_smoke` (Linux with a JDK; needs the llama and bert goldens), `jni_decl_matches`, `jni_syntax` |
+| Server API | `tests/serve_api_test.py`: request fields (`n`, `logprobs`, `logit_bias`, stop ids, ...), end-of-turn stops, tool calling, keep-alive / pipelining / chunked bodies / limits, graceful shutdown, `--lora`. `tests/serve_auth_test.py`: API keys, rate limits, quotas, TLS and mutual TLS (certificates from the `openssl` command; the TLS part is skipped, with a message, when forge-serve has no OpenSSL) | `serve_api`, `serve_auth` (need `golden_tiny_llama` to have run) |
 | Embedding server | `tests/serve_embeddings_test.py`: `/v1/embeddings` on the tiny BERT of the bert golden against `forge embed`, 400 on a generative model | `serve_embeddings` (needs `golden_tiny_bert` and `golden_tiny_llama` to have run) |
 | C ABI | `tests/capi_smoke.c` | `capi_smoke` (not built when cross-compiling) |
 | Installed package | `tests/install_consumer/` (install to a scratch prefix, then `find_package(forge)` from a C++ and a C program; see [building.md](building.md#the-install_consumer-test)) | `install_consumer`, label `install` (not for cross or sanitizer builds) |
@@ -37,6 +39,8 @@
 | Mobile | `tests/mobile_build.sh` | `mobile_android_{arm64-v8a,x86_64}`, `mobile_android_device`, `mobile_ios`, labels `mobile;slow` |
 | Cross compile/link | zig cross builds (`zig` on PATH, `ZIG_PATH`, or the `ziglang` Python wheel): every `tests/test_os*.cpp` and `test_loadbalancer` linked per target through `cmake/xos_link.cmake` (C sources compiled separately); `xos_headers_<target>` compiles each os header as its own translation unit | `xos_*`, labels `cross;slow` |
 | Scalable vectors under qemu | `test_simd`, `test_tile` | `lane_sve_vl<N>`, `lane_rvv_vl<N>`, `tile_sme_svl<N>`, label `emu` (defined only in the qemu cross builds) |
+| simd companion tables and element types | `test_simd_tables` (seq and int8 tables against scalar, bit for bit), `test_simd_tiera`, `test_simd_types` and the per-table `test_simd_types_<table>` (`vec_types.hpp`, exhaustive for 8-bit binary and 16-bit unary operations), `test_simd_std` / `test_simd_std_libcxx` (`interop.hpp`). They link only the simd library; the CMake target `forge_simd_tests` builds all of them | natively `types_<table>` (skipped when the CPU lacks the ISA), `tiera_sse2`, `tiera_sse4.2`, `tiera_avx2`; in the qemu cross builds `tables_*`, `tiera_*`, `types_*` per CPU model or vector length, label `emu` |
+| Engine executor | `test_engine` | `engine_pool`, `engine_sched`; `sched_test_graph`, `sched_test_inference`, `sched_test_kvquant`, `sched_test_sessions`, `sched_test_aot` (the engine's tests under `FORGE_TASK_SCHEDULER=sched`, label `sched`) |
 | Emulated AMX tiles | Intel SDE | `tile_amx_sde_*`, label `emu` |
 
 The `gpu_compile_*`, `jni_syntax` and `mobile_*` tests are only defined when CMake finds a GPU-capable clang (`FORGE_GPU_CLANG`).
@@ -113,7 +117,7 @@ By default each fuzz target links a small built-in mutation driver (`fuzz/driver
 
 | Target | Input | What counts as a finding besides a crash or sanitizer report |
 |--------|-------|------|
-| `fuzz_serve_http` | forge-serve's HTTP request reader (`apps/serve_http.hpp`), fed in fuzzer-chosen `recv()` sizes | any exception |
+| `fuzz_serve_http` | forge-serve's HTTP request reader (`apps/serve_http.hpp`), fed in fuzzer-chosen `recv()` sizes as a kept-alive connection: pipelined requests, `Content-Length` and chunked bodies, `Expect: 100-continue`, with small limits | any exception; a body over the limit, a body without framing, both framings accepted, a malformed method / target / header name accepted |
 | `fuzz_proxy_http` | the L7 proxy (`loadbalancer/proxy.hpp`): the client loop against an empty pool, then the upstream response parser | any exception |
 | `fuzz_rpc` | `authorized_keys`, token file, client map and permission list parsers; FRPC op frames, FRPS/FRPZ script frames and the FRPH handshake sent to real `rpc::server` instances on 127.0.0.1 | a reply larger than a frame allows |
 | `fuzz_json_schema` | JSON Schema → GBNF (`response_format`) | an accepted schema whose grammar the GBNF parser rejects |

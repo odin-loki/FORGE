@@ -154,7 +154,8 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt,
         import::import_options o; o.codec = codec; if (requant) o.requant = codec;
         o.allow_unused = allow_unused;
         auto tmp = out.string() + ".partial";
-        auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
+        auto r = import::is_blueprint_dir(path) ? import::import_blueprint_dir(path, tmp, o)
+               : path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
         fs::rename(tmp, out);
         std::fprintf(stderr, "[imported %s (%s, %zu tensors) -> %s]\n", path.c_str(), r.template_name.c_str(), r.tensors, out.c_str());
         for (auto& n : r.notes) std::fprintf(stderr, "[import] %s\n", n.c_str());
@@ -796,8 +797,12 @@ int cmd_run(const args& a) {
         gc = std::make_unique<inference::grammar_constraint>(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
         smp.filter = [&](std::span<float> l) { gc->apply(l); }; smp.allow = [&](int t) { return gc->allows(t); };
     }
+    // --chat: the turn ends at the model's end-of-turn tokens (<|im_end|>, <|eot_id|>, ...: inference/chat_tools.hpp), not only at EOS
+    std::vector<int> turn_ends;
+    if (a.has("chat")) for (int t : inference::end_of_turn_tokens(*s.shared_model())) if (t != s.tokenizer()->eos()) turn_ends.push_back(t);
     auto show = [&](int t) {
         if (gc && !gc->accept(t)) return false;
+        if (std::find(turn_ends.begin(), turn_ends.end(), t) != turn_ends.end()) return false;
         if (ids) std::printf("%d ", t); else std::printf("%s", s.tokenizer()->decode_one(t).c_str());
         std::fflush(stdout);
         return !(gc && gc->finished());
@@ -863,7 +868,7 @@ int cmd_bench_kernels(int mb) {
     using namespace forge::graph;
     const std::size_t k = 4096;
     std::mt19937 rng(1);
-    std::printf("quantised matvec, k=%zu, %d MB matrix, %u threads, integer kernels: %s, prefetch %d B\n", k, mb, task::pool::global().size(),
+    std::printf("quantised matvec, k=%zu, %d MB matrix, %u threads, integer kernels: %s, prefetch %d B\n", k, mb, task::engine_threads(),
                 simd::qi8_active().target, simd::qi8_prefetch_bytes);
     for (const char* cn : {"q4_k", "q5_k", "q6_k", "q8_0"}) {
         const auto* c = codecs::find(cn); const int fmt = qweights::fmt_of(c);

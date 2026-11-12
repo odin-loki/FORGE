@@ -6,16 +6,21 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `auto` (scores every device that opens; software devices never beat the CPU), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
+| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `auto` (scores every device that opens; software devices never beat the CPU), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`), or `pipe:auto` (the devices of one backend, shares from throughput and memory). An unavailable device logs a warning and falls back to the CPU. In code: `model::set_device`, the C ABI's `forge_open_params.device` / `forge_weights_set_device` ([capi.md](capi.md)) and the bindings' `device` arguments take the same values and win over the variable |
 | `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx512`, `avx2`, `sse4.2`, `sse2`, `neon`, `sve`, `rvv`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` (32-bit Arm `neon` needs `FORGE_SIMD_ARM32_NEON=1` as well: [simd.md](simd.md)). Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
 | `FORGE_SVE_KEEP_VL=1` | simd (aarch64 Linux) | Do not change the SVE vector length at start-up when there is no kernel table for the hardware length |
-| `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
+| `FORGE_THREADS` | task pool, scheduler | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
 | `FORGE_SPIN_US` | task pool | How long idle workers spin for the next `parallel_for` before sleeping (default 200; 0 = sleep at once) |
+| `FORGE_TASK_SCHEDULER` | `task::parallel_for` (graph, inference, gpu) | Executor of the engine's data-parallel loops: `pool` (default: `task::pool`) or `sched` (the work-stealing `task::scheduler`, one thread set of the same size). Results are the same bits on both. Read once per process ([support.md](support.md#engine-executor-taskenginehpp)) |
 | `FORGE_PROCESSES` | `os::process_pool` | Worker process count when the pool is created with 0 workers (default: hardware concurrency) |
-| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels. Default: on for x86 with a SIMD integer table; off on AArch64 (NEON / dotprod / SVE tables exist, `=1` opts in: never timed on hardware) and on every other architecture (scalar table only) |
-| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`; x86 `avx2`, `avxvnni`, `avx512vnni`; AArch64 `neon`, `dotprod`, `sve` (ignored when the CPU cannot run it) |
+| `FORGE_CPU_INT8=0` | quantised matmul (CPU) | Turn off the int8-activation integer kernels (q8_0/q4_k/q5_k/q6_k) and use the f32 decode + dot path, the accuracy reference. `=1` forces them even with only the scalar kernels. Default: on for x86 with an AVX integer table (`avx2`, `avxvnni`, `avx512vnni`); off everywhere else, where `=1` opts in: the x86 SSE tables, AArch64 (NEON / dotprod / SVE) and the GNU-vector tables of the other architectures have never been timed on hardware |
+| `FORGE_QI8_TARGET` | quantised matmul (CPU) | Force an integer-kernel table: `scalar`; x86 `avx512vnni`, `avxvnni`, `avx2`, `sse4.2`, `sse2`; AArch64 `sve`, `dotprod`, `neon`; `rvv`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` on their architectures (ignored when the CPU cannot run it). `FORGE_SIMD_TARGET` also selects the Tier A and attention tables of the same name |
 | `FORGE_QI8_PF` | quantised matmul (CPU) | Software prefetch distance of the integer kernels in bytes (default 2048, 0 = off) |
 | `FORGE_QDOT=0` | quantised matmul (CPU) | Use the plain scalar decode + dot path instead of the SIMD one (benchmarking, bisecting) |
+| `FORGE_FUSE=0` | graph (host plans) | Turn off conv + batch_norm folding, row chains and shared int8 activations together ([graph.md](graph.md#fusion)). `silu_mul` fusion is not affected |
+| `FORGE_FUSE_CONV_BN=0` | graph `optimise` | Keep a `batch_norm` after a convolution as its own op instead of folding it into the convolution's weights (folding is within 2e-5 of the largest output, not bit-identical) |
+| `FORGE_FUSE_CHAIN=0` | graph, host plans | Run every step of a row chain (elementwise ops, bias adds, `rms_norm`, `layer_norm` in a row) as its own pass instead of block by block. Same bits either way |
+| `FORGE_FUSE_QACT=0` | graph, host plans | Quantise the activation of every int8 quantised `matmul_t` separately instead of once per group of steps that share it. Same bits either way |
 
 ## GPU tuning and debugging
 
@@ -25,10 +30,10 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 |----------|-----------|--------|
 | `FORGE_GPU_NO_RESIDENCY` | CUDA, HIP, OpenCL, Level Zero, Metal | If set, tensors are not kept on the device between ops; every op uploads and downloads. Vulkan always keeps tensors resident |
 | `FORGE_GPU_EAGER_SYNC` | CUDA, HIP | If set, every run ends by syncing all resident buffers to the host; turns off the fixed arena and whole-run replay |
-| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP, OpenCL, Level Zero | If set, Gated DeltaNet state ops run on the host instead of the device |
-| `FORGE_GPU_QMATMUL=0` | CUDA, HIP, OpenCL, Level Zero | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
-| `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero | Do not gather from encoded embedding tables on the device |
-| `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
+| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | If set, Gated DeltaNet state ops run on the host instead of the device |
+| `FORGE_GPU_QMATMUL=0` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
+| `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero, Vulkan, Metal | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
 | `FORGE_DETERMINISTIC=1` | all devices | Determinism mode: only order-stable device paths (no split-K / stream-K matmul, no split-over-keys decode attention, single-block argmax, fixed CPU chunking). Same device + same build gives bit-identical results; see [gpu.md](gpu.md#determinism-mode). `session_options::deterministic` and `gpu::set_deterministic` override it |
 | `FORGE_DEVICE_PREFER`, `FORGE_DEVICE_EXCLUDE` | `FORGE_DEVICE=auto` | Comma lists of backends (`cuda`) or devices (`opencl:1`): preferred ones win whenever eligible, excluded ones are never chosen ([gpu.md](gpu.md#automatic-device-selection)) |
 | `FORGE_DEVICE_ALLOW_SOFTWARE=1` | `FORGE_DEVICE=auto` | Let software devices (lavapipe, SwiftShader, OpenCL CPU runtimes) compete; by default they never win over the CPU |
@@ -129,6 +134,9 @@ Read by `rpc:host:port` devices and `forge::remote` (see [rpc.md](rpc.md)).
 | `FORGE_RPC_FINGERPRINT` | SHA-256 fingerprint of the server certificate |
 | `FORGE_RPC_TLS_CERT`, `FORGE_RPC_TLS_KEY` | Client certificate and key, for servers started with `--tls-client-ca` |
 | `FORGE_RPC_SERVER_NAME` | Server name for TLS verification |
+| `FORGE_RPC_RESIDENT=0` | Device clients: do not upload weights to the server; send them with every op |
+| `FORGE_RPC_RESIDENT_MIN` | Device clients: smallest weight, in bytes, uploaded once and sent by handle (default 4096) |
+| `FORGE_RPC_WEIGHT_CACHE` | `forge rpc-serve` and `rpc::server`: bytes of uploaded weights kept over all connections (`k` / `m` / `g` suffix; default 1 GiB; `0` = none). See [rpc.md](rpc.md#weights-on-the-server) |
 
 `forge rpc-serve --allow-scripts` removes `FORGE_SCRIPT_CACHE_SIGN_SEED`, `FORGE_RPC_TOKEN`, `FORGE_RPC_KEY` and `FORGE_RPC_TLS_KEY` from the environment of script child processes.
 

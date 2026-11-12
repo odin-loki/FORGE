@@ -2,6 +2,7 @@
 #include <sys/prctl.h>
 #endif
 #include <forge/simd/dispatch.hpp>
+#include "isa_tables.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <format>
@@ -35,57 +36,57 @@ namespace mv_avx2 { extern const kernels table; }
 namespace mv_avx512 { extern const kernels table; }
 #endif
 #if defined(FORGE_SIMD_HAVE_SSE)
-namespace mv_sse2 { extern const kernels table; }
-namespace mv_sse42 { extern const kernels table; }
+namespace mv_sse2 { extern const kernels table; extern const isa_tables extra; }
+namespace mv_sse42 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_LSX)
-namespace mv_lsx { extern const kernels table; }
+namespace mv_lsx { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_LASX)
-namespace mv_lasx { extern const kernels table; }
+namespace mv_lasx { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_VSX)
-namespace mv_vsx { extern const kernels table; }
+namespace mv_vsx { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_VXE)
-namespace mv_vxe { extern const kernels table; }
+namespace mv_vxe { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_WASM128)
-namespace mv_simd128 { extern const kernels table; }
+namespace mv_simd128 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_MSA)
-namespace mv_msa { extern const kernels table; }
+namespace mv_msa { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_NEON32)
 namespace mv_neon { extern const kernels table; }
 #endif
 #if defined(__aarch64__)
-namespace mv_neon { extern const kernels table; }
+namespace mv_neon { extern const kernels table; extern const isa_tables extra; }
 #endif
 // Fixed-length scalable tables, one per built length (FORGE_SIMD_SVE<B> / FORGE_SIMD_RVV<B> set by CMake).
 #if defined(FORGE_SIMD_SVE128)
-namespace mv_sve128 { extern const kernels table; }
+namespace mv_sve128 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_SVE256)
-namespace mv_sve256 { extern const kernels table; }
+namespace mv_sve256 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_SVE512)
-namespace mv_sve512 { extern const kernels table; }
+namespace mv_sve512 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_SVE1024)
-namespace mv_sve1024 { extern const kernels table; }
+namespace mv_sve1024 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_RVV128)
-namespace mv_rvv128 { extern const kernels table; }
+namespace mv_rvv128 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_RVV256)
-namespace mv_rvv256 { extern const kernels table; }
+namespace mv_rvv256 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_RVV512)
-namespace mv_rvv512 { extern const kernels table; }
+namespace mv_rvv512 { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_RVV1024)
-namespace mv_rvv1024 { extern const kernels table; }
+namespace mv_rvv1024 { extern const kernels table; extern const isa_tables extra; }
 #endif
 // Read the hardware vector length without SVE/V codegen flags in this TU (raw encodings, numeric CSR).
 #if defined(__aarch64__) && defined(__linux__)
@@ -357,6 +358,64 @@ const kernels* by_name(const char* t) {
         return e && *e == '1' && f.neon && f.vfpv4 ? &mv_neon::table : nullptr;
     }
 #endif
+    return nullptr;
+}
+
+// The Tier A / seq / int8 tables built beside a kernel table (isa_extra.cpp), found through the kernel table
+// by_name() resolves, so the usability rules are stated once.
+const isa_tables* isa_extra_by_name(const char* t) {
+    [[maybe_unused]] const kernels* k = by_name(t);
+    if (!k) return nullptr;
+#define FORGE_ISA_EXTRA(ns) if (k == &ns::table) return &ns::extra;
+#if defined(__aarch64__)
+    FORGE_ISA_EXTRA(mv_neon)
+#endif
+#if defined(FORGE_SIMD_HAVE_SSE)
+    FORGE_ISA_EXTRA(mv_sse2) FORGE_ISA_EXTRA(mv_sse42)
+#endif
+#if defined(FORGE_SIMD_HAVE_LSX)
+    FORGE_ISA_EXTRA(mv_lsx)
+#endif
+#if defined(FORGE_SIMD_HAVE_LASX)
+    FORGE_ISA_EXTRA(mv_lasx)
+#endif
+#if defined(FORGE_SIMD_HAVE_VSX)
+    FORGE_ISA_EXTRA(mv_vsx)
+#endif
+#if defined(FORGE_SIMD_HAVE_VXE)
+    FORGE_ISA_EXTRA(mv_vxe)
+#endif
+#if defined(FORGE_SIMD_HAVE_WASM128)
+    FORGE_ISA_EXTRA(mv_simd128)
+#endif
+#if defined(FORGE_SIMD_HAVE_MSA)
+    FORGE_ISA_EXTRA(mv_msa)
+#endif
+#if defined(FORGE_SIMD_SVE128)
+    FORGE_ISA_EXTRA(mv_sve128)
+#endif
+#if defined(FORGE_SIMD_SVE256)
+    FORGE_ISA_EXTRA(mv_sve256)
+#endif
+#if defined(FORGE_SIMD_SVE512)
+    FORGE_ISA_EXTRA(mv_sve512)
+#endif
+#if defined(FORGE_SIMD_SVE1024)
+    FORGE_ISA_EXTRA(mv_sve1024)
+#endif
+#if defined(FORGE_SIMD_RVV128)
+    FORGE_ISA_EXTRA(mv_rvv128)
+#endif
+#if defined(FORGE_SIMD_RVV256)
+    FORGE_ISA_EXTRA(mv_rvv256)
+#endif
+#if defined(FORGE_SIMD_RVV512)
+    FORGE_ISA_EXTRA(mv_rvv512)
+#endif
+#if defined(FORGE_SIMD_RVV1024)
+    FORGE_ISA_EXTRA(mv_rvv1024)
+#endif
+#undef FORGE_ISA_EXTRA
     return nullptr;
 }
 

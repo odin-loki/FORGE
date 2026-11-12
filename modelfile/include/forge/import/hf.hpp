@@ -375,6 +375,24 @@ template <class W> void store_hf_tokenizer(const std::filesystem::path& dir, jso
         if (auto* ae = tok_cfg.find("add_eos_token"); ae && ae->is_bool() && !has("add_eos")) man.emplace_back("add_eos", ae->b());
         chat_tpl = chat_template_of(tok_cfg);
     }
+    {   // manifest "eos_token_ids": every id that ends generation. generation_config.json's eos_token_id (an id or a
+        // list, e.g. Llama-3's <|end_of_text|>, <|eom_id|>, <|eot_id|>), else config.json's when that is a list.
+        json::array ends;
+        auto take = [&](const std::filesystem::path& f, bool lists_only) {
+            if (!ends.empty() || !std::filesystem::exists(f)) return;
+            try {
+                auto e = json::parse(read_file(f)); auto* v = e.find("eos_token_id");
+                if (v && v->is_num() && v->num() >= 0 && !lists_only) ends.push_back(*v);
+                else if (v && v->is_arr()) for (auto& x : v->arr()) if (x.is_num() && x.num() >= 0 && ends.size() < 64) ends.push_back(x);
+            } catch (const std::exception& e) { rep.notes.push_back(std::string("warning: ") + f.filename().string() + " is not readable JSON (" + e.what() + "); its eos_token_id is ignored"); }
+        };
+        take(dir / "generation_config.json", false); take(dir / "config.json", true);
+        if (!ends.empty() && !has("eos_token_ids")) {
+            // a config.json whose eos_token_id is a list left the manifest's single eos_token_id at -1: use its first id
+            for (auto& kv : man) if (kv.first == "eos_token_id" && kv.second.is_num() && kv.second.num() < 0) kv.second = ends.front();
+            man.emplace_back("eos_token_ids", std::move(ends));
+        }
+    }
     if (std::filesystem::exists(dir / "chat_template.jinja")) chat_tpl = read_file(dir / "chat_template.jinja");
     else if (chat_tpl.empty() && std::filesystem::exists(dir / "chat_template.json")) chat_tpl = chat_template_of(json::parse(read_file(dir / "chat_template.json")));
     std::string tj, from;

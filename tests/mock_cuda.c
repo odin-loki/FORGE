@@ -65,7 +65,7 @@ int N_(cuStreamDestroy_v2, hipStreamDestroy)(void* s) { free(s); return 0; }
 int N_(cuStreamSynchronize, hipStreamSynchronize)(void* s) { (void)s; return 0; }
 
 /* graph capture: launches between begin/end are recorded (with copies of their argument values) */
-#define MAXARGS 16
+#define MAXARGS 24
 typedef struct { void* f; unsigned gx, bx; int nargs; uint64_t vals[MAXARGS]; } rec;
 typedef struct { int n; rec* r; } graph;
 static int g_capturing = 0; static graph* g_cap = NULL;
@@ -74,7 +74,21 @@ int N_(cuStreamEndCapture, hipStreamEndCapture)(void* s, void** g) { (void)s; g_
 int N_(cuGraphInstantiateWithFlags, hipGraphInstantiateWithFlags)(void** e, void* g, unsigned long long f) { (void)f; *e = g; return 0; }
 int N_(cuGraphExecDestroy, hipGraphExecDestroy)(void* e) { (void)e; return 0; }
 int N_(cuGraphDestroy, hipGraphDestroy)(void* g) { graph* gr = g; free(gr->r); free(gr); return 0; }
+/* The encoder / vision kernels (gpu_gen.py PORT_NN: layer_norm, group_norm, conv1d, conv2d, pooling, attention_bias)
+   are not hand copies: the generated portable source is compiled here as C, as mock_opencl.c does with kernels.cl. */
+#define FORGE_CL_HOST_SHIM
+#define FORGE_K static
+#define G
+#ifdef _MSC_VER
+static __declspec(thread) size_t mock_gid;
+#else
+static __thread size_t mock_gid;
+#endif
+static size_t get_global_id(int d) { (void)d; return mock_gid; }
+#include "kernels_nn_mock.inc"
+#undef G
 static float un(const char* op, float x) {
+    if (!strcmp(op, "gelu")) return fgelu(x);
     if (!strcmp(op, "neg")) return -x; if (!strcmp(op, "abs")) return fabsf(x); if (!strcmp(op, "sqrt")) return sqrtf(x);
     if (!strcmp(op, "rsqrt")) return 1.0f / sqrtf(x); if (!strcmp(op, "recip")) return 1.0f / x; if (!strcmp(op, "square")) return x * x;
     if (!strcmp(op, "exp")) return expf(x); if (!strcmp(op, "exp2")) return exp2f(x); if (!strcmp(op, "log")) return logf(x);
@@ -155,6 +169,7 @@ static int mock_qmma(const signed char* xq, const float* xds, const unsigned cha
     for (i = 0; i < rows * k; ++i) a[i] = xds[2u * (i / 32u)] * (float)xq[i];
     mock_qmm(a, w, y, rows, cols, k, fmt, rb); free(a); return 0; }
 static int nargs_of(const char* op) {
+    for (int ti = 0; forge_nn_tramps[ti].name; ++ti) if (!strcmp(op, forge_nn_tramps[ti].name + 6)) return forge_nn_tramps[ti].nargs;
     if (!strcmp(op, "quant_q8r")) return 4; if (!strncmp(op, "qmatmul_mma", 11)) return 14; if (!strncmp(op, "qmatmul_glu", 11)) return 15;
     if (!strcmp(op, "glu_q81")) return 5; if (!strcmp(op, "sum_splits")) return 4; if (!strcmp(op, "argmax")) return 4;
     if (!strcmp(op, "qmatmul_q81")) return 8; if (!strcmp(op, "quant_q81")) return 3;
@@ -199,6 +214,9 @@ static float m_moe_dot(const float* x, const unsigned char* w, size_t row, unsig
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     const char* op = (const char*)f + 6;   /* skip "forge_" */
     unsigned threads = gx * bx, i;
+    for (int ti = 0; forge_nn_tramps[ti].name; ++ti) if (!strcmp(op, forge_nn_tramps[ti].name + 6)) {   /* a work item per thread, bounds-checked by the kernel */
+        for (mock_gid = 0; mock_gid < threads; ++mock_gid) forge_nn_tramps[ti].f(args);
+        return 0; }
     if (!strcmp(op, "moe_hidden")) { const float *h = P(ARG(0, dptr)), *route = P(ARG(1, dptr)); float* hid = P(ARG(4, dptr));
         const unsigned char *wg = (const unsigned char*)(uintptr_t)ARG(2, dptr), *wu = (const unsigned char*)(uintptr_t)ARG(3, dptr);
         unsigned np = ARG(5, unsigned), ff = ARG(6, unsigned), d = ARG(7, unsigned), fg = ARG(8, unsigned), rg = ARG(9, unsigned), fu = ARG(10, unsigned), ru = ARG(11, unsigned);

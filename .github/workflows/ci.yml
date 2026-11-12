@@ -39,8 +39,8 @@ jobs:
       - run: cmake --build --preset dev -j4
       - run: ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200
   linux-vulkan:
-    # Vulkan backend on Mesa lavapipe (llvmpipe, CPU): test_vulkan, its 256-byte-alignment rerun and the two
-    # Vulkan goldens. The loader is pinned to the lavapipe ICD; test_vulkan must report an llvmpipe device.
+    # Vulkan backend on Mesa lavapipe (llvmpipe, CPU): test_vulkan (spec kernels, the GLSL ports of the portable
+    # kernels), its 256-byte-alignment rerun and the Vulkan goldens (llama, MoE, RoPE scaling, quantised, families). The loader is pinned to the lavapipe ICD; test_vulkan must report an llvmpipe device.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -67,8 +67,8 @@ jobs:
           [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
           grep -q "^vulkan device: llvmpipe" vk.log
       - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
-      - name: all four Vulkan tests ran
-        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 4
+      - name: all fifteen Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 15
   linux-tsan:
     # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
     # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
@@ -229,7 +229,7 @@ jobs:
             experimental: true
     env:
       QEMU_LD_PREFIX: /usr/${{ matrix.triple }}
-      EMU_TESTS: test_simd test_tile test_dtypes test_graph test_kvquant test_support test_util
+      EMU_TESTS: test_simd test_simd_tables test_simd_tiera test_simd_types test_tile test_dtypes test_graph test_kvquant test_support test_util
     steps:
       - uses: actions/checkout@v4
       - name: install qemu-user and the cross compiler (g++-14, else g++-13, else unversioned)
@@ -250,11 +250,12 @@ jobs:
           ${{ matrix.qemu }} --version | head -1
           cmake -S . -B build/emu -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }}.cmake -DFORGE_CROSS_CC=$CROSS_CC -DFORGE_CROSS_CXX=$CROSS_CXX -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF | tee configure.log
           if [ -n "${{ matrix.tables }}" ]; then grep -E "FORGE: (SVE|RVV) kernel tables: .*FORGE_SIMD_(SVE|RVV)256" configure.log; fi
-      - run: cmake --build build/emu -j4 --target $EMU_TESTS
+      # forge_simd_tests: the per-table vec_types executables (test_simd_types_<table>) next to the simd tests
+      - run: cmake --build build/emu -j4 --target $EMU_TESTS forge_simd_tests
       - name: fixed-width kernel tables, each forced and required to be the active one
         if: matrix.lanes
         run: |
-          for t in ${{ matrix.lanes }}; do ctest --test-dir build/emu -R "^lane_$t\$" --timeout 1800 --no-tests=error --output-on-failure; done
+          for t in ${{ matrix.lanes }}; do ctest --test-dir build/emu -R "^(lane|tables|tiera|types)_$t\$" --timeout 1800 --no-tests=error --output-on-failure; done
       - name: emu-labelled tests (scalable lane active at every vector length)
         if: matrix.emu_min > 0
         run: |

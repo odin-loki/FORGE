@@ -922,3 +922,292 @@ TEST(rpc_tls_zz_cleanup) {
     for (auto* f : {&p.srv, &p.srv_key, &p.ca, &p.ca_key, &p.cl, &p.cl_key, &p.cl2, &p.cl2_key, &p.cl3, &p.cl3_key, &p.rogue, &p.rogue_key}) { std::error_code ec; std::filesystem::remove(*f, ec); }
     if (std::error_code ec; !openssl_bin().empty() && !pki2().dir.empty()) std::filesystem::remove_all(pki2().dir, ec);
 }
+
+// ---- remote weight residency (graph/rpc.hpp protocol version 2; docs/rpc.md "Weights on the server") ----
+namespace {
+struct wfix {   // y[rows, cols] = x[rows, k] . W[cols, k]^T with W a noted weight
+    i64 rows = 3, k = 256, cols = 64;
+    tensor W, x, y;
+    explicit wfix(float ph) : W({cols, k}), x({rows, k}), y({rows, cols}) {
+        for (std::size_t i = 0; i < W.data.size(); ++i) W.data[i] = std::sin(float(i) * 0.37f + ph) * 0.1f;
+        for (std::size_t i = 0; i < x.data.size(); ++i) x.data[i] = std::cos(float(i) * 0.11f + ph);
+    }
+    std::size_t wbytes() const { return W.data.size() * 4; }
+    void run(graph::rpc::client& c) {
+        std::fill(y.data.begin(), y.data.end(), -7.f);
+        tensor_view in[2] = {{x.data.data(), x.shape}, {W.data.data(), W.shape}};
+        c.run("matmul_t", std::span<const tensor_view>(in, 2), {y.data.data(), y.shape}, {});
+    }
+    bool right() const { auto r = ops::ref::matmul_t({x, W}, {}); for (std::size_t i = 0; i < r.data.size(); ++i) if (std::abs(r.data[i] - y.data[i]) > 1e-4f) return false; return true; }
+};
+// One connection: send `bytes`, half-close, return everything the server answers until it closes.
+std::string raw_talk(int port, const std::vector<char>& bytes) {
+    auto c = os::socket::connect("127.0.0.1", port, 2000); if (!c) return "<no connection>";
+    c->set_timeout_ms(5000);
+    if (!bytes.empty() && !c->send_all(bytes.data(), bytes.size())) return "<send failed>";
+    c->shutdown_write();
+    std::string out; char buf[4096];
+    for (long k; (k = c->recv(buf, sizeof buf)) > 0;) out.append(buf, std::size_t(k));
+    return out;
+}
+std::uint32_t u32_at(const std::string& s, std::size_t at) { std::uint32_t v = 0xffffffffu; if (s.size() >= at + 4) std::memcpy(&v, s.data() + at, 4); return v; }
+hash::blake3::digest hash_of(const std::vector<float>& d) { hash::blake3 h; h.update(d.data(), d.size() * 4); return h.final(); }
+void put_upload(graph::rpc::detail::writer& w, const hash::blake3::digest& h, const shape_t& sh, const std::vector<float>& d) {
+    w.raw("FRPW", 4); w.raw(h.data(), 32); w.shape(sh); w.raw(d.data(), d.size() * 4);
+}
+}
+
+TEST(rpc_weight_residency_upload_once) {
+    graph::rpc::server srv(nullptr, 0); srv.start();
+    auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+    CHECK(c != nullptr);
+    wfix f(1.f);
+    f.run(*c); CHECK(f.right());                                   // not noted: the weight travels with the op (FRPC)
+    CHECK(c->uploads() == 0 && c->weight_refs() == 0 && srv.weight_uploads() == 0);
+    c->note_weight(f.W.data.data(), f.W.data.size());
+    const auto sent0 = c->bytes_sent();
+    f.run(*c); CHECK(f.right());                                   // first use: one upload, then the op by handle
+    CHECK(c->resident() && c->weight_budget() == srv.weight_budget_bytes);
+    CHECK(c->uploads() == 1 && c->upload_bytes() == f.wbytes() && c->weight_refs() == 1);
+    CHECK(srv.weight_uploads() == 1 && srv.weight_bytes() == f.wbytes() && srv.weight_hits() == 1);
+    const auto sent1 = c->bytes_sent();
+    for (int i = 0; i < 3; ++i) { f.x.data[0] += 1.f; f.run(*c); CHECK(f.right()); }
+    CHECK(c->uploads() == 1 && c->weight_refs() == 4 && srv.weight_uploads() == 1 && srv.weight_hits() == 4);
+    CHECK_MSG(sent1 - sent0 > f.wbytes() && c->bytes_sent() - sent1 < f.wbytes() / 2, "bytes sent: first use %llu, three later ops %llu, weight %zu",
+              (unsigned long long)(sent1 - sent0), (unsigned long long)(c->bytes_sent() - sent1), f.wbytes());
+    // the same bytes at another address: another upload request, but the server already holds the hash
+    wfix g(1.f); c->note_weight(g.W.data.data(), g.W.data.size());
+    g.run(*c); CHECK(g.right());
+    CHECK(c->uploads() == 2 && srv.weight_uploads() == 1 && srv.weight_bytes() == f.wbytes());
+    // a noted buffer whose contents changed is hashed again, never served from the old handle
+    for (auto& v : f.W.data) v *= 2.f;
+    f.run(*c); CHECK(f.right());
+    CHECK(c->uploads() == 3 && srv.weight_uploads() == 2);
+    // forgotten: travels inline again
+    c->forget_weight(f.W.data.data(), f.W.data.size());
+    const auto refs = c->weight_refs(); f.run(*c); CHECK(f.right() && c->weight_refs() == refs);
+    c.reset();                                                     // the connection's weights go with it
+    for (int i = 0; i < 200 && srv.weight_bytes(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(srv.weight_bytes() == 0);
+    srv.stop();
+}
+
+TEST(rpc_weight_residency_lru_budget) {
+    graph::rpc::server srv(nullptr, 0);
+    wfix a(1.f), b(2.f), c3(3.f);
+    srv.weight_budget_bytes = 2 * a.wbytes() + 100;                // room for two of the three
+    srv.start();
+    auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+    for (auto* f : {&a, &b, &c3}) c->note_weight(f->W.data.data(), f->W.data.size());
+    a.run(*c); b.run(*c); a.run(*c);                               // a is now the most recently used
+    CHECK(a.right() && b.right() && srv.weight_uploads() == 2 && srv.weight_evictions() == 0);
+    c3.run(*c);                                                    // evicts b, the least recently used
+    CHECK(c3.right() && srv.weight_uploads() == 3 && srv.weight_evictions() == 1 && srv.weight_bytes() == 2 * a.wbytes());
+    a.run(*c); CHECK(a.right() && c->weight_misses() == 0);        // a is still there
+    b.run(*c);                                                     // b is not: the server says so, the client uploads it again
+    CHECK(b.right() && c->weight_misses() == 1 && c->uploads() == 4 && srv.weight_evictions() == 2);
+    CHECK(srv.weight_bytes() <= srv.weight_budget_bytes);
+    // a weight larger than the whole budget is refused once and then travels inline
+    wfix big(4.f); big.cols = 300; big.W = tensor({big.cols, big.k}); big.y = tensor({big.rows, big.cols});
+    for (std::size_t i = 0; i < big.W.data.size(); ++i) big.W.data[i] = std::sin(float(i) * 0.21f) * 0.1f;
+    c->note_weight(big.W.data.data(), big.W.data.size());
+    const auto up = c->uploads(); big.run(*c); big.run(*c);
+    CHECK(big.right() && c->uploads() == up && srv.weight_bytes() <= srv.weight_budget_bytes);
+    // a second connection shares the budget but not the weights: it cannot use a hash the first one uploaded
+    auto c2 = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+    c2->note_weight(a.W.data.data(), a.W.data.size());
+    const auto su = srv.weight_uploads(); a.run(*c2);
+    CHECK(a.right() && c2->uploads() <= 1 && (c2->uploads() == 0 || srv.weight_uploads() == su + 1));
+    CHECK(srv.weight_bytes() <= srv.weight_budget_bytes);
+    srv.stop();
+}
+
+TEST(rpc_weight_residency_reconnect_invalidates) {
+    graph::rpc::server srv(nullptr, 0); srv.start();
+    auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+    wfix f(1.f); c->note_weight(f.W.data.data(), f.W.data.size());
+    f.run(*c); f.run(*c);
+    CHECK(f.right() && c->uploads() == 1 && srv.weight_uploads() == 1);
+    CHECK(c->reconnect());                                         // a new connection: the server's copy is gone, the client knows
+    f.run(*c);
+    CHECK(f.right() && c->uploads() == 2 && srv.weight_uploads() == 2 && c->weight_misses() == 0 && c->reconnects() == 1);
+    srv.stop();
+    // the server goes away and another one takes its place: the next op reconnects by itself and uploads again
+    graph::rpc::server s1(nullptr, 0); s1.start(); const int port = s1.port();
+    auto d = graph::rpc::client::connect("127.0.0.1", std::to_string(port), nullptr);
+    d->note_weight(f.W.data.data(), f.W.data.size());
+    f.run(*d); CHECK(f.right() && d->uploads() == 1);
+    s1.stop();
+    bool rebound = true; std::unique_ptr<graph::rpc::server> s2;
+    try { s2 = std::make_unique<graph::rpc::server>(nullptr, port); s2->start(); } catch (const std::exception&) { rebound = false; }   // the port may be taken
+    if (rebound) {
+        f.run(*d);
+        CHECK(f.right() && d->reconnects() == 1 && d->uploads() == 2 && s2->weight_uploads() == 1);
+        s2->stop();
+    } else std::puts("  note: could not listen on the same port again; automatic reconnect not exercised");
+}
+
+TEST(rpc_weight_residency_old_peers) {
+    wfix f(1.f);
+    {   // a server from before residency (protocol 1): the probe is an unknown op, weights travel with every op
+        graph::rpc::server srv(nullptr, 0); srv.protocol_version = 1; srv.start();
+        auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+        c->note_weight(f.W.data.data(), f.W.data.size());
+        f.run(*c); f.run(*c);
+        CHECK(f.right() && !c->resident() && c->uploads() == 0 && c->weight_refs() == 0 && c->reconnects() == 0 && srv.weight_uploads() == 0);
+        // and it closes the connection on the new frames, as an old server does on any unknown magic
+        graph::rpc::detail::writer w; put_upload(w, hash_of(f.W.data), f.W.shape, f.W.data);
+        CHECK(raw_talk(srv.port(), w.b).empty());
+        srv.stop();
+    }
+    {   // a client from before residency sends plain FRPC frames: a version 2 server serves them unchanged
+        graph::rpc::server srv(nullptr, 0); srv.start();
+        graph::rpc::detail::writer w; w.raw("FRPC", 4); w.str("relu"); graph::rpc::detail::put_attrs(w, {}); w.u32(1);
+        std::vector<float> v{-1.f, 2.f}; w.shape({2}); w.raw(v.data(), 8); w.shape({2});
+        auto rep = raw_talk(srv.port(), w.b);
+        float out[2] = {9, 9}; if (rep.size() == 12) std::memcpy(out, rep.data() + 4, 8);
+        CHECK(rep.size() == 12 && u32_at(rep, 0) == 0 && out[0] == 0.f && out[1] == 2.f);
+        srv.stop();
+    }
+    {   // a server with no budget says so in the probe
+        graph::rpc::server srv(nullptr, 0); srv.weight_budget_bytes = 0; srv.start();
+        auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+        c->note_weight(f.W.data.data(), f.W.data.size());
+        f.run(*c); CHECK(f.right() && !c->resident() && c->uploads() == 0);
+        srv.stop();
+    }
+}
+
+TEST(rpc_weight_residency_permissions) {
+    wfix f(1.f);                                                   // W: 64 KiB, x: 3 KiB, y: 768 bytes
+    graph::rpc::server_security sec;
+    sec.tokens = graph::rpc::parse_tokens(
+        "full\n"
+        "allow=device.contraction contr\n"
+        "allow=device.elementwise elem\n"
+        "allow=device max-bytes=4096 small\n"                      // the weight alone is over the limit
+        "allow=device max-bytes=66000 exact\n"                     // the weight fits; weight + x + y (69,376 bytes) does not
+        "allow=device max-bytes=100000 roomy\n"
+        "allow=scripts scr\n");
+    std::vector<std::string> log; std::mutex lm;
+    graph::rpc::server srv(nullptr, 0, "127.0.0.1", sec);
+    srv.log = [&](const std::string& m) { std::lock_guard g(lm); log.push_back(m); };
+    srv.start();
+    auto conn = [&](const char* t) { auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr, tok(t)); if (c) c->note_weight(f.W.data.data(), f.W.data.size()); return c; };
+    auto up0 = srv.weight_uploads();
+    { auto c = conn("contr"); f.run(*c); f.run(*c); CHECK(f.right() && c->uploads() == 1 && c->weight_refs() == 2); }      // matmul_t is a contraction
+    CHECK(srv.weight_uploads() == up0 + 1);
+    { auto c = conn("elem");                                       // may upload (it has a device permission) but not run a contraction
+      CHECK(throws_with([&] { f.run(*c); }, "may not run contraction ops")); CHECK(c->uploads() == 1); }
+    { auto c = conn("scr");                                        // no device permission at all: the upload is refused, then the op
+      CHECK(throws_with([&] { f.run(*c); }, "permission denied")); CHECK(c->uploads() == 0); }
+    { auto c = conn("small");                                      // upload over max-bytes: refused without being buffered; inline is over it too
+      const auto su = srv.weight_uploads();
+      CHECK(throws_with([&] { f.run(*c); }, "above its limit (max-bytes=4096)")); CHECK(c->uploads() == 0 && srv.weight_uploads() == su); }
+    { auto c = conn("exact");                                      // the upload fits, but the handle counts as the weight's bytes in the op
+      CHECK(throws_with([&] { f.run(*c); }, "above its limit (max-bytes=66000)")); CHECK(c->uploads() == 1); }
+    { auto c = conn("roomy"); f.run(*c); CHECK(f.right() && c->uploads() == 1 && c->weight_refs() == 1); }
+    srv.stop();
+    bool logged = false; for (auto& l : log) if (l.find("refused weight upload") != std::string::npos) logged = true;
+    CHECK(logged);
+}
+
+// Everything in an upload or a handle comes from the peer. Found while writing the decoder, kept as cases: a wrong
+// hash, an unknown handle, a handle used with another size, a 44-byte frame naming gigabytes, a bad input kind.
+TEST(rpc_weight_residency_untrusted_wire) {
+    using graph::rpc::detail::writer;
+    graph::rpc::server srv(nullptr, 0); srv.max_tensor_elems = 1u << 20; srv.start();
+    std::vector<float> wd(64); for (std::size_t i = 0; i < wd.size(); ++i) wd[i] = float(i) - 30.f;
+    const auto good = hash_of(wd);
+    auto op_by_handle = [&](writer& w, const hash::blake3::digest& h, const shape_t& sh, std::uint32_t kind = 1) {
+        w.raw("FRPR", 4); w.str("relu"); graph::rpc::detail::put_attrs(w, {}); w.u32(1); w.u32(kind); w.raw(h.data(), 32); w.shape(sh); w.shape(sh);
+    };
+    {   // upload, then use the handle: status 0 twice, relu of the stored data
+        writer w; put_upload(w, good, {64}, wd); op_by_handle(w, good, {64});
+        auto rep = raw_talk(srv.port(), w.b);
+        CHECK(rep.size() == 4 + 4 + 64 * 4 && u32_at(rep, 0) == 0 && u32_at(rep, 4) == 0);
+        float y30 = -1, y40 = -1; if (rep.size() == 264) { std::memcpy(&y30, rep.data() + 8 + 30 * 4, 4); std::memcpy(&y40, rep.data() + 8 + 40 * 4, 4); }
+        CHECK(y30 == 0.f && y40 == 10.f);
+    }
+    {   // the same handle with another shape of the same size is fine; with another size it is an error, not a read past the weight
+        writer w; put_upload(w, good, {64}, wd); op_by_handle(w, good, {8, 8}); op_by_handle(w, good, {65}); op_by_handle(w, good, {4});
+        auto rep = raw_talk(srv.port(), w.b);
+        CHECK(u32_at(rep, 0) == 0 && u32_at(rep, 4) == 0 && u32_at(rep, 8 + 256) == 1);
+        CHECK(rep.find("a weight handle names 64 elements, the request 65") != std::string::npos && rep.find("the request 4") != std::string::npos);
+    }
+    {   // a hash that does not match the bytes: refused, nothing stored, and the handle stays unknown
+        auto bad = good; bad[0] ^= 1;
+        writer w; put_upload(w, bad, {64}, wd); op_by_handle(w, bad, {64});
+        auto rep = raw_talk(srv.port(), w.b);
+        CHECK(u32_at(rep, 0) == 1 && rep.find("do not have the hash") != std::string::npos);
+        const auto at = rep.size() >= 40 ? rep.size() - 40 : 0;    // the last reply: status 3, one missing hash
+        CHECK(rep.size() >= 40 && u32_at(rep, at) == 3 && u32_at(rep, at + 4) == 1 && std::memcmp(rep.data() + at + 8, bad.data(), 32) == 0);
+    }
+    {   // a handle another connection uploaded is not visible here
+        writer up; put_upload(up, good, {64}, wd);
+        auto c1 = os::socket::connect("127.0.0.1", srv.port(), 2000); CHECK(bool(c1));
+        if (c1) { c1->set_timeout_ms(5000); CHECK(c1->send_all(up.b.data(), up.b.size())); char st[4]; CHECK(c1->recv_all(st, 4)); }   // stored, connection kept open
+        writer w; op_by_handle(w, good, {64});
+        auto rep = raw_talk(srv.port(), w.b);
+        CHECK(rep.size() == 40 && u32_at(rep, 0) == 3);
+    }
+    {   // 44 bytes that name a 4 MiB weight: over this server's budget -> refused by size, the missing payload just ends the connection
+        graph::rpc::server small(nullptr, 0); small.weight_budget_bytes = 1 << 16; small.max_tensor_elems = 1u << 30; small.start();
+        writer w; w.raw("FRPW", 4); w.raw(good.data(), 32); w.shape({i64(1) << 20});
+        CHECK(raw_talk(small.port(), w.b).empty() && small.weight_bytes() == 0 && small.weight_uploads() == 0);
+        writer w2; w2.raw("FRPW", 4); w2.raw(good.data(), 32); w2.shape({i64(1) << 40});      // more elements than any tensor may have: dropped
+        CHECK(raw_talk(small.port(), w2.b).empty());
+        writer w3; w3.raw("FRPW", 4); w3.raw(good.data(), 32); w3.u32(99);                     // a rank no shape has
+        CHECK(raw_talk(small.port(), w3.b).empty());
+        writer w4; put_upload(w4, hash_of({}), {0}, {});                                        // an empty weight
+        auto rep = raw_talk(small.port(), w4.b); CHECK(u32_at(rep, 0) == 1 && rep.find("empty weight") != std::string::npos);
+        small.stop();
+    }
+    {   // an input kind that does not exist ends the connection; a truncated handle does too
+        writer w; op_by_handle(w, good, {64}, 7); CHECK(raw_talk(srv.port(), w.b).empty());
+        writer w2; w2.raw("FRPR", 4); w2.str("relu"); graph::rpc::detail::put_attrs(w2, {}); w2.u32(1); w2.u32(1); w2.raw(good.data(), 10);
+        CHECK(raw_talk(srv.port(), w2.b).empty());
+    }
+    {   // handles and inline inputs mixed, more handles than the op has inputs, the same handle twice
+        std::vector<float> xd(64, 2.f);
+        writer w; put_upload(w, good, {64}, wd);
+        w.raw("FRPR", 4); w.str("add"); graph::rpc::detail::put_attrs(w, {}); w.u32(2); w.u32(1); w.raw(good.data(), 32); w.shape({64}); w.u32(0); w.shape({64}); w.raw(xd.data(), 256); w.shape({64});
+        w.raw("FRPR", 4); w.str("add"); graph::rpc::detail::put_attrs(w, {}); w.u32(2); w.u32(1); w.raw(good.data(), 32); w.shape({64}); w.u32(1); w.raw(good.data(), 32); w.shape({64}); w.shape({64});
+        w.raw("FRPR", 4); w.str("relu"); graph::rpc::detail::put_attrs(w, {}); w.u32(2); w.u32(1); w.raw(good.data(), 32); w.shape({64}); w.u32(1); w.raw(good.data(), 32); w.shape({64}); w.shape({64});
+        auto rep = raw_talk(srv.port(), w.b);
+        float a0 = 0, b0 = 0; if (rep.size() >= 4 + 260 + 260) { std::memcpy(&a0, rep.data() + 8, 4); std::memcpy(&b0, rep.data() + 4 + 260 + 4, 4); }
+        CHECK(u32_at(rep, 0) == 0 && u32_at(rep, 4) == 0 && a0 == -28.f && u32_at(rep, 4 + 260) == 0 && b0 == -60.f);
+        CHECK(u32_at(rep, 4 + 520) == 1 && rep.find("relu takes 1 inputs, got 2") != std::string::npos);
+    }
+    {   // the server is still serving
+        auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+        CHECK(c && relu_ok(*c));
+    }
+    for (int i = 0; i < 300 && srv.weight_bytes(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(srv.weight_bytes() == 0);   // every connection above is closed: nothing stays stored
+    srv.stop();
+}
+
+// A whole model over loopback: the plan reports its weights (registry::weights), each is uploaded once, the second
+// forward pass uploads nothing, and the logits are those of the CPU.
+TEST(rpc_weight_residency_model) {
+    graph::rpc::server srv(nullptr, 0); srv.start();
+    auto ref = logits("cpu");
+    auto m = model::open(model_a());
+    const std::string dev = "rpc:127.0.0.1:" + std::to_string(srv.port());
+    CHECK(m->set_device(dev) == dev);
+    std::vector<int> p = {1, 5, 9, 33, 70, 101};
+    std::vector<float> got;
+    std::uint64_t up1 = 0, hits1 = 0;
+    {
+        inference::session s(m);
+        got = s.forward(p);
+        up1 = srv.weight_uploads(); hits1 = srv.weight_hits();
+        int t = 7; auto b = s.forward(std::span<const int>(&t, 1)); got.insert(got.end(), b.begin(), b.end());
+    }
+    CHECK_MSG(up1 > 0 && hits1 >= up1, "uploads %llu, handle uses %llu", (unsigned long long)up1, (unsigned long long)hits1);
+    CHECK_MSG(srv.weight_uploads() <= up1 + 4, "the second pass uploaded %llu more weights", (unsigned long long)(srv.weight_uploads() - up1));
+    CHECK(srv.weight_hits() > hits1);
+    CHECK_MSG(maxdiff(ref, got) < 1e-5f, "rpc diff %g", maxdiff(ref, got));
+    srv.stop();
+}

@@ -4,7 +4,7 @@
 graph treats a tensor graph as a program that is compiled once and replayed:
 
 1. **Build** a `tensor_graph` (or let [inference](inference.md) build one from a model's blueprint).
-2. **Optimise** (`passes.hpp`): verify shapes, then CSE, constant folding, algebraic simplification, dead-code elimination, and fusion. The only fusion today is `silu(a) * b` → `silu_mul(a, b)` when `silu(a)` has no other users.
+2. **Optimise** (`passes.hpp`): verify shapes, then CSE, constant folding, algebraic simplification, dead-code elimination, and fusion: `silu(a) * b` → `silu_mul(a, b)` when `silu(a)` has no other users, and a `batch_norm` folded into the convolution in front of it. Host plans get two more fusions after lowering (step 4). All of them are listed under [Fusion](#fusion).
 3. **Plan memory** (`memplan.hpp`): liveness analysis gives static arena offsets, view aliasing (`reshape`) and in-place reuse, so peak memory is known before running.
 4. **Lower** each op to an implementation from a lowering registry: CPU by default, or a device registry (Vulkan, CUDA, HIP, OpenCL, Level Zero, Metal, RPC, or a multi-device pipeline).
 5. **Replay** the flat plan with an `executor`. inference caches plans per shape bucket (`plan_cache`).
@@ -22,7 +22,7 @@ Quantised weights (`tensor_graph::qweight`) stay encoded. On the CPU, `matmul_t`
 |------|--------|-------|
 | `tensor_graph` | `ir.hpp` | `input(name, shape)`, `weight(name, shape, data)`, `qweight(name, shape, bytes, codec)`, `constant(tensor)`, `scalar(v)`, `apply(op, {inputs}, attrs)` (op enum or name), `state_append(slot, x)`, `state_op(slot, fn, {inputs}, attrs)`, `output(name, value)`; helpers `add`, `mul`, `matmul`. `to_string(g)` prints it |
 | `verify_graph(g)` | `passes.hpp` | Infers shapes; errors name the node (`node %2 (matmul)`) |
-| `optimise(g, pass_options)` | `passes.hpp` | `pass_options{cse, fold, simplify, fuse}` all default to `true`; `lowerings` is the registry (`nullptr` = CPU) |
+| `optimise(g, pass_options)` | `passes.hpp` | `pass_options{cse, fold, simplify, fuse}` all default to `true`; `lowerings` is the registry (`nullptr` = CPU); `fold_conv_bn`, `fuse_chain`, `fuse_qact` (default `true`) and `chain_min_elems` (4096) control the [fusions](#fusion) |
 | `compile(g, state_store* = nullptr, pass_options = {})` | `plan.hpp` | → `std::unique_ptr<plan>`; `plan::describe()` prints it |
 | `executor(plan&, state_store* = nullptr)` | `plan.hpp` | `set_input(name, data)`, `run()`, `output(name)` (tensor copy), `output_view(name)` |
 | `aot::builder`, `aot::image`, `aot::instantiate` | `aot.hpp` | Compiled plans as a checked, versioned blob, and back ([aot-models.md](aot-models.md)). `aot_codegen.hpp` writes the straight-line C++ for native compilation; `aot_rt.hpp` is what that code calls |
@@ -77,8 +77,19 @@ The attention kernels decode quantised slots on the fly. inference selects the c
 | `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]` | `<backend>.<op>` |
 | `rpc:host:port` | ops run by a remote `forge rpc-serve` |
 | `pipe:<dev>[*w],<dev>[*w],...` | Split contiguous layer ranges across devices, balanced by cost × weight `w` (e.g. `pipe:vulkan*3,cpu`, `pipe:cuda:0,cuda:1`) |
+| `pipe:auto` | The same split with the devices and weights chosen from device memory and measured throughput ([below](#automatic-split-pipeauto)) |
 
 Device lowerings have priority 20, above the CPU ones. The backends themselves are described in [gpu.md](gpu.md).
+
+### Automatic split: `pipe:auto`
+`pipe:auto` builds the `pipe:` string itself (`gpu::plan_pipeline` in `gpu/select.hpp`, `graph::auto_pipeline`) from the device records `FORGE_DEVICE=auto` gathers (class, memory, cached micro-benchmark; [gpu.md](gpu.md#automatic-device-selection)):
+
+1. **Devices.** The eligible devices (not in `FORGE_DEVICE_EXCLUDE`, not a software device unless `FORGE_DEVICE_ALLOW_SOFTWARE=1`) of one backend: the first of cuda, hip, metal, level_zero, opencl, vulkan that has any. Other backends' devices are left out, because one GPU is usually listed under several APIs and would be counted twice. A machine with one NVIDIA and one AMD card is therefore not split by `pipe:auto`; write that `pipe:` string by hand.
+2. **Shares.** Proportional to throughput: the micro-benchmark when every chosen device has one, else the class prior.
+3. **Memory.** With a known model size (`inference::model` passes the data section's size) no device gets a larger share than 90% of its memory holds; the excess moves to the devices with room, and what fits on none becomes a last `cpu` stage.
+4. **Result.** Stages in device order with their shares as weights (`pipe:cuda:0*0.7429,cuda:1*0.2571`), a single device's own name when one device takes everything (a plain resident device, not a pipeline), or `cpu`. The choice and the table are logged at info level.
+
+The share is a share of the planner's cost estimate (op cost × tensor size), which the pipeline splits into contiguous node ranges. It tracks weight bytes only for models with uniform layers, so the memory cap is approximate: there is no per-layer byte accounting. As for every `pipe:` device, the stages are non-resident and activations cross a stage boundary through host memory; device-to-device peer copies (`copy_to_peer`) are not used for the hand-off. Tested with synthetic records (`test_gpu`: `pipeline_auto_partition`) and on the mock drivers with `MOCK_DEVICES=2` (`test_gpu_select_{cuda,hip,opencl,ze}_mock`: the split, a graph run over both devices against the CPU, the one-device case; `golden_tiny_llama_pipe_auto_cuda_mock`); the peer copy itself only by `test_gpu_features_*_mock`. No multi-GPU machine has run it.
 
 ### CPU lowerings
 `kernels.hpp` registers the SIMD lowerings of the decoder ops (elementwise strips, softmax, rms_norm, gemm, attention, rope, gather); `kernels_ext.hpp` adds the spatial and encoder families:
@@ -92,18 +103,41 @@ Device lowerings have priority 20, above the CPU ones. The backends themselves a
 
 Every other op of those families (`conv_transpose2d`, pooling, resize, `group_norm`, `batch_norm`, `pad`, `alibi_bias`, `sinusoid_embed`, `topk`, `index_select`, `masked_mean`) runs its scalar reference: correct, not fast. The same holds for older ops without a lowering (the reductions, `transpose`, `concat`, `slice`).
 
+`add`, `sub` and `mul` of a tensor with a row vector broadcast over the last axis (`x[..., n] op v[n]`, either operand order: a bias add, a per-channel scale) have SIMD lowerings (`lane.add_row`, `lane.mul_row`, …; before, any broadcast went to the float64 reference, one element at a time on one thread). `relu` (`cpu.relu`) and `scale` (`cpu.scale`) have float loops. Each is a single float operation per element, so the bits are the reference's (`row_vector_lowerings_match_reference_bits`). Other broadcasts still run the reference.
+
+### Fusion
+
+| Fusion | Where | What it does | Against the unfused result | Off switch |
+|--------|-------|--------------|----------------------------|------------|
+| `silu(a) * b` → `silu_mul` | graph pass (`fuse`) | One op, one kernel | within the ops' tolerances | `pass_options::fuse = false` |
+| conv + `batch_norm` folding | graph pass (`fold_conv_bn`) | `batch_norm(conv2d / conv1d(x, W, b), w, bb, mean, var)` with constant f32 parameters becomes the convolution with `W' = W · s`, `b' = (b − mean) · s + bb`, `s = w / sqrt(var + eps)` (computed in double, rounded once). Needs the convolution's result, `W` and `b` to have no other user. Applies on every backend: it is a rewrite of constants | **Not bit-identical.** Stated bound: 2·10⁻⁵ of the largest output (measured 2.8·10⁻⁷ over 24 random cases), and inside the convolution's oracle tolerance (rel 10⁻⁴ of the float64 reference) | `FORGE_FUSE_CONV_BN=0`, `pass_options::fold_conv_bn` |
+| Row chains | host plans, after lowering (`fuse_cpu.hpp`) | A run of adjacent steps that each compute row r of their output from row r of their inputs (elementwise ops, bias adds, `rms_norm`, `layer_norm`) is run block by block: the tensor is cut into blocks of rows of about 64 KB and each block goes through all steps while it is in cache, so the chain is one pass over memory instead of one per step. This is what `matmul_t → add(bias) → gelu / silu / relu` (the epilogue; the matmul itself is not blocked), `add → rms_norm`, `norm → mul / scale` and longer elementwise expressions become | **Bit-identical**: a block is run by calling each step's own lowering on row slices of its views | `FORGE_FUSE_CHAIN=0`, `pass_options::fuse_chain`; tensors below `chain_min_elems` (4096 elements) are left alone |
+| Shared int8 activations | host plans, after lowering | Quantised `matmul_t` on the integer path quantises its activation rows to int8 first. Steps that multiply the same activation (q / k / v after one norm; an FFN's gate and up) share that: the first to run quantises into a buffer the plan owns, the others reuse it | **Bit-identical** (quantisation is a function of the row) | `FORGE_FUSE_QACT=0`, `pass_options::fuse_qact` |
+
+`FORGE_FUSE=0` turns off all but the first. The last two do not rewrite anything: the step list, the lowerings and the buffers stay as they are and steps are only marked (`step::chain`, `step::qact`; `plan::describe()` prints `fused: …` lines). That is why they cannot interfere with the other paths:
+
+- **Devices.** They are applied only to plans lowered from the CPU registry (no device hooks, no pipeline stages). On a device, over RPC, and in every stage of a `pipe:` split (CPU stages included), each op lowers and runs exactly as before; the device-side pair fusions (`fuse_steps`, below) are separate and unchanged.
+- **Precompiled plans** (`forge aot`) store the same steps with or without them; `aot::pipeline_version` is 3 because of the new lowerings and the conv folding. Natively compiled plans run their steps unfused (the compiled code is a kernel call per step).
+- **Memory.** The memory plan was made for the unfused order. A chain interleaves its steps, so it is formed only when every pair of buffers it touches is disjoint or the same buffer used row for row (an in-place step).
+
+What a chain is, exactly: step t + 1 takes step t's output as a whole-tensor operand; every other operand is a whole tensor of the same size (sliced by rows with it), a row vector of the last dimension, or a scalar; any other broadcast ends the chain. An intermediate with other users is still written in full. A chain of only elementwise steps with no row vector is cut by elements, not rows.
+
+Not fused (and why): the matmul with its epilogue inside the GEMM loop (the epilogue is a separate block-wise pass over the output); `rope` with the `attention` after it (two kernels, as before; devices have the `rms_rope` pair); `layer_norm` followed by a separate scale only fuses as a row chain, the scale is not folded into the norm's weights; chains on devices. No measurement of the row chains' effect on a real model was made (the tiny / wide synthetic models have neither biases nor separate activations after their matmuls, so `forge bench` on them does not exercise it).
+
+Tests (`test_graph`): `fusion_row_chains_are_bit_identical` (60 random graphs of 13 unary ops, 5 binary ops, bias adds, row-vector scales, `rms_norm`, `layer_norm`, a `matmul_t` head and intermediates with a second user: outputs `memcmp`-equal to the plan compiled without fusion, over two runs, and equal to the unoptimised pipeline; the three switches), `fusion_shared_int8_activations` (q4_k, q8_0, q6_k; 1, 5 and 40 rows; three runs), `fusion_conv_bn_folds` (24 random conv2d / conv1d cases with stride, padding, groups and a `[1]` bias; the cases that must not fold).
+
 A growing state view (`state_append`) may only feed `attention` and `attention_bias`. `attention_bias` reads f32 rows, so a graph that feeds it from a state slot is refused at plan time when the store uses a quantised KV codec.
 
 ## Device execution
-Device registries have kernels for 36 ops ([reference.md](reference.md)). A step whose op has no device kernel (all of the spatial family, `attention_bias`, `layer_norm`, `gelu`, ...) is lowered to the CPU: the executor fetches its inputs to the host, runs it there and reports the write back to the device. The mock-driver goldens `golden_tiny_{gpt2,gemma,phi3,bert,vit,whisper}_{cuda,opencl}_mock` run such mixed plans.
+Device registries have lowerings for 42 ops, 45 on Vulkan ([reference.md](reference.md)), since 2026-11-12 including `gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d` and `attention_bias` ([gpu.md](gpu.md#encoder-and-vision-kernels)). A step whose op has no device kernel (`transpose`, `l2_normalize`, `masked_mean`, the resize and transposed-convolution ops, `batch_norm`, ...) is lowered to the CPU: the executor fetches its inputs to the host, runs it there and reports the write back to the device. The mock-driver goldens `golden_tiny_{gpt2,gemma,phi3,bert,vit,whisper}_{cuda,opencl}_mock` and their `_vulkan` versions run such mixed plans; `FORGE_PLAN_TRACE` lists the host steps.
 
-A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`, `argmax` and `fused`. With `fused`, `compile` marks adjacent step pairs the backend may run as one kernel (`fuse_steps`: a residual `add` followed by the `rms_norm` of its result; an `rms_norm` whose only consumer is the next step, a `rope`); the executor offers each pair to the hook and runs the two steps as usual when it declines. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
+A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`, `argmax` and `fused`. With `fused`, `compile` marks adjacent step pairs the backend may run as one kernel (`fuse_steps`: a residual `add` followed by the `rms_norm` of its result; an `rms_norm` whose only consumer is the next step, a `rope`); the executor offers each pair to the hook and runs the two steps as usual when it declines. The host-plan fusions of [Fusion](#fusion) are never applied to a device plan. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
 
 Quantised weights on a device:
 - CUDA and HIP keep q8_0, q4_k, q5_k and q6_k weights encoded on the device and run them with their own kernels.
 - Other resident backends get an f32 copy, decoded on the host and mirrored on the device, up to `FORGE_GPU_WEIGHT_BUDGET` bytes (default `8G`; K/M/G suffixes). Weights beyond the budget stay encoded and their `matmul_t`/`gather` run on the CPU.
 
-Sparse MoE (`moe_ffn(h, router_logits, gate[e,f,d], up[e,f,d], down[e,d,f], k, norm, scale, gating)`): each token is routed to its top-k experts; the (token, slot) pairs are grouped by expert and only the selected experts' slices of the stacked (encoded) weights are read, with the same SIMD quantised dot / row-decode kernels as `matmul_t`; tokens are combined in slot order (deterministic). Expert weights always stay encoded. On CUDA, HIP, OpenCL and Level Zero `moe_ffn` runs on the device (`registry::device_moe`): the router's top-k is computed on the host from the synced logits with the same `moe_route`, and two kernels evaluate the routed experts from the stacked weights, which stay resident (encoded or f32 constants; see [gpu.md](gpu.md#mixture-of-experts-on-the-device); `FORGE_GPU_MOE=0` turns it off). On Vulkan, Metal and RPC devices it runs on the host.
+Sparse MoE (`moe_ffn(h, router_logits, gate[e,f,d], up[e,f,d], down[e,d,f], k, norm, scale, gating)`): each token is routed to its top-k experts; the (token, slot) pairs are grouped by expert and only the selected experts' slices of the stacked (encoded) weights are read, with the same SIMD quantised dot / row-decode kernels as `matmul_t`; tokens are combined in slot order (deterministic). Expert weights always stay encoded. On CUDA, HIP, OpenCL, Level Zero and Vulkan `moe_ffn` runs on the device (`registry::device_moe`): the router's top-k is computed on the host from the synced logits with the same `moe_route`, and two kernels evaluate the routed experts from the stacked weights, which stay resident (encoded or f32 constants; see [gpu.md](gpu.md#mixture-of-experts-on-the-device); `FORGE_GPU_MOE=0` turns it off). On Metal and RPC devices it runs on the host.
 
 On the CPU, `FORGE_QDOT=0` replaces the SIMD quantised-row kernels with plain decode + dot (for benchmarking and bisecting).
 
@@ -127,7 +161,7 @@ tensor out = ex.output("y");
 ```
 
 ## RPC device
-`rpc:host:port` sends each op to a server started with `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu]`. The server runs it with its own device registry. Every op is still oracle-checked on the client. Weights travel with every op (no remote residency).
+`rpc:host:port` sends each op to a server started with `forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu]`. The server runs it with its own device registry. Every op is still oracle-checked on the client. The plan's f32 weights and constants are uploaded once per connection and referred to by BLAKE3 hash afterwards ([rpc.md](rpc.md#weights-on-the-server)); activations travel with every op.
 
 Optional TLS (mTLS too) and token or Ed25519 key authentication are available. The client reads its credentials from `FORGE_RPC_KEY`, `FORGE_RPC_TOKEN`, `FORGE_RPC_TLS=1`, `FORGE_RPC_CA`, `FORGE_RPC_FINGERPRINT`, `FORGE_RPC_SERVER_NAME`, `FORGE_RPC_TLS_CERT` and `FORGE_RPC_TLS_KEY`. A server with no tokens or keys accepts anyone, so bind it to loopback. Details: [rpc.md](rpc.md).
 

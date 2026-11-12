@@ -251,8 +251,13 @@ private:
     unsigned size_ = 1;
 };
 
-template <class F> void parallel_for(std::size_t n, std::size_t grain, F&& f) { pool::global().parallel_for(n, grain, std::forward<F>(f)); }
-template <class F> void parallel_for(std::size_t n, std::size_t lo, std::size_t hi, F&& f) { pool::global().parallel_for(n, lo, hi, std::forward<F>(f)); }
+// task::parallel_for(n, grain, f) and task::parallel_for(n, lo, hi, f), the engine's entry points, are in
+// engine.hpp (included below): pool::global() by default, the work-stealing scheduler with
+// FORGE_TASK_SCHEDULER=sched.
 template <class F> auto submit(F&& f, options o = {}) { return pool::global().submit(std::forward<F>(f), std::move(o)); }
 
 } // namespace forge::task
+
+#if !defined(FORGE_TASK_POOL_FROM_SCHED)   // sched.hpp includes engine.hpp itself, after the scheduler is defined
+#include <forge/task/engine.hpp>
+#endif

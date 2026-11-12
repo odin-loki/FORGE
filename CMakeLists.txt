@@ -255,7 +255,7 @@ set(FORGE_GPU_SOURCES)
 foreach(k ${FORGE_GPU_KERNELS})
   list(APPEND FORGE_GPU_SOURCES ${FORGE_GPU_DIR}/${k}.comp)
 endforeach()
-add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels.metal
+add_custom_command(OUTPUT ${FORGE_GPU_SOURCES} ${FORGE_GPU_DIR}/kernels.cu ${FORGE_GPU_DIR}/kernels.cl ${FORGE_GPU_DIR}/kernels_cl_mock.inc ${FORGE_GPU_DIR}/kernels_nn_mock.inc ${FORGE_GPU_DIR}/kernels.metal
   COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py --ops ${FORGE_FSPECS} --out ${FORGE_GPU_DIR}
   DEPENDS ${FORGE_FSPECS} ${PROJECT_SOURCE_DIR}/ops/gen/gpu_gen.py COMMENT "Generating GPU kernels from spec/ops")
 if(_gpu_rc EQUAL 0 AND FORGE_GLSLANG AND FORGE_VULKAN_INCLUDE)
@@ -383,6 +383,7 @@ add_dependencies(forge_gpu_images forge_gpu_gen)
 message(STATUS "FORGE: CUDA/HIP images: ${FORGE_GPU_IMAGES}")
 add_library(forge_gpu INTERFACE)
 forge_include_dirs(forge_gpu INTERFACE gpu/include support/include third_party)
+target_link_libraries(forge_gpu INTERFACE forge_os)   # task/pool.hpp -> task/engine.hpp -> task/sched.hpp uses os/cpu_topology.hpp, numa.hpp, sync.hpp
 forge_include_dirs(forge_gpu INTERFACE ${FORGE_GEN_DIR})
 if(FORGE_HAVE_VULKAN)
   forge_include_dirs(forge_gpu INTERFACE ${FORGE_GEN_DIR}/vkinc)
@@ -394,7 +395,7 @@ if(APPLE)   # Metal runtime (Objective-C++); HARDWARE-UNTESTED
   add_library(forge_metal STATIC gpu/src/metal.mm)
   target_compile_options(forge_metal PRIVATE -fobjc-arc)
   target_compile_definitions(forge_metal PUBLIC FORGE_GPU_METAL=1)
-  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
+  forge_include_dirs(forge_metal PUBLIC gpu/include support/include third_party third_party/monocypher ${FORGE_GEN_DIR} core/include os/include ops/include simd/include)
   add_dependencies(forge_metal forge_gpu_gen forge_gpu_images)
   target_link_libraries(forge_metal PUBLIC "-framework Metal" "-framework Foundation")
   target_link_libraries(forge_gpu INTERFACE forge_metal)
@@ -628,6 +629,9 @@ function(forge_simd_gn_table name header cond)
     unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
     if(_ok)
       add_library(forge_simd_${name} OBJECT simd/src/kernels_gn.cpp)
+      if(NOT name STREQUAL "neon32")   # Tier A, seq and int8 tables of the same ISA (not for the opt-in Armv7 table)
+        target_sources(forge_simd_${name} PRIVATE simd/src/isa_extra.cpp)
+      endif()
       target_compile_options(forge_simd_${name} PRIVATE ${_fl})
       if(NOT (MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
         target_compile_options(forge_simd_${name} PRIVATE -ffp-contract=off)   # see vec_gn.hpp
@@ -646,19 +650,26 @@ function(forge_simd_gn_table name header cond)
   endforeach()
 endfunction()
 set(FORGE_SIMD_GN_DEFS)
+# simd/src/isa_extra.cpp: the Tier A, seq and int8 tables of one Tier P backend, compiled beside each kernel
+# table with the same flags. No contraction of a*b+c: the seq and int8 kernels must give the scalar bits.
+if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set_source_files_properties(simd/src/isa_extra.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+else()
+  set_source_files_properties(simd/src/isa_extra.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()
 
 # Scalable vectors: one fixed-length kernel table per VL (128..1024 bits); dispatch picks the hardware's.
 set(FORGE_SCALABLE_BITS 128 256 512 1024)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64" OR (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
   set(FORGE_ARCH aarch64)
-  add_library(forge_simd_mv STATIC simd/src/kernels_scalar.cpp simd/src/kernels_neon.cpp simd/src/dispatch.cpp)
+  add_library(forge_simd_mv STATIC simd/src/kernels_scalar.cpp simd/src/kernels_neon.cpp simd/src/isa_extra.cpp simd/src/dispatch.cpp)
   set(_defs)
   foreach(b ${FORGE_SCALABLE_BITS})
     set(FORGE_PROBE_BITS ${b})
     forge_probe_flags(FORGE_SVE${b}_FLAGS arm_sve.h svfloat32_t "arm_sve_vector_bits(${b})"
       "-march=armv8.2-a+sve|-msve-vector-bits=${b}" "-mcpu=generic+sve|-msve-vector-bits=${b}")
     if(FORGE_SVE${b}_FLAGS)
-      add_library(forge_simd_sve${b} OBJECT simd/src/kernels_sve.cpp)
+      add_library(forge_simd_sve${b} OBJECT simd/src/kernels_sve.cpp simd/src/isa_extra.cpp)
       target_compile_options(forge_simd_sve${b} PRIVATE ${FORGE_SVE${b}_FLAGS})
       set_target_properties(forge_simd_sve${b} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
       target_link_libraries(forge_simd_sve${b} PRIVATE forge_simd)
@@ -723,7 +734,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     forge_probe_flags(FORGE_RVV${b}_FLAGS riscv_vector.h vfloat32m1_t "riscv_rvv_vector_bits(${b})"
       "-march=rv64gcv_zvl${b}b|-mrvv-vector-bits=${b}" "-mcpu=baseline_rv64+v+zvl${b}b|-mrvv-vector-bits=${b}")
     if(FORGE_RVV${b}_FLAGS)
-      add_library(forge_simd_rvv${b} OBJECT simd/src/kernels_rvv.cpp)
+      add_library(forge_simd_rvv${b} OBJECT simd/src/kernels_rvv.cpp simd/src/isa_extra.cpp)
       target_compile_options(forge_simd_rvv${b} PRIVATE ${FORGE_RVV${b}_FLAGS})
       set_target_properties(forge_simd_rvv${b} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
       target_link_libraries(forge_simd_rvv${b} PRIVATE forge_simd)
@@ -936,6 +947,9 @@ if(FORGE_BUILD_APPS)
   target_link_libraries(forge PRIVATE forge_security)   # forge security check
   add_executable(forge-serve apps/forge_serve.cpp)
   target_link_libraries(forge-serve PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
+  if(TARGET forge_rpc_tls)   # --tls-cert / --tls-key / --tls-client-ca; without OpenSSL forge-serve is plain HTTP only
+    target_link_libraries(forge-serve PRIVATE forge_rpc_tls)
+  endif()
 endif()
 
 if(FORGE_BUILD_TESTS)
@@ -1040,6 +1054,32 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       continue()
     endif()
+    if(n STREQUAL "test_simd_std")   # interop.hpp: also built against libc++ where that is the library with <mdspan>
+      if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND NOT CMAKE_CROSSCOMPILING AND NOT MSVC AND NOT APPLE)
+        set(CMAKE_REQUIRED_FLAGS "-stdlib=libc++")
+        check_cxx_source_compiles("#include <mdspan>\n#include <vector>\n#ifndef __cpp_lib_mdspan\n#error no mdspan\n#endif\nint main(){std::vector<int> v(4);std::mdspan<int,std::dextents<unsigned long,1>> m(v.data(),4);return m[0];}" FORGE_LIBCXX_MDSPAN)
+        unset(CMAKE_REQUIRED_FLAGS)
+        if(FORGE_LIBCXX_MDSPAN)
+          # Everything in this executable is compiled against libc++: the scalar Tier A table from source and
+          # the test's own tier_a_active() (the kernel library is built against the default standard library).
+          add_executable(${n}_libcxx ${t} simd/src/tiera_scalar.cpp)
+          target_compile_options(${n}_libcxx PRIVATE -stdlib=libc++)
+          target_compile_definitions(${n}_libcxx PRIVATE FORGE_TEST_OWN_TIERA_DISPATCH=1)
+          target_link_options(${n}_libcxx PRIVATE -stdlib=libc++)
+          target_link_libraries(${n}_libcxx PRIVATE forge_simd)
+          target_include_directories(${n}_libcxx PRIVATE tests)
+          add_test(NAME ${n}_libcxx COMMAND ${n}_libcxx WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+          set_tests_properties(${n}_libcxx PROPERTIES PASS_REGULAR_EXPRESSION "mdspan overloads: yes")
+        endif()
+      endif()
+    endif()
+    if(n STREQUAL "test_simd_tables" OR n STREQUAL "test_simd_types" OR n STREQUAL "test_simd_std")   # simd only: cross-builds without the rest of the tree
+      add_executable(${n} ${t})
+      target_link_libraries(${n} PRIVATE forge_simd_mv)
+      target_include_directories(${n} PRIVATE tests)
+      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      continue()
+    endif()
     if(n STREQUAL "test_mobile")   # only needs the device layer
       add_executable(${n} ${t})
       target_link_libraries(${n} PRIVATE forge_mobile)
@@ -1097,6 +1137,71 @@ if(FORGE_BUILD_TESTS)
   # Tier R: every generated wrapper of every architecture, compiled against the real target headers with
   # clang's cross targets (no foreign sysroot needed). Skipped (77) when that clang is not installed.
   set(FORGE_RAW_CHECK_CLANG "clang++-23" CACHE STRING "clang++ (23 or newer, all targets) for the Tier R cross syntax check")
+  # The engine on the work-stealing scheduler (FORGE_TASK_SCHEDULER=sched, task/engine.hpp): the executor contract
+  # on both executors (test_engine itself runs with the default, the pool), then the engine's own tests again
+  # under `sched`: their determinism checks (batch vs single row, prefill vs decode, golden logits) must hold there too.
+  if(TARGET test_engine)
+    add_test(NAME engine_sched COMMAND test_engine WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(engine_sched PROPERTIES ENVIRONMENT "FORGE_TASK_SCHEDULER=sched" PASS_REGULAR_EXPRESSION "engine: sched" FAIL_REGULAR_EXPRESSION "FAIL")
+    add_test(NAME engine_pool COMMAND test_engine WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(engine_pool PROPERTIES ENVIRONMENT "FORGE_TASK_SCHEDULER=pool" PASS_REGULAR_EXPRESSION "engine: pool" FAIL_REGULAR_EXPRESSION "FAIL")
+    foreach(_t test_graph test_inference test_kvquant test_sessions test_aot)
+      if(TARGET ${_t})
+        add_test(NAME sched_${_t} COMMAND ${_t} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(sched_${_t} PROPERTIES ENVIRONMENT "FORGE_TASK_SCHEDULER=sched" LABELS sched)
+      endif()
+    endforeach()
+  endif()
+  # vec_types.hpp on every Tier P backend: one executable per kernel table, tests/simd_types_isa.cpp compiled with
+  # that table's flags and a baseline main that returns 77 (skipped) when the CPU cannot run the table. Not for
+  # MSVC, where every target uses the portable arrays that test_simd_types already covers.
+  function(forge_types_test name)   # ARGN: the table's compile options ("none" for the baseline)
+    add_library(forge_types_obj_${name} OBJECT tests/simd_types_isa.cpp)
+    if(NOT "${ARGN}" STREQUAL "none")
+      target_compile_options(forge_types_obj_${name} PRIVATE ${ARGN})
+    endif()
+    target_link_libraries(forge_types_obj_${name} PRIVATE forge_simd)
+    target_include_directories(forge_types_obj_${name} PRIVATE tests)
+    add_executable(test_simd_types_${name} tests/simd_types_main.cpp $<TARGET_OBJECTS:forge_types_obj_${name}>)
+    target_link_libraries(test_simd_types_${name} PRIVATE forge_simd_mv)
+    add_test(NAME types_${name} COMMAND test_simd_types_${name} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+    set_tests_properties(types_${name} PROPERTIES SKIP_RETURN_CODE 77)
+  endfunction()
+  if(NOT (MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang") AND EXISTS "${PROJECT_SOURCE_DIR}/tests/simd_types_isa.cpp")
+    foreach(_t sse2 sse42 lsx lasx vsx vxe wasm128 msa)
+      string(TOUPPER "${_t}" _up)
+      if(TARGET forge_simd_${_t})
+        forge_types_test(${_t} ${FORGE_SIMD_${_up}_FLAGS})
+      endif()
+    endforeach()
+    if(FORGE_ARCH STREQUAL "x86_64")
+      forge_types_test(avx2 -mavx2 -mfma -mf16c -DFORGE_TYPES_AVX2=1)
+      forge_types_test(avx512 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma -DFORGE_TYPES_AVX512=1)
+    elseif(FORGE_ARCH STREQUAL "aarch64")
+      forge_types_test(neon none)
+    endif()
+    foreach(b ${FORGE_SCALABLE_BITS})
+      if(TARGET forge_simd_sve${b})
+        forge_types_test(sve${b} ${FORGE_SVE${b}_FLAGS})
+      endif()
+      if(TARGET forge_simd_rvv${b})
+        forge_types_test(rvv${b} ${FORGE_RVV${b}_FLAGS})
+      endif()
+    endforeach()
+  endif()
+  # Every simd test executable, for builds that want just those (the emulated CI rows, cross builds).
+  set(_simd_tests)
+  foreach(_t test_simd test_simd_tables test_simd_tiera test_simd_types test_simd_std)
+    if(TARGET ${_t})
+      list(APPEND _simd_tests ${_t})
+    endif()
+  endforeach()
+  foreach(_t sse2 sse42 lsx lasx vsx vxe wasm128 msa avx2 avx512 neon sve128 sve256 sve512 sve1024 rvv128 rvv256 rvv512 rvv1024)
+    if(TARGET test_simd_types_${_t})
+      list(APPEND _simd_tests test_simd_types_${_t})
+    endif()
+  endforeach()
+  add_custom_target(forge_simd_tests DEPENDS ${_simd_tests})
   add_test(NAME raw_intrinsics_cross
            COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_raw_intrinsics.py
                    --clang ${FORGE_RAW_CHECK_CLANG} --out ${PROJECT_BINARY_DIR}/raw_check)
@@ -1124,7 +1229,31 @@ if(FORGE_BUILD_TESTS)
       list(GET v 1 cpu)
       add_test(NAME lane_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(lane_${_lane}_vl${b} PROPERTIES PASS_REGULAR_EXPRESSION "active: ${_lane}" FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
+      # the Tier A, seq and int8 tables of the same lane (isa_extra.cpp): bit identity with scalar at this length
+      add_test(NAME tables_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd_tables> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(tables_${_lane}_vl${b} PROPERTIES PASS_REGULAR_EXPRESSION "seq tables: ${_lane}" FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
+      add_test(NAME tiera_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd_tiera> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(tiera_${_lane}_vl${b} PROPERTIES PASS_REGULAR_EXPRESSION "active: ${_lane}" FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
+      if(TARGET test_simd_types_${_lane}${b})   # vec_types.hpp on the table built for exactly this length
+        add_test(NAME types_${_lane}_vl${b} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd_types_${_lane}${b}> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(types_${_lane}_vl${b} PROPERTIES PASS_REGULAR_EXPRESSION "0 failure" FAIL_REGULAR_EXPRESSION "CHECK failed" LABELS emu)
+      endif()
     endforeach()
+    if(_emu MATCHES "qemu-aarch64")   # NEON alone (an ARMv8.0 core, then one with dotprod and no SVE)
+      foreach(v "a57|cortex-a57" "nosve|max,sve=off")
+        string(REPLACE "|" ";" v "${v}")
+        list(GET v 0 n)
+        list(GET v 1 cpu)
+        add_test(NAME tables_neon_${n} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd_tables> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(tables_neon_${n} PROPERTIES PASS_REGULAR_EXPRESSION "seq tables: neon" FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
+        add_test(NAME tiera_neon_${n} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd_tiera> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(tiera_neon_${n} PROPERTIES PASS_REGULAR_EXPRESSION "active: neon" FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
+        if(TARGET test_simd_types_neon)
+          add_test(NAME types_neon_${n} COMMAND ${_emu} -cpu ${cpu} $<TARGET_FILE:test_simd_types_neon> WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+          set_tests_properties(types_neon_${n} PROPERTIES PASS_REGULAR_EXPRESSION "0 failure" FAIL_REGULAR_EXPRESSION "CHECK failed" LABELS emu)
+        endif()
+      endforeach()
+    endif()
     # vec_gn.hpp tables under qemu: test_simd again with each table forced (it must become the active one).
     set(_gn)
     if(_emu MATCHES "qemu-loongarch64")
@@ -1139,6 +1268,10 @@ if(FORGE_BUILD_TESTS)
     foreach(t ${_gn})
       add_test(NAME lane_${t} COMMAND test_simd WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(lane_${t} PROPERTIES ENVIRONMENT "FORGE_SIMD_TARGET=${t}" PASS_REGULAR_EXPRESSION "active: ${t}" FAIL_REGULAR_EXPRESSION "FAIL")
+      add_test(NAME tables_${t} COMMAND test_simd_tables WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(tables_${t} PROPERTIES PASS_REGULAR_EXPRESSION "qi8 tables:[a-z0-9. ]* ${t} " FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
+      add_test(NAME tiera_${t} COMMAND test_simd_tiera WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(tiera_${t} PROPERTIES ENVIRONMENT "FORGE_SIMD_TARGET=${t}" PASS_REGULAR_EXPRESSION "active: ${t}" FAIL_REGULAR_EXPRESSION "FAIL" LABELS emu)
     endforeach()
     # Integer matvec tables (simd/qdot_i8.hpp) against the scalar reference: an ARMv8.0 core (neon only), then
     # dotprod and the vector-length agnostic SVE table at several VLs (FORGE_SVE_KEEP_VL: 384 and 2048 stay as they are).
@@ -1173,6 +1306,12 @@ if(FORGE_BUILD_TESTS)
     foreach(t sse2)
       add_test(NAME lane_${t} COMMAND test_simd WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       set_tests_properties(lane_${t} PROPERTIES ENVIRONMENT "FORGE_SIMD_TARGET=${t}" PASS_REGULAR_EXPRESSION "active: ${t}" FAIL_REGULAR_EXPRESSION "FAIL")
+    endforeach()
+    # Tier A with each lower x86 table forced as the active one (test_simd_tiera / test_simd_tables already run
+    # every usable table against scalar; these also cover the dispatch path).
+    foreach(t sse2 sse4.2 avx2)
+      add_test(NAME tiera_${t} COMMAND test_simd_tiera WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(tiera_${t} PROPERTIES ENVIRONMENT "FORGE_SIMD_TARGET=${t}" PASS_REGULAR_EXPRESSION "0 failure" FAIL_REGULAR_EXPRESSION "FAIL")
     endforeach()
   endif()
   # forge::os / forge::loadbalancer cross-OS compile+link checks (zig ships FreeBSD, macOS and MinGW libcs).
@@ -1282,6 +1421,8 @@ if(FORGE_BUILD_TESTS)
     add_library(mock_cuda SHARED tests/mock_cuda.c)
     set_target_properties(mock_cuda PROPERTIES OUTPUT_NAME cuda SOVERSION 1 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockcuda)
     target_link_libraries(mock_cuda PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+    target_include_directories(mock_cuda PRIVATE ${FORGE_GPU_DIR})   # kernels_nn_mock.inc (generated)
+    add_dependencies(mock_cuda forge_gpu_gen)
     add_test(NAME test_gpu_cuda_mock COMMAND test_cuda_hip cuda)
     set_tests_properties(test_gpu_cuda_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda" LABELS gpu SKIP_RETURN_CODE 77)
     add_dependencies(test_cuda_hip mock_cuda)
@@ -1289,6 +1430,8 @@ if(FORGE_BUILD_TESTS)
     target_compile_definitions(mock_hip PRIVATE MOCK_HIP)
     set_target_properties(mock_hip PROPERTIES OUTPUT_NAME amdhip64 SOVERSION 6 LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/mockhip)
     target_link_libraries(mock_hip PRIVATE $<$<NOT:$<C_COMPILER_ID:MSVC>>:m>)
+    target_include_directories(mock_hip PRIVATE ${FORGE_GPU_DIR})
+    add_dependencies(mock_hip forge_gpu_gen)
     add_dependencies(test_cuda_hip mock_hip)
     foreach(m opencl ze)
       if(m STREQUAL "opencl")
@@ -1339,6 +1482,11 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_cumock)
       set_tests_properties(golden_tiny_llama_cuda_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=cuda;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
+      # "pipe:auto" over two mock CUDA devices (gpu::plan_pipeline): the layers split over cuda:0 and cuda:1
+      add_test(NAME golden_tiny_llama_pipe_auto_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
+               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_pipeauto_cumock)
+      set_tests_properties(golden_tiny_llama_pipe_auto_cuda_mock PROPERTIES LABELS gpu
+        ENVIRONMENT "FORGE_DEVICE=pipe:auto;MOCK_DEVICES=2;FORGE_DEVICE_ALLOW_SOFTWARE=1;FORGE_DEVICE_BENCH=0;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockcuda")
       add_test(NAME golden_tiny_llama_opencl_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_clmock)
       set_tests_properties(golden_tiny_llama_opencl_mock PROPERTIES LABELS gpu
@@ -1362,8 +1510,9 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=hip;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip")
-      # Device fallback: the other template families use ops with no device kernel (attention_bias over the KV state,
-      # conv1d / conv2d, layer_norm, gelu); those steps must run on the CPU between device steps and give the same result.
+      # The other template families: attention_bias over the KV state, conv1d / conv2d, layer_norm and gelu run on the
+      # device (the PORT_NN kernels); what has no device kernel (transpose, l2_normalize, masked_mean, ...) must run on
+      # the CPU between device steps and give the same result.
       foreach(_g gpt2 gemma phi3 bert vit whisper)
         add_test(NAME golden_tiny_${_g}_cuda_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_${_g}.py
                  --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_cumock)
@@ -1446,6 +1595,16 @@ if(FORGE_BUILD_TESTS)
     endif()
     add_test(NAME gpu_compile_metal_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -std=c++17 -fsyntax-only -Wno-unknown-attributes -Werror
              -include ${PROJECT_SOURCE_DIR}/tests/shims/msl_host_shim.hpp -x c++ ${FORGE_GPU_DIR}/kernels.metal)
+    # gpu/src/metal.mm (the Metal host code, Objective-C++) parsed against stub declarations of the Metal API on Linux,
+    # where no Apple SDK exists: catches C++ / Objective-C errors before the macOS build does. Not a check of Metal usage.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+      add_test(NAME gpu_compile_metal_host_syntax COMMAND ${FORGE_GPU_CLANG} --driver-mode=g++ -x objective-c++ -std=c++23 -fobjc-arc -fobjc-runtime=gnustep-2.0
+               -fsyntax-only -Werror -Wno-objc-root-class -I${PROJECT_SOURCE_DIR}/tests/shims/metal_stub -I${PROJECT_SOURCE_DIR}/gpu/include
+               -I${PROJECT_SOURCE_DIR}/support/include -I${PROJECT_SOURCE_DIR}/third_party -I${PROJECT_SOURCE_DIR}/third_party/monocypher -I${FORGE_GEN_DIR}
+               -I${PROJECT_SOURCE_DIR}/core/include -I${PROJECT_SOURCE_DIR}/os/include -I${PROJECT_SOURCE_DIR}/ops/include -I${PROJECT_SOURCE_DIR}/simd/include
+               ${PROJECT_SOURCE_DIR}/gpu/src/metal.mm)
+      set_tests_properties(gpu_compile_metal_host_syntax PROPERTIES LABELS gpu)
+    endif()
     find_program(FORGE_XCRUN xcrun)
     if(FORGE_XCRUN)   # real Metal compiler (macOS with Xcode)
       add_test(NAME gpu_compile_metal COMMAND ${FORGE_XCRUN} -sdk macosx metal -c ${FORGE_GPU_DIR}/kernels.metal -o ${PROJECT_BINARY_DIR}/kernels.air)
@@ -1560,20 +1719,64 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME golden_rope_scaling_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope_vk)
       set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_rope_scaling_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      # Quantised weights kept encoded on the device (the GLSL ports of forge_qmatmul_t / forge_qglu / forge_qgather:
+      # q8_0 HF imports, in-place quantisation, AWQ / GPTQ checkpoints), QK-norm, and the other template families
+      # (their attention_bias / conv / layer_norm steps run on the CPU between device steps).
+      set(_vk_goldens hf_quant:${Python3_EXECUTABLE} quant_inplace:${FORGE_GOLDEN_PYTHON} tiny_qwen2:${Python3_EXECUTABLE} tiny_qwen3:${Python3_EXECUTABLE})
+      foreach(_g ${FORGE_GOLDEN_FAMILIES})
+        list(APPEND _vk_goldens tiny_${_g}:${Python3_EXECUTABLE})
+      endforeach()
+      foreach(_e ${_vk_goldens})
+        string(REGEX REPLACE "^([^:]+):(.*)$" "\\1" _g "${_e}")
+        string(REGEX REPLACE "^([^:]+):(.*)$" "\\2" _py "${_e}")
+        add_test(NAME golden_${_g}_vulkan COMMAND ${_py} ${PROJECT_SOURCE_DIR}/verify/golden/${_g}.py
+                 --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_vk)
+        set_tests_properties(golden_${_g}_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      endforeach()
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
       set_tests_properties(golden_tiny_llama golden_tiny_qwen2 golden_rope_scaling golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla golden_gguf_types golden_hf_quant modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
-      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
-      set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
+      # ABI 1-4: the generative golden, the tiny BERT for forge_embed_*, and a work dir for the adapter / plan sidecar it writes
+      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
+      set_tests_properties(capi_smoke PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert")
       add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python_bindings.py
-               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk)
-      set_tests_properties(python_bindings PROPERTIES DEPENDS golden_tiny_llama ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
+               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk
+               ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
+      set_tests_properties(python_bindings PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert" ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # The JNI surface: the Kotlin externals, their Java mirror and forge_jni.c declare the same natives
+      add_test(NAME jni_decl_matches COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/jni_decl_check.py ${PROJECT_SOURCE_DIR})
+      # ... and the bridge runs on a host JVM (every native, -Xcheck:jni). Linux hosts with a JDK only: the one place
+      # it has been run. The Kotlin classes on top are not compiled by this (docs/bindings.md).
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT FORGE_SANITIZE)
+        find_package(JNI QUIET)
+        find_package(Java QUIET COMPONENTS Runtime Development)
+        if(JNI_FOUND AND Java_FOUND)
+          if(NOT TARGET forge_jni)
+            add_library(forge_jni SHARED bindings/android/jni/forge_jni.c)
+            target_include_directories(forge_jni PRIVATE inference/include ${JNI_INCLUDE_DIRS})
+            target_link_libraries(forge_jni PRIVATE forge_c)
+          endif()
+          add_test(NAME jni_smoke COMMAND ${CMAKE_COMMAND} -DJAVAC=${Java_JAVAC_EXECUTABLE} -DJAVA=${Java_JAVA_EXECUTABLE}
+                   -DSRC=${PROJECT_SOURCE_DIR}/tests/jni -DOUT=${PROJECT_BINARY_DIR}/jni_smoke -DLIBDIR=$<TARGET_FILE_DIR:forge_jni>
+                   -DFPK=${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk -DBERT=${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk
+                   -P ${PROJECT_SOURCE_DIR}/tests/jni_smoke.cmake)
+          set_tests_properties(jni_smoke PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert" TIMEOUT 300)
+        endif()
+      endif()
+      # request fields, tool calling, HTTP behaviour (keep-alive, chunked bodies, limits, shutdown) and --lora
+      add_test(NAME serve_api COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_api_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden/hf ${PROJECT_BINARY_DIR}/serve_api)
+      set_tests_properties(serve_api PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 600)
+      # API keys, rate limits and quotas; TLS and mutual TLS (skipped parts are printed when the build has no OpenSSL)
+      add_test(NAME serve_auth COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_auth_test.py
+               $<TARGET_FILE:forge-serve> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/serve_auth)
+      set_tests_properties(serve_auth PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 300)
       # /v1/embeddings on a `session embedding` model (the tiny BERT the bert golden imports), 400 on a generative one
       add_test(NAME serve_embeddings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_embeddings_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk
@@ -1605,7 +1808,10 @@ if(FORGE_BUILD_TESTS)
       golden_gguf_types golden_hf_quant
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
-      capi_smoke python_bindings serve_http security_cli modelfile_signing)
+      capi_smoke python_bindings serve_http serve_api serve_auth security_cli modelfile_signing)
+    if(TEST jni_smoke)
+      forge_py_needs("numpy;safetensors" jni_smoke)   # it runs on the golden models
+    endif()
     foreach(_g ${FORGE_GOLDEN_FAMILIES})   # the family goldens (and the mock-device runs of them, where defined)
       forge_py_needs("numpy;safetensors" golden_tiny_${_g} golden_tiny_${_g}_cuda_mock golden_tiny_${_g}_opencl_mock)
     endforeach()

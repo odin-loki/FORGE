@@ -33,6 +33,10 @@ struct lowering {
 
 // A device backend's residency protocol, driven by the executor: buffers may live on the device for the
 // duration of run(); the executor asks for host copies before CPU work and reports host writes after it.
+// For a registry that wants to know a plan's weights and constants without being a resident device: the RPC client
+// uploads them once and refers to them by content hash afterwards (graph/rpc.hpp). note(p, n) is called for each of
+// them when a plan first runs, forget(p, n) when the plan is destroyed (the memory may go away or be reused).
+struct weight_sink { std::function<void(const float*, std::size_t)> note, forget; };
 struct device_hooks {
     std::function<void()> begin_run, end_run;
     // optional: end a run without copying device intermediates back (the executor has already fetched outputs/state)
@@ -94,6 +98,7 @@ public:
     }
     std::vector<lowering>& lowerings(ops::op o) { return by_op_[std::size_t(o)]; }
     std::shared_ptr<device_hooks> hooks;  // set by device backends that keep data resident
+    std::shared_ptr<weight_sink> weights; // set by registries that track a plan's constants themselves (rpc)
     // Pipeline split ("pipe:a,b,..."): when non-empty, compile() cuts the graph into contiguous stages of about
     // equal cost (weights in stage_weight) and selects each node's lowering from its stage's registry
     // (null entry = CPU). Stage registries must be non-resident; activations cross stages through host memory.
@@ -163,6 +168,35 @@ template <auto member> kernel_fn binary() {
     };
 }
 inline void rows(const tensor_view& x, std::size_t& r, std::size_t& n) { n = std::size_t(x.shape.back()); r = x.size() / n; }
+
+// Binary op of a tensor with a row vector broadcast over its last axis (x[..., n] op v[n]: a bias add, a
+// per-channel scale). SIDE names which operand is the vector. One row at a time through the same strip kernel
+// as the same-shape form; a single float operation per element, so the bits are the reference's.
+inline bool is_row_vec(const shape_t& v, const shape_t& out) {
+    return !v.empty() && !out.empty() && v.back() == out.back() && numel(v) == out.back() && numel(out) > out.back();
+}
+inline bool row_vec_rhs(sp in, const shape_t& out, const ops::attrs&) { return in.size() == 2 && in[0] == out && is_row_vec(in[1], out); }
+inline bool row_vec_lhs(sp in, const shape_t& out, const ops::attrs&) { return in.size() == 2 && in[1] == out && is_row_vec(in[0], out); }
+template <auto member, int SIDE> kernel_fn binary_row() {
+    return [](std::span<const tensor_view> in, tensor_view out, const ops::attrs&) {
+        auto f = simd::active().*member;
+        const tensor_view& x = in[SIDE == 1 ? 0 : 1]; const float* v = in[SIDE == 1 ? 1 : 0].data;
+        std::size_t r, n; rows(x, r, n);
+        task::parallel_for(r, std::max<std::size_t>(1, 16384 / n), [&](std::size_t b, std::size_t e) {
+            for (std::size_t i = b; i < e; ++i) {
+                if (SIDE == 1) f(x.data + i * n, v, out.data + i * n, n);
+                else f(v, x.data + i * n, out.data + i * n, n);
+            }
+        });
+    };
+}
+// y = alpha * x in single precision (the reference's definition of scale)
+inline kernel_fn scale() {
+    return [](std::span<const tensor_view> in, tensor_view out, const ops::attrs& a) {
+        const float al = float(a.num("alpha", 1.0));
+        task::parallel_for(out.size(), 16384, [&](std::size_t b, std::size_t e) { for (std::size_t i = b; i < e; ++i) out.data[i] = al * in[0].data[i]; });
+    };
+}
 
 inline kernel_fn softmax() {
     return [](std::span<const tensor_view> in, tensor_view out, const ops::attrs&) {
@@ -314,6 +348,15 @@ inline void registry::make_cpu(registry& r) {
     r.add({"lane.sub", ops::op::sub, 10, same_shapes, binary<&K::sub>()});
     r.add({"lane.mul", ops::op::mul, 10, same_shapes, binary<&K::mul>()});
     r.add({"lane.silu_mul", ops::op::silu_mul, 10, same_shapes, binary<&K::silu_mul>()});
+    // a row vector broadcast over the last axis (bias add, per-channel scale): the reference otherwise
+    r.add({"lane.add_row", ops::op::add, 9, row_vec_rhs, binary_row<&K::add, 1>()});
+    r.add({"lane.add_row_l", ops::op::add, 9, row_vec_lhs, binary_row<&K::add, 0>()});
+    r.add({"lane.sub_row", ops::op::sub, 9, row_vec_rhs, binary_row<&K::sub, 1>()});
+    r.add({"lane.sub_row_l", ops::op::sub, 9, row_vec_lhs, binary_row<&K::sub, 0>()});
+    r.add({"lane.mul_row", ops::op::mul, 9, row_vec_rhs, binary_row<&K::mul, 1>()});
+    r.add({"lane.mul_row_l", ops::op::mul, 9, row_vec_lhs, binary_row<&K::mul, 0>()});
+    r.add({"cpu.relu", ops::op::relu, 10, always, map_float([](float x) { return x > 0.f ? x : 0.f; })});
+    r.add({"cpu.scale", ops::op::scale, 10, always, scale()});
     r.add({"lane.softmax", ops::op::softmax, 10, always, softmax()});
     r.add({"lane.rms_norm", ops::op::rms_norm, 10, always, rms_norm()});
     r.add({"lane.gemm_nt", ops::op::matmul_t, 10, weight_2d, matmul_t()});

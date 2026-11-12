@@ -1,0 +1,6 @@
+ÿPOST /v1/chat/completions HTTP/1.1
+Expect: 100-continue
+Content-Length: 2
+Connection: close
+
+{}

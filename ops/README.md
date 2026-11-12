@@ -19,7 +19,7 @@ The generated op table is [docs/reference.md](../docs/reference.md) (87 ops, 36 
 | `ops/intrinsics/<isa>.dropped.txt` | Candidates the build script left out of the database, each with the reason (the compiler's diagnostic) |
 | `ops/intrinsics/build_*_db.py`, `intrin_db.py` | Derive the databases from clang's own intrinsic headers and validate every entry by compiling it. Run by hand; the build only reads the JSON |
 | `ops/gen/fspec_gen.py` | Generates `forge/ops/ops.gen.hpp` and `ops.md` in the build tree |
-| `ops/gen/gpu_gen.py` | Generates the GPU kernels: one GLSL compute shader per kernel (Vulkan), `kernels.cu` (CUDA/HIP, plus CUDA/HIP-only quantised, attention and state-op kernels), `kernels.cl` (OpenCL, Level Zero), `kernels.metal` (Metal). Also embeds the compiled images into headers |
+| `ops/gen/gpu_gen.py` | Generates the GPU kernels: one GLSL compute shader per kernel (Vulkan; the spec kernels and the `VK_PORT` ports of the portable kernels), `kernels.cu` (CUDA/HIP, plus CUDA/HIP-only quantised, attention and state-op kernels), `kernels.cl` (OpenCL, Level Zero), `kernels.metal` (Metal). Also embeds the compiled images into headers |
 | `ops/gen/intrin_gen.py` | Generates `forge/simd/raw/<isa>.gen.hpp` from each database: C++ intrinsic wrappers gated by CPU feature. Using an intrinsic the target lacks is a compile error |
 | `ops/gen/fit_math.py` | Fits the polynomials behind `simd` erf, erfc and lgamma. Run by hand: `python ops/gen/fit_math.py > simd/include/forge/simd/math_coeffs.hpp` |
 

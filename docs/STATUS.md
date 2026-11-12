@@ -28,11 +28,11 @@ have never run on GitHub, and it now uses clang 23 where the table below says Cl
 | Android, physical device | no | never | — |
 | Linux aarch64 (SVE) | locally, zig cross | under qemu-user only (2026-10-31: 50/54, see changelog) | `qemu-aarch64 -cpu max,sveN=on` |
 | Linux riscv64 (RVV) | locally, zig cross | under qemu-user only (same) | `qemu-riscv64 -cpu rv64,v=true,vlen=N` |
-| Linux loongarch64 (LSX, LASX) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-loongarch64 -cpu la464` |
-| Linux ppc64le (VSX) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-ppc64le -cpu power9`, `power8` |
-| Linux s390x (z14 vector) | locally, zig cross and g++ 13: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
-| wasm32-wasi (SIMD128) | simd layer and `test_simd` only, `tests/wasm_simd.sh` | `test_simd` 7/7 under node 22 (2026-11-12) | zig `wasm32-wasi` |
-| Linux mips64el (MSA) | locally, zig cross: `test_simd` only | `test_simd` 7/7 under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
+| Linux loongarch64 (LSX, LASX) | locally, zig cross: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-loongarch64 -cpu la464` |
+| Linux ppc64le (VSX) | locally, zig cross and g++ 13: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-ppc64le -cpu power9`, `power8` |
+| Linux s390x (z14 vector) | locally, zig cross and g++ 13: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
+| wasm32-wasi (SIMD128) | simd layer and its tests only, `tests/wasm_simd.sh` | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14 (one test per process), `vec_types` checks under node 22 (2026-11-12) | zig `wasm32-wasi` |
+| Linux mips64el (MSA) | locally, zig cross: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
 | 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: i386 7/7, arm 5/7 with the opt-in `neon` table, 7/7 without it (2026-11-12) | `qemu-i386`, `qemu-arm -cpu cortex-a7` |
 | Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
@@ -52,7 +52,7 @@ found and tested. The other shells in the job's install list were not present in
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
 | Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering) | MSL host syntax check | `macos` |
-| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe); SwiftShader in the Android emulator (local) | `linux-vulkan` on lavapipe; compiled out in every other job |
+| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe; local 2026-11-12: 36 spec kernels, the 11 ported kernels and 13 Vulkan goldens, see the changelog); SwiftShader in the Android emulator (local, not since 2026-11-05) | `linux-vulkan` on lavapipe; compiled out in every other job |
 
 `test_gpu_metal` passing means the runtime opened a device and all checks passed; the device name is not in the
 CI log because ctest only prints output on failure.
@@ -126,6 +126,76 @@ published model: every model in these tests is a tiny one built by the tests.
 | ONNX importer: CNN, shape, reduction and movement operators; shape-subgraph folding; external data; integer inputs; several symbolic dimensions ([modelfile.md](modelfile.md#onnx-graphs)) | `onnx_import`: 78 outputs of 10 graphs against `onnx.reference.ReferenceEvaluator` and onnxruntime 1.29; 8 refusals; 7 bad external-data references. `fuzz_onnx` with 8 new seeds | No published ONNX model. Convolution-family operators only at batch 1. See the "Not done" list in the guide |
 | Blueprint opset 4: session parameters, entry points; `session diffusion_loop`, `session streaming` through `inference::session`; `forge denoise`, `forge stream`; blueprint-directory import ([inference.md](inference.md#session-kinds-chosen-by-the-file-diffusion_loop-and-streaming-file_sessionshpp)) | `test_sessions` (runners against the graph computed by hand); `golden_tiny_sessions` (numpy references: five schedule / prediction / sampler combinations, guidance, streaming with carried conv state, chunk-size invariance) | Tiny MLP denoiser and a 6-channel streaming encoder only: no UNet / DiT, no VAE, no audio front end. Not exposed by `forge-serve` or the C ABI. CPU only |
 | Self-speculative decoding (early exit) ([inference.md](inference.md#speculative-decoding-speculativehpp)) | `test_inference` `self_speculative_early_exit_is_exact`: equal to plain decoding for greedy and three seeded samplers, exit layers 1 to 3, a recurrent hybrid; `golden_tiny_llama` (CLI) | No trained model: acceptance (2 % random, 97 % with damped late layers) says nothing about real models. No speed measurement. The early layers' KV is not shared with the verify pass |
+### 2026-11-12 (GPU follow-up: Vulkan and Metal ports, device conv / norm ops, eviction and captures, prims, pipe:auto, RPC residency)
+Linux x86_64, clang 23, no GPU. "lavapipe" = Mesa 25.2.8 llvmpipe (LLVM 20), a CPU implementation of Vulkan that
+executes the embedded SPIR-V; "mock" = the mock drivers of the entry below. Nothing in this entry ran on a physical
+GPU, and nothing was built by a compiler other than clang 23.
+- **Vulkan ports of the portable kernels** (`VK_PORT` in `ops/gen/gpu_gen.py`: quantised matmul_t / gather / FFN
+  gate-up for q8_0, q4_k, q5_k, q6_k, one-pass and split-over-keys attention, delta_rule, causal_conv, broadcast,
+  device MoE; host side `gpu::portable_kernels<>` on `gpu::vk::runtime`). **Lavapipe-verified**: all 47 shaders build
+  with glslang 15.1 and pass `spirv-val`; `test_vulkan` and `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`: views
+  staged through scratch buffers) run the checks of `tests/gpu_checks.hpp`, which `test_cuda_hip` runs on the mocks:
+  14/14 attention shapes, 24/24 quantised matmul cases, 28/28 against the decoded-weight reference (worst 1.2e-6 of
+  the largest output), 20/20 fused FFN cases, state ops (3 shapes, 2e-8), 4/4 quantised gather, 21/21 MoE cases, 8/8
+  broadcast cases, every `vk.*` lowering through the oracle. Goldens with `FORGE_DEVICE=vulkan`: the existing three
+  plus `golden_{hf_quant,quant_inplace,tiny_qwen2,tiny_qwen3,tiny_gpt2,tiny_gemma,tiny_phi3,tiny_bert,tiny_vit,tiny_whisper}_vulkan`
+  (13 in all) pass. `tiny_qwen3_5` (DeltaNet end to end) was skipped: no torch here; the state ops are covered by the
+  check above only. First attempt failed the oracle on decode attention by 1.2e-5 against 1e-5 (one `fma` chain per
+  score); the ports sum scores in 4 partial sums like the spec shader. Never on a GPU: descriptor limits, real
+  drivers' SPIR-V compilers and buffers over the tested sizes are untested.
+- **Vulkan dispatch folding**: launches are folded over the second dispatch dimension (rows of 32768 groups); before,
+  a launch of more than 65535 × 64 work items exceeded what `maxComputeWorkGroupCount` guarantees. Lavapipe: a
+  2,098,152-item `add` (0 wrong). The 36 spec shaders were regenerated with the linear index and pass as before.
+- **Metal ports of the same families**: `kernels.metal` gets the eleven portable kernels through a textual
+  translation of the OpenCL C (`msl_port`), and `gpu/src/metal.mm` gets the host side (`gpu::portable_kernels<>`).
+  **Never executed, never compiled by a Metal toolchain.** Checked here: the generated MSL passes the C++ syntax
+  check `gpu_compile_metal_syntax` (45 kernels; address-space keywords vanish in that check), and `metal.mm` parses
+  as Objective-C++ against stub declarations of the Metal API (`gpu_compile_metal_host_syntax`, new). That second
+  check found that `forge_metal` lacked the `third_party/monocypher` include directory `core/memory.hpp` needs since
+  the 2026-11-12 merges (not verified on macOS, but the include path was missing from the target); added. `test_gpu_metal` now runs the attention, quantised,
+  state-op and MoE checks too, so the macOS CI job is the first place any of this runs.
+- **Device kernels for `gelu`, `layer_norm`, `group_norm`, `conv1d`, `conv2d`, `max_pool2d`, `avg_pool2d`,
+  `attention_bias`** on every backend (one portable source, `PORT_NN`). **Mock-verified** on CUDA, HIP, OpenCL, Level
+  Zero: `test_gpu_{cuda,hip,opencl,ze}_mock` 42/42 lowerings through the oracle (34 before) and 26/26 cases of the new
+  `nn_ops_check`. The CUDA / HIP mock now compiles the generated portable source as C for these kernels (no hand
+  copy); the PTX (sm_70, sm_80) and AMDGPU builds of that text compile and have not run. **Lavapipe-verified** on
+  Vulkan: `gelu.comp` and the seven GLSL ports pass the oracle and the same 26 cases, also with
+  `FORGE_VK_SSBO_ALIGN=256`. **Metal: never executed** (`msl_port` translation, C++ syntax check only). Goldens of the
+  six template families pass on the CUDA mock, the OpenCL mock and lavapipe; with `FORGE_PLAN_TRACE` the OpenCL-mock
+  runs show no `attention_bias`, `layer_norm`, `gelu` or convolution left on the host (remaining: `transpose`,
+  `l2_normalize`, `masked_mean`). A broadcast with a single-element operand (`x * [1]`) now also stays on the device.
+  No GPU has run any of it and nothing was timed.
+- **Eviction and recorded graphs** (buffer generations, `gpu/graph_refs.hpp`): a graph whose buffers were evicted,
+  released or re-created is detected at `graph_launch` and re-recorded from the host views (per launch on OpenCL /
+  Level Zero, the whole captured graph on CUDA / HIP); OpenCL and Level Zero now evict while a recording is open.
+  **Mock-verified** only: `test_gpu_memory_{cuda,hip,opencl,ze}_mock` step 6 (6 checks per backend, see
+  [gpu.md](gpu.md#eviction-and-recorded-graphs)). On the mocks the CUDA / HIP re-record uses the generated
+  parameter-size table, since the mock has no `cuFuncGetParamInfo`; the driver path of that lookup has not run.
+  Still not possible: eviction while a CUDA / HIP stream capture is open. Not run on the RTX 3090.
+- **`gpu::prims` (FORGE_PLAN B.6)**: `gemv`, `gemm_batched` with an epilogue, `conv1d` / `conv2d`, `fft`,
+  `softmax`, `rms_norm`, `layer_norm`, `flash_attention` on the CPU (`prims.hpp`), and all but the FFT on a device
+  through the generated kernels (`prims_device.hpp`). CPU: 5 new `test_gpu` tests against the float64 references on
+  this x86_64 machine only. Device: `prims_check` 22/22 on the CUDA, HIP, OpenCL, Level Zero **mocks**
+  and on **lavapipe**; Metal never executed; no GPU. The device epilogue is separate launches, not a fused kernel.
+- **`pipe:auto`** (`gpu::plan_pipeline`): the layer split over the devices of one backend, shares from throughput,
+  capped by device memory, overflow to a CPU stage. Synthetic records in `test_gpu` (`pipeline_auto_partition`);
+  **mock-verified** with `MOCK_DEVICES=2` on CUDA, HIP, OpenCL, Level Zero (`test_gpu_select_*_mock`: the two-stage
+  split, an 8-layer graph running 8 + 8 ops over both devices against the CPU, the one-device case) and
+  `golden_tiny_llama_pipe_auto_cuda_mock`. The mocks report equal priors, so only the 50 / 50 split ran on a driver;
+  the memory-capped and benchmark-weighted splits ran on synthetic records only. Stage hand-off is through host
+  memory: peer copies are not used by the pipeline (the peer-copy API is covered by `test_gpu_features_*_mock` as
+  before). No multi-GPU machine has run it.
+- **RPC remote weight residency** (protocol version 2 in `graph/rpc.hpp`: the `rpc.caps` probe, `FRPW` uploads keyed
+  by BLAKE3, `FRPR` ops with handles, a per-connection LRU under a shared byte budget, invalidation on reconnect).
+  Tested over **loopback only**, plain TCP, CPU server: `test_rpc` 7 new tests (upload once and the bytes saved, LRU
+  eviction and re-upload, reconnect by hand and after a server restart, a version 1 server and a version 1 client,
+  `allow=` / `max-bytes=` on uploads and on handles, hostile frames, a whole model against the CPU); the 24 older
+  `test_rpc` tests pass unchanged (the TLS ones included: this build has OpenSSL). `fuzz_rpc`: 32 new seeds, 150,000 mutated inputs without a finding, in a build
+  **without** sanitizers. Not run: two machines, TLS-specific paths, a GPU behind the server (the device pin of a
+  stored weight has only run against the CPU registry, where it is a no-op), concurrent connections under load. `forge rpc-serve` still opens its device non-resident, so only the network
+  transfer of a weight is saved, not the server's host-to-GPU copy.
+- The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
+  tests pass unchanged after the move.
 
 ### 2026-11-12 (session summary: everything merged on this day, and how each part was verified)
 One machine did all of this: Linux x86_64 (4 cores, kernel 6.18), **clang 23**, no GPU. Nothing below has been
@@ -142,6 +212,7 @@ Whole tree after the last merge (`ctest -LE "slow|emu" -j2`, clang 23, RelWithDe
 | Script language fixes (catch-clause matching, fatal errors, `.fsc` version 4), conformance sweep | Native: `test_script*`, `script_conformance` (each program also built as real C++23 and the outputs compared) | Other platforms through CI only |
 | Tokenizers (Hugging Face pipeline, SentencePiece BPE, Unigram, WordPiece, WordLevel) and chat templates (Jinja subset) | Native: `test_tokenizer` and `test_chat_template` against goldens produced by the `tokenizers` 0.23, `sentencepiece` 0.2 and `jinja2` packages; `chat_template_http`; fuzz targets. Text to ids to model output through `forge run --prompt` / `forge embed --text` in the family goldens | Tokenizers of full-size published models; the llama.cpp regex table and the model chat templates were written from memory |
 | Template families GPT-2, Gemma 1 / 2 / 3, Phi-3, BERT, ViT / CLIP / SigLIP, Whisper encoder; 24 spatial and encoder ops; embedding sessions; opset 3 | Native: `test_ops_ext`, `golden_tiny_{gpt2,gemma,phi3,bert,vit,whisper}` against float64 numpy references (HF and GGUF imports, f32 and q8_0); the same goldens on the CUDA and OpenCL mock drivers | Any published checkpoint; any real GPU |
+| forge-serve: end-of-turn stops, tool calls, request fields (`n`, `logprobs`, `logit_bias`, ...), keep-alive HTTP, API keys, TLS / mTLS, `--lora`; C ABI 4 (shared weights, sampler chain, adapters, KV state, embeddings, batching); Python / Kotlin / Swift bindings on it | Native (clang 23, Linux x86_64, tiny golden models): `serve_api`, `serve_auth`, `test_chat_tools`, `fuzz_serve_http`, `capi_smoke`, `doc_example_capi_generate`, `python_bindings`, `jni_smoke` (the JNI C bridge on a host JVM), `jni_decl_matches`. forge-serve without TLS: built by hand once and run through `serve_auth` | No real chat or tool-calling checkpoint served. **Kotlin and Swift sources never compiled.** Other compilers and OSes through CI only; Windows shutdown path, `device = auto` through the C ABI: not run |
 | `/v1/embeddings`, `forge embed --text` / `--text-pair`, opset enforcement per feature | Native: `serve_embeddings`, `test_modelfile` (`blueprint_opset_enforced_per_feature`, `shipped_templates_declare_their_opset`), the family goldens | — |
 | Importer fixes: Qwen2 bias template, RoPE scaling, tensor accounting, GGUF tensor types and `--codec` for GGUF, AWQ / GPTQ checkpoints, licence capture | Native: `golden_tiny_qwen2`, `golden_rope_scaling`, `golden_gguf_types` (against gguf-py), `golden_hf_quant`, `test_modelfile` | Published checkpoints |
 | GPU: portable OpenCL / Level Zero kernels, device MoE, kernel program cache, determinism mode, automatic device selection | **Mock drivers only** (the OpenCL mock compiles the generated OpenCL C as C and runs it). The Level Zero mock is handed the OpenCL C source (`FORGE_ZE_TEST_IMAGE=opencl-c`): this build has no SPIR-V image because `llvm-spirv` is not installed, so the SPIR-V path itself did not run. See the GPU entry below | Any real HIP, OpenCL, Level Zero or Vulkan device; the CUDA changes on the RTX 3090; Metal (MSL syntax check only) |
@@ -160,6 +231,41 @@ Sanitizers on this day: after the last merge, clang 23 `-DFORGE_SANITIZE=ON` (AS
 
 Environment notes for reproducing the run: Python packages numpy, safetensors, onnx, cryptography, gguf, tokenizers,
 sentencepiece; `llvm-spirv` absent; shells found for the script emit goldens: sh, bash, zsh, dash, ash, ksh, mksh, yash, posh, fish, tcsh, csh, xonsh, elvish, rc.
+
+### 2026-11-12 (simd: companion tables and element types on every ISA; std interop; CPU fusions; engine on the scheduler)
+One machine, as above: Linux x86_64, 4 cores shared with other jobs, clang 23. Everything for other architectures
+ran under qemu-user 8.2 or node 22 only; nothing ran on real non-x86 hardware and nothing was through CI.
+- **Tier A, `seq` and int8 tables for every Tier P backend** (`simd/src/isa_extra.cpp`, `qi8_gn.inc`). x86_64 natively:
+  `test_simd_tables` 3/3 (tables `avx512 avx2 sse4.2 sse2 scalar`; int8 `avx512vnni avxvnni avx2 sse4.2 sse2`),
+  `test_simd_tiera` 14/14, `test_graph` with the extended table lists. Emulated, per CPU model, `test_simd_tables` 3/3
+  and `test_simd_tiera` 14/14: AArch64 (g++ 13) `cortex-a57`, `max,sve=off`, SVE at 128 / 256 / 384 / 512 / 640 / 1024
+  / 1536 / 2048 bits; riscv64 (zig 0.17) VLEN 128 / 256 / 512 / 1024; loongarch64 `la464` (`lasx`, `lsx`); ppc64le
+  `power9`; s390x `max`; mips64el `Loongson-3A4000`; wasm32 under node (Tier A one test per process: node segfaults on
+  the whole binary). The int8 reference hash of fixed blocks equals x86's on every little-endian target; s390x is
+  only compared with its own scalar reference. g++ 13, by hand on x86_64: the `sse2` / `sse4.2` companion tables
+  3/3 and the `sse4.2` / `avx2` / `avx512` `vec_types` checks 0 failed. No timing anywhere; the new int8 tables are
+  off by default.
+- **`vec_types.hpp`** (`vec<T>` for double and the integers): about 25.5 million checks per register width, exhaustive
+  for 8-bit binary and 16-bit unary operations. 0 failed: x86 `scalar`, `emulated`, `sse2`, `sse4.2`, `avx2`, `avx512`
+  natively; `neon`, `sve` 128 / 256 / 512 / 1024, `rvv` 128 / 256 / 512 / 1024, `lsx`, `lasx`, `vsx`, `vxe`, `msa`, `simd128`
+  under emulation. Known: on loongarch64 with zig 0.17 the portable-array path (`emulated_t`, unused there) has 46,976
+  differing checks from a compiler defect, reported by the test without failing it. Compiler defects worked around:
+  MSA double `fma` / `abs`, LASX half-precision conversion (`tools/repro_llvm_vector_codegen.cpp`). MSVC is untested
+  and uses the portable arrays.
+- **`interop.hpp`**: `std::experimental::simd` conversions compiled and run with libstdc++ 13 (x86_64, and AArch64 under
+  qemu); `std::mdspan` overloads compiled and run with libc++ 23 (`test_simd_std_libcxx`) and with zig's libc++ on
+  s390x and riscv64 under qemu. C++26 `std::simd`: nothing (no library has it here). libstdc++ 15's `<mdspan>`: not tried.
+- **CPU fusions** (`fuse_cpu.hpp`, `passes.hpp`; [graph.md](graph.md#fusion)): row chains and shared int8 activations
+  bit-identical to the unfused plans on 60 random graphs / 27 quantised cases; conv + batch_norm folding within
+  2.8e-7 of the largest output over 24 random cases (stated bound 2e-5). x86_64 only. Host plans only: device plans
+  and `pipe:` stages are untouched. No model-level timing of the fusions was made.
+- **Engine on `task::scheduler`** (`FORGE_TASK_SCHEDULER=sched`): `test_engine` and `test_graph`, `test_inference`,
+  `test_kvquant`, `test_sessions`, `test_aot` pass under both executors; identical token ids from `forge run` on the
+  wide and deep synthetic models. `forge bench` (9 interleaved runs, loaded machine): wide prefill 1472 (pool) vs 1458
+  (sched) tok/s, wide decode 678 vs 418, deep prefill 28260 vs 13800, deep decode 5719 vs 2197. `pool` stays the default.
+- Not done: Tier A's hand-written byte search / partition for non-x86 ISAs (they use the 8-byte integer path or the
+  compiler); a fused GEMM epilogue; rope + attention fusion; 32-bit x86 / Arm companions; any of this on MSVC, GCC 14,
+  Apple clang, NDK, FreeBSD.
 
 ### 2026-11-12 (simd tables for more architectures; emulation only)
 New Tier P backend `vec_gn.hpp` and kernel tables `sse2`, `sse4.2`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` and

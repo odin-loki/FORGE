@@ -76,7 +76,7 @@ allow=scripts fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025 c
 |---|---|
 | `allow=PERM[,PERM...]` | The key may only do these. Repeated `allow=` options add up. `allow=` with no value authenticates but permits nothing |
 | `ops=OP[,OP...]` | Of the device ops its permissions allow, the key may run only these (op names as in [reference.md](reference.md); repeated options add up). An unknown name stops `rpc-serve` at start |
-| `max-bytes=N` | Largest request: tensor bytes of one device op (all inputs plus the output, 4 bytes per element) and source bytes of one script. `N` is bytes, or has a `k`, `m` or `g` suffix (powers of 1024) |
+| `max-bytes=N` | Largest request: tensor bytes of one device op (all inputs plus the output, 4 bytes per element; a weight handle counts as the tensor it names), bytes of one weight upload, and source bytes of one script. `N` is bytes, or has a `k`, `m` or `g` suffix (powers of 1024) |
 | `script-timeout=MS` | Upper limit per script for this key, below the server's `--script-timeout` |
 
 Without `allow=` a line has every permission; its limits still apply.
@@ -175,6 +175,47 @@ Device clients (`rpc:host:port`) read the environment. `forge::remote` reads it 
 | `FORGE_RPC_FINGERPRINT` | `fingerprint` | SHA-256 of the server certificate, hex (turns TLS on) |
 | `FORGE_RPC_SERVER_NAME` | `server_name` | Name checked against the certificate (default: the host) |
 | `FORGE_RPC_TLS_CERT`, `FORGE_RPC_TLS_KEY` | `tls_cert`, `tls_key` | Client certificate and key, PEM (the certificate turns TLS on) |
+| `FORGE_RPC_RESIDENT=0` | – | Device clients: never upload weights; send them with every op ([Weights on the server](#weights-on-the-server)) |
+| `FORGE_RPC_RESIDENT_MIN` | – | Device clients: smallest weight, in bytes, sent by handle (default 4096) |
+
+## Weights on the server
+Until 2026-11-12 every op carried all of its inputs, so a model's weights crossed the network once per op that used them. With protocol version 2 the client uploads each weight once per connection and names it by the BLAKE3 hash of its bytes afterwards.
+
+**What the client does** (`rpc:host:port` devices; `graph/rpc.hpp`):
+1. The plan reports its weights and constants (`registry::weights`), by host address and size. Inputs that are not one of those buffers exactly (activations, slices of a weight) travel inline as before.
+2. Before the first op that carries such a weight, the client asks the server what it can do (below). If the server keeps weights, each weight of at least 4096 bytes (`FORGE_RPC_RESIDENT_MIN`) and at most the server's budget is hashed (BLAKE3 over the f32 bytes, once), uploaded with `FRPW`, and then sent as a 32-byte handle plus the shape the op sees.
+3. If the server answers that it does not hold a handle (it evicted it), the client uploads that weight again and repeats the request, at most twice; then the op goes inline.
+4. A weight the server refuses (permissions, `max-bytes=`, no room) travels inline from then on.
+5. A lost connection is reopened once and the op sent again. A new connection starts empty on both sides: the client forgets what it uploaded, so nothing refers to a weight the server no longer has.
+6. Before each use the client checks 64 sampled words of the buffer against what it hashed. A noted buffer that was reused for other data is hashed and uploaded again. This is a check, not a proof: code that rewrites a constant in place between runs must not rely on it.
+
+`FORGE_RPC_RESIDENT=0` turns all of this off on the client.
+
+**What the server does**:
+- Uploads are kept **per connection**: a handle names only bytes this connection sent, so one peer cannot compute with another peer's weights by knowing or guessing a hash. They are dropped when the connection ends.
+- All connections share one byte budget: `FORGE_RPC_WEIGHT_CACHE` (bytes, or with a `k`, `m`, `g` suffix; default 1 GiB; `0` keeps nothing), `server::weight_budget_bytes` for embedders. An upload that does not fit evicts the same connection's least recently used weights; if that is not enough it is refused with "no room" and the client sends that weight inline. A connection never evicts another connection's weights.
+- What is saved is the network transfer. `forge rpc-serve` opens its device without residency, so with `--device cuda` each op still copies its inputs, the stored weight included, from the server's host memory to the GPU. An embedder that gives `rpc::server` a resident registry gets the stored weights pinned on the device (and dropped from it on eviction); that path has only run against the CPU registry, where it does nothing.
+- **Nothing from the wire is trusted.** The size an upload names is checked against the peer's `max-bytes=`, the budget and the server's tensor limit before any payload is buffered, and the buffer grows only with bytes that arrive. The server hashes the payload itself and stores it under that hash only if it equals the one named. A handle is looked up in the connection's own table; an unknown one gets the "not held" reply, and one used with a shape of another size is an error, never a read past the stored bytes. An input kind other than inline or handle ends the connection.
+
+**Permissions and limits**:
+
+| Rule | Effect on weights |
+|---|---|
+| `allow=` | An upload needs at least one `device.*` permission. A peer with `allow=scripts` only cannot upload. Running the op still needs the op's class (`device.contraction` for `matmul_t`), handle or not |
+| `ops=` | Unchanged: it limits which ops run, not what may be uploaded |
+| `max-bytes=N` | An upload larger than `N` is refused, unbuffered. In an op, a handle counts as the bytes of the tensor it names, exactly like an inline input, so uploading first does not get a larger op past the limit |
+
+There is no per-rule cap on how much a peer may keep stored: the shared budget is the only bound, and one connection can fill it (then other connections' uploads are refused and their weights travel inline).
+
+**Versions.** The probe is an ordinary `FRPC` frame for the op name `rpc.caps` (no inputs). A version 2 server answers with its version, a flag for weight residency and its budget. A version 1 server answers "unknown op" like for any other unknown name and the connection stays usable, so a new client simply keeps sending weights inline to an old server, with no reconnect. A version 2 server serves the `FRPC` frames of an old client unchanged. A connection whose plans have no weights never sends the probe.
+
+| Frame | Layout | Reply |
+|---|---|---|
+| probe | `FRPC`, name `rpc.caps`, 0 attrs, 0 inputs, rank-0 output | `u32 0`, `u32 version` (2), `u32 flags` (bit 0: weights), `u64 budget` |
+| upload | `FRPW`, `hash[32]`, `u32 rank`, `i64 dims`, f32 data | `u32 status`: 0 stored (or already held); 1 refused + text; 2 no room + text |
+| op | `FRPR`: as `FRPC`, each input preceded by `u32 kind`: 0 inline (rank, dims, data), 1 handle (`hash[32]`, rank, dims) | as `FRPC`, or `u32 3`, `u32 n`, `n × hash[32]`: handles not held |
+
+Not covered: the encoded (quantised) weights of a model are not sent by handle; on an RPC device the quantised matmuls run on the client's CPU as before. There is no frame to drop one weight; the LRU and the end of the connection are the only ways out. Tested over loopback only (`test_rpc`: `rpc_weight_residency_*`, 7 tests; `fuzz_rpc` with uploads and handles in its corpus); not across machines, not under TLS specifically (the frames ride the same channel), not with a GPU behind the server.
 
 ## Remote scripts
 With `--allow-scripts`, each `FRPS` frame runs in its own child process (`forge script --rpc-child`, source on stdin) with the timeout and memory limit above, at most 32 MiB of output, and `FORGE_RPC_TOKEN`, `FORGE_RPC_KEY`, `FORGE_RPC_TLS_KEY` and `FORGE_SCRIPT_CACHE_SIGN_SEED` removed from its environment. A capability is denied to a script when the server's `--script-no-*` flag says so or when its sender lacks `scripts.fs` / `scripts.net` / `scripts.proc`. When any capability is denied, the child applies the OS sandbox with `require` on POSIX, so a sandbox failure fails the script instead of running it unconfined. On Windows it is `best-effort` (job object; the interpreter enforces the rest); see [scripting.md](scripting.md).
@@ -200,8 +241,8 @@ FORGE_RPC_KEY=me.key FORGE_RPC_CA=c.pem FORGE_RPC_TLS_CERT=me-client.pem FORGE_R
 ```
 
 ## Limits
-- Not optimised: weights travel with every op (no remote residency), and device ops on one server run one at a time.
-- Permissions stop at what the protocol carries: device ops are stateless (tensors in, tensor out), so there is no per-model or read-only scope and no server-side buffer to protect; scripts are scoped by capability, not by path (on Windows the OS part of the script sandbox is best-effort, see above).
+- Device ops on one server run one at a time. Weights are uploaded once per connection ([Weights on the server](#weights-on-the-server)), but activations still cross the network for every op, and encoded (quantised) weights are not sent by handle.
+- Permissions stop at what the protocol carries: device ops are tensors in, tensor out, and the only server-side state is a connection's own uploaded weights, so there is no per-model or read-only scope and no per-rule cap on stored bytes; scripts are scoped by capability, not by path (on Windows the OS part of the script sandbox is best-effort, see above).
 - Client-certificate rules do not look at other subject fields (O, OU) or at otherName / directoryName SANs. Revocation is by CRL file or fingerprint list only: no OCSP, no CRL download from distribution points, and CRLs are not checked for the server certificate on the client side.
 - An embedder that sets only `server::script_handler` / `signed_script_handler` (not `script_request_handler`) cannot withhold script capabilities: peers without the full `scripts` set are refused there.
 - Only source travels for scripts and `remote_call`; compiled lambdas are not shipped.

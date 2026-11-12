@@ -146,6 +146,14 @@ private:
 // gemma / gemma2 / gemma3 / phi3 / gpt2 / bert (defined in gguf_arch.hpp, included at the end of this file)
 inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const std::string& path, const std::string& out, const import_options& opt, const std::string& arch);
 
+// Manifest "eos_token_ids": every id that ends generation: the EOS, end-of-turn and end-of-message ids of the file.
+template <class G> void gguf_eos_ids(const G& g, json::object& man) {
+    json::array ends;
+    for (auto k : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"})
+        if (auto* v = g.get(k); v && v->is_num() && v->num() >= 0 && std::find_if(ends.begin(), ends.end(), [&](auto& e) { return e.num() == v->num(); }) == ends.end()) ends.push_back(*v);
+    if (!ends.empty()) man.emplace_back("eos_token_ids", std::move(ends));
+}
+
 inline import_report import_gguf(const std::string& path, const std::string& out, const import_options& opt = {}) {
     check_write(out);
     gguf_file g(path);
@@ -433,6 +441,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     // Whether prompts start with BOS: GGUF says so explicitly (Qwen-family files set it to false).
     if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
     if (auto* ae = g.get("tokenizer.ggml.add_eos_token"); ae && ae->is_bool()) man.emplace_back("add_eos", ae->b());
+    gguf_eos_ids(g, man);
     if (!xi.empty()) { man.emplace_back("forge_format_minor", double(modelfile::format_minor)); w.set_section("experts", xi.dump()); }
     {   // tensor types: what the GGUF stored, and what the import changed
         json::object ty; for (auto& [k, n] : seen) ty.emplace_back(k, double(n));

@@ -64,6 +64,34 @@ for n, f in frames.items():
 put("rpc", "authed_script", b"\x05" + script); put("rpc", "authed_signed_script", b"\x05" + signed)
 put("rpc", "authed_script_then_op", b"\x05" + script + frames["add"])
 put("rpc", "plain_script_refused", b"\x04" + script)
+# remote weights (protocol version 2): the capability probe, FRPW uploads, FRPR ops with handles. Byte 0 = 11 / 12 is
+# 4 / 5 with the harness's fixed 16-float weight uploaded first; 32 bytes 0xA5 stand for its hash (fuzz_rpc.cpp).
+H = b"\xa5" * 32
+def frpr(op, ins, out):   # ins: ("h", hash, shape) or ("i", shape, data)
+    b = b"FRPR" + s(op) + u32(0) + u32(len(ins))
+    for x in ins: b += (u32(1) + x[1] + shape(*x[2])) if x[0] == "h" else (u32(0) + shape(*x[1]) + f32(*x[2]))
+    return b + shape(*out)
+frpw = lambda h, sh, data: b"FRPW" + h + shape(*sh) + f32(*data)
+res = {
+    "caps_probe": frpc("rpc.caps", [], [], ()),
+    "handle_relu": frpr("relu", [("h", H, (16,))], (16,)),
+    "handle_reshaped": frpr("neg", [("h", H, (4, 4))], (4, 4)),
+    "handle_and_inline": frpr("add", [("h", H, (16,)), ("i", (16,), [1.0] * 16)], (16,)),
+    "handle_twice": frpr("mul", [("h", H, (16,)), ("h", H, (16,))], (16,)),
+    "handle_matmul": frpr("matmul_t", [("i", (1, 4), (1, 2, 3, 4)), ("h", H, (4, 4))], (1, 4)),
+    "handle_wrong_size": frpr("relu", [("h", H, (17,))], (17,)),
+    "handle_unknown": frpr("relu", [("h", bytes(range(32)), (16,))], (16,)),
+    "handle_bad_kind": b"FRPR" + s("relu") + u32(0) + u32(1) + u32(7) + H + shape(16) + shape(16),
+    "upload_bad_hash": frpw(bytes(32), (4,), (1, 2, 3, 4)) + frpr("relu", [("h", bytes(32), (4,))], (4,)),
+    "upload_huge": b"FRPW" + H + shape(1 << 40),
+    "upload_over_budget": b"FRPW" + H + shape(2048) + f32(*([0.5] * 64)),
+    "upload_empty": frpw(H, (0,), ()),
+    "upload_twice_then_use": frpw(H, (16,), [i - 7.5 for i in range(16)]) * 2 + frpr("relu", [("h", H, (16,))], (16,)),
+    "two_ops": frpr("relu", [("h", H, (16,))], (16,)) + frames["add"] + frpr("neg", [("h", H, (16,))], (16,)),
+}
+for n, f in res.items():
+    put("rpc", "resident_" + n, b"\x0b" + f); put("rpc", "resident_authed_" + n, b"\x0c" + f)
+put("rpc", "plain_caps_probe", b"\x04" + res["caps_probe"]); put("rpc", "plain_handle_without_upload", b"\x04" + res["handle_relu"])
 key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 put("rpc", "hello_token", b"\x06FRPH" + u32(1) + s("tok") + frames["add"])
 put("rpc", "hello_bad_token", b"\x06FRPH" + u32(1) + s("nope"))
