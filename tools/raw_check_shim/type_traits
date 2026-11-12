@@ -1,0 +1,8 @@
+// Minimal <type_traits> for tools/check_raw_intrinsics.py only: the cross-target syntax check of the Tier R
+// headers runs with -nostdinc++ (no foreign C++ standard library is installed), and forge/simd/caps.hpp needs
+// nothing from the library but std::is_same_v. Never on the include path of a real build.
+#pragma once
+namespace std {
+template <class, class> inline constexpr bool is_same_v = false;
+template <class T> inline constexpr bool is_same_v<T, T> = true;
+}

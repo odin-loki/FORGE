@@ -17,6 +17,12 @@ struct cpu_features {
     bool os_avx = false, os_avx512 = false; // XGETBV state enabled
     bool neon = false, sve = false, sve2 = false; int sve_bytes = 0, sve_hw_bytes = 0;
     bool rvv = false; int rvv_bytes = 0;
+    // Other architectures (Tier R feature gates; getauxval HWCAP bits on Linux, compile-time on WebAssembly).
+    bool lsx = false, lasx = false;                                                  // LoongArch
+    bool altivec = false, vsx = false, power8 = false, power9 = false, power10 = false;   // PowerPC: ISA 2.07 / 3.0 / 3.1
+    bool zvector = false, zvector_e1 = false, zvector_e2 = false;                    // s390x: VX, VXE, VXE2
+    bool msa = false;                                                                // MIPS
+    bool wasm_simd128 = false;
     bool hybrid = false;                 // P/E-core part
     std::string vendor, brand;
     std::string summary() const;

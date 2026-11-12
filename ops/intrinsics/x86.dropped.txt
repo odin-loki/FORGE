@@ -1,0 +1,220 @@
+# Candidates left out of x86.json by its build script, with the reason.
+#     17  does not compile
+#    177  feature outside Tier R
+#      9  macro
+#     12  no target feature
+__lzcnt16	no target feature: generic helper, not a SIMD intrinsic
+__lzcnt32	no target feature: generic helper, not a SIMD intrinsic
+__lzcnt64	no target feature: generic helper, not a SIMD intrinsic
+__tile_loaddrs	feature outside Tier R: amx-movrs
+__tile_stream_loaddrs	feature outside Tier R: amx-movrs
+__tzcnt_u16	no target feature: generic helper, not a SIMD intrinsic
+__tzcnt_u32	no target feature: generic helper, not a SIMD intrinsic
+__tzcnt_u64	no target feature: generic helper, not a SIMD intrinsic
+_aadd_i32	feature outside Tier R: raoint
+_aadd_i64	feature outside Tier R: raoint
+_aand_i32	feature outside Tier R: raoint
+_aand_i64	feature outside Tier R: raoint
+_addcarry_u32	no target feature: generic helper, not a SIMD intrinsic
+_addcarry_u64	no target feature: generic helper, not a SIMD intrinsic
+_addcarryx_u32	feature outside Tier R: adx
+_addcarryx_u64	feature outside Tier R: adx
+_aor_i32	feature outside Tier R: raoint
+_aor_i64	feature outside Tier R: raoint
+_axor_i32	feature outside Tier R: raoint
+_axor_i64	feature outside Tier R: raoint
+_cldemote	feature outside Tier R: cldemote
+_clrssbsy	feature outside Tier R: shstk
+_clui	feature outside Tier R: uintr
+_cmpccxadd_epi32	feature outside Tier R: cmpccxadd
+_cmpccxadd_epi64	feature outside Tier R: cmpccxadd
+_directstoreu_u32	feature outside Tier R: movdiri
+_directstoreu_u64	feature outside Tier R: movdiri
+_encls_u32	feature outside Tier R: sgx
+_enclu_u32	feature outside Tier R: sgx
+_enclv_u32	feature outside Tier R: sgx
+_enqcmd	feature outside Tier R: enqcmd
+_enqcmds	feature outside Tier R: enqcmd
+_fxrstor	feature outside Tier R: fxsr
+_fxrstor64	feature outside Tier R: fxsr
+_fxsave	feature outside Tier R: fxsr
+_fxsave64	feature outside Tier R: fxsr
+_get_ssp	feature outside Tier R: shstk
+_hreset	feature outside Tier R: hreset
+_inc_ssp	feature outside Tier R: shstk
+_incsspd	feature outside Tier R: shstk
+_incsspq	feature outside Tier R: shstk
+_invpcid	feature outside Tier R: invpcid
+_loadbe_i16	feature outside Tier R: movbe
+_loadbe_i32	feature outside Tier R: movbe
+_loadbe_i64	feature outside Tier R: movbe
+_lzcnt_u32	no target feature: generic helper, not a SIMD intrinsic
+_lzcnt_u64	no target feature: generic helper, not a SIMD intrinsic
+_m_prefetchit0	feature outside Tier R: prefetchi
+_m_prefetchit1	feature outside Tier R: prefetchi
+_m_prefetchrs	feature outside Tier R: movrs
+_mm128_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm128_mask_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm128_maskz_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm256_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm256_bmacor16x16x16	feature outside Tier R: avx512bmm
+_mm256_bmacxor16x16x16	feature outside Tier R: avx512bmm
+_mm256_loadrs_epi16	feature outside Tier R: movrs
+_mm256_loadrs_epi32	feature outside Tier R: movrs
+_mm256_loadrs_epi64	feature outside Tier R: movrs
+_mm256_loadrs_epi8	feature outside Tier R: movrs
+_mm256_mask_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm256_mask_loadrs_epi16	feature outside Tier R: movrs
+_mm256_mask_loadrs_epi32	feature outside Tier R: movrs
+_mm256_mask_loadrs_epi64	feature outside Tier R: movrs
+_mm256_mask_loadrs_epi8	feature outside Tier R: movrs
+_mm256_maskz_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm256_maskz_loadrs_epi16	feature outside Tier R: movrs
+_mm256_maskz_loadrs_epi32	feature outside Tier R: movrs
+_mm256_maskz_loadrs_epi64	feature outside Tier R: movrs
+_mm256_maskz_loadrs_epi8	feature outside Tier R: movrs
+_mm512_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm512_bmacor16x16x16	feature outside Tier R: avx512bmm
+_mm512_bmacxor16x16x16	feature outside Tier R: avx512bmm
+_mm512_i32logather_epi64	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_i32logather_pd	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_i32loscatter_epi64	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_i32loscatter_pd	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_loadrs_epi16	feature outside Tier R: movrs
+_mm512_loadrs_epi32	feature outside Tier R: movrs
+_mm512_loadrs_epi64	feature outside Tier R: movrs
+_mm512_loadrs_epi8	feature outside Tier R: movrs
+_mm512_mask_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm512_mask_i32logather_epi64	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_mask_i32logather_pd	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_mask_i32loscatter_epi64	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_mask_i32loscatter_pd	macro: does not compile with the parameter types read from its casts: no matching function for call to '_mm512_castsi512_si256'
+_mm512_mask_loadrs_epi16	feature outside Tier R: movrs
+_mm512_mask_loadrs_epi32	feature outside Tier R: movrs
+_mm512_mask_loadrs_epi64	feature outside Tier R: movrs
+_mm512_mask_loadrs_epi8	feature outside Tier R: movrs
+_mm512_maskz_bitrev_epi8	feature outside Tier R: avx512bmm
+_mm512_maskz_loadrs_epi16	feature outside Tier R: movrs
+_mm512_maskz_loadrs_epi32	feature outside Tier R: movrs
+_mm512_maskz_loadrs_epi64	feature outside Tier R: movrs
+_mm512_maskz_loadrs_epi8	feature outside Tier R: movrs
+_mm512_reduce_max_ph	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: 0x563de89fe670: v8f16 = pseudo_fmax nnan 0x563de8b39780, 0x563de8b39a20
+_mm512_reduce_min_ph	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: 0x556896c03e30: v8f16 = pseudo_fmin nnan 0x556896c0bcb0, 0x556896c0bf50
+_mm_aesdec128kl_u8	feature outside Tier R: kl
+_mm_aesdec256kl_u8	feature outside Tier R: kl
+_mm_aesdecwide128kl_u8	feature outside Tier R: kl,widekl
+_mm_aesdecwide256kl_u8	feature outside Tier R: kl,widekl
+_mm_aesenc128kl_u8	feature outside Tier R: kl
+_mm_aesenc256kl_u8	feature outside Tier R: kl
+_mm_aesencwide128kl_u8	feature outside Tier R: kl,widekl
+_mm_aesencwide256kl_u8	feature outside Tier R: kl,widekl
+_mm_cldemote	feature outside Tier R: cldemote
+_mm_clflush	does not compile: expected unqualified-id
+_mm_clflushopt	feature outside Tier R: clflushopt
+_mm_clwb	feature outside Tier R: clwb
+_mm_empty	feature outside Tier R: mmx
+_mm_encodekey128_u32	feature outside Tier R: kl
+_mm_encodekey256_u32	feature outside Tier R: kl
+_mm_getcsr	does not compile: expected unqualified-id
+_mm_insert_ps	macro: does not compile with the parameter types read from its casts: cannot initialize a parameter of type '__attribute__((__vector_size__(4 * sizeof(float)))) float' (vector of 4 'float' values) with an rvalue of type 'int'
+_mm_lfence	does not compile: expected unqualified-id
+_mm_loadiwkey	feature outside Tier R: kl
+_mm_loadrs_epi16	feature outside Tier R: movrs
+_mm_loadrs_epi32	feature outside Tier R: movrs
+_mm_loadrs_epi64	feature outside Tier R: movrs
+_mm_loadrs_epi8	feature outside Tier R: movrs
+_mm_mask3_fmsub_round_sd	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512.vfmadd.f64
+_mm_mask3_fmsub_round_sh	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512fp16.vfmadd.f16
+_mm_mask3_fmsub_round_ss	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512.vfmadd.f32
+_mm_mask3_fnmsub_round_sd	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512.vfmadd.f64
+_mm_mask3_fnmsub_round_sh	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512fp16.vfmadd.f16
+_mm_mask3_fnmsub_round_ss	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512.vfmadd.f32
+_mm_mask_loadrs_epi16	feature outside Tier R: movrs
+_mm_mask_loadrs_epi32	feature outside Tier R: movrs
+_mm_mask_loadrs_epi64	feature outside Tier R: movrs
+_mm_mask_loadrs_epi8	feature outside Tier R: movrs
+_mm_maskz_fcmadd_round_sch	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512fp16.maskz.vfcmadd.csh
+_mm_maskz_fmadd_round_sch	does not compile: compiler crash or unattributable error: fatal error: error in backend: Cannot select: intrinsic %llvm.x86.avx512fp16.maskz.vfmadd.csh
+_mm_maskz_loadrs_epi16	feature outside Tier R: movrs
+_mm_maskz_loadrs_epi32	feature outside Tier R: movrs
+_mm_maskz_loadrs_epi64	feature outside Tier R: movrs
+_mm_maskz_loadrs_epi8	feature outside Tier R: movrs
+_mm_mfence	does not compile: expected unqualified-id
+_mm_pause	does not compile: expected unqualified-id
+_mm_setcsr	does not compile: expected unqualified-id
+_mm_sfence	does not compile: expected unqualified-id
+_movdir64b	feature outside Tier R: movdir64b
+_movrs_i16	feature outside Tier R: movrs
+_movrs_i32	feature outside Tier R: movrs
+_movrs_i64	feature outside Tier R: movrs
+_movrs_i8	feature outside Tier R: movrs
+_pconfig_u32	feature outside Tier R: pconfig
+_ptwrite32	feature outside Tier R: ptwrite
+_ptwrite64	feature outside Tier R: ptwrite
+_rdpid_u32	feature outside Tier R: rdpid
+_rdpkru_u32	feature outside Tier R: pku
+_rdrand16_step	feature outside Tier R: rdrnd
+_rdrand32_step	feature outside Tier R: rdrnd
+_rdrand64_step	feature outside Tier R: rdrnd
+_rdseed16_step	feature outside Tier R: rdseed
+_rdseed32_step	feature outside Tier R: rdseed
+_rdseed64_step	feature outside Tier R: rdseed
+_rdsspd	feature outside Tier R: shstk
+_rdsspd_i32	feature outside Tier R: shstk
+_rdsspq	feature outside Tier R: shstk
+_rdsspq_i64	feature outside Tier R: shstk
+_readfsbase_u32	feature outside Tier R: fsgsbase
+_readfsbase_u64	feature outside Tier R: fsgsbase
+_readgsbase_u32	feature outside Tier R: fsgsbase
+_readgsbase_u64	feature outside Tier R: fsgsbase
+_rstorssp	feature outside Tier R: shstk
+_saveprevssp	feature outside Tier R: shstk
+_senduipi	feature outside Tier R: uintr
+_serialize	feature outside Tier R: serialize
+_setssbsy	feature outside Tier R: shstk
+_storebe_i16	feature outside Tier R: movbe
+_storebe_i32	feature outside Tier R: movbe
+_storebe_i64	feature outside Tier R: movbe
+_stui	feature outside Tier R: uintr
+_subborrow_u32	no target feature: generic helper, not a SIMD intrinsic
+_subborrow_u64	no target feature: generic helper, not a SIMD intrinsic
+_testui	feature outside Tier R: uintr
+_tile_loaddrs	feature outside Tier R: amx-movrs
+_tile_loaddrs_internal	feature outside Tier R: amx-movrs
+_tile_loaddrst1_internal	feature outside Tier R: amx-movrs
+_tile_stream_loaddrs	feature outside Tier R: amx-movrs
+_tpause	feature outside Tier R: waitpkg
+_umonitor	feature outside Tier R: waitpkg
+_umwait	feature outside Tier R: waitpkg
+_urdmsr	feature outside Tier R: usermsr
+_uwrmsr	feature outside Tier R: usermsr
+_wbnoinvd	feature outside Tier R: wbnoinvd
+_writefsbase_u32	feature outside Tier R: fsgsbase
+_writefsbase_u64	feature outside Tier R: fsgsbase
+_writegsbase_u32	feature outside Tier R: fsgsbase
+_writegsbase_u64	feature outside Tier R: fsgsbase
+_wrpkru	feature outside Tier R: pku
+_wrssd	feature outside Tier R: shstk
+_wrssq	feature outside Tier R: shstk
+_wrussd	feature outside Tier R: shstk
+_wrussq	feature outside Tier R: shstk
+_xabort	feature outside Tier R: rtm
+_xbegin	feature outside Tier R: rtm
+_xend	feature outside Tier R: rtm
+_xgetbv	feature outside Tier R: xsave
+_xresldtrk	feature outside Tier R: tsxldtrk
+_xrstor	feature outside Tier R: xsave
+_xrstor64	feature outside Tier R: xsave
+_xrstors	feature outside Tier R: xsaves
+_xrstors64	feature outside Tier R: xsaves
+_xsave	feature outside Tier R: xsave
+_xsave64	feature outside Tier R: xsave
+_xsavec	feature outside Tier R: xsavec
+_xsavec64	feature outside Tier R: xsavec
+_xsaveopt	feature outside Tier R: xsaveopt
+_xsaveopt64	feature outside Tier R: xsaveopt
+_xsaves	feature outside Tier R: xsaves
+_xsaves64	feature outside Tier R: xsaves
+_xsetbv	feature outside Tier R: xsave
+_xsusldtrk	feature outside Tier R: tsxldtrk
+_xtest	feature outside Tier R: rtm

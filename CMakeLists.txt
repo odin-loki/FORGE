@@ -115,14 +115,25 @@ add_custom_command(
 add_custom_target(forge_ops_gen DEPENDS ${FORGE_GEN_DIR}/forge/ops/ops.gen.hpp)
 
 # ---- Tier R: raw intrinsic wrappers generated from ops/intrinsics ----
-add_custom_command(
-  OUTPUT ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp
-  COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/intrin_gen.py
-          --db ${PROJECT_SOURCE_DIR}/ops/intrinsics/x86.json
-          --out ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp
-  DEPENDS ${PROJECT_SOURCE_DIR}/ops/intrinsics/x86.json ${PROJECT_SOURCE_DIR}/ops/gen/intrin_gen.py
-  COMMENT "Generating simd Tier R (x86)")
-add_custom_target(forge_raw_gen DEPENDS ${FORGE_GEN_DIR}/forge/simd/raw/x86.gen.hpp)
+# One header per ISA, every one includable (and empty) on every platform; forge/simd/raw.hpp picks the
+# target's. riscv_policy holds the RVV tail/mask policy variants (opt-in, not included by raw.hpp).
+set(FORGE_RAW_ISAS x86 arm riscv riscv_policy loongarch ppc wasm s390x mips)
+set(FORGE_RAW_HEADERS)
+foreach(isa ${FORGE_RAW_ISAS})
+  set(_count intrinsic_count)
+  if(isa STREQUAL "riscv_policy")
+    set(_count policy_intrinsic_count)
+  endif()
+  add_custom_command(
+    OUTPUT ${FORGE_GEN_DIR}/forge/simd/raw/${isa}.gen.hpp
+    COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/ops/gen/intrin_gen.py
+            --db ${PROJECT_SOURCE_DIR}/ops/intrinsics/${isa}.json
+            --out ${FORGE_GEN_DIR}/forge/simd/raw/${isa}.gen.hpp --count-name ${_count}
+    DEPENDS ${PROJECT_SOURCE_DIR}/ops/intrinsics/${isa}.json ${PROJECT_SOURCE_DIR}/ops/gen/intrin_gen.py
+    COMMENT "Generating simd Tier R (${isa})")
+  list(APPEND FORGE_RAW_HEADERS ${FORGE_GEN_DIR}/forge/simd/raw/${isa}.gen.hpp)
+endforeach()
+add_custom_target(forge_raw_gen DEPENDS ${FORGE_RAW_HEADERS})
 
 add_library(forge_core INTERFACE)
 target_include_directories(forge_core INTERFACE core/include)
@@ -658,7 +669,56 @@ if(FORGE_BUILD_TESTS)
   set(FORGE_TEST_SHELL_PATH "${_shells_default}" CACHE STRING "Extra PATH entries for shell backend tests")
   foreach(t ${FORGE_TESTS})
     get_filename_component(n ${t} NAME_WE)
-    if(n STREQUAL "test_simd_raw" AND NOT FORGE_ARCH STREQUAL "x86_64")
+    if(n STREQUAL "test_simd_raw")   # Tier R: header-only, so it builds (and cross-runs) without the libraries
+      add_executable(${n} ${t})
+      target_link_libraries(${n} PRIVATE forge_simd)
+      if(FORGE_ARCH STREQUAL "x86_64")   # x86 asks simd::detect() (CPUID + XGETBV) before executing AVX2 code
+        target_link_libraries(${n} PRIVATE forge_simd_mv)
+      endif()
+      target_include_directories(${n} PRIVATE tests)
+      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(${n} PROPERTIES SKIP_RETURN_CODE 77)
+      # The wrappers of an optional ISA only exist in a translation unit compiled for it; the test checks
+      # the CPU before it runs any (and x86 never executes past what CPUID reports).
+      set(_raw_flags)
+      set(_raw_variant)
+      if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+          set(_raw_flags /arch:AVX2)
+        endif()
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64" OR (APPLE AND CMAKE_OSX_ARCHITECTURES STREQUAL "arm64"))
+        set(_raw_variant sve "-march=armv8.2-a+sve")
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
+        set(_raw_variant rvv "-march=rv64gcv")
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "loongarch64")
+        set(_raw_variant lsx "-mlsx")
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "s390x")
+        set(_raw_variant zvector "-march=z13;-mzvector")
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "mips64")
+        set(_raw_variant msa "-mmsa")
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc64")
+        set(_raw_flags -maltivec -mvsx)
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "wasm")
+        set(_raw_flags -msimd128)
+      elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64|amd64")
+        set(_raw_flags -mavx2 -mfma -mf16c)
+      endif()
+      target_compile_options(${n} PRIVATE ${_raw_flags})
+      if(_raw_variant)   # second build of the same test for the ISA the default flags leave off
+        list(GET _raw_variant 0 _rv_name)
+        list(GET _raw_variant 1 _rv_flags)
+        include(CheckCXXCompilerFlag)
+        string(REPLACE ";" " " _rv_flag_str "${_rv_flags}")
+        check_cxx_compiler_flag("${_rv_flag_str}" FORGE_RAW_TEST_${_rv_name})
+        if(FORGE_RAW_TEST_${_rv_name})
+          add_executable(${n}_${_rv_name} ${t})
+          target_link_libraries(${n}_${_rv_name} PRIVATE forge_simd)
+          target_include_directories(${n}_${_rv_name} PRIVATE tests)
+          target_compile_options(${n}_${_rv_name} PRIVATE ${_rv_flags})
+          add_test(NAME ${n}_${_rv_name} COMMAND ${n}_${_rv_name} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+          set_tests_properties(${n}_${_rv_name} PROPERTIES SKIP_RETURN_CODE 77)
+        endif()
+      endif()
       continue()
     endif()
     if(n MATCHES "^test_(text|locale)")   # only needs forge_text
@@ -725,13 +785,6 @@ if(FORGE_BUILD_TESTS)
       target_include_directories(${n} PRIVATE script/src)
     endif()
     target_include_directories(${n} PRIVATE tests)
-    if(n STREQUAL "test_simd_raw")
-      if(MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-        target_compile_options(${n} PRIVATE /arch:AVX2)
-      else()
-        target_compile_options(${n} PRIVATE -mavx2 -mfma -mf16c)
-      endif()
-    endif()
     add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     if(n MATCHES "^test_script" AND FORGE_TEST_SHELL_PATH)
       set_tests_properties(${n} PROPERTIES ENVIRONMENT "FORGE_TEST_SHELL_PATH=${FORGE_TEST_SHELL_PATH}")
@@ -750,6 +803,13 @@ if(FORGE_BUILD_TESTS)
   endif()
   set_tests_properties(test_log PROPERTIES SKIP_RETURN_CODE 77)   # skips when built with FORGE_LOG_MIN_LEVEL
   add_test(NAME log_min_level_cmake COMMAND ${CMAKE_COMMAND} -P ${PROJECT_SOURCE_DIR}/tests/log_min_level.cmake)
+  # Tier R: every generated wrapper of every architecture, compiled against the real target headers with
+  # clang's cross targets (no foreign sysroot needed). Skipped (77) when that clang is not installed.
+  set(FORGE_RAW_CHECK_CLANG "clang++-23" CACHE STRING "clang++ (23 or newer, all targets) for the Tier R cross syntax check")
+  add_test(NAME raw_intrinsics_cross
+           COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_raw_intrinsics.py
+                   --clang ${FORGE_RAW_CHECK_CLANG} --out ${PROJECT_BINARY_DIR}/raw_check)
+  set_tests_properties(raw_intrinsics_cross PROPERTIES SKIP_RETURN_CODE 77 LABELS "raw_cross" TIMEOUT 3600)
   # Scalable vectors at many lengths under qemu: the sve/rvv lane must be active at every VL, including the
   # ones without a power-of-two table (lowered at load time) and ones above 1024 bits.
   if(CMAKE_CROSSCOMPILING AND CMAKE_CROSSCOMPILING_EMULATOR)

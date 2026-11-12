@@ -1,0 +1,51 @@
+# Candidates left out of ppc.json by its build script, with the reason.
+#     14  deprecated overload
+#     46  type-generic or alias macro without a typed declaration
+vec_cipher_be	type-generic or alias macro without a typed declaration
+vec_cipherlast_be	type-generic or alias macro without a typed declaration
+vec_cntm	type-generic or alias macro without a typed declaration
+vec_ctd	type-generic or alias macro without a typed declaration
+vec_ctf	type-generic or alias macro without a typed declaration
+vec_cts	type-generic or alias macro without a typed declaration
+vec_ctsl	type-generic or alias macro without a typed declaration
+vec_ctu	type-generic or alias macro without a typed declaration
+vec_ctul	type-generic or alias macro without a typed declaration
+vec_dss	type-generic or alias macro without a typed declaration
+vec_dst	type-generic or alias macro without a typed declaration
+vec_dstst	type-generic or alias macro without a typed declaration
+vec_dststt	type-generic or alias macro without a typed declaration
+vec_dstt	type-generic or alias macro without a typed declaration
+vec_extract4b	type-generic or alias macro without a typed declaration
+vec_gb	type-generic or alias macro without a typed declaration
+vec_genpcvm	type-generic or alias macro without a typed declaration
+vec_gnb	type-generic or alias macro without a typed declaration
+vec_insert4b	type-generic or alias macro without a typed declaration
+vec_lvsl	deprecated overload
+vec_lvsr	deprecated overload
+vec_ncipher_be	type-generic or alias macro without a typed declaration
+vec_ncipherlast_be	type-generic or alias macro without a typed declaration
+vec_permi	type-generic or alias macro without a typed declaration
+vec_permx	type-generic or alias macro without a typed declaration
+vec_pmsum_be	type-generic or alias macro without a typed declaration
+vec_replace_elt	type-generic or alias macro without a typed declaration
+vec_replace_unaligned	type-generic or alias macro without a typed declaration
+vec_sbox_be	type-generic or alias macro without a typed declaration
+vec_shasigma_be	type-generic or alias macro without a typed declaration
+vec_sldb	type-generic or alias macro without a typed declaration
+vec_splati	type-generic or alias macro without a typed declaration
+vec_srdb	type-generic or alias macro without a typed declaration
+vec_ternarylogic	type-generic or alias macro without a typed declaration
+vec_test_data_class	type-generic or alias macro without a typed declaration
+vec_vcfsx	type-generic or alias macro without a typed declaration
+vec_vcfux	type-generic or alias macro without a typed declaration
+vec_vclz	type-generic or alias macro without a typed declaration
+vec_vctsxs	type-generic or alias macro without a typed declaration
+vec_vctuxs	type-generic or alias macro without a typed declaration
+vec_vupkhpx	type-generic or alias macro without a typed declaration
+vec_vupklpx	type-generic or alias macro without a typed declaration
+vec_xld2	type-generic or alias macro without a typed declaration
+vec_xlw4	type-generic or alias macro without a typed declaration
+vec_xstd2	type-generic or alias macro without a typed declaration
+vec_xstw4	type-generic or alias macro without a typed declaration
+vec_xxpermdi	type-generic or alias macro without a typed declaration
+vec_xxsldwi	type-generic or alias macro without a typed declaration

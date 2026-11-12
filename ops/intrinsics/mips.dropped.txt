@@ -1,0 +1,8 @@
+# Candidates left out of mips.json by its build script, with the reason.
+#      6  argument count not found
+__msa_cast_to_scalar_double	argument count not found: use of undeclared identifier '__builtin_msa_cast_to_scalar_double'
+__msa_cast_to_scalar_float	argument count not found: use of undeclared identifier '__builtin_msa_cast_to_scalar_float'
+__msa_cast_to_vector_double	argument count not found: use of undeclared identifier '__builtin_msa_cast_to_vector_double'
+__msa_cast_to_vector_float	argument count not found: use of undeclared identifier '__builtin_msa_cast_to_vector_float'
+__msa_ldr_w	argument count not found: use of undeclared identifier '__builtin_msa_ldrq_w'
+__msa_str_w	argument count not found: use of undeclared identifier '__builtin_msa_strq_w'

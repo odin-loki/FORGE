@@ -1,0 +1,1 @@
+# Candidates left out of loongarch.json by its build script, with the reason.

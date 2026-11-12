@@ -9,7 +9,7 @@ Kernels are written once and compiled per target:
 |-------|--------|----------|
 | Tier P | `vec.hpp` | Portable fixed-width vectors and masks over native registers |
 | Tier A | `algo.hpp`, `qdot.hpp` | Algorithms written against Tier P (dot, softmax, GEMM, quantised-row decode and dot, …) |
-| Tier R | `forge/simd/raw/x86.gen.hpp` (generated) | Raw x86 intrinsic wrappers from `ops/intrinsics/x86.json` (`ops/gen/intrin_gen.py`). Each wrapper requires its CPU feature, so using one the target lacks is a compile error |
+| Tier R | `raw.hpp`, `forge/simd/raw/<isa>.gen.hpp` (generated) | Raw intrinsic wrappers for every architecture, generated from `ops/intrinsics/<isa>.json` by `ops/gen/intrin_gen.py`. Each wrapper requires its CPU feature, so using one the target lacks is a compile error. See [Tier R](#tier-r-raw-intrinsics) |
 | Capabilities | `caps.hpp` | Feature tags; a target is a set of features |
 | Maths | `math.hpp`, `math_coeffs.hpp` | Vectorised libm. The erf/erfc/lgamma coefficients come from `ops/gen/fit_math.py` (run by hand; the output is checked in) |
 
@@ -35,6 +35,49 @@ Matrix tile units are separate (`tile.hpp`, namespace `forge::simd::tile`). They
 | `sme_gemm_f32` | Arm SME | f32 outer products, same class as `gemm_nt` |
 
 `amx_available()`, `sme_available()` and `sme_vl_bytes()` report the units.
+
+## Tier R: raw intrinsics
+`forge/simd/raw/<isa>.gen.hpp` wraps the compiler's intrinsics one to one: 103,666 wrappers across eight ISA families. A wrapper has the intrinsic's exact signature, is a template over a Target, and requires the feature tags its intrinsic needs:
+
+```cpp
+#include <forge/simd/raw.hpp>                        // the current architecture's header; opt-in, nothing else includes it
+namespace r = forge::simd::raw::native;              // raw::x86, raw::arm, raw::riscv, raw::loongarch, raw::ppc, raw::wasm, raw::s390x, raw::mips
+
+__m256i s = r::avx2::mm256_add_epi32<x86_64_v3>(a, b);            // ok: x86_64_v3 has avx2
+__m512  t = r::avx512f::mm512_add_ps<x86_64_v3>(x, y);            // does not compile: x86_64_v3 lacks avx512f
+__m256i u = r::avx2::mm256_shuffle_epi32<0x1b, x86_64_v3>(a);     // immediates are template arguments
+svfloat32_t v = r::sve::add_f32_x<neoverse2>(pg, p, q);           // sizeless types pass through
+auto w = r::rvv::vadd_vv_i32m1<rvv1>(p, q, vl);
+```
+
+- **Names.** The namespace is the feature (the most specific one when an intrinsic needs several: `_mm256_mask_add_epi8` is `raw::x86::avx512bw::mm256_mask_add_epi8` and requires `avx512bw` and `avx512vl`). The wrapper drops the intrinsic's prefix (`_mm_` → `mm_`, `vaddq_f32` → `addq_f32`, `svadd_f32_x` → `add_f32_x`, `__riscv_vadd_vv_i32m1` → `vadd_vv_i32m1`, `__lsx_vadd_w` → `vadd_w`, `wasm_i32x4_add` → `i32x4_add`, `__msa_addv_w` → `addv_w`, `vec_add` → `v_add`), so it never collides with a compiler that defines the intrinsic as a macro. Overloaded intrinsics (SVE short forms, AltiVec and z/Vector `vec_*`) are overload sets with concrete types.
+- **Gating.** `requires Has<T, tag>` per feature. SSE/SSE2 need `sse2`; SSE3, SSSE3, SSE4.1, SSE4.2 and CRC32 need `sse4_2`. Tags that only Tier R uses are the `FORGE_RAW_FEATURES` list in `caps.hpp`. The wrappers are `always_inline` and carry no target attribute: as with the intrinsic itself, the calling code must be compiled for the feature (`-m…` flags or a target attribute).
+- **Optional ISAs.** SVE, SME, RVV, LSX/LASX, AltiVec/VSX, z/Vector, MSA and SIMD128 types can only be named in a translation unit compiled for that ISA, so those parts of a header exist only when the compiler's macro (`__ARM_FEATURE_SVE`, `__riscv_vector`, `__loongarch_sx`, `__VSX__`, `__VEC__`, `__mips_msa`, `__wasm_simd128__`, …) is defined. Every header is includable on every platform and is empty off its architecture.
+- **Arm streaming mode.** SME wrappers carry the keyword attributes their intrinsic needs (`__arm_streaming`, `__arm_streaming_compatible`, `__arm_inout("za")`, `__arm_inout("zt0")`). SVE wrappers whose intrinsic is streaming-compatible are marked `__arm_streaming_compatible` when the translation unit has SME enabled, so they stay callable from streaming functions.
+- **Compilers.** The databases are derived from clang 23. An intrinsic that GCC 13 or the older clang the database was tried with (`checked_with` in the JSON) rejects is guarded (`FORGE_RAW_CLANG`, `FORGE_RAW_CLANG_GE(23)` in `forge/simd/raw/config.hpp`), not removed. Not verified in this repository: MSVC (x64 gets the wrappers of the long-standing feature sets whose signatures GCC also accepts, ARM64 the baseline NEON ones), Apple clang, GCC 14+ for the entries GCC 13 lacks (they stay clang-only), GCC for LoongArch, MIPS and WebAssembly.
+- **`compiled_t`** (`caps.hpp`) is the Target of the features the translation unit is compiled for, from the predefined macros: `r::avx2::mm256_add_epi32<compiled_t>(a, b)` compiles exactly when the file is built with AVX2.
+
+| Architecture | Database | Intrinsics | Size | Namespace | Feature namespaces (most used first) | Regenerate with | Derived from |
+|---|---|---|---|---|---|---|---|
+| x86-64 | `x86.json` | 7,136 | 1.0 MB | `raw::x86` | `avx512f`, `avx512vl`, `avx512fp16`, `avx512bw`, `avx10_2`, `sse2`, `avx512dq`, `avx2`, `avx`, `avx512vbmi2`, `sse4_2`, `avx512cd`, `avx512bf16`, `avx512vnni`, `fma` (tag `fma3`), `avx512vbmi`, `gfni`, `avx512bitalg`, `amx_avx512`, `avx512vpopcntdq`, `avx512ifma`, `bmi1`, `avxneconvert`, `amx_tile`, `amx_int8`, `amx_fp8`, `avxvnniint8`, `avxvnniint16`, `bmi2`, `avxvnni`, `vaes`, `shani`, `aesni`, `f16c`, `amx_complex`, `avx512vp2intersect`, `sm4`, `avxifma`, `sha512`, `sm3`, `amx_bf16`, `amx_fp16`, `popcnt`, `vpclmulqdq`, `pclmulqdq` | `build_x86_db.py` | `immintrin.h` |
+| AArch64 (NEON subset also ARMv7) | `arm.json` | 22,766 | 3.0 MB | `raw::arm` | `sve`, `neon`, `sve2`, `sve2p1`, `sme2`, `sme`, `sme_mop4`, `sve2p3`, `fp16` (tag `arm_fp16`), `f64mm` (tag `arm_f64mm`), `sme_i16i64`, `sve_b16b16`, `sme2p1`, `sve2p2`, `faminmax` (tag `arm_faminmax`), `fp8` (tag `arm_fp8`), `lut` (tag `arm_lut`), `fp8fma` (tag `arm_fp8fma`), `sme_lutv2`, `bf16` (tag `arm_bf16`), `sve_bitperm`, `sme_f16f16`, `rdm` (tag `arm_rdm`), `sme_b16b16`, `sme_f64f64`, `complex` (tag `arm_complex`), `sme_f8f32`, `sme_f8f16`, `i8mm`, `sve_bfscale`, `sme_tmop`, `fp16fml` (tag `arm_fp16fml`), `frintts` (tag `arm_frintts`), `sme2p2`, `sve_aes2`, `sha3` (tag `arm_sha3`), `sme2p3`, `rcpc3` (tag `arm_rcpc3`), `sve_aes`, `dotprod`, `fp8dot2` (tag `arm_fp8dot2`), `fp8dot4` (tag `arm_fp8dot4`), `sha2` (tag `arm_sha2`), `sm4` (tag `arm_sm4`), `crc` (tag `arm_crc`), `aes` (tag `arm_aes`), `f16f32dot` (tag `arm_f16f32dot`), `sve_sha3`, `sve_sm4`, `f8f16mm` (tag `arm_f8f16mm`), `f8f32mm` (tag `arm_f8f32mm`), `f32mm` (tag `arm_f32mm`), `sve_b16mm`, `sve_f16f32mm`, `f16f32mm` (tag `arm_f16f32mm`), `f16mm` (tag `arm_f16mm`) | `build_arm_db.py` | `arm_neon.h`, `arm_acle.h`, `arm_sve.h`, `arm_neon_sve_bridge.h`, `arm_sme.h` |
+| RISC-V | `riscv.json` | 29,329 | 4.1 MB | `raw::riscv` | `rvv`, `zvfh`, `zvfbfmin`, `zvfhmin`, `zvkb`, `zvbb`, `zvkned`, `zvl256b`, `zvfbfwma`, `zvbc`, `zvksed`, `zbb`, `zvknha`, `zvkg`, `zvknhb`, `zknh`, `zvksh`, `zbc`, `zknd`, `zbkb`, `zbkx`, `zkne`, `zksh`, `zvl512b` | `build_riscv_db.py` | rvv-intrinsic-doc prototype lists, `riscv_bitmanip.h`, `riscv_crypto.h` |
+| RISC-V (`_tu`/`_tum`/`_tumu`/`_mu` variants) | `riscv_policy.json` | 37,510 | 5.9 MB | `raw::riscv` | `rvv`, `zvfh`, `zvfbfmin`, `zvfhmin`, `zvkb`, `zvbb`, `zvfbfwma`, `zvkned`, `zvbc`, `zvl256b`, `zvksed`, `zvknha`, `zvkg`, `zvknhb`, `zvksh`, `zvl512b` | `build_riscv_db.py` | rvv-intrinsic-doc prototype lists |
+| LoongArch | `loongarch.json` | 1,470 | 145 KB | `raw::loongarch` | `lasx`, `lsx` | `build_misc_db.py loongarch` | `lsxintrin.h`, `lasxintrin.h` |
+| PowerPC | `ppc.json` | 2,739 | 342 KB | `raw::ppc` | `altivec`, `vsx`, `power8_vector`, `power10_vector`, `power9_vector` | `build_misc_db.py ppc` | `altivec.h` |
+| WebAssembly | `wasm.json` | 328 | 35 KB | `raw::wasm` | `simd128` (tag `wasm_simd128`), `fp16` (tag `wasm_fp16`), `relaxed_simd` (tag `wasm_relaxed_simd`) | `build_misc_db.py wasm` | `wasm_simd128.h` |
+| s390x | `s390x.json` | 1,857 | 247 KB | `raw::s390x` | `zvector`, `zvector_e1`, `zvector_e3`, `zvector_e2` | `build_misc_db.py s390x` | `vecintrin.h` |
+| MIPS | `mips.json` | 531 | 48 KB | `raw::mips` | `msa` | `build_misc_db.py mips` | `msa.h` |
+
+The databases and their build scripts are in `ops/intrinsics/` ([ops/README.md](../ops/README.md#intrinsic-databases)); each `<isa>.dropped.txt` lists what was left out and why. Coverage notes:
+- x86: MMX, 3DNow!, XOP/FMA4/TBM and system instructions (XSAVE, RTM, key locker, CET, …) are outside Tier R. AVX10.2 intrinsics are tagged `avx10_2`; AVX10.1 has no intrinsics of its own (it is the AVX-512 set).
+- RISC-V: the explicit (non-overloaded) v1.0 API. The policy variants are a second header, `forge/simd/raw/riscv_policy.gen.hpp` (same namespaces, `policy_intrinsic_count`), which `raw.hpp` does not include.
+- PowerPC: every typed overload in `altivec.h`; the type-generic `_Generic` macros (`vec_ctf`, `vec_cts`, …) have no declaration to wrap and are listed in `ppc.dropped.txt`.
+
+Checks:
+- `test_simd_raw` (every architecture; a second build for the optional ISA where the default flags leave it off: `test_simd_raw_sve`, `_rvv`, `_lsx`, `_zvector`, `_msa`) runs a sample of wrappers and asserts the gating at compile time: a wrapper call is well-formed for a Target with the feature and ill-formed without it.
+- ctest `raw_intrinsics_cross` (label `raw_cross`; `tools/check_raw_intrinsics.py`) instantiates every wrapper of every architecture and compiles it with `clang++-23 --target=<triple> … -fsyntax-only -ffreestanding -nostdinc++` against the real target headers, in several feature configurations per architecture (all features, baseline, in between), plus one translation unit that includes every header for every target. It is skipped when that clang is not installed (`-DFORGE_RAW_CHECK_CLANG=` to name another).
+<!-- end Tier R -->
 
 ## API (`simd/include/forge/simd/dispatch.hpp`)
 

@@ -182,6 +182,39 @@ static cpu_features do_detect() {
     f.rvv = getauxval(AT_HWCAP) & (1ul << ('V' - 'A'));
     if (f.rvv) f.rvv_bytes = rvv_vlenb();
 #endif
+// ---- architectures without kernel tables of their own: feature bits for Tier R / the capability report ----
+#elif defined(__loongarch__)
+    f.vendor = "loongarch64";
+#if defined(__linux__)
+    { unsigned long hw = getauxval(AT_HWCAP); f.lsx = hw & (1ul << 4); f.lasx = hw & (1ul << 5); }   // HWCAP_LOONGARCH_LSX / _LASX
+#endif
+#elif defined(__powerpc64__) || defined(__powerpc__)
+    f.vendor = "powerpc";
+#if defined(__linux__)
+    { unsigned long hw = getauxval(AT_HWCAP), hw2 = getauxval(AT_HWCAP2);
+      f.altivec = hw & 0x10000000ul; f.vsx = hw & 0x00000080ul;                 // PPC_FEATURE_HAS_ALTIVEC / _HAS_VSX
+      f.power8 = f.vsx && (hw2 & 0x80000000ul);                                 // PPC_FEATURE2_ARCH_2_07
+      f.power9 = f.power8 && (hw2 & 0x00800000ul);                              // PPC_FEATURE2_ARCH_3_00
+      f.power10 = f.power9 && (hw2 & 0x00040000ul); }                           // PPC_FEATURE2_ARCH_3_1
+#endif
+#elif defined(__s390x__)
+    f.vendor = "s390x";
+#if defined(__linux__)
+    { unsigned long hw = getauxval(AT_HWCAP);
+      f.zvector = hw & (1ul << 11);                                             // HWCAP_S390_VXRS (the kernel enables the vector registers)
+      f.zvector_e1 = f.zvector && (hw & (1ul << 13));                           // HWCAP_S390_VXRS_EXT
+      f.zvector_e2 = f.zvector_e1 && (hw & (1ul << 15)); }                      // HWCAP_S390_VXRS_EXT2
+#endif
+#elif defined(__mips__)
+    f.vendor = "mips";
+#if defined(__linux__)
+    f.msa = getauxval(AT_HWCAP) & (1ul << 1);                                   // HWCAP_MIPS_MSA
+#endif
+#elif defined(__wasm__)
+    f.vendor = "wasm";
+#if defined(__wasm_simd128__)
+    f.wasm_simd128 = true;   // no run-time detection in WebAssembly: a module that uses SIMD does not validate without it
+#endif
 #endif
     return f;
 }
@@ -199,6 +232,9 @@ std::string cpu_features::summary() const {
     add(sve, "sve"); add(sve2, "sve2"); if (sve_bytes) s += std::format("(vl={}b)", sve_bytes * 8);
     if (sve_hw_bytes && sve_hw_bytes != sve_bytes) s += std::format("(hw vl={}b, lowered)", sve_hw_bytes * 8);
     add(rvv, "rvv"); if (rvv_bytes) s += std::format("(vlen={}b)", rvv_bytes * 8);
+    add(lsx, "lsx"); add(lasx, "lasx"); add(altivec, "altivec"); add(vsx, "vsx"); add(power8, "power8"); add(power9, "power9");
+    add(power10, "power10"); add(zvector, "zvector"); add(zvector_e1, "vxe"); add(zvector_e2, "vxe2"); add(msa, "msa");
+    add(wasm_simd128, "simd128");
     return s;
 }
 
