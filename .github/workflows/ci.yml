@@ -71,12 +71,12 @@ jobs:
     # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
     # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
     # scripting runtime. The single-threaded suites add build time and nothing TSan can see.
-    # __TSAN_EXCLUDED__
+    # Nothing is excluded or suppressed; a suppression would go in ci/sanitizers/ with the reason.
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1 suppressions=${{ github.workspace }}/ci/sanitizers/tsan.supp
-      TSAN_TESTS: __TSAN_TESTS__
+      TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+      TSAN_TESTS: test_pool test_process_pool test_loadbalancer test_memory test_aio test_log test_rpc test_os test_os_net test_os_process test_os_sys test_os_ext test_os_dev test_os_dynlib test_sessions test_inference test_script test_script_fsc test_script_golden test_script_os_sandbox test_script_oserror test_script_security test_modelfile test_kvquant test_graph
     steps:
       - uses: actions/checkout@v4
       - name: add the LLVM apt repository (clang 23)
@@ -93,13 +93,12 @@ jobs:
         run: ctest --test-dir build-tsan -R "^($(echo $TSAN_TESTS | tr ' ' '|'))$" -j2 --timeout 3600 --no-tests=error
   linux-asan:
     # AddressSanitizer + UndefinedBehaviorSanitizer over the whole test suite (Debug), leak detection on.
-    # __ASAN_EXCLUDED__
+    # Nothing is excluded or suppressed; a suppression would go in ci/sanitizers/ with the reason.
     runs-on: ubuntu-24.04
     timeout-minutes: 150
     env:
       ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
-      LSAN_OPTIONS: suppressions=${{ github.workspace }}/ci/sanitizers/lsan.supp
     steps:
       - uses: actions/checkout@v4
       - name: add the LLVM apt repository (clang 23)
@@ -116,7 +115,7 @@ jobs:
       - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_FUZZ_ITERS=1000
       - run: cmake --build build-asan -j4
       - name: whole suite under ASan + UBSan
-        run: ctest --test-dir build-asan -LE "slow|emu" -E "__ASAN_EXCLUDE_RE__" -j2 --timeout 3600
+        run: ctest --test-dir build-asan -LE "slow|emu" -j2 --timeout 3600
   linux-fuzz:
     # Every fuzz target with libFuzzer under ASan + UBSan for a short, fixed time on its seed corpus. A crash
     # fails the job and its input is uploaded; add it to fuzz/corpus/<target>/ as regress_<what> with the fix.
@@ -146,7 +145,8 @@ jobs:
         run: |
           mkdir -p fuzz-out; rc=0
           for t in $(cat fuzz-targets.txt); do
-            n=${t#fuzz_}; mkdir -p fuzz-out/corpus-$n; cp fuzz/corpus/$n/* fuzz-out/corpus-$n/ 2>/dev/null || true
+            n=${t#fuzz_}; mkdir -p fuzz-out/corpus-$n; src=$n; [ $n = script_aot ] && src=script   # fuzz_script_aot reads the script corpus
+            cp fuzz/corpus/$src/* fuzz-out/corpus-$n/ 2>/dev/null || true
             echo "::group::$t"
             ./build-fuzz/$t -max_total_time=$FUZZ_SECONDS -timeout=30 -rss_limit_mb=3072 -print_final_stats=1 -artifact_prefix=fuzz-out/$n- fuzz-out/corpus-$n > fuzz-out/$n.log 2>&1 || { rc=1; echo "::error::$t found something (see the fuzz-findings artefact)"; }
             tail -n 25 fuzz-out/$n.log
@@ -162,6 +162,9 @@ jobs:
     # toolchain file, the Ubuntu cross compiler, the sysroot qemu loads the target's libc from, and the qemu
     # -cpu models the suites are run under (the lane_*_vl<N> / tile_sme_svl<N> tests, label emu, set their own
     # and cover more vector lengths). Adding an architecture = adding a row and its toolchain file.
+    # Fixed-width rows (LoongArch LSX/LASX, POWER VSX, s390x VXE, MIPS MSA) have no kernel-table configure line
+    # (`tables` empty), no emu-labelled tests (`emu_min` 0) and one CPU model, which their toolchain file sets
+    # (`cpus` "default"); their lane_<table> tests force each table and require it to be the active one.
     name: emu-${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
@@ -172,11 +175,49 @@ jobs:
           - name: aarch64-sve
             toolchain: aarch64-sve-qemu
             triple: aarch64-linux-gnu
+            qemu: qemu-aarch64
+            tables: "(SVE|RVV)"
+            emu_min: 4
             cpus: "max,sve256=on max,sve512=on"
           - name: riscv64-rvv
             toolchain: riscv64-rvv-qemu
             triple: riscv64-linux-gnu
+            qemu: qemu-riscv64
+            tables: "(SVE|RVV)"
+            emu_min: 4
             cpus: "rv64,v=true,vlen=256"
+          - name: loongarch64-lasx
+            toolchain: loongarch64-lasx-qemu
+            triple: loongarch64-linux-gnu
+            qemu: qemu-loongarch64
+            tables: ""
+            emu_min: 0
+            lanes: "lasx lsx"
+            cpus: "default"
+          - name: ppc64le-vsx
+            toolchain: ppc64le-vsx-qemu
+            triple: powerpc64le-linux-gnu
+            qemu: qemu-ppc64le
+            tables: ""
+            emu_min: 0
+            lanes: "vsx"
+            cpus: "default"
+          - name: s390x-vxe
+            toolchain: s390x-vxe-qemu
+            triple: s390x-linux-gnu
+            qemu: qemu-s390x
+            tables: ""
+            emu_min: 0
+            lanes: "vxe"
+            cpus: "default"
+          - name: mips64el-msa
+            toolchain: mips64el-msa-qemu
+            triple: mips64el-linux-gnuabi64
+            qemu: qemu-mips64el
+            tables: ""
+            emu_min: 0
+            lanes: "msa"
+            cpus: "default"
     env:
       QEMU_LD_PREFIX: /usr/${{ matrix.triple }}
       EMU_TESTS: test_simd test_tile test_dtypes test_graph test_kvquant test_support test_util
@@ -187,22 +228,48 @@ jobs:
         with: { key: "emu-${{ matrix.name }}" }
       - name: configure (cross build, tests run under qemu-user)
         run: |
-          qemu-$(echo ${{ matrix.triple }} | cut -d- -f1) --version | head -1
+          ${{ matrix.qemu }} --version | head -1
           cmake -S . -B build/emu -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }}.cmake -DFORGE_CROSS_CC=${{ matrix.triple }}-gcc-14 -DFORGE_CROSS_CXX=${{ matrix.triple }}-g++-14 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF | tee configure.log
-          grep -E "FORGE: (SVE|RVV) kernel tables: .*FORGE_SIMD_(SVE|RVV)256" configure.log
+          if [ -n "${{ matrix.tables }}" ]; then grep -E "FORGE: (SVE|RVV) kernel tables: .*FORGE_SIMD_(SVE|RVV)256" configure.log; fi
       - run: cmake --build build/emu -j4 --target $EMU_TESTS
+      - name: fixed-width kernel tables, each forced and required to be the active one
+        if: matrix.lanes
+        run: |
+          for t in ${{ matrix.lanes }}; do ctest --test-dir build/emu -R "^lane_$t\$" --timeout 1800 --no-tests=error --output-on-failure; done
       - name: emu-labelled tests (scalable lane active at every vector length)
+        if: matrix.emu_min > 0
         run: |
           ctest --test-dir build/emu -L emu -j2 --timeout 1800 --no-tests=error
-          test "$(ctest --test-dir build/emu -N -L emu | grep -c 'Test *#')" -ge 4
+          test "$(ctest --test-dir build/emu -N -L emu | grep -c 'Test *#')" -ge ${{ matrix.emu_min }}
       - name: SIMD-facing suites at each -cpu model
         run: |
           for cpu in ${{ matrix.cpus }}; do
             echo "::group::-cpu $cpu"
-            cmake build/emu -DFORGE_QEMU_CPU="$cpu" > /dev/null
+            if [ "$cpu" != default ]; then cmake build/emu -DFORGE_QEMU_CPU="$cpu" > /dev/null; fi
             ctest --test-dir build/emu -R "^($(echo $EMU_TESTS | tr ' ' '|'))$" -j2 --timeout 2400 --no-tests=error
             echo "::endgroup::"
           done
+  wasm-simd:
+    # The simd layer on wasm32-wasi (the rest of FORGE is not ported): tests/wasm_simd.sh builds test_simd and the
+    # scalar + SIMD128 kernel tables with zig and runs them under node's WASI, then once more without -msimd128.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: python -m pip install ziglang numpy
+      - name: put the package's zig on PATH
+        run: python -c "import ziglang, os; print(os.path.dirname(ziglang.__file__))" >> "$GITHUB_PATH"
+      - name: native configure and test_simd (the generated headers the wasm build includes)
+        run: |
+          cmake --preset dev -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF
+          cmake --build build/dev -j4 --target test_simd
+      - run: tests/wasm_simd.sh build/wasm
+      - run: WASM_SIMD=0 tests/wasm_simd.sh build/wasm-scalar
   perf:
     # forge bench against perf/baseline-x86_64.json. Hosted runners are shared and are not the machine the
     # baseline was recorded on, so the job never blocks a merge (continue-on-error) and only fails below a quarter
