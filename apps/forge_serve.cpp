@@ -344,6 +344,8 @@ int main(int argc, char** argv) {
         if (fs::is_directory(path) || path.ends_with(".gguf")) {   // import into a temp .fpk
             auto out = (fs::temp_directory_path() / (fs::path(path).filename().string() + ".serve.fpk")).string();
             import::import_options o; o.codec = arg(argc, argv, "codec", "f32");
+            o.requant = arg(argc, argv, "codec", "keep");   // GGUF / AWQ / GPTQ inputs keep their stored quantisation unless a codec is given
+            if (o.codec == "keep") o.codec = "f32";
             if (path.ends_with(".gguf")) import::import_gguf(path, out, o); else import::import_hf(path, out, o);
             path = out;
         }

@@ -57,6 +57,8 @@ int usage() {
         "usage: forge <command> [options]\n"
         "  info                                   CPU features, lane target, grid backends, memory budget\n"
         "  import <hf_dir|model.gguf> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|fp8_e5m2|q8_0|q4_k|q4_g32|q8_g32|mxfp8|mxfp6|mxfp4|mxint8|nvfp4|tq2] [--template llama] [--emb-codec q8_0|q4_k|f32]\n"
+        "      more codecs (GGUF block layouts): q5_k q6_k q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0\n"
+        "      --codec keep (default for .gguf and AWQ/GPTQ checkpoints): tensors stay in their stored quantisation; another codec re-quantises them\n"
         "      mixed precision (hf inputs): --codec q4_k_m|q5_k_m [--recipe forge|llama] [--output-tensor-type T] [--token-embedding-type T]\n"
         "      [--tensor-type REGEX=TYPE[,..]] [--pure] [--bf16-head]   (llama.cpp llama-quant.cpp rules; forge adds q6_k DeltaNet/attn_output, q8_0 head)\n"
         "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
@@ -87,10 +89,16 @@ int usage() {
 }
 
 // `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
-std::string resolve_model(const std::string& path, const std::string& codec) {
+std::string resolve_model(const std::string& path, const std::string& codec_opt) {
     namespace fs = std::filesystem;
     if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
-    std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(modelfile::format_version));
+    // `codec_opt` is --codec as given (empty when absent): Hugging Face inputs default to f32, a GGUF keeps its stored
+    // types unless a codec is asked for (then it is re-quantised, and cached under a separate key).
+    const bool quantised_src = path.ends_with(".gguf") || (fs::is_directory(path) && fs::exists(fs::path(path) / "config.json") &&
+                               import::read_file(fs::path(path) / "config.json").find("\"quantization_config\"") != std::string::npos);
+    const bool requant = quantised_src && !codec_opt.empty() && codec_opt != "keep";
+    const std::string codec = codec_opt.empty() || codec_opt == "keep" ? "f32" : codec_opt;
+    std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(modelfile::format_version)) + (requant ? "|requant" : "");
     auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
                                                             (long long)fs::last_write_time(f).time_since_epoch().count()); };
     if (fs::is_directory(path)) { std::vector<fs::path> fl; for (auto& e : fs::directory_iterator(path)) if (e.is_regular_file()) fl.push_back(e.path());
@@ -102,11 +110,12 @@ std::string resolve_model(const std::string& path, const std::string& codec) {
     auto h = hash::blake3::hex(hash::blake3::of({reinterpret_cast<const std::uint8_t*>(key.data()), key.size()})).substr(0, 24);
     fs::path out = dir / (fs::path(path).filename().string() + "-" + codec + "-" + h + ".fpk");
     if (!fs::exists(out)) {
-        import::import_options o; o.codec = codec;
+        import::import_options o; o.codec = codec; if (requant) o.requant = codec;
         auto tmp = out.string() + ".partial";
         auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
         fs::rename(tmp, out);
         std::fprintf(stderr, "[imported %s (%s, %zu tensors) -> %s]\n", path.c_str(), r.template_name.c_str(), r.tensors, out.c_str());
+        for (auto& n : r.notes) std::fprintf(stderr, "[import] %s\n", n.c_str());
     } else std::fprintf(stderr, "[using cached %s]\n", out.c_str());
     return out.string();
 }
@@ -159,6 +168,8 @@ int cmd_info() {
 int cmd_import(const args& a) {
     if (a.pos.empty() || a.get("o").empty()) return usage();
     import::import_options o; o.codec = a.get("codec", "f32"); o.template_name = a.get("template"); o.emb_codec = a.get("emb-codec");
+    o.requant = a.get("codec", "keep");   // GGUF inputs: stored types unless a codec is asked for
+    if (o.codec == "keep") o.codec = "f32";   // keep: GGUF types / AWQ and GPTQ codes as stored; plain checkpoints are f32
     o.recipe.recipe = a.get("recipe", "forge");
     o.recipe.output_type = a.get("output-tensor-type");
     o.recipe.token_embedding_type = a.get("token-embedding-type");
@@ -171,6 +182,7 @@ int cmd_import(const args& a) {
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
+    for (auto& n : r.notes) std::fprintf(stderr, "forge import: %s\n", n.c_str());
     return 0;
 }
 
@@ -316,7 +328,7 @@ int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
     activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
-    inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")), so);
+    inference::session s(resolve_model(a.pos[0], a.get("codec")), so);
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
@@ -356,7 +368,7 @@ int cmd_run(const args& a) {
         inference::speculative_stats sst;
         int k = int(a.num("spec-k", 0)), n = int(a.num("n", 32));
         if (a.kv.count("draft")) {
-            inference::session d(resolve_model(a.get("draft"), a.get("codec", "f32")), so);
+            inference::session d(resolve_model(a.get("draft"), a.get("codec")), so);
             inference::speculative_generate(s, d, prompt, n, smp, k, show, &sst);
         } else {
             int ng = std::max(1, int(a.num("ngram", 3)));
@@ -448,7 +460,7 @@ int cmd_bench(const args& a) {
     if (a.kv.count("kernels")) return cmd_bench_kernels(int(a.num("kernels", 1024)));
     if (a.pos.empty()) return usage();
     activate_policy(a.get("policy"));
-    inference::session s(resolve_model(a.pos[0], a.get("codec", "f32")));
+    inference::session s(resolve_model(a.pos[0], a.get("codec")));
     int p = int(a.num("p", 32)), n = int(a.num("n", 32));
     std::vector<int> prompt(std::size_t(p), 1);
     inference::sampler smp;
@@ -490,7 +502,8 @@ int cmd_bench(const args& a) {
 
 // forge rpc-serve [--port 7000] [--bind 127.0.0.1] [--device cpu|vulkan|cuda:0...]
 //   [--token T | --token-file F]... [--authorized-keys FILE | --pubkey HEX|FILE]...
-//   [--tls-cert C --tls-key K [--tls-client-ca CA [--tls-client-map FILE]...]] [--quiet]
+//   [--tls-cert C --tls-key K [--tls-client-ca CA [--tls-client-map FILE]... [--tls-crl PEM]... [--tls-revoked SHA256|FILE]...]]
+//   [--quiet]
 //   [--allow-scripts [--script-timeout MS] [--script-mem-mb N] [--script-no-proc] [--script-no-fs] [--script-no-net]]
 // Without tokens/keys it is unauthenticated (keep it on loopback). Scripts require auth. See docs/rpc.md.
 int cmd_rpc_serve(const args& a) {
@@ -503,14 +516,14 @@ int cmd_rpc_serve(const args& a) {
     graph::rpc::server_security sec;
     auto toks = a.all("token"); if (toks.empty() && a.has("token")) toks.push_back(a.get("token"));
     for (auto& t : toks) {   // "--token T" (full access) or "--token 'allow=device T'" (a token-file line)
-        if (!t.starts_with("allow=")) { sec.tokens.push_back(t); continue; }
+        if (!graph::rpc::sec::is_option(t)) { sec.tokens.push_back(t); continue; }
         for (auto& e : graph::rpc::parse_tokens(t, "--token")) sec.tokens.push_back(std::move(e));
     }
     auto files = a.all("token-file"); if (files.empty() && a.has("token-file")) files.push_back(a.get("token-file"));
     // FSS-FIO-2: secrets (token files, the TLS key) must be owner-only and trusted lists (authorized keys, client
     // maps) writable only by their owner; profile strict refuses otherwise, other profiles warn (audit).
     for (auto& f : files) security::require_private_file(pol, "--token-file", f, security::file_kind::secret);
-    for (auto& f : files) {   // "[allow=device,scripts] <token> [name]" per line (graph/rpc_secure.hpp)
+    for (auto& f : files) {   // "[allow=...] [ops=...] [max-bytes=N] [script-timeout=MS] <token> [name]" per line (graph/rpc_secure.hpp)
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         struct wipe_on_exit { std::string& s; ~wipe_on_exit() { if (!s.empty()) crypto_wipe(s.data(), s.size()); } } w{r.value};
         auto ts = graph::rpc::parse_tokens(r.value, f);
@@ -518,7 +531,7 @@ int cmd_rpc_serve(const args& a) {
         for (auto& e : ts) sec.tokens.push_back(std::move(e));
     }
     auto keyfiles = a.all("authorized-keys"); if (keyfiles.empty() && a.has("authorized-keys")) keyfiles.push_back(a.get("authorized-keys"));
-    for (auto& f : keyfiles) {   // "[allow=device,scripts] <hex> [comment]" per line (graph/rpc_secure.hpp)
+    for (auto& f : keyfiles) {   // "[options] <hex> [comment]" per line, options as for tokens (graph/rpc_secure.hpp)
         security::require_private_file(pol, "--authorized-keys", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         try { for (auto& k : graph::rpc::parse_authorized_keys(r.value)) sec.authorized_keys.push_back(std::move(k)); }
@@ -531,7 +544,7 @@ int cmd_rpc_serve(const args& a) {
     security::require_private_file(pol, "--tls-key", sec.tls.key_file, security::file_kind::secret);
     if (!sec.tls.client_ca_file.empty() && sec.tls.cert_file.empty()) throw std::runtime_error("--tls-client-ca needs --tls-cert and --tls-key");
     auto maps = a.all("tls-client-map"); if (maps.empty() && a.has("tls-client-map")) maps.push_back(a.get("tls-client-map"));
-    for (auto& f : maps) {   // "[allow=...] sha256:<hex>|cn:<name> [comment]" per line (graph/rpc_secure.hpp)
+    for (auto& f : maps) {   // "[options] sha256:<hex> | san:<type>:<value> | cn:<name> [comment]" per line (graph/rpc_secure.hpp)
         security::require_private_file(pol, "--tls-client-map", f, security::file_kind::trusted);
         auto r = os::read_file(f); if (!r) throw std::runtime_error("cannot read " + f);
         auto rs = graph::rpc::parse_client_map(r.value, f);
@@ -539,6 +552,21 @@ int cmd_rpc_serve(const args& a) {
         for (auto& x : rs) sec.client_map.push_back(std::move(x));
     }
     if (!sec.client_map.empty() && sec.tls.client_ca_file.empty()) throw std::runtime_error("--tls-client-map needs --tls-client-ca");
+    // Revocation of client certificates: PEM CRLs checked in the TLS handshake, and a deny-list of SHA-256 certificate
+    // fingerprints (a fingerprint, or a file of them). The server re-reads the files when they change.
+    sec.tls.crl_files = a.all("tls-crl"); if (sec.tls.crl_files.empty() && a.has("tls-crl")) sec.tls.crl_files.push_back(a.get("tls-crl"));
+    auto revoked = a.all("tls-revoked"); if (revoked.empty() && a.has("tls-revoked")) revoked.push_back(a.get("tls-revoked"));
+    for (auto& r : revoked) {
+        if (!os::exists(r)) {   // not a file: one fingerprint
+            try { auto one = graph::rpc::parse_revoked(r, "--tls-revoked"); if (one.size() != 1) throw std::runtime_error("empty"); sec.revoked_certs.push_back(one[0]); }
+            catch (const std::exception&) { throw std::runtime_error("--tls-revoked wants a SHA-256 certificate fingerprint (64 hex) or a file of them: " + r); }
+            continue;
+        }
+        security::require_private_file(pol, "--tls-revoked", r, security::file_kind::trusted);
+        sec.revoked_files.push_back(r);
+    }
+    for (auto& f : sec.tls.crl_files) security::require_private_file(pol, "--tls-crl", f, security::file_kind::trusted);
+    if ((!sec.tls.crl_files.empty() || !revoked.empty()) && sec.tls.client_ca_file.empty()) throw std::runtime_error("--tls-crl and --tls-revoked need --tls-client-ca");
     sec.allow_scripts = a.has("allow-scripts");
     std::string bind = a.get("bind", "127.0.0.1");
     if (pol.active()) {
@@ -562,9 +590,12 @@ int cmd_rpc_serve(const args& a) {
         // Each remote script runs in its own child process (`forge script --rpc-child`), so ForgeScript's OS sandbox
         // (seccomp / Capsicum / pledge / sandbox_init / restricted token) applies to the script without touching the
         // server's own sockets, and a crash, leak or runaway loop dies with the child. The source goes over stdin.
-        srv.signed_script_handler = [self, def_tmo, mem_mb, no_proc, no_fs, no_net, child_policy](const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t tmo,
-                                                                                                const std::string& signature) {
-            auto t = tmo ? std::min<std::uint64_t>(tmo, def_tmo) : def_tmo;
+        // The peer's permissions can only take capabilities away: a script keeps fs / net / proc when the server
+        // flags allow it and its token or key (and client certificate) has scripts.fs / scripts.net / scripts.proc.
+        srv.script_request_handler = [self, def_tmo, mem_mb, srv_no_proc = no_proc, srv_no_fs = no_fs, srv_no_net = no_net, child_policy](const graph::rpc::server::script_request& q) {
+            const auto& src = q.source; const auto& name = q.name; const auto& argv = q.argv; const auto& signature = q.signature;
+            const bool no_proc = srv_no_proc || !q.allow_proc, no_fs = srv_no_fs || !q.allow_fs, no_net = srv_no_net || !q.allow_net;
+            auto t = q.timeout_ms ? std::min<std::uint64_t>(q.timeout_ms, def_tmo) : def_tmo;
             os::spawn_spec sp;
             sp.argv = {self, "script", "--rpc-child", name.empty() ? "<remote>" : name, "--timeout", std::to_string(t)};
             if (no_proc) sp.argv.push_back("--no-proc");
@@ -601,8 +632,9 @@ int cmd_rpc_serve(const args& a) {
         };
     }
     server_lockdown(pol, "forge rpc", bind + ":" + std::to_string(srv.port()));
-    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
+    std::printf("forge rpc: listening on %s:%d (%s)%s%s%s%s%s%s\n", bind.c_str(), srv.port(), reg ? dev.c_str() : "cpu",
                 srv.tls() ? " tls" : "", sec.tls.client_ca_file.empty() ? "" : " mtls", sec.client_map.empty() ? "" : " cert-map",
+                sec.tls.crl_files.empty() && revoked.empty() ? "" : " revocation",
                 sec.auth_required() ? " auth" : " NO-AUTH", sec.allow_scripts ? " scripts" : "");
     std::fflush(stdout);
     srv.run();

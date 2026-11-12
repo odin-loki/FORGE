@@ -13,13 +13,14 @@
 |------|-------|---------------------|
 | Unit and differential | `tests/test_*.cpp` | `test_<name>` |
 | Script golden tests | `tests/script/*.fs` with expected `*.out` | inside `test_script_golden`: each script runs on the tree-walker and the VM, and both outputs must match the `.out` file (`FORGE_GOLDEN_UPDATE=1` rewrites them) |
-| Golden models | `verify/golden/tiny_llama.py`, `tiny_moe.py`, `tiny_qwen3.py`, `tiny_qwen3_5.py`, `quant_inplace.py` | `golden_tiny_llama`, `golden_moe_mla`, `golden_tiny_qwen3`, `golden_tiny_qwen3_5`, `golden_quant_inplace`; `golden_tiny_llama_vulkan` and `golden_moe_mla_vulkan` (label `gpu`) when Vulkan is built. `golden_tiny_llama` writes `build/<dir>/golden/tiny_f32.fpk`, which later tests use |
+| Golden models | `verify/golden/tiny_llama.py`, `tiny_moe.py`, `tiny_qwen3.py`, `tiny_qwen3_5.py`, `quant_inplace.py`, `gguf_types.py`, `hf_quant.py` | `golden_tiny_llama`, `golden_moe_mla`, `golden_tiny_qwen3`, `golden_tiny_qwen3_5`, `golden_quant_inplace`, `golden_gguf_types` (every GGUF tensor type against gguf-py), `golden_hf_quant` (AWQ / GPTQ checkpoints from the script's own packer); `golden_tiny_llama_vulkan` and `golden_moe_mla_vulkan` (label `gpu`) when Vulkan is built. `golden_tiny_llama` writes `build/<dir>/golden/tiny_f32.fpk`, which later tests use |
 | Real GPU runtimes | `tests/test_cuda_hip.cpp` | `test_gpu_{cuda,hip,opencl,ze,metal}`, `test_gpu_features_*`, label `gpu`; skip without a driver and device |
 | Mock GPU drivers | `tests/mock_cuda.c` (also built as the HIP mock), `mock_opencl.c`, `mock_ze.c` stand in for the vendor libraries | `test_gpu_*_mock`, `test_gpu_features_*_mock`, `test_gpu_memory_*_mock`, `golden_tiny_llama_{cuda,hip,opencl,ze}_mock`, label `gpu`. Not built when cross-compiling |
 | Vulkan | `tests/test_vulkan.cpp` | `test_vulkan`, `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`), label `gpu` |
 | GPU compile checks | generated kernels compiled with clang | `gpu_compile_{cuda,hip,opencl,opencl_nofp64,metal_syntax}`, and `gpu_compile_metal` with `xcrun`; label `gpu` |
 | Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` (`tools/sbom.py`: the SPDX 2.3 and the CycloneDX 1.5 output) |
 | C ABI | `tests/capi_smoke.c` | `capi_smoke` (not built when cross-compiling) |
+| Installed package | `tests/install_consumer/` (install to a scratch prefix, then `find_package(forge)` from a C++ and a C program; see [building.md](building.md#the-install_consumer-test)) | `install_consumer`, label `install` (not for cross or sanitizer builds) |
 | TLS-only RPC cases | `test_rpc` with `FORGE_TEST_ONLY=rpc_tls` | `test_rpc_tls` (skips in a build without OpenSSL, or without the `openssl` command) |
 | Log strip | `tests/log_min_level.cmake` | `log_min_level_cmake` |
 | Doc examples | `docs/examples/*` | `doc_example_*` |
@@ -110,4 +111,4 @@ mkdir -p /tmp/rpc-corpus && cp fuzz/corpus/rpc/* /tmp/rpc-corpus/      # libFuzz
 - `tools/bench_llm.sh --gguf <model.gguf> [--fpk <model.fpk>] [--forge PATH] [--llama-bench PATH] [-p 512] [-n 128] [-r 3] [--device cuda] [--codec q4_k] [--nsys PREFIX] [--no-llama]` compares FORGE with llama.cpp's `llama-bench` on the same model: prefill and decode tok/s, FORGE with and without `FORGE_GRAPHS=1`, and FORGE's GPU driver calls per decode token from `forge bench`. `--nsys` adds an Nsight Systems kernel summary per FORGE run. It needs a GPU and a model.
 
 ## Golden test Python environment
-`golden_tiny_qwen3_5` skips without torch and transformers 5 or newer. `golden_quant_inplace` skips its GGUF sub-check without `gguf`. Install the pinned set from `verify/golden/requirements.txt` into a venv and configure with `-DFORGE_GOLDEN_PYTHON=<venv>/bin/python`.
+`golden_tiny_qwen3_5` skips without torch and transformers 5 or newer. `golden_quant_inplace` skips its GGUF sub-check without `gguf`, and `golden_gguf_types` is skipped as a whole. Install the pinned set from `verify/golden/requirements.txt` into a venv and configure with `-DFORGE_GOLDEN_PYTHON=<venv>/bin/python`.

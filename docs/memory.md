@@ -107,4 +107,4 @@ In a container the cgroup limit is detected, so the defaults are usually enough.
 - Budget awareness in `forge run` and the C ABI entry points.
 - `os_proc_available_memory` on iOS and Job Object limit detection on Windows.
 
-CPU attention reads int8 and f32 KV slots in place through the chunked kernel (`graph/attn_cpu.hpp`), and int8 rows are encoded on the task pool. fp8 and tbq slots still use the per-(token, head) decode path.
+CPU attention reads int8 and f32 KV slots in place through the chunked kernel (`graph/attn_cpu.hpp`), and int8 rows are encoded on the task pool. `FORGE_CPU_ATTN=q16` reads the int8 key bytes with an integer kernel (int16 query); the slot layout is the same. fp8 and tbq slots still use the per-(token, head) decode path.

@@ -169,6 +169,16 @@ Generated from `graph/codecs.hpp` (codec list), `qweights::fmt_of` in `graph/pla
 | `tq2` | 64 / 18 | decode + f32 dot |  |  |
 | `q6_k` | 256 / 210 | SIMD dot on the encoded rows | encoded on device | yes |
 | `q5_k` | 256 / 176 | SIMD dot on the encoded rows | encoded on device |  |
+| `q4_0` | 32 / 18 | decode + f32 dot |  |  |
+| `q4_1` | 32 / 20 | decode + f32 dot |  |  |
+| `q5_0` | 32 / 22 | decode + f32 dot |  |  |
+| `q5_1` | 32 / 24 | decode + f32 dot |  |  |
+| `q2_k` | 256 / 84 | decode + f32 dot |  |  |
+| `q3_k` | 256 / 110 | decode + f32 dot |  |  |
+| `iq4_nl` | 32 / 18 | decode + f32 dot |  |  |
+| `iq4_xs` | 256 / 136 | decode + f32 dot |  |  |
+| `tq1_0` | 256 / 54 | decode + f32 dot |  |  |
+| `tq2_0` | 256 / 66 | decode + f32 dot |  |  |
 
 ## C ABI (version 3, `inference/include/forge.h`)
 

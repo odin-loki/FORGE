@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <thread>
 #if !defined(_WIN32)
 #include <unistd.h>
@@ -286,6 +287,233 @@ TEST(rpc_token_scopes) {
     CHECK(all.find("devtok") == std::string::npos && all.find("fulltok") == std::string::npos);
 }
 
+// ---- finer permissions (device.<op class>, scripts.run/fs/net/proc) and per-rule limits (ops=, max-bytes=,
+// script-timeout=); plain TCP, so these run without OpenSSL too
+static bool matmul_ok(graph::rpc::client& c) {
+    tensor a({2, 3}, 1.f), b({3, 2}, 1.f), y({2, 2}); tensor_view in[2] = {{a.data.data(), a.shape}, {b.data.data(), b.shape}};
+    c.run("matmul", std::span<const tensor_view>(in, 2), {y.data.data(), y.shape}, {}); return y.data[0] == 3.f && y.data[3] == 3.f;
+}
+static bool unary_ok(graph::rpc::client& c, const char* op, std::size_t n, float want) {
+    tensor x({std::int64_t(n)}, -1.f), y({std::int64_t(n)}); tensor_view in{x.data.data(), x.shape};
+    c.run(op, std::span<const tensor_view>(&in, 1), {y.data.data(), y.shape}, {}); return y.data[0] == want && y.data[n - 1] == want;
+}
+TEST(rpc_fine_permissions_parse) {
+    namespace R = graph::rpc;
+    // the old names are the full sets, so files written before the split mean what they meant
+    CHECK(R::parse_perms("device") == R::perm_device && R::parse_perms("scripts") == R::perm_scripts && R::parse_perms("all") == R::perm_all);
+    CHECK(R::parse_perms("device,scripts") == R::perm_all);
+    CHECK(R::parse_perms("device.elementwise,device.reduction,device.contraction,device.data_movement,device.stateful") == R::perm_device);
+    CHECK(R::parse_perms("scripts.run,scripts.fs,scripts.net,scripts.proc") == R::perm_scripts);
+    CHECK(R::parse_perms("device.contraction,scripts.run") == unsigned(R::perm_device_contraction | R::perm_scripts_run));
+    CHECK((R::perm_device & R::perm_scripts) == 0);
+    // the device bits follow ops::op_class
+    CHECK(R::perm_for_op_class(unsigned(ops::op_class::elementwise)) == R::perm_device_elementwise);
+    CHECK(R::perm_for_op_class(unsigned(ops::op_class::reduction)) == R::perm_device_reduction);
+    CHECK(R::perm_for_op_class(unsigned(ops::op_class::contraction)) == R::perm_device_contraction);
+    CHECK(R::perm_for_op_class(unsigned(ops::op_class::data_movement)) == R::perm_device_data_movement);
+    CHECK(R::perm_for_op_class(unsigned(ops::op_class::stateful)) == R::perm_device_stateful);
+    CHECK(R::perm_for_op_class(5) == 0);
+    CHECK(R::perms_string(R::perm_all) == "all" && R::perms_string(R::perm_none) == "none");
+    CHECK(R::perms_string(R::perm_device) == "device" && R::perms_string(R::perm_scripts) == "scripts");
+    CHECK_MSG(R::perms_string(R::perm_device_contraction | R::perm_scripts_run) == "device.contraction,scripts.run", "%s", R::perms_string(R::perm_device_contraction | R::perm_scripts_run).c_str());
+    CHECK(R::perms_string(R::perm_device | R::perm_scripts_run | R::perm_scripts_net) == "device,scripts.run,scripts.net");
+    CHECK(R::parse_perms(R::perms_string(R::perm_device_reduction | R::perm_scripts_fs)) == unsigned(R::perm_device_reduction | R::perm_scripts_fs));
+    CHECK(throws_with([] { R::parse_perms("device.gpu"); }, "unknown permission 'device.gpu'"));
+    CHECK(throws_with([] { R::parse_perms("scripts.exec"); }, "unknown permission"));
+    // limits on token lines, key lines and client-map rules
+    auto ts = R::parse_tokens("allow=device ops=relu,matmul ops=relu max-bytes=4k script-timeout=1500 tok a name\nops=neg bare\nplain\n");
+    CHECK(ts.size() == 3);
+    if (ts.size() == 3) {
+        CHECK(ts[0].token == "tok" && ts[0].perms == R::perm_device && ts[0].name == "a name");
+        CHECK(ts[0].lim.ops_limited && ts[0].lim.ops == std::vector<std::string>({"matmul", "relu"}) && ts[0].lim.max_bytes == 4096 && ts[0].lim.script_timeout_ms == 1500);
+        CHECK_MSG(ts[0].lim.str() == " ops=matmul,relu max-bytes=4096 script-timeout=1500", "%s", ts[0].lim.str().c_str());
+        CHECK(ts[0].lim.op_allowed("relu") && !ts[0].lim.op_allowed("neg"));
+        CHECK(ts[1].token == "bare" && ts[1].perms == R::perm_all && ts[1].lim.ops == std::vector<std::string>({"neg"}));   // a limit alone keeps all permissions
+        CHECK(ts[2].perms == R::perm_all && !ts[2].lim.any() && ts[2].lim.op_allowed("anything") && ts[2].lim.str().empty());
+    }
+    auto ks = R::parse_authorized_keys("allow=scripts.run script-timeout=250 max-bytes=2m " + std::string(64, 'a') + " ci\n");
+    CHECK(ks.size() == 1 && ks[0].perms == R::perm_scripts_run && ks[0].lim.script_timeout_ms == 250 && ks[0].lim.max_bytes == (2u << 20) && ks[0].comment == "ci");
+    auto cm = R::parse_client_map("allow=device.contraction ops=matmul max-bytes=1g cn:gpu\n");
+    CHECK(cm.size() == 1 && cm[0].perms == R::perm_device_contraction && cm[0].lim.ops == std::vector<std::string>({"matmul"}) && cm[0].lim.max_bytes == (1ull << 30));
+    CHECK(R::parse_tokens("ops= t").at(0).lim.ops_limited && R::parse_tokens("ops= t").at(0).lim.ops.empty());   // ops= with no value: no op at all
+    CHECK(throws_with([] { R::parse_tokens("ok\nmax-bytes=0 t\n", "tok.txt"); }, "tok.txt line 2: max-bytes= wants a positive size"));
+    CHECK(throws_with([] { R::parse_tokens("max-bytes=12x t\n"); }, "line 1: max-bytes="));
+    CHECK(throws_with([] { R::parse_tokens("max-bytes=99999999999999999999 t\n"); }, "max-bytes="));
+    CHECK(throws_with([] { R::parse_tokens("max-bytes=1 max-bytes=2 t\n"); }, "given twice"));
+    CHECK(throws_with([] { R::parse_tokens("script-timeout=5k t\n"); }, "script-timeout= wants positive milliseconds"));
+    CHECK(throws_with([] { R::parse_tokens("script-timeout=0 t\n"); }, "script-timeout="));
+    CHECK(throws_with([] { R::parse_authorized_keys("limit=3 " + std::string(64, 'a')); }, "unknown option 'limit'"));
+    CHECK(throws_with([] { R::parse_tokens("allow=device.contraction,device.gpu t\n"); }, "line 1: unknown permission 'device.gpu'"));
+    // a token and its client certificate: the stricter of each limit, and only ops both allow
+    R::limits a, b; a.ops_limited = true; a.ops = {"matmul", "relu"}; a.max_bytes = 100; b.ops_limited = true; b.ops = {"neg", "relu"}; b.max_bytes = 50; b.script_timeout_ms = 9;
+    a.intersect(b); CHECK(a.ops == std::vector<std::string>({"relu"}) && a.max_bytes == 50 && a.script_timeout_ms == 9);
+    R::limits c2; c2.intersect(a); CHECK(c2.ops_limited && c2.ops == a.ops && c2.max_bytes == 50);
+    R::limits d; d.max_bytes = 10; d.intersect(R::limits{}); CHECK(d.max_bytes == 10 && !d.ops_limited);
+    // a typo in ops= is a configuration error, not a rule that silently allows nothing
+    R::server_security s; s.tokens = R::parse_tokens("ops=relu,matmull t\n");
+    CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", s); }, "unknown op 'matmull'"));
+}
+TEST(rpc_fine_permissions_device) {
+    namespace R = graph::rpc;
+    R::server_security sec;
+    sec.tokens = R::parse_tokens("allow=device.elementwise ew\nallow=device.contraction con\nallow=device ops=relu,matmul listed\n"
+                                 "allow=device max-bytes=64 small\nallow=device.elementwise,device.contraction ops=neg both\nallow=scripts noscope\n");
+    R::server srv(nullptr, 0, "127.0.0.1", sec);
+    std::mutex lm; std::string logs; srv.log = [&](const std::string& m) { std::lock_guard g(lm); logs += m + "\n"; };
+    srv.start(); auto port = std::to_string(srv.port());
+    auto conn = [&](const std::string& t) { std::string why; auto c = R::client::connect("127.0.0.1", port, &why, tok(t)); CHECK_MSG(c != nullptr, "%s", why.c_str()); return c; };
+    auto denied = [](auto&& fn, std::string_view why) { return throws_with(fn, "permission denied") && throws_with(fn, why); };
+    if (auto c = conn("ew")) {            // one op class
+        CHECK(relu_ok(*c));
+        CHECK(denied([&] { matmul_ok(*c); }, "may not run contraction ops such as matmul (allow=device.contraction)"));
+        CHECK(relu_ok(*c));               // the refused request's tensors were consumed: the connection is in step
+        CHECK(throws_with([&] { unary_ok(*c, "no_such_op", 4, 0.f); }, "unknown op"));
+    }
+    if (auto c = conn("con")) { CHECK(matmul_ok(*c)); CHECK(denied([&] { relu_ok(*c); }, "may not run elementwise ops such as relu")); CHECK(matmul_ok(*c)); }
+    if (auto c = conn("listed")) {        // every class, two ops
+        CHECK(relu_ok(*c)); CHECK(matmul_ok(*c));
+        CHECK(denied([&] { unary_ok(*c, "neg", 4, 1.f); }, "may not run the op neg (ops=)"));
+        CHECK(relu_ok(*c));
+    }
+    if (auto c = conn("small")) {         // 4 floats in + 4 out = 32 bytes; 64 floats = 512 bytes
+        CHECK(unary_ok(*c, "neg", 4, 1.f)); CHECK(unary_ok(*c, "neg", 8, 1.f));     // 64 bytes: at the limit
+        CHECK(denied([&] { unary_ok(*c, "neg", 64, 1.f); }, "above its limit (max-bytes=64)"));
+        CHECK(denied([&] { unary_ok(*c, "neg", 9, 1.f); }, "72 tensor bytes"));     // counted with the output
+        CHECK(unary_ok(*c, "neg", 4, 1.f));
+    }
+    if (auto c = conn("both")) {          // the class and the list must both allow the op
+        CHECK(unary_ok(*c, "neg", 4, 1.f));
+        CHECK(denied([&] { relu_ok(*c); }, "(ops=)")); CHECK(denied([&] { matmul_ok(*c); }, "(ops=)"));
+    }
+    if (auto c = conn("noscope")) CHECK(denied([&] { relu_ok(*c); }, "may not run device ops"));
+    CHECK_MSG(srv.ops() == 11, "ops %llu", static_cast<unsigned long long>(srv.ops()));
+    srv.stop();
+    CHECK_MSG(logs.find("authenticated token#1 allow=device.elementwise") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("authenticated token#3 allow=device ops=matmul,relu") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("authenticated token#4 allow=device max-bytes=64") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("denied device op matmul for token#1: may not run contraction ops") != std::string::npos, "%s", logs.c_str());
+    CHECK_MSG(logs.find("denied device op neg for token#4") != std::string::npos, "%s", logs.c_str());
+}
+TEST(rpc_fine_permissions_scripts) {
+    namespace R = graph::rpc;
+    R::server_security sec; sec.allow_scripts = true;
+    sec.tokens = R::parse_tokens("allow=scripts.run runonly\nallow=scripts.run,scripts.fs fsonly\nallow=scripts full\nallow=scripts.fs,scripts.net,scripts.proc norun\n"
+                                 "allow=scripts script-timeout=500 max-bytes=8 lim\nallow=device,scripts.run,scripts.net mixed\n");
+    auto denied = [](auto&& fn, std::string_view why) { return throws_with(fn, "permission denied") && throws_with(fn, why); };
+    {
+        R::server srv(nullptr, 0, "127.0.0.1", sec);
+        std::mutex qm; R::server::script_request last;
+        srv.script_request_handler = [&](const R::server::script_request& q) { std::lock_guard g(qm); last = q; return R::server::script_result{true, "", "", "ran:" + q.source}; };
+        // the request handler wins over the older ones
+        srv.script_handler = [](const std::string&, const std::string&, const std::vector<std::string>&, std::uint32_t) { return R::server::script_result{false, "RuntimeError", "old handler", ""}; };
+        std::mutex lm; std::string logs; srv.log = [&](const std::string& m) { std::lock_guard g(lm); logs += m + "\n"; };
+        srv.start(); auto port = std::to_string(srv.port());
+        auto conn = [&](const std::string& t) { std::string why; auto c = R::client::connect("127.0.0.1", port, &why, tok(t)); CHECK_MSG(c != nullptr, "%s", why.c_str()); return c; };
+        if (auto c = conn("runonly")) {
+            auto r = c->run_script("src", "<n>", {"a"}, 0, "sigtext"); CHECK(r.ok && r.output == "ran:src");
+            CHECK(!last.allow_fs && !last.allow_net && !last.allow_proc);
+            CHECK(last.who == "token#1" && last.name == "<n>" && last.argv == std::vector<std::string>({"a"}) && last.signature == "sigtext" && last.timeout_ms == 0);
+            CHECK(denied([&] { relu_ok(*c); }, "may not run device ops"));
+        }
+        if (auto c = conn("fsonly")) { CHECK(c->run_script("x").ok); CHECK(last.allow_fs && !last.allow_net && !last.allow_proc); }
+        if (auto c = conn("full")) { CHECK(c->run_script("x", "<remote>", {}, 1234).ok); CHECK(last.allow_fs && last.allow_net && last.allow_proc && last.timeout_ms == 1234 && last.signature.empty()); }
+        if (auto c = conn("norun")) { CHECK(denied([&] { c->run_script("x"); }, "may not run scripts")); CHECK(denied([&] { c->run_script("y"); }, "may not run scripts")); }
+        if (auto c = conn("lim")) {           // script-timeout= caps what the client asks for; max-bytes= caps the source
+            CHECK(c->run_script("12345678").ok && last.timeout_ms == 500);
+            CHECK(c->run_script("x", "<remote>", {}, 100).ok && last.timeout_ms == 100);
+            CHECK(c->run_script("x", "<remote>", {}, 9000).ok && last.timeout_ms == 500);
+            CHECK(denied([&] { c->run_script("123456789"); }, "script of 9 bytes, above its limit (max-bytes=8)"));
+            CHECK(c->run_script("ok").ok);
+        }
+        if (auto c = conn("mixed")) { CHECK(relu_ok(*c)); CHECK(c->run_script("x").ok); CHECK(!last.allow_fs && last.allow_net && !last.allow_proc); }
+        CHECK_MSG(srv.scripts() == 8, "scripts %llu", static_cast<unsigned long long>(srv.scripts()));
+        srv.stop();
+        CHECK_MSG(logs.find("authenticated token#1 allow=scripts.run") != std::string::npos, "%s", logs.c_str());
+        CHECK_MSG(logs.find("authenticated token#5 allow=scripts max-bytes=8 script-timeout=500") != std::string::npos, "%s", logs.c_str());
+        CHECK_MSG(logs.find("script '<n>' for token#1 (signed) without fs net proc") != std::string::npos, "%s", logs.c_str());
+        CHECK_MSG(logs.find("script '<remote>' for token#6 without fs proc") != std::string::npos, "%s", logs.c_str());
+        CHECK_MSG(logs.find("denied script for token#4") != std::string::npos, "%s", logs.c_str());
+    }
+    {   // a host with only the older handlers cannot withhold a capability: partial script permissions are refused
+        R::server srv(nullptr, 0, "127.0.0.1", sec);
+        srv.signed_script_handler = [](const std::string&, const std::string&, const std::vector<std::string>&, std::uint32_t t, const std::string&) {
+            return R::server::script_result{true, "", "", "old:" + std::to_string(t)}; };
+        srv.start(); auto port = std::to_string(srv.port()); std::string why;
+        auto run = R::client::connect("127.0.0.1", port, &why, tok("runonly")); CHECK(run != nullptr);
+        if (run) CHECK(denied([&] { run->run_script("x"); }, "cannot restrict capabilities"));
+        auto full = R::client::connect("127.0.0.1", port, &why, tok("full")); CHECK(full != nullptr);
+        if (full) CHECK(full->run_script("x").output == "old:0");
+        auto lim = R::client::connect("127.0.0.1", port, &why, tok("lim")); CHECK(lim != nullptr);
+        if (lim) CHECK(lim->run_script("x").output == "old:500");          // limits still apply
+        CHECK(srv.scripts() == 2);
+        srv.stop();
+    }
+}
+// ---- client-map san: rules and the revoked list: parsing and matching (no TLS needed)
+TEST(rpc_san_rules_parse) {
+    namespace R = graph::rpc;
+    auto m = R::parse_client_map("allow=device san:dns:Runner1.CI.Example. laptop\nsan:dns:*.ci.example\nsan:uri:spiffe://forge.test/ns/CI\n"
+                                 "allow=scripts.run san:email:Ops@Forge.Test\nsan:ip:10.1.2.3\nsan:ip:FD00::7\nsan:ip:::ffff:1.2.3.4\ncn:x\n");
+    CHECK(m.size() == 8);
+    if (m.size() == 8) {
+        CHECK(m[0].kind == R::cert_rule::san_dns && m[0].value == "runner1.ci.example" && m[0].perms == R::perm_device && m[0].comment == "laptop" && m[0].is_san());
+        CHECK(m[1].kind == R::cert_rule::san_dns && m[1].value == "*.ci.example" && m[1].perms == R::perm_all);
+        CHECK(m[2].kind == R::cert_rule::san_uri && m[2].value == "spiffe://forge.test/ns/CI");
+        CHECK(m[3].kind == R::cert_rule::san_email && m[3].value == "Ops@forge.test" && m[3].perms == R::perm_scripts_run);
+        CHECK(m[4].kind == R::cert_rule::san_ip && m[4].value == "10.1.2.3");
+        CHECK_MSG(m[5].value == "fd00:0:0:0:0:0:0:7", "%s", m[5].value.c_str());
+        CHECK_MSG(m[6].value == "0:0:0:0:0:ffff:102:304", "%s", m[6].value.c_str());
+        CHECK(!m[7].is_san());
+        // entries as channel::peer_cert_sans reports them
+        CHECK(m[0].matches_san("dns:runner1.ci.example") && !m[0].matches_san("dns:runner2.ci.example") && !m[0].matches_san("uri:runner1.ci.example"));
+        CHECK(m[1].matches_san("dns:runner1.ci.example") && m[1].matches_san("dns:x.ci.example"));
+        CHECK(!m[1].matches_san("dns:ci.example") && !m[1].matches_san("dns:a.b.ci.example") && !m[1].matches_san("dns:.ci.example") && !m[1].matches_san("dns:xci.example"));
+        CHECK(m[1].matches_san("dns:*.ci.example"));                       // the same spelling
+        CHECK(!m[0].matches_san("dns:*.ci.example"));                      // a wildcard in the certificate is not expanded
+        CHECK(m[2].matches_san("uri:spiffe://forge.test/ns/CI") && !m[2].matches_san("uri:spiffe://forge.test/ns/ci") && !m[2].matches_san("uri:spiffe://forge.test/ns/CI/x"));
+        CHECK(m[3].matches_san("email:Ops@forge.test") && !m[3].matches_san("email:ops@forge.test"));
+        CHECK(m[4].matches_san("ip:10.1.2.3") && !m[4].matches_san("ip:10.1.2.30") && !m[4].matches_san("dns:10.1.2.3"));
+        CHECK(m[5].matches_san("ip:fd00:0:0:0:0:0:0:7"));
+        CHECK(!m[7].matches_san("dns:x"));
+    }
+    CHECK(R::sec::dns_rule_matches("*.b.c", "a.b.c") && !R::sec::dns_rule_matches("*.b.c", "b.c") && !R::sec::dns_rule_matches("*.b.c", "*.x.b.c") && !R::sec::dns_rule_matches("", ""));
+    // addresses
+    std::vector<std::uint8_t> ip;
+    CHECK(R::sec::parse_ip("192.168.0.1", ip) && ip == std::vector<std::uint8_t>({192, 168, 0, 1}));
+    CHECK(R::sec::parse_ip("::", ip) && ip == std::vector<std::uint8_t>(16, 0));
+    CHECK(R::sec::parse_ip("1::", ip) && ip.size() == 16 && ip[1] == 1 && ip[15] == 0);
+    CHECK(R::sec::parse_ip("2001:db8:0:0:1:0:0:1", ip) && R::sec::ip_text(ip.data(), ip.size()) == "2001:db8:0:0:1:0:0:1");
+    CHECK(R::sec::parse_ip("2001:db8::1:0:0:1", ip) && R::sec::ip_text(ip.data(), ip.size()) == "2001:db8:0:0:1:0:0:1");
+    for (auto bad : {"", "1.2.3", "1.2.3.4.5", "256.1.1.1", "1.2.3.x", "1..2.3", "1:2", ":1::2", "1::2::3", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7::8", "12345::", "g::", "1::2:", ":::", "1.2.3.4::"})
+        CHECK_MSG(!R::sec::parse_ip(bad, ip), "parse_ip accepted '%s'", bad);
+    CHECK(R::sec::ip_text(ip.data(), 5).empty());
+    CHECK(R::sec::san_canonical("dns", "a b").empty() && R::sec::san_canonical("dns", std::string_view("a\0b", 3)).empty() && R::sec::san_canonical("dns", "a..b").empty());
+    CHECK(R::sec::san_canonical("email", "nobody").empty() && R::sec::san_canonical("uri", "no-scheme").empty() && R::sec::san_canonical("other", "x").empty());
+    // config errors name the file and line
+    CHECK(throws_with([] { R::parse_client_map("cn:a\nsan:dns:\n", "map.txt"); }, "map.txt line 2: bad san:dns: value"));
+    CHECK(throws_with([] { R::parse_client_map("san:host.example\n"); }, "line 1: san: wants a type"));
+    CHECK(throws_with([] { R::parse_client_map("san:rid:1.2.3\n"); }, "san: wants a type"));
+    CHECK(throws_with([] { R::parse_client_map("san:ip:10.0.0.256\n"); }, "bad san:ip: value"));
+    CHECK(throws_with([] { R::parse_client_map("san:email:nobody\n"); }, "bad san:email: value"));
+    CHECK(throws_with([] { R::parse_client_map("san:uri:no-scheme\n"); }, "bad san:uri: value"));
+    for (auto bad : {"san:dns:*", "san:dns:*.", "san:dns:a.*.example", "san:dns:*x.example", "san:dns:*.*.example", "san:uri:spiffe://*/x", "san:email:*@forge.test"})
+        CHECK_MSG(throws_with([&] { R::parse_client_map(std::string(bad) + "\n"); }, "'*' is only a wildcard"), "accepted %s", bad);
+    CHECK(throws_with([] { R::parse_client_map("san:dns:a.example\nsan:dns:A.Example.\n"); }, "line 2: duplicate"));
+    CHECK(throws_with([] { R::parse_client_map("san:ip:::1\nsan:ip:0:0:0:0:0:0:0:1\n"); }, "line 2: duplicate"));
+    CHECK(throws_with([] { R::parse_client_map("from=x san:dns:a.example\n"); }, "unknown option 'from'"));
+    // revoked lists
+    auto fp = std::string(64, 'b'); std::string colons; for (std::size_t i = 0; i < 64; i += 2) { if (i) colons += ':'; colons += "BB"; }
+    auto rv = R::parse_revoked("# stolen laptops\n\n" + colons + " laptop 3\nsha256:" + std::string(64, 'c') + "\n");
+    CHECK(rv.size() == 2 && rv[0] == fp && rv[1] == std::string(64, 'c'));
+    CHECK(R::parse_revoked("# nothing yet\n").empty());
+    CHECK(throws_with([] { R::parse_revoked("ok\n", "rev.txt"); }, "rev.txt line 1: want a 64-hex"));
+    // revocation needs client certificates
+    R::server_security s; s.tokens = {"t"}; s.revoked_certs = {fp};
+    CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", s); }, "needs client certificates"));
+    R::server_security s2; s2.tokens = {"t"}; s2.tls.crl_files = {tmp("no-such-crl.pem")};
+    CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", s2); }, "needs client certificates"));
+}
+
 // ---- TLS. These skip without OpenSSL (or its CLI); the `test_rpc_tls` ctest entry runs only them and then exits 77.
 // The CLI runs through os::run (no shell, no redirects), so the probe and the throwaway PKI work on Windows too.
 // FORGE_TEST_OPENSSL names the binary; on Windows, Git for Windows' copies are tried after PATH.
@@ -509,8 +737,188 @@ TEST(rpc_tls_client_map) {
     CHECK_MSG(logs.find("(runner) cert:sha256:") != std::string::npos && logs.find("(laptop) allow=none") != std::string::npos, "%s", logs.c_str());
     CHECK_MSG(logs.find("cn=forge-client-3 is not in the client map") != std::string::npos, "%s", logs.c_str());
 }
+// Second throwaway PKI, issued by pki()'s client CA: two client certificates with subjectAltName entries, and CRLs
+// of that CA (one revoking nothing, one revoking pki().cl3) made with `openssl ca`. Everything lives in one directory.
+struct test_pki2 { std::string dir, san1, san1_key, san2, san2_key, crl_none, crl_cl3; bool ok = false; };
+static bool write_text(const std::string& path, const std::string& text) { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << text; f.close(); return bool(f); }
+static const test_pki2& pki2() {
+    static test_pki2 q = [] {
+        test_pki2 q; auto& p = pki(); if (!p.ok) return q;
+        q.dir = tmp("pki2"); std::error_code e; std::filesystem::create_directories(q.dir, e);
+        auto at = [&](const char* n) { return (std::filesystem::path(q.dir) / n).generic_string(); };
+        q.san1 = at("san1.pem"); q.san1_key = at("san1.key"); q.san2 = at("san2.pem"); q.san2_key = at("san2.key"); q.crl_none = at("crl-none.pem"); q.crl_cl3 = at("crl-cl3.pem");
+        auto csr = at("c.csr"), ext = at("ext.cnf"), cnf = at("ca.cnf"), index = at("index.txt");
+        auto client = [&](const std::string& cn, const std::string& sans, const std::string& crt, const std::string& key, const char* serial) {
+            return write_text(ext, "subjectAltName=" + sans + "\n")
+                && ossl({"req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-subj", "/CN=" + cn, "-keyout", key, "-out", csr})
+                && ossl({"x509", "-req", "-in", csr, "-CA", p.ca, "-CAkey", p.ca_key, "-set_serial", serial, "-days", "1", "-extfile", ext, "-out", crt});
+        };
+        // `openssl ca` wants a config naming its database; -gencrl and -revoke use nothing else of it
+        auto ca = [&](std::vector<std::string> a) { a.insert(a.begin(), {"ca", "-config", cnf, "-keyfile", p.ca_key, "-cert", p.ca}); return ossl(a); };
+        q.ok = client("san-one", "DNS:runner1.ci.forge.test,URI:spiffe://forge.test/ci/runner1,email:ci@Forge.Test,IP:10.1.2.3,IP:fd00::7", q.san1, q.san1_key, "16")
+            && client("san-two", "DNS:deep.runner.ci.forge.test,DNS:*.wild.forge.test", q.san2, q.san2_key, "17")
+            && write_text(index, "") && write_text(cnf, "[ca]\ndefault_ca = forge_ca\n[forge_ca]\ndatabase = " + index + "\ndefault_md = sha256\ndefault_crl_days = 30\n")
+            && ca({"-gencrl", "-out", q.crl_none})
+            && ca({"-revoke", p.cl3}) && ca({"-gencrl", "-out", q.crl_cl3});
+        return q;
+    }();
+    return q;
+}
+static std::string slurp(const std::string& path) { auto r = os::read_file(path); return r ? r.value : std::string(); }
+static graph::rpc::client_security with_cert(graph::rpc::client_security s, const std::string& crt, const std::string& key) { s.tls.cert_file = crt; s.tls.key_file = key; return s; }
+// Connect and run one op. "" when it worked, else what went wrong (the connect error or the op's exception).
+static std::string try_relu(int port, const graph::rpc::client_security& s) {
+    std::string why; auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(port), &why, s);
+    if (!c) return why.empty() ? "connect failed" : why;
+    try { return relu_ok(*c) ? "" : "wrong result"; } catch (const std::exception& e) { return e.what(); }
+}
+// Client-map san: rules against real certificates: every SAN type, the DNS wildcard, and precedence over cn: rules.
+TEST(rpc_tls_san_rules) {
+    if (!tls_or_skip()) return;
+    auto& p = pki(); auto& q = pki2(); CHECK(p.ok); CHECK(q.ok); namespace R = graph::rpc;
+    if (!p.ok || !q.ok) return;
+    // a certificate-only server with a one-rule map: does this certificate get in?
+    auto admits = [&](const std::string& rule, const std::string& crt, const std::string& key) {
+        R::server_security sec; sec.tls = {p.srv, p.srv_key, p.ca}; sec.client_map = R::parse_client_map(rule + "\n");
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.start();
+        auto err = try_relu(srv.port(), with_cert(tls_tok(""), crt, key)); srv.stop();
+        if (!err.empty()) CHECK_MSG(err.find("client certificate not authorized") != std::string::npos, "%s: %s", rule.c_str(), err.c_str());
+        return err.empty();
+    };
+    auto one = [&](const std::string& rule) { return admits(rule, q.san1, q.san1_key); };
+    auto two = [&](const std::string& rule) { return admits(rule, q.san2, q.san2_key); };
+    CHECK(one("san:dns:runner1.ci.forge.test")); CHECK(!two("san:dns:runner1.ci.forge.test"));
+    CHECK(!admits("san:dns:runner1.ci.forge.test", p.cl, p.cl_key));              // a certificate without SANs
+    CHECK(one("san:dns:RUNNER1.ci.forge.test."));                                 // case and a trailing dot do not matter
+    CHECK(!one("san:dns:runner2.ci.forge.test")); CHECK(!one("san:dns:ci.forge.test"));
+    CHECK(one("san:dns:*.ci.forge.test"));                                        // one label
+    CHECK(!two("san:dns:*.ci.forge.test"));                                       // deep.runner.ci.forge.test is two labels
+    CHECK(two("san:dns:*.runner.ci.forge.test"));
+    CHECK(!two("san:dns:build.wild.forge.test"));                                 // the certificate's own wildcard is not expanded
+    CHECK(two("san:dns:*.wild.forge.test"));                                      // only the same spelling matches it
+    CHECK(one("san:uri:spiffe://forge.test/ci/runner1")); CHECK(!one("san:uri:spiffe://forge.test/ci/runner")); CHECK(!one("san:uri:spiffe://forge.test/ci/Runner1"));
+    CHECK(!two("san:uri:spiffe://forge.test/ci/runner1"));
+    CHECK(one("san:email:ci@forge.test")); CHECK(!one("san:email:CI@forge.test")); CHECK(!one("san:email:ci@forge.example"));
+    CHECK(one("san:ip:10.1.2.3")); CHECK(!one("san:ip:10.1.2.4")); CHECK(one("san:ip:fd00::7")); CHECK(one("san:ip:FD00:0:0::7")); CHECK(!one("san:ip:fd00::8"));
+    CHECK(!one("san:dns:10.1.2.3")); CHECK(!one("san:uri:runner1.ci.forge.test:"));   // types do not cross
+    CHECK(one("cn:san-one"));                                                     // cn: rules still work for it
+    // With tokens: the san: rule's permissions intersect with the token's, and a san: rule wins over a cn: rule.
+    {
+        R::server_security sec; sec.tls = {p.srv, p.srv_key, p.ca}; sec.allow_scripts = true; sec.tokens = R::parse_tokens("full\n");
+        sec.client_map = R::parse_client_map("cn:san-one by-name\nallow=device.elementwise,scripts.run san:dns:*.ci.forge.test runners\nallow=device san:uri:spiffe://forge.test/ci/runner1 later\n");
+        R::server srv(nullptr, 0, "127.0.0.1", sec);
+        std::mutex lm; std::string logs; srv.log = [&](const std::string& m) { std::lock_guard g(lm); logs += m + "\n"; };
+        R::server::script_request last;
+        srv.script_request_handler = [&](const R::server::script_request& r) { std::lock_guard g(lm); last = r; return R::server::script_result{true, "", "", "ran"}; };
+        srv.start(); std::string why;
+        auto c = R::client::connect("127.0.0.1", std::to_string(srv.port()), &why, with_cert(tls_tok("full"), q.san1, q.san1_key)); CHECK_MSG(c != nullptr, "%s", why.c_str());
+        if (c) {
+            CHECK(relu_ok(*c));
+            CHECK(throws_with([&] { matmul_ok(*c); }, "permission denied"));          // device.elementwise only
+            CHECK(c->run_script("x").ok); CHECK(!last.allow_fs && !last.allow_net && !last.allow_proc);
+            CHECK_MSG(last.who == "token#1 cert:san=dns:runner1.ci.forge.test (runners)", "%s", last.who.c_str());
+        }
+        why.clear(); CHECK(!R::client::connect("127.0.0.1", std::to_string(srv.port()), &why, with_cert(tls_tok("full"), q.san2, q.san2_key)));   // no rule for san-two
+        CHECK_MSG(why.find("client certificate not authorized") != std::string::npos, "%s", why.c_str());
+        srv.stop();
+        CHECK_MSG(logs.find("authenticated token#1 cert:san=dns:runner1.ci.forge.test (runners) allow=device.elementwise,scripts.run") != std::string::npos, "%s", logs.c_str());
+    }
+}
+// Revocation: a CRL checked in the TLS handshake, a deny-list of fingerprints checked with the credentials, and both
+// re-read when their files change.
+TEST(rpc_tls_revocation) {
+    if (!tls_or_skip()) return;
+    auto& p = pki(); auto& q = pki2(); CHECK(p.ok); CHECK(q.ok); namespace R = graph::rpc;
+    if (!p.ok || !q.ok) return;
+    auto cl = with_cert(tls_tok("t"), p.cl, p.cl_key), cl2 = with_cert(tls_tok("t"), p.cl2, p.cl2_key), cl3 = with_cert(tls_tok("t"), p.cl3, p.cl3_key);
+    std::mutex lm; std::string logs; auto logger = [&](const std::string& m) { std::lock_guard g(lm); logs += m + "\n"; };
+    auto logged = [&](std::string_view what) { std::lock_guard g(lm); return logs.find(what) != std::string::npos; };
+    {   // a CRL that revokes cl3: its handshake fails, whatever token it holds; the other certificates are served
+        R::server_security sec; sec.tokens = {"t"}; sec.tls = {p.srv, p.srv_key, p.ca, {q.crl_cl3}};
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.log = logger; srv.start();
+        CHECK_MSG(try_relu(srv.port(), cl).empty(), "%s", try_relu(srv.port(), cl).c_str());
+        CHECK(try_relu(srv.port(), cl2).empty());
+        CHECK(!try_relu(srv.port(), cl3).empty());
+        CHECK(try_relu(srv.port(), cl).empty());
+        CHECK(srv.ops() == 3);
+        srv.stop();
+        CHECK_MSG(logged("refused: tls accept:") && logged("certificate revoked"), "%s", logs.c_str());
+    }
+    {   // a CRL that revokes nothing serves cl3; a server without a CRL of the client CA would not check at all
+        R::server_security sec; sec.tokens = {"t"}; sec.tls = {p.srv, p.srv_key, p.ca, {q.crl_none}};
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.start();
+        CHECK_MSG(try_relu(srv.port(), cl3).empty(), "%s", try_relu(srv.port(), cl3).c_str());
+        srv.stop();
+    }
+    {   // configuration errors: fail closed at start
+        R::server_security sec; sec.tokens = {"t"}; sec.tls = {p.srv, p.srv_key, "", {q.crl_cl3}};              // a CRL without a client CA
+        CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", sec); }, "needs client certificates"));
+        sec.tls = {p.srv, p.srv_key, p.ca, {tmp("missing-crl.pem")}};
+        CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", sec); }, "cannot read CRL"));
+        sec.tls = {p.srv, p.srv_key, p.ca, {p.ca}};                                                                // PEM, but no CRL in it
+        CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", sec); }, "no PEM CRL in"));
+        // a CRL from another issuer does not cover the client CA: every client is refused (no CRL = fail closed)
+        auto other_key = pki2().dir + "/other.key", other_ca = pki2().dir + "/other.pem", other_crl = pki2().dir + "/other-crl.pem", cnf = pki2().dir + "/ca.cnf";
+        CHECK(ossl({"req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1", "-subj", "/CN=another-ca", "-keyout", other_key, "-out", other_ca}));
+        CHECK(ossl({"ca", "-config", cnf, "-keyfile", other_key, "-cert", other_ca, "-gencrl", "-out", other_crl}));
+        sec.tls = {p.srv, p.srv_key, p.ca, {other_crl}};
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.log = logger; srv.start();
+        CHECK(!try_relu(srv.port(), cl).empty());
+        srv.stop();
+        CHECK_MSG(logged("unable to get certificate CRL"), "%s", logs.c_str());
+    }
+    {   // reload: the CRL file is replaced while the server runs
+        auto live = pki2().dir + "/live-crl.pem"; CHECK(write_text(live, slurp(q.crl_none)));
+        R::server_security sec; sec.tokens = {"t"}; sec.tls = {p.srv, p.srv_key, p.ca, {live}};
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.log = logger; srv.start();
+        CHECK(try_relu(srv.port(), cl3).empty());
+        CHECK(write_text(live, slurp(q.crl_cl3)));
+        CHECK(!try_relu(srv.port(), cl3).empty());                               // revoked from the next connection on
+        CHECK(try_relu(srv.port(), cl).empty());
+        CHECK_MSG(logged("reloaded certificate revocation lists (1 CRL file(s), 0 revoked fingerprint(s))"), "%s", logs.c_str());
+        CHECK(write_text(live, "not a CRL\n"));                                  // a broken file keeps the previous list
+        CHECK(!try_relu(srv.port(), cl3).empty());
+        CHECK(try_relu(srv.port(), cl).empty());
+        CHECK_MSG(logged("certificate revocation reload failed, keeping the previous lists"), "%s", logs.c_str());
+        srv.stop();
+    }
+    {   // the deny-list: a fingerprint as the openssl CLI prints it; refused with a valid token or key
+        auto key_id = ident(6);
+        R::server_security sec; sec.tokens = {"t"}; sec.authorized_keys = {pubhex(*key_id)}; sec.tls = {p.srv, p.srv_key, p.ca};
+        sec.revoked_certs = {cli_fingerprint(p.cl2)};
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.log = logger; srv.start();
+        CHECK(try_relu(srv.port(), cl).empty());
+        auto e = try_relu(srv.port(), cl2); CHECK_MSG(e.find("permission denied: client certificate revoked") != std::string::npos, "%s", e.c_str());
+        auto ks = with_cert(tls_tok(""), p.cl2, p.cl2_key); ks.key = key_id;
+        e = try_relu(srv.port(), ks); CHECK_MSG(e.find("client certificate revoked") != std::string::npos, "%s", e.c_str());
+        ks = with_cert(tls_tok(""), p.cl, p.cl_key); ks.key = key_id; CHECK(try_relu(srv.port(), ks).empty());
+        e = try_relu(srv.port(), with_cert(tls_tok("wrong"), p.cl2, p.cl2_key)); CHECK_MSG(e.find("bad token") != std::string::npos, "%s", e.c_str());   // no hint without a credential
+        CHECK(srv.ops() == 2);
+        srv.stop();
+        CHECK_MSG(logged("refused: token#1 with cert:sha256:") && logged("is on the revoked list"), "%s", logs.c_str());
+        sec.revoked_certs = {"abcd"};
+        CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", sec); }, "64-hex"));
+    }
+    {   // a revoked file, with a client map and no tokens (certificates authenticate), edited while the server runs
+        auto file = pki2().dir + "/revoked.txt"; CHECK(write_text(file, "# nothing revoked yet\n"));
+        R::server_security sec; sec.tls = {p.srv, p.srv_key, p.ca}; sec.client_map = R::parse_client_map("cn:forge-client\ncn:forge-client-2\n");
+        sec.revoked_files = {file};
+        R::server srv(nullptr, 0, "127.0.0.1", sec); srv.log = logger; srv.start();
+        auto c1 = with_cert(tls_tok(""), p.cl, p.cl_key), c2 = with_cert(tls_tok(""), p.cl2, p.cl2_key);
+        CHECK(try_relu(srv.port(), c1).empty()); CHECK(try_relu(srv.port(), c2).empty());
+        CHECK(write_text(file, "# nothing revoked yet\nsha256:" + cli_fingerprint(p.cl) + " lost laptop\n"));
+        auto e = try_relu(srv.port(), c1); CHECK_MSG(e.find("client certificate revoked") != std::string::npos, "%s", e.c_str());
+        CHECK(try_relu(srv.port(), c2).empty());
+        CHECK_MSG(logged("(0 CRL file(s), 1 revoked fingerprint(s))"), "%s", logs.c_str());
+        CHECK(srv.ops() == 3);
+        srv.stop();
+        sec.revoked_files = {tmp("missing-revoked.txt")};
+        CHECK(throws_with([&] { R::server x(nullptr, 0, "127.0.0.1", sec); }, "cannot read revoked list"));
+    }
+}
 TEST(rpc_tls_zz_cleanup) {
     if (!graph::rpc::tls_available()) return;
     auto& p = pki();
     for (auto* f : {&p.srv, &p.srv_key, &p.ca, &p.ca_key, &p.cl, &p.cl_key, &p.cl2, &p.cl2_key, &p.cl3, &p.cl3_key, &p.rogue, &p.rogue_key}) { std::error_code ec; std::filesystem::remove(*f, ec); }
+    if (std::error_code ec; !openssl_bin().empty() && !pki2().dir.empty()) std::filesystem::remove_all(pki2().dir, ec);
 }

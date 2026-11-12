@@ -169,8 +169,131 @@ inline bool is_elevated() {
 #endif
 }
 
+// ---------------------------------------------------------------- account database, sessions, elevation
+// Windows: gid is the RID of the group's SID, sid the full SID; members are "DOMAIN\name" for local groups
+// (netapi32, loaded at run time). POSIX: the group database (NSS: files, LDAP, OpenDirectory on macOS).
+struct group_info { std::string name; long gid = -1; std::vector<std::string> members; std::string sid; };
+namespace detail_users {
+inline std::mutex& db_mutex() { static std::mutex m; return m; }   // getpwent / getgrent / getutxent keep process-wide cursors
+#if defined(FORGE_OS_WINDOWS)
+struct netapi {
+    HMODULE h = LoadLibraryExW(L"netapi32.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/);
+    template <class F> F get(const char* n) const { return h ? reinterpret_cast<F>(reinterpret_cast<void*>(GetProcAddress(h, n))) : nullptr; }
+    static const netapi& api() { static const netapi a; return a; }
+};
+inline std::vector<std::string> local_group_members(const std::wstring& group) {
+    std::vector<std::string> out; auto& na = netapi::api();
+    auto members = na.get<DWORD(WINAPI*)(const wchar_t*, const wchar_t*, DWORD, LPBYTE*, DWORD, DWORD*, DWORD*, DWORD_PTR*)>("NetLocalGroupGetMembers");
+    auto fre = na.get<DWORD(WINAPI*)(void*)>("NetApiBufferFree"); if (!members || !fre) return out;
+    LPBYTE b = nullptr; DWORD n = 0, tot = 0;
+    if (members(nullptr, group.c_str(), 3, &b, MAX_PREFERRED_LENGTH, &n, &tot, nullptr) == NERR_Success && b) { auto* m = reinterpret_cast<LOCALGROUP_MEMBERS_INFO_3*>(b); for (DWORD i = 0; i < n; ++i) if (m[i].lgrmi3_domainandname) out.push_back(narrow(m[i].lgrmi3_domainandname)); }
+    if (b) fre(b);
+    return out;
+}
+#else
+inline group_info group_from_(const group& g) {
+    group_info r; r.name = g.gr_name ? g.gr_name : ""; r.gid = long(g.gr_gid);
+    for (char** m = g.gr_mem; m && *m; ++m) r.members.push_back(*m);
+    return r;
+}
+#endif
+}
+inline result<group_info> lookup_group(const std::string& name) {
+#if defined(FORGE_OS_POSIX)
+    std::vector<char> b(16384); group g{}, *r = nullptr; int rc = 0;
+    for (int tries = 0; tries < 6 && (rc = ::getgrnam_r(name.c_str(), &g, b.data(), b.size(), &r)) == ERANGE; ++tries) b.resize(b.size() * 4);   // big groups
+    if (rc || !r) return {{}, error{rc ? rc : ENOENT, "group " + name + ": not found"}};
+    return {detail_users::group_from_(g), {}};
+#else
+    BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD sn = sizeof sid; wchar_t dom[256]; DWORD dn = 256; SID_NAME_USE use{};
+    if (!LookupAccountNameW(nullptr, widen(name).c_str(), sid, &sn, dom, &dn, &use) || (use != SidTypeGroup && use != SidTypeAlias && use != SidTypeWellKnownGroup))
+        return {{}, error{ERROR_NONE_MAPPED, "group " + name + ": not found"}};
+    group_info g; g.name = name; g.gid = sid_rid_(sid); g.sid = sid_string_(sid); g.members = detail_users::local_group_members(widen(name));
+    return {std::move(g), {}};
+#endif
+}
+// Local accounts (Windows: NetUserEnum normal accounts; POSIX: getpwent, which on directory-backed systems may
+// list only local users). Android: unsupported below API 26; each app has its own uid anyway.
+inline result<std::vector<user_info>> list_users() {
+    std::vector<user_info> out;
+#if defined(FORGE_OS_WINDOWS)
+    auto& na = detail_users::netapi::api();
+    auto en = na.get<DWORD(WINAPI*)(const wchar_t*, DWORD, DWORD, LPBYTE*, DWORD, DWORD*, DWORD*, DWORD*)>("NetUserEnum");
+    auto fre = na.get<DWORD(WINAPI*)(void*)>("NetApiBufferFree"); if (!en || !fre) return {{}, unsupported("list_users (netapi32)")};
+    DWORD resume = 0, rc = 0;
+    do {
+        LPBYTE b = nullptr; DWORD n = 0, tot = 0;
+        rc = en(nullptr, 0, 2 /*FILTER_NORMAL_ACCOUNT*/, &b, MAX_PREFERRED_LENGTH, &n, &tot, &resume);
+        if ((rc == NERR_Success || rc == ERROR_MORE_DATA) && b) { auto* u = reinterpret_cast<USER_INFO_0*>(b); for (DWORD i = 0; i < n; ++i) if (u[i].usri0_name) { if (auto r = lookup_user(narrow(u[i].usri0_name))) out.push_back(std::move(r.value)); else { user_info x; x.name = narrow(u[i].usri0_name); out.push_back(std::move(x)); } } }
+        if (b) fre(b);
+    } while (rc == ERROR_MORE_DATA);
+    if (rc != NERR_Success) return {{}, error{int(rc), "NetUserEnum: " + error_text(int(rc))}};
+#elif defined(FORGE_OS_ANDROID) && __ANDROID_API__ < 26
+    return {{}, unsupported("list_users (getpwent needs API 26)")};
+#else
+    std::vector<passwd> rows; std::vector<std::string> names;
+    { std::lock_guard<std::mutex> g(detail_users::db_mutex()); ::setpwent(); while (passwd* p = ::getpwent()) if (p->pw_name) names.push_back(p->pw_name); ::endpwent(); }
+    for (auto& n : names) { bool dup = false; for (auto& x : out) dup |= x.name == n; if (dup) continue; if (auto r = lookup_user(n)) out.push_back(std::move(r.value)); }
+#endif
+    return {std::move(out), {}};
+}
+inline result<std::vector<group_info>> list_groups() {
+    std::vector<group_info> out;
+#if defined(FORGE_OS_WINDOWS)
+    auto& na = detail_users::netapi::api();
+    auto en = na.get<DWORD(WINAPI*)(const wchar_t*, DWORD, LPBYTE*, DWORD, DWORD*, DWORD*, DWORD_PTR*)>("NetLocalGroupEnum");
+    auto fre = na.get<DWORD(WINAPI*)(void*)>("NetApiBufferFree"); if (!en || !fre) return {{}, unsupported("list_groups (netapi32)")};
+    DWORD_PTR resume = 0; DWORD rc = 0;
+    do {
+        LPBYTE b = nullptr; DWORD n = 0, tot = 0;
+        rc = en(nullptr, 0, &b, MAX_PREFERRED_LENGTH, &n, &tot, &resume);
+        if ((rc == NERR_Success || rc == ERROR_MORE_DATA) && b) { auto* g = reinterpret_cast<LOCALGROUP_INFO_0*>(b); for (DWORD i = 0; i < n; ++i) if (g[i].lgrpi0_name) { if (auto r = lookup_group(narrow(g[i].lgrpi0_name))) out.push_back(std::move(r.value)); } }
+        if (b) fre(b);
+    } while (rc == ERROR_MORE_DATA);
+    if (rc != NERR_Success) return {{}, error{int(rc), "NetLocalGroupEnum: " + error_text(int(rc))}};
+#elif defined(FORGE_OS_ANDROID) && __ANDROID_API__ < 26
+    return {{}, unsupported("list_groups (getgrent needs API 26)")};
+#else
+    std::lock_guard<std::mutex> g(detail_users::db_mutex());
+    ::setgrent(); while (group* p = ::getgrent()) { if (!p->gr_name) continue; bool dup = false; for (auto& x : out) dup |= x.name == p->gr_name; if (!dup) out.push_back(detail_users::group_from_(*p)); } ::endgrent();
+#endif
+    return {std::move(out), {}};
+}
+// May this user administer the machine? True when already elevated, and also for an account that could elevate:
+// Windows: a member of Administrators (a UAC-filtered token counts); macOS: group admin; FreeBSD: wheel;
+// Linux: sudo, wheel or admin. Android / iOS apps: false.
+inline bool is_admin() {
+    if (is_elevated()) return true;
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE t = nullptr; bool r = false;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) {
+        DWORD ty = 0, n = 0; if (GetTokenInformation(t, static_cast<TOKEN_INFORMATION_CLASS>(18) /*TokenElevationType*/, &ty, sizeof ty, &n)) r = ty == 2 /*Full*/ || ty == 3 /*Limited: an administrator's filtered token*/;
+        CloseHandle(t);
+    }
+    if (!r) { BYTE sid[SECURITY_MAX_SID_SIZE]; DWORD sn = sizeof sid; BOOL member = FALSE; if (CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, sid, &sn) && CheckTokenMembership(nullptr, sid, &member)) r = member != FALSE; }
+    return r;
+#elif defined(FORGE_OS_ANDROID) || defined(FORGE_OS_IOS)
+    return false;
+#else
+    auto u = current_user();
+    for (auto& g : u.groups) {
+#if defined(__APPLE__)
+        if (g == "admin") return true;
+#elif defined(FORGE_OS_FREEBSD)
+        if (g == "wheel") return true;
+#else
+        if (g == "sudo" || g == "wheel" || g == "admin") return true;
+#endif
+    }
+    return false;
+#endif
+}
+
 // ---------------------------------------------------------------- standard per-user directories
-enum class user_dir { config, cache, data, state, runtime, documents, downloads, desktop };
+// music .. temp were added later (kept at the end so existing values do not move). public_share: files shared
+// with other users of the machine; templates: document templates (Linux; elsewhere the documents directory);
+// fonts / applications: where a user installs fonts and programs for themselves.
+enum class user_dir { config, cache, data, state, runtime, documents, downloads, desktop, music, pictures, videos, public_share, templates, fonts, applications, home, temp };
 #if defined(FORGE_OS_WINDOWS)
 // SHGetKnownFolderPath (shell32/ole32 loaded at run time): follows folder redirection (OneDrive, Group Policy).
 inline std::string known_folder_(const GUID& id) {
@@ -221,6 +344,15 @@ inline std::string user_directory(user_dir d) {
         case user_dir::documents: return kf(docs, h + "\\Documents");
         case user_dir::downloads: return kf(downloads, h + "\\Downloads");
         case user_dir::desktop: return kf(desktop, h + "\\Desktop");
+        case user_dir::music: { static const GUID g{0x4BD8D571, 0x6D19, 0x48D3, {0xBE, 0x97, 0x42, 0x22, 0x20, 0x08, 0x0E, 0x43}}; return kf(g, h + "\\Music"); }
+        case user_dir::pictures: { static const GUID g{0x33E28130, 0x4E1E, 0x4676, {0x83, 0x5A, 0x98, 0x39, 0x5C, 0x3B, 0xC3, 0xBB}}; return kf(g, h + "\\Pictures"); }
+        case user_dir::videos: { static const GUID g{0x18989B1D, 0x99B5, 0x455B, {0x84, 0x1C, 0xAB, 0x7C, 0x74, 0xE4, 0xDD, 0xFC}}; return kf(g, h + "\\Videos"); }
+        case user_dir::public_share: { static const GUID g{0xDFDF76A2, 0xC82A, 0x4D63, {0x90, 0x6A, 0x56, 0x44, 0xAC, 0x45, 0x73, 0x85}}; return kf(g, getenv("PUBLIC", "C:\\Users\\Public")); }
+        case user_dir::templates: { static const GUID g{0xA63293E8, 0x664E, 0x48DB, {0xA0, 0x79, 0xDF, 0x75, 0x9E, 0x05, 0x09, 0xF7}}; return kf(g, ad() + "\\Microsoft\\Windows\\Templates"); }
+        case user_dir::fonts: return lad() + "\\Microsoft\\Windows\\Fonts";
+        case user_dir::applications: { static const GUID g{0x5CD7AEE2, 0x2219, 0x4A67, {0xB8, 0x5D, 0x6C, 0x9C, 0xE1, 0x56, 0x60, 0xCB}}; return kf(g, lad() + "\\Programs"); }
+        case user_dir::home: return h;
+        case user_dir::temp: return temp_dir();
     }
 #elif defined(__APPLE__)
     switch (d) {
@@ -230,6 +362,15 @@ inline std::string user_directory(user_dir d) {
         case user_dir::documents: return h + "/Documents";
         case user_dir::downloads: return h + "/Downloads";
         case user_dir::desktop: return h + "/Desktop";
+        case user_dir::music: return h + "/Music";
+        case user_dir::pictures: return h + "/Pictures";
+        case user_dir::videos: return h + "/Movies";
+        case user_dir::public_share: return h + "/Public";
+        case user_dir::templates: return h + "/Documents";
+        case user_dir::fonts: return h + "/Library/Fonts";
+        case user_dir::applications: return h + "/Applications";
+        case user_dir::home: return h;
+        case user_dir::temp: return temp_dir();
     }
 #else
     auto x = [&](const char* var, const std::string& dflt) { auto v = getenv(var); return v.empty() || v[0] != '/' ? dflt : v; };
@@ -244,6 +385,15 @@ inline std::string user_directory(user_dir d) {
         case user_dir::documents: return u("XDG_DOCUMENTS_DIR", h + "/Documents");
         case user_dir::downloads: return u("XDG_DOWNLOAD_DIR", h + "/Downloads");
         case user_dir::desktop: return u("XDG_DESKTOP_DIR", h + "/Desktop");
+        case user_dir::music: return u("XDG_MUSIC_DIR", h + "/Music");
+        case user_dir::pictures: return u("XDG_PICTURES_DIR", h + "/Pictures");
+        case user_dir::videos: return u("XDG_VIDEOS_DIR", h + "/Videos");
+        case user_dir::public_share: return u("XDG_PUBLICSHARE_DIR", h + "/Public");
+        case user_dir::templates: return u("XDG_TEMPLATES_DIR", h + "/Templates");
+        case user_dir::fonts: return x("XDG_DATA_HOME", h + "/.local/share") + "/fonts";
+        case user_dir::applications: return h + "/.local/bin";
+        case user_dir::home: return h;
+        case user_dir::temp: return temp_dir();
     }
 #endif
     return h;

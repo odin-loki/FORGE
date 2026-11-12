@@ -5,7 +5,9 @@
 // Wire format (little endian): request  = "FRPC" u32 op-name-len name u32 nattrs {key, tag, value} u32 nin {u32 rank, i64 dims, f32 data} u32 rank i64 out-dims
 //                              response = u32 status(0 ok) then f32 out data, or u32 len + error text.
 // Not optimised: weights travel with every op (no remote residency yet).
-// Security (rpc_secure.hpp, docs/rpc.md): optional TLS + token / Ed25519 key auth before the first frame.
+// Security (rpc_secure.hpp, docs/rpc.md): optional TLS + token / Ed25519 key auth before the first frame; per-rule
+// permissions and limits are checked on every request (a refused request gets "permission denied: ..." and the
+// connection stays usable); client certificates can be revoked by CRL or by a fingerprint deny-list.
 // Remote scripts:  request  = "FRPS" str source, str name, u32 argc {str}, u32 timeout_ms
 //                  or "FRPZ" (signed) with the same fields then str signature (the script's detached .sig text, FSS
 //                  INT-2; servers older than FRPZ close the connection)
@@ -95,6 +97,15 @@ inline void check_call(ops::op o, const std::vector<shape_t>& in, const shape_t&
     else if (inf.name == "moe_ffn") ok = rank(0) == 2 && rank(1) == 2 && rank(2) == 3 && rank(4) == 3 && in[3] == in[2] && in[1][0] == in[0][0] &&
                                          in[1][1] == in[2][0] && in[2][2] == in[0][1] && in[4] == shape_t{in[2][0], in[0][1], in[2][1]};
     if (!ok) raise(errc::shape_mismatch, "{}: operand shapes do not fit together", inf.name);
+}
+// Read and drop n bytes (the payload of a request that is refused anyway), without buffering them.
+inline void skip(reader& r, std::uint64_t n) {
+    char buf[1 << 15];
+    while (n && r.ok) { auto k = std::size_t(std::min<std::uint64_t>(n, sizeof buf)); r.raw(buf, k); n -= k; }
+}
+inline std::string_view op_class_name(ops::op_class c) {
+    static constexpr std::string_view names[] = {"elementwise", "reduction", "contraction", "data_movement", "stateful"};
+    return std::size_t(c) < std::size(names) ? names[std::size_t(c)] : std::string_view("unknown");
 }
 } // namespace detail
 
@@ -198,6 +209,17 @@ public:
     // Same, with the client's detached signature ("" for an unsigned FRPS request). Preferred over script_handler when set.
     std::function<script_result(const std::string& src, const std::string& name, const std::vector<std::string>& argv, std::uint32_t timeout_ms,
                                 const std::string& signature)> signed_script_handler;
+    // The whole request: also who sent it and which capabilities its permissions leave the script (scripts.fs,
+    // scripts.net, scripts.proc). Preferred over the two above when set, and the only handler that serves peers
+    // without the full `scripts` set: the other two cannot withhold a capability, so such peers are refused.
+    // timeout_ms already has the peer's script-timeout= limit applied (0 = the client asked for none and has no limit).
+    struct script_request {
+        std::string source, name; std::vector<std::string> argv; std::uint32_t timeout_ms = 0;
+        std::string signature;                  // the client's detached signature ("" for an unsigned FRPS request)
+        std::string who;                        // the authenticated principal, as in the security log
+        bool allow_fs = true, allow_net = true, allow_proc = true;
+    };
+    std::function<script_result(const script_request&)> script_request_handler;
     // Security log (optional): authentications with the principal and its permissions, refusals, permission denials.
     // Called from connection threads.
     std::function<void(const std::string&)> log;
@@ -215,6 +237,21 @@ public:
 #endif
         }
         if (!sec_.client_map.empty() && sec_.tls.client_ca_file.empty()) raise(errc::invalid_argument, "rpc: a client certificate map needs client certificates (mTLS: a client CA)");
+        if ((!sec_.tls.crl_files.empty() || !sec_.revoked_certs.empty() || !sec_.revoked_files.empty()) && sec_.tls.client_ca_file.empty())
+            raise(errc::invalid_argument, "rpc: certificate revocation (a CRL or a revoked list) needs client certificates (mTLS: a client CA)");
+        for (auto& h : sec_.revoked_certs) {   // "AB:CD:..." or "sha256:..." -> lower-case hex; anything else is an error
+            auto one = parse_revoked(h, "revoked certificate");
+            if (one.size() != 1) raise(errc::invalid_argument, "rpc: revoked certificate: want one 64-hex SHA-256 fingerprint");
+            h = one[0];
+        }
+        // ops= names are checked against the op table, so a typo is an error instead of a rule that allows nothing
+        auto check_ops = [](const limits& l, std::string_view where) {
+            for (auto& o : l.ops) if (detail::op_index(o) < 0) raise(errc::invalid_argument, "rpc: ops= of {} names an unknown op '{}'", where, o);
+        };
+        for (std::size_t i = 0; i < sec_.tokens.size(); ++i) check_ops(sec_.tokens[i].lim, "token#" + std::to_string(i + 1));
+        for (auto& k : sec_.authorized_keys) check_ops(k.lim, "key " + k.pub.substr(0, 8));
+        for (auto& c : sec_.client_map) check_ops(c.lim, "client-map rule " + c.value.substr(0, 16));
+        revoked_ = load_revoked(); stamp_ = watch_stamp(); has_tls_ = !sec_.tls.cert_file.empty();
         if (sec_.allow_scripts && !sec_.has_credentials()) raise(errc::invalid_argument, "rpc: remote scripts need authentication (tokens or authorized keys)");
         auto l = os::socket::listen(bind, port, 8);
         if (!l) raise(errc::io_error, "rpc: cannot listen on {}:{}: {}", bind, port, l.err.what);
@@ -233,10 +270,15 @@ public:
             if (!c) { if (stop_) break; continue; }
             auto ch = std::make_shared<channel>(std::move(c.value));
             auto done = std::make_shared<std::atomic<bool>>(false);
+            reload_if_changed();   // CRLs / revoked lists edited since the last connection
+            conn_env env; env.revoked = revoked_;
+#ifdef FORGE_HAVE_TLS
+            env.tls = tls_;
+#endif
             std::lock_guard g(m_);
             for (std::size_t i = 0; i < conns_.size();)   // reap finished connections
                 if (conns_[i].done->load()) { if (conns_[i].th.joinable()) conns_[i].th.join(); conns_.erase(conns_.begin() + std::ptrdiff_t(i)); } else ++i;
-            conns_.push_back({ch, done, std::thread([this, ch, done] { serve_conn(*ch); ch->shutdown_both(); done->store(true); })});
+            conns_.push_back({ch, done, std::thread([this, ch, done, env] { serve_conn(*ch, env); ch->shutdown_both(); done->store(true); })});
         }
     }
     void start() { th_ = std::thread([this] { run(); }); }
@@ -254,12 +296,61 @@ public:
         for (auto& c : cs) if (c.th.joinable()) c.th.join();     // workers never outlive the server
     }
 private:
-    void serve_conn(channel& s) {
+    // What one connection is served with: the TLS context and certificate deny-list in force when it was accepted
+    // (a reload replaces them for later connections only).
+    struct conn_env {
 #ifdef FORGE_HAVE_TLS
-        if (tls_) { s.sock().set_timeout_ms(15000); if (!s.accept_tls(tls_, nullptr)) return; s.sock().set_timeout_ms(0); }
+        std::shared_ptr<SSL_CTX> tls;
 #endif
-        peer_info peer; bool first = true; auto conn_id = ++conn_seq_;
+        std::shared_ptr<const std::vector<std::string>> revoked;
+    };
+    // Deny-list in force: the configured fingerprints plus those of the revoked files.
+    std::shared_ptr<const std::vector<std::string>> load_revoked() const {
+        auto v = std::make_shared<std::vector<std::string>>(sec_.revoked_certs);
+        for (auto& f : sec_.revoked_files) {
+            auto r = os::read_file(f); if (!r) raise(errc::io_error, "rpc: cannot read revoked list {}: {}", f, r.err.what);
+            auto x = parse_revoked(r.value, f); v->insert(v->end(), x.begin(), x.end());
+        }
+        return v;
+    }
+    // Modification time and size of every CRL and revoked file ("" = nothing to watch).
+    std::string watch_stamp() const {
+        std::string st;
+        auto add = [&](const std::string& f) {
+            auto m = os::fs::mtime_ns(f); auto z = os::fs::file_size(f);
+            st += f + '|' + (m ? std::to_string(m.value) : std::string("?")) + '|' + (z ? std::to_string(z.value) : std::string("?")) + '\n';
+        };
+        for (auto& f : sec_.tls.crl_files) add(f);
+        for (auto& f : sec_.revoked_files) add(f);
+        return st;
+    }
+    // Called from run() before each connection is served: when a CRL or revoked file changed on disk, load them
+    // again (the TLS context is rebuilt, so the certificate, key and client CA files are read again too). A failed
+    // reload keeps the previous lists and is logged; it is retried when a file changes again.
+    void reload_if_changed() {
+        if (sec_.tls.crl_files.empty() && sec_.revoked_files.empty()) return;
+        auto st = watch_stamp(); if (st == stamp_) return;
+        stamp_ = std::move(st);
+        try {
+            auto rv = load_revoked();
+#ifdef FORGE_HAVE_TLS
+            if (tls_) tls_ = make_server_tls(sec_.tls);
+#endif
+            revoked_ = std::move(rv);
+            if (log) log("reloaded certificate revocation lists (" + std::to_string(sec_.tls.crl_files.size()) + " CRL file(s), " + std::to_string(revoked_->size()) + " revoked fingerprint(s))");
+        } catch (const std::exception& e) { if (log) log(std::string("certificate revocation reload failed, keeping the previous lists: ") + e.what()); }
+    }
+    void serve_conn(channel& s, const conn_env& env) {
+        auto conn_id = ++conn_seq_;
         auto say = [&](const std::string& m) { if (log) log("conn " + std::to_string(conn_id) + ": " + m); };
+#ifdef FORGE_HAVE_TLS
+        if (env.tls) {
+            std::string why; s.sock().set_timeout_ms(15000);
+            if (!s.accept_tls(env.tls, &why)) { say("refused: " + why); return; }
+            s.sock().set_timeout_ms(0);
+        }
+#endif
+        peer_info peer; bool first = true;
         for (;;) {
 #if defined(_WIN32)
             // Winsock: shutdown() from stop() does not reliably wake a blocked recv(), so idle between requests in slices.
@@ -272,18 +363,32 @@ private:
             if (first) {
                 first = false;
                 std::string why;
-                if (!server_auth(s, sec_, magic, peer, &why)) { say("refused: " + (why.empty() ? std::string("connection lost during authentication") : why)); return; }
-                if (peer.authed) say("authenticated " + peer.who + " allow=" + perms_string(peer.perms));
+                if (!server_auth(s, sec_, magic, peer, &why, env.revoked.get())) { say("refused: " + (why.empty() ? std::string("connection lost during authentication") : why)); return; }
+                if (peer.authed) say("authenticated " + peer.who + " allow=" + perms_string(peer.perms) + peer.lim.str());
                 else say("unauthenticated (no auth configured)");
                 if (peer.handshake) continue;   // handshake consumed; next frame
             }
             if (std::memcmp(magic, "FRPS", 4) == 0 || std::memcmp(magic, "FRPZ", 4) == 0) { if (!serve_script(s, r, peer, say, magic[3] == 'Z')) return; continue; }
             if (std::memcmp(magic, "FRPC", 4) != 0) return;
             auto name = r.str(256); auto a = detail::get_attrs(r);
-            auto n = r.u32(); if (n > 64) return;
+            auto n = r.u32(); if (!r.ok || n > 64) return;
+            int oi = detail::op_index(name);
+            // Permission checks (per request). What is known before the tensors arrive is decided first, so a refused
+            // request is not buffered: its payload is read and dropped, which keeps the connection usable.
+            std::string deny;   // why this peer may not run this request ("" = it may)
+            if (!(peer.perms & perm_device)) deny = "may not run device ops (allow=)";
+            else if (oi >= 0) {
+                auto cls = ops::info(ops::op(oi)).cls;
+                if (!(peer.perms & perm_for_op_class(unsigned(cls)))) deny = "may not run " + std::string(detail::op_class_name(cls)) + " ops such as " + name + " (allow=device." + std::string(detail::op_class_name(cls)) + ")";
+                else if (!peer.lim.op_allowed(name)) deny = "may not run the op " + name + " (ops=)";
+            }
+            const std::uint64_t cap = peer.lim.max_bytes; std::uint64_t bytes = 0;
+            auto over = [&] { return cap && bytes > cap; };
             std::vector<tensor> ins; std::vector<tensor_view> views; std::vector<shape_t> shapes;
             for (std::uint32_t i = 0; i < n && r.ok; ++i) {
-                auto sh = r.shape(); if (!detail::valid_shape(sh, i64(max_tensor_elems))) return;
+                auto sh = r.shape(); if (!r.ok || !detail::valid_shape(sh, i64(max_tensor_elems))) return;
+                auto nb = std::uint64_t(numel(sh)) * 4; bytes += nb;
+                if (!deny.empty() || over()) { ins.clear(); detail::skip(r, nb); continue; }
                 // grow with the bytes that actually arrive: a 40-byte frame may name a 16 GiB tensor
                 tensor t; t.shape = sh; const std::size_t want = std::size_t(numel(sh));
                 while (r.ok && t.data.size() < want) {
@@ -293,11 +398,12 @@ private:
                 ins.push_back(std::move(t));
             }
             auto os = r.shape(); if (!r.ok || !detail::valid_shape(os, i64(max_tensor_elems))) return;
+            bytes += std::uint64_t(numel(os)) * 4;
+            if (deny.empty() && over()) deny = "asked for an op over " + std::to_string(bytes) + " tensor bytes, above its limit (max-bytes=" + std::to_string(cap) + ")";
             for (auto& t : ins) { views.push_back({t.data.data(), t.shape}); shapes.push_back(t.shape); }
             detail::writer w;
-            int oi = detail::op_index(name);
             try {
-                if (!(peer.perms & perm_device)) { say("denied device op " + name + " for " + peer.who); raise(errc::unsupported, "permission denied: {} may not run device ops (allow=)", peer.who); }
+                if (!deny.empty()) { say("denied device op " + name + " for " + peer.who + ": " + deny); raise(errc::unsupported, "permission denied: {} {}", peer.who, deny); }
                 if (oi < 0) raise(errc::unsupported, "unknown op '{}'", name);
                 detail::check_call(ops::op(oi), shapes, os, a);
                 tensor out(os);
@@ -318,30 +424,42 @@ private:
         auto tmo = r.u32(); if (!r.ok) return false;
         std::string sig; if (with_sig) { sig = r.str(64u << 10); if (!r.ok) return false; }
         detail::writer w;
+        // scripts.run without scripts.fs / .net / .proc: the script runs, its child without those capabilities
+        const bool fs = (peer.perms & perm_scripts_fs) != 0, net = (peer.perms & perm_scripts_net) != 0, proc = (peer.perms & perm_scripts_proc) != 0;
         if (!sec_.allow_scripts || !peer.authed) { w.u32(1); w.str("remote scripts are disabled on this server"); }
-        else if (!(peer.perms & perm_scripts)) { say("denied script for " + peer.who); w.u32(1); w.str("permission denied: " + peer.who + " may not run scripts (allow=)"); }
-        else if (!script_handler && !signed_script_handler) { w.u32(1); w.str("this server has no script runtime"); }
+        else if (!(peer.perms & perm_scripts_run)) { say("denied script for " + peer.who); w.u32(1); w.str("permission denied: " + peer.who + " may not run scripts (allow=)"); }
+        else if (peer.lim.max_bytes && src.size() > peer.lim.max_bytes) {
+            say("denied script for " + peer.who + ": " + std::to_string(src.size()) + " source bytes, max-bytes=" + std::to_string(peer.lim.max_bytes));
+            w.u32(1); w.str("permission denied: " + peer.who + " sent a script of " + std::to_string(src.size()) + " bytes, above its limit (max-bytes=" + std::to_string(peer.lim.max_bytes) + ")");
+        }
+        else if (!script_request_handler && !script_handler && !signed_script_handler) { w.u32(1); w.str("this server has no script runtime"); }
+        else if (!(fs && net && proc) && !script_request_handler) {   // fail closed: the older handlers cannot withhold a capability
+            say("denied script for " + peer.who + ": the script runtime cannot restrict capabilities");
+            w.u32(1); w.str("permission denied: " + peer.who + " has no full scripts permission and this server's script runtime cannot restrict capabilities");
+        }
         else {
-            script_result res; say("script '" + name + "' for " + peer.who + (sig.empty() ? "" : " (signed)"));
-            try { res = signed_script_handler ? signed_script_handler(src, name, argv, tmo, sig) : script_handler(src, name, argv, tmo); } catch (const std::exception& e) { res.ok = false; res.error_type = "RuntimeError"; res.error = e.what(); }
+            if (auto cap = peer.lim.script_timeout_ms) tmo = tmo ? std::min(tmo, cap) : cap;
+            script_result res; std::string without = std::string(fs ? "" : " fs") + (net ? "" : " net") + (proc ? "" : " proc");
+            say("script '" + name + "' for " + peer.who + (sig.empty() ? "" : " (signed)") + (without.empty() ? "" : " without" + without));
+            try {
+                if (script_request_handler) { script_request q; q.source = std::move(src); q.name = name; q.argv = std::move(argv); q.timeout_ms = tmo; q.signature = sig; q.who = peer.who; q.allow_fs = fs; q.allow_net = net; q.allow_proc = proc; res = script_request_handler(q); }
+                else res = signed_script_handler ? signed_script_handler(src, name, argv, tmo, sig) : script_handler(src, name, argv, tmo);
+            } catch (const std::exception& e) { res.ok = false; res.error_type = "RuntimeError"; res.error = e.what(); }
             w.u32(0); w.u32(res.ok ? 1 : 0); w.str(res.error_type); w.str(res.error); w.str(res.output); ++scripts_;
         }
         return detail::send_all(s, w.b.data(), w.b.size());
     }
 public:
     std::uint64_t scripts() const { return scripts_; }
-    bool tls() const {
-#ifdef FORGE_HAVE_TLS
-        return tls_ != nullptr;
-#else
-        return false;
-#endif
-    }
+    bool tls() const { return has_tls_; }
 private:
     registry* reg_; server_security sec_; os::socket ls_; int port_ = 0; std::atomic<std::uint64_t> scripts_{0};
+    // tls_, revoked_ and stamp_ belong to the constructor and then to the run() thread (reload_if_changed);
+    // connection threads get their own references (conn_env).
 #ifdef FORGE_HAVE_TLS
     std::shared_ptr<SSL_CTX> tls_;
 #endif
+    bool has_tls_ = false; std::shared_ptr<const std::vector<std::string>> revoked_; std::string stamp_;
     std::atomic<bool> stop_{false}; std::atomic<std::uint64_t> ops_{0}, conn_seq_{0};
     std::thread th_; std::mutex m_, dev_m_; struct conn { std::shared_ptr<channel> ch; std::shared_ptr<std::atomic<bool>> done; std::thread th; };
     std::vector<conn> conns_;

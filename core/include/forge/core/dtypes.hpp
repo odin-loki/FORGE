@@ -215,7 +215,8 @@ using c64 = std::complex<double>;
 
 // Runtime dtype tag used by graph/modelfile. New tags are appended before `invalid` so stored values stay stable.
 enum class dtype : u8 { f32, f16, bf16, f64, i8, u8, i16, i32, i64, fp8_e4m3, fp8_e5m2, q8_0, q4_k,
-                        q4_g32, q8_g32, mxfp8, mxfp6, mxfp4, mxint8, nvfp4, tq2, q6_k, q5_k, invalid };
+                        q4_g32, q8_g32, mxfp8, mxfp6, mxfp4, mxint8, nvfp4, tq2, q6_k, q5_k,
+                        q4_0, q4_1, q5_0, q5_1, q2_k, q3_k, iq4_nl, iq4_xs, tq1_0, tq2_0, invalid };
 
 constexpr std::string_view name(dtype d) {
     switch (d) {
@@ -228,6 +229,9 @@ constexpr std::string_view name(dtype d) {
         case dtype::mxfp6: return "mxfp6"; case dtype::mxfp4: return "mxfp4"; case dtype::mxint8: return "mxint8";
         case dtype::nvfp4: return "nvfp4"; case dtype::tq2: return "tq2";
         case dtype::q6_k: return "q6_k"; case dtype::q5_k: return "q5_k";
+        case dtype::q4_0: return "q4_0"; case dtype::q4_1: return "q4_1"; case dtype::q5_0: return "q5_0"; case dtype::q5_1: return "q5_1";
+        case dtype::q2_k: return "q2_k"; case dtype::q3_k: return "q3_k"; case dtype::iq4_nl: return "iq4_nl"; case dtype::iq4_xs: return "iq4_xs";
+        case dtype::tq1_0: return "tq1_0"; case dtype::tq2_0: return "tq2_0";
         default: return "invalid";
     }
 }
