@@ -133,12 +133,8 @@ for everything marked "never run" above.
 
 ### Not built (the OS could do it)
 
-- cgroup v2 (Linux) and `rctl` (FreeBSD) limits for spawned processes.
-- `clone_file` on Windows ReFS (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`).
-- One reactor over sockets, events, timers and child exits (`poller` takes sockets; `wait_event` / `wait_timer`
-  expose `native()` for epoll / kqueue / `WaitForMultipleObjects`).
-- Resizing a `mapping` in place (`mremap`).
-- Named FIFOs in `pipe.hpp` (`local_ipc.hpp` covers named endpoints).
+All five items listed here on 2026-11-12 were built the same day (wave 4, below): `limit_group` (cgroup v2, rctl,
+job objects), `clone_file` on ReFS, `reactor`, `fs::mapped_file::resize`, `fifo`.
 ## System, hardware, network, services, mobile
 
 Read from the code, branch by branch, on 2026-11-12. One row per public function or class of the headers in this
@@ -320,6 +316,86 @@ of it. Nothing in `os/src/mobile/apple.mm` or `os/src/text/locale_apple.mm` was 
   fast open without `ConnectEx`.
 - **FreeBSD**: no per-user service manager, no idle inhibitor or lock-state registry, no display registry outside
   X11 / Wayland, cron cannot express arbitrary intervals, removable flag not exposed by `statfs`.
-- **Linux**: desktop features (clipboard, open, notifications, idle) depend on a session and on helper programs;
-  qemu-user translation cannot be detected. KDE proxy settings are not read.
+- **Linux**: desktop features (clipboard, open, notifications, idle) depend on a session; since wave 4 they no
+  longer need helper programs (D-Bus and X11 are spoken directly). qemu-user translation cannot be detected. PAC
+  scripts are not evaluated (no JavaScript engine).
 - **File watching**: kqueue and FSEvents do not pair the two halves of a rename, so no backend reports pairs.
+
+## Wave 4 (2026-11-12): event loop, limits, D-Bus, proxy, clipboard, appearance
+
+New headers: `reactor.hpp`, `process_limits.hpp`, `dbus.hpp`, `desktop_bus.hpp`, `proxy.hpp`, `clipboard_x11.hpp`,
+`appearance.hpp`, `timesync.hpp`. Additions to `fs.hpp` (`mapped_file`, Windows `clone_file`), `pipe.hpp` (`fifo`),
+`process.hpp` (`spawn_spec::attach`), `power.hpp` (`power::inhibit_sleep`, `power::profile`), `file_watch.hpp`
+(`native_handle`). Same legend as above.
+
+### How each OS was checked (wave 4, and a re-check of waves 1 to 3)
+
+| OS | Compiled | Run |
+|---|---|---|
+| Linux x86_64 | clang 23 (C++23), native; ASan + UBSan for the D-Bus, proxy, clipboard and misc tests; TSan for the reactor | every `test_os*` passes; `test_os_dbus` also against a real `dbus-daemon`; `test_os_clipboard` against Xvfb, cross-checked with `xsel`; `fuzz_dbus` 300 000 inputs. cgroup v2 could **not** run: the machine has a v1 hierarchy (the file protocol ran against a stand-in directory, the fallback ran for real) |
+| Windows, MinGW | g++ 13 (C++23), static link, every `test_os*` | under wine 9.0: all pass. Skipped there because wine lacks it: nested job objects (`limit_group::start`), job limits, ReFS (`clone_file` reports unsupported), `PowerCreateRequest`, plus the wave 3 list. `WinHttpGetProxyForUrl` did run (wine fetched and evaluated the test PAC script) |
+| Windows, MSVC ABI | **clang-cl 23 against the MSVC STL and Windows SDK 10.0.22621** (fetched with xwin), `/std:c++latest /W4 /permissive-`: every os header on its own and every `test_os*` linked with lld-link (static CRT) | the same tests under wine 9.0: all pass. `cl.exe` itself has still not compiled the code (clang-cl accepts some things cl rejects); real Windows has not run wave 3 or 4 |
+| macOS arm64 / x86_64 | zig 0.17 (`aarch64-macos`, `x86_64-macos`): every header on its own, every test linked | **never run** (kqueue reactor backend, `CFNetworkExecuteProxyAutoConfigurationURL`, CFPreferences appearance, `ntp_adjtime`) |
+| FreeBSD 14 x86_64 | zig 0.17 (`x86_64-freebsd`): every header on its own, every test linked | **never run** (kqueue reactor backend, rctl limit groups, ConsoleKit inhibitor) |
+| Android arm64-v8a, x86_64 | **NDK r27c (clang 18, API 26)**: every os header on its own and every `test_os*` linked | **never run** (no emulator here) |
+| iOS | not compiled (no SDK); the iOS branches of wave 3 were re-read against the UIKit / Foundation documentation | **never run** |
+
+### Event loop (`reactor.hpp`)
+| Call | Linux | Android | Windows | macOS / iOS | FreeBSD |
+|---|---|---|---|---|---|
+| `reactor` loop, `post`, `stop`, `hold`, timers (`after`, `at`, `every`) | ✓ epoll + eventfd | ✓ | ✓ completion port (timer waits rounded up to 1 ms) | ✓ kqueue | ✓ kqueue |
+| `read`, `read_exact`, `write`, `write_some` on sockets | ✓ | ✓ | ✓ `WSAEventSelect` + thread-pool wait | ✓ | ✓ |
+| the same on pipes, `local_stream`, ttys | ✓ | ✓ | **degraded**: the call starts on a helper thread; an overlapped handle is then awaited through the thread pool, a synchronous handle keeps the helper thread (16 at most) until it finishes | ✓ | ✓ |
+| `accept`, `connect` (resolver on a helper thread) | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `wait_readable`, `wait_writable` | ✓ any descriptor | ✓ | sockets only (**unsupported** for other handles: inherent) | ✓ | ✓ |
+| `on_exit(pid)` | ✓ pidfd (5.3+), else a helper thread | ✓ pidfd from API 31, else a helper thread | ✓ process handle | ✓ `EVFILT_PROC`; iOS **unsupported** (inherent) | ✓ `EVFILT_PROC` |
+| `on_event`, `on_signal` | ✓ | ✓ | ✓ (console control events; no `SIGPIPE`) | ✓ | ✓ |
+| `watch(file_watcher)` | ✓ inotify descriptor | ✓ | **degraded**: polled every 20 ms | ✓ kqueue descriptor | ✓ |
+| `read_file`, `write_file` | ✓ through `async_file_io` (io_uring) | ✓ (threads) | ✓ (IOCP) | ✓ (POSIX AIO) | ✓ (AIO + kqueue) |
+| `offload`, coroutine awaiters (`async_*`, `reactor::task`) | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+### Limits, files, pipes
+| Call | Linux | Android | Windows | macOS | iOS | FreeBSD |
+|---|---|---|---|---|---|---|
+| `limit_group` memory / CPU / process caps for a group | ✓ cgroup v2 in a writable (delegated) subtree; else **degraded** to `RLIMIT_AS` per process (`backend() == "rlimit"`) | **unsupported** with limits (apps cannot write cgroups; `RLIMIT_AS` is unusable under bionic) | ✓ job object (memory, active processes, CPU rate) | **unsupported** with limits (no mechanism; inherent) | **unsupported** | ✓ rctl rules per member process (needs `kern.racct.enable=1` and root), else **degraded** to `RLIMIT_AS` |
+| `limit_group` membership, `kill`, `usage` without limits | ✓ | ✓ (tracked pids) | ✓ | ✓ (tracked pids) | **unsupported** | ✓ |
+| `spawn_spec::attach` (start inside the group) | ✓ | ✓ | ✓ (nested job, Windows 8+) | ✓ | — | ✓ (rules added right after the spawn) |
+| `fs::mapped_file::resize` | ✓ `mremap` | ✓ | ✓ remap | ✓ remap | ✓ | ✓ remap |
+| `fs::clone_file` | ✓ (unchanged) | ✓ | ✓ ReFS / Dev Drive (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`); **unsupported** on NTFS / FAT | ✓ | ✓ | **unsupported** (inherent) |
+| `fifo::create` / `open_read` / `open_write` / `remove` | ✓ `mkfifo` | ✓ | ✓ named pipe; the reader must open first (**degraded**: nothing on disk) | ✓ | ✓ (inside the container) | ✓ |
+
+### D-Bus and what uses it
+| Call | Linux | FreeBSD | macOS | Windows / iOS / Android |
+|---|---|---|---|---|
+| `dbus` codec (`encode`, `decode`, signatures) | ✓ | ✓ | ✓ | ✓ |
+| `dbus::connection` (unix transport, EXTERNAL auth, calls, signals, fd receiving) | ✓ | ✓ (no abstract sockets) | ✓ when a bus address is given | **unsupported** (no bus) |
+| `desktop_bus::*` (notifications, portal OpenURI, FileManager1, login1, ScreenSaver, Mutter idle, portal settings, power profiles) | ✓ when the service is on the bus | ✓ likewise | **unsupported** without a bus | **unsupported** |
+| `notify` | ✓ native, helpers as fallback | ✓ | (unchanged) | (unchanged) |
+| `open_url` | ✓ helper, or the portal when none is installed / inside Flatpak or Snap | ✓ | (unchanged) | (unchanged) |
+| `reveal_path` | ✓ native FileManager1 | ✓ | (unchanged) | (unchanged) |
+| `idle_seconds` | ✓ X11, Mutter (GNOME on Wayland), logind over D-Bus | ✓ X11, Mutter | (unchanged) | (unchanged) |
+| `screen_locked` | ✓ logind over D-Bus, else ScreenSaver service | ✓ ScreenSaver service (was unsupported) | (unchanged) | (unchanged) |
+| `power::inhibit_sleep` | ✓ logind inhibitor (native client, sd-bus as fallback); `not_required` without logind | ✓ ConsoleKit2 inhibitor when present, else `not_required` | ✓ IOPMAssertion | Windows ✓ power request; iOS ✓ background task; Android **hook** |
+| `power::profile` | ✓ power-profiles-daemon, else ACPI platform profile | **unsupported** | ✓ low-power mode | Windows ✓ active scheme; iOS ✓; Android **unsupported** |
+
+### Proxy, clipboard, appearance, time
+| Call | Linux | Android | Windows | macOS | iOS | FreeBSD |
+|---|---|---|---|---|---|---|
+| `net::desktop_proxy` | ✓ env, dconf database, kioslaverc, gsettings | **hook** | ✓ (= `system_proxy`) | ✓ | ✓ | ✓ as Linux |
+| `net::resolve_proxy`, static settings | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `net::resolve_proxy`, PAC script | **not evaluated**: `pac_url_present`, `pac_evaluated == false`, no proxies (no JavaScript engine is embedded) | **not evaluated** | ✓ `WinHttpGetProxyForUrl` | ✓ `CFNetworkExecuteProxyAutoConfigurationURL` | ✓ | **not evaluated** |
+| WPAD auto-detection | not performed | not performed | not performed | not performed | not performed | not performed |
+| `clipboard::get` / `set` | ✓ X11 protocol through libxcb (also under XWayland), wl-copy / wl-paste in a Wayland session that has them, xclip / xsel as fallback | **hook** | ✓ | ✓ | ✓ | ✓ as Linux |
+| `system_appearance`, `appearance_watcher` | ✓ portal, else dconf / kdeglobals | **hook** | ✓ registry + SystemParametersInfo | ✓ CFPreferences | ✓ UIKit | ✓ as Linux |
+| `time_sync_status` | ✓ `adjtimex` | **unsupported** | **unsupported** (ask `sntp_query`) | ✓ `ntp_adjtime` | **unsupported** | ✓ `ntp_adjtime` |
+| `sntp_query` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+### Still not built
+- A native Wayland clipboard (`wl_data_device` needs a focused surface; `wlr-data-control` / `ext-data-control` are not
+  offered by GNOME). Wayland sessions use wl-copy / wl-paste, or the X11 path through XWayland.
+- The portal's `OpenFile` (needs a descriptor sent over the bus; the client only receives descriptors), so `open_path`
+  inside a Flatpak still needs `xdg-open`.
+- Secret Service over the native client (the keystore keeps libsecret at run time).
+- Audio devices and volume, SMART, Bluetooth adapter state, desktop camera enumeration, Wi-Fi SSID, firewall state,
+  temperature and fan sensors beyond what `power.hpp` reads, keyboard layout, time-zone change notifications.
+- `limit_group` I/O limits (`io.max`, job I/O rate control).

@@ -27,6 +27,8 @@
 //   returned. Destroying the reactor drops pending callbacks without calling them (after waiting for in-flight
 //   OS calls); call cancel_all() and run() first when every callback must run.
 //   Sockets and descriptors given to the reactor are switched to non-blocking mode and stay that way.
+//   POSIX: writing to a pipe whose reader has gone raises SIGPIPE unless the process ignores it
+//   (os::ignore_sigpipe()); sockets are written with MSG_NOSIGNAL / SO_NOSIGPIPE and only report EPIPE.
 #include <forge/os/detail.hpp>
 #include <forge/os/sync.hpp>
 #include <forge/os/async_file.hpp>

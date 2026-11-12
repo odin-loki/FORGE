@@ -70,6 +70,23 @@ Added 2026-11-12 (same conventions; what each OS answers is tabulated in [os-par
 | `shell_open.hpp`, `notification.hpp`, `trash.hpp` | `open_url`, `open_path`, `reveal_path`; `notify`; `trash` |
 | `dynlib.hpp` (additions), `clipboard.hpp` (additions) | `loaded_modules`, `module_of_address`, `dynlib::open_with`; `clipboard::set_backend`, UIPasteboard on iOS |
 
+Added in wave 4 (2026-11-12):
+
+| Header | Main API |
+|---|---|
+| `reactor.hpp` | `reactor`: one event loop over sockets, pipes, local IPC, timers, posted functions, child exits, signals, `wait_event`s, file watchers and file I/O; callbacks or `co_await` (`async_read`, `async_accept`, `async_sleep` ...). epoll / kqueue / completion port |
+| `process_limits.hpp` | `limit_group`: memory, CPU and process-count caps for a group of processes (cgroup v2, job object, rctl, `RLIMIT_AS` fallback); `spawn_spec::attach` |
+| `fs.hpp` (additions), `pipe.hpp` (additions) | `fs::mapped_file` with `resize`; `clone_file` on ReFS; `os::fifo` named pipes |
+| `dbus.hpp`, `desktop_bus.hpp` | a D-Bus wire client (codec + AF_UNIX connection) and the freedesktop services forge::os calls through it |
+| `proxy.hpp` | `net::desktop_proxy` (dconf, kioslaverc), `net::resolve_proxy` (PAC through WinHTTP / CFNetwork, reported as not evaluated elsewhere) |
+| `clipboard_x11.hpp` | the X11 CLIPBOARD selection through libxcb at run time; `clipboard.hpp` uses it |
+| `appearance.hpp`, `timesync.hpp`, `power.hpp` (additions) | `system_appearance`, `appearance_watcher`; `time_sync_status`, `sntp_query`; `power::inhibit_sleep`, `power::profile` |
+
+Late binding added by these: `libxcb.so.1` (clipboard), `userenv.dll` (AppContainer profiles; no longer a link
+dependency), `winhttp.dll`, CFNetwork. On Linux and FreeBSD, notifications, `open_url` (portal), `reveal_path`, idle and
+lock state and the sleep inhibitor talk to D-Bus directly; `notify-send`, `gdbus`, `loginctl`, `xclip` / `xsel` and
+libsystemd are only fallbacks now.
+
 Desktop-session features (`open_url`, `notify`, `idle_seconds`, `displays`, clipboard on Linux) return `unsupported`
 on a headless machine. `open_url`, `notify`, `displays`, `clipboard`, `system_proxy` and `machine_id` take a hook
 so Android / iOS glue (or a test) can supply them.
@@ -97,7 +114,7 @@ if (!pin && os::is_unsupported(pin.err)) { /* platform lacks it: carry on */ }
 - **Windows sandbox.** Network denial cannot be added to a running process (`apply_sandbox` returns unsupported and applies nothing); `run_sandboxed` starts a child under the full policy. `deny_fs_write` lowers the process to low integrity: writes to anything not labelled low are refused, but `%LOCALAPPDATA%Low`, volumes without ACLs and handles opened earlier stay writable. `deny_exec` is the job object (or the child-process mitigation policy).
 - **Parity.** [os-parity.md](os-parity.md) lists every call per OS: native, degraded (how) or unsupported (why), and which paths have been run, only cross-compiled, or never compiled.
 - **Wine.** The MinGW builds of the tests also run under wine (`tests/wine_run.sh`). Wine lacks parts of iphlpapi and cfgmgr32: `network_monitor` and `devices::monitor` fall back to polling there, and `default_routes` is unsupported.
-- **Tests.** `tests/test_os.cpp` (core) and `tests/test_os_ext.cpp` (one test per extension module). `test_os_ext` re-runs itself with `FORGE_OS_EXT_CHILD` set for the sandbox and crash cases, so never export that variable. When `zig` is installed, the `xos_*` ctests (label `cross;slow`) compile and link these tests for FreeBSD, macOS, MinGW Windows and aarch64 musl.
+- **Tests.** `tests/test_os.cpp` (core) and `tests/test_os_ext.cpp` (one test per extension module). `test_os_ext` re-runs itself with `FORGE_OS_EXT_CHILD` set for the sandbox and crash cases, so never export that variable. When `zig` is installed (also as the `ziglang` Python wheel), the `xos_*` ctests (label `cross;slow`) compile and link every `tests/test_os*.cpp` for FreeBSD, macOS, MinGW Windows and aarch64 musl, and `xos_headers_*` compiles every os header on its own.
 
 ## Where it has run
 | Platform | Status |

@@ -1235,7 +1235,11 @@ if(FORGE_BUILD_TESTS)
     else()
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp fuzz/driver.cpp)
     endif()
-    target_link_libraries(fuzz_${ft} PRIVATE forge_inference forge_verify forge_simd_mv)
+    if(ft STREQUAL "dbus")   # the os::dbus codec is header-only: no need to build the inference library for it
+      target_link_libraries(fuzz_${ft} PRIVATE forge_core)
+    else()
+      target_link_libraries(fuzz_${ft} PRIVATE forge_inference forge_verify forge_simd_mv)
+    endif()
     if(NOT FORGE_LIBFUZZER)
       add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${FORGE_FUZZ_ITERS} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
                WORKING_DIRECTORY ${PROJECT_BINARY_DIR})

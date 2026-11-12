@@ -26,10 +26,10 @@
 | Doc examples | `docs/examples/*` | `doc_example_*` |
 | Integration examples | `examples/integrations/*.cpp` | `example_*`, label `integration` |
 | Docs freshness | `tools/gen_docs.py --check` | `docs_up_to_date` (fails if `docs/reference.md` is stale) |
-| Fuzz | `fuzz/fuzz_*.cpp` (blueprint, fpk, gguf, grammar, json, onnx, safetensors, script, tokenizer) | `fuzz_*`, label `fuzz` |
+| Fuzz | `fuzz/fuzz_*.cpp` (blueprint, dbus, fpk, gguf, grammar, json, onnx, safetensors, script, tokenizer) | `fuzz_*`, label `fuzz` |
 | JNI syntax | `bindings/android/jni/forge_jni.c` against a JDK's `jni.h` | `jni_syntax` |
 | Mobile | `tests/mobile_build.sh` | `mobile_android_{arm64-v8a,x86_64}`, `mobile_android_device`, `mobile_ios`, labels `mobile;slow` |
-| Cross compile/link | zig cross builds | `xos_*`, labels `cross;slow` |
+| Cross compile/link | zig cross builds (`zig` on PATH, `ZIG_PATH`, or the `ziglang` Python wheel): every `tests/test_os*.cpp` and `test_loadbalancer` linked per target through `cmake/xos_link.cmake` (C sources compiled separately); `xos_headers_<target>` compiles each os header as its own translation unit | `xos_*`, labels `cross;slow` |
 | Scalable vectors under qemu | `test_simd`, `test_tile` | `lane_sve_vl<N>`, `lane_rvv_vl<N>`, `tile_sme_svl<N>` |
 | Emulated AMX tiles | Intel SDE | `tile_amx_sde_*`, label `emu` |
 
