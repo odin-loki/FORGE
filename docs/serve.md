@@ -59,10 +59,28 @@ Test: `tests/security_cli_test.py` (strict policy with a signed model serves on 
 | `GET /v1/models` | `{"object":"list","data":[{"id":<model file name>,"object":"model","owned_by":"forge"}]}` |
 | `POST /v1/completions` | `{"id","object":"text_completion","created","model","choices":[{"index","text","tokens","finish_reason"}],"usage"}` |
 | `POST /v1/chat/completions` | `{"id","object":"chat.completion",...,"choices":[{"index","message":{"role":"assistant","content"},"finish_reason"}],"usage"}` |
+| `POST /v1/embeddings` | `{"object":"list","data":[{"object":"embedding","index","embedding"}],"model","usage":{"prompt_tokens","total_tokens"}}`; see [Embeddings](#embeddings) |
 | `GET /metrics` | Prometheus text, see below |
 | `OPTIONS *` | `204` with permissive CORS headers. All responses carry `Access-Control-Allow-Origin: *` |
 
-The method is only checked on the completion endpoints (`405` otherwise). Other paths get `404`.
+The method is only checked on the completion and embedding endpoints (`405` otherwise). Other paths get `404`.
+
+### Embeddings
+
+`POST /v1/embeddings` serves a model whose blueprint declares `session embedding` and takes token input (the `bert` template: BERT, RoBERTa, XLM-R and the MiniLM / BGE / E5 / GTE checkpoints built on them). On such a model the completion endpoints answer `400`; on a generative model `/v1/embeddings` answers `400` naming the model's session kind.
+
+| Field | Default | Notes |
+|---|---|---|
+| `input` | required | A string, a list of strings (at most 2048), a list of token ids, or a list of token id lists. Text goes through the model's tokenizer, whose post-processor adds the special tokens (`[CLS]` ... `[SEP]`) and token types; ids are fed as given. An empty string, an id outside the vocabulary or an input longer than the model's positions is a `400` (nothing is truncated) |
+| `model` | | Accepted and ignored; the response names the served file |
+| `encoding_format` | `float` | `float`: a JSON array per vector. `base64`: base64 of the vector's little-endian f32 bytes |
+| `dimensions` | | Only the model's own size is accepted; anything else is a `400` |
+
+One vector per input, in input order (`index`). The vector is what `forge embed` prints: pooled, and L2-normalised when the checkpoint says so. `usage.prompt_tokens` counts the tokens fed to the model, special tokens included. Requests run one at a time on one embedding session (no batching); the scheduler, `--max-active`, `--max-queue` and the prefix cache do not apply to them. Vision and audio encoders (`vit`, `whisper_encoder`) take no token input and are not served here. Test: `tests/serve_embeddings_test.py` (ctest `serve_embeddings`) against the tiny BERT of `verify/golden/tiny_bert.py`.
+
+```sh
+curl -s localhost:8080/v1/embeddings -d '{"input":["hello world","second text"]}'
+```
 
 ### Request fields
 

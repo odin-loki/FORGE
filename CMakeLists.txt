@@ -1574,6 +1574,11 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # /v1/embeddings on a `session embedding` model (the tiny BERT the bert golden imports), 400 on a generative one
+      add_test(NAME serve_embeddings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_embeddings_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk
+               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/serve_embeddings)
+      set_tests_properties(serve_embeddings PROPERTIES DEPENDS "golden_tiny_bert;golden_tiny_llama")
       # forge run --chat and /v1/chat/completions through a model file's own chat template (a checked-in tiny GGUF)
       add_test(NAME chat_template_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/chat_template_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_SOURCE_DIR}/tests/data/tokenizer/gguf_tiny_llama.gguf ${PROJECT_BINARY_DIR}/chat_template_http)
@@ -1601,6 +1606,10 @@ if(FORGE_BUILD_TESTS)
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
       capi_smoke python_bindings serve_http security_cli modelfile_signing)
+    foreach(_g ${FORGE_GOLDEN_FAMILIES})   # the family goldens (and the mock-device runs of them, where defined)
+      forge_py_needs("numpy;safetensors" golden_tiny_${_g} golden_tiny_${_g}_cuda_mock golden_tiny_${_g}_opencl_mock)
+    endforeach()
+    forge_py_needs("numpy;safetensors" serve_embeddings)
     forge_py_needs("cryptography" modelfile_signing)
     forge_py_needs("numpy;onnx" onnx_import)
     if(Python3_EXECUTABLE)
