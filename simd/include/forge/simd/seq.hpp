@@ -1,6 +1,6 @@
 #pragma once
-// Sequence-mixing kernels for the CPU: chunked attention over an f32 or int8 KV cache and the column-blocked
-// gated delta rule. Each ISA table (scalar, avx2, avx512) is built from one source (seq_impl.hpp) over a
+// Sequence-mixing kernels for the CPU: chunked attention over an f32 or int8 KV cache (int8 keys optionally
+// through an int16-query integer kernel, attn_chunk_q16) and the column-blocked gated delta rule. Each ISA table (scalar, avx2, avx512) is built from one source (seq_impl.hpp) over a
 // 16-lane vector type whose operations are all exactly rounded IEEE single precision (add, mul, fma, max,
 // int8 -> float) and whose reductions use one fixed tree, and exp is a fixed polynomial written with the same
 // operations. So every table returns identical bits, and results never depend on how tokens were batched.
@@ -41,6 +41,13 @@ struct seq_kernels {
                        const float* g, const float* beta, std::size_t gb_stride, float* S, float* out, std::size_t o_stride,
                        std::size_t s, std::size_t dk, std::size_t dv, std::size_t j0, std::size_t nj);
     float (*exp1)(float);   // the tables' exp (deterministic, same bits on every target)
+    // attn_chunk with the int16-query path for int8 keys (f32 keys: identical to attn_chunk). Each query row is
+    // quantised to int16 codes with one scale (amax / 32767; fewer levels when d > 512 so an int32 cannot
+    // overflow), q.k is an exact int32 sum of int16 x int8 products (pmaddwd on x86) and the score is
+    // (float(sum) * kscale) * (qscale * scale). Integer sums have no rounding, so the tables still agree bit for bit.
+    void (*attn_chunk_q16)(const seq_kv& k, const seq_kv& v, std::size_t d, std::size_t dv, float scale, std::size_t c0, std::size_t c1,
+                           std::size_t ns, const float* const* q, const std::size_t* lo, const std::size_t* hi,
+                           float* m, float* l, float* acc, float* scratch);
 };
 
 const seq_kernels& seq_active();                  // FORGE_SIMD_TARGET picks scalar/avx2/avx512 like simd::active()

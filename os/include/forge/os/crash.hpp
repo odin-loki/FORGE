@@ -6,6 +6,11 @@
 //   tombstone / ReportCrash still happens; Windows SEH and the CRT abort / invalid-parameter / purecall paths,
 //   plus a minidump <dir>/<app>-<pid>.dmp). Details at crash_handler below.
 #include <forge/os/detail.hpp>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#elif defined(__FreeBSD__)
+#include <sys/procctl.h>
+#endif
 #if defined(FORGE_OS_POSIX)
 #include <unwind.h>
 #endif
@@ -375,4 +380,47 @@ private:
     }
 #endif
 };
+
+// ---------------------------------------------------------------- core dump control
+// Whether a crash of this process may leave a memory image behind. Turn it off in processes that hold secrets.
+//   POSIX    the RLIMIT_CORE soft limit (0, or back up to the hard limit).
+//   Linux    also PR_SET_DUMPABLE, which additionally stops ptrace attach by the same user and /proc/<pid>/mem reads.
+//   FreeBSD  also procctl(PROC_TRACE_CTL): no core, no ptrace / ktrace.
+//   Windows  the process error mode (SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS): Windows Error Reporting is
+//            not invoked for this process, so it writes no crash dump. A crash_handler installed here still writes
+//            its own report and minidump; a debugger can always take one.
+// core_dumps_enabled() reads the setting back (it cannot tell whether the system keeps core files at all).
+inline status set_core_dumps(bool enabled) {
+#if defined(FORGE_OS_WINDOWS)
+    const UINT off = SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS;
+    const UINT cur = GetErrorMode();
+    SetErrorMode(enabled ? (cur & ~off) : (cur | off));
+    return {};
+#else
+    struct rlimit r{};
+    if (::getrlimit(RLIMIT_CORE, &r) != 0) return {{}, last_error("getrlimit(RLIMIT_CORE)")};
+    r.rlim_cur = enabled ? r.rlim_max : 0;
+    if (::setrlimit(RLIMIT_CORE, &r) != 0) return {{}, last_error("setrlimit(RLIMIT_CORE)")};
+#if defined(__linux__)
+    if (::prctl(PR_SET_DUMPABLE, enabled ? 1 : 0, 0, 0, 0) != 0) return {{}, last_error("prctl(PR_SET_DUMPABLE)")};
+#elif defined(FORGE_OS_FREEBSD) && defined(PROC_TRACE_CTL)
+    int v = enabled ? PROC_TRACE_CTL_ENABLE : PROC_TRACE_CTL_DISABLE;
+    if (::procctl(P_PID, ::getpid(), PROC_TRACE_CTL, &v) != 0 && !enabled) return {{}, last_error("procctl(PROC_TRACE_CTL)")};
+#endif
+    return {};
+#endif
+}
+inline bool core_dumps_enabled() {
+#if defined(FORGE_OS_WINDOWS)
+    return (GetErrorMode() & SEM_NOGPFAULTERRORBOX) == 0;
+#else
+    struct rlimit r{};
+    if (::getrlimit(RLIMIT_CORE, &r) != 0 || r.rlim_cur == 0) return false;
+#if defined(__linux__)
+    return ::prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) == 1;
+#else
+    return true;
+#endif
+#endif
+}
 } // namespace forge::os

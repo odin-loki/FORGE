@@ -116,6 +116,55 @@ inline V exp_cut(V x) {
     __mmask16 small = _mm512_cmp_ps_mask(x.v, _mm512_set1_ps(-80.0f), _CMP_LT_OQ);
     return {_mm512_mask_blend_ps(small, exp_v(x).v, _mm512_setzero_ps())};
 }
+// int16 query x int8 keys: t[p] = sum_e q[e] * k[p][e] for 16 key rows (exact int32; q holds round32(d) int16, zero padded)
+inline V cvt_i32(const std::int32_t* p) { return {_mm512_cvtepi32_ps(_mm512_loadu_si512(p))}; }
+// 16 vectors -> their 16 sums (the transpose-and-add of reduce16; integer sums are exact in any order)
+inline void ireduce16(const __m512i* a, std::int32_t* t) {
+    __m512i x[8], y[4], z[2];
+    for (int j = 0; j < 8; ++j)
+        x[j] = _mm512_add_epi32(_mm512_shuffle_i32x4(a[2 * j], a[2 * j + 1], 0x44), _mm512_shuffle_i32x4(a[2 * j], a[2 * j + 1], 0xEE));
+    for (int j = 0; j < 4; ++j)
+        y[j] = _mm512_add_epi32(_mm512_shuffle_i32x4(x[2 * j], x[2 * j + 1], 0x88), _mm512_shuffle_i32x4(x[2 * j], x[2 * j + 1], 0xDD));
+    for (int j = 0; j < 2; ++j)
+        z[j] = _mm512_add_epi32(_mm512_unpacklo_epi64(y[2 * j], y[2 * j + 1]), _mm512_unpackhi_epi64(y[2 * j], y[2 * j + 1]));
+    const __m512 z0 = _mm512_castsi512_ps(z[0]), z1 = _mm512_castsi512_ps(z[1]);
+    const __m512i f = _mm512_add_epi32(_mm512_castps_si512(_mm512_shuffle_ps(z0, z1, 0x88)), _mm512_castps_si512(_mm512_shuffle_ps(z0, z1, 0xDD)));
+    const __m512i idx = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+    _mm512_storeu_si512(t, _mm512_permutexvar_epi32(idx, f));
+}
+inline void idot16(const unsigned char* q, const std::int8_t* const* k, std::size_t d, std::int32_t* t) {
+    __m512i a[16];
+    for (auto& x : a) x = _mm512_setzero_si512();
+    std::size_t e = 0;
+    for (; e + 32 <= d; e += 32) {
+        const __m512i qv = _mm512_loadu_si512(q + 2 * e);
+        for (int p = 0; p < 16; ++p)
+            a[p] = _mm512_add_epi32(a[p], _mm512_madd_epi16(qv, _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(k[p] + e)))));
+    }
+    if (e < d) {
+        const __m512i qv = _mm512_loadu_si512(q + 2 * e);
+        const __mmask32 mk = __mmask32((std::uint32_t(1) << (d - e)) - 1u);
+        for (int p = 0; p < 16; ++p)
+            a[p] = _mm512_add_epi32(a[p], _mm512_madd_epi16(qv, _mm512_cvtepi8_epi16(_mm256_maskz_loadu_epi8(mk, k[p] + e))));
+    }
+    ireduce16(a, t);
+}
+// keys widened once per block to int16 rows (round32(d) each): pays off when several slots share the block
+inline void widen16(const std::int8_t* k, std::size_t d, unsigned char* dst) {
+    std::size_t e = 0;
+    for (; e + 32 <= d; e += 32) _mm512_storeu_si512(dst + 2 * e, _mm512_cvtepi8_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(k + e))));
+    if (e < d) _mm512_storeu_si512(dst + 2 * e, _mm512_cvtepi8_epi16(_mm256_maskz_loadu_epi8(__mmask32((std::uint32_t(1) << (d - e)) - 1u), k + e)));
+}
+inline void idot16w(const unsigned char* q, const unsigned char* const* k, std::size_t d, std::int32_t* t) {
+    __m512i a[16];
+    for (auto& x : a) x = _mm512_setzero_si512();
+    for (std::size_t e = 0; e < d; e += 32) {
+        const __m512i qv = _mm512_loadu_si512(q + 2 * e);
+        for (int p = 0; p < 16; ++p) a[p] = _mm512_add_epi32(a[p], _mm512_madd_epi16(qv, _mm512_loadu_si512(k[p] + 2 * e)));
+    }
+    ireduce16(a, t);
+}
+constexpr std::size_t k_q16_widen = 4;   // slots from which the keys are widened first
 constexpr int k_vgroup = 8;   // value accumulators per pass (slots)
 #elif defined(FORGE_SEQ_AVX2)
 // ------------------------------------------------ AVX2 + FMA (two 8-lane halves) ------------------------------------------------
@@ -173,6 +222,32 @@ inline V exp_cut(V x) {
     __m256 c = _mm256_set1_ps(-80.0f), z = _mm256_setzero_ps();
     return {_mm256_blendv_ps(exp8(x.lo), z, _mm256_cmp_ps(x.lo, c, _CMP_LT_OQ)), _mm256_blendv_ps(exp8(x.hi), z, _mm256_cmp_ps(x.hi, c, _CMP_LT_OQ))};
 }
+inline V cvt_i32(const std::int32_t* p) {
+    return {_mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p))), _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 8)))};
+}
+inline void idot16(const unsigned char* q, const std::int8_t* const* k, std::size_t d, std::int32_t* t) {
+    auto ld = [](const void* p) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)); };
+    auto kx = [](const std::int8_t* p) { return _mm256_cvtepi8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p))); };
+    for (int p = 0; p < 16; ++p) {
+        __m256i a = _mm256_setzero_si256(), b = _mm256_setzero_si256();
+        std::size_t e = 0;
+        for (; e + 32 <= d; e += 32) {
+            a = _mm256_add_epi32(a, _mm256_madd_epi16(ld(q + 2 * e), kx(k[p] + e)));
+            b = _mm256_add_epi32(b, _mm256_madd_epi16(ld(q + 2 * e + 32), kx(k[p] + e + 16)));
+        }
+        for (; e < d; e += 16) {
+            if (e + 16 <= d) { a = _mm256_add_epi32(a, _mm256_madd_epi16(ld(q + 2 * e), kx(k[p] + e))); continue; }
+            alignas(16) std::int8_t tmp[16] = {};
+            std::memcpy(tmp, k[p] + e, d - e);
+            a = _mm256_add_epi32(a, _mm256_madd_epi16(ld(q + 2 * e), kx(tmp)));
+        }
+        a = _mm256_add_epi32(a, b);
+        __m128i c = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+        c = _mm_add_epi32(c, _mm_shuffle_epi32(c, 0x4E));
+        c = _mm_add_epi32(c, _mm_shuffle_epi32(c, 0xB1));
+        t[p] = _mm_cvtsi128_si32(c);
+    }
+}
 constexpr int k_vgroup = 4;
 #else
 // ------------------------------------------------ portable scalar ------------------------------------------------
@@ -205,6 +280,14 @@ inline V keep_range(V a, std::size_t lo, std::size_t hi, float fill) {
 }
 inline V exp_v(V x) { for (auto& e : x.v) e = exp_s(e); return x; }
 inline V exp_cut(V x) { for (auto& e : x.v) e = e < -80.0f ? 0.0f : exp_s(e); return x; }
+inline V cvt_i32(const std::int32_t* p) { V r; for (int i = 0; i < 16; ++i) r.v[i] = float(p[i]); return r; }
+inline void idot16(const unsigned char* q, const std::int8_t* const* k, std::size_t d, std::int32_t* t) {
+    for (int p = 0; p < 16; ++p) {
+        std::int32_t a = 0;
+        for (std::size_t e = 0; e < d; ++e) { std::int16_t v; std::memcpy(&v, q + 2 * e, 2); a += std::int32_t(v) * std::int32_t(k[p][e]); }
+        t[p] = a;
+    }
+}
 constexpr int k_vgroup = 4;
 #endif
 
@@ -212,30 +295,69 @@ constexpr int k_vgroup = 4;
 constexpr std::size_t CH = seq_attn_chunk;
 inline std::size_t round16(std::size_t n) { return (n + 15) & ~std::size_t(15); }
 
+inline std::size_t round32(std::size_t n) { return (n + 31) & ~std::size_t(31); }
+
 inline std::size_t attn_scratch(std::size_t ns, std::size_t d, std::size_t) {
     std::size_t d16 = round16(d);
-    return 16 * d16 + d16 + ns * d16 + ns * CH + CH + 16;
+    return 16 * d16 + d16 + ns * d16 + ns * CH + CH + 16 + ns * (round32(d) / 2 + 1);
 }
 
-inline void attn_chunk(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::size_t dv, float scale, std::size_t c0, std::size_t c1,
-                       std::size_t ns, const float* const* q, const std::size_t* lo, const std::size_t* hi,
-                       float* m, float* l, float* acc, float* scratch) {
+// Largest |q| code of the int16-query path: 32767, lowered for d > 512 so that the int32 dot against int8 keys
+// (|k| <= 128) cannot overflow.
+inline std::int32_t q16_max(std::size_t d) {
+    const std::uint64_t lim = d ? std::uint64_t(0x7fffffff) / (std::uint64_t(128) * d) : 32767;
+    return std::int32_t(std::min<std::uint64_t>(32767, std::max<std::uint64_t>(lim, 1)));
+}
+// One query row -> int16 codes (round half away from zero, written in plain float and integer steps so every
+// table quantises alike) at dst (2 bytes each, zero padded to round32(d)); returns the code scale amax / qmax.
+inline float q16_quantise(const float* q, std::size_t d, unsigned char* dst) {
+    const float qmax = float(q16_max(d));
+    float amax = 0.f;
+    for (std::size_t e = 0; e < d; ++e) { float a = std::fabs(q[e]); if (a > amax) amax = a; }
+    const float qs = amax / qmax;
+    const float inv = qs > 0.f ? 1.0f / qs : 0.f;
+    for (std::size_t e = 0; e < d; ++e) {
+        float t = q[e] * inv;
+        t = t < 0.f ? t - 0.5f : t + 0.5f;
+        if (!(t >= -qmax)) t = -qmax;   // also catches NaN
+        if (!(t <= qmax)) t = qmax;
+        const std::int16_t c = std::int16_t(std::int32_t(t));
+        std::memcpy(dst + 2 * e, &c, 2);
+    }
+    std::memset(dst + 2 * d, 0, 2 * (round32(d) - d));
+    return qs;
+}
+
+// q16: int8 keys are scored with the int16-query integer kernel (idot16) instead of converting them to float
+inline void attn_chunk_impl(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::size_t dv, float scale, std::size_t c0, std::size_t c1,
+                            std::size_t ns, const float* const* q, const std::size_t* lo, const std::size_t* hi,
+                            float* m, float* l, float* acc, float* scratch, bool q16) {
     const std::size_t d16 = round16(d), n = c1 - c0, nb = (n + 15) / 16;
+    const bool kq = q16 && K.int8;
     float* Kf = scratch;                 // 16 converted key rows
     float* zrow = Kf + 16 * d16;         // zeros (rows past the chunk end)
     float* qp = zrow + d16;              // queries, zero padded to d16
     float* sco = qp + ns * d16;          // [ns][CH] scores, then weights
     float* vsc = sco + ns * CH;          // value scales of the chunk (int8)
     float* ks = vsc + CH;                // key scales of the current block
+    float* qf = ks + 16;                 // int16 path: query code scale * scale per slot
+    auto* qi = reinterpret_cast<unsigned char*>(qf + ns);   // int16 path: query codes, round32(d) int16 per slot
+    const std::size_t qib = 2 * round32(d);
     std::fill(zrow, zrow + d16, 0.f);
     auto lr = [&](std::size_t s) { return std::min(std::max(lo[s], c0), c1) - c0; };
     auto hr = [&](std::size_t s) { return std::min(std::max(hi[s], c0), c1) - c0; };
     for (std::size_t s = 0; s < ns; ++s) {
+        if (kq) { qf[s] = q16_quantise(q[s], d, qi + s * qib) * scale; continue; }
         std::memcpy(qp + s * d16, q[s], d * 4);
         std::fill(qp + s * d16 + d, qp + (s + 1) * d16, 0.f);
     }
     const bool kdirect = !K.int8 && d % 16 == 0;
     const float* kp[16];
+    const std::int8_t* kb[16];
+#if defined(FORGE_SEQ_AVX512)
+    const bool kwide = kq && ns >= k_q16_widen;   // same exact sums either way
+    const unsigned char* kwp[16];
+#endif
     const V vscale = splat(scale);
     for (std::size_t b = 0; b < nb; ++b) {
         const std::size_t p0 = b * 16, np = std::min<std::size_t>(16, n - p0);
@@ -243,8 +365,15 @@ inline void attn_chunk(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::si
         for (std::size_t s = 0; s < ns && !any; ++s) any = std::max(lr(s), p0) < std::min(hr(s), p0 + np);
         if (!any) continue;
         for (std::size_t p = 0; p < 16; ++p) {
-            if (p >= np) { kp[p] = zrow; ks[p] = 0.f; continue; }
+            if (p >= np) { kp[p] = zrow; kb[p] = reinterpret_cast<const std::int8_t*>(zrow); ks[p] = 0.f; continue; }
             const float* row = K.base + (c0 + p0 + p) * K.stride;
+            if (kq) {
+                ks[p] = row[0]; kb[p] = reinterpret_cast<const std::int8_t*>(row + 1);
+#if defined(FORGE_SEQ_AVX512)
+                if (kwide) widen16(kb[p], d, reinterpret_cast<unsigned char*>(Kf + p * d16));
+#endif
+                continue;
+            }
             if (kdirect) { kp[p] = row; continue; }
             float* dst = Kf + p * d16;
             if (K.int8) {
@@ -260,9 +389,22 @@ inline void attn_chunk(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::si
             kp[p] = dst;
         }
         const V ksv = K.int8 ? load(ks) : splat(1.f);
+#if defined(FORGE_SEQ_AVX512)
+        if (kwide) for (std::size_t p = 0; p < 16; ++p) kwp[p] = reinterpret_cast<const unsigned char*>(p < np ? Kf + p * d16 : zrow);
+#endif
         for (std::size_t s = 0; s < ns; ++s) {
             std::size_t a0 = std::max(lr(s), p0), a1 = std::min(hr(s), p0 + np);
             if (a0 >= a1) continue;
+            if (kq) {   // exact integer dots, then (float(sum) * key scale) * (query scale * scale)
+                alignas(64) std::int32_t isum[16];
+#if defined(FORGE_SEQ_AVX512)
+                if (kwide) idot16w(qi + s * qib, kwp, d, isum); else
+#endif
+                idot16(qi + s * qib, kb, d, isum);
+                V r = mul(mul(cvt_i32(isum), ksv), splat(qf[s]));
+                store(sco + s * CH + p0, keep_range(r, a0 - p0, a1 - p0, k_ninf));
+                continue;
+            }
             V a[16];
             for (auto& x : a) x = zero();
             const float* qs = qp + s * d16;
@@ -322,6 +464,17 @@ inline void attn_chunk(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::si
             }
         }
     }
+}
+
+inline void attn_chunk(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::size_t dv, float scale, std::size_t c0, std::size_t c1,
+                       std::size_t ns, const float* const* q, const std::size_t* lo, const std::size_t* hi,
+                       float* m, float* l, float* acc, float* scratch) {
+    attn_chunk_impl(K, Vv, d, dv, scale, c0, c1, ns, q, lo, hi, m, l, acc, scratch, false);
+}
+inline void attn_chunk_q16(const seq_kv& K, const seq_kv& Vv, std::size_t d, std::size_t dv, float scale, std::size_t c0, std::size_t c1,
+                           std::size_t ns, const float* const* q, const std::size_t* lo, const std::size_t* hi,
+                           float* m, float* l, float* acc, float* scratch) {
+    attn_chunk_impl(K, Vv, d, dv, scale, c0, c1, ns, q, lo, hi, m, l, acc, scratch, true);
 }
 
 // running (M, L, A) <- merge with a chunk partial (m, l, acc); M == -inf means "nothing yet"
@@ -401,5 +554,5 @@ inline void delta_cols(const float* q, const float* k, std::size_t qk_stride, co
     namespace forge::simd::FORGE_SEQ_NS {                                                                     \
     extern const seq_kernels table;                                                                           \
     const seq_kernels table = {NAME, &attn_scratch, &attn_chunk, &attn_merge, &attn_finish, &l2norm_scale,   \
-                               &delta_cols, &exp_s};                                                          \
+                               &delta_cols, &exp_s, &attn_chunk_q16};                                                        \
     }

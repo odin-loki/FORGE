@@ -944,4 +944,19 @@ inline result<http_response> http(const http_request& rq) {
     return detail_net::http_once(rq, rq.deadline_ms > 0 ? monotonic_ns() + std::uint64_t(rq.deadline_ms) * 1000000ull : 0);
 }
 inline result<http_response> http_get(const std::string& u, int timeout_ms = 10000) { http_request r; r.url = u; r.timeout_ms = timeout_ms; return http(r); }
+// Which TLS implementation https:// uses on this OS and whether it could be loaded: "schannel" (Windows),
+// "network.framework" (macOS/iOS), "openssl" (Linux, Android, FreeBSD: the system libssl >= 1.1; on Android only
+// when the app ships one). available == false means http() answers https:// URLs with unsupported().
+struct tls_info { std::string name; bool available = false; };
+inline tls_info tls_backend() {
+#if defined(FORGE_OS_WINDOWS)
+    return {"schannel", detail_net::sspi_api::get().ok};
+#elif defined(__APPLE__) && defined(__BLOCKS__)
+    return {"network.framework", detail_net::nw_api::get().ok};
+#elif defined(FORGE_OS_POSIX) && !defined(__APPLE__)
+    return {"openssl", detail_net::ssl_api::instance().ok};
+#else
+    return {"none", false};
+#endif
+}
 } // namespace forge::os::net

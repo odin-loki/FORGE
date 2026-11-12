@@ -16,15 +16,18 @@
 // cgroup v1 memory.limit_in_bytes, RLIMIT_AS). Device budgets come from FORGE_MEM_DEVICE_LIMIT or set_limit.
 #include <forge/core/error.hpp>
 #include <forge/os/os.hpp>
+#include <forge/os/locked_memory.hpp>   // spill_store key; Monocypher comes with forge_os (forge_core -> forge_os -> forge_trust)
 #include <forge/os/private_files.hpp>
 #include <forge/os/memory_pressure.hpp>
 #include <forge/os/process.hpp>
+#include <monocypher.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -344,14 +347,30 @@ private:
 };
 
 // Evicted blobs on disk. Directory: `dir`, else FORGE_MEM_SPILL_DIR, else a fresh <tmp>/forge-spill-<pid>-<random>;
-// removed on destruction. Writes are size-capped by FORGE_MEM_SPILL_MAX (default unlimited).
+// removed on destruction. Writes are size-capped by FORGE_MEM_SPILL_MAX (default unlimited; counted in blob bytes,
+// an encrypted file is 20 bytes longer than its blob).
 // FSS: the directory is private (0700 / owner + SYSTEM + Administrators DACL; an existing one must be ours and not a
 // symlink, and is tightened to 0700 on POSIX) and every spill file is created exclusively, 0600, without following
 // symlinks (FIO-1). Under an active forge::security policy the directory must pass enforce(fs_write) (CAP-1, through
 // os::check_access); a denial throws errc::io_error with the policy's reason.
+// Encryption (on unless FORGE_MEM_SPILL_ENCRYPT is 0 / off / false / no): every blob is sealed with
+// XChaCha20-Poly1305 (Monocypher) under a random 32-byte key made when the store is constructed. The key exists only
+// in this process, in an os::locked_buffer (locked and excluded from core dumps where the OS allows, wiped on
+// destruction), so files left behind by a crash cannot be decrypted afterwards, not even by this program's next run.
+// File: "FSP1" | 16-byte tag | ciphertext. The 24-byte nonce is 16 random bytes drawn per store followed by the
+// blob's key number (never reused within a store), and the key number and blob length are authenticated, so a
+// modified, truncated, extended or swapped file fails take() with errc::integrity_error instead of being returned.
+// Not hidden: how many blobs there are, their sizes and when they were written. The plaintext blob is in ordinary
+// memory before put() and after take(), as it was before it was evicted.
 class spill_store {
 public:
+    static constexpr std::size_t file_overhead = 20;   // encrypted file size - blob size: magic (4) + tag (16)
     explicit spill_store(std::filesystem::path dir = {}) {
+        if (auto e = os::getenv("FORGE_MEM_SPILL_ENCRYPT"); e == "0" || e == "off" || e == "false" || e == "no") encrypt_ = false;
+        if (encrypt_) {   // before any directory is made, so a failure leaves nothing behind
+            key_ = os::locked_buffer(32 + 16);   // XChaCha20-Poly1305 key, then the per-store nonce prefix
+            if (!os::entropy(key_.data(), key_.size())) raise(errc::io_error, "spill store: no entropy for the encryption key");
+        }
         if (dir.empty()) if (auto e = os::getenv("FORGE_MEM_SPILL_DIR"); !e.empty()) dir = std::filesystem::path(e);
         if (!dir.empty()) {
             auto u = dir.u8string(); std::string d(u.begin(), u.end());
@@ -366,31 +385,70 @@ public:
         }
         if (auto m = os::getenv("FORGE_MEM_SPILL_MAX"); !m.empty()) cap_ = parse_size(m).value_or(0);
     }
-    ~spill_store() { std::error_code ec; for (auto& [k, _] : sizes_) std::filesystem::remove(path_(k), ec); std::filesystem::remove(dir_, ec); }
+    ~spill_store() { std::error_code ec; for (auto& [k, _] : sizes_) std::filesystem::remove(path_(k), ec); std::filesystem::remove(dir_, ec); }   // key_ wipes itself
     spill_store(const spill_store&) = delete; spill_store& operator=(const spill_store&) = delete;
     // Returns a key, or 0 when the cap would be exceeded or the write failed.
     std::uint64_t put(const void* data, std::size_t n) {
         std::lock_guard g(m_);
         if (cap_ && bytes_ + n > cap_) return 0;
         auto k = ++next_;
-        auto u = path_(k).u8string();
-        if (!os::write_new_private_file(std::string(u.begin(), u.end()), std::string_view(static_cast<const char*>(data), n))) return 0;   // removes a partial file
+        auto u = path_(k).u8string(); std::string p(u.begin(), u.end());
+        if (encrypt_) {
+            std::vector<std::uint8_t> out;
+            try { out.resize(file_overhead + n); } catch (const std::bad_alloc&) { return 0; }   // evicting under memory pressure: drop, do not throw
+            std::uint8_t nonce[24], ad[ad_size_]; nonce_(k, nonce); ad_(k, n, ad);
+            std::memcpy(out.data(), magic_, 4);
+            crypto_aead_lock(out.data() + file_overhead, out.data() + 4, key_.data(), nonce, ad, sizeof ad, static_cast<const std::uint8_t*>(data), n);
+            if (!os::write_new_private_file(p, std::string_view(reinterpret_cast<const char*>(out.data()), out.size()))) return 0;   // removes a partial file
+        } else if (!os::write_new_private_file(p, std::string_view(static_cast<const char*>(data), n))) return 0;
         sizes_[k] = n; bytes_ += n; return k;
     }
-    // Reads back and deletes. Empty optional if the key is unknown.
+    // Reads back and deletes. Empty optional if the key is unknown. Throws errc::io_error when the file cannot be
+    // opened or (unencrypted store) is short, errc::integrity_error when an encrypted file is not exactly what put()
+    // wrote; the file is deleted and the key forgotten either way.
     std::optional<std::vector<std::byte>> take(std::uint64_t k) {
         std::lock_guard g(m_); auto it = sizes_.find(k); if (it == sizes_.end()) return std::nullopt;
-        std::vector<std::byte> v(it->second); std::ifstream f(path_(k), std::ios::binary); f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size()));
-        bool ok = bool(f); f.close(); bytes_ -= it->second; sizes_.erase(it); std::error_code ec; std::filesystem::remove(path_(k), ec);
-        if (!ok) raise(errc::io_error, "spill file {} truncated", path_(k).string());
-        return v;
+        const std::size_t n = it->second, want = n + (encrypt_ ? file_overhead : 0);
+        const auto path = path_(k);
+        bytes_ -= n; sizes_.erase(it);
+        struct remover { const std::filesystem::path& p; ~remover() { std::error_code ec; std::filesystem::remove(p, ec); } } rm{path};
+        std::vector<std::byte> v(want + 1);   // one spare byte: a longer file is noticed
+        std::size_t got = 0;
+        {
+            std::ifstream f(path, std::ios::binary);
+            if (!f) raise(errc::io_error, "spill file {} cannot be opened", path.string());
+            f.read(reinterpret_cast<char*>(v.data()), std::streamsize(v.size())); got = std::size_t(f.gcount());
+        }   // closed before it is removed (Windows)
+        if (!encrypt_) {
+            if (got < want) raise(errc::io_error, "spill file {} truncated", path.string());
+            v.resize(n); return v;
+        }
+        auto* b = reinterpret_cast<std::uint8_t*>(v.data());
+        if (got != want || std::memcmp(b, magic_, 4) != 0)
+            raise(errc::integrity_error, "spill file {} was truncated or modified ({} bytes read, expected {})", path.string(), got, want);
+        std::uint8_t nonce[24], ad[ad_size_]; nonce_(k, nonce); ad_(k, n, ad);
+        std::vector<std::byte> out(n);
+        if (crypto_aead_unlock(reinterpret_cast<std::uint8_t*>(out.data()), b + 4, key_.data(), nonce, ad, sizeof ad, b + file_overhead, n))
+            raise(errc::integrity_error, "spill file {} failed authentication (modified or replaced)", path.string());
+        return out;
     }
     void drop(std::uint64_t k) { std::lock_guard g(m_); if (auto it = sizes_.find(k); it != sizes_.end()) { bytes_ -= it->second; sizes_.erase(it); std::error_code ec; std::filesystem::remove(path_(k), ec); } }
-    std::uint64_t bytes() const { std::lock_guard g(m_); return bytes_; }
+    std::uint64_t bytes() const { std::lock_guard g(m_); return bytes_; }   // blob bytes held (without the per-file overhead)
     const std::filesystem::path& dir() const { return dir_; }
+    bool encrypted() const { return encrypt_; }
+    bool key_locked() const { return key_.locked(); }   // the key's pages are locked in RAM (best effort; false when not encrypted)
+    std::filesystem::path file_of(std::uint64_t k) const { return path_(k); }   // where blob `k` is (tests, diagnostics)
 private:
+    static constexpr const char* magic_ = "FSP1";
+    static constexpr std::size_t ad_size_ = 14 + 16;
+    void nonce_(std::uint64_t k, std::uint8_t* o) const { std::memcpy(o, key_.data() + 32, 16); for (int i = 0; i < 8; ++i) o[16 + i] = std::uint8_t(k >> (8 * i)); }
+    static void ad_(std::uint64_t k, std::uint64_t n, std::uint8_t* o) {
+        std::memcpy(o, "forge-spill-v1", 14);
+        for (int i = 0; i < 8; ++i) { o[14 + i] = std::uint8_t(k >> (8 * i)); o[22 + i] = std::uint8_t(n >> (8 * i)); }
+    }
     std::filesystem::path path_(std::uint64_t k) const { return dir_ / std::format("{}.bin", k); }
     std::filesystem::path dir_; mutable std::mutex m_; std::map<std::uint64_t, std::size_t> sizes_; std::uint64_t next_ = 0, bytes_ = 0, cap_ = 0;
+    bool encrypt_ = true; os::locked_buffer key_;
 };
 
 // A child process whose address-space cap is a lease on a budget. The cap and the charge are the same

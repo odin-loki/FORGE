@@ -7,12 +7,13 @@
 // one or two float steps per block, in the same order, on every ISA:
 //     acc  = fma(d_w * d_a, float(isum), acc)       accm = fma(dmin_w * d_a, float(imin), accm)
 //     y    = acc - accm
-// Integer sums do not depend on the order they were formed in, so the scalar reference and the AVX2, AVX-VNNI
-// and AVX-512 VNNI kernels give identical bits, and a vector's result does not depend on how many other
-// vectors were computed with it (nv = 1..N).
+// Integer sums do not depend on the order they were formed in, so the scalar reference, the AVX2, AVX-VNNI
+// and AVX-512 VNNI kernels and the AArch64 NEON, dotprod and SVE kernels give identical bits, and a vector's
+// result does not depend on how many other vectors were computed with it (nv = 1..N).
 //
 // qi8_kernels is a dispatch table separate from simd::kernels: it is chosen once from the CPU's integer
-// dot-product support (avx512vnni > avxvnni > avx2 > scalar), FORGE_QI8_TARGET overrides.
+// dot-product support (x86: avx512vnni > avxvnni > avx2; AArch64: sve when the vector length is 256 bits or
+// more > dotprod > neon; scalar everywhere else), FORGE_QI8_TARGET overrides.
 #include <forge/simd/qdot.hpp>
 #include <forge/core/fma.hpp>
 #include <cmath>
@@ -155,7 +156,11 @@ struct qi8_kernels {
                    std::size_t act_stride, std::size_t k, std::size_t nv, float* y, std::size_t y_stride);
 };
 const qi8_kernels& qi8_active();                 // best for this CPU (FORGE_QI8_TARGET overrides)
-const qi8_kernels* qi8_by_name(const char* t);   // "scalar", "avx2", "avxvnni", "avx512vnni"; nullptr if unusable
+// "scalar"; x86: "avx2", "avxvnni", "avx512vnni"; AArch64: "neon", "dotprod", "sve". nullptr if unusable here.
+const qi8_kernels* qi8_by_name(const char* t);
+// Whether the CPU quantised matmul uses the integer kernels when FORGE_CPU_INT8 is not set: x86 with a SIMD
+// table. AArch64 stays on the f32 path until the kernels have been timed on hardware (FORGE_CPU_INT8=1 opts in).
+bool qi8_default_on();
 // Software prefetch distance of the matvec kernels in bytes (FORGE_QI8_PF, default 2048; 0 disables).
 extern int qi8_prefetch_bytes;
 

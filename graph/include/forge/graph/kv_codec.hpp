@@ -12,7 +12,14 @@
 // then dp codes, 8 per word (tbq4, 4 bits each) or 10 per word (tbq3, 3 bits each, top 2 bits zero).
 // Since R is orthonormal, q.k = (Rq).(Rk): GPU attention rotates q once and dots it against the codebook
 // values directly, and accumulates V in the rotated domain, applying R^T once per output row.
-// The optional 1-bit QJL residual from the paper is not implemented (MSE-optimal codes only).
+// tbq4p / tbq3p (TurboQuant_prod, opt-in, CPU only) add the paper's 1-bit QJL residual stage at the same bit
+// budget: the MSE stage drops to 3 / 2 bits, and the residual r = y - yhat (rotated domain) is stored as its
+// norm |r| (a second f32 word after the gain) plus the dp sign bits of S r, 32 per word after the codes, for
+// the seeded orthonormal projection S = H D3 H D2 (kv_qjl_project). Decoding adds
+// rhat = c |r| S^T sign(S r) to yhat, c = kv_qjl_gain(dp) ~ sqrt(pi/2) / sqrt(dp), so <q, decode(x)> =
+// <q, xhat> + c |r| <S R q, sign(S r)> is an unbiased estimate of <q, x> (the MSE-only codes shrink it by the
+// quantiser's relative distortion); tests/test_kvquant.cpp measures the constant and the bias.
+// tbq4 / tbq3 stay MSE-only. The GPU attention kernels refuse the QJL types.
 // Mixed "k8v4": keys int8, values tbq4 (kv_codec_pair_from_name).
 #include <forge/core/dtypes.hpp>
 #include <forge/core/error.hpp>
@@ -93,6 +100,32 @@ inline void kv_fwht(float* a, i64 n) {
     float r = 1.f / std::sqrt(float(n));
     for (i64 i = 0; i < n; ++i) a[i] *= r;
 }
+// QJL projection S = H D3 H D2 (two random-sign Hadamard rounds; orthonormal) and its transpose. One round
+// leaves the coordinates of S r visibly non-Gaussian for a scalar-quantiser residual (it is a function of the
+// codes), which showed as a bias of about 0.13 / n of |x|^2 in <x, xhat> (2e-3 at n = 64); with the second
+// round the measured bias is below 1e-3 for n = 16 .. 256.
+inline void kv_qjl_project(float* a, i64 n) {
+    for (i64 e = 0; e < n; ++e) a[e] *= kv_tbq_sign(std::uint32_t(e) + 0x10000u);
+    kv_fwht(a, n);
+    for (i64 e = 0; e < n; ++e) a[e] *= kv_tbq_sign(std::uint32_t(e) + 0x20000u);
+    kv_fwht(a, n);
+}
+inline void kv_qjl_project_t(float* a, i64 n) {
+    kv_fwht(a, n);
+    for (i64 e = 0; e < n; ++e) a[e] *= kv_tbq_sign(std::uint32_t(e) + 0x20000u);
+    kv_fwht(a, n);
+    for (i64 e = 0; e < n; ++e) a[e] *= kv_tbq_sign(std::uint32_t(e) + 0x10000u);
+}
+// Decode gain c of rhat = c |r| S^T sign(S r). <r, S^T sign(S r)> = |S r|_1, and S is orthonormal, so S r is a
+// point of the sphere of radius |r|; taking its direction as uniform, E|S r|_1 = |r| n G(n/2) / (sqrt(pi) G((n+1)/2))
+// (G = gamma function), hence <r, rhat> = |r|^2 in expectation for
+//   c = sqrt(pi) G((n+1)/2) / (n G(n/2)) = sqrt(pi/2) / sqrt(n) * (1 - 1/(4n) + 1/(32n^2) - ...).
+// The leading term is the paper's sqrt(pi/2)/d (unit-variance Gaussian rows) rescaled to unit-norm rows; the
+// 1/(4n) term is the difference between a sphere and independent Gaussians (0.4% at n = 64).
+inline float kv_qjl_gain(i64 n) {
+    const double x = 1.0 / double(n);
+    return float(1.2533141373155003 / std::sqrt(double(n)) * (1.0 - 0.25 * x + 0.03125 * x * x));
+}
 inline void kv_tbq_encode(const float* x, i64 d, kv_codec c, float* dst) {
     i64 dp = kv_tbq_dim(d); int L = 1 << kv_tbq_bits(c), bits = kv_tbq_bits(c), per = kv_tbq_per_word(c);
     const float* lv = kv_tbq_levels(c);
@@ -119,11 +152,11 @@ inline void kv_tbq_encode(const float* x, i64 d, kv_codec c, float* dst) {
     }
     float g = den > 0 ? float(num / den) : 0.f;
     std::memcpy(dst, &g, 4);
-    if (kv_is_qjl(c)) {   // QJL (Zandieh et al.): sign bits of S r, S = H D2 (a second random-sign Hadamard), plus |r|
+    if (kv_is_qjl(c)) {   // QJL (Zandieh et al.): |r| and the sign bits of S r (kv_qjl_project)
         std::vector<float> r(static_cast<std::size_t>(dp));
         double rn = 0;
-        for (i64 e = 0; e < dp; ++e) { r[e] = (y[e] - g * lv[codes[e]]) * kv_tbq_sign(std::uint32_t(e) + 0x10000u); rn += double(r[e]) * r[e]; }
-        kv_fwht(r.data(), dp);
+        for (i64 e = 0; e < dp; ++e) { r[e] = y[e] - g * lv[codes[e]]; rn += double(r[e]) * r[e]; }
+        kv_qjl_project(r.data(), dp);
         float rnf = float(std::sqrt(rn)); std::memcpy(dst + 1, &rnf, 4);
         auto* sb = w + (dp + per - 1) / per;
         for (i64 e = 0; e < dp; ++e) if (r[e] >= 0.f) sb[e / 32] |= 1u << (e % 32);
@@ -138,14 +171,14 @@ inline void kv_tbq_decode(const float* src, i64 d, kv_codec c, float* out) {
     float zb[512]; std::vector<float> zh; float* z = zb;
     if (dp > 512) { zh.resize(std::size_t(dp)); z = zh.data(); }
     for (i64 e = 0; e < dp; ++e) z[e] = lv[(w[e / per] >> (bits * (e % per))) & mask] * g;
-    if (kv_is_qjl(c)) {   // unbiased residual estimate: sqrt(pi/2) |r| / sqrt(n) * S^T sign(S r)
+    if (kv_is_qjl(c)) {   // unbiased residual estimate: kv_qjl_gain |r| S^T sign(S r)
         float rn; std::memcpy(&rn, src + 1, 4);
         auto* sb = w + (dp + per - 1) / per;
         std::vector<float> t(static_cast<std::size_t>(dp));
         for (i64 e = 0; e < dp; ++e) t[e] = (sb[e / 32] >> (e % 32)) & 1u ? 1.f : -1.f;
-        kv_fwht(t.data(), dp);
-        float k = 1.2533141373155003f * rn / std::sqrt(float(dp));
-        for (i64 e = 0; e < dp; ++e) z[e] += k * t[e] * kv_tbq_sign(std::uint32_t(e) + 0x10000u);
+        kv_qjl_project_t(t.data(), dp);
+        float k = kv_qjl_gain(dp) * rn;
+        for (i64 e = 0; e < dp; ++e) z[e] += k * t[e];
     }
     kv_fwht(z, dp);
     for (i64 e = 0; e < d; ++e) out[e] = z[e] * kv_tbq_sign(std::uint32_t(e));
