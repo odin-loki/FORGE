@@ -28,7 +28,7 @@ forge-serve proxy --backend HOST:PORT [...] [--policy FILE]   # see loadbalancer
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--host`, `--port` | `127.0.0.1`, `8080` | Listen address: an IPv4 or IPv6 address or a host name (`""`-style wildcards: `0.0.0.0`, `::`). `--port 0` picks a free port (printed on startup). A non-loopback `--host` without API keys prints a warning |
+| `--host`, `--port` | `127.0.0.1`, `8080` | Listen address: an IPv4 or IPv6 address or a host name (`0.0.0.0` / `::` for all interfaces). `--port 0` picks a free port (printed on startup). A non-loopback `--host` without API keys prints a warning |
 | `--max-active` | 8 | Sequences decoded together (`batch_options::max_active`) |
 | `--ctx` | 0 | KV context per request; 0 = the model's maximum |
 | `--codec` | `f32` | Weight codec for the import of a HF directory or `.gguf`; ignored for `.fpk` |
@@ -233,6 +233,7 @@ The `serve_http` ctest (`tests/serve_test.py`) checks concurrent completions aga
 - Tool calling, end-of-turn detection and LoRA serving have been run on the tiny random golden models only (see the sections above for what each test does); no real chat or tool-calling checkpoint was served here.
 - `logprobs` report the model's distribution, not the distribution after sampling settings. `logit_bias` of exactly ±100 is absolute; other values are added to unbounded logits, so their strength depends on the model.
 - Rate limits and quotas are per process and in memory. They are not shared between forge-serve instances behind `forge-serve proxy`.
+- IPv6 listen addresses (`--host ::1`) are accepted by the code but were not run: the test host has no IPv6.
 - The graceful shutdown was tested on Linux (SIGTERM). On Windows the console control handler path of `os::on_signal` is used and is untested here.
 - `--ask-model` is a `forge script` flag, not a forge-serve flag (see [scripting.md](scripting.md)).
 - Readiness notification was tested with an abstract `NOTIFY_SOCKET` in `test_os_ext`, not under a real systemd. Running under the Windows SCM or launchd is untested.

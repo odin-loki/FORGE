@@ -33,6 +33,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <random>
 
@@ -1176,7 +1178,7 @@ int main(int argc, char** argv) {
         server_lockdown(pol, "forge-serve", host_port(listen_host, port));
         if (listen_host != "127.0.0.1" && listen_host != "::1" && listen_host != "localhost" && !srv.auth_enabled())
             std::fprintf(stderr, "forge-serve: warning: listening on %s without --api-key / --api-key-file: anyone who can reach the port can use the model\n", listen_host.c_str());
-        std::printf("forge-serve: %s on %s://%s:%d (max_active %d, memory budget %s)\n", path.c_str(), use_tls ? "https" : "http", listen_host.c_str(), port, bo.max_active,
+        std::printf("forge-serve: %s on %s://%s (max_active %d, memory budget %s)\n", path.c_str(), use_tls ? "https" : "http", host_port(listen_host, port).c_str(), bo.max_active,
                     host.limit() ? mem::format_size(host.limit()).c_str() : "off");
         std::fflush(stdout);
         fos::service::ready("serving " + path);
