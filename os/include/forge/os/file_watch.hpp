@@ -84,6 +84,11 @@ public:
         return "none";
 #endif
     }
+#if defined(__linux__) || defined(FORGE_OS_KQUEUE)
+    // The inotify / kqueue descriptor: readable while poll(0) would return events (for an event loop such as
+    // os::reactor). Not present on Windows, where the watcher is polled.
+    int native_handle() const { return fd_; }
+#endif
     // kqueue: cap on the descriptors this watcher holds (a no-op elsewhere).
     void set_max_handles(std::size_t n) {
 #if defined(FORGE_OS_KQUEUE)
