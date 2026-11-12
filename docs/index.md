@@ -12,6 +12,8 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 
 ## Library layers, bottom up
 - [os.md](os.md): `forge::os`, the portability layer and its extension modules
+- [os-parity.md](os-parity.md): every `forge::os` call per operating system: native, degraded or unsupported, and whether that path was run, only cross-compiled or never compiled
+- [os-audit.md](os-audit.md): the audit of the OS layer: findings by wave, what was fixed, what is open
 - [os-wrapper.md](os-wrapper.md): the `forge::os` headers beyond the core layer: processes, pipes, signals, file-system extras, users, time, system information, console, networking, file watching, service control, Windows registry, devices, clipboard, dynamic libraries, process pools. Built; the missing parts are listed in the page
 - [text-locale.md](text-locale.md): `forge::os::text` and `forge::os::locale` (Unicode, encodings, locales; `forge_text`)
 - [mobile.md](mobile.md): `forge::os::mobile`, sensors, touch and device services (`forge_mobile`)
@@ -19,13 +21,13 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 - [simd.md](simd.md): CPU feature detection and SIMD kernel dispatch
 - [gpu.md](gpu.md): devices, graphs, parallel primitives, GPU runtimes
 - [graph.md](graph.md): graph IR, passes, plans, codecs, autodiff, RPC devices
-- [modelfile.md](modelfile.md): the `.fpk` container, signing, encryption, importing
+- [modelfile.md](modelfile.md): the `.fpk` container, signing, encryption, blueprints and opsets, tokenizers, importing and the template families
 - [format.md](format.md): `.fpk` byte layout
-- [inference.md](inference.md): models, sessions, samplers, generation
+- [inference.md](inference.md): models, sessions (generative and embedding), samplers, generation, chat templates
 - [aot-models.md](aot-models.md): `forge aot`: precompiled plans in the `.fpk`, and models compiled to native libraries and executables
 
 ## Serving, remote devices and embedding
-- [serve.md](serve.md): `forge-serve` HTTP server
+- [serve.md](serve.md): `forge-serve` HTTP server (completions, chat, embeddings)
 - [loadbalancer.md](loadbalancer.md): load-balancing pool and `forge-serve proxy`
 - [rpc.md](rpc.md): `forge rpc-serve`, authentication, TLS and remote scripts
 - [capi.md](capi.md): the C ABI (`forge.h`)
@@ -45,10 +47,11 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 ## Reference and project
 - [reference.md](reference.md): op table, GPU kernel list and C ABI, **generated** by `tools/gen_docs.py` (do not edit by hand; the `docs_up_to_date` test checks it)
 - [../ops/README.md](../ops/README.md): op specs and code generators
-- [STATUS.md](STATUS.md): what has been tested where
+- [STATUS.md](STATUS.md): what has been tested where, and how each part was verified (native, emulator, wine, mock driver, cross-compile only, never compiled)
 - [RELEASING.md](RELEASING.md): release procedure
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): how to change code and docs, and how to merge
-- [../TODO.md](../TODO.md): open work items
+- [../TODO.md](../TODO.md): open work items, gathered from the "not run" and "not done" notes of the guides
+- [../NOTICE](../NOTICE): third-party code and derived data, with licences
 - [../FORGE_PLAN.md](../FORGE_PLAN.md): the original design plan (a roadmap, not a description of current behaviour)
 - [claims-audit.md](claims-audit.md): historical record of audits of doc claims against the code; not a description of current behaviour
 - `wip/dn-scratch.patch`: a saved work-in-progress diff from a scratch directory. It is not applied and uses the old module names (`flow`, `grid`)

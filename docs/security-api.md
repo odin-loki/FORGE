@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
 
 ## Policy
 
-`forge-security.json` (shape as in [security-standard.md](security-standard.md#policy-file-planned)). Omitted fields take
+`forge-security.json` (shape as in [security-standard.md](security-standard.md#policy-file)). Omitted fields take
 the profile's values. Load order: `--policy FILE` (the argument to `load_policy`), `$FORGE_SECURITY_POLICY`,
 `./forge-security.json`, `<config dir>/forge/forge-security.json` (`$XDG_CONFIG_HOME/forge`, `%APPDATA%\forge`,
 `~/Library/Application Support/forge`). The first one that exists is used. A file named by `--policy` or

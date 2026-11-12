@@ -1,40 +1,471 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CTEST_OUTPUT_ON_FAILURE: "1"
+  FORGE_THREADS: "2"
 jobs:
-  linux-x86:
+  linux:
+    name: linux-${{ matrix.cc }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { cc: gcc,   cxx: g++-14,     c: gcc-14 }
+          - { cc: clang, cxx: clang++-23, c: clang-23 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      # dbus-daemon, xvfb, xsel, libxcb1: test_os_dbus and test_os_clipboard run against a real bus / a private X
+      # server when these are installed and skip those cases otherwise
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 clang-23 ccache dbus-daemon xvfb xsel libxcb1
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: linux-${{ matrix.cc }}
+      - run: cmake --preset dev -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} -DCMAKE_C_COMPILER=${{ matrix.c }} -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+      - run: cmake --build --preset dev -j4
+      - run: ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200
+  linux-vulkan:
+    # Vulkan backend on Mesa lavapipe (llvmpipe, CPU): test_vulkan, its 256-byte-alignment rerun and the two
+    # Vulkan goldens. The loader is pinned to the lavapipe ICD; test_vulkan must report an llvmpipe device.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 python3-numpy
-      - run: cmake --preset dev -DCMAKE_CXX_COMPILER=g++-14
-      - run: cmake --build --preset dev -j
-      - run: ctest --preset dev
-  # ThreadSanitizer: scripting runtime (tasks, channels, forge::shared, ARC across threads, debug-mode
-  # race/deadlock detector) and the thread-pool backed tests. Slow/emulator suites are excluded.
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 ccache glslang-tools spirv-tools libvulkan-dev mesa-vulkan-drivers
+      - name: pin the Vulkan loader to lavapipe
+        run: |
+          icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -1)
+          test -n "$icd"; cat "$icd"
+          echo "VK_ICD_FILENAMES=$icd" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icd" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-vulkan }
+      - name: configure (Vulkan must be enabled)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DPython3_EXECUTABLE=$(which python) | tee configure.log
+          grep -q "Vulkan backend enabled" configure.log
+      - run: cmake --build build -j4 --target forge test_vulkan
+      - name: test_vulkan on lavapipe
+        run: |
+          rc=0; ./build/test_vulkan | tee vk.log || rc=$?
+          [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
+          grep -q "^vulkan device: llvmpipe" vk.log
+      - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
+      - name: all four Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 4
   linux-tsan:
+    # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
+    # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
+    # scripting runtime. The single-threaded suites add build time and nothing TSan can see.
+    # Nothing is excluded or suppressed; a suppression would go in ci/sanitizers/ with the reason.
     runs-on: ubuntu-24.04
+    timeout-minutes: 120
     env:
       TSAN_OPTIONS: halt_on_error=1 second_deadlock_stack=1
+      TSAN_TESTS: test_pool test_process_pool test_loadbalancer test_memory test_aio test_log test_rpc test_os test_os_net test_os_process test_os_sys test_os_ext test_os_dev test_os_dynlib test_sessions test_inference test_script test_script_fsc test_script_golden test_script_os_sandbox test_script_oserror test_script_security test_modelfile test_kvquant test_graph
     steps:
       - uses: actions/checkout@v4
       - name: add the LLVM apt repository (clang 23)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
           echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 python3-numpy
-      - run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
-      - run: cmake --build build-tsan -j --target test_script forge
-      - run: ./build-tsan/test_script
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache python3-numpy dbus-daemon xvfb xsel libxcb1
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-tsan }
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_TSAN=ON -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake --build build-tsan -j4 --target forge forge_script_example_plugin $TSAN_TESTS
+      - name: threaded suites under TSan
+        run: ctest --test-dir build-tsan -R "^($(echo $TSAN_TESTS | tr ' ' '|'))$" -j2 --timeout 3600 --no-tests=error
   linux-asan:
+    # AddressSanitizer + UndefinedBehaviorSanitizer over the whole test suite (Debug), leak detection on.
+    # Nothing is excluded or suppressed; a suppression would go in ci/sanitizers/ with the reason.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1:detect_stack_use_after_return=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache dbus-daemon xvfb xsel libxcb1
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-asan }
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_FUZZ_ITERS=1000
+      - run: cmake --build build-asan -j4
+      - name: whole suite under ASan + UBSan
+        run: ctest --test-dir build-asan -LE "slow|emu" -j2 --timeout 3600
+  linux-fuzz:
+    # Every fuzz target with libFuzzer under ASan + UBSan for a short, fixed time on its seed corpus. A crash
+    # fails the job and its input is uploaded; add it to fuzz/corpus/<target>/ as regress_<what> with the fix.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      ASAN_OPTIONS: detect_leaks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      FUZZ_SECONDS: "60"
+    steps:
+      - uses: actions/checkout@v4
+      - name: add the LLVM apt repository (clang 23)
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 ccache
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: linux-fuzz }
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_SANITIZE=ON -DFORGE_LIBFUZZER=ON -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF
+      - name: build the fuzz targets
+        run: |
+          ls fuzz/fuzz_*.cpp | xargs -n1 basename | sed 's/\.cpp$//' | sort > fuzz-targets.txt   # one target per fuzz/fuzz_<name>.cpp
+          cat fuzz-targets.txt; test -s fuzz-targets.txt
+          cmake --build build-fuzz -j4 --target $(cat fuzz-targets.txt)
+      - name: fuzz each target for ${{ env.FUZZ_SECONDS }} s
+        run: |
+          mkdir -p fuzz-out; rc=0
+          for t in $(cat fuzz-targets.txt); do
+            n=${t#fuzz_}; mkdir -p fuzz-out/corpus-$n; src=$n; [ $n = script_aot ] && src=script   # fuzz_script_aot reads the script corpus
+            cp fuzz/corpus/$src/* fuzz-out/corpus-$n/ 2>/dev/null || true
+            echo "::group::$t"
+            ./build-fuzz/$t -max_total_time=$FUZZ_SECONDS -timeout=30 -rss_limit_mb=3072 -print_final_stats=1 -artifact_prefix=fuzz-out/$n- fuzz-out/corpus-$n > fuzz-out/$n.log 2>&1 || { rc=1; echo "::error::$t found something (see the fuzz-findings artefact)"; }
+            tail -n 25 fuzz-out/$n.log
+            echo "::endgroup::"
+            rm -rf fuzz-out/corpus-$n
+          done
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: fuzz-findings, path: fuzz-out }
+  emu:
+    # ctest label `emu` and the SIMD-facing suites under qemu-user: one row per emulated target. A row names the
+    # toolchain file, the Ubuntu cross compiler, the sysroot qemu loads the target's libc from, and the qemu
+    # -cpu models the suites are run under (the lane_*_vl<N> / tile_sme_svl<N> tests, label emu, set their own
+    # and cover more vector lengths). Adding an architecture = adding a row and its toolchain file.
+    # Fixed-width rows (LoongArch LSX/LASX, POWER VSX, s390x VXE, MIPS MSA) have no kernel-table configure line
+    # (`tables` empty), no emu-labelled tests (`emu_min` 0) and one CPU model, which their toolchain file sets
+    # (`cpus` "default"); their lane_<table> tests force each table and require it to be the active one.
+    # The cross compiler: g++-14-<triple> where Ubuntu 24.04 has it, else g++-13-<triple>, else the unversioned
+    # g++-<triple> (the install step tries them in that order and exports the one it found). The loongarch64 and
+    # mips64el rows are `experimental`: whether those cross packages exist on the runner image has not been
+    # checked (this job has never run on GitHub), so they do not fail the workflow.
+    name: emu-${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    continue-on-error: ${{ matrix.experimental == true }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64-sve
+            toolchain: aarch64-sve-qemu
+            triple: aarch64-linux-gnu
+            qemu: qemu-aarch64
+            tables: "(SVE|RVV)"
+            emu_min: 4
+            cpus: "max,sve256=on max,sve512=on"
+          - name: riscv64-rvv
+            toolchain: riscv64-rvv-qemu
+            triple: riscv64-linux-gnu
+            qemu: qemu-riscv64
+            tables: "(SVE|RVV)"
+            emu_min: 4
+            cpus: "rv64,v=true,vlen=256"
+          - name: loongarch64-lasx
+            toolchain: loongarch64-lasx-qemu
+            triple: loongarch64-linux-gnu
+            qemu: qemu-loongarch64
+            tables: ""
+            emu_min: 0
+            lanes: "lasx lsx"
+            cpus: "default"
+            experimental: true
+          - name: ppc64le-vsx
+            toolchain: ppc64le-vsx-qemu
+            triple: powerpc64le-linux-gnu
+            qemu: qemu-ppc64le
+            tables: ""
+            emu_min: 0
+            lanes: "vsx"
+            cpus: "default"
+          - name: s390x-vxe
+            toolchain: s390x-vxe-qemu
+            triple: s390x-linux-gnu
+            qemu: qemu-s390x
+            tables: ""
+            emu_min: 0
+            lanes: "vxe"
+            cpus: "default"
+          - name: mips64el-msa
+            toolchain: mips64el-msa-qemu
+            triple: mips64el-linux-gnuabi64
+            qemu: qemu-mips64el
+            tables: ""
+            emu_min: 0
+            lanes: "msa"
+            cpus: "default"
+            experimental: true
+    env:
+      QEMU_LD_PREFIX: /usr/${{ matrix.triple }}
+      EMU_TESTS: test_simd test_tile test_dtypes test_graph test_kvquant test_support test_util
+    steps:
+      - uses: actions/checkout@v4
+      - name: install qemu-user and the cross compiler (g++-14, else g++-13, else unversioned)
+        run: |
+          sudo apt-get update && sudo apt-get install -y ninja-build ccache qemu-user
+          t=${{ matrix.triple }}
+          for v in -14 -13 ""; do
+            if sudo apt-get install -y gcc$v-$t g++$v-$t; then
+              echo "CROSS_CC=$t-gcc$v" >> "$GITHUB_ENV"; echo "CROSS_CXX=$t-g++$v" >> "$GITHUB_ENV"
+              echo "cross compiler: $t-g++$v"; exit 0
+            fi
+          done
+          echo "::error::no g++ cross package for $t on this image"; exit 1
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: "emu-${{ matrix.name }}" }
+      - name: configure (cross build, tests run under qemu-user)
+        run: |
+          ${{ matrix.qemu }} --version | head -1
+          cmake -S . -B build/emu -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/${{ matrix.toolchain }}.cmake -DFORGE_CROSS_CC=$CROSS_CC -DFORGE_CROSS_CXX=$CROSS_CXX -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF | tee configure.log
+          if [ -n "${{ matrix.tables }}" ]; then grep -E "FORGE: (SVE|RVV) kernel tables: .*FORGE_SIMD_(SVE|RVV)256" configure.log; fi
+      - run: cmake --build build/emu -j4 --target $EMU_TESTS
+      - name: fixed-width kernel tables, each forced and required to be the active one
+        if: matrix.lanes
+        run: |
+          for t in ${{ matrix.lanes }}; do ctest --test-dir build/emu -R "^lane_$t\$" --timeout 1800 --no-tests=error --output-on-failure; done
+      - name: emu-labelled tests (scalable lane active at every vector length)
+        if: matrix.emu_min > 0
+        run: |
+          ctest --test-dir build/emu -L emu -j2 --timeout 1800 --no-tests=error
+          test "$(ctest --test-dir build/emu -N -L emu | grep -c 'Test *#')" -ge ${{ matrix.emu_min }}
+      - name: SIMD-facing suites at each -cpu model
+        run: |
+          for cpu in ${{ matrix.cpus }}; do
+            echo "::group::-cpu $cpu"
+            if [ "$cpu" != default ]; then cmake build/emu -DFORGE_QEMU_CPU="$cpu" > /dev/null; fi
+            ctest --test-dir build/emu -R "^($(echo $EMU_TESTS | tr ' ' '|'))$" -j2 --timeout 2400 --no-tests=error
+            echo "::endgroup::"
+          done
+  wasm-simd:
+    # The simd layer on wasm32-wasi (the rest of FORGE is not ported): tests/wasm_simd.sh builds test_simd and the
+    # scalar + SIMD128 kernel tables with zig and runs them under node's WASI, then once more without -msimd128.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - run: python -m pip install ziglang numpy
+      - name: put the package's zig on PATH
+        run: python -c "import ziglang, os; print(os.path.dirname(ziglang.__file__))" >> "$GITHUB_PATH"
+      - name: native configure and test_simd (the generated headers the wasm build includes)
+        run: |
+          cmake --preset dev -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_EXAMPLES=OFF -DFORGE_BUILD_APPS=OFF
+          cmake --build build/dev -j4 --target test_simd
+      - run: tests/wasm_simd.sh build/wasm
+      - run: WASM_SIMD=0 tests/wasm_simd.sh build/wasm-scalar
+  perf:
+    # forge bench against perf/baseline-x86_64.json. Hosted runners are shared and are not the machine the
+    # baseline was recorded on, so the job never blocks a merge (continue-on-error) and only fails below a quarter
+    # of the baseline; the table goes to the job summary and the numbers to the perf-report artefact.
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14 ccache
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: perf }
+      - run: cmake -S . -B build/release -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF -DPython3_EXECUTABLE=$(which python)
+      - run: cmake --build build/release -j4 --target forge
+      - name: the bench model (golden_tiny_llama writes build/release/golden/tiny_f32.fpk)
+        run: ctest --test-dir build/release -R "^golden_tiny_llama$" --no-tests=error
+      - name: perf_baseline.py --check
+        env: { FORGE_THREADS: "4" }
+        run: |
+          grep -m1 "model name" /proc/cpuinfo; nproc
+          python tools/perf_baseline.py --forge build/release/forge --model build/release/golden/tiny_f32.fpk --baseline perf/baseline-x86_64.json --check --tolerance 0.75 --allow-missing --reps 5 --report perf-report.json --markdown "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: perf-report, path: perf-report.json, if-no-files-found: warn }
+  repro:
+    # Reproducible builds: two clean Release builds in two directories of different depth must give bit-identical
+    # forge, forge-serve and libforge.so (ci/repro_check.sh; no compiler cache, it would hide a difference).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: sh ci/repro_check.sh -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_EXAMPLES=OFF
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with: { name: repro-diff, path: repro-diff, if-no-files-found: ignore }
+  cross-zig:
+    # ctest label `cross`: the xos_* tests compile (and for the OS-layer tests link) the portable sources with zig
+    # for x86_64-freebsd, aarch64/x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl. Compile checks only.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install ziglang numpy
+      - name: put the package's zig on PATH
+        run: python -c "import ziglang, os; print(os.path.dirname(ziglang.__file__))" >> "$GITHUB_PATH"
+      - name: configure (zig must be found)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_EXAMPLES=OFF -DPython3_EXECUTABLE=$(which python)
+          test "$(ctest --test-dir build -N -L cross | grep -c 'Test *#')" -ge 10
+      - run: ctest --test-dir build -L cross -j4 --timeout 1800 --no-tests=error
+  shells:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: add the LLVM apt repository (clang 23)
+      - name: install shells
         run: |
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
-          echo "deb https://apt.llvm.org/noble/ llvm-toolchain-noble-23 main" | sudo tee /etc/apt/sources.list.d/llvm-23.list
-      - run: sudo apt-get update && sudo apt-get install -y ninja-build clang-23 python3-numpy
-      - run: cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++-23 -DCMAKE_C_COMPILER=clang-23 -DFORGE_SANITIZE=ON -DFORGE_BUILD_EXAMPLES=OFF
-      - run: cmake --build build-asan -j --target test_script
-      - run: ./build-asan/test_script
-  # Planned: Intel SDE (AVX-512/AMX), QEMU AArch64 (NEON/SVE), QEMU RISC-V, MSVC, macOS, Android/iOS, GPU lab.
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++-14 ccache zsh dash busybox ksh mksh yash fish tcsh csh posh rc es xonsh || true
+          sudo apt-get install -y oksh || true
+          sudo snap install powershell --classic || true
+          pip install --user oils-for-unix 2>/dev/null || true
+          ls -l /bin/*sh /usr/bin/*sh 2>/dev/null || true
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: shells }
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake --build build -j4 --target test_script forge
+      - run: FORGE_TEST_ONLY=emit ./build/test_script
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: brew install ninja ccache
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with: { key: macos }
+      - run: cmake --preset dev -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
+      - run: cmake --build --preset dev -j4
+      - run: ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200
+  ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build/ios -G Xcode -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_APPS=OFF -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake --build build/ios --config Release --target forge_c -- -quiet CODE_SIGNING_ALLOWED=NO
+      # apple.mm (UIKit, CoreMotion) and locale_apple.mm only compile in these
+      - run: cmake --build build/ios --config Release --target forge_mobile -- -quiet CODE_SIGNING_ALLOWED=NO
+      - run: cmake --build build/ios --config Release --target forge_text -- -quiet CODE_SIGNING_ALLOWED=NO
+      # Command-line test executables for the arm64 iOS simulator (Ninja; ld64 ad-hoc signs them), run with
+      # `xcrun simctl spawn` in a booted iPhone simulator.
+      - run: brew install ninja
+      - name: build tests for the iOS simulator
+        run: |
+          cmake -S . -B build/ios-sim -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/ios.cmake -DFORGE_IOS_SIMULATOR=ON -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_BUILD_TYPE=Release -DFORGE_BUILD_TESTS=ON -DFORGE_BUILD_APPS=OFF -DFORGE_BUILD_EXAMPLES=OFF
+          cmake --build build/ios-sim -j4 --target test_os test_text test_locale test_mobile test_util
+      - name: run tests in the iOS simulator
+        timeout-minutes: 20
+        run: sh .github/ios_sim_check.sh build/ios-sim test_os test_text test_locale test_mobile test_util
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install numpy safetensors onnx cryptography blake3 gguf tokenizers sentencepiece
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl -DCMAKE_C_COMPILER=cl -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake --build build -j4
+      - run: ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200
+      - name: emitted cmd / pwsh / powershell 5.1 goldens
+        shell: cmd
+        run: set FORGE_TEST_ONLY=emit&& build\test_script.exe
+  windows-mingw:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja mingw-w64-ucrt-x86_64-python mingw-w64-ucrt-x86_64-python-numpy mingw-w64-ucrt-x86_64-python-cryptography
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF
+      - run: cmake --build build -j4
+      - run: ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200
+  freebsd:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          mem: 8192
+          prepare: |
+            pkg install -y cmake ninja python3 bash zsh mksh fish
+            py=$(python3 -c 'import sys; print("py%d%d" % sys.version_info[:2])')
+            pkg install -y $py-numpy $py-cryptography || true
+          run: |
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF
+            cmake --build build -j4
+            ctest --test-dir build -LE "slow|emu|gpu" -j2 --timeout 1200 --output-on-failure
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build g++-14
+      - name: NDK cross builds (arm64-v8a, x86_64)
+        run: |
+          export ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME
+          sh tests/mobile_build.sh android arm64-v8a
+          cmake -S . -B build/android-x86_64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/android-arm64.cmake -DANDROID_ABI=x86_64 -DCMAKE_BUILD_TYPE=Release -DFORGE_BUILD_EXAMPLES=OFF
+          cmake --build build/android-x86_64 -j4 --target forge test_script forge_script_example_plugin test_mobile test_locale test_text test_os test_os_ext test_os_sys test_util test_loadbalancer
+      - name: host forge for --emit android
+        run: |
+          cmake -S . -B build/host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 -DFORGE_BUILD_TESTS=OFF -DFORGE_BUILD_EXAMPLES=OFF
+          cmake --build build/host -j4 --target forge
+          mkdir -p emit && for g in functions flat batch; do ./build/host/forge script --emit android tests/data/emit/$g.cpp > emit/$g.sh; rc=0; ./build/host/forge script tests/data/emit/$g.cpp > emit/$g.want || rc=$?; echo $rc > emit/$g.rc; done
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: sh .github/android_check.sh

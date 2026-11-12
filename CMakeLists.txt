@@ -1614,6 +1614,13 @@ if(FORGE_BUILD_TESTS)
     forge_py_needs("numpy;onnx" onnx_import)
     if(Python3_EXECUTABLE)
       add_test(NAME docs_up_to_date COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/gen_docs.py --check)
+      # relative links, anchors and backticked repository paths of README.md and docs/*.md resolve
+      add_test(NAME docs_links COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/check_docs_links.py --root ${PROJECT_SOURCE_DIR})
+      # the workflow GitHub runs and the two copies kept under ci/ (ci/install-workflows.sh installs from ci/github) are one file
+      if(EXISTS ${PROJECT_SOURCE_DIR}/.github/workflows/ci.yml)
+        add_test(NAME ci_workflow_copies COMMAND ${CMAKE_COMMAND} -E compare_files ${PROJECT_SOURCE_DIR}/.github/workflows/ci.yml ${PROJECT_SOURCE_DIR}/ci/github/ci.yml)
+        add_test(NAME ci_workflow_copy_flat COMMAND ${CMAKE_COMMAND} -E compare_files ${PROJECT_SOURCE_DIR}/.github/workflows/ci.yml ${PROJECT_SOURCE_DIR}/ci/github-actions-ci.yml)
+      endif()
       add_test(NAME sbom_spdx COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/sbom_test.py ${PROJECT_SOURCE_DIR})
       # docs/reference.md's op x backend table is read from the sources by gen_docs.py; this compares it with
       # the registries of the code as built (tools/coverage_dump.cpp walks them).
@@ -1773,6 +1780,24 @@ endif()
 if(FORGE_BUILD_TESTS AND TARGET test_aot)
   # the golden MoE / quantised models (built by the golden tests) when they are there
   target_compile_definitions(test_aot PRIVATE FORGE_TEST_BINARY_DIR="${PROJECT_BINARY_DIR}")
+  # ... and the models of the other template families: run after the golden tests that write them (order only; the
+  # cases skip a model that is not there)
+  set(_forge_aot_after golden_tiny_llama golden_moe_mla golden_tiny_qwen2 golden_rope_scaling)
+  foreach(_g gpt2 gemma phi3 bert vit whisper)
+    list(APPEND _forge_aot_after golden_tiny_${_g})
+  endforeach()
+  set(_forge_aot_deps "")
+  foreach(_t ${_forge_aot_after})
+    if(TEST ${_t})
+      list(APPEND _forge_aot_deps ${_t})
+    endif()
+  endforeach()
+  if(_forge_aot_deps)
+    set_property(TEST test_aot APPEND PROPERTY DEPENDS ${_forge_aot_deps})
+    if(TEST test_aot_native)
+      set_property(TEST test_aot_native APPEND PROPERTY DEPENDS ${_forge_aot_deps})
+    endif()
+  endif()
 endif()
 
 # ---- fuzz targets (fuzz/): libFuzzer entry points + a built-in mutational driver for CI ----

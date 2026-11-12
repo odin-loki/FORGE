@@ -20,6 +20,7 @@
 | Vulkan | `tests/test_vulkan.cpp` | `test_vulkan`, `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`), label `gpu` |
 | GPU compile checks | generated kernels compiled with clang | `gpu_compile_{cuda,hip,opencl,opencl_nofp64,metal_syntax}`, and `gpu_compile_metal` with `xcrun`; label `gpu` |
 | Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` (`tools/sbom.py`: the SPDX 2.3 and the CycloneDX 1.5 output) |
+| Embedding server | `tests/serve_embeddings_test.py`: `/v1/embeddings` on the tiny BERT of the bert golden against `forge embed`, 400 on a generative model | `serve_embeddings` (needs `golden_tiny_bert` and `golden_tiny_llama` to have run) |
 | C ABI | `tests/capi_smoke.c` | `capi_smoke` (not built when cross-compiling) |
 | Installed package | `tests/install_consumer/` (install to a scratch prefix, then `find_package(forge)` from a C++ and a C program; see [building.md](building.md#the-install_consumer-test)) | `install_consumer`, label `install` (not for cross or sanitizer builds) |
 | TLS-only RPC cases | `test_rpc` with `FORGE_TEST_ONLY=rpc_tls` | `test_rpc_tls` (skips in a build without OpenSSL, or without the `openssl` command) |
@@ -27,6 +28,8 @@
 | Doc examples | `docs/examples/*` | `doc_example_*` |
 | Integration examples | `examples/integrations/*.cpp` | `example_*`, label `integration` |
 | Docs freshness | `tools/gen_docs.py --check` | `docs_up_to_date` (fails if `docs/reference.md` is stale) |
+| Docs links | `tools/check_docs_links.py`: every relative link and anchor, and every backticked repository path, of `README.md`, the other top-level guides and `docs/*.md` resolves; every guide is linked from `docs/index.md` | `docs_links` |
+| CI workflow copies | `.github/workflows/ci.yml`, `ci/github/ci.yml` and `ci/github-actions-ci.yml` are the same file | `ci_workflow_copies`, `ci_workflow_copy_flat` |
 | Fuzz | `fuzz/fuzz_*.cpp`: file formats (aot, blueprint, bmp, chat_template, dbus, fpk, fsc, gguf, grammar, inflate, json, onnx, png, pnm, reflect, safetensors, script, script_aot, tokenizer) and network or request input (serve_http, proxy_http, rpc, json_schema, policy, signature) | `fuzz_*`, label `fuzz` |
 | Lowering table | `tools/coverage_dump.cpp` walks the registries of the built code | `coverage_table`: the op × backend table `tools/gen_docs.py` reads from the sources for `docs/reference.md` must match them |
 | JNI syntax | `bindings/android/jni/forge_jni.c` against a JDK's `jni.h` | `jni_syntax` |
