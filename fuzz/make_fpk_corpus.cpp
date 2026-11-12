@@ -3,8 +3,10 @@
 // A model of three small tensors (f32, f16, q8_0), then the same file signed, sealed with the old single-AEAD
 // scheme, sealed with the chunked scheme (64-byte chunks, so a tensor spans several), and sealed + signed.
 // sections_aligned.fpk carries the optional sections (state, adapters, calib) and 4096-byte tensor alignment.
+// sharded.fpk is the main file of a sharded model (packed, 128-byte blobs) without its blobs.
 // The sealed seeds use the fixed key of fuzz/fuzz_fpk.cpp. regress_* files are left alone.
 #include <forge/modelfile/sign.hpp>
+#include <forge/modelfile/shard.hpp>
 #include <forge/modelfile/adapters.hpp>
 #include <forge/modelfile/calib.hpp>
 #include <forge/modelfile/state_schema.hpp>
@@ -50,6 +52,13 @@ int main(int argc, char** argv) {
         x.write(at("sections_aligned.fpk"));
         modelfile::reader r(at("sections_aligned.fpk"));
         if (modelfile::read_adapters(r).size() != 1 || !r.misaligned_tensors().empty()) { std::fprintf(stderr, "sections_aligned.fpk is not as intended\n"); return 1; }
+    }
+    {   // a sharded main file (its blobs are not part of the corpus: the harness sees them as missing)
+        auto td = out / "shard_tmp"; fs::remove_all(td); fs::create_directories(td);
+        modelfile::shard_split(at("plain.fpk"), (td / "sharded.fpk").string(), {.shard_bytes = 128});
+        fs::copy_file(td / "sharded.fpk", out / "sharded.fpk", fs::copy_options::overwrite_existing);
+        fs::remove_all(td);
+        std::printf("%-28s %zu bytes\n", "sharded.fpk", std::size_t(fs::file_size(out / "sharded.fpk")));
     }
     for (auto* n : {"plain.fpk", "signed.fpk", "sealed_single.fpk", "sealed_chunked.fpk", "sealed_chunked_signed.fpk", "sections_aligned.fpk"}) {
         modelfile::reader r(at(n), key);

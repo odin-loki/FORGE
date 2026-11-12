@@ -91,7 +91,7 @@ inline requant_report requantise(const std::string& in, const std::string& out, 
         w.add_tensor(e->name, e->shape, t.data, c); ++rep.requantised;
     }
     for (auto& [name, s] : r.sections()) {
-        if (name == "data" || name == "tensors" || name == "signature" || name == "aot" || name == "encryption" || name == "enc_macs" || name == "manifest" || name == modelfile::calib_section) continue;
+        if (name == "data" || name == "tensors" || name == "signature" || name == "aot" || name == "encryption" || name == "enc_macs" || name == "manifest" || name == modelfile::calib_section || name == modelfile::shards_section) continue;
         w.set_section(name, std::string(r.section_text(name)));
     }
     if (!calib.empty()) w.set_section(modelfile::calib_section, calib.dump());
@@ -100,6 +100,7 @@ inline requant_report requantise(const std::string& in, const std::string& out, 
         auto& o = man.obj_mut();
         auto set = [&](const char* k, json::value v) { for (auto& [kk, vv] : o) if (kk == k) { vv = std::move(v); return; } o.emplace_back(k, std::move(v)); };
         set("codec", opt.codec); set("requantised", true);
+        std::erase_if(o, [](auto& kv) { return kv.first == "sharded"; });   // the output is one file
     }
     w.set_manifest(man);
     if (r.has_section("signature")) rep.notes.push_back("the signature was dropped (the weights changed): sign the output again");

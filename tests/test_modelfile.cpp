@@ -2,6 +2,7 @@
 #include <forge/inference/inference.hpp>
 #include <forge/import/gguf.hpp>
 #include <forge/import/requant.hpp>
+#include <forge/modelfile/shard.hpp>
 #include <cstdio>
 #include <filesystem>
 #if !defined(_WIN32)
@@ -541,6 +542,179 @@ TEST(blueprint_binary_form_round_trips) {
         modelfile::detail::write_sections(txt, m);
         CHECK_THROWS(inference::model(txt));
     }
+}
+
+// ---- sharded models and the content-addressed blob store (FORGE_PLAN D.3) ----
+TEST(fpk_shards_and_blob_store) {
+    namespace fs = std::filesystem;
+    auto root = fs::path(tmp("shards")); fs::remove_all(root); fs::create_directories(root);
+    auto P = [&](const char* n) { return (root / n).string(); };
+    auto count_blobs = [](const fs::path& d) { std::size_t n = 0; std::error_code ec; for (auto it = fs::recursive_directory_iterator(d, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) if (it->is_regular_file() && it->path().extension() == ".fpkb") ++n; return n; };
+    auto base = forge_test::make_tiny_model(P("base.fpk"));
+    const std::vector<int> ids{1, 2, 3, 4};
+    std::vector<float> ref; std::size_t n_tensors = 0; std::uint64_t data_bytes = 0;
+    { inference::session s(base); ref = s.forward(ids); n_tensors = s.file().tensors().size(); data_bytes = s.file().data_size(); }
+
+    // ---- one blob per tensor
+    auto rep = modelfile::shard_split(base, P("a.fpk"));
+    CHECK(rep.tensors == n_tensors && rep.shards == n_tensors && rep.written == n_tensors && rep.reused == 0 && rep.blob_dir == (root / "blobs").string());
+    CHECK(count_blobs(root / "blobs") == n_tensors && fs::file_size(P("a.fpk")) < 32768 && fs::file_size(P("a.fpk")) * 4 < fs::file_size(base));
+    {
+        modelfile::reader r(P("a.fpk")), b(base);
+        CHECK(r.sharded() && r.shards().size() == n_tensors && r.missing_shards().empty() && r.verify().empty() && r.section_bytes("data").empty() && r.data_size() <= data_bytes);
+        CHECK(r.manifest().find("sharded") && r.manifest().num_or("forge_format_minor", 0) == 3 && r.has_section("state"));
+        for (auto& [n, e] : b.tensors()) {
+            CHECK(r.entry(n).blake3 == e.blake3 && r.entry(n).offset == 0 && r.shards()[std::size_t(r.entry(n).shard)].blake3 == e.blake3);   // the blob is named by the tensor's own hash
+            auto x = r.tensor_bytes(n), y = b.tensor_bytes(n);
+            CHECK(x.size() == y.size() && std::memcmp(x.data(), y.data(), y.size()) == 0);
+        }
+        CHECK(fs::exists(modelfile::blob_path((root / "blobs").string(), b.entry("lm_head").blake3)));
+        inference::session s(P("a.fpk")); CHECK(s.forward(ids) == ref);
+    }
+    CHECK_THROWS(modelfile::shard_split(P("a.fpk"), P("x.fpk")));        // already sharded
+    CHECK_THROWS(modelfile::shard_split(base, base));
+
+    // ---- dedup: a "fine-tune" that changes one tensor adds one blob; a second copy of the base adds none
+    auto tuned = P("tuned.fpk");
+    {
+        modelfile::reader b(base); modelfile::writer w;
+        std::vector<const modelfile::tensor_entry*> order; for (auto& [n, e] : b.tensors()) order.push_back(&e);
+        std::sort(order.begin(), order.end(), [](auto* x, auto* y) { return x->offset < y->offset; });
+        for (auto* e : order) {
+            if (e->name == "layer.1.wo") { auto t = b.load(e->name); for (auto& v : t.data) v *= 1.5f; w.add_tensor(e->name, e->shape, t.data); }
+            else w.add_raw(e->name, e->shape, e->codec, b.tensor_bytes(e->name));
+        }
+        for (auto& [n, sc] : b.sections()) if (n != "data" && n != "tensors") w.set_section(n, std::string(b.section_text(n)));
+        w.write(tuned);
+    }
+    std::vector<float> ref_tuned; { inference::session s(tuned); ref_tuned = s.forward(ids); CHECK(ref_tuned != ref); }
+    auto rep2 = modelfile::shard_split(tuned, P("b.fpk"));
+    CHECK(rep2.shards == n_tensors && rep2.written == 1 && rep2.reused == n_tensors - 1 && count_blobs(root / "blobs") == n_tensors + 1);
+    auto rep3 = modelfile::shard_split(base, P("c.fpk"));
+    CHECK(rep3.written == 0 && rep3.reused == n_tensors && rep3.bytes_written == 0 && count_blobs(root / "blobs") == n_tensors + 1);
+    { inference::session a(P("a.fpk")), b(P("b.fpk")), c(P("c.fpk")); CHECK(a.forward(ids) == ref && b.forward(ids) == ref_tuned && c.forward(ids) == ref); }
+    std::printf("  %zu tensors: base %zu blobs, fine-tune +%zu, second copy +%zu\n", n_tensors, rep.written, rep2.written, rep3.written);
+
+    // ---- a blob that is absent only matters when one of its tensors is used; verify() names it
+    std::string lm_blob, wq_blob;
+    { modelfile::reader r(P("a.fpk")); lm_blob = r.find_shard(std::size_t(r.entry("lm_head").shard)); wq_blob = r.find_shard(std::size_t(r.entry("layer.0.wq").shard)); }
+    fs::rename(lm_blob, lm_blob + ".away");
+    {
+        modelfile::reader r(P("a.fpk"));   // opens: partial download
+        CHECK(r.missing_shards().size() == 1 && r.load("layer.0.wq").size() == 32 * 32);
+        bool nf = false; try { (void)r.tensor_bytes("lm_head"); } catch (const forge_exception& e) { nf = e.code == errc::not_found && std::string(e.what()).find(r.entry("lm_head").blake3) != std::string::npos; }
+        CHECK(nf);
+        auto bad = r.verify(); CHECK(bad.size() == 1 && bad[0].find("missing") != std::string::npos);
+        CHECK_THROWS(modelfile::shard_join(P("a.fpk"), P("j.fpk")));
+        inference::session s(P("a.fpk")); CHECK_THROWS(s.forward(ids));
+    }
+    fs::rename(lm_blob + ".away", lm_blob);
+
+    // ---- a corrupt or substituted blob is refused when its tensor is read, whatever its name and size say
+    auto flip = [](const std::string& f, std::streamoff at) { std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary); io.seekg(at); char c; io.get(c); io.seekp(at); io.put(char(c ^ 0x20)); };
+    flip(wq_blob, 100);
+    {
+        modelfile::reader r(P("a.fpk"));
+        bool ie = false; try { (void)r.tensor_bytes("layer.0.wq"); } catch (const forge_exception& e) { ie = e.code == errc::integrity_error; }
+        CHECK(ie); CHECK_THROWS(r.load("layer.0.wq")); CHECK(r.load("layer.1.wq").size() == 32 * 32);   // other tensors are fine
+        auto bad = r.verify(); CHECK(bad.size() == 2);   // the blob and its tensor
+        inference::session s(P("a.fpk")); CHECK_THROWS(s.forward(ids));
+    }
+    flip(wq_blob, 100);
+    {   // two blobs of the same size exchanged (layer.0.wq and layer.1.wq): names and sizes still match
+        modelfile::reader r0(P("a.fpk")); auto other = r0.find_shard(std::size_t(r0.entry("layer.1.wq").shard));
+        fs::rename(wq_blob, wq_blob + ".t"); fs::rename(other, wq_blob); fs::rename(wq_blob + ".t", other);
+        { modelfile::reader r(P("a.fpk")); CHECK(r.missing_shards().empty()); CHECK_THROWS(r.tensor_bytes("layer.0.wq")); CHECK_THROWS(r.tensor_bytes("layer.1.wq")); CHECK(r.verify().size() == 4); }
+        fs::rename(wq_blob, wq_blob + ".t"); fs::rename(other, wq_blob); fs::rename(wq_blob + ".t", other);
+        modelfile::reader r(P("a.fpk")); CHECK(r.verify().empty());
+    }
+
+    // ---- the signature of the main file covers every blob and tensor hash
+    {
+        auto kp = modelfile::generate_keypair(); auto sg = P("signed.fpk");
+        modelfile::sign_file(P("a.fpk"), sg, kp);
+        { modelfile::reader r(sg); auto rp = modelfile::verify_signature(r, {modelfile::detail::to_hex(kp.pub)}); CHECK(rp.trusted && r.verify().empty()); inference::session s(sg); CHECK(s.forward(ids) == ref); }
+        // an index edited so that layer.0.wq is layer.1.wq's blob, hash and all: every content check passes (the blob
+        // is what the index says), the weights are wrong, and only the signature over the index can tell
+        auto m = read_sections(sg);
+        auto idx = json::parse(sec(m, "tensors")).arr(); json::object* e0 = nullptr; json::object* e1 = nullptr;
+        for (auto& e : idx) { if (e["name"].str() == "layer.0.wq") e0 = &e.obj_mut(); if (e["name"].str() == "layer.1.wq") e1 = &e.obj_mut(); }
+        CHECK(e0 && e1);
+        if (e0 && e1) for (auto& [k, v] : *e0) if (k == "blake3" || k == "shard") for (auto& [k1, v1] : *e1) if (k1 == k) v = v1;
+        sec(m, "tensors") = json::dump(json::value(idx));
+        modelfile::detail::write_sections(P("forged.fpk"), m);
+        modelfile::reader rf(P("forged.fpk"));
+        CHECK(rf.verify().empty() && rf.load("layer.0.wq").data == rf.load("layer.1.wq").data);
+        CHECK(!modelfile::verify_signature(rf).digest_ok);
+    }
+
+    // ---- packed shards
+    auto rp = modelfile::shard_split(base, P("p.fpk"), {.shard_bytes = 64 << 10, .blob_dir = (root / "packs").string()});
+    CHECK(rp.shards >= 2 && rp.shards < n_tensors && rp.written == rp.shards && count_blobs(root / "packs") == rp.shards);
+    {
+        modelfile::reader r(P("p.fpk"));
+        CHECK(!r.missing_shards().empty());                                    // the packs are not in the default places (a pack of one tensor is the same blob as that tensor's, so some may be)
+        r.set_blob_dirs({(root / "packs").string()});
+        CHECK(r.missing_shards().empty() && r.verify().empty() && r.misaligned_tensors().empty());
+        for (auto& sh : r.shards()) CHECK(sh.bytes <= (64u << 10));
+        modelfile::reader b(base); for (auto& [n, e] : b.tensors()) { auto x = r.tensor_bytes(n); CHECK(x.size() == e.bytes && hash::blake3::hex(hash::blake3::of(x)) == e.blake3); }
+    }
+    forge_test::set_env("FORGE_BLOB_DIR", (root / "packs").string().c_str());   // the environment names the store
+    { inference::session s(P("p.fpk")); CHECK(s.forward(ids) == ref); }
+    {   // join: back to one file with the same tensors
+        auto rj = modelfile::shard_join(P("p.fpk"), P("joined.fpk"));
+        modelfile::reader j(P("joined.fpk")), b(base);
+        CHECK(rj.tensors == n_tensors && !j.sharded() && j.verify().empty() && !j.manifest().find("sharded") && j.misaligned_tensors().empty());
+        for (auto& [n, e] : b.tensors()) CHECK(j.entry(n).blake3 == e.blake3 && j.entry(n).codec == e.codec);
+        inference::session s(P("joined.fpk")); CHECK(s.forward(ids) == ref);
+        CHECK_THROWS(modelfile::shard_join(base, P("x.fpk")));
+    }
+    forge_test::set_env("FORGE_BLOB_DIR", nullptr);
+
+    // ---- names from the file are untrusted
+    CHECK_THROWS(modelfile::blob_path(root.string(), "../../../../etc/passwd"));
+    CHECK_THROWS(modelfile::blob_path(root.string(), std::string(64, 'G')));
+    CHECK_THROWS(modelfile::blob_path(root.string(), std::string(63, 'a') + "/"));
+    CHECK(modelfile::blob_path(root.string(), std::string(64, 'a')).find("aa") != std::string::npos);
+    for (auto [from, to] : {std::pair<std::string, std::string>{"\"version\":1", "\"version\":2"}, {"\"blake3\":\"", "\"blake3\":\"../"}, {"\"bytes\":", "\"bytes\":-"}}) {
+        auto m = read_sections(P("a.fpk")); auto& t = sec(m, "shards"); auto was = t; t = replace_all(t, from, to); CHECK(t != was);
+        modelfile::detail::write_sections(P("hostile.fpk"), m);
+        CHECK_THROWS(modelfile::reader(P("hostile.fpk")));
+    }
+    { auto m = read_sections(P("a.fpk")); auto& t = sec(m, "tensors"); t = replace_all(t, "\"shard\":0}", "\"shard\":999}"); modelfile::detail::write_sections(P("hostile.fpk"), m); CHECK_THROWS(modelfile::reader(P("hostile.fpk"))); }
+    { auto m = read_sections(base); auto& t = sec(m, "tensors"); t = replace_all(t, "\"bytes\":", "\"shard\":0,\"bytes\":"); modelfile::detail::write_sections(P("hostile.fpk"), m); CHECK_THROWS(modelfile::reader(P("hostile.fpk"))); }   // a shard index without a shards section
+#if !defined(_WIN32)
+    {   // a blob directory entry that is a symlink out of the store is not followed
+        modelfile::reader r0(P("a.fpk")); auto h = r0.entry("tok_emb").blake3; auto real = r0.find_shard(std::size_t(r0.entry("tok_emb").shard));
+        auto outside = root / "outside"; fs::create_directories(outside / h.substr(0, 2));
+        fs::rename(real, outside / h.substr(0, 2) / fs::path(real).filename());
+        auto sub = fs::path(real).parent_path(); bool only = fs::is_empty(sub);
+        if (only) {
+            fs::remove(sub); fs::create_directory_symlink(outside / h.substr(0, 2), sub);
+            modelfile::reader r(P("a.fpk")); CHECK(r.missing_shards().size() == 1); CHECK_THROWS(r.tensor_bytes("tok_emb"));
+            fs::remove(sub); fs::create_directories(sub);
+        }
+        fs::rename(outside / h.substr(0, 2) / fs::path(real).filename(), real);
+        modelfile::reader r(P("a.fpk")); CHECK(r.verify().empty());
+    }
+#endif
+    // ---- what does not combine with shards says so
+    auto key = modelfile::generate_model_key();
+    CHECK_THROWS(modelfile::encrypt_file(P("a.fpk"), P("x.fpk"), key));
+    modelfile::encrypt_file(base, P("enc.fpk"), key); CHECK_THROWS(modelfile::shard_split(P("enc.fpk"), P("x.fpk")));
+    CHECK_THROWS(modelfile::remove_adapter(P("a.fpk"), P("x.fpk"), "nope"));
+    {   // tools that copy sections keep working on the small main file: binary blueprint, precompiled-plan section
+        CHECK(modelfile::convert_blueprint_section(P("a.fpk"), P("a_bin.fpk"), true));
+        inference::session s(P("a_bin.fpk")); CHECK(s.forward(ids) == ref);
+        std::vector<std::uint8_t> blob(64, 3); modelfile::aot::write_section(P("a.fpk"), P("a_aot.fpk"), blob);
+        modelfile::reader r(P("a_aot.fpk")); CHECK(r.sharded() && r.has_section("aot") && r.verify().empty());
+    }
+    {   // requant reads a sharded model and writes one file
+        import::requant_options ro; ro.base.codec = "q8_0";
+        auto rq = import::requantise(P("a.fpk"), P("rq.fpk"), ro);
+        modelfile::reader r(P("rq.fpk")); CHECK(rq.requantised > 0 && !r.sharded() && !r.manifest().find("sharded") && r.verify().empty() && r.entry("layer.0.wq").codec == "q8_0");
+    }
+    fs::remove_all(root);
 }
 
 // Tensor alignment: 64 (default of the writers), 4096, 65536; recorded in the manifest; kept by every tool that

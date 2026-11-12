@@ -97,6 +97,7 @@ inline void rewrite_tensors(const std::string& in, const std::string& out, const
     {
         reader r(in);
         if (r.has_section("encryption")) raise(errc::unsupported, "{}: the file is encrypted; change adapters on the plain file, then encrypt it", in);
+        if (r.sharded()) raise(errc::unsupported, "{}: the file is sharded; change adapters on the joined file (forge shard join), then split it again", in);
         if (auto bad = r.verify(); !bad.empty()) raise(errc::format_error, "{}: refusing to rewrite a corrupt file ({})", in, bad.front());
         dl = r.layout();
         for (auto& [name, s] : r.sections()) {

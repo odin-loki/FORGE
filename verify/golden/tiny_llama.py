@@ -241,6 +241,37 @@ def main():
     ok = ok and same   # requant from the f32 file == importing with that codec, tensor for tensor
     ok = ok and "no adapters in this file" in run([a.forge, "adapter", "list", base])
     print(f"[{'ok' if ok else 'FAIL'}] state section declared; --calib statistics match numpy; requant q8_0 from the .fpk: cosine {cos:.6f}"); fails += not ok
+    # sharded import: tensors in content-addressed blobs; a second model in the same store adds only what differs;
+    # precompiled plans and the binary blueprint work on the small main file; join gives the tensors back
+    import shutil
+    sd = os.path.join(a.work, "shards"); shutil.rmtree(sd, ignore_errors=True); os.makedirs(sd)
+    sh = os.path.join(sd, "m.fpk"); sh2 = os.path.join(sd, "m_q8.fpk"); ls = os.path.join(a.work, "logits_sharded.f32")
+    o1 = run([a.forge, "import", hf, "-o", sh, "--shard-size", "0"])
+    nt = len(json.loads(sections_of(sh)["tensors"]))
+    blobs = lambda: sum(len(f) for _, _, f in os.walk(os.path.join(sd, "blobs")))
+    ok = f"{nt} tensors in {nt} blobs" in o1 and blobs() == nt and os.path.getsize(sh) < 20000 and not os.path.exists(sh + ".unsharded")
+    o2 = run([a.forge, "import", hf, "-o", sh2, "--shard-size", "0", "--codec", "q8_0"])
+    f32_kept = sum(1 for t in json.loads(sections_of(sh2)["tensors"]) if t["codec"] == "f32")   # norms stay f32: shared with the first model
+    ok = ok and blobs() == 2 * nt - f32_kept and f"{f32_kept} already there" in o2 and f32_kept > 0
+    info = run([a.forge, "inspect", sh, "--verify"])
+    ok = ok and f"shards    {nt} content-addressed blobs" in info and f"{nt} present, 0 missing" in info and "verify    ok" in info
+    run([a.forge, "run", sh, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", ls])
+    ok = ok and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32))
+    run([a.forge, "aot", sh]); run([a.forge, "blueprint", sh, "--to", "binary"]); run([a.forge, "aot", sh])
+    r3 = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "run", sh, "--tokens", ",".join(map(str, prompt)), "-n", "3", "--ids", "--logits", ls], capture_output=True, text=True, errors="replace")
+    ok = ok and r3.returncode == 0 and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32)) and "precompiled" in r3.stdout + r3.stderr
+    jn = os.path.join(a.work, "tiny_joined.fpk"); run([a.forge, "shard", "join", sh, "-o", jn])
+    bi = {t["name"]: t["blake3"] for t in json.loads(sections_of(base)["tensors"])}
+    ok = ok and {t["name"]: t["blake3"] for t in json.loads(sections_of(jn)["tensors"])} == bi and "verify    ok" in run([a.forge, "inspect", jn, "--verify"])
+    victim = next(l.split()[-1] for l in run([a.forge, "shard", "list", sh]).splitlines() if int(l.split()[1]) > 1000)   # a blob of this model
+    b = bytearray(open(victim, "rb").read()); b[500] ^= 1; open(victim, "wb").write(b)
+    r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "inspect", sh, "--verify"], capture_output=True, text=True, errors="replace")
+    ok = ok and r.returncode != 0 and "MISMATCH shard" in r.stdout
+    b[500] ^= 1; open(victim, "wb").write(b)
+    pk = os.path.join(sd, "packed.fpk"); o4 = run([a.forge, "shard", "split", base, "-o", pk, "--shard-size", "128k", "--blob-dir", os.path.join(sd, "packs")])
+    lst = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "shard", "list", pk], capture_output=True, text=True, env={**os.environ, "FORGE_BLOB_DIR": os.path.join(sd, "packs")}).stdout
+    ok = ok and "MISSING" not in lst and 1 < len(lst.strip().splitlines()) < nt
+    print(f"[{'ok' if ok else 'FAIL'}] sharded import: {nt} blobs, second model shares {f32_kept}; logits unchanged (also with aot + binary blueprint); join restores every tensor; a flipped blob byte fails verify"); fails += not ok
     # tokenizer + text path
     out = os.path.join(a.work, "tiny_f32.fpk")
     txt = run([a.forge, "run", out, "--prompt", "the theory of things", "-n", "4"])

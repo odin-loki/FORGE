@@ -22,6 +22,7 @@ Readers find sections through the table, so section order on disk does not matte
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
 | `data` | yes | Tensor bytes in the codec's block layout (`graph/codecs.hpp`), each tensor on a file offset that is a multiple of the file's [tensor alignment](#tensor-alignment) (64 B unless the manifest says otherwise) |
 | `experts` | no | Minor revision 1 (manifest `forge_format_minor: 1`). JSON `{version, align: 4096, tensors: [{layer, proj (gate/up/down), name, codec, n_experts, offset, file_offset, expert_bytes, aligned}]}` indexing the stacked MoE expert tensors `[n_experts, rows, k]` read by `moe_ffn`. Expert e is bytes `[offset + e * expert_bytes, + expert_bytes)` of `data`; `aligned` means every expert slice starts on a 4 KiB file offset (one direct read per expert, groundwork for expert streaming). Older readers ignore the section |
+| `shards` | sharded files | JSON list of the content-addressed blobs that hold the tensor bytes ([Shards](#shards)). With it, `data` is empty and every `tensors` entry has a `shard` field |
 | `state` | no | JSON state schema: the session state slots the model keeps between runs ([State section](#state-section)). Written by importers for models that have state; older readers ignore it |
 | `adapters` | no | JSON list of the LoRA adapters carried in the file ([Adapters section](#adapters-section)); their factors are ordinary tensors named `adapter.<name>.<weight>.lora_a` / `.lora_b`. Older readers ignore the section and never read those tensors: they run the base model |
 | `calib` | no | JSON calibration statistics: per-tensor range, moments and a magnitude histogram of the full-precision weights ([Calib section](#calib-section)). Older readers ignore it |
@@ -30,6 +31,26 @@ Readers find sections through the table, so section order on disk does not matte
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | JSON header of the sealed `data` section; two schemes, told apart by `alg`: see [Encryption](#encryption) |
 | `enc_macs` | with chunked encryption | Binary: one 16-byte Poly1305 tag per sealed chunk, in chunk order |
+
+## Shards
+A sharded model is a small `.fpk` (every section except the tensor bytes) plus blob files that are named by their content:
+
+```
+model.fpk       shards : {"version": 1, "layout": "per-tensor" | "packed", "shards": [{"blake3": <64 hex>, "bytes": N}, ...]}
+                tensors: [{name, codec, shape, bytes, blake3, "shard": <index into shards>, "offset": <within that blob>}, ...]
+                data   : empty
+<blob dir>/<first two hex digits>/<blake3 hex>.fpkb      raw bytes; the BLAKE3 of the file is its name
+```
+
+- **Layouts.** `per-tensor` (the default of `forge shard split` and of `forge import --shard-size 0`): one blob per tensor, named by the tensor's own hash, offset 0. `packed` (`--shard-size 2G`): tensors in file order packed into blobs of at most that size, each on the file's tensor alignment within the blob; a tensor larger than the size gets a blob to itself.
+- **Dedup.** A blob is written only if the store does not already hold a file of that name and size. With the per-tensor layout two models written to one store share every tensor whose encoded bytes are equal: a fine-tune that changes one tensor adds one blob. Packed blobs are shared only when a whole pack is identical.
+- **Where blobs are looked for**, in order: the directory named by `FORGE_BLOB_DIR`, then `blobs/` next to the model file. `forge shard split` writes to `--blob-dir`, else `FORGE_BLOB_DIR`, else `blobs/` next to its output.
+- **Trust.** The index is the root: a signature on the main file covers the `tensors` and `shards` sections, that is every tensor hash and every blob hash, so blobs carry no signature and can be fetched from anywhere. A reader does not hash blobs at open. It maps a blob when a tensor in it is first used and hashes that tensor's bytes against the index before returning them (`integrity_error` on a mismatch); `reader::verify()` (`forge inspect --verify`, `forge verify`, signing) also hashes every blob whole and reports missing ones. Without a signature the hashes still catch corruption, not a rewritten index.
+- **Partial downloads.** A missing blob is an error only when one of its tensors is asked for (`not_found`, naming the blob and the directories searched). `forge shard list` and `forge inspect` show which blobs are present.
+- **Untrusted names.** A blob name is used only if it is 64 lowercase hex digits, and its path is built with `security::safe_join`, which also refuses a store entry that is a symlink out of the store. Shard indices and offsets are bounds-checked against the `shards` list; a `shard` field without a `shards` section, or a missing one with it, is a format error.
+- **Compatibility.** Sharding is opt-in; single-file models are unchanged. The main file's manifest gets `sharded: true` and `forge_format_minor: 3`. A reader that predates shards stops at open with `tensor <name> out of bounds` (its bounds check against the empty `data` section). `forge shard join` turns a sharded model back into one file.
+- **What does not combine**: an encrypted file cannot be sharded and a sharded file cannot be encrypted (sealed tensors are not content-addressable; blobs are plain); `forge adapter add / remove` want the joined file; `forge aot --embed-weights` refuses a sharded model. `forge aot` (plan mode), `forge sign`, `forge blueprint` and `forge requant` work on a sharded model; split drops a signature, precompiled plans and an `experts` index.
+- Nothing removes blobs that no model references any more; that is left to whoever owns the store.
 
 ## Binary blueprint
 A blueprint is a program (params, `repeat` loops, composites, expressions over symbolic dimensions), so its binary form encodes that program: the token stream of the text with names interned and numbers typed. `str` is a varint length followed by the bytes; varints are LEB128 (minimal, at most 10 bytes); fixed-size integers are little-endian.
@@ -182,7 +203,7 @@ Compatibility:
 ## Tools
 - `forge blueprint` converts a model's blueprint (or a bare `.fbp` / `.fbpb` file) between the forms; `forge inspect --blueprint text|binary|canonical [-o FILE]` shows or extracts one.
 - `forge inspect <file> [--tensors] [--blueprint] [--verify] [--state]` shows the layout, the alignment, the declared state, embedded adapters and calibration data.
-- `forge adapter list|add|remove`, `forge requant`: see [cli.md](cli.md).
+- `forge adapter list|add|remove`, `forge requant`, `forge shard split|join|list`: see [cli.md](cli.md).
 - `forge aot <file> --list` shows the precompiled plans and whether they would be used; `--strip` removes them.
 - `forge dump <file> <tensor> out.f32` extracts one tensor as raw f32.
 - `forge keygen`, `forge sign`, `forge verify`, `forge encrypt`: see [modelfile.md](modelfile.md#examples).

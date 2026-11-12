@@ -21,6 +21,11 @@
 //       "forge-fpk-enc-v2\0" | file nonce | u64 i | u64 n_chunks | u64 data_bytes | u64 chunk_bytes | BLAKE3(tensors),
 //       so a chunk cannot be moved, dropped, or taken from another file, and the index cannot be edited.
 //       A reader decrypts only the chunks a tensor needs, when the tensor is first used.
+//   Sharded files (docs/format.md "Shards"; modelfile/shard.hpp writes them): the tensor bytes live outside the
+//   container, in content-addressed blob files "<blob dir>/<hh>/<blake3 hex>.fpkb". A "shards" section lists the
+//   blobs {blake3, bytes}; every "tensors" entry then carries "shard" (an index into that list) and its offset is
+//   within the blob; "data" is empty. Blobs are looked up in $FORGE_BLOB_DIR and in "blobs" next to the file, mapped
+//   when a tensor in them is first used, and each tensor is hashed against the index before its bytes are handed out.
 #include <forge/core/error.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/graph/codecs.hpp>
@@ -28,6 +33,9 @@
 #include <forge/json/json.hpp>
 #include <forge/security/enforce.hpp>
 #include <forge/security/files.hpp>
+#include <forge/security/path.hpp>
+#include <filesystem>
+#include <set>
 #include "monocypher.h"
 #include <forge/os/locked_memory.hpp>
 #include <cmath>
@@ -83,7 +91,34 @@ struct tensor_entry {
     shape_t shape;
     std::uint64_t offset = 0, bytes = 0;
     std::string blake3;
+    int shard = -1;   // sharded files: index into the "shards" list (offset is then within that blob); -1: in "data"
 };
+inline constexpr char shards_section[] = "shards";
+inline constexpr std::string_view blob_ext = ".fpkb";
+inline constexpr std::uint32_t format_minor_sharded = 3;
+struct shard_info { std::string blake3; std::uint64_t bytes = 0; };
+inline bool is_blake3_hex(std::string_view h) {
+    if (h.size() != 64) return false;
+    for (char c : h) if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    return true;
+}
+// Path of blob `hash` under `dir`: "<dir>/<first two hex digits>/<hash>.fpkb". The hash comes from a model file, so
+// it is checked to be 64 lowercase hex digits and the join goes through security::safe_join (FSS CAP-3): nothing a
+// file can put in its index names a path outside the blob directory.
+inline std::string blob_path(const std::string& dir, std::string_view hash) {
+    if (!is_blake3_hex(hash)) raise(errc::format_error, "blob name '{}' is not a BLAKE3 hash", std::string(hash).substr(0, 80));
+    return security::safe_join(dir, std::string(hash.substr(0, 2)) + "/" + std::string(hash) + std::string(blob_ext));
+}
+// Where the blobs of the model file at `path` are looked for, in order: $FORGE_BLOB_DIR, then "blobs" next to the file.
+inline std::vector<std::string> blob_search_dirs(const std::string& path) {
+    std::vector<std::string> d;
+    if (auto* e = std::getenv("FORGE_BLOB_DIR"); e && *e) d.emplace_back(e);
+    if (!path.empty()) {
+        auto parent = os::fs::u8path(path).parent_path();
+        d.push_back(os::fs::u8str((parent.empty() ? std::filesystem::path(".") : parent) / "blobs"));
+    }
+    return d;
+}
 
 class writer {
 public:
@@ -385,11 +420,13 @@ public:
         // under an active policy; no-op with profile none.
         security::enforce(security::capability::fs_read, path);
         map_ = forge::map_readonly(path, size_);
+        blob_dirs_ = blob_search_dirs(path);
         try { init_(path, key); } catch (...) { forge::unmap_readonly(map_, size_); map_ = nullptr; throw; }   // the dtor does not run on a throwing ctor
     }
     // A .fpk that is already in memory (embedded in a compiled model, docs/aot-models.md). The bytes are borrowed and
     // must outlive the reader; `label` stands in for the path in messages.
     reader(std::span<const std::uint8_t> mem, const std::string& label, std::optional<model_key> key = std::nullopt) : path_(label), map_(mem.data()), size_(mem.size()), borrowed_(true) {
+        blob_dirs_ = blob_search_dirs({});   // no file to look next to: a sharded image finds its blobs in $FORGE_BLOB_DIR only
         init_(label, key);
     }
 private:
@@ -408,15 +445,35 @@ private:
             sections_[s.name] = s;
         }
         if (!has_section("tensors") || !has_section("data")) raise(errc::format_error, "{}: no tensor index or data section", path);
+        if (has_section(shards_section)) {
+            if (has_section("encryption")) raise(errc::unsupported, "{}: a sharded file cannot be encrypted", path);
+            json::value sv = json::parse(section_text(shards_section));
+            if (!sv.is_obj() || sv.num_or("version", 0) != 1) raise(errc::unsupported, "{}: shards section version {} is not supported (this build reads version 1)", path, sv.num_or("version", 0));
+            auto* arr = sv.find("shards");
+            if (!arr || !arr->is_arr() || arr->arr().size() > (std::size_t(1) << 20)) raise(errc::format_error, "{}: bad shards section", path);
+            std::set<std::string> seen;
+            for (auto& e : arr->arr()) {
+                shard_info si; si.blake3 = e.str_or("blake3", ""); double nb = e.num_or("bytes", -1);
+                if (!is_blake3_hex(si.blake3) || !(nb >= 0 && nb <= 9e15) || nb != std::floor(nb) || !seen.insert(si.blake3).second) raise(errc::format_error, "{}: bad shards section", path);
+                si.bytes = std::uint64_t(nb); shards_.push_back(std::move(si));
+            }
+            sharded_ = true; shard_map_.assign(shards_.size(), nullptr); shard_file_.assign(shards_.size(), std::string());
+        }
         if (has_section("encryption")) { auto k = key ? key : model_key_from_env(); if (k) decrypt(k); else locked_ = true; }
         auto idx = json::parse(section_text("tensors"));
-        const std::uint64_t dsize = sections_.at("data").size;
+        std::uint64_t dsize = sections_.at("data").size;
         for (auto& t : idx.arr()) {
             tensor_entry e; e.name = t["name"].str(); e.codec = t["codec"].str();
             for (auto& d : t["shape"].arr()) e.shape.push_back(d.i());
             double off = t["offset"].num(), nb = t["bytes"].num();
             if (!(off >= 0 && off <= 9e15 && nb >= 0 && nb <= 9e15)) raise(errc::format_error, "tensor {} out of bounds", e.name);
             e.offset = std::uint64_t(off); e.bytes = std::uint64_t(nb); e.blake3 = t["blake3"].str();
+            if (sharded_) {   // every tensor of a sharded file lies in one of its blobs
+                double si = t.num_or("shard", -1);
+                if (!(si >= 0 && si < double(shards_.size())) || si != std::floor(si)) raise(errc::format_error, "tensor {} names no shard of this file", e.name);
+                e.shard = int(si); dsize = shards_[std::size_t(e.shard)].bytes;
+                if (!is_blake3_hex(e.blake3)) raise(errc::format_error, "tensor {} has no content hash", e.name);
+            } else if (t.find("shard")) raise(errc::format_error, "tensor {} names a shard, but the file has no shards section", e.name);
             if (e.offset > dsize || e.bytes > dsize - e.offset) raise(errc::format_error, "tensor {} out of bounds", e.name);
             // the element count must be what the stored bytes hold: decoders and kernels size their reads from the shape
             std::uint64_t cnt = 1;
@@ -429,7 +486,10 @@ private:
 public:
     reader(const reader&) = delete;
     reader& operator=(const reader&) = delete;
-    ~reader() { if (!borrowed_) forge::unmap_readonly(map_, size_); }
+    ~reader() {
+        for (std::size_t i = 0; i < shard_map_.size(); ++i) if (shard_map_[i]) forge::unmap_readonly(shard_map_[i], std::size_t(shards_[i].bytes));
+        if (!borrowed_) forge::unmap_readonly(map_, size_);
+    }
 
     bool has_section(const std::string& n) const { return sections_.count(n) != 0; }
     // Plaintext bytes of a section. For "data" prefer tensor_bytes(): on a chunk-encrypted file this call has to
@@ -454,7 +514,30 @@ public:
     bool locked() const { return locked_; }                                    // encrypted and opened without the key
     bool encrypted() const { return !locked_ && (plain_.has_value() || enc2_.has_value()); }   // encrypted and opened with the key
     bool chunked_encryption() const { return enc2_.has_value(); }              // the on-demand scheme (alg ...-chunked)
-    std::uint64_t data_size() const { return sections_.at("data").size; }      // size of the tensor data, without reading it
+    // size of the tensor data, without reading it (a sharded file: the sum of its blobs)
+    std::uint64_t data_size() const {
+        if (!sharded_) return sections_.at("data").size;
+        std::uint64_t n = 0; for (auto& s : shards_) n += s.bytes; return n;
+    }
+    // ---- sharded files ----
+    bool sharded() const { return sharded_; }
+    const std::vector<shard_info>& shards() const { return shards_; }
+    const std::vector<std::string>& blob_dirs() const { return blob_dirs_; }
+    // Directories searched for blobs, replacing the default ($FORGE_BLOB_DIR, then "blobs" next to the file).
+    void set_blob_dirs(std::vector<std::string> d) { std::lock_guard lk(pmu_); blob_dirs_ = std::move(d); }
+    // The file that holds shard i, or "" when it is in none of the blob directories (not downloaded yet). Only the
+    // presence and the size are looked at here; the content is checked when a tensor is read (and by verify()).
+    std::string find_shard(std::size_t i) const {
+        const auto& s = shards_.at(i);
+        for (auto& d : blob_dirs_) {
+            std::string p;
+            try { p = blob_path(d, s.blake3); } catch (const std::exception&) { continue; }
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(os::fs::u8path(p), ec) && std::filesystem::file_size(os::fs::u8path(p), ec) == s.bytes && !ec) return p;
+        }
+        return {};
+    }
+    std::vector<std::size_t> missing_shards() const { std::vector<std::size_t> m; for (std::size_t i = 0; i < shards_.size(); ++i) if (find_shard(i).empty()) m.push_back(i); return m; }
     // The file's tensor alignment: manifest "tensor_alignment", 64 when it is absent (files written before the option)
     // or not a valid value. Informational: readers find tensors by offset and never rely on it.
     std::size_t tensor_alignment() const {
@@ -465,7 +548,7 @@ public:
     // Tensors whose file offset is not a multiple of `a` (0 = the file's own alignment): empty for a file as written.
     std::vector<std::string> misaligned_tensors(std::size_t a = 0) const {
         if (!a) a = tensor_alignment();
-        std::vector<std::string> bad; const std::uint64_t d = sections_.at("data").offset;
+        std::vector<std::string> bad; const std::uint64_t d = sharded_ ? 0 : sections_.at("data").offset;   // a blob starts at offset 0 of its file
         for (auto& [n, e] : tensors_) if ((d + e.offset) % a) bad.push_back(n);
         return bad;
     }
@@ -492,6 +575,18 @@ public:
     // plaintext resident in memory is the tensors that were asked for, not the file.
     std::span<const std::uint8_t> tensor_bytes(const std::string& n) const {
         const auto& e = entry(n);
+        if (sharded_) {
+            // lazy, per tensor: the blob is mapped on first use and this tensor's bytes are hashed against the index
+            // (which the signature covers) before anyone sees them
+            std::lock_guard lk(pmu_);
+            auto b = shard_bytes_(std::size_t(e.shard)).subspan(std::size_t(e.offset), std::size_t(e.bytes));
+            if (!shard_verified_.count(n)) {
+                if (hash::blake3::hex(hash::blake3::of(b)) != e.blake3)
+                    raise(errc::integrity_error, "{}: tensor {} in blob {} does not match its hash (corrupt or substituted blob)", path_, n, shards_[std::size_t(e.shard)].blake3.substr(0, 16));
+                shard_verified_.insert(n);
+            }
+            return b;
+        }
         if (!enc2_) return section_bytes("data").subspan(std::size_t(e.offset), std::size_t(e.bytes));
         if (locked_) raise_locked_();
         std::lock_guard lk(pmu_);
@@ -537,6 +632,17 @@ public:
         for (auto& [n, s] : sections_)
             if (hash::blake3::of({map_ + s.offset, s.size}) != s.hash) bad.push_back("section " + n);
         if (locked_) return bad;                       // tensor hashes are over plaintext: need the key
+        if (sharded_) {   // every blob must be present and hash to its name; then every tensor must hash
+            std::lock_guard lk(pmu_);
+            std::vector<char> present(shards_.size(), 0);
+            for (std::size_t i = 0; i < shards_.size(); ++i) {
+                try { present[i] = 1; if (hash::blake3::hex(hash::blake3::of(shard_bytes_(i))) != shards_[i].blake3) bad.push_back("shard " + shards_[i].blake3.substr(0, 16)); }
+                catch (const forge_exception&) { present[i] = 0; bad.push_back("shard " + shards_[i].blake3.substr(0, 16) + " (missing)"); }
+            }
+            for (auto& [n, e] : tensors_)
+                if (present[std::size_t(e.shard)] && hash::blake3::hex(hash::blake3::of(shard_bytes_(std::size_t(e.shard)).subspan(std::size_t(e.offset), std::size_t(e.bytes)))) != e.blake3) bad.push_back("tensor " + n);
+            return bad;
+        }
         if (enc2_) {   // every chunk must authenticate (also the ones no tensor lies in), then every tensor must hash
             std::lock_guard lk(pmu_);
             detail::plain_buffer scratch(std::size_t(enc2_->chunk), false);
@@ -561,6 +667,23 @@ private:
     [[noreturn]] void raise_locked_() const {
         raise(errc::invalid_argument, "{}: model is encrypted (key id {}); set FORGE_MODEL_KEY or FORGE_MODEL_KEY_FILE",
               path_, json::parse(section_text("encryption")).str_or("key_id", "?"));
+    }
+    // The bytes of shard i (callers hold pmu_): found in the blob directories, mapped once, size checked.
+    std::span<const std::uint8_t> shard_bytes_(std::size_t i) const {
+        const auto& s = shards_[i];
+        if (!s.bytes) return {};
+        if (!shard_map_[i]) {
+            auto p = find_shard(i);
+            if (p.empty()) {
+                std::string dirs; for (auto& d : blob_dirs_) dirs += (dirs.empty() ? "" : ", ") + d;
+                raise(errc::not_found, "{}: blob {}{} ({} bytes) is not in {}; fetch it or set FORGE_BLOB_DIR", path_, s.blake3, std::string(blob_ext), s.bytes, dirs.empty() ? "any blob directory (none is set)" : dirs);
+            }
+            security::enforce(security::capability::fs_read, p);
+            std::size_t len = 0; auto* m = forge::map_readonly(p, len);
+            if (len != s.bytes) { forge::unmap_readonly(m, len); raise(errc::integrity_error, "{}: blob {} changed size while it was opened", path_, s.blake3.substr(0, 16)); }
+            shard_map_[i] = m; shard_file_[i] = p;
+        }
+        return {shard_map_[i], std::size_t(s.bytes)};
     }
     bool cached_(const std::string& n) const { std::lock_guard lk(pmu_); return plain_.has_value() || ptensors_.count(n) != 0; }
     void decrypt(const std::optional<model_key>& key) {
@@ -629,6 +752,12 @@ private:
     mutable std::mutex pmu_;
     mutable std::map<std::string, detail::plain_buffer> ptensors_;
     mutable std::uint64_t president_ = 0;
+    bool sharded_ = false;
+    std::vector<shard_info> shards_;
+    std::vector<std::string> blob_dirs_;
+    mutable std::vector<const std::uint8_t*> shard_map_;
+    mutable std::vector<std::string> shard_file_;
+    mutable std::set<std::string> shard_verified_;
     bool lock_plain_ = false;
     bool locked_ = false;
     std::string path_;
@@ -650,6 +779,7 @@ inline void encrypt_file(const std::string& in, const std::string& out, const mo
     {
         reader r(in);
         if (r.has_section("encryption")) raise(errc::invalid_argument, "{}: already encrypted", in);
+        if (r.sharded()) raise(errc::unsupported, "{}: a sharded file cannot be encrypted (its tensors are plain content-addressed blobs); join it first", in);
         if (auto bad = r.verify(); !bad.empty()) raise(errc::format_error, "{}: refusing to encrypt a corrupt file ({})", in, bad.front());
         dl = r.layout();
         for (auto& [name, s] : r.sections()) {

@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `adapter`, `blueprint`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `shard`, `adapter`, `blueprint`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -25,6 +25,7 @@ Converts a model to `.fpk`.
 | `--allow-unused` | Import although the source has tensors the template does not use. Without it such an import fails and lists them (name and shape). Hugging Face leftovers are left out; GGUF leftovers are kept as `extra.<name>` |
 | `--ignore-tensor NAME[,NAME...]` | Source tensors known to be harmless: a whole name, `prefix*` or `*suffix`. `position_ids`, `masked_bias` and `inv_freq` buffers are always ignored |
 | `--align 64\|4096\|65536` | File alignment of every tensor (`4k`, `64k` also parse). Default: 4096 when the source weights are at least 64 MiB, else 64; see [format.md](format.md#tensor-alignment) |
+| `--shard-size SIZE [--blob-dir DIR]` | Write a sharded model ([format.md](format.md#shards)): the import goes to `out.fpk.unsharded`, is split and removed. `0` = one blob per tensor (models in one store share equal tensors); `2G`, `512M` = packed blobs of at most that size |
 | `--calib` | Record statistics of the full-precision weights in a `calib` section, for a later `forge requant` (Hugging Face sources; a GGUF's weights are already quantised, so nothing is recorded) |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
 | `--output-tensor-type T`, `--token-embedding-type T` | Mixed precision: codec for the output head / token embedding |
@@ -54,6 +55,9 @@ Re-encodes the float weights of a model file in another codec, without the sourc
 | `--align 64\|4096\|65536` | Tensor alignment of the output (default: the input's) |
 
 With calibration (the default) the statistics come from the input's `calib` section; without one they are computed from the input's `f32` weights. The output carries them. The other sections are copied; a signature and precompiled plans are dropped, an encrypted input needs its key and the output is plain. Files with an `experts` index (stacked MoE experts) are refused: import the source again. See [modelfile.md](modelfile.md#re-quantising-a-model-file).
+
+### `forge shard split <in.fpk> -o out.fpk [--shard-size SIZE] [--blob-dir DIR]` / `join <in.fpk> -o out.fpk` / `list <model.fpk>`
+`split` moves the tensors of a single-file model into content-addressed blobs and writes the small main file ([format.md](format.md#shards)); without `--shard-size` (or with `0`) every tensor is its own blob. It prints how many blobs it wrote and how many were already in the store. `join` writes one file again (every blob must be present; each tensor is checked against the index). `list` prints each blob with its size, tensor count and path, or `MISSING`. Both drop a signature and precompiled plans. Set `FORGE_BLOB_DIR` to share one store between models; otherwise blobs live in `blobs/` next to the model.
 
 ### `forge adapter list <model.fpk>` / `add <model.fpk> --name N --from lora.fpk [-o out.fpk]` / `remove <model.fpk> --name N [-o out.fpk]`
 LoRA adapters carried in the model file. `add` copies the `<weight>.lora_a` / `<weight>.lora_b` tensors of `lora.fpk` (the layout `model::add_adapter_file` reads; `lora_alpha` from its manifest) into the model under the name `N`; `remove` takes one out; without `-o` the file is rewritten in place. Select one with `forge run --adapter N`. Both drop a signature and precompiled plans, refuse an encrypted file, and hold the whole file in memory while they work.

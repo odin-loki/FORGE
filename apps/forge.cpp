@@ -6,6 +6,7 @@
 #include <forge/import/gguf.hpp>
 #include <forge/import/onnx.hpp>
 #include <forge/import/requant.hpp>
+#include <forge/modelfile/shard.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
 #include <forge/inference/aot_build.hpp>
@@ -68,6 +69,10 @@ int usage() {
         "      [--ignore-tensor NAME[,NAME..]] leftovers known to be harmless (NAME, prefix* or *suffix)\n"
         "      [--align 64|4096|65536] file alignment of every tensor (default: 4096 when the source weights are >= 64 MiB, else 64)\n"
         "      [--calib] record statistics of the full-precision weights (\"calib\" section) for a later forge requant\n"
+        "      [--shard-size SIZE [--blob-dir DIR]] write a sharded model: tensors in content-addressed blobs (0 = one per tensor)\n"
+        "  shard split <in.fpk> -o <out.fpk> [--shard-size 2G] [--blob-dir DIR]   tensors into blobs named by their BLAKE3 hash\n"
+        "      (default one blob per tensor: models that share tensors store them once); blobs go to DIR, $FORGE_BLOB_DIR or ./blobs next to out\n"
+        "  shard join <in.fpk> -o <out.fpk>  |  shard list <model.fpk>             back to one file; which blobs are present\n"
         "  requant <in.fpk> -o <out.fpk> --codec C   re-encode the float weights of a model file (codecs and the mixed-precision\n"
         "      options of import); reads the calib section, or measures f32 weights [--no-calib] [--calib-crest 12] [--align A]\n"
         "  adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]\n"
@@ -222,7 +227,19 @@ int cmd_import(const args& a) {
     if (!a.get("align").empty()) o.align = std::size_t(parse_size_arg(a.get("align"), "--align"));
     o.calib = a.has("calib");   // record weight statistics for a later `forge requant` ("calib" section)
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
-    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
+    // --shard-size SIZE (0 = one blob per tensor) [--blob-dir DIR]: write a sharded model. The import goes to a
+    // single file next to the output first, which is then split (modelfile/shard.hpp) and removed.
+    const bool shard = a.kv.count("shard-size") != 0;
+    const std::string final_out = a.get("o"), import_out = shard ? final_out + ".unsharded" : final_out;
+    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], import_out, o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], import_out, o) : import::import_hf(a.pos[0], import_out, o);
+    if (shard) {
+        modelfile::shard_options so; so.shard_bytes = parse_size_arg(a.get("shard-size"), "--shard-size"); so.blob_dir = a.get("blob-dir");
+        modelfile::shard_report sr;
+        try { sr = modelfile::shard_split(import_out, final_out, so); } catch (...) { os::remove(import_out); throw; }
+        os::remove(import_out);
+        r.bytes = std::filesystem::file_size(final_out);
+        std::printf("sharded   %zu tensors in %zu blobs under %s (%zu written, %zu already there: %llu bytes not stored again)\n", sr.tensors, sr.shards, sr.blob_dir.c_str(), sr.written, sr.reused, (unsigned long long)sr.bytes_reused);
+    }
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     for (auto& n : r.notes) std::fprintf(stderr, "forge import: %s\n", n.c_str());
     std::printf("license   %s\n", r.license.empty() ? "(none found in the source)" : r.license.c_str());
@@ -254,6 +271,11 @@ int cmd_inspect(const args& a) {
         if (auto* lf = m.find("license_files"); lf && lf->is_arr()) for (auto& f : lf->arr()) if (f.is_str()) line += (line.empty() ? "" : " ") + ("[" + f.str() + "]");
         if (r.has_section("license")) line += std::format("{}text: {} bytes (--license prints it)", line.empty() ? "" : ", ", r.section_text("license").size());
         std::printf("license   %s\n", line.empty() ? "(not recorded)" : line.c_str());
+    }
+    if (r.sharded()) {   // where the tensor bytes are, and how much of them is here
+        auto miss = r.missing_shards(); std::string dirs; for (auto& d : r.blob_dirs()) dirs += (dirs.empty() ? "" : ", ") + d;
+        std::printf("shards    %zu content-addressed blobs, %llu bytes; %zu present, %zu missing; searched: %s\n", r.shards().size(), (unsigned long long)r.data_size(),
+                    r.shards().size() - miss.size(), miss.size(), dirs.c_str());
     }
     {   // tensor alignment: the recorded value and what the offsets actually are
         std::size_t al = r.tensor_alignment(); auto off = r.misaligned_tensors();
@@ -345,6 +367,38 @@ int cmd_adapter(const args& a) {
         return 0;
     }
     return usage();
+}
+
+// forge shard split <in.fpk> -o <out.fpk> [--shard-size SIZE] [--blob-dir DIR] | join <in.fpk> -o <out.fpk> | list <model.fpk>
+int cmd_shard(const args& a) {
+    if (a.pos.size() < 2) return usage();
+    const std::string& verb = a.pos[0]; const std::string& f = a.pos[1];
+    if (verb == "list") {
+        modelfile::reader r(f);
+        if (!r.sharded()) { std::puts("not a sharded file (its tensors are in the data section)"); return 0; }
+        std::map<int, std::size_t> count; for (auto& [n, e] : r.tensors()) ++count[e.shard];
+        for (std::size_t i = 0; i < r.shards().size(); ++i) {
+            auto p = r.find_shard(i);
+            std::printf("%s%s  %12llu bytes  %4zu tensors  %s\n", r.shards()[i].blake3.c_str(), std::string(modelfile::blob_ext).c_str(), (unsigned long long)r.shards()[i].bytes, count[int(i)], p.empty() ? "MISSING" : p.c_str());
+        }
+        return 0;
+    }
+    if (a.get("o").empty()) return usage();
+    activate_policy(a.get("policy"));
+    import::check_write(a.get("o"));
+    modelfile::shard_report sr;
+    if (verb == "split") {
+        modelfile::shard_options so; so.blob_dir = a.get("blob-dir");
+        if (!a.get("shard-size").empty()) so.shard_bytes = parse_size_arg(a.get("shard-size"), "--shard-size");
+        sr = modelfile::shard_split(f, a.get("o"), so);
+        std::printf("split %s -> %s: %zu tensors in %zu blobs under %s\n  %zu blobs written (%llu bytes), %zu already in the store (%llu bytes not stored again)\n", f.c_str(), a.get("o").c_str(), sr.tensors, sr.shards,
+                    sr.blob_dir.c_str(), sr.written, (unsigned long long)sr.bytes_written, sr.reused, (unsigned long long)sr.bytes_reused);
+    } else if (verb == "join") {
+        sr = modelfile::shard_join(f, a.get("o"));
+        std::printf("joined %s -> %s: %zu tensors from %zu blobs, %llu bytes\n", f.c_str(), a.get("o").c_str(), sr.tensors, sr.shards, (unsigned long long)sr.bytes);
+    } else return usage();
+    for (auto& n : sr.notes) std::fprintf(stderr, "forge shard: %s\n", n.c_str());
+    return 0;
 }
 
 // forge blueprint <model.fpk | file.fbp | file.fbpb> --to binary|text|canonical [-o out]
@@ -1203,6 +1257,7 @@ int main(int argc, char** argv) {
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
         if (c == "adapter") return cmd_adapter(a);
+        if (c == "shard") return cmd_shard(a);
         if (c == "blueprint") return cmd_blueprint(a);
         if (c == "requant") return cmd_requant(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);
