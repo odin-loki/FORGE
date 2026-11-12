@@ -39,7 +39,7 @@ Quantised weights (`tensor_graph::qweight`) stay encoded. On the CPU, `matmul_t`
 | `int8` (`i8`, `q8`) | symmetric int8, one f32 scale per (row, head) | CPU, Vulkan, CUDA/HIP |
 | `fp8` (`fp8_e4m3`, `e4m3`) | E4M3 (saturating), one f32 scale per (row, head) | CPU, Vulkan, CUDA/HIP |
 | `tbq4` (`tbq4_0`, `turbo4`), `tbq3` (`tbq3_0`, `turbo3`) | TurboQuant: Walsh-Hadamard rotation, then 4- or 3-bit Lloyd-Max codes and one gain per head | CPU; GPU up to head dim 256 |
-| `tbq4p`, `tbq3p` (`*_qjl`, `turbo*p`) | TurboQuant with a 1-bit QJL sketch of the residual | CPU only |
+| `tbq4p`, `tbq3p` (`*_qjl`, `turbo*p`) | TurboQuant_prod at the same bit budget: 3- or 2-bit Lloyd-Max codes, plus the residual's norm and one sign bit per coordinate of a seeded projection of it (QJL). Inner products against the decoded head are unbiased (measured within 1e-3 of ‖x‖² where `tbq4` / `tbq3` shrink by 1% / 3.4%), at about twice the vector MSE of `tbq4` / `tbq3` | CPU only (the GPU kernels raise `unsupported`) |
 | `k8v4` | int8 keys, tbq4 values (`kv_codec_pair_from_name` only) | as its parts |
 
 The attention kernels decode quantised slots on the fly. inference selects the codec with `session_options.kv_codec` or `FORGE_KV_CODEC` ([inference.md](inference.md)).
