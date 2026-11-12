@@ -18,7 +18,7 @@
 | Mock GPU drivers | `tests/mock_cuda.c` (also built as the HIP mock), `mock_opencl.c`, `mock_ze.c` stand in for the vendor libraries | `test_gpu_*_mock`, `test_gpu_features_*_mock`, `test_gpu_memory_*_mock`, `golden_tiny_llama_{cuda,hip,opencl,ze}_mock`, label `gpu`. Not built when cross-compiling |
 | Vulkan | `tests/test_vulkan.cpp` | `test_vulkan`, `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`), label `gpu` |
 | GPU compile checks | generated kernels compiled with clang | `gpu_compile_{cuda,hip,opencl,opencl_nofp64,metal_syntax}`, and `gpu_compile_metal` with `xcrun`; label `gpu` |
-| Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` |
+| Script tests | `tests/*.py` | `modelfile_signing`, `onnx_import`, `python_bindings`, `serve_http`, `sbom_spdx` (`tools/sbom.py`: the SPDX 2.3 and the CycloneDX 1.5 output) |
 | C ABI | `tests/capi_smoke.c` | `capi_smoke` (not built when cross-compiling) |
 | TLS-only RPC cases | `test_rpc` with `FORGE_TEST_ONLY=rpc_tls` | `test_rpc_tls` (skips in a build without OpenSSL, or without the `openssl` command) |
 | Log strip | `tests/log_min_level.cmake` | `log_min_level_cmake` |

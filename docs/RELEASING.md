@@ -1,7 +1,7 @@
 # Releasing FORGE
 
 ## Concepts
-`tools/release.py` drives a release that is reproducible and can be signed. During `build`, `SOURCE_DATE_EPOCH` is set from the last commit, so rebuilding the same commit should give identical archives and SBOM as long as `FORGE_REPRODUCIBLE=ON` (the default). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`.
+`tools/release.py` drives a release that is reproducible and can be signed. During `build`, `SOURCE_DATE_EPOCH` is set from the last commit, so rebuilding the same commit should give identical archives and SBOMs as long as `FORGE_REPRODUCIBLE=ON` (the default). `ci/repro_check.sh` checks that two clean Release builds give bit-identical `forge`, `forge-serve` and `libforge.so`.
 
 ## Commands (`tools/release.py --help`)
 
@@ -10,7 +10,7 @@
 | `version` | Prints the version from `project(FORGE VERSION ...)` in `CMakeLists.txt` (currently `0.1.0`) |
 | `bump X.Y.Z[-pre]` | Sets the project VERSION in `CMakeLists.txt` (without the pre-release suffix) and `VERSION_NAME` in `bindings/android/gradle.properties`. It also tries `FORGE_VERSION_STRING` in `inference/include/forge.h`, which does not exist, so that edit is skipped. `libforge` follows `${PROJECT_VERSION}` |
 | `changelog [--since TAG]` | Adds a section at the top of `CHANGELOG.md` from `git log --no-merges` since the last tag (or the whole history), grouped by keywords in the subject. Creates the file if missing (there is none yet) |
-| `build [--preset release] [--skip-tests] [--sign-key PEM] [--out DIR]` | `cmake --preset`, `cmake --build --preset` (`-j` up to 4), `ctest -LE slow`, CPack binary and source archives, the SPDX SBOM (`tools/sbom.py`), `SHA256SUMS`, and with `--sign-key` a detached Ed25519 `.sig` per file (`openssl pkeyutl -rawin`). Output goes to `dist/<version>/` |
+| `build [--preset release] [--skip-tests] [--sign-key PEM] [--out DIR]` | `cmake --preset`, `cmake --build --preset` (`-j` up to 4), `ctest -LE slow`, CPack binary and source archives, the SBOM in two formats (`tools/sbom.py`: SPDX 2.3 `forge-<version>.spdx.json` and CycloneDX 1.5 `forge-<version>.cdx.json`), `SHA256SUMS`, and with `--sign-key` a detached Ed25519 `.sig` per file (`openssl pkeyutl -rawin`). Output goes to `dist/<version>/` |
 | `verify DIR [--pub PUB]` | Re-checks `SHA256SUMS`, and every `.sig` if a public key is given. Exits 1 on any mismatch |
 | `tag` | Creates the annotated tag `vX.Y.Z`. Refuses if the working tree is not clean. Never pushes |
 
