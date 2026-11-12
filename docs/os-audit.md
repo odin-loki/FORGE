@@ -105,8 +105,26 @@ The work is split by file ownership so changes can proceed in parallel without c
 | W2-7 | Apple mobile backends (deviceMotion, pedometer, proximity, pasteboard, macOS notifications/cameras/location/biometrics) | fixed: iOS deviceMotion → rotation_vector/gravity/linear_acceleration on the shared CMMotionManager, CMPedometer step_counter/step_detector, UIDevice proximity (refcounted, main thread), UIPasteboard; macOS CoreLocation (async on the main run loop), AVCaptureDeviceDiscoverySession cameras + camera/location permission, LAContext Touch ID, NSPasteboard; macOS notifications (UNUserNotificationCenter / osascript) verified. Compiled in CI only (no Mac/device) |
 | W2-8 | FSEvents on macOS; `load_average` emulation on Windows | FSEvents fixed: `file_watcher::add_tree` opens one recursive stream (CoreServices late-bound, FileEvents/NoDefer/WatchRoot, 50 ms, dispatch queue waking the kqueue through EVFILT_USER; drops → `overflow`); `tree_watcher` uses it (`fsevents = false` for kqueue); kqueue kept for `add`/`add_file`. macOS CI only | | FSEvents fixed: `file_watcher::add_tree` opens one recursive stream (CoreServices late-bound, FileEvents/NoDefer/WatchRoot, 50 ms, dispatch queue waking the kqueue through EVFILT_USER; drops → `overflow`); `tree_watcher` uses it (`fsevents = false` for kqueue); kqueue kept for `add`/`add_file`. macOS CI only Windows half done (20f3cac): 5 s sampler of busy CPUs + PDH processor queue length, exp(-5/60 / 300 / 900) decay, lazy start with a 100 ms first estimate |
 
+## Wave 3: parity across OSes (2026-11-12)
+Per-call table: [os-parity.md](os-parity.md). Linux ran natively; Windows ran under wine (MinGW build) where wine
+implements the call; macOS, FreeBSD, iOS and Android were cross-compiled only (see the table there).
+
+| ID | Item | Status |
+|---|---|---|
+| P1 | `run_sandboxed` `deny_exec` on the target: macOS, Linux without Landlock, `ld.so prog` | fixed 2026-11-12: Linux one-exec gate (seccomp user notification, 5.5+; Android probes it in a child), macOS Seatbelt profile with `process-exec` allowed on the target only |
+| P2 | Windows in-process sandbox | partial 2026-11-12: `deny_fs_write` = low integrity level; `deny_exec` falls back to the child-process mitigation policy; `deny_network` stays unsupported (inherent) |
+| P3 | iOS: `os::run` returned code -1 instead of `unsupported` | fixed 2026-11-12; `test_os` (the iOS simulator job) asserts every process call |
+| P4 | Linux-only primitives without equivalents: futex, eventfd, timerfd, pidfd, signalfd | fixed 2026-11-12: `sync.hpp` (`wait_on_address`, `wait_event`, `wait_timer`, `signal_listener`), `wait_for_exit`, `child::wait` on the exit event |
+| P5 | Files: fast copy / clone, preallocation, holes, file ids, xattrs / streams, no-replace and exchange renames, directory fsync, anonymous files | fixed 2026-11-12 (`fs.hpp`); unsupported where the OS has no call (see os-parity.md) |
+| P6 | Windows: `MAX_PATH`, symlinks and `read_link` on MinGW, junctions | fixed 2026-11-12: `os::wpath` (`\\?\`) in `os.hpp` and the native `fs` calls, `CreateSymbolicLinkW` + junction fallback, reparse-point `read_link`. Junction / `read_link` did not run (wine has no reparse points) |
+| P7 | Passing handles: children, peers, anonymous shared memory | fixed 2026-11-12: `spawn_spec::inherit`, `local_stream::send_handle` / `recv_handle`, `shared_memory::anonymous` / `attach` / `share` / `seal` |
+| P8 | Process priority, affinity, I/O priority, tree listing and kill, `apply_limits` on Windows | fixed 2026-11-12 (`process.hpp`) |
+| P9 | Pseudo-terminals | fixed 2026-11-12: `pty.hpp` (`posix_openpt`, ConPTY) |
+| P10 | Console mouse / paste / focus / alternate screen, resize; boot and awake clocks; core-dump control | fixed 2026-11-12 (`console.hpp`, `time.hpp`, `crash.hpp`) |
+| P11 | cgroup v2 / `rctl` limits, ReFS `clone_file`, one reactor over all waitables, `mremap` | open |
+
 ## Inherent limits (not fixed)
 Windows: `chown`, POSIX signals beyond kill/terminate, user-mode PMCs, THP, per-process open-file/file-size limits,
-in-process network/file denial. macOS: hard CPU affinity, temperature without SMC. iOS: spawning, process listing,
+in-process network denial, atomic rename exchange, sealing a section. macOS: hard CPU affinity, temperature without SMC. iOS: spawning, process listing,
 services, light sensor. Android: JNI-only features (vibrate, notify, display, clipboard, services, keystore dir).
 Linux: abstract sockets only. DPAPI and Keychain do not isolate secrets between processes of one user.
