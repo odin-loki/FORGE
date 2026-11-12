@@ -1002,3 +1002,88 @@ TEST(capability_escape_engine_level) {
     expect_denied("limit {.timeout = \"5s\"} { auto s = forge::bash; s(\"echo hi\"); }");
     expect_denied("forge::sandbox(std::map<std::string, bool>{{\"fs\", true}}, [] { auto r = forge::fs::read; r(\"/etc/hostname\"); });");
 }
+
+// options::mem_limit_bytes (forge script --mem-limit): a hard cap on the managed heap for the whole run. Same
+// accounting and the same catchable OutOfMemoryError as --heap / limit {mem}; a limit block cannot widen it.
+// (tests/script/mem_containers.fs covers the accounting per container kind and for strings.)
+TEST(mem_limit_whole_run) {
+    script::options o; o.mem_limit_bytes = 4u << 20;
+    auto grows = [&](const std::string& what, const std::string& body) {
+        auto got = run(body, o);
+        CHECK_MSG(got == "!OutOfMemoryError", "%s -> %s", what.c_str(), got.c_str());
+    };
+    grows("vector<string>", "std::vector<std::string> v; while (true) v.push_back(std::string(256, 'x'));");
+    grows("vector<int>", "std::vector<int> v; while (true) v.push_back(1);");
+    grows("deque", "std::deque<int> d; while (true) d.push_front(1);");
+    grows("list", "std::list<int> l; while (true) l.push_back(1);");
+    grows("map", "std::map<int, int> m; int i = 0; while (true) { m[i] = i; ++i; }");
+    grows("unordered_map", "std::unordered_map<std::string, int> m; int i = 0; while (true) { m[std::to_string(i)] = i; ++i; }");
+    grows("set", "std::set<int> s; int i = 0; while (true) s.insert(i++);");
+    grows("unordered_set", "std::unordered_set<int> s; int i = 0; while (true) s.insert(i++);");
+    grows("string +=", "std::string s = \"x\"; while (true) s += s;");
+    grows("string append", "std::string s; while (true) s.append(4096, 'x');");
+    grows("string push_back", "std::string s; while (true) s.push_back('x');");
+    grows("string(n, c)", "int n = 1024; while (true) { std::string s(n, 'x'); n *= 2; }");
+    grows("objects", "struct P { std::string a; int b = 0; }; std::vector<P> v; while (true) v.push_back(P{\"p\", 1});");
+    // the message names the limit as it was given
+    { auto a = run1("std::vector<int> v; while (true) v.push_back(1);", true, o);
+      CHECK_MSG(a.r.error.find("limit of 4194304 bytes exceeded (--mem-limit)") != std::string::npos, "%s", a.r.error.c_str()); }
+    // catchable, like the other heap limits; once the memory is released the script carries on
+    CHECK(run("try { std::vector<std::string> v; while (true) v.push_back(std::string(256, 'x')); } catch (const OutOfMemoryError& e) { std::println(\"caught\"); }\n"
+              "std::vector<int> w; for (int i = 0; i < 1000; ++i) w.push_back(i); std::println(\"{}\", w.size());", o) == "caught\n1000\n");
+    CHECK(run("try { std::string s = \"x\"; while (true) s += s; } catch (const std::bad_alloc& e) { std::println(\"bad_alloc\"); }", o) == "bad_alloc\n");
+    // still over the cap after the catch: raised again (the handler only gets the usual grace)
+    CHECK(run("std::vector<std::string> v;\ntry { while (true) v.push_back(std::string(256, 'x')); } catch (const OutOfMemoryError& e) { std::println(\"caught\"); }\n"
+              "while (true) v.push_back(std::string(256, 'x'));", o) == "caught\n!OutOfMemoryError");
+    // below the limit nothing fires
+    CHECK(run("std::vector<std::string> v; for (int i = 0; i < 2000; ++i) v.push_back(std::string(256, 'x'));\n"
+              "std::map<int, int> m; for (int i = 0; i < 2000; ++i) m[i] = i; std::println(\"{} {}\", v.size(), m.size());", o) == "2000 2000\n");
+    // a limit block can narrow the cap but not widen it
+    CHECK(run("limit {.mem = \"1G\"} { std::vector<int> v; while (true) v.push_back(1); }", o) == "!OutOfMemoryError");
+    CHECK(run("try { limit {.mem = \"64K\"} { std::vector<int> v; for (int i = 0; i < 100000; ++i) v.push_back(1); } } catch (const OutOfMemoryError& e) { std::println(\"inner\"); }\n"
+              "std::vector<int> w; for (int i = 0; i < 50000; ++i) w.push_back(i); std::println(\"{}\", w.size());", o) == "inner\n50000\n");
+    // with --heap as well, the lower of the two applies
+    { script::options both = o; both.heap_bytes = 256u << 10;
+      CHECK(run("std::vector<int> v; for (int i = 0; i < 60000; ++i) v.push_back(1); std::println(\"ok\");", both) == "!OutOfMemoryError");
+      CHECK(run("std::vector<int> v; for (int i = 0; i < 60000; ++i) v.push_back(1); std::println(\"ok\");", o) == "ok\n"); }
+    // a task shares the cap
+    CHECK(run("auto t = std::async([] { std::vector<int> v; while (true) v.push_back(1); return 0; }); t.get();", o) == "!OutOfMemoryError");
+    // forge::gc::stats() shows it, and the cap goes away with the engine (the heap is process-wide)
+    CHECK(run("std::println(\"{}\", forge::gc::stats()[\"hard_cap\"] > 0);", o) == "true\n");
+    EXPECT("std::println(\"{}\", forge::gc::stats()[\"hard_cap\"]);", "0\n");
+    EXPECT("std::vector<std::string> v; for (int i = 0; i < 40000; ++i) v.push_back(std::string(256, 'x')); std::println(\"{}\", v.size());", "40000\n");
+}
+
+// Size strings for --mem-limit: the syntax of limit {mem: "2G"}.
+TEST(mem_limit_size_strings) {
+    auto ok = [](const char* s, std::uint64_t want) { std::uint64_t b = 0; std::string why; bool r = script::parse_size(s, b, &why); CHECK_MSG(r && b == want, "%s -> %llu (%s)", s, static_cast<unsigned long long>(b), why.c_str()); };
+    ok("4096", 4096); ok("64K", 64ull << 10); ok("64k", 64ull << 10); ok("512M", 512ull << 20); ok("512MB", 512ull << 20); ok("512MiB", 512ull << 20);
+    ok("2G", 2ull << 30); ok("1.5G", 3ull << 29); ok("1T", 1ull << 40); ok("100B", 100); ok(" 8 M ", 8ull << 20);
+    for (const char* bad : {"", "lots", "12Q", "M", "-1", "1e3", "99999999999T"}) {
+        std::uint64_t b = 7; std::string why;
+        CHECK_MSG(!script::parse_size(bad, b, &why) && !why.empty(), "'%s' should be refused", bad);
+    }
+    std::uint64_t b = 0; CHECK(!script::parse_size("x", b));   // err is optional
+}
+
+// The cap reaches child processes: a child started by the script runs under an OS memory cap of the same size
+// (spawn_spec::limits.memory_bytes, as limit {proc_mem}), and a ProcessPool worker's engine gets the same limit.
+TEST(mem_limit_children) {
+    script::options o; o.mem_limit_bytes = 512u << 20;
+    // ProcessPool: the worker's own interpreter enforces it
+    auto got = run("auto pp = ProcessPool(1);\n"
+                   "std::println(\"{}\", pp.submit(\"auto task(auto x) { return forge::gc::stats()[\\\"hard_cap\\\"] > 0; }\", 0).get());\n"
+                   "pp.shutdown();", o);
+    CHECK_MSG(got == "true\n", "%s", got.c_str());
+    EXPECT("auto pp = ProcessPool(1);\nstd::println(\"{}\", pp.submit(\"auto task(auto x) { return forge::gc::stats()[\\\"hard_cap\\\"]; }\", 0).get());\npp.shutdown();", "0\n");
+#if defined(__linux__) && !defined(__ANDROID__)
+    // RLIMIT_AS in the child: `ulimit -v` prints it in KiB
+    if (std::filesystem::exists("/bin/sh")) {
+        auto lim = run("std::print(\"{}\", forge::sh(\"ulimit -v\").out);", o);
+        CHECK_MSG(lim == "524288\n", "ulimit -v in a child: %s", lim.c_str());
+        // limit {proc_mem} can narrow it, not widen it
+        CHECK(run("limit {.proc_mem = \"256M\"} { std::print(\"{}\", forge::sh(\"ulimit -v\").out); }", o) == "262144\n");
+        CHECK(run("limit {.proc_mem = \"4G\"} { std::print(\"{}\", forge::sh(\"ulimit -v\").out); }", o) == "524288\n");
+    }
+#endif
+}

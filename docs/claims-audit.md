@@ -31,7 +31,7 @@ False claims found and fixed then:
 |---|---|---|
 | Scripts sandboxed "using sandbox.hpp" | No OS sandbox in script/src | Now true: `engine.cpp` applies it for `--no-fs/--no-net/--no-proc` (PR #27). |
 | `.fsc` bytecode cache | Absent | Now exists. |
-| `--mem-limit` for scripts | Absent | Still absent; `forge script` has `--timeout`, `--max-steps`, `--heap`. |
+| `--mem-limit` for scripts | Absent | Still absent on 2026-11-04. Added 2026-11-12: `forge script --mem-limit SIZE` (`options::mem_limit_bytes`); what it bounds is in docs/scripting.md "Resource limits". |
 | `limit {mem: "2G", ...}` block syntax | Absent | Now exists (`limit {...} { body }`, size/duration strings). |
 | Recursion depth default 10 000 | It was 800 | See `script/src/interp.hpp` `Limits`. |
 | Allocation, handle and child-count limits | Absent | Now exist (`allocs`, `handles`, `procs`). |
@@ -45,3 +45,12 @@ A second pass re-derived the changed sentences from source and found 5 more erro
 lazy REPL compilation wrongly marked false, goldens, fuzz target, `forge::limit` test). Claims verified then
 included: capability checks raise `PermissionError`; AI code needs confirmation; plugins are refused in
 sandboxed runs; remote scripts need auth; `.fpk` Ed25519 signing.
+
+## 2026-11-12: script memory limit and indirect capability checks
+
+| Claim | Finding | Status |
+|---|---|---|
+| security.md: "Static capability checks miss indirect calls" | True, and wider than stated: the error-level check saw only the `lib.fn(...)` spelling, so `forge::fs::read(p)` and a `forge::sandbox(std::map<std::string, bool>{{"fs", false}}, ...)` literal were not seen either | `script/src/capflow.hpp` follows callables and reports warnings (docs/scripting.md "Static checks", *Indirect calls*); the error-level check is unchanged. |
+| security.md: "Nested non-isolated `sandbox` blocks are interpreter-checked only" | True and inherent: every OS mechanism is one-way for the process | Behaviour kept; the docs now say why. |
+| security.md: "`sandbox({isolate: true})` ... unavailable on Windows" | True | Not changed; a re-spawn design is noted under Known gaps. |
+| scripting.md: only `limit-option` has a dedicated checker test | Was true | The indirect `capability` warnings now have tests too. |

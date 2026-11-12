@@ -16,6 +16,12 @@ struct options {
     std::uint64_t max_steps = 0;        // 0 = unlimited
     std::uint64_t timeout_ms = 0;       // whole-run wall clock; 0 = unlimited
     std::uint64_t heap_bytes = 0;       // managed heap cap; 0 = forge::mem budget only
+    // Hard memory cap for the whole run (`forge script --mem-limit`); 0 = none. Inside the interpreter it caps the
+    // managed heap like heap_bytes (OutOfMemoryError, catchable), but a `limit {mem}` block or heap_bytes can only
+    // narrow it, and it is also the default OS memory cap of every child process the script starts (shell calls,
+    // run / proc::start, ProcessPool workers: RLIMIT_AS / job object / watchdog, as `limit {proc_mem}`). The engine
+    // never limits the host process itself; the forge CLI does (docs/scripting.md "Resource limits").
+    std::uint64_t mem_limit_bytes = 0;
     int max_depth = 800;
     bool use_vm = true;                 // compile hot functions and whole scripts to bytecode
     bool debug = false;                 // race detector + lock-order / stall deadlock detector (slower)
@@ -70,6 +76,11 @@ struct local_ai_request { std::string model, system, prompt; bool json = false; 
 using local_ai_fn = std::function<std::string(const local_ai_request&)>;
 void set_local_ai(local_ai_fn fn);   // process-wide; null clears
 bool has_local_ai();
+
+// Size strings as `limit {mem: "2G"}` takes them: a number of bytes, or a number with K, M, G or T (powers of
+// 1024; "KB", "KiB", "MB", ... and a trailing "B" are accepted), e.g. "64K", "512M", "1.5G". Returns false and
+// fills *err (when given) on a malformed number, an unknown unit or a value that does not fit.
+bool parse_size(std::string_view text, std::uint64_t& bytes, std::string* err = nullptr);
 
 struct result {
     bool ok = true;
