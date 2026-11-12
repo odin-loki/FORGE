@@ -49,6 +49,29 @@ One header each. The table lists the mechanism each header uses per platform.
 | `background.hpp` | `background::begin/end`, `background_scope` | logind `sleep:idle` inhibitor, else not required | JNI hooks, else unsupported | power request (`PowerSetRequest`) | IOPMAssertion / `beginBackgroundTask` with expiration handler | not required |
 | `service.hpp` | `service::ready/reloading/stopping/watchdog`, `log`, `run_as_service` | `sd_notify` + journald, else syslog | liblog | SCM + Event Log | launchd detection + syslog | rc.d detection + syslog |
 
+Added 2026-11-12 (same conventions; what each OS answers is tabulated in [os-parity.md](os-parity.md)):
+
+| Header | Main API |
+|---|---|
+| `netinfo.hpp` | `net::links` (MAC, MTU, type, prefix), `default_routes`, `dns_servers`, `system_proxy` / `proxy_for` / `proxy_bypassed`, `network_monitor` |
+| `sockopt.hpp` | `net::set_keepalive`, `set_fastopen`, `set_reuseport`, `set_v6only`, `listen_dual_stack`, `unix_listen` / `unix_connect` (Windows too), `udp_bind`, `join_multicast`, `mdns_query`, `dns_parse`, `connect_happy_eyeballs`, `capabilities`; `net::tls_backend()` is in `net.hpp` |
+| `sysinfo.hpp` (additions) | `machine_id`, `boot_time_ns`, `cpu_limits` / `usable_cpu_count`, `memory_limits` (cgroups, job objects, rctl, jetsam) |
+| `virtualization.hpp` | `virtualization()`: hypervisor, container (incl. WSL, jails), translator (Rosetta, ARM64 emulation, wine), emulator |
+| `device_watch.hpp` | `devices::monitor` hot-plug events |
+| `volumes.hpp` | `volumes`, `volume_for` (sizes, removable / network / read-only) |
+| `display.hpp` | `displays` (pixels, millimetres, DPI, scale, refresh) |
+| `idle.hpp` | `idle_seconds`, `screen_locked` |
+| `users.hpp` (additions), `sessions.hpp` | `list_users`, `list_groups`, `lookup_group`, `is_admin`, nine more `user_dir` kinds; `login_sessions`, `run_elevated` |
+| `service_control.hpp` (additions), `scheduler.hpp` | `service::restart`, `service::logs`; `schedule::install` / `uninstall` / `installed` (systemd timers, crontab, launchd, Task Scheduler) |
+| `preferences.hpp` | `preferences` key/value store (registry, CFPreferences, XDG file) |
+| `single_instance.hpp`, `autostart.hpp` | `single_instance::acquire`; `autostart::enable` / `disable` / `is_enabled` |
+| `shell_open.hpp`, `notification.hpp`, `trash.hpp` | `open_url`, `open_path`, `reveal_path`; `notify`; `trash` |
+| `dynlib.hpp` (additions), `clipboard.hpp` (additions) | `loaded_modules`, `module_of_address`, `dynlib::open_with`; `clipboard::set_backend`, UIPasteboard on iOS |
+
+Desktop-session features (`open_url`, `notify`, `idle_seconds`, `displays`, clipboard on Linux) return `unsupported`
+on a headless machine. `open_url`, `notify`, `displays`, `clipboard`, `system_proxy` and `machine_id` take a hook
+so Android / iOS glue (or a test) can supply them.
+
 Process control, pipes, signals, `fs`, users, time, sysinfo, console, networking, recursive file watching, service control, registry, devices, clipboard, `dynlib` and `process_pool` are described in [os-wrapper.md](os-wrapper.md). `settings.hpp` is in [support.md](support.md).
 
 Environment: `FORGE_AIO=threads` forces the portable async-file backend; `FORGE_KEYSTORE=file` and `FORGE_KEYSTORE_DIR` select the file keystore (see [configuration.md](configuration.md)).
@@ -70,6 +93,7 @@ if (!pin && os::is_unsupported(pin.err)) { /* platform lacks it: carry on */ }
 - **File keystore.** One mode-0600 file per secret, sealed with XChaCha20-Poly1305 under a store key kept in the same directory (DPAPI-wrapped on Windows). It stops other users and detects tampering, but same-user code can read the key; `keystore::backend()` reports when it is in use. Needs Monocypher (`forge_os` links `forge_trust`).
 - **Mobile hooks.** `power_hooks`, `memory_pressure::on_trim_memory`, `background::set_hooks` and `keystore::set_backend` are plain C++ entry points. The app's JNI or Swift code must call them.
 - **Windows sandbox.** Network and filesystem denial cannot be added to a running process. `apply_sandbox` only blocks child processes; `run_sandboxed` starts a child under the full policy.
+- **Wine.** The MinGW builds of the tests also run under wine (`tests/wine_run.sh`). Wine lacks parts of iphlpapi and cfgmgr32: `network_monitor` and `devices::monitor` fall back to polling there, and `default_routes` is unsupported.
 - **Tests.** `tests/test_os.cpp` (core) and `tests/test_os_ext.cpp` (one test per extension module). `test_os_ext` re-runs itself with `FORGE_OS_EXT_CHILD` set for the sandbox and crash cases, so never export that variable. When `zig` is installed, the `xos_*` ctests (label `cross;slow`) compile and link these tests for FreeBSD, macOS, MinGW Windows and aarch64 musl.
 
 ## Where it has run

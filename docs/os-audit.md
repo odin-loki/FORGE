@@ -105,6 +105,28 @@ The work is split by file ownership so changes can proceed in parallel without c
 | W2-7 | Apple mobile backends (deviceMotion, pedometer, proximity, pasteboard, macOS notifications/cameras/location/biometrics) | fixed: iOS deviceMotion → rotation_vector/gravity/linear_acceleration on the shared CMMotionManager, CMPedometer step_counter/step_detector, UIDevice proximity (refcounted, main thread), UIPasteboard; macOS CoreLocation (async on the main run loop), AVCaptureDeviceDiscoverySession cameras + camera/location permission, LAContext Touch ID, NSPasteboard; macOS notifications (UNUserNotificationCenter / osascript) verified. Compiled in CI only (no Mac/device) |
 | W2-8 | FSEvents on macOS; `load_average` emulation on Windows | FSEvents fixed: `file_watcher::add_tree` opens one recursive stream (CoreServices late-bound, FileEvents/NoDefer/WatchRoot, 50 ms, dispatch queue waking the kqueue through EVFILT_USER; drops → `overflow`); `tree_watcher` uses it (`fsevents = false` for kqueue); kqueue kept for `add`/`add_file`. macOS CI only | | FSEvents fixed: `file_watcher::add_tree` opens one recursive stream (CoreServices late-bound, FileEvents/NoDefer/WatchRoot, 50 ms, dispatch queue waking the kqueue through EVFILT_USER; drops → `overflow`); `tree_watcher` uses it (`fsevents = false` for kqueue); kqueue kept for `add`/`add_file`. macOS CI only Windows half done (20f3cac): 5 s sampler of busy CPUs + PDH processor queue length, exp(-5/60 / 300 / 900) decay, lazy start with a 100 ms first estimate |
 
+## Wave 3 (2026-11-12): parity, system / hardware / network / services half
+The per-function matrix is [os-parity.md](os-parity.md). Run on Linux (clang 23) and, for Windows, as MinGW builds
+under wine 9; FreeBSD and macOS compiled with zig only; Android and iOS branches were only syntax-checked with
+faked platform macros.
+
+| ID | Cat | Item | Status |
+|---|---|---|---|
+| P1 | A | No link details, default routes, DNS servers, system proxy or network change notifications | fixed 2026-11-12: `netinfo.hpp` (iOS: no routes, the SDK lacks `<net/route.h>`; Android: proxy through `set_proxy_hook`) |
+| P2 | A | No keep-alive tuning, fast open, reuseport, dual stack, AF_UNIX on Windows, multicast, mDNS, happy eyeballs, TLS capability query | fixed 2026-11-12: `sockopt.hpp`, `net::tls_backend()`; `SO_REUSEPORT` and client fast open stay unsupported on Windows |
+| P3 | A | No machine id, boot time, container-aware CPU / memory budget, virtualization detection | fixed 2026-11-12: `sysinfo.hpp`, `virtualization.hpp` |
+| P4 | A | FreeBSD reports every core as a P-core on Intel hybrid CPUs | fixed 2026-11-12: CPUID leaf 0x1A read per CPU (compiled only) |
+| P5 | A | No device hot-plug; clipboard unsupported on iOS / Android | fixed 2026-11-12: `device_watch.hpp`; UIPasteboard, `clipboard::set_backend` |
+| P6 | A | No loaded-module list or loader flags | fixed 2026-11-12: `loaded_modules`, `module_of_address`, `dynlib::open_with` |
+| P7 | A | Services: no restart, no logs; no scheduled tasks | fixed 2026-11-12: `service::restart`, `service::logs`, `scheduler.hpp` |
+| P8 | A | No user / group enumeration, admin check, sessions, elevation; registry is Windows-only | fixed 2026-11-12: `users.hpp`, `sessions.hpp`, `preferences.hpp` |
+| P9 | C | `service_control.hpp` used `fs::` without including `fs.hpp` (compiled only after another header) | fixed 2026-11-12 |
+| P10 | A | Missing on every OS: volumes, displays, idle / lock state, single instance, autostart, open URL / file, notifications, trash | added 2026-11-12, one header each |
+| P11 | B | Linux clipboard, `open_url`, `notify` need helper programs (wl-clipboard / xclip / xsel, xdg-open / gio, notify-send / gdbus); no native X11 / Wayland / D-Bus client | open: a wire-protocol client is a large addition; calls return `unsupported` without the helper |
+| P12 | B | Rename events are not paired (old → new) on any backend | won't fix: kqueue and FSEvents cannot pair; all backends report `renamed` + `created` |
+| P13 | B | `system_proxy` does not evaluate PAC scripts or read KDE settings | open |
+| P14 | D | The Android and iOS branches added here have never been compiled by a real toolchain; MSVC has not built them | open: first CI run |
+
 ## Inherent limits (not fixed)
 Windows: `chown`, POSIX signals beyond kill/terminate, user-mode PMCs, THP, per-process open-file/file-size limits,
 in-process network/file denial. macOS: hard CPU affinity, temperature without SMC. iOS: spawning, process listing,

@@ -33,3 +33,19 @@
 #include <forge/os/devices.hpp>
 #include <forge/os/clipboard.hpp>
 #include <forge/os/dynlib.hpp>
+// System, hardware, network, services and desktop integration.
+#include <forge/os/netinfo.hpp>
+#include <forge/os/sockopt.hpp>
+#include <forge/os/virtualization.hpp>
+#include <forge/os/volumes.hpp>
+#include <forge/os/device_watch.hpp>
+#include <forge/os/display.hpp>
+#include <forge/os/idle.hpp>
+#include <forge/os/sessions.hpp>
+#include <forge/os/scheduler.hpp>
+#include <forge/os/preferences.hpp>
+#include <forge/os/single_instance.hpp>
+#include <forge/os/autostart.hpp>
+#include <forge/os/shell_open.hpp>
+#include <forge/os/notification.hpp>
+#include <forge/os/trash.hpp>
