@@ -1,0 +1,11 @@
+ÿPOST /v1/embeddings HTTP/1.1
+Transfer-Encoding: Chunked
+
+A
+{"input":1
+1
+}
+0
+X-Checksum: abc
+X-More: 1
+

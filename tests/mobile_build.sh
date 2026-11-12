@@ -17,7 +17,7 @@ android)
     -DCMAKE_SHARED_LINKER_FLAGS="-fexperimental-library" >/dev/null   # NDK libc++: jthread/stop_token/<format> (CMakeLists.txt adds it too)
   cmake --build "$b" --target forge_jni -j "${FORGE_MOBILE_JOBS:-3}"
   nm=$(ls "$ndk"/toolchains/llvm/prebuilt/*/bin/llvm-nm | head -1)
-  n=$("$nm" -D --defined-only "$b/libforge_jni.so" | grep -c ' T Java_dev_forge_ForgeModel_native')
+  n=$("$nm" -D --defined-only "$b/libforge_jni.so" | grep -c ' T Java_dev_forge_ForgeNative_')
   want=$(grep -c '^JNIEXPORT' "$src/bindings/android/jni/forge_jni.c")
   echo "JNI exports: $n / $want"; [ "$n" -eq "$want" ]
   "$nm" -D --defined-only "$b/libforge.so" | grep -q ' T forge_open$';;

@@ -452,8 +452,12 @@ int cmd_run(const args& a) {
         gc = std::make_unique<inference::grammar_constraint>(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
         smp.filter = [&](std::span<float> l) { gc->apply(l); }; smp.allow = [&](int t) { return gc->allows(t); };
     }
+    // --chat: the turn ends at the model's end-of-turn tokens (<|im_end|>, <|eot_id|>, ...: inference/chat_tools.hpp), not only at EOS
+    std::vector<int> turn_ends;
+    if (a.has("chat")) for (int t : inference::end_of_turn_tokens(*s.shared_model())) if (t != s.tokenizer()->eos()) turn_ends.push_back(t);
     auto show = [&](int t) {
         if (gc && !gc->accept(t)) return false;
+        if (std::find(turn_ends.begin(), turn_ends.end(), t) != turn_ends.end()) return false;
         if (ids) std::printf("%d ", t); else std::printf("%s", s.tokenizer()->decode_one(t).c_str());
         std::fflush(stdout);
         return !(gc && gc->finished());
