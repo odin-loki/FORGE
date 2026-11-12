@@ -560,7 +560,12 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
         if (n.kind == node_kind::op) {
             // state views grow at run time; only consumers that read the live length are allowed
             for (auto in : n.inputs)
-                if (G.at(in).kind == node_kind::state_append && n.op != ops::op::attention)
+                if (G.at(in).kind == node_kind::state_append && n.op == ops::op::attention_bias) {
+                    // biased / soft-capped attention reads f32 keys and values only (kernels_ext.hpp)
+                    if (st->slots[G.at(in).name].codec != kv_codec::f32)
+                        raise(errc::unsupported, "state slot '{}' feeds attention_bias: a quantised KV cache is not supported here (use the f32 KV codec)", G.at(in).name);
+                }
+                else if (G.at(in).kind == node_kind::state_append && n.op != ops::op::attention)
                     raise(errc::unsupported, "state slot '{}' feeds '{}': only attention may consume a growing state view",
                           G.at(in).name, ops::info(n.op).name);
             std::vector<shape_t> ins; for (auto in : n.inputs) ins.push_back(G.at(in).shape);

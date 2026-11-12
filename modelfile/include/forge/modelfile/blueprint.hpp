@@ -17,9 +17,17 @@
 // keyword args, `W.<path>` weight references, `state[i].append(k, v)`, fixed-size state ops `state[i].conv(x, w)` and
 // `state[i].delta(q, k, v, g, beta)`, tuple assignment `a, b = f(..)`.
 // Any spec op is callable by name; positional numeric/list args bind to the op's declared attrs in order.
-// Built-in composites: linear(x, W) = x @ W^T, embed(W, ids) = gather, heads(x, n) / merge(x) reshapes.
+// Built-in composites: linear(x, W) = x @ W^T, embed(W, ids) = gather, heads(x, n) / merge(x) reshapes,
+// scalar(v) = a [1] constant. Number helpers folded at build time: sqrt floor ceil min max mod.
+// User composites: `op name(a, b, eps = 1e-6) { t = ...  return expr }` at the top level, called like any op
+// (`name(x, y)`, `name(x, y, eps: 1e-5)`). They are inlined into the graph where they are called; recursion (direct
+// or through other composites) is a parse error. The text is the canonical form: it is stored verbatim in the .fpk
+// "blueprint" section and re-parsed on load.
+// Session kinds: generative_sequence (token decoder with state), embedding (one pass, the first output is the
+// result vector: sentence / image embeddings, encoder states), one_shot (named inputs to named outputs).
 #include <forge/graph/ir.hpp>
 #include <forge/ops/ops.gen.hpp>
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <functional>
@@ -72,7 +80,10 @@ inline std::vector<bp_token> bp_lex(std::string_view s) {
 //   1  the first op set
 //   2  rope frequency scaling attrs (scaling, factor, orig_ctx, low_freq, high_freq, beta_fast, beta_slow, truncate,
 //      freq_factors). An opset-1 engine would ignore them and rotate by the wrong angles.
-inline constexpr int opset_min = 1, opset_max = 2;
+//   3  the spatial and encoder op families (conv, pooling, resize, group / batch norm, pad, attention_bias, ...),
+//      composite-op defaults and keyword arguments, scalar() and the number helpers, and `session embedding`.
+//      An older engine would stop at the first of these with an unknown-op or parse error.
+inline constexpr int opset_min = 1, opset_max = 3;
 
 struct bp_state_decl { std::string name; i64 count = 1; std::string kind; std::map<std::string, double> args; };
 struct bp_io_decl { std::string name, dtype; std::vector<std::string> dims; };
@@ -89,7 +100,10 @@ struct blueprint {
     std::size_t graph_begin = 0, graph_end = 0;     // token range of the graph body
     // Composite ops: `op name(a, b) { t = ...  return expr }`. A spec op of the same name wins when the
     // engine has one, so files keep working on old engines and pick up fused kernels on new ones.
-    struct composite { std::vector<std::string> args; std::size_t body_begin = 0, body_end = 0; };
+    // Parameters may carry a numeric default (`op f(x, eps = 1e-6)`) and be passed by name (`f(x, eps: 1e-5)`).
+    // Composites are inlined when the graph is built; a composite that reaches itself (directly or through other
+    // composites) is rejected by parse_blueprint.
+    struct composite { std::vector<std::string> args; std::size_t body_begin = 0, body_end = 0; std::map<std::string, double> defaults; };
     std::map<std::string, composite> composites;
     double param(const std::string& k) const {
         auto it = params.find(k);
@@ -305,7 +319,8 @@ private:
         ps_.expect("(");
         std::vector<bp_val> pos; std::vector<std::pair<std::string, bp_val>> kw;
         while (!ps_.is(")")) {
-            if (ps_.cur().kind == bp_token::k_ident && ps_.pos() + 1 < bp_.graph_end && bp_.toks[ps_.pos() + 1].text == ":") {
+            // (composite bodies may sit after the graph block, so the bound is the token list, not graph_end)
+            if (ps_.cur().kind == bp_token::k_ident && ps_.pos() + 1 < bp_.toks.size() && bp_.toks[ps_.pos() + 1].kind == bp_token::k_punct && bp_.toks[ps_.pos() + 1].text == ":") {
                 auto k = ps_.ident(); ps_.expect(":"); kw.emplace_back(k, expr());
             } else pos.push_back(expr());
             if (!ps_.accept(",")) break;
@@ -323,13 +338,30 @@ private:
             if (o_.all_rows) return pos.at(0);
             return T(g_.apply(ops::op::slice, {as_tensor(pos.at(0))}, {{"axis", 0.0}, {"start", double(n - 1)}, {"end", double(n)}}));
         }
+        if (fn == "scalar") {   // a number as a [1] constant tensor (e.g. the zero bias of attention_bias)
+            if (pos.size() != 1 || !kw.empty()) ps_.fail("scalar(x) takes one number");
+            return T(g_.scalar(float(expect_num(pos[0]))));
+        }
+        // number helpers, folded while the graph is built (per-layer attrs: `window * min(1, mod(l + 1, pattern))`)
+        if (kw.empty() && !pos.empty() && std::all_of(pos.begin(), pos.end(), [](const bp_val& v) { return v.k == bp_val::num; })) {
+            auto N = [](double x) { bp_val r; r.k = bp_val::num; r.n = x; return r; };
+            if (pos.size() == 1 && fn == "sqrt") return N(std::sqrt(pos[0].n));
+            if (pos.size() == 1 && fn == "floor") return N(std::floor(pos[0].n));
+            if (pos.size() == 1 && fn == "ceil") return N(std::ceil(pos[0].n));
+            if (pos.size() == 2 && fn == "min") return N(std::min(pos[0].n, pos[1].n));
+            if (pos.size() == 2 && fn == "max") return N(std::max(pos[0].n, pos[1].n));
+            if (pos.size() == 2 && fn == "mod") {
+                if (pos[1].n == 0) ps_.fail("mod by zero");
+                return N(pos[0].n - std::floor(pos[0].n / pos[1].n) * pos[1].n);
+            }
+        }
         auto o = ops::op_from_name(fn);
         if (!o) {
             auto cit = bp_.composites.find(fn);
             if (cit == bp_.composites.end())
                 raise(errc::parse_error, "blueprint:{}: unknown op '{}' (blueprint \"{}\" declares opset {}; this engine supports opsets {}..{})",
                       line, fn, bp_.name, bp_.opset, opset_min, opset_max);
-            return expand_composite(fn, cit->second, pos, line);
+            return expand_composite(fn, cit->second, pos, kw, line);
         }
         const auto& inf = ops::info(*o);
         std::vector<std::string> anames;
@@ -355,12 +387,27 @@ private:
         return T(g_.apply(*o, ins, a));
     }
 
-    bp_val expand_composite(const std::string& fn, const blueprint::composite& c, const std::vector<bp_val>& pos, int line) {
-        if (pos.size() != c.args.size()) raise(errc::parse_error, "blueprint:{}: {} expects {} arguments, got {}", line, fn, c.args.size(), pos.size());
+    // Inline a composite at the call site. Arguments bind by position, then by name (`f(x, eps: 1e-5)`); a parameter
+    // left unbound takes its declared default (`op f(x, eps = 1e-6)`), else the call is an arity error.
+    bp_val expand_composite(const std::string& fn, const blueprint::composite& c, const std::vector<bp_val>& pos,
+                            const std::vector<std::pair<std::string, bp_val>>& kw, int line) {
+        if (pos.size() > c.args.size()) raise(errc::parse_error, "blueprint:{}: {} expects {} arguments, got {}", line, fn, c.args.size(), pos.size());
+        std::map<std::string, bp_val> bound;
+        for (std::size_t i = 0; i < pos.size(); ++i) bound[c.args[i]] = pos[i];
+        for (auto& [k, v] : kw) {
+            if (std::find(c.args.begin(), c.args.end(), k) == c.args.end()) raise(errc::parse_error, "blueprint:{}: {} has no parameter '{}'", line, fn, k);
+            if (!bound.emplace(k, v).second) raise(errc::parse_error, "blueprint:{}: {}: parameter '{}' given twice", line, fn, k);
+        }
+        for (auto& an : c.args) {
+            if (bound.count(an)) continue;
+            auto d = c.defaults.find(an);
+            if (d == c.defaults.end()) raise(errc::parse_error, "blueprint:{}: {} expects {} arguments, got {} (missing '{}')", line, fn, c.args.size(), pos.size() + kw.size(), an);
+            bp_val v; v.k = bp_val::num; v.n = d->second; bound[an] = v;
+        }
         if (++expansions_ > 100000) raise(errc::parse_error, "blueprint:{}: too many composite expansions", line);
         if (++depth_ > 64) raise(errc::parse_error, "blueprint:{}: composite '{}' recursion too deep", line, fn);
         auto saved_env = env_; auto back = ps_.pos();
-        for (std::size_t i = 0; i < pos.size(); ++i) env_[c.args[i]] = pos[i];   // lexical: args shadow outer names
+        for (auto& [k, v] : bound) env_[k] = v;   // args shadow outer names
         ps_.seek(c.body_begin);
         bp_val r; bool got = false;
         while (ps_.pos() < c.body_end) {
@@ -451,7 +498,14 @@ inline blueprint parse_blueprint(std::string_view src) {
         else if (ps.accept("session")) bp.session = ps.ident();
         else if (ps.accept("op")) {
             auto nm = ps.ident(); blueprint::composite c; ps.expect("(");
-            while (!ps.accept(")")) { c.args.push_back(ps.ident()); ps.accept(","); }
+            while (!ps.accept(")")) {
+                auto an = ps.ident();
+                if (std::find(c.args.begin(), c.args.end(), an) != c.args.end()) ps.fail("op '" + nm + "': parameter '" + an + "' repeated");
+                c.args.push_back(an);
+                if (ps.accept("=")) { bool neg = ps.accept("-"); double v = ps.number(); c.defaults[an] = neg ? -v : v; }
+                else if (!c.defaults.empty()) ps.fail("op '" + nm + "': parameter '" + an + "' without a default follows one with a default");
+                ps.accept(",");
+            }
             if (!ps.is("{")) ps.fail("expected '{' after op signature");
             c.body_begin = ps.pos() + 1; ps.skip_block(); c.body_end = ps.pos() - 1;
             if (!bp.composites.emplace(nm, c).second) ps.fail("op '" + nm + "' defined twice");
@@ -463,6 +517,35 @@ inline blueprint parse_blueprint(std::string_view src) {
             bp.graph_end = ps.pos() - 1;
             have_graph = true;
         } else ps.fail("expected params/state/input/graph/output/session/op");
+    }
+    // Recursion is forbidden: composites are inlined, so a cycle could never terminate. Calls are `name (` tokens in
+    // a body that resolve to a composite (a built-in or spec op of the same name wins, exactly as in the builder).
+    {
+        auto callees = [&](const blueprint::composite& c) {
+            std::vector<std::string> out;
+            for (std::size_t i = c.body_begin; i + 1 < c.body_end; ++i) {
+                const auto& t = bp.toks[i];
+                if (t.kind != bp_token::k_ident || bp.toks[i + 1].kind != bp_token::k_punct || bp.toks[i + 1].text != "(") continue;
+                if (i > 0 && bp.toks[i - 1].kind == bp_token::k_punct && bp.toks[i - 1].text == ".") continue;   // member call (state.append)
+                if (t.text == "linear" || t.text == "embed" || t.text == "heads" || t.text == "merge" || t.text == "last" || t.text == "scalar") continue;
+                if (bp.composites.count(t.text) && !ops::op_from_name(t.text)) out.push_back(t.text);
+            }
+            return out;
+        };
+        std::map<std::string, int> mark;   // 1 = on the current path, 2 = done
+        std::vector<std::string> path;
+        std::function<void(const std::string&)> visit = [&](const std::string& n) {
+            if (mark[n] == 2) return;
+            if (mark[n] == 1) {
+                std::string chain; bool on = false;
+                for (auto& p : path) { on = on || p == n; if (on) chain += p + " -> "; }
+                raise(errc::parse_error, "blueprint '{}': composite op '{}' is recursive ({}{})", bp.name, n, chain, n);
+            }
+            mark[n] = 1; path.push_back(n);
+            for (auto& m : callees(bp.composites.at(n))) visit(m);
+            path.pop_back(); mark[n] = 2;
+        };
+        for (auto& [n, c] : bp.composites) visit(n);
     }
     if (!have_graph) raise(errc::parse_error, "blueprint '{}': no graph block", bp.name);
     if (bp.outputs.empty()) raise(errc::parse_error, "blueprint '{}': no outputs declared", bp.name);

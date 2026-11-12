@@ -1,0 +1,46 @@
+# Phi-3 / Phi-3.5 mini and Phi-4-mini text decoder (Phi3ForCausalLM without LongRoPE): Llama-shaped blocks with
+#   - one fused projection for q, k and v (qkv_proj: rows [q | k | v]),
+#   - one fused projection for the MLP's gate and up halves (gate_up_proj: rows [gate | up]; y = down(up * silu(gate))),
+#   - RoPE over the first `rot` dims of each head (Phi-4-mini: partial_rotary_factor 0.75; Phi-3: the whole head).
+# The importer picks `rope_part` or `rope_full` below. Double-brace placeholders come from config.json.
+blueprint "decoder-lm" opset 3
+
+params {
+  d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
+  n_kv: {{num_key_value_heads}}  head_dim: {{head_dim}}  ffn: {{intermediate_size}}
+  vocab: {{vocab_size}}  eps: {{rms_norm_eps}}  rot: {{rotary_dim}}
+  rope: { base: {{rope_theta}} }
+}
+
+state kv[n_layers] : kv_cache(heads: n_kv, dim: head_dim)
+
+input tokens    : f32[seq]
+input positions : f32[seq]
+
+op rope_full(x, pos) { return rope(x, pos, base: rope.base, neox: 1) }
+op rope_part(x, pos) {
+  return concat(rope(slice(x, 2, 0, rot), pos, base: rope.base, neox: 1), slice(x, 2, rot, head_dim), axis: 2)
+}
+
+graph {
+  qd = n_heads * head_dim
+  kd = n_kv * head_dim
+  x = embed(W.tok_emb, tokens)
+  repeat l in 0..n_layers {
+    h = rms_norm(x, W.layer[l].attn_norm, eps)
+    qkv = linear(h, W.layer[l].w_qkv)
+    q = {{rope_fn}}(heads(slice(qkv, 1, 0, qd), n_heads, head_dim), positions)
+    k = {{rope_fn}}(heads(slice(qkv, 1, qd, qd + kd), n_kv, head_dim), positions)
+    v = heads(slice(qkv, 1, qd + kd, qd + 2 * kd), n_kv, head_dim)
+    kk, vv = kv[l].append(k, v)
+    a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv)
+    x = x + linear(merge(a, qd), W.layer[l].wo)
+    h = rms_norm(x, W.layer[l].ffn_norm, eps)
+    gu = linear(h, W.layer[l].w_gate_up)
+    x = x + linear(silu(slice(gu, 1, 0, ffn)) * slice(gu, 1, ffn, 2 * ffn), W.layer[l].w_down)
+  }
+  logits = linear(rms_norm(last(x, seq), W.out_norm, eps), W.lm_head)
+}
+
+output logits : f32[1, vocab]
+session generative_sequence

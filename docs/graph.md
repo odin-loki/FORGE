@@ -80,7 +80,23 @@ The attention kernels decode quantised slots on the fly. inference selects the c
 
 Device lowerings have priority 20, above the CPU ones. The backends themselves are described in [gpu.md](gpu.md).
 
+### CPU lowerings
+`kernels.hpp` registers the SIMD lowerings of the decoder ops (elementwise strips, softmax, rms_norm, gemm, attention, rope, gather); `kernels_ext.hpp` adds the spatial and encoder families:
+
+| Op | CPU lowering |
+|----|--------------|
+| `conv2d`, `conv1d` | im2col + the blocked gemm (`gpu::prims::gemm_nt`), one gemm per group; depthwise (one input channel per filter) runs direct loops |
+| `gelu`, `quick_gelu`, `mish`, `hard_swish`, `floor` | float strips over the task pool |
+| `layer_norm`, `l2_normalize` | one row per task (sums in double) |
+| `attention_bias` | the plain attention loop (SIMD dot / saxpy) with the bias, soft-cap and masks; f32 keys and values only |
+
+Every other op of those families (`conv_transpose2d`, pooling, resize, `group_norm`, `batch_norm`, `pad`, `alibi_bias`, `sinusoid_embed`, `topk`, `index_select`, `masked_mean`) runs its scalar reference: correct, not fast. The same holds for older ops without a lowering (the reductions, `transpose`, `concat`, `slice`).
+
+A growing state view (`state_append`) may only feed `attention` and `attention_bias`. `attention_bias` reads f32 rows, so a graph that feeds it from a state slot is refused at plan time when the store uses a quantised KV codec.
+
 ## Device execution
+Device registries have kernels for 36 ops ([reference.md](reference.md)). A step whose op has no device kernel (all of the spatial family, `attention_bias`, `layer_norm`, `gelu`, ...) is lowered to the CPU: the executor fetches its inputs to the host, runs it there and reports the write back to the device. The mock-driver goldens `golden_tiny_{gpt2,gemma,phi3,bert,vit,whisper}_{cuda,opencl}_mock` run such mixed plans.
+
 A resident device registry carries `device_hooks` (`kernels.hpp`) that the executor calls: `begin_run`/`end_run`, `pin` (weights and constants, once), `to_host`, `host_wrote`, `release`, device-side `copy`/`copy2d` (reshape and concat stay on the device), and optionally `arena`, `keep`, `end_run_discard`, `state`, `ran`/`replay`, `argmax` and `fused`. With `fused`, `compile` marks adjacent step pairs the backend may run as one kernel (`fuse_steps`: a residual `add` followed by the `rms_norm` of its result; an `rms_norm` whose only consumer is the next step, a `rope`); the executor offers each pair to the hook and runs the two steps as usual when it declines. Which hooks a backend provides, and the environment variables that turn them off, are in [gpu.md](gpu.md#environment).
 
 Quantised weights on a device:

@@ -1,0 +1,26 @@
+# Seed for fuzz_blueprint: user-defined composite ops (defaults, keyword arguments, nesting, a body defined after
+# the graph block), the number helpers and scalar().
+blueprint "composites" opset 3
+params { d: 8  n_layers: 2  k: 3  rope: { base: 10000 } }
+state kv[n_layers] : kv_cache(heads: 2, dim: 4)
+input tokens    : f32[seq]
+input positions : f32[seq]
+op affine(x, w, b = 0.5) { return linear(x, w) + b }
+op glu(h, wg, wu, wd, gain = 1) {
+  g = gelu_tanh(affine(h, wg)) * affine(h, wu, b: 0)
+  return affine(g, wd, 0) * gain
+}
+graph {
+  x = embed(W.tok, tokens) * sqrt(d)
+  repeat l in 0..n_layers {
+    local = min(1, mod(l + 1, 2))
+    q = rot(heads(affine(x, W.layer[l].wq), 2, 4), positions)
+    kk, vv = kv[l].append(q, q)
+    a = attention_bias(q, kk, vv, scalar(0), causal: true, window: 4 * local, softcap: 5)
+    x = x + merge(a, d) + glu(x, W.layer[l].g, W.layer[l].u, W.layer[l].o, gain: 1 / (l + 1))
+  }
+  y = l2_normalize(x) * max(1, floor(k / 2))
+}
+op rot(x, pos, base = 10000) { return concat(rope(slice(x, 2, 0, 2), pos, base: base, neox: 1), slice(x, 2, 2, 4), axis: 2) }
+output y : f32[seq, d]
+session generative_sequence

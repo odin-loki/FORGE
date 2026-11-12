@@ -185,6 +185,96 @@ TEST(fpk_encryption_hook) {
     forge_test::set_env("FORGE_MODEL_KEY", nullptr);
 }
 
+// Composite ops: default and keyword parameters, definitions after the graph block, nesting, the number helpers,
+// and the rejection of recursion (directly, through other composites, and in composites nothing calls).
+TEST(blueprint_composite_defaults_keywords_recursion) {
+    auto src = R"(blueprint "c"
+params { k: 3 }
+input x : f32[4]
+graph {
+  a = scaled(x)
+  b = scaled(x, by: 4)
+  c = scaled(x, 5, bias: 1)
+  d = outer(x) * scalar(2)
+  e = x * mod(7, k) + min(2, max(0, floor(sqrt(17))))
+}
+op scaled(v, by = 2, bias = -0.5) { return v * by + bias }
+op outer(v) { return scaled(v, bias: 0) + inner(v) }
+op inner(v) { return scaled(v, by: k) }
+output a : f32[4]
+output b : f32[4]
+output c : f32[4]
+output d : f32[4]
+output e : f32[4]
+)";
+    auto bp = modelfile::parse_blueprint(src);
+    CHECK(bp.composites.size() == 3 && bp.composites.at("scaled").defaults.size() == 2);
+    auto p = graph::compile(modelfile::build_graph(bp, {})); graph::executor ex(*p);
+    std::vector<float> x = {-2, 0, 0.5f, 3}; ex.set_input("x", x); ex.run();
+    for (std::size_t i = 0; i < 4; ++i) {
+        CHECK(std::fabs(ex.output_view("a").data[i] - (2 * x[i] - 0.5f)) < 1e-6);
+        CHECK(std::fabs(ex.output_view("b").data[i] - (4 * x[i] - 0.5f)) < 1e-6);
+        CHECK(std::fabs(ex.output_view("c").data[i] - (5 * x[i] + 1)) < 1e-6);
+        CHECK(std::fabs(ex.output_view("d").data[i] - (10 * x[i] - 1)) < 1e-5);   // (2x + 0 + 3x - 0.5) * 2
+        CHECK(std::fabs(ex.output_view("e").data[i] - (x[i] + 2)) < 1e-6);        // mod(7, 3) = 1; min(2, floor(sqrt 17)) = 2
+    }
+    auto bad = [](const char* ops, const char* call, const char* needle) {
+        std::string s = std::string("blueprint \"e\"\n") + ops + "\ninput x : f32[2]\ngraph { y = " + call + " }\noutput y : f32[2]";
+        try { (void)modelfile::build_graph(modelfile::parse_blueprint(s), {}); }
+        catch (const forge_exception& e) { return std::string(e.what()).find(needle) != std::string::npos; }
+        return false;
+    };
+    CHECK(bad("op f(a, by = 2) { return a * by }", "f(x, nope: 1)", "no parameter 'nope'"));
+    CHECK(bad("op f(a, by = 2) { return a * by }", "f(x, 3, by: 4)", "given twice"));
+    CHECK(bad("op f(a, b) { return a + b }", "f(x)", "missing 'b'"));
+    CHECK(bad("op f(a, b) { return a + b }", "f(x, x, x)", "expects 2 arguments"));
+    CHECK(bad("op f(a = 1, b) { return a + b }", "f(x, x)", "without a default"));
+    CHECK(bad("op f(a, a) { return a }", "f(x, x)", "repeated"));
+    CHECK(bad("op f(a) { return f(a) }", "f(x)", "is recursive (f -> f)"));
+    CHECK(bad("op f(a) { return g(a) }\nop g(a) { return h(a) + 1 }\nop h(a) { return f(a) }", "x + 1", "f -> g -> h -> f"));   // never called: still rejected
+    // a composite named like a spec op is shadowed by the op, so its "self call" is the op, not recursion
+    CHECK(modelfile::parse_blueprint("blueprint \"e\"\nop tanh(a) { return tanh(a) * 2 }\ninput x : f32[2]\ngraph { y = tanh(x) }\noutput y : f32[2]").composites.size() == 1);
+}
+
+// Every shipped template parses once its placeholders are filled (catches a template edit that breaks the grammar).
+TEST(templates_parse_with_placeholder_values) {
+    int n = 0;
+    for (auto& f : std::filesystem::directory_iterator(import::template_dir())) {
+        if (f.path().extension() != ".fbp") continue;
+        auto text = import::read_file(f.path());
+        for (std::size_t p; (p = text.find("{{")) != std::string::npos;) {
+            auto e = text.find("}}", p); auto key = text.substr(p + 2, e - p - 2);
+            std::string v = "4";
+            if (auto bar = key.find('|'); bar != std::string::npos) v = key.substr(bar + 1);   // {{key|default}}
+            else if (key == "act") v = "gelu";
+            else if (key == "rope_fn") v = "rope_part";
+            else if (key == "logits_expr") v = "lg";
+            else if (key == "pool_expr" && f.path().stem() == "bert") v = "masked_mean(x, mask)";
+            else if (key == "pool_expr") v = "map_pool(x)";
+            else if (key == "embed_expr") v = "p + W.pos_emb";
+            else if (key == "pre_expr") v = "x";
+            else if (key == "mla_q_expr") v = "linear(h, W.layer[l].wq)";
+            text.replace(p, e - p + 2, v);
+        }
+        try { (void)modelfile::parse_blueprint(text); ++n; }
+        catch (const std::exception& ex) { CHECK_MSG(false, "%s: %s", f.path().filename().string().c_str(), ex.what()); }
+    }
+    CHECK(n >= 16);
+}
+
+// The fuzz seed for composite ops builds a graph exactly as fuzz/fuzz_blueprint.cpp drives it.
+TEST(fuzz_seed_composites_builds) {
+    auto text = import::read_file(std::filesystem::path(FORGE_SOURCE_DIR) / "fuzz" / "corpus" / "blueprint" / "composites.fbp");
+    auto bp = modelfile::parse_blueprint(text);
+    CHECK(bp.composites.size() == 3 && bp.session == "generative_sequence");
+    modelfile::build_options o; o.dims = {{"seq", 3}};
+    static std::vector<float> zeros(4096, 0.f);
+    o.weight = [](const std::string&) -> std::pair<shape_t, const float*> { return {shape_t{8, 8}, zeros.data()}; };
+    auto g = modelfile::build_graph(bp, o);
+    int biased = 0; for (auto& n : g.nodes()) biased += n.kind == graph::node_kind::op && n.op == ops::op::attention_bias;
+    CHECK(biased == 2 && g.outputs().size() == 1);
+}
+
 // ---- importers: every tensor accounted for, opset range, licence capture ------------------------------------------
 namespace {
 namespace fs = std::filesystem;

@@ -1,0 +1,39 @@
+# Gemma (first generation: gemma-2b / 7b, CodeGemma) text decoder: Llama-shaped blocks with
+#   - token embeddings scaled by sqrt(d_model),
+#   - RMSNorm computed as x / rms(x) * (1 + w): the importer stores 1 + w, so `rms_norm` applies it directly,
+#   - a GeGLU MLP (GELU-tanh gate),
+#   - the output head tied to the embedding.
+# Double-brace placeholders are substituted by `forge import` from config.json.
+blueprint "decoder-lm" opset 3
+
+params {
+  d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
+  n_kv: {{num_key_value_heads}}  head_dim: {{head_dim}}  ffn: {{intermediate_size}}
+  vocab: {{vocab_size}}  eps: {{rms_norm_eps}}
+  rope: { base: {{rope_theta}} }
+}
+
+state kv[n_layers] : kv_cache(heads: n_kv, dim: head_dim)
+
+input tokens    : f32[seq]
+input positions : f32[seq]
+
+op geglu(h, w_gate, w_up, w_down) { return linear({{act}}(linear(h, w_gate)) * linear(h, w_up), w_down) }
+
+graph {
+  x = embed(W.tok_emb, tokens) * sqrt(d_model)
+  repeat l in 0..n_layers {
+    h = rms_norm(x, W.layer[l].attn_norm, eps)
+    q = rope(heads(linear(h, W.layer[l].wq), n_heads, head_dim), positions, base: rope.base, neox: 1)
+    k = rope(heads(linear(h, W.layer[l].wk), n_kv, head_dim), positions, base: rope.base, neox: 1)
+    v = heads(linear(h, W.layer[l].wv), n_kv, head_dim)
+    kk, vv = kv[l].append(k, v)
+    a = attention(q, kk, vv, causal: true, groups: n_heads / n_kv)
+    x = x + linear(merge(a, n_heads * head_dim), W.layer[l].wo)
+    x = x + geglu(rms_norm(x, W.layer[l].ffn_norm, eps), W.layer[l].w_gate, W.layer[l].w_up, W.layer[l].w_down)
+  }
+  logits = linear(rms_norm(last(x, seq), W.out_norm, eps), W.lm_head)
+}
+
+output logits : f32[1, vocab]
+session generative_sequence

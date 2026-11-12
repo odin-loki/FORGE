@@ -451,6 +451,54 @@ TEST(lora_adapter_file) {
     CHECK(a.forward(ids) == b.forward(ids));
 }
 
+// Embedding sessions (`session embedding`): one stateless pass, the first output is the vector.
+TEST(embedding_session_tokens_mask_and_named_inputs) {
+    auto path = tmp("emb.fpk");
+    std::mt19937 rng(3); std::normal_distribution<float> N(0, 1);
+    std::vector<float> tok(10 * 4), pos(8 * 4); for (auto& x : tok) x = N(rng);
+    for (auto& x : pos) x = N(rng);
+    {
+        modelfile::writer w;
+        w.add_tensor("tok", {10, 4}, tok, "f32"); w.add_tensor("pos", {8, 4}, pos, "f32");
+        w.set_manifest(json::value(json::object{{"format", "fpk"}, {"session", "embedding"}, {"max_position_embeddings", 8.0}}));
+        w.set_section("blueprint", R"(blueprint "emb" opset 1
+params { d: 4  vocab: 10 }
+input tokens    : f32[seq]
+input positions : f32[seq]
+input mask      : f32[seq]
+graph {
+  x = embed(W.tok, tokens) + embed(W.pos, positions)
+  embedding = l2_normalize(masked_mean(x, mask))
+}
+output embedding : f32[d]
+session embedding
+)");
+        w.write(path);
+    }
+    auto want = [&](std::vector<int> ids) {
+        std::vector<double> m(4, 0.0); double n2 = 0;
+        for (std::size_t i = 0; i < ids.size(); ++i) for (std::size_t j = 0; j < 4; ++j) m[j] += (double(tok[std::size_t(ids[i]) * 4 + j]) + pos[i * 4 + j]) / double(ids.size());
+        for (double v : m) n2 += v * v;
+        std::vector<float> o; for (double v : m) o.push_back(float(v / std::sqrt(n2)));
+        return o;
+    };
+    inference::session s(path);
+    CHECK(s.blueprint().session == "embedding" && s.embedding_shape() == (shape_t{4}));
+    std::vector<int> ids{1, 7, 3};
+    CHECK(maxdiff(s.embed(ids), want(ids)) < 1e-6f);
+    CHECK(maxdiff(s.embed(std::vector<int>{1, 7, 3, 9, 9}, {}, std::vector<int>{1, 1, 1, 0, 0}), want(ids)) < 1e-6f);   // padding masked out
+    CHECK(maxdiff(s.embed(std::vector<int>{4}), want({4})) < 1e-6f);                                                    // another length: another plan
+    CHECK(maxdiff(s.embed_inputs({{"tokens", {1, 7, 3}}, {"positions", {0, 1, 2}}, {"mask", {1, 1, 1}}}, 3), want(ids)) < 1e-6f);
+    CHECK_THROWS(s.embed(std::vector<int>{}));
+    CHECK_THROWS(s.embed(std::vector<int>(9, 1)));                                   // more tokens than positions
+    CHECK_THROWS(s.embed(ids, {}, std::vector<int>{1, 1}));                          // mask of the wrong length
+    CHECK_THROWS(s.embed(std::vector<int>{1, 12}));                                  // token id outside the table
+    sampler g; CHECK_THROWS(s.generate(ids, 2, g));                                  // not a generative model
+    inference::session gen(model_a());
+    CHECK_THROWS(gen.embed(ids));                                                    // and a decoder is not an embedding model
+    std::filesystem::remove(path);
+}
+
 // ---- RoPE frequency scaling and the opset through a session ---------------------------------------------------------
 // Copies a model file with its blueprint text edited (same tensors, manifest and tokenizer).
 static std::string with_blueprint(const std::string& src, const std::string& dst, const std::function<void(std::string&)>& edit) {

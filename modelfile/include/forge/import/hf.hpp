@@ -318,9 +318,14 @@ struct expert_index {
     }
 };
 
+// Architectures outside the Llama-style decoder path below (defined in hf_arch.hpp, included at the end of this file).
+inline std::optional<import_report> import_hf_extra(const std::filesystem::path& dir, const json::value& cfg, const std::string& out, const import_options& opt);
+
 inline import_report import_hf(const std::filesystem::path& dir, const std::string& out, const import_options& opt_in = {}) {
     check_read(dir); check_write(out);
     auto cfg = json::parse(read_file(dir / "config.json"));
+    // GPT-2, Gemma, Phi-3, BERT-family, ViT / CLIP / SigLIP vision and Whisper-encoder checkpoints: hf_arch.hpp
+    if (auto extra = import_hf_extra(dir, cfg, out, opt_in)) return *extra;
     // AWQ / GPTQ checkpoint (hf_quant.hpp). keep (the default): quantised Linears are stored as grouped-codec blocks
     // where they fit, everything else as f16 (these checkpoints are fp16). --codec C: decoded and encoded as C.
     import_options opt = opt_in;
@@ -622,3 +627,5 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
 }
 
 } // namespace forge::import
+
+#include <forge/import/hf_arch.hpp>   // import_hf_extra: GPT-2, Gemma, Phi-3, BERT, vision and Whisper-encoder families

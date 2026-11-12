@@ -1,0 +1,40 @@
+# BERT-family encoder as an embedding model (BERT, RoBERTa / XLM-R, MiniLM, BGE, E5, GTE ...): token + learned
+# position + token-type embeddings, post-LayerNorm blocks with bidirectional attention, then pooling.
+#   mask    1 for real tokens, 0 for padding: padded keys get a -1e30 score bias (attention_bias) and are left out
+#           of mean pooling. A single unpadded sequence passes all ones (what `forge embed` and session::embed do).
+#   pooling the importer writes the pooling expression: the [CLS] row or the masked mean, optionally L2-normalised
+#           (sentence-transformers 1_Pooling / Normalize modules).
+# RoBERTa numbers positions from pad_token_id + 1 (pos_offset). Double-brace placeholders come from config.json.
+blueprint "encoder-embedding" opset 3
+
+params {
+  d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}
+  head_dim: {{head_dim}}  ffn: {{intermediate_size}}  vocab: {{vocab_size}}
+  eps: {{layer_norm_eps}}  pos_offset: {{position_offset}}
+}
+
+input tokens      : f32[seq]
+input positions   : f32[seq]
+input token_types : f32[seq]
+input mask        : f32[seq]
+
+op affine(x, w, b) { return linear(x, w) + b }
+
+graph {
+  x = embed(W.tok_emb, tokens) + embed(W.pos_emb, positions + pos_offset) + embed(W.type_emb, token_types)
+  x = layer_norm(x, W.emb_norm_w, W.emb_norm_b, eps)
+  key_bias = reshape((mask - 1) * 1e30, [1, 1, seq])
+  repeat l in 0..n_layers {
+    q = heads(affine(x, W.layer[l].wq, W.layer[l].bq), n_heads, head_dim)
+    k = heads(affine(x, W.layer[l].wk, W.layer[l].bk), n_heads, head_dim)
+    v = heads(affine(x, W.layer[l].wv, W.layer[l].bv), n_heads, head_dim)
+    a = attention_bias(q, k, v, key_bias)
+    x = layer_norm(x + affine(merge(a, d_model), W.layer[l].wo, W.layer[l].bo), W.layer[l].attn_norm_w, W.layer[l].attn_norm_b, eps)
+    f = affine({{act}}(affine(x, W.layer[l].w_in, W.layer[l].b_in)), W.layer[l].w_out, W.layer[l].b_out)
+    x = layer_norm(x + f, W.layer[l].ffn_norm_w, W.layer[l].ffn_norm_b, eps)
+  }
+  embedding = {{pool_expr}}
+}
+
+output embedding : f32[d_model]
+session embedding

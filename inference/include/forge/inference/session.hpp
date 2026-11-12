@@ -453,6 +453,54 @@ public:
         for (auto& o : blueprint().outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
         return out;
     }
+
+    // ---- embedding sessions (`session embedding` in the blueprint) ----
+    // One stateless pass; the first declared output is the result: a pooled sentence or image vector, or an
+    // encoder's state sequence (flattened row-major; embedding_shape() gives its dims).
+    void check_embedding() const {
+        if (blueprint().session != "embedding") raise(errc::unsupported, "session kind '{}' is not an embedding model", blueprint().session);
+    }
+    // Token models (BERT family): feeds the inputs the blueprint declares out of `tokens` (the ids), `positions`
+    // (0 .. n-1), `token_types` (zeros unless given) and `mask` (ones unless given: 0 marks padding).
+    std::vector<float> embed(std::span<const int> ids, std::span<const int> token_types = {}, std::span<const int> mask = {}) {
+        check_embedding();
+        const i64 n = i64(ids.size());
+        if (n == 0) raise(errc::invalid_argument, "embed: no tokens");
+        if (n > m_->max_context()) raise(errc::out_of_memory, "embed: {} tokens exceed the model's {} positions", n, m_->max_context());
+        if ((!token_types.empty() && i64(token_types.size()) != n) || (!mask.empty() && i64(mask.size()) != n))
+            raise(errc::invalid_argument, "embed: token_types / mask must have one entry per token");
+        std::map<std::string, std::vector<float>> in;
+        bool has_tokens = false;
+        for (auto& d : blueprint().inputs) {
+            auto& v = in[d.name]; v.resize(std::size_t(n));
+            if (d.name == "tokens") { std::copy(ids.begin(), ids.end(), v.begin()); has_tokens = true; }
+            else if (d.name == "positions") for (i64 i = 0; i < n; ++i) v[std::size_t(i)] = float(i);
+            else if (d.name == "token_types") { if (!token_types.empty()) std::copy(token_types.begin(), token_types.end(), v.begin()); }
+            else if (d.name == "mask") { if (mask.empty()) std::fill(v.begin(), v.end(), 1.f); else std::copy(mask.begin(), mask.end(), v.begin()); }
+            else raise(errc::unsupported, "embed: model input '{}' is not a token input; use embed_inputs()", d.name);
+        }
+        if (!has_tokens) raise(errc::unsupported, "embed: the model takes no `tokens` input; use embed_inputs()");
+        return embed_inputs(in, n);
+    }
+    // Any embedding model: named f32 inputs as the blueprint declares them (an image [c, h, w], mel frames
+    // [n_mels, frames], or the token inputs above). `seq` binds the symbolic `seq` dimension when there is one.
+    std::vector<float> embed_inputs(const std::map<std::string, std::vector<float>>& in, i64 seq = 1) {
+        check_embedding();
+        auto out = infer(in, seq);
+        return std::move(out.at(blueprint().outputs.front().name));
+    }
+    // Declared shape of the embedding output with `seq` bound (e.g. {384}, or {1500, 384} for encoder states).
+    shape_t embedding_shape(i64 seq = 1) const {
+        check_embedding();
+        shape_t s;
+        for (auto& d : blueprint().outputs.front().dims) {
+            if (d == "seq") s.push_back(seq);
+            else if (auto it = blueprint().params.find(d); it != blueprint().params.end()) s.push_back(i64(it->second));
+            else s.push_back(i64(std::strtoll(d.c_str(), nullptr, 10)));
+        }
+        return s;
+    }
+    // ---- end embedding ----
 private:
     std::vector<float> run(std::span<const int> ids, bool all) { auto v = run_view(ids, all); return {v.begin(), v.end()}; }
     // Runs like run_view and returns the argmax of the last position's logits: on the device when the backend can

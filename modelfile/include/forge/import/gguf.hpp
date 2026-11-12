@@ -143,10 +143,14 @@ private:
     std::vector<tinfo> tensors_;
 };
 
+// gemma / gemma2 / gemma3 / phi3 / gpt2 / bert (defined in gguf_arch.hpp, included at the end of this file)
+inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const std::string& path, const std::string& out, const import_options& opt, const std::string& arch);
+
 inline import_report import_gguf(const std::string& path, const std::string& out, const import_options& opt = {}) {
     check_write(out);
     gguf_file g(path);
     auto arch = g.need("general.architecture").str();
+    if (auto extra = import_gguf_extra(g, path, out, opt, arch)) return *extra;
     if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral" && arch != "qwen35" && arch != "qwen3moe" && arch != "qwen35moe")
         raise(errc::unsupported, "GGUF architecture '{}' has no template", arch);
     // qwen2: the llama graph + Q/K/V biases (blk.N.attn_{q,k,v}.bias). A qwen2 file that carries no bias tensors is the
@@ -471,3 +475,5 @@ inline import_report import_gguf(const std::string& path, const std::string& out
 }
 
 } // namespace forge::import
+
+#include <forge/import/gguf_arch.hpp>   // import_gguf_extra: gemma, gemma2, gemma3, phi3, gpt2, bert

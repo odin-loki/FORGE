@@ -83,7 +83,13 @@ inline case_t make_case(ops::op o, std::mt19937& rng, i64 n = 37) {
         else if (nm == "rope") {
             tensor pos({5}); for (int i = 0; i < 5; ++i) pos.data[std::size_t(i)] = float(i * 3);
             c.in = {rt({5, 2, 16}), pos}; c.a.set("base", 10000.0); c.a.set("neox", 1.0);
-        } else {
+        }
+        else if (nm == "group_norm") { c.in = {rt({6, 4, 5}), rt({6}), rt({6})}; c.a.set("groups", 3.0); c.a.set("eps", 1e-5); }
+        else if (nm == "batch_norm") {
+            c.in = {rt({6, 4, 5}), rt({6}), rt({6}), rt({6}), rt({6})}; c.a.set("eps", 1e-5);
+            for (auto& x : c.in[4].data) x = 0.1f + std::fabs(x);   // variance > 0
+        }
+        else {
             for (int i = 0; i < inf.inputs; ++i) c.in.push_back(rt({3, n}));
             if (nm == "select") for (auto& x : c.in[2].data) x = x > 0 ? 1.f : 0.f;
             if (nm == "scale") c.a.set("alpha", 0.37);
@@ -102,8 +108,56 @@ inline case_t make_case(ops::op o, std::mt19937& rng, i64 n = 37) {
     case ops::shape_rule::matmul: c.in = {rt({2, 5, n}), rt({n, 11})}; break;
     case ops::shape_rule::matmul_t: c.in = {rt({2, 5, n}), rt({11, n})}; break;
     case ops::shape_rule::attention:
-        c.in = {rt({3, 4, 16}), rt({7, 2, 16}), rt({7, 2, 12})}; c.a.set("causal", 1.0); break;
-    case ops::shape_rule::transpose: c.in = {rt({3, 4, 5})}; c.a.set("perm", std::vector<i64>{2, 0, 1}); break;
+        c.in = {rt({3, 4, 16}), rt({7, 2, 16}), rt({7, 2, 12})}; c.a.set("causal", 1.0);
+        if (nm == "attention_bias") {   // per-head bias with a masked key column; the 5-wide trial adds soft-capping
+            tensor b({4, 1, 7}); for (auto& x : b.data) x = std::uniform_real_distribution<float>(-2.f, 2.f)(rng);
+            for (i64 h = 0; h < 4; ++h) b.data[std::size_t(h * 7 + 2)] = -INFINITY;
+            c.in.push_back(std::move(b)); c.a.set("causal", n == 64 ? 1.0 : 0.0);
+            if (n == 5) c.a.set("softcap", 3.0);
+            if (n == 37) c.a.set("window", 3.0);
+        }
+        break;
+    case ops::shape_rule::conv1d:
+        c.in = {rt({4, n + 3}), rt({6, 2, 3}), rt({6})}; c.a.set("stride", 2.0); c.a.set("pad", 1.0); c.a.set("groups", 2.0);
+        for (auto& x : c.in[1].data) x *= 0.2f;
+        break;
+    case ops::shape_rule::conv2d:
+        c.in = {rt({4, 9, n > 16 ? 11 : 7}), rt({6, 2, 3, 2}), rt({6})};
+        c.a.set("stride", std::vector<i64>{2, 1}); c.a.set("pad", std::vector<i64>{1, 2}); c.a.set("dilation", std::vector<i64>{1, 2}); c.a.set("groups", 2.0);
+        for (auto& x : c.in[1].data) x *= 0.2f;
+        break;
+    case ops::shape_rule::conv_transpose2d:
+        c.in = {rt({4, 5, 6}), rt({4, 3, 3, 2}), rt({6})};
+        c.a.set("stride", 2.0); c.a.set("pad", 1.0); c.a.set("output_pad", 1.0); c.a.set("groups", 2.0);
+        for (auto& x : c.in[1].data) x *= 0.2f;
+        break;
+    case ops::shape_rule::pool2d:
+        c.in = {rt({3, 9, 10})}; c.a.set("kernel", std::vector<i64>{3, 2}); c.a.set("stride", 2.0); c.a.set("pad", std::vector<i64>{1, 0});
+        break;
+    case ops::shape_rule::adaptive_pool2d: c.in = {rt({3, 7, 10})}; c.a.set("out", std::vector<i64>{3, 4}); break;
+    case ops::shape_rule::global_pool: c.in = {rt({5, 4, 6})}; break;
+    case ops::shape_rule::upsample2d:
+        c.in = {rt({3, 4, 5})}; c.a.set("scale", std::vector<i64>{2, 3});
+        if (nm == "upsample_bilinear") c.a.set("align_corners", n == 64 ? 1.0 : 0.0);
+        break;
+    case ops::shape_rule::pad:
+        c.in = {rt({3, 4, 5})}; c.a.set("pads", std::vector<i64>{1, 2, 3, 0}); c.a.set("mode", n == 37 ? 1.0 : n == 64 ? 2.0 : 0.0); c.a.set("value", 0.5);
+        break;
+    case ops::shape_rule::alibi: {
+        tensor qp({3}), kp({7}); for (int i = 0; i < 7; ++i) kp.data[std::size_t(i)] = float(i);
+        for (int i = 0; i < 3; ++i) qp.data[std::size_t(i)] = float(4 + i);
+        c.in = {qp, kp}; c.a.set("heads", n == 64 ? 6.0 : 4.0); break; }
+    case ops::shape_rule::embed_dim: {
+        tensor t({5}); for (int i = 0; i < 5; ++i) t.data[std::size_t(i)] = float(i * 7);
+        c.in = {t}; c.a.set("dim", n == 5 ? 7.0 : 16.0); c.a.set("max_period", 10000.0); c.a.set("shift", n == 64 ? 1.0 : 0.0); c.a.set("flip", n == 37 ? 1.0 : 0.0);
+        break; }
+    case ops::shape_rule::topk: c.in = {rt({4, n})}; c.a.set("k", 3.0); break;
+    case ops::shape_rule::index_select: {
+        tensor idx({4}); for (std::size_t i = 0; i < 4; ++i) idx.data[i] = float(i64(rng() % 5) - (i == 3 ? 5 : 0));
+        c.in = {rt({3, 5, 4}), idx}; c.a.set("axis", 1.0); break; }
+    case ops::shape_rule::masked_mean: {
+        tensor m({6}); for (std::size_t i = 0; i < 6; ++i) m.data[i] = i == 1 || i == 4 ? 0.f : 1.f;
+        c.in = {rt({6, n}), m}; break; }    case ops::shape_rule::transpose: c.in = {rt({3, 4, 5})}; c.a.set("perm", std::vector<i64>{2, 0, 1}); break;
     case ops::shape_rule::reshape: c.in = {rt({3, 4, 5})}; c.a.set("shape", std::vector<i64>{-1, 10}); break;
     case ops::shape_rule::gather: {
         tensor idx({2, 3}); for (std::size_t i = 0; i < 6; ++i) idx.data[i] = float(rng() % 9);

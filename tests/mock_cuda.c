@@ -82,6 +82,9 @@ static float un(const char* op, float x) {
     if (!strcmp(op, "silu")) return x / (1.0f + expf(-x)); if (!strcmp(op, "relu")) return x > 0 ? x : 0;
     if (!strcmp(op, "softplus")) return fmaxf(x, 0) + log1pf(expf(-fabsf(x)));
     if (!strcmp(op, "gelu_tanh")) return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+    if (!strcmp(op, "quick_gelu")) return x / (1.0f + expf(-1.702f * x));
+    if (!strcmp(op, "mish")) return x * tanhf(fmaxf(x, 0) + log1pf(expf(-fabsf(x))));
+    if (!strcmp(op, "hard_swish")) return x * (x < -3.0f ? 0.0f : (x > 3.0f ? 6.0f : x + 3.0f)) / 6.0f;
     return NAN;
 }
 static float bin(const char* op, float a, float b) {
