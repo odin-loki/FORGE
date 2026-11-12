@@ -90,7 +90,7 @@ Greedy output is identical with CUDA graphs on and off.
 - AMX/SME: AMX ran natively and under Intel SDE; SME only under qemu.
 - GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open;
   graphs recorded before an eviction must not be replayed after it.
-- RPC: permissions are coarse (`device`, `scripts`); client-certificate rules match only the fingerprint or subject CN.
+- RPC: revocation is by CRL file and fingerprint list (no OCSP, no CRL fetching); device ops have no per-model scope. The finer permissions, SAN rules and revocation (`test_rpc`, `test_rpc_tls`) have run on Linux x86-64 with OpenSSL 3.0 only.
 - Not tested anywhere: hybrid P/E cores, multi-node NUMA, batteries and thermal sensors, running under
   systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox decode, CUDA graphics interop.
 - Security gaps: [security.md](security.md#known-gaps).
