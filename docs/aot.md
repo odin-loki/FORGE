@@ -253,7 +253,10 @@ library and the code generator came from different builds.
 
 A native build spends most of its time parsing the runtime's headers. `--aot-pch DIR` keeps one precompiled header
 per (compiler, flags, runtime) in `DIR`; use a directory only you can write, since a precompiled header is trusted
-like source. A stale one is detected by the compiler, deleted and the build repeated without it.
+like source. The key includes the size and time stamp of the runtime library, so a rebuilt runtime gets a new
+precompiled header (GCC does not notice changed headers behind a `.gch` by itself); one the compiler rejects is
+deleted and the build repeated without it. Old entries are not evicted (31 MB for clang++ 23 and 161 MB for g++ 13 here): delete the
+directory to clear it.
 
 ## Cross-compiling
 
@@ -274,7 +277,38 @@ the compiler and linker; an embed-mode binary is a deterministic function of the
 
 ## Performance
 
-PERF_SECTION
+Measured on 2026-11-12 on the development machine: x86-64 Linux, 4 cores shared with other jobs (load average
+17 to 20 during the runs), FORGE built RelWithDebInfo with clang 23.1.6, native binaries built at the default
+`-O2` with clang++ 23.1.6 and g++ 13.3. Numbers are CPU seconds (user + system), best of 5 runs; wall-clock times
+were 2 to 3 times higher for every mode because of the load. The three programs are in `examples/scripts/`; every
+mode printed the same output.
+
+| program | tree-walker (`--tree`) | VM (`forge script`) | embed | native, clang++ | native, g++ | native vs VM |
+|---|---|---|---|---|---|---|
+| `bench_ints.cpp 300000` (integer loops; 9 unboxed locals) | 6.31 | 5.50 | 5.47 | 1.36 | 1.41 | 4.0x |
+| `bench_calls.cpp 32` (recursive calls; 3 unboxed locals) | 2.09 | 2.04 | 2.01 | 1.59 | 1.74 | 1.3x |
+| `bench_objects.cpp 20000` (strings, maps, structs) | 1.40 | 1.42 | 1.37 | 1.18 | 1.26 | 1.2x |
+
+What the numbers say:
+
+- Embed mode is the VM: same speed, by construction.
+- Native mode wins where the work is arithmetic on locals it can unbox. The remaining cost in `bench_ints` is the
+  per-statement `Interp::step()` (limits, cancellation, destructors) and the call overhead of `is_prime` /
+  `collatz`.
+- Calls, containers, strings and objects are the runtime's own code in every mode (`Interp::call_function`
+  allocates an activation record and a stack-trace frame per call; members live in a hash map), so native mode
+  only removes the dispatch around them: 1.2x to 1.3x.
+- These are three small programs measured on a loaded machine; treat the ratios as indicative.
+
+Build cost, same machine and load: a native build of a small script took 13 to 26 s wall-clock without a
+precompiled header, nearly all of it the compiler parsing the runtime's headers (about 140,000 preprocessed lines).
+The time with `--aot-pch` was not measured separately. Embed mode copies a file.
+
+Sizes: the stripped runner stub `forge-script-run` is 8.4 MB (8,384,768 bytes in this build), so an embed-mode
+executable is 8.4 MB plus the program. Native executables of the three benchmarks were 9.5 MB (debug information
+is left out unless `-Og` is given). If no `forge-script-run` is found, embed mode falls back to copying `forge`
+itself, which is far larger (111 MB in this RelWithDebInfo build): keep the stub next to `forge` or in the
+runtime directory.
 
 ## Tests
 
@@ -307,8 +341,10 @@ Written to be portable, never run:
 - **FreeBSD, Android, iOS**: only the "compiling is not supported" path on Android / iOS is by construction; running
   an embed payload on those systems has not been tried.
 - **Cross-compiling in native mode**: the `--target` pass-through exists; no cross runtime has been built or linked.
-- **The install tree**: the install rules were written and inspected, not exercised by an AOT build from an
-  installed prefix.
+- **The install tree**: native (clang++ 23, g++ 13) and embed builds were run from a hand-assembled copy of the
+  installed layout (`bin/forge`, `lib/forge/aot/`, `include/`), with `forge` finding the runtime by itself.
+  `cmake --install` itself, the exported `forge::script_rt` target and the `install_consumer` test were not run.
+- `--mem-limit` baked into a binary and `--forge-mem-limit`: implemented, no automated test.
 - **A baked or run-time FSS policy** and `integrity.scripts` on the executable: implemented from the `forge script`
   logic, no automated test.
 - MSVC's limits on function size and nesting for very large scripts.

@@ -224,6 +224,13 @@ aot_result build_native(const aot::translated& tr, const std::string& out, const
             std::string key_src = cxx + "\n" + (ver ? ver->out : std::string()) + "\n" + cfg.dir + "\n" + header + "\n";
             for (std::size_t k = 1; k < cmd.size(); ++k) key_src += cmd[k] + "\n";
             for (auto& i : cfg.includes) key_src += i + "\n";
+            // GCC does not notice that a header behind a .gch changed. The runtime library is rebuilt whenever one
+            // of them does, so its size and time stamp (and the entry header's) are part of the key.
+            std::vector<std::string> stamped(cfg.libs); stamped.push_back(header);
+            for (auto& f : stamped) {
+                std::error_code e5;
+                key_src += std::to_string(fs::file_size(f, e5)) + ":" + std::to_string(fs::last_write_time(f, e5).time_since_epoch().count()) + "\n";
+            }
             const std::string key = hash::blake3::hex(hash::blake3::of(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(key_src.data()), key_src.size()))).substr(0, 24);
             const fs::path dir = fs::path(pch_dir) / key;
             const fs::path pch = dir / (clang ? "forge_aot_rt.hpp.pch" : "forge_aot_rt.hpp.gch");
