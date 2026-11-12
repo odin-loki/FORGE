@@ -511,6 +511,25 @@ public:
 #endif
         return s_.recv_all(p, n);
     }
+    // One read of up to n bytes, for stream protocols that do not know the length in advance (forge-serve's HTTP).
+    // > 0: bytes read; 0: the peer closed; -1: error; -2: nothing arrived within the socket's receive timeout (retry).
+    long recv_some(void* p, std::size_t n) {
+#ifdef FORGE_HAVE_TLS
+        if (ssl_) {
+            int k = SSL_read(ssl_.get(), p, int(std::min<std::size_t>(n, 1 << 30)));
+            if (k > 0) return k;
+            int e = SSL_get_error(ssl_.get(), k); ERR_clear_error();
+            return e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE ? -2 : e == SSL_ERROR_ZERO_RETURN ? 0 : -1;
+        }
+#endif
+        long r = s_.recv(p, n);
+        if (r >= 0) return r;
+        int e = os::sock_errno();
+#if defined(_WIN32)
+        if (e == WSAETIMEDOUT) return -2;
+#endif
+        return os::would_block(e) ? -2 : -1;
+    }
     void close() {
 #ifdef FORGE_HAVE_TLS
         if (ssl_) { SSL_shutdown(ssl_.get()); ssl_.reset(); }

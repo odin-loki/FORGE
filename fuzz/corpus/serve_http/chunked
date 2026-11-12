@@ -1,0 +1,10 @@
+ÿPOST /v1/completions HTTP/1.1
+Host: x
+Transfer-Encoding: chunked
+
+5
+{"pro
+1b;ext=1
+mpt":"the","max_tokens":4}
+0
+

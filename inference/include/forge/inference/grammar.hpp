@@ -267,13 +267,15 @@ private:
 // Per-generation constraint state: masks logits and advances on accepted tokens.
 class grammar_constraint {
 public:
-    grammar_constraint(std::shared_ptr<const grammar> g, const modelfile::bpe_tokenizer& tok, int vocab, int eos)
-        : g_(std::move(g)), eos_(eos) {
+    // `ends`: further tokens that end the output like EOS does (a chat model's end-of-turn tokens): allowed exactly
+    // when the grammar can end, and never matched against the grammar's bytes.
+    grammar_constraint(std::shared_ptr<const grammar> g, const modelfile::bpe_tokenizer& tok, int vocab, int eos, std::vector<int> ends = {})
+        : g_(std::move(g)), eos_(eos), ends_(std::move(ends)) {
         stacks_ = g_->start();
         tokens_.resize(std::size_t(vocab));
         nodes_.emplace_back();
         for (int t = 0; t < vocab; ++t) {
-            if (t == eos) continue;
+            if (t == eos || is_end(t)) continue;
             auto b = tok.decode_one(t);
             tokens_[std::size_t(t)] = b;
             if (b.empty()) continue;
@@ -303,6 +305,7 @@ public:
             std::vector<char> ok(logits.size(), 0);
             walk_parallel(stacks_, ok);
             if (eos_ >= 0 && std::size_t(eos_) < ok.size() && grammar::can_end(stacks_)) ok[std::size_t(eos_)] = 1;
+            if (grammar::can_end(stacks_)) for (int e : ends_) if (e >= 0 && std::size_t(e) < ok.size()) ok[std::size_t(e)] = 1;
             fresh.assign((ok.size() + 63) / 64, 0);
             for (std::size_t i = 0; i < ok.size(); ++i) if (ok[i]) fresh[i >> 6] |= std::uint64_t(1) << (i & 63);
             if (cache_.size() >= kMaxCached) cache_.clear();
@@ -314,7 +317,7 @@ public:
     void reset() { stacks_ = g_->start(); }
     // whether `t` may come next (the per-token form of apply(), for sampler::allow); the state is not changed
     bool allows(int t) const {
-        if (t == eos_) return grammar::can_end(stacks_);
+        if (t == eos_ || is_end(t)) return grammar::can_end(stacks_);
         if (t < 0 || std::size_t(t) >= tokens_.size() || tokens_[std::size_t(t)].empty()) return false;
         auto st = stacks_;
         for (unsigned char c : tokens_[std::size_t(t)]) { st = g_->advance(st, c); if (st.empty()) return false; }
@@ -322,7 +325,7 @@ public:
     }
     // advance on a sampled token; returns false if the token was not allowed
     bool accept(int t) {
-        if (t == eos_) return grammar::can_end(stacks_);
+        if (t == eos_ || is_end(t)) return grammar::can_end(stacks_);
         auto st = stacks_;
         for (unsigned char c : tokens_.at(std::size_t(t))) { st = g_->advance(st, c); if (st.empty()) return false; }
         stacks_ = std::move(st);
@@ -353,8 +356,10 @@ private:
             if (!s2.empty()) walk(m, s2, ok);
         }
     }
+    bool is_end(int t) const { return std::find(ends_.begin(), ends_.end(), t) != ends_.end(); }
     std::shared_ptr<const grammar> g_;
     int eos_;
+    std::vector<int> ends_;
     std::vector<grammar::stack> stacks_;
     std::vector<std::string> tokens_;
     std::vector<node> nodes_;

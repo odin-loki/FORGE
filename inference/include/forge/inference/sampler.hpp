@@ -27,6 +27,9 @@ struct sampler_config {
     float frequency_penalty = 0.f;  // OpenAI-style: subtract per occurrence in the window
     int repetition_window = 64;
     std::uint64_t seed = 0;
+    // Added to the raw logits of the listed token ids before everything else (OpenAI logit_bias: -100 bans a token,
+    // +100 forces it). Ids outside the vocabulary are ignored.
+    std::vector<std::pair<int, float>> logit_bias;
 };
 
 class sampler {
@@ -60,7 +63,7 @@ public:
 
     // Plain greedy: the next token is the argmax of the raw logits (no penalties or filter), so a device can pick it.
     bool plain_greedy() const {
-        return c_.temperature <= 0.f && c_.repetition_penalty == 1.f && c_.presence_penalty == 0.f && c_.frequency_penalty == 0.f && !filter && !allow;
+        return c_.temperature <= 0.f && c_.repetition_penalty == 1.f && c_.presence_penalty == 0.f && c_.frequency_penalty == 0.f && c_.logit_bias.empty() && !filter && !allow;
     }
     // Optional per-token form of `filter` (grammar_constraint::allows): sample() then tests the likeliest candidates
     // first and runs `filter` over the whole vocabulary only when they do not settle the draw (same result: the
@@ -124,6 +127,7 @@ private:
     }
     std::vector<float> prepare(std::span<const float> logits_in, std::span<const int> history, bool use_filter = true) {
         std::vector<float> l(logits_in.begin(), logits_in.end());
+        for (auto [t, b] : c_.logit_bias) if (t >= 0 && std::size_t(t) < l.size()) l[std::size_t(t)] += b;
         if (c_.repetition_penalty != 1.f) {
             std::unordered_set<int> seen;
             std::size_t from = history.size() > std::size_t(c_.repetition_window) ? history.size() - std::size_t(c_.repetition_window) : 0;

@@ -78,6 +78,19 @@ try:
     ts = [threading.Thread(target=worker, args=(i,)) for i in range(9)]
     [t.start() for t in ts]; [t.join() for t in ts]
     assert all(close(got[i], want[i % 3][0]) for i in range(9))
+    # batching: many inputs of mixed lengths in one request (run shortest first inside the server, session::embed_batch)
+    # come back in input order with the vectors each gives alone; texts and id lists the same way
+    order = [0, 2, 1, 1, 0, 2, 2, 0]
+    r = post(base, "/v1/embeddings", {"input": [texts[i] for i in order]})
+    assert [d["index"] for d in r["data"]] == list(range(len(order))) and all(close(d["embedding"], want[i][0]) for d, i in zip(r["data"], order))
+    assert r["usage"]["prompt_tokens"] == sum(len(want[i][1]) for i in order)
+    r = post(base, "/v1/embeddings", {"input": [want[i][1] for i in order], "encoding_format": "base64"})
+    for d, i in zip(r["data"], order):
+        raw = base64.b64decode(d["embedding"]); assert close(list(struct.unpack(f"<{len(raw) // 4}f", raw)), want[i][0])
+    # one input that does not fit fails the whole request before anything is computed, naming the entry
+    msg = refused(base, "/v1/embeddings", {"input": [texts[0], " ".join(["fox"] * 500), texts[1]]}, "\"input\"[1]")
+    m = urllib.request.urlopen(base + "/metrics").read().decode()
+    assert "forge_embedding_inputs_total" in m and int(float(next(l.split()[1] for l in m.split("\n") if l.startswith("forge_embedding_inputs_total ")))) >= 3 + 8 + 8, m
     # malformed requests: 400 with a message, and the server keeps serving
     refused(base, "/v1/embeddings", {"model": "x"}, "input")
     refused(base, "/v1/embeddings", {"input": ""}, "empty")

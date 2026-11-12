@@ -39,8 +39,8 @@ jobs:
       - run: cmake --build --preset dev -j4
       - run: ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200
   linux-vulkan:
-    # Vulkan backend on Mesa lavapipe (llvmpipe, CPU): test_vulkan, its 256-byte-alignment rerun and the two
-    # Vulkan goldens. The loader is pinned to the lavapipe ICD; test_vulkan must report an llvmpipe device.
+    # Vulkan backend on Mesa lavapipe (llvmpipe, CPU): test_vulkan (spec kernels, the GLSL ports of the portable
+    # kernels), its 256-byte-alignment rerun and the Vulkan goldens (llama, MoE, RoPE scaling, quantised, families). The loader is pinned to the lavapipe ICD; test_vulkan must report an llvmpipe device.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -67,8 +67,8 @@ jobs:
           [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
           grep -q "^vulkan device: llvmpipe" vk.log
       - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
-      - name: all four Vulkan tests ran
-        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 4
+      - name: all fifteen Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 15
   linux-tsan:
     # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
     # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
