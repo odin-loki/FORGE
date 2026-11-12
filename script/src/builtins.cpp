@@ -246,18 +246,31 @@ std::pair<double, std::string> num_unit(Interp& in, const std::string& s, const 
     std::string u; for (; i < s.size(); ++i) if (s[i] != ' ') u += char(std::tolower(static_cast<unsigned char>(s[i])));
     return {v, u};
 }
+// Size string -> bytes. 0 ok, 1 malformed number, 2 too large, 3 unknown unit (shared with script::parse_size).
+int size_from_string(const std::string& s, std::uint64_t& out) {
+    std::size_t i = 0; while (i < s.size() && s[i] == ' ') ++i;
+    std::size_t b = i; while (i < s.size() && (std::isdigit(static_cast<unsigned char>(s[i])) || s[i] == '.')) ++i;
+    double n = 0; if (!parse_double(s.substr(b, i - b), n)) return 1;
+    std::string u; for (; i < s.size(); ++i) if (s[i] != ' ') u += char(std::tolower(static_cast<unsigned char>(s[i])));
+    if (u.size() > 1 && u.back() == 'b') u.pop_back();             // KB, MiB -> k, mi
+    if (u.size() == 2 && u.back() == 'i') u.pop_back();
+    static const std::pair<const char*, double> units[] = {{"", 1}, {"k", 1024.0}, {"m", 1048576.0}, {"g", 1073741824.0}, {"t", 1099511627776.0}};
+    for (auto& [name, mul] : units) if (u == name || (u == "b" && !*name)) {
+        double bytes = n * mul;
+        if (bytes >= 1.8e19) return 2;
+        out = std::uint64_t(bytes); return 0;
+    }
+    return 3;
+}
 std::uint64_t size_opt(Interp& in, const Value& v, const char* key) {
     if (auto* s = as<String>(v)) {
-        auto [n, u] = num_unit(in, s->s, key);
-        if (u.size() > 1 && u.back() == 'b') u.pop_back();             // KB, MiB -> k, mi
-        if (u.size() == 2 && u.back() == 'i') u.pop_back();
-        static const std::pair<const char*, double> units[] = {{"", 1}, {"k", 1024.0}, {"m", 1048576.0}, {"g", 1073741824.0}, {"t", 1099511627776.0}};
-        for (auto& [name, mul] : units) if (u == name || (u == "b" && !*name)) {
-            double bytes = n * mul;
-            if (bytes >= 1.8e19) in.raise("ValueError", std::string("limit: ") + key + " \"" + s->s + "\" is too large");
-            return std::uint64_t(bytes);
+        std::uint64_t bytes = 0;
+        switch (size_from_string(s->s, bytes)) {
+        case 0: return bytes;
+        case 1: in.raise("ValueError", std::string("limit: bad ") + key + " value \"" + s->s + "\"");
+        case 2: in.raise("ValueError", std::string("limit: ") + key + " \"" + s->s + "\" is too large");
+        default: in.raise("ValueError", std::string("limit: unknown size unit in ") + key + " \"" + s->s + "\" (use K, M, G or T)");
         }
-        in.raise("ValueError", std::string("limit: unknown size unit in ") + key + " \"" + s->s + "\" (use K, M, G or T)");
     }
     double d = f_of(in, v, key);
     if (d < 0) in.raise("ValueError", std::string("limit: ") + key + " must not be negative");
@@ -286,8 +299,19 @@ std::int64_t count_opt(Interp& in, const Value& v, const char* key) {
 
 } // namespace
 
+bool parse_size(std::string_view text, std::uint64_t& bytes, std::string* err) {
+    std::string s(text);
+    switch (s.empty() ? 1 : size_from_string(s, bytes)) {
+    case 0: return true;
+    case 1: if (err) *err = "bad size \"" + s + "\""; return false;
+    case 2: if (err) *err = "size \"" + s + "\" is too large"; return false;
+    default: if (err) *err = "unknown size unit in \"" + s + "\" (use K, M, G or T)"; return false;
+    }
+}
+
 // ---- ProcessPool (forge::os::process_pool): script tasks in worker processes.
-// Payload (JSON): {"src": source defining task(arg), "arg": <json>, "fs","net","proc","env": bools, "timeout_ms": n}.
+// Payload (JSON): {"src": source defining task(arg), "arg": <json>, "fs","net","proc","env": bools, "timeout_ms": n,
+// "mem": bytes (the parent's --mem-limit, applied to the worker's engine)}.
 // The worker runs src in a fresh engine with those capabilities (the pool already applied the matching OS
 // sandbox to the worker process), calls task(arg) and answers {"ok":true,"value":<json>} or
 // {"ok":false,"type":"<ErrorType>","msg":"..."}; script errors keep their exact type across the process boundary.
@@ -300,6 +324,7 @@ std::string script_process_task(std::string payload) {
     o.os_sandbox = options::os_sandbox_mode::off;   // the pool sandboxes the worker process itself
     o.cancel_signals = false;
     if (auto* t = get("timeout_ms"); t && t->v.index() == 2) o.timeout_ms = std::uint64_t(t->num());
+    if (auto* t = get("mem"); t && t->v.index() == 2) o.mem_limit_bytes = std::uint64_t(t->num());   // the parent's --mem-limit
     std::string out_text; o.out = [&out_text](std::string_view t) { if (out_text.size() < (1u << 20)) out_text += t; };
     std::string src = get("src") && get("src")->v.index() == 3 ? get("src")->str() : std::string();
     std::string arg = get("arg") ? json::dump(*get("arg")) : std::string("null");
@@ -616,7 +641,7 @@ void install_builtins(Shared& sh) {
             auto m = make<Map>(); auto& h = Heap::instance();
             m->set_str("live_bytes", std::int64_t(h.live_bytes())); m->set_str("live_objects", std::int64_t(h.live_objects()));
             m->set_str("collections", std::int64_t(h.collections())); m->set_str("collected", std::int64_t(h.collected()));
-            m->set_str("soft_cap", std::int64_t(h.soft_cap()));
+            m->set_str("soft_cap", std::int64_t(h.soft_cap())); m->set_str("hard_cap", std::int64_t(h.hard_cap()));
             return obj(m);
         }).done();
     B["mem"] = Lib("mem")
@@ -962,6 +987,7 @@ void install_builtins(Shared& sh) {
         p.emplace_back("src", in.str(src)); p.emplace_back("arg", to_json(in, arg));
         p.emplace_back("fs", box.fs); p.emplace_back("net", box.net); p.emplace_back("proc", box.proc); p.emplace_back("env", box.env);
         if (box.timeout_ms) p.emplace_back("timeout_ms", double(box.timeout_ms));
+        if (in.sh->limits.mem_bytes) p.emplace_back("mem", double(in.sh->limits.mem_bytes));
         auto fb = std::make_shared<FutureBox>();
         fb->f = box.pool->submit("forge.script", json::dump(json::value(std::move(p))));
         return make_handle(in, "processfuture", fb, [] {});
@@ -1095,7 +1121,7 @@ void install_builtins(Shared& sh) {
     lm("get_len", 1, 1, [](Interp&, Args& a) -> Value { return std::int64_t(as<List>(a[0])->items.size()); });
     lm("push", 2, -1, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); for (std::size_t i = 1; i < a.size(); ++i) l->push(in.share(a[i])); return a[0]; });
     lm("pop", 1, 1, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); if (l->items.empty()) in.raise("IndexError", "pop from empty list"); Value v = l->items.back(); l->items.pop_back(); return v; });
-    lm("insert", 3, 3, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); auto i = i_of(in, a[1], "insert"); auto n = std::int64_t(l->items.size()); if (i < 0) i += n; if (i < 0 || i > n) in.raise("IndexError", "insert index out of range"); l->items.insert(l->items.begin() + i, in.share(a[2])); return a[0]; });
+    lm("insert", 3, 3, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); auto i = i_of(in, a[1], "insert"); auto n = std::int64_t(l->items.size()); if (i < 0) i += n; if (i < 0 || i > n) in.raise("IndexError", "insert index out of range"); Heap::instance().charge(*l, sizeof(Value)); l->items.insert(l->items.begin() + i, in.share(a[2])); return a[0]; });
     lm("remove_at", 2, 2, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); auto i = i_of(in, a[1], "remove_at"); auto n = std::int64_t(l->items.size()); if (i < 0) i += n; if (i < 0 || i >= n) in.raise("IndexError", "remove_at index out of range"); Value v = l->items[std::size_t(i)]; l->items.erase(l->items.begin() + i); return v; });
     lm("clear", 1, 1, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); l->items.clear(); return a[0]; });
     lm("extend", 2, 2, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mut(in, *l); auto src = l_of(in, a[1], "extend").items; for (auto& x : src) l->push(x); return a[0]; });

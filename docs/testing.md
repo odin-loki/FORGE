@@ -112,7 +112,10 @@ By default each fuzz target links a small built-in mutation driver (`fuzz/driver
 | `fuzz_json_schema` | JSON Schema → GBNF (`response_format`) | an accepted schema whose grammar the GBNF parser rejects |
 | `fuzz_policy` | security policy files | `to_json` output that does not parse back to the same policy |
 | `fuzz_signature` | bundle `FORGE-SIGNATURE.json` manifests and detached `.sig` files | a manifest that verifies against a key nobody holds |
+| `fuzz_aot` | precompiled plan blobs (`fuzz/fuzz_aot.cpp`) | an exception that is not a `forge_exception` |
 | `fuzz_fpk`, `fuzz_fsc`, `fuzz_gguf`, `fuzz_onnx`, `fuzz_safetensors`, `fuzz_tokenizer`, `fuzz_blueprint`, `fuzz_json`, `fuzz_grammar`, `fuzz_script` | the file formats and the script front end | an exception that is not a `forge_exception` |
+
+The `aot` seed is written by `FORGE_AOT_WRITE_SEED=fuzz/corpus/aot/seed.fplan build/dev/test_aot`; `test_aot` fails when the checked-in seed no longer loads.
 
 Seeds: `fuzz/make_corpus.py <forge>` regenerates the binary model seeds (it needs numpy, safetensors and gguf), `fuzz/make_net_corpus.py` the HTTP, RPC and JSON Schema seeds (standard library only). The policy and signature seeds are written by the code under test (`cmake --build <build> --target fuzz_make_sig_corpus && <build>/fuzz_make_sig_corpus fuzz/corpus`), so they carry real digests and signatures by a fixed throwaway key. An input that found a bug is kept as `fuzz/corpus/<name>/regress_<what>` in the commit that fixes it, so every later build replays it.
 
