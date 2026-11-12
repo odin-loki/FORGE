@@ -298,6 +298,9 @@ inline kernel_fn reshape() {
     };
 }
 } // namespace cpu_kernels
+} // namespace forge::graph
+#include <forge/graph/kernels_ext.hpp>   // spatial + encoder op families: cpu_kernels::add_ext_cpu
+namespace forge::graph {
 
 inline void registry::make_cpu(registry& r) {
     using namespace cpu_kernels;
@@ -320,6 +323,7 @@ inline void registry::make_cpu(registry& r) {
     r.add({"cpu.rope", ops::op::rope, 10, always, rope()});
     r.add({"cpu.gather", ops::op::gather, 10, always, gather()});
     r.add({"cpu.reshape", ops::op::reshape, 10, always, reshape()});
+    add_ext_cpu(r);
 }
 
 } // namespace forge::graph

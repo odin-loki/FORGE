@@ -400,3 +400,5 @@ inline tensor expand(const tv& in, const attrs& a) {
     return o;
 }
 } // namespace forge::ops::ref
+
+#include <forge/ops/reference_ext.hpp>   // spatial + encoder op families
