@@ -151,14 +151,18 @@ Accepted but different, or failing at run time with an `AttributeError` / `TypeE
 - Functions and constructors are not overloaded on parameter types. Constructors may differ in argument count;
   a user-defined copy constructor replaces a one-argument constructor (copying is member-wise, done by the
   runtime). Other overloads (a unary and a binary `operator-` in one class, const / non-const pairs that differ in
-  behaviour) are not distinguished: the last one wins. User `operator++`/`--`, `operator[]` and conversion
-  operators are not supported; `<=>` works only as `= default`. Constructors are chosen by argument count, so a
+  behaviour) are not distinguished: the last one wins. User `operator++`/`--` and conversion operators are not
+  supported; `<=>` works only as `= default`. Constructors are chosen by argument count, so a
   delegating constructor (`T() : T(0) {}`) and a base initialiser (`D() : B(1, 2) {}`) name the constructor of that
   arity; a constructor without a base initialiser runs the base's default constructor first.
-- Member initialisers follow the member's declared type when it is a vector or string built from two arguments
-  (`cells(n, 0)`), a class member (`pos(1, 2)`, `origin()`), or empty (`count()` value-initialises). A
-  one-argument initialiser is a copy of its argument (`v(n)` does not build `n` elements, and a class member is not
-  constructed from one argument of another type): write those in the constructor body.
+- Member initialisers follow the member's declared type when it is a vector (`cells(n)`, `cells(n, 0)`,
+  `cells(other)`), a string built from two arguments, a class member with no or several arguments (`pos(1, 2)`,
+  `origin()`), or empty (`count()` value-initialises). A class member initialised from one argument is a copy of
+  that argument (its one-argument constructor is not called): construct it in the body.
+- User `operator[]`: `obj[i]` calls it. `obj[i] = v` and `obj[i] += v` work when the operator returns a non-const
+  reference and its whole body is `return <member or element>;` (the parser derives the store from that
+  expression); for any other body the assignment is a `TypeError` that says so. A member of the returned object
+  can always be updated (`board[i].value = 7`).
 - Templates are type-erased: `T x{};` has no value, and a template cannot be specialised.
 - A moved-from variable cannot be read at all (`BorrowError`), not even compared with `nullptr`.
 - `std::optional<int>` holding a value is the value: `o.reset()` and `o.emplace(x)` work on a named variable only

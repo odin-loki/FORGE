@@ -750,6 +750,10 @@ Value Interp::get_index(const Value& o, const Value& i) {
     }
     if (auto* s = as<String>(o)) { auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int"); return new_char(s->s.at(norm_index(*this, *k, s->s.size()))); }
     if (auto* g = as<Globals>(o)) { if (auto* s = as<String>(i)) return get_field(o, s->s); }
+    if (as<Instance>(o)) {   // user operator[]; "operator[]&" (parser: index_accessors) yields the element itself, as v[i] does
+        bool found = false; Value r = call_operator(o, "operator[]&", {i}, found); if (found) return r;
+        r = call_operator(o, "operator[]", {i}, found); if (found) return r;
+    }
     raise("TypeError", "cannot index " + type_of(o));
 }
 void Interp::set_index(const Value& o, const Value& i, Value v) {
@@ -764,6 +768,13 @@ void Interp::set_index(const Value& o, const Value& i, Value v) {
         auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int");
         auto* c = as<String>(v); if (!c || c->s.size() != 1) raise("TypeError", "s[i] = needs a single char");
         s->s.at(norm_index(*this, *k, s->s.size())) = c->s[0]; return;
+    }
+    if (auto* inst = as<Instance>(o)) {
+        // user operator[]: the parser writes "operator[]=" next to an operator[] whose body is `return <lvalue>;`
+        bool found = false; call_operator(o, "operator[]=", {i, std::move(v)}, found);
+        if (found) return;
+        if (inst->cls->find_method("operator[]"))
+            raise("TypeError", inst->cls->name + "::operator[] cannot be assigned through: only an operator[] that returns a reference and whose body is a single `return member[i];` (or another assignable expression) can");
     }
     raise("TypeError", "cannot assign by index on " + type_of(o));
 }

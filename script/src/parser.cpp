@@ -1506,6 +1506,7 @@ private:
                 i_ = save;
                 auto fd = function_body(mname, ml, full, ti.is_static, ti);
                 fd->name = mname; fd->access = access; fd->is_virtual = is_virtual;
+                if (mname == "operator[]" && !ti.is_static) index_accessors(*fd, ti, *cd);
                 if (ti.is_static) {   // static member function: kept on the class as a plain function
                     auto lam = mk(NK::Lambda, ml); lam->fn = fd;
                     auto f = mk(NK::Field, ml); f->s = mname; f->kids.push_back(hidden_ref(cv, ml));
@@ -1568,12 +1569,46 @@ private:
         if (ti.nullable || ti.smart) return nullptr;
         if (args.empty()) return ti.k == TK::Auto || ti.k == TK::Any || ti.k == TK::Fn || ti.k == TK::Void ? NodeP() : default_value(ti, line);
         switch (ti.k) {
-        case TK::List: return !brace && args.size() == 2 ? construct(ti, args, false, line) : NodeP();
+        case TK::List: return !brace && args.size() <= 2 ? construct(ti, args, false, line) : NodeP();   // (n), (n, value), (first, last); (other) copies (std::vector built-in)
         case TK::String: return !brace && args.size() == 2 ? construct(ti, args, false, line) : NodeP();
         case TK::Map: case TK::Set: return brace && args.size() != 1 ? construct(ti, args, true, line) : NodeP();
         case TK::Class: return args.size() != 1 && (classes_.count(ti.name) || types_.count(ti.name)) && !enums_.count(ti.name) ? construct(ti, args, brace, line) : NodeP();
         default: return nullptr;
         }
+    }
+    // `T& operator[](K i) { return data[i]; }`: in C++ the element can be assigned and updated because the operator
+    // returns a reference. A script function returns a copy of a member or element, so for an operator[] that
+    // returns a reference and whose whole body is `return <assignable expression>;` two more methods are written:
+    //   "operator[]&"  the same body without the copy: `obj[i]` is then the element itself, as `v[i]` of a vector is
+    //                  (the parser already copies an index expression wherever C++ would copy the element)
+    //   "operator[]="  (non-const reference only) the parameters plus a value, body `<expression> = value;`
+    // Any other operator[] is read-only: assigning through it is a TypeError at run time (Interp::set_index).
+    void index_accessors(const FnDecl& get, const TI& ret, ClassDecl& cd) {
+        if (!ret.ref || !get.body || get.body->kids.size() != 1 || get.params.size() != 1) return;
+        const NodeP& rs = get.body->kids[0];
+        if (!rs || rs->k != NK::Return || rs->kids.size() != 1 || !rs->kids[0]) return;
+        NodeP target = rs->kids[0];
+        while (target->k == NK::Copy && !target->kids.empty()) target = target->kids[0];
+        if (!is_lvalue(target)) return;
+        auto drop = [&](const char* name) { std::erase_if(cd.methods, [&](const std::shared_ptr<const FnDecl>& m) { return m && m->name == name; }); };
+        auto fresh = [&](const char* name) {
+            auto f = std::make_shared<FnDecl>(get);
+            f->name = name; f->aot_body = nullptr; f->src.reset(); f->src_b = f->src_e = 0;
+            return f;
+        };
+        auto ref = fresh("operator[]&");
+        { auto body = mk(NK::Block, get.line); auto r = mk(NK::Return, get.line); r->kids.push_back(target); body->kids.push_back(r); ref->body = body; }
+        drop("operator[]&"); cd.methods.push_back(ref);
+        if (ret.cnst) return;
+        auto st = fresh("operator[]=");
+        st->ret_name = "void"; st->is_const = false;
+        Param v; v.name = "__value"; v.slot = st->nslots++;
+        st->params.push_back(v);
+        auto val = mk(NK::Var, get.line); val->s = v.name; val->var = VarRef{v.name, 0, v.slot};
+        auto body = mk(NK::Block, get.line);
+        body->kids.push_back(assign_node(target, val, get.line));
+        st->body = body;
+        drop("operator[]="); cd.methods.push_back(st);
     }
     void expect_kw_operator() { if (!accept_kw("operator")) fail("expected 'operator'"); }
     // Constructor after `Name`: params, member-initialiser list, body.
