@@ -2,6 +2,8 @@
 #include "tiny_model.hpp"
 #include <forge/inference/inference.hpp>
 #include <filesystem>
+#include <functional>
+#include <set>
 #if !defined(_WIN32)
 #include <unistd.h>
 #endif
@@ -447,4 +449,84 @@ TEST(lora_adapter_file) {
     std::vector<int> ids{4, 5, 6};
     inference::session a(m), b(m); a.set_adapter("file"); b.set_adapter("mem");
     CHECK(a.forward(ids) == b.forward(ids));
+}
+
+// ---- RoPE frequency scaling and the opset through a session ---------------------------------------------------------
+// Copies a model file with its blueprint text edited (same tensors, manifest and tokenizer).
+static std::string with_blueprint(const std::string& src, const std::string& dst, const std::function<void(std::string&)>& edit) {
+    modelfile::reader r(src); modelfile::writer w;
+    for (auto& [n, e] : r.tensors()) { auto t = r.load(n); w.add_tensor(n, t.shape, t.data, "f32"); }
+    w.set_manifest(r.manifest());
+    std::string bp(r.section_text("blueprint")); edit(bp);
+    w.set_section("blueprint", bp); w.set_section("tokenizer", std::string(r.section_text("tokenizer")));
+    w.write(dst);
+    return dst;
+}
+static void replace_all(std::string& s, const std::string& a, const std::string& b) {
+    std::size_t n = 0;
+    for (std::size_t p = 0; (p = s.find(a, p)) != std::string::npos; p += b.size()) { s.replace(p, a.size(), b); ++n; }
+    CHECK_MSG(n > 0, "'%s' not found in the blueprint", a.c_str());
+}
+
+TEST(rope_scaling_in_a_session) {
+    std::vector<int> ids{5, 17, 99, 3, 42, 7, 200, 13, 8, 150, 31, 64};
+    std::vector<float> plain; { inference::session s(model_a()); plain = s.forward(ids); }
+    // the tiny model's blueprint with the rope attrs each scaling variant adds (what the importers emit as {{rope_args|}})
+    const std::pair<const char*, const char*> variants[] = {
+        {"linear", ", scaling: 1, factor: 4"},
+        {"dynamic", ", scaling: 2, factor: 2, orig_ctx: 4"},
+        {"yarn", ", scaling: 3, factor: 4, orig_ctx: 8, beta_fast: 32, beta_slow: 1, truncate: 1"},
+        {"llama3", ", scaling: 4, factor: 8, orig_ctx: 8, low_freq: 1, high_freq: 4"},
+    };
+    for (auto& [name, args] : variants) {
+        auto path = with_blueprint(model_a(), tmp(std::string("rope_") + name + ".fpk"), [&](std::string& bp) {
+            replace_all(bp, "neox: 1)", std::string("neox: 1") + args + ")"); replace_all(bp, "opset 1", "opset 2"); });
+        inference::session full(path), inc(path);
+        auto want = full.forward(ids);
+        CHECK_MSG(maxdiff(want, plain) > 1e-2f, "%s: the scaling attrs changed nothing", name);
+        if (std::string(name) == "dynamic") continue;   // per-call frequencies: cached keys keep the base they were rotated with
+        // KV-cached decode rotates each new position with the same scaled frequencies as the prefill
+        inc.forward(std::vector<int>(ids.begin(), ids.begin() + 5));
+        std::vector<float> got; for (std::size_t i = 5; i < ids.size(); ++i) got = inc.forward(std::vector<int>{ids[i]});
+        CHECK_MSG(maxdiff(got, want) < 2e-4f, "%s: incremental decode differs from the prefill by %g", name, maxdiff(got, want));
+    }
+    // YaRN's attention factor is attention's scale (m^2 / sqrt(head_dim)): the default scale written out changes nothing
+    {
+        auto path = with_blueprint(model_a(), tmp("rope_scale.fpk"), [&](std::string& bp) { replace_all(bp, "groups: n_heads / n_kv)", "groups: n_heads / n_kv, scale: 0.35355339059327379)"); });
+        inference::session s(path); CHECK(maxdiff(s.forward(ids), plain) < 1e-5f);   // 1 / sqrt(8)
+        auto path2 = with_blueprint(model_a(), tmp("rope_scale2.fpk"), [&](std::string& bp) { replace_all(bp, "groups: n_heads / n_kv)", "groups: n_heads / n_kv, scale: 0.5)"); });
+        inference::session s2(path2); CHECK(maxdiff(s2.forward(ids), plain) > 1e-3f);
+    }
+    // an unknown scaling id is an error when the graph runs, never a silently unscaled model
+    {
+        auto path = with_blueprint(model_a(), tmp("rope_bad.fpk"), [&](std::string& bp) { replace_all(bp, "neox: 1)", "neox: 1, scaling: 7, factor: 2)"); });
+        CHECK_THROWS([&] { inference::session s(path); return s.forward(ids); }());
+    }
+}
+
+TEST(blueprint_opset_checked_at_load) {
+    for (int v : {0, 3, 99}) {
+        if (v >= modelfile::opset_min && v <= modelfile::opset_max) continue;
+        auto path = with_blueprint(model_a(), tmp("opset.fpk"), [&](std::string& bp) { replace_all(bp, "opset 1", "opset " + std::to_string(v)); });
+        std::string msg;
+        try { inference::session s(path); } catch (const forge_exception& e) { msg = e.what(); CHECK(e.code == errc::unsupported); }
+        CHECK_MSG(msg.find("opset " + std::to_string(v)) != std::string::npos && msg.find("opset.fpk") != std::string::npos, "opset %d: message '%s'", v, msg.c_str());
+    }
+    // an op from a later opset: the error names the op and the opset the file declares
+    auto path = with_blueprint(model_a(), tmp("opset_op.fpk"), [&](std::string& bp) { replace_all(bp, "silu(", "hyper_silu("); replace_all(bp, "opset 1", "opset 2"); });
+    std::string msg;
+    try { inference::session s(path); (void)s.forward(std::vector<int>{1, 2}); } catch (const forge_exception& e) { msg = e.what(); }
+    CHECK_MSG(msg.find("'hyper_silu'") != std::string::npos && msg.find("opset 2") != std::string::npos, "message '%s'", msg.c_str());
+}
+
+// The templates and the tensor names the engine tests write agree: the blueprint reads every tensor, and only those.
+TEST(blueprint_reads_exactly_the_tensors_written) {
+    for (auto& path : {model_a(), forge_test::make_tiny_qwen35_model(tmp("bw35.fpk"))}) {
+        modelfile::reader r(path);
+        auto ws = modelfile::blueprint_weights(modelfile::parse_blueprint(r.section_text("blueprint")));
+        std::set<std::string> need(ws.begin(), ws.end());
+        CHECK(need.size() == ws.size());   // each weight listed once
+        CHECK_MSG(need.size() == r.tensors().size(), "%zu weights read, %zu tensors in the file", need.size(), r.tensors().size());
+        for (auto& [n, e] : r.tensors()) CHECK_MSG(need.count(n) == 1, "tensor %s is never read", n.c_str());
+    }
 }

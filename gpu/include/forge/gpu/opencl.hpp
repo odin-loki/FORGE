@@ -9,10 +9,13 @@
 // to_host/host_wrote/release/copy_resident), recorded "graphs" (captured enqueues replayed with the same
 // arguments; OpenCL has no portable graph object), multiple devices by ordinal, copies between runtimes.
 #include <forge/gpu/cuda.hpp>   // kernel_sig / supports / images
+#include <forge/gpu/portable_kernels.hpp>
+#include <forge/gpu/kernel_cache.hpp>
 #include <forge/core/dl.hpp>
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -22,7 +25,8 @@
 namespace forge::gpu::ocl {
 
 using cuda_hip::sig;
-class runtime {
+class runtime : public portable_kernels<runtime> {
+    friend class portable_kernels<runtime>;
 public:
     static int device_count() { runtime p; if (!p.load_lib().empty()) return 0; return int(p.all_devices().size()); }
     static std::unique_ptr<runtime> open(std::string* why = nullptr, int ordinal = 0) {
@@ -35,6 +39,7 @@ public:
     ~runtime() {
         dm_.detach();
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) drop(e); res_.clear(); } catch (...) {}
+        for (auto& [k, q] : qres_) f_.rel_mem(q.mem);
         for (auto m : keep_) f_.rel_mem(m);
         for (auto& [n, k] : kern_) f_.rel_kernel(k);
         if (prog_) f_.rel_program(prog_);
@@ -45,9 +50,20 @@ public:
     const char* backend() const { return "opencl"; }
     int ordinal() const { return ordinal_; }
     const std::string& device_name() const { return name_; }
+    // For automatic device selection (gpu/select.hpp): CL_DEVICE_TYPE and CL_DEVICE_HOST_UNIFIED_MEMORY; a CPU runtime
+    // (PoCL, the Intel CPU runtime) or a software-named device is "software".
+    gpu::device_class device_class() const {
+        if ((dev_type_ & 2) || software_name(name_)) return gpu::device_class::software;
+        if (dev_type_ & 4) return unified_ ? gpu::device_class::integrated : gpu::device_class::discrete;
+        return gpu::device_class::unknown;
+    }
     const std::string& image_arch() const { static const std::string s = "opencl-c"; return s; }
     bool has_graphs() const { return true; }
     bool has_streams() const { return true; }
+    // Program-binary cache (gpu/kernel_cache.hpp; $FORGE_GPU_KERNEL_CACHE=0 off): true when open() loaded the driver's
+    // binary from disk instead of building the OpenCL C; the file this device/driver/source/options maps to.
+    bool program_from_cache() const { return from_cache_; }
+    const std::string& kernel_cache_path() const { return cache_path_; }
     std::map<std::string, std::size_t> dispatches() { std::lock_guard lk(mu_); return dispatches_; }
     struct mem_info { std::size_t free = 0, total = 0; };
     mem_info memory() { mem_info m; m.total = total_mem_; m.free = total_mem_ > stats_.resident_bytes ? total_mem_ - stats_.resident_bytes : 0; return m; }
@@ -83,6 +99,20 @@ public:
         std::vector<std::uintptr_t> ks;
         each_overlap(p, n, [&](entry& e) { if (!e.host_valid) download(e); ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         finish(); for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        // the range is going away (or being replaced): its pins go too, or a later buffer at the same address and size
+        // would inherit one and outlive its run as a stale resident entry
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
+    }
+    // [p, p+n) is going away for good (a plan's constants, a state slot): drop every overlapping device copy without
+    // fetching it and the pin records inside the range. Without this a later host buffer at the same address would
+    // inherit the pin or be taken for a sub-range of the stale entry, and that entry's next sync-back would write
+    // its old size over the new buffer (graph::plan::~plan calls it through device_hooks::forget).
+    void forget(const float* p, std::size_t n) {
+        std::lock_guard lk(mu_); finish();
+        std::vector<std::uintptr_t> ks;
+        each_overlap(p, n, [&](entry& e) { ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
+        for (auto k : ks) { drop(res_[k]); res_.erase(k); }
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first < p + std::max<std::size_t>(n, 1) && p < pr.first + std::max<std::size_t>(pr.second, 1); });
     }
     void copy_resident(float* src, std::size_t n, float* dst_base, std::size_t dst_count, std::size_t off) {
         std::lock_guard lk(mu_); if (!n) return;
@@ -118,9 +148,20 @@ public:
     bool run_op(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) {
         std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
         if (!cuda_hip::supports(op, ss, a)) return false;
+        if (op == "attention") if (int r = attention_port(in, a, out); r >= 0) return true;   // one-pass / split-K kernels
         auto L = cuda_hip::kernel_args(op, in, a, out);
         std::lock_guard lk(mu_); begin_op();
         ++dispatches_[op];
+        // Settle the residency map before binding anything: acquiring a range that partly overlaps a resident entry
+        // drops that entry (after syncing it back), and an input bound earlier in this same launch may live inside
+        // it (an activation inside a stale larger entry of the reused arena, then an output that overlaps the same
+        // entry). Its handle would then be freed while the kernel still uses it. After this pass every range has
+        // its entry, so the binds below only hit the cache.
+        if (in_run_) {
+            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+            acquire(out.data, out.size(), true);
+            for (auto& v : in) acquire(const_cast<float*>(v.data), v.size(), false);
+        }
         launch l; l.kernel = kernel("forge_" + op); l.global = L.threads;
         std::vector<void*> temps;
         auto free_temps = [&] { for (auto m : temps) dfree(m); };
@@ -170,6 +211,69 @@ private:
     struct launch { void* kernel = nullptr; std::size_t global = 0; std::vector<arg> args; };
     struct entry { float* host; std::size_t count; void* mem; bool host_valid = true, pinned = false; std::uint64_t last = 0; };
     struct bound { entry* e; std::size_t off; std::size_t bytes; };
+    // ---- kernel-call builder for portable_kernels<> (gpu/portable_kernels.hpp); mu_ held ----
+    struct kcall {
+        launch l; std::vector<void*> temps;
+        struct wb_t { void* tmp; void* dst; std::size_t off, bytes; }; std::vector<wb_t> wb;   // staged outputs to copy back on the device
+        struct rd_t { void* m; float* h; std::size_t bytes; }; std::vector<rd_t> rd;            // outputs to read back (outside a run)
+    };
+    struct qentry { void* mem = nullptr; std::size_t bytes = 0; std::uint64_t last = 0; };
+    void k_touch(const float* h, std::size_t cnt, int mode) { if (in_run_) acquire(const_cast<float*>(h), cnt, mode == 1); }
+    entry* k_buf(kcall& c, const float* h, std::size_t cnt, int mode) {   // mode 0 in, 1 out, 2 in/out
+        void* m; entry* ent = nullptr;
+        if (in_run_) {
+            auto b = acquire(const_cast<float*>(h), cnt, mode == 1); if (mode) b.e->host_valid = false; ent = b.e;
+            if (b.off % align_ == 0) m = b.off ? sub(b) : b.e->mem;
+            else {   // unaligned sub-range: stage through a temporary, copied device-side (and back for an output)
+                m = dalloc(b.bytes, "scratch"); c.temps.push_back(m);
+                if (mode != 1) ck(f_.copy(q_, b.e->mem, m, b.off, 0, b.bytes, 0, nullptr, nullptr), "clEnqueueCopyBuffer");
+                if (mode) c.wb.push_back({m, b.e->mem, b.off, b.bytes});
+            }
+        } else {
+            m = dalloc(cnt * 4, "scratch"); c.temps.push_back(m);
+            if (mode != 1) ck(f_.write(q_, m, 0, 0, cnt * 4, h, 0, nullptr, nullptr), "clEnqueueWriteBuffer");
+            if (mode) c.rd.push_back({m, const_cast<float*>(h), cnt * 4});
+        }
+        c.l.args.push_back(arg::mem(m)); return ent;
+    }
+    void k_dev(kcall& c, void* m) { c.l.args.push_back(arg::mem(m)); }
+    void k_u32(kcall& c, std::uint32_t v) { c.l.args.push_back(arg::u32(v)); }
+    void k_f32(kcall& c, float v) { c.l.args.push_back(arg::f32(v)); }
+    void* k_scratch(kcall& c, std::size_t bytes) { void* m = dalloc(bytes, "scratch"); c.temps.push_back(m); return m; }
+    void k_upload(void* m, const void* h, std::size_t bytes) { ck(f_.write(q_, m, 1, 0, bytes, h, 0, nullptr, nullptr), "clEnqueueWriteBuffer"); }
+    void k_launch(kcall& c, const std::string& name, std::size_t global) {
+        c.l.kernel = kernel(name); c.l.global = global;
+        if (global) enqueue(c.l);
+        if (capturing_) cur_.push_back(c.l);
+        c.l.args.clear();
+    }
+    void k_done(kcall& c) {
+        for (auto& w : c.wb) ck(f_.copy(q_, w.tmp, w.dst, 0, w.off, w.bytes, 0, nullptr, nullptr), "clEnqueueCopyBuffer");
+        for (auto& r : c.rd) ck(f_.read(q_, r.m, 1, 0, r.bytes, r.h, 0, nullptr, nullptr), "clEnqueueReadBuffer");
+        if (c.temps.empty()) return;
+        finish();
+        if (capturing_) keep_.insert(keep_.end(), c.temps.begin(), c.temps.end());   // a recorded launch still refers to them
+        else for (auto m : c.temps) dfree(m);
+        c.temps.clear();
+    }
+    void k_abort(kcall& c) { try { finish(); } catch (...) {} for (auto m : c.temps) dfree(m); c.temps.clear(); }
+    bool k_has(const std::string& n) {
+        if (kern_.count(n)) return true;
+        if (missing_.count(n)) return false;
+        int err = 0; void* k = f_.create_kernel(prog_, n.c_str(), &err);
+        if (err || !k) { missing_.insert(n); return false; }
+        kern_[n] = k; return true;
+    }
+    // An encoded weight (or any read-only blob) uploaded once and kept for the runtime's lifetime, keyed by host address
+    // and size; evictable least recently used first (the host copy is the source of truth, so nothing is synced back).
+    void* qweight(const std::uint8_t* q, std::size_t bytes) {
+        auto key = std::make_pair(reinterpret_cast<std::uintptr_t>(q), bytes);
+        if (auto it = qres_.find(key); it != qres_.end()) { it->second.last = ++clock_; return it->second.mem; }
+        void* m = dalloc(bytes, "weights");
+        try { ck(f_.write(q_, m, 1, 0, bytes, q, 0, nullptr, nullptr), "clEnqueueWriteBuffer"); } catch (...) { dfree(m); throw; }
+        qres_[key] = {m, bytes, ++clock_}; ++stats_.uploads; stats_.qweight_bytes += bytes;
+        return m;
+    }
     struct fns {
         int (*platforms)(unsigned, void**, unsigned*) = nullptr;
         int (*devices)(void*, std::uint64_t, unsigned, void**, unsigned*) = nullptr;
@@ -193,6 +297,9 @@ private:
         int (*rel_program)(void*) = nullptr;
         int (*rel_queue)(void*) = nullptr;
         int (*rel_context)(void*) = nullptr;
+        // optional (program-binary cache): absent entry points only turn the cache off
+        void* (*program_bin)(void*, unsigned, void* const*, const std::size_t*, const unsigned char**, int*, int*) = nullptr;
+        int (*program_info)(void*, unsigned, std::size_t, void*, std::size_t*) = nullptr;
     };
     template<class F> bool sym(F& f, const char* n) { f = reinterpret_cast<F>(dlsym(lib_, n)); return f != nullptr; }
     void ck(int r, const char* what) { if (r != 0) throw std::runtime_error(std::string("opencl: ") + what + " failed (" + std::to_string(r) + ")"); }
@@ -213,6 +320,11 @@ private:
     // first; never one the op in progress has bound, and nothing while a graph is being recorded.
     std::uint64_t evict_device(std::uint64_t want, bool external) {
         if (capturing_) return 0;
+        std::uint64_t got = evict_tensors(want, external);
+        if (!want || got < want) got += evict_weights(want ? want - got : 0);
+        return got;
+    }
+    std::uint64_t evict_tensors(std::uint64_t want, bool external) {
         if (external) op_mark_ = clock_;
         std::vector<std::pair<std::uint64_t, std::uintptr_t>> vs;
         for (auto& [k, e] : res_) if (e.last <= op_mark_) vs.push_back({e.last, k});
@@ -225,6 +337,19 @@ private:
         for (std::size_t i = 0; i < n; ++i) { drop(res_[vs[i].second]); res_.erase(vs[i].second); }
         stats_.evictions += n; stats_.evicted_bytes += got;
         return got;
+    }
+    // Encoded weights not bound by the op in progress, least recently used first (re-uploaded from the host on next use).
+    std::uint64_t evict_weights(std::uint64_t want) {
+        std::vector<std::pair<std::uint64_t, std::pair<std::uintptr_t, std::size_t>>> vs;
+        for (auto& [k, q] : qres_) if (q.last <= op_mark_) vs.push_back({q.last, k});
+        if (vs.empty()) return 0;
+        std::sort(vs.begin(), vs.end()); finish();
+        std::uint64_t got = 0;
+        for (auto& [last, k] : vs) {
+            if (want && got >= want) break;
+            auto& q = qres_[k]; got += q.bytes; stats_.qweight_bytes -= q.bytes; dfree(q.mem); qres_.erase(k); ++stats_.evictions;
+        }
+        stats_.evicted_bytes += got; return got;
     }
     void enqueue(const launch& l) {
         for (unsigned i = 0; i < l.args.size(); ++i) {
@@ -241,8 +366,8 @@ private:
         int err = 0; void* k = f_.create_kernel(prog_, n.c_str(), &err); ck(err, ("clCreateKernel " + n).c_str());
         return kern_[n] = k;
     }
-    void* sub(const bound& b) {   // a sub-range view of a resident buffer (origin must be base-aligned)
-        auto key = std::make_pair(b.e->mem, b.off);
+    void* sub(const bound& b) {   // a sub-range view of a resident buffer (origin must be base-aligned); cached per (parent, origin, size)
+        auto key = std::make_tuple(b.e->mem, b.off, b.bytes);
         if (auto it = subs_.find(key); it != subs_.end()) return it->second;
         std::size_t region[2] = {b.off, b.bytes}; int err = 0;
         void* m = f_.sub_buffer(b.e->mem, 1, 0x1220 /*CL_BUFFER_CREATE_TYPE_REGION*/, region, &err); ck(err, "clCreateSubBuffer");
@@ -254,7 +379,7 @@ private:
     }
     void download(entry& e) { ck(f_.read(q_, e.mem, 0, 0, e.count * 4, e.host, 0, nullptr, nullptr), "clEnqueueReadBuffer"); e.host_valid = true; ++stats_.downloads; }
     void drop(entry& e) {
-        for (auto it = subs_.begin(); it != subs_.end();) if (it->first.first == e.mem) { f_.rel_mem(it->second); it = subs_.erase(it); } else ++it;
+        for (auto it = subs_.begin(); it != subs_.end();) if (std::get<0>(it->first) == e.mem) { f_.rel_mem(it->second); it = subs_.erase(it); } else ++it;
         dfree(e.mem); stats_.resident_bytes -= e.count * 4;
     }
     bound acquire(float* h, std::size_t count, bool is_out) {
@@ -288,6 +413,7 @@ private:
                   sym(f_.read, "clEnqueueReadBuffer") && sym(f_.copy, "clEnqueueCopyBuffer") && sym(f_.finish, "clFinish") &&
                   sym(f_.rel_mem, "clReleaseMemObject") && sym(f_.rel_kernel, "clReleaseKernel") && sym(f_.rel_program, "clReleaseProgram") &&
                   sym(f_.rel_queue, "clReleaseCommandQueue") && sym(f_.rel_context, "clReleaseContext");
+        sym(f_.program_bin, "clCreateProgramWithBinary"); sym(f_.program_info, "clGetProgramInfo");
         return ok ? std::string{} : "libOpenCL is missing entry points";
     }
     // Devices across all platforms; FORGE_OPENCL_TYPE=gpu|cpu|all (default all, GPUs listed first).
@@ -316,15 +442,46 @@ private:
         unsigned bits = 0; if (f_.dev_info(dev_, 0x1019 /*MEM_BASE_ADDR_ALIGN*/, 4, &bits, nullptr) == 0 && bits >= 8) align_ = bits / 8;
         if (const char* t = std::getenv("FORGE_OPENCL_TEST_ALIGN")) align_ = std::size_t(std::atoi(t));
         std::uint64_t tm = 0; if (f_.dev_info(dev_, 0x101F /*GLOBAL_MEM_SIZE*/, 8, &tm, nullptr) == 0) total_mem_ = tm;
+        std::uint64_t ty = 0; if (f_.dev_info(dev_, 0x1000 /*TYPE*/, 8, &ty, nullptr) == 0) dev_type_ = ty;
+        unsigned um = 0; if (f_.dev_info(dev_, 0x1035 /*HOST_UNIFIED_MEMORY*/, 4, &um, nullptr) == 0) unified_ = um != 0;
         int err = 0;
         ctx_ = f_.create_context(nullptr, 1, &dev_, nullptr, nullptr, &err); if (err || !ctx_) return "clCreateContext failed";
         q_ = f_.create_queue(ctx_, dev_, 0, &err); if (err || !q_) return "clCreateCommandQueue failed";
         const char* src = cuda_hip::images::opencl_c; std::size_t len = cuda_hip::images::opencl_c_size;
-        prog_ = f_.program_src(ctx_, 1, &src, &len, &err); if (err || !prog_) return "clCreateProgramWithSource failed";
-        if (f_.build(prog_, 1, &dev_, "-cl-std=CL1.2", nullptr, nullptr) != 0) {
-            std::size_t n = 0; f_.build_info(prog_, dev_, 0x1183 /*BUILD_LOG*/, 0, nullptr, &n);
-            std::string log(n, '\0'); if (n) f_.build_info(prog_, dev_, 0x1183, n, log.data(), nullptr);
-            return "clBuildProgram failed: " + log;
+        const char* opts = "-cl-std=CL1.2";
+        // Program-binary cache: keyed by device name, vendor, device and driver version, the source hash and the build
+        // options. A cached binary the driver refuses (or that lacks a kernel) falls back to the source build.
+        auto info = [&](unsigned what) { char b[256] = {}; return f_.dev_info(dev_, what, sizeof b - 1, b, nullptr) == 0 ? std::string(b) : std::string(); };
+        char hx[32]; std::snprintf(hx, sizeof hx, "%016llx", static_cast<unsigned long long>(kernel_cache::fnv({src, len})));
+        const std::string key = "opencl\n" + name_ + "\n" + info(0x102C /*VENDOR*/) + "\n" + info(0x102F /*VERSION*/) + "\n" + info(0x102D /*DRIVER_VERSION*/) +
+                                "\n" + opts + "\n" + hx;
+        const bool cache = f_.program_bin && f_.program_info && kernel_cache::enabled();
+        if (cache) {
+            cache_path_ = kernel_cache::path("cl-program", key);
+            if (auto bin = kernel_cache::load("cl-program", key); !bin.empty()) {
+                std::size_t bl = bin.size(); const unsigned char* bp = bin.data(); int st = 0, e2 = 0;
+                void* p = f_.program_bin(ctx_, 1, &dev_, &bl, &bp, &st, &e2);
+                if (!e2 && p && st == 0 && f_.build(p, 1, &dev_, opts, nullptr, nullptr) == 0) {
+                    int ke = 0; void* k = f_.create_kernel(p, "forge_scale", &ke);   // the binary must hold our kernels
+                    if (!ke && k) { f_.rel_kernel(k); prog_ = p; p = nullptr; from_cache_ = true; }
+                }
+                if (p) f_.rel_program(p);
+            }
+        }
+        if (!prog_) {
+            prog_ = f_.program_src(ctx_, 1, &src, &len, &err); if (err || !prog_) return "clCreateProgramWithSource failed";
+            if (f_.build(prog_, 1, &dev_, opts, nullptr, nullptr) != 0) {
+                std::size_t n = 0; f_.build_info(prog_, dev_, 0x1183 /*BUILD_LOG*/, 0, nullptr, &n);
+                std::string log(n, '\0'); if (n) f_.build_info(prog_, dev_, 0x1183, n, log.data(), nullptr);
+                return "clBuildProgram failed: " + log;
+            }
+            if (cache) {   // one device: one binary
+                std::size_t sz = 0;
+                if (f_.program_info(prog_, 0x1165 /*PROGRAM_BINARY_SIZES*/, sizeof sz, &sz, nullptr) == 0 && sz) {
+                    std::vector<unsigned char> b(sz); unsigned char* bp = b.data();
+                    if (f_.program_info(prog_, 0x1166 /*PROGRAM_BINARIES*/, sizeof bp, &bp, nullptr) == 0) kernel_cache::store("cl-program", key, b.data(), b.size());
+                }
+            }
         }
         dm_.attach("opencl:" + std::to_string(ordinal_), mu_, [this](std::uint64_t w, bool ext) { return evict_device(w, ext); });
         return {};
@@ -332,17 +489,21 @@ private:
     int ordinal_ = 0;
     void* lib_ = nullptr; void* dev_ = nullptr; void* ctx_ = nullptr; void* q_ = nullptr; void* prog_ = nullptr;
     fns f_;
-    std::string name_;
+    std::string name_, cache_path_;
+    bool from_cache_ = false, unified_ = false;
+    std::uint64_t dev_type_ = 0;
     std::size_t align_ = 128, total_mem_ = 0;
     std::mutex mu_;
     bool in_run_ = false, capturing_ = false;
     std::map<std::uintptr_t, entry> res_;
-    std::map<std::pair<void*, std::size_t>, void*> subs_;
+    std::map<std::tuple<void*, std::size_t, std::size_t>, void*> subs_;
     std::vector<std::pair<const float*, std::size_t>> pinned_;
     std::vector<launch> cur_;
     std::vector<std::vector<launch>> graphs_;
     std::vector<void*> keep_;
     std::map<std::string, void*> kern_;
+    std::set<std::string> missing_;
+    std::map<std::pair<std::uintptr_t, std::size_t>, qentry> qres_;
     std::map<std::string, std::size_t> dispatches_;
     residency_stats stats_;
 };

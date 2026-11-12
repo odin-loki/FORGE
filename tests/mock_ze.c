@@ -25,6 +25,7 @@ static __thread size_t mock_gid;
 #endif
 static size_t get_global_id(int d) { (void)d; return mock_gid; }
 static unsigned as_uint(float f) { unsigned u; memcpy(&u, &f, 4); return u; }
+static float as_float(unsigned u) { float f; memcpy(&f, &u, 4); return f; }
 #include "kernels.cl"
 #define MOCK_MEM(p) (*(char**)(p))
 #include "kernels_cl_mock.inc"
@@ -32,6 +33,7 @@ static unsigned as_uint(float f) { unsigned u; memcpy(&u, &f, 4); return u; }
 typedef struct { int idx; uint32_t gx; void* args[16]; char store[16][8]; } kern;
 static int ndev(void) { const char* e = getenv("MOCK_DEVICES"); return e ? atoi(e) : 1; }
 static size_t g_live;
+int mock_source_builds = 0;   /* modules compiled from IL (not created from a native binary) */
 ze_result_t zeInit(ze_init_flags_t f) { (void)f; return ZE_RESULT_SUCCESS; }
 ze_result_t zeDriverGet(uint32_t* n, ze_driver_handle_t* d) { if (d && *n) d[0] = (ze_driver_handle_t)1; *n = 1; return ZE_RESULT_SUCCESS; }
 ze_result_t zeDeviceGet(ze_driver_handle_t dr, uint32_t* n, ze_device_handle_t* d) {
@@ -57,14 +59,32 @@ ze_result_t zeCommandListAppendMemoryCopy(ze_command_list_handle_t l, void* d, c
 ze_result_t zeCommandListAppendBarrier(ze_command_list_handle_t l, ze_event_handle_t e, uint32_t ne, ze_event_handle_t* w) { (void)l; (void)e; (void)ne; (void)w; return ZE_RESULT_SUCCESS; }
 ze_result_t zeMemAllocDevice(ze_context_handle_t c, const ze_device_mem_alloc_desc_t* d, size_t n, size_t al, ze_device_handle_t dev, void** p) {
     (void)c; (void)dev; if (d->stype != ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
-    size_t a2 = al < 16 ? 16 : al; size_t* b = MOCK_ALIGNED_ALLOC(a2, ((n + 16 + a2 - 1) / a2) * a2 + a2); if (!b) return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
-    g_live += n; *p = b; return ZE_RESULT_SUCCESS; }
-ze_result_t zeMemFree(ze_context_handle_t c, void* p) { (void)c; MOCK_ALIGNED_FREE(p); return ZE_RESULT_SUCCESS; }
+    /* layout: [header: one alignment unit, size and alignment in its last 16 bytes] [n bytes] [16-byte canary]; a kernel writing past its buffer aborts at free */
+    size_t a2 = al < 64 ? 64 : al; char* b = MOCK_ALIGNED_ALLOC(a2, ((n + 16 + a2 - 1) / a2) * a2 + a2); if (!b) return ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+    memcpy(b + a2 - 16, &n, 8); memcpy(b + a2 - 8, &a2, 8); memset(b + a2 + n, 0xA5, 16);
+    g_live += n; *p = b + a2; return ZE_RESULT_SUCCESS; }
+ze_result_t zeMemFree(ze_context_handle_t c, void* p) {
+    (void)c; if (!p) return ZE_RESULT_SUCCESS;
+    size_t n, a2, i; memcpy(&n, (char*)p - 16, 8); memcpy(&a2, (char*)p - 8, 8);
+    for (i = 0; i < 16; ++i) if (((unsigned char*)p)[n + i] != 0xA5) { fprintf(stderr, "mock ze: a kernel wrote past a %zu-byte device buffer\n", n); abort(); }
+    MOCK_ALIGNED_FREE((char*)p - a2); return ZE_RESULT_SUCCESS; }
 ze_result_t zeModuleCreate(ze_context_handle_t c, ze_device_handle_t d, const ze_module_desc_t* m, ze_module_handle_t* mod, ze_module_build_log_handle_t* log) {
     (void)c; (void)d; if (log) *log = NULL;
-    if (m->stype != ZE_STRUCTURE_TYPE_MODULE_DESC || m->format != ZE_MODULE_FORMAT_IL_SPIRV) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    if (m->stype != ZE_STRUCTURE_TYPE_MODULE_DESC) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
+    if (m->format == ZE_MODULE_FORMAT_NATIVE) {   /* a native binary from zeModuleGetNativeBinary; MOCK_REJECT_BINARY refuses all */
+        if (m->inputSize != 24 || memcmp(m->pInputModule, "MOCKZEB1", 8) || getenv("MOCK_REJECT_BINARY")) return ZE_RESULT_ERROR_INVALID_NATIVE_BINARY;
+        uint64_t* x = malloc(24); memcpy(x, m->pInputModule, 24); *mod = (ze_module_handle_t)x; return ZE_RESULT_SUCCESS; }
+    if (m->format != ZE_MODULE_FORMAT_IL_SPIRV) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
     if (m->inputSize < 100 || !strstr((const char*)m->pInputModule, "forge_attention")) return ZE_RESULT_ERROR_MODULE_BUILD_FAILURE;
-    *mod = malloc(1); return ZE_RESULT_SUCCESS; }
+    { uint64_t* x = malloc(24); uint64_t h = 1469598103934665603ull; memcpy(x, "MOCKZEB1", 8);
+      for (size_t i = 0; i < m->inputSize; ++i) h = (h ^ m->pInputModule[i]) * 1099511628211ull;
+      x[1] = h; x[2] = 0; ++mock_source_builds; *mod = (ze_module_handle_t)x; }
+    return ZE_RESULT_SUCCESS; }
+ze_result_t zeModuleGetNativeBinary(ze_module_handle_t m, size_t* n, uint8_t* b) {
+    if (b) { if (*n < 24) return ZE_RESULT_ERROR_INVALID_SIZE; memcpy(b, m, 24); }
+    *n = 24; return ZE_RESULT_SUCCESS; }
+ze_result_t zeDriverGetProperties(ze_driver_handle_t d, ze_driver_properties_t* p) {
+    (void)d; p->driverVersion = getenv("MOCK_DRIVER_VERSION") ? (uint32_t)atoi(getenv("MOCK_DRIVER_VERSION")) : 1; return ZE_RESULT_SUCCESS; }
 ze_result_t zeModuleDestroy(ze_module_handle_t m) { free(m); return ZE_RESULT_SUCCESS; }
 ze_result_t zeModuleBuildLogGetString(ze_module_build_log_handle_t l, size_t* n, char* s) { (void)l; (void)s; *n = 0; return ZE_RESULT_SUCCESS; }
 ze_result_t zeModuleBuildLogDestroy(ze_module_build_log_handle_t l) { (void)l; return ZE_RESULT_SUCCESS; }
