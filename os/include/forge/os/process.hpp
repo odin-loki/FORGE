@@ -20,6 +20,9 @@
 #include <libproc.h>
 #include <sys/proc_info.h>
 #endif
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #if defined(FORGE_OS_FREEBSD)
 #include <sys/sysctl.h>
 #include <sys/user.h>
@@ -72,6 +75,21 @@ inline bool apply_limits(const proc_limits& lim) noexcept {
     if (lim.no_core) set(RLIMIT_CORE, 0, 0);
     return ok;
 }
+#else
+// Windows: the calling process joins a new Job Object that carries memory_bytes (per-process committed memory),
+// cpu_seconds (per-process user time) and no_core (DIE_ON_UNHANDLED_EXCEPTION). Irreversible, and inherited by
+// the processes it starts. open_files / file_size_bytes have no Windows equivalent (ignored). False when the
+// job cannot be created or joined (a parent job that forbids nesting).
+inline bool apply_limits(const proc_limits& lim) noexcept {
+    if (!lim.memory_bytes && !lim.cpu_seconds && !lim.no_core) return true;
+    HANDLE job = CreateJobObjectW(nullptr, nullptr); if (!job) return false;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    if (lim.memory_bytes) { li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY; li.ProcessMemoryLimit = SIZE_T(lim.memory_bytes); }
+    if (lim.cpu_seconds) { li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME; li.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = LONGLONG(lim.cpu_seconds) * 10000000LL; }
+    if (lim.no_core) li.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &li, sizeof li) || !AssignProcessToJobObject(job, GetCurrentProcess())) { CloseHandle(job); return false; }
+    return true;   // the handle stays open for the life of the process (closing it would not lift the limits either)
+}
 #endif
 
 struct spawn_spec {
@@ -100,11 +118,19 @@ struct spawn_spec {
     // exit_code = 137. Windows: Job Object committed memory of every process in the job; Linux/Android: RSS of
     // the process group (/proc); other POSIX: the child's RSS is not readable, use limits.memory_bytes.
     std::uint64_t watch_memory_bytes = 0;
+    // Native handles the child inherits besides its three std streams, under the same value: POSIX descriptors
+    // (close-on-exec is cleared in the child only), Windows HANDLEs that are already inheritable. Tell the child
+    // the values through argv or the environment. shared_memory::share() and inheritable_handle() produce them.
+    std::vector<std::intptr_t> inherit;
 };
 
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS)
 // Signal every process in group `pgid` (spawned children lead their own group). True on success.
 inline bool kill_group(std::uint64_t pgid, int sig = SIGKILL) { return pgid > 1 && pgid <= std::uint64_t(std::numeric_limits<pid_t>::max()) && ::kill(-pid_t(pgid), sig) == 0; }
+#else
+// Windows has no process groups that can be signalled, and an iOS app has no other processes: always false.
+// Children started here are killed as a tree by spawn_wait / child (Job Object); kill_tree() handles other trees.
+inline bool kill_group(std::uint64_t, int = 9) { return false; }
 #endif
 namespace detail_proc {
 #if defined(__linux__) || defined(__ANDROID__)
@@ -309,9 +335,18 @@ inline std::vector<std::string> process_caps() {
 #if defined(FORGE_OS_IOS)
     return {};
 #elif defined(FORGE_OS_WINDOWS)
-    return {"spawn", "process.limits.memory", "process.limits.cpu", "process.tree_kill", "process.timeout"};
+    return {"spawn", "process.limits.memory", "process.limits.cpu", "process.tree_kill", "process.timeout", "process.inherit_handles",
+            "process.wait_for_exit", "process.priority", "process.affinity", "process.io_priority", "process.kill_tree"};
 #else
-    return {"spawn", "process.limits.memory", "process.limits.cpu", "process.limits.files", "process.tree_kill", "process.timeout", "signals"};
+    return {"spawn", "process.limits.memory", "process.limits.cpu", "process.limits.files", "process.tree_kill", "process.timeout", "signals",
+            "process.inherit_handles", "process.wait_for_exit", "process.priority", "process.kill_tree",
+#if !defined(__APPLE__)
+            "process.affinity",
+#endif
+#if !defined(FORGE_OS_FREEBSD) && !defined(FORGE_OS_ANDROID)
+            "process.io_priority",
+#endif
+    };
 #endif
 }
 
@@ -466,6 +501,39 @@ inline void cloexec(int fd) { ::fcntl(fd, F_SETFD, FD_CLOEXEC); }
 // In a forked child: make `from` the descriptor `to` (0/1/2), inheritable across exec. Pipes are close-on-exec
 // (detail::pipe_cloexec); dup2 clears the flag on the copy, but dup2(fd, fd) is a no-op that would leave it set.
 inline void dup_to(int from, int to) { if (from == to) ::fcntl(to, F_SETFD, 0); else ::dup2(from, to); }
+// Sleep until process `pid` exits or timeout_ns passes: a pidfd (Linux 5.3+) or kqueue EVFILT_PROC / NOTE_EXIT
+// becomes ready at exit, so nothing is polled. Returns 1 exited (or gone already), 0 timeout, -1 when the OS gives
+// no such event for this pid (older kernel, pid of another user in a hardened jail); the caller then naps.
+inline int exit_event(pid_t pid, std::uint64_t timeout_ns) {
+    const int ms = timeout_ns == ~0ull ? -1 : int(std::min<std::uint64_t>((timeout_ns + 999999ull) / 1000000ull, 0x7fffffffu));
+#if defined(__linux__)
+    if (android_api_level() < 31) return -1;   // pidfd_open: Android 12
+#if defined(SYS_pidfd_open)
+    int fd = int(::syscall(SYS_pidfd_open, pid, 0u));
+#else
+    int fd = int(::syscall(434, pid, 0u));
+#endif
+    if (fd < 0) return errno == ESRCH ? 1 : -1;
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);   // the kernel sets it already; older ones before 5.3 never get here
+    struct pollfd f{fd, POLLIN, 0}; int r;
+    do r = ::poll(&f, 1, ms); while (r < 0 && errno == EINTR && ms < 0);
+    ::close(fd); return r > 0 ? 1 : 0;
+#elif defined(FORGE_OS_KQUEUE)
+    int kq = ::kqueue(); if (kq < 0) return -1;
+    struct kevent k; EV_SET(&k, uintptr_t(pid), EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, nullptr);
+    if (::kevent(kq, &k, 1, nullptr, 0, nullptr) < 0) { int e = errno; ::close(kq); return e == ESRCH ? 1 : -1; }
+    struct timespec ts{}, *tp = nullptr;
+    if (ms >= 0) { ts.tv_sec = ms / 1000; ts.tv_nsec = long(ms % 1000) * 1000000L; tp = &ts; }
+    struct kevent ev; int n;
+    do n = ::kevent(kq, nullptr, 0, &ev, 1, tp); while (n < 0 && errno == EINTR && ms < 0);
+    ::close(kq); return n > 0 ? 1 : 0;
+#else
+    (void)pid; (void)timeout_ns; return -1;
+#endif
+}
+inline void await_exit(pid_t pid, std::uint64_t timeout_ns) {
+    if (exit_event(pid, timeout_ns) < 0) sleep_ns(std::min<std::uint64_t>(timeout_ns, 1000000ull));
+}
 }
 #endif
 
@@ -509,8 +577,9 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     if (!job) return fail(last_error("CreateJobObject"));
     PROCESS_INFORMATION pi{};
     std::wstring wcwd = widen(sp.cwd);
+    std::vector<HANDLE> extra; for (std::intptr_t h : sp.inherit) extra.push_back(reinterpret_cast<HANDLE>(h));
     BOOL ok = create_process_std_only(widen(exe).c_str(), cmd.data(), CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
-                                      envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi);
+                                      envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi, &extra);
     closeh(in_r); closeh(out_w); closeh(err_w); closeh(fin); closeh(fout); closeh(ferr);
     if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); CloseHandle(job); return fail(e); }
     if (auto e = detail_proc::win_assign(job, pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); CloseHandle(job); return fail(e); }
@@ -614,6 +683,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
     const bool new_session = sp.new_session;
     const char* cwd = sp.cwd.empty() ? nullptr : sp.cwd.c_str();
     const proc_limits lim = sp.limits;
+    const std::vector<std::intptr_t>& inherit = sp.inherit;
     pid_t p = forge::os::serialized_fork();
     if (p < 0) { auto e = last_error("fork"); for (int* f : {&pin[0], &pin[1], &pout[0], &pout[1], &perr[0], &perr[1], &pexec[0], &pexec[1]}) cl(*f); return {{}, e}; }
     if (p == 0) {
@@ -624,6 +694,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         const int o1 = fout >= 0 ? fout : pout[1];
         if (o1 >= 0) dup_to(o1, 1);
         if (sp.merge_stderr && o1 >= 0) dup_to(o1, 2); else if (ferr >= 0) dup_to(ferr, 2); else if (perr[1] >= 0) dup_to(perr[1], 2);
+        for (std::intptr_t h : inherit) if (h > 2) ::fcntl(int(h), F_SETFD, 0);
         (void)apply_limits(lim);
         if (cwd && ::chdir(cwd) != 0) { int e = errno; (void)!::write(pexec[1], &e, sizeof e); ::_exit(127); }
         ::execve(exe.c_str(), av.data(), ev.data());
@@ -812,6 +883,7 @@ public:
             using detail_proc::dup_to;
             if (devnull >= 0) dup_to(devnull, 0);
             dup_to(po[1], 1); if (merge) dup_to(po[1], 2); else if (ferr >= 0) dup_to(ferr, 2);
+            for (std::intptr_t h : sp.inherit) if (h > 2) ::fcntl(int(h), F_SETFD, 0);
             (void)apply_limits(lim);
             if (wd && ::chdir(wd) != 0) { int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127); }
             ::execve(exe.c_str(), av.data(), ev.data());
@@ -907,7 +979,7 @@ public:
             pid_t w = ::waitpid(pid_, &st, end ? WNOHANG : 0);
             if (w == pid_) break;
             if (w < 0 && errno != EINTR) return -1;
-            if (w == 0) { if (monotonic_ns() >= end) return -1; sleep_ns(1000000); }
+            if (w == 0) { auto now = monotonic_ns(); if (now >= end) return -1; detail_proc::await_exit(pid_, end - now); }
         }
         done_ = true; code_ = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + (WIFSIGNALED(st) ? WTERMSIG(st) : 0);
         return code_;
@@ -983,8 +1055,9 @@ private:
         if (!job) { auto e = last_error("CreateJobObject"); closeh(out_r); closeh(out_w); closeh(fin); closeh(ferr); return {{}, e}; }
         PROCESS_INFORMATION pi{};
         std::wstring wcwd = widen(sp.cwd);
+        std::vector<HANDLE> extra; for (std::intptr_t h : sp.inherit) extra.push_back(reinterpret_cast<HANDLE>(h));
         BOOL ok = create_process_std_only(widen(exe).c_str(), cmd.data(), CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED | (sp.new_session ? CREATE_NEW_PROCESS_GROUP : 0),
-                                          envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi);
+                                          envb.data(), sp.cwd.empty() ? nullptr : wcwd.c_str(), si, pi, &extra);
         closeh(out_w); closeh(fin); closeh(ferr);
         if (!ok) { auto e = last_error("CreateProcess " + sp.argv[0]); closeh(out_r); closeh(job); return {{}, e}; }
         if (auto e = detail_proc::win_assign(job, pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); closeh(out_r); closeh(job); return {{}, e}; }
@@ -1161,6 +1234,237 @@ inline result<process_entry> process_info(std::uint64_t pid) {
     if (!all) return {{}, all.err};
     for (auto& p : all.value) if (p.pid == pid) return {p, {}};
     return {{}, {-1, "process_info: no such process"}};
+}
+
+// ---------------------------------------------------------------- waiting for any process
+// Wait until process `pid` (a child or not) has exited. True: it has exited or does not exist; false: still
+// running after timeout_ms (0 = wait without limit). It does not reap a child (use child::wait / waitpid for the
+// exit code). Linux / Android: pidfd_open + poll (5.3+), else a 10 ms kill(pid, 0) poll. macOS / FreeBSD: kqueue
+// EVFILT_PROC. Windows: a SYNCHRONIZE handle. iOS: other processes are not visible (unsupported).
+inline result<bool> wait_for_exit(std::uint64_t pid, std::uint64_t timeout_ms = 0) {
+#if defined(FORGE_OS_IOS)
+    (void)pid; (void)timeout_ms; return {false, unsupported("wait_for_exit")};
+#elif defined(FORGE_OS_WINDOWS)
+    if (pid == 0 || pid > 0xFFFFFFFFull) return {false, {ERROR_INVALID_PARAMETER, "wait_for_exit: invalid pid"}};
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, DWORD(pid));
+    if (!h) { if (GetLastError() == ERROR_INVALID_PARAMETER) return {true, {}}; return {false, last_error("OpenProcess")}; }   // no such process
+    const std::uint64_t end = timeout_ms ? monotonic_ns() + timeout_ms * 1000000ull : 0;
+    for (;;) {
+        DWORD slice = INFINITE;
+        if (end) { auto now = monotonic_ns(); slice = now >= end ? 0 : DWORD(std::min<std::uint64_t>((end - now + 999999ull) / 1000000ull, 0x7fffffffu)); }
+        DWORD w = WaitForSingleObject(h, slice);
+        if (w == WAIT_OBJECT_0) { CloseHandle(h); return {true, {}}; }
+        if (w != WAIT_TIMEOUT) { auto e = last_error("WaitForSingleObject"); CloseHandle(h); return {false, e}; }
+        if (!end || monotonic_ns() >= end) { CloseHandle(h); return {false, {}}; }
+    }
+#else
+    if (pid == 0 || pid > std::uint64_t(std::numeric_limits<pid_t>::max())) return {false, {EINVAL, "wait_for_exit: invalid pid"}};
+    const pid_t p = pid_t(pid);
+    const std::uint64_t end = timeout_ms ? monotonic_ns() + timeout_ms * 1000000ull : 0;
+    for (;;) {
+        // A zombie still "exists" for kill(); the exit event fires for it, which is what callers mean by exited.
+        if (::kill(p, 0) != 0 && errno == ESRCH) return {true, {}};
+        std::uint64_t left = ~0ull;
+        if (end) { auto now = monotonic_ns(); if (now >= end) return {false, {}}; left = end - now; }
+        int r = detail_proc::exit_event(p, left);
+        if (r > 0) return {true, {}};
+        if (r < 0) sleep_ns(std::min<std::uint64_t>(left, 10000000ull));
+    }
+#endif
+}
+
+// ---------------------------------------------------------------- priority, affinity, I/O priority
+// Scheduling priority of a whole process (pid 0 = this one). POSIX: the nice value (idle 19, low 10, normal 0,
+// high -10; raising needs privilege or RLIMIT_NICE). Windows: the priority class (IDLE / BELOW_NORMAL / NORMAL /
+// HIGH). Threads: os::set_thread_priority.
+enum class process_priority { idle, low, normal, high };
+inline status set_process_priority(process_priority pr, std::uint64_t pid = 0) {
+#if defined(FORGE_OS_WINDOWS)
+    const DWORD cls = pr == process_priority::idle ? IDLE_PRIORITY_CLASS : pr == process_priority::low ? BELOW_NORMAL_PRIORITY_CLASS
+                    : pr == process_priority::high ? HIGH_PRIORITY_CLASS : NORMAL_PRIORITY_CLASS;
+    HANDLE h = pid ? OpenProcess(PROCESS_SET_INFORMATION, FALSE, DWORD(pid)) : GetCurrentProcess();
+    if (!h) return {{}, last_error("OpenProcess")};
+    BOOL ok = SetPriorityClass(h, cls); auto e = ok ? error{} : last_error("SetPriorityClass");
+    if (pid) CloseHandle(h);
+    if (!ok) return {{}, e};
+    return {};
+#else
+    const int nice = pr == process_priority::idle ? 19 : pr == process_priority::low ? 10 : pr == process_priority::high ? -10 : 0;
+    if (::setpriority(PRIO_PROCESS, id_t(pid), nice) != 0) return {{}, last_error("setpriority")};
+    return {};
+#endif
+}
+inline result<process_priority> get_process_priority(std::uint64_t pid = 0) {
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE h = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(pid)) : GetCurrentProcess();
+    if (!h) return {process_priority::normal, last_error("OpenProcess")};
+    DWORD c = GetPriorityClass(h); auto e = c ? error{} : last_error("GetPriorityClass");
+    if (pid) CloseHandle(h);
+    if (!c) return {process_priority::normal, e};
+    return {c == IDLE_PRIORITY_CLASS ? process_priority::idle : c == BELOW_NORMAL_PRIORITY_CLASS ? process_priority::low
+          : (c == HIGH_PRIORITY_CLASS || c == ABOVE_NORMAL_PRIORITY_CLASS || c == REALTIME_PRIORITY_CLASS) ? process_priority::high : process_priority::normal, {}};
+#else
+    errno = 0; int n = ::getpriority(PRIO_PROCESS, id_t(pid));
+    if (n == -1 && errno) return {process_priority::normal, last_error("getpriority")};
+    return {n >= 19 ? process_priority::idle : n > 0 ? process_priority::low : n < 0 ? process_priority::high : process_priority::normal, {}};
+#endif
+}
+// The CPUs a process (pid 0 = this one) may run on. Linux / Android: sched_setaffinity (for this process: the
+// calling thread and threads it starts later). FreeBSD: cpuset_setaffinity(CPU_WHICH_PID). Windows:
+// SetProcessAffinityMask (CPUs of the process's own processor group, ids 0-63). macOS / iOS have no hard
+// affinity: unsupported.
+inline status set_process_affinity(const std::vector<unsigned>& cpus, std::uint64_t pid = 0) {
+    if (cpus.empty()) return {{}, errno_error(EINVAL, "set_process_affinity: empty CPU set")};
+#if defined(FORGE_OS_WINDOWS)
+    DWORD_PTR mask = 0;
+    for (unsigned c : cpus) { if (c >= sizeof(DWORD_PTR) * 8) return {{}, {ERROR_INVALID_PARAMETER, "set_process_affinity: CPU id outside the processor group"}}; mask |= DWORD_PTR(1) << c; }
+    HANDLE h = pid ? OpenProcess(PROCESS_SET_INFORMATION, FALSE, DWORD(pid)) : GetCurrentProcess();
+    if (!h) return {{}, last_error("OpenProcess")};
+    BOOL ok = SetProcessAffinityMask(h, mask); auto e = ok ? error{} : last_error("SetProcessAffinityMask");
+    if (pid) CloseHandle(h);
+    if (!ok) return {{}, e};
+    return {};
+#elif defined(__linux__)
+    cpu_set_t set; CPU_ZERO(&set);
+    for (unsigned c : cpus) { if (c >= CPU_SETSIZE) return {{}, errno_error(EINVAL, "set_process_affinity: CPU id too large")}; CPU_SET(c, &set); }
+    if (::sched_setaffinity(pid_t(pid), sizeof set, &set) != 0) return {{}, last_error("sched_setaffinity")};
+    return {};
+#elif defined(FORGE_OS_FREEBSD)
+    cpuset_t set; CPU_ZERO(&set);
+    for (unsigned c : cpus) { if (c >= CPU_SETSIZE) return {{}, errno_error(EINVAL, "set_process_affinity: CPU id too large")}; CPU_SET(c, &set); }
+    if (::cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, pid ? id_t(pid) : id_t(-1), sizeof set, &set) != 0) return {{}, last_error("cpuset_setaffinity")};
+    return {};
+#else
+    (void)pid; return {{}, unsupported("process affinity")};
+#endif
+}
+inline result<std::vector<unsigned>> get_process_affinity(std::uint64_t pid = 0) {
+    std::vector<unsigned> out;
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE h = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(pid)) : GetCurrentProcess();
+    if (!h) return {{}, last_error("OpenProcess")};
+    DWORD_PTR pm = 0, sm = 0; BOOL ok = GetProcessAffinityMask(h, &pm, &sm); auto e = ok ? error{} : last_error("GetProcessAffinityMask");
+    if (pid) CloseHandle(h);
+    if (!ok) return {{}, e};
+    for (unsigned c = 0; c < sizeof(DWORD_PTR) * 8; ++c) if (pm & (DWORD_PTR(1) << c)) out.push_back(c);
+    return {std::move(out), {}};
+#elif defined(__linux__)
+    cpu_set_t set; CPU_ZERO(&set);
+    if (::sched_getaffinity(pid_t(pid), sizeof set, &set) != 0) return {{}, last_error("sched_getaffinity")};
+    for (unsigned c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &set)) out.push_back(c);
+    return {std::move(out), {}};
+#elif defined(FORGE_OS_FREEBSD)
+    cpuset_t set; CPU_ZERO(&set);
+    if (::cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, pid ? id_t(pid) : id_t(-1), sizeof set, &set) != 0) return {{}, last_error("cpuset_getaffinity")};
+    for (unsigned c = 0; c < CPU_SETSIZE; ++c) if (CPU_ISSET(c, &set)) out.push_back(c);
+    return {std::move(out), {}};
+#else
+    (void)pid; return {{}, unsupported("process affinity")};
+#endif
+}
+// Disk I/O priority of this process: low = background (it yields to everyone else's I/O), normal = default.
+// Linux: ioprio_set, idle class (honoured by the BFQ and CFQ schedulers). macOS / iOS:
+// setiopolicy_np(IOPOL_THROTTLE). Windows: background processing mode (PROCESS_MODE_BACKGROUND_BEGIN / END),
+// which lowers I/O, memory and CPU priority together. FreeBSD has no per-process I/O priority, and Android's
+// libc (and so the app seccomp policy) has no ioprio_set: unsupported on both.
+enum class io_priority { low, normal };
+inline status set_io_priority(io_priority pr) {
+#if defined(FORGE_OS_WINDOWS)
+    if (SetPriorityClass(GetCurrentProcess(), pr == io_priority::low ? PROCESS_MODE_BACKGROUND_BEGIN : PROCESS_MODE_BACKGROUND_END)) return {};
+    const DWORD e = GetLastError();   // already in / not in background mode: the state asked for is the state we have
+    if (e == ERROR_PROCESS_MODE_ALREADY_BACKGROUND || e == ERROR_PROCESS_MODE_NOT_BACKGROUND) return {};
+    SetLastError(e); return {{}, last_error("SetPriorityClass(PROCESS_MODE_BACKGROUND)")};
+#elif defined(__linux__) && !defined(__ANDROID__)
+    // ioprio_set(IOPRIO_WHO_PROCESS = 1, 0 = the calling thread, (class << 13) | data): class 3 = idle, class 0 =
+    // none (back to the default derived from the nice value). Linux keeps it per thread; threads and processes
+    // started afterwards inherit it, so call this early (before starting workers) to cover the process.
+#if defined(SYS_ioprio_set)
+    const int v = pr == io_priority::low ? (3 << 13) : 0;
+    if (::syscall(SYS_ioprio_set, 1, 0, v) != 0) return {{}, last_error("ioprio_set")};
+    return {};
+#else
+    (void)pr; return {{}, unsupported("ioprio_set")};
+#endif
+#elif defined(__APPLE__)
+    if (::setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, pr == io_priority::low ? IOPOL_THROTTLE : IOPOL_DEFAULT) != 0) return {{}, last_error("setiopolicy_np")};
+    return {};
+#else
+    (void)pr; return {{}, unsupported("I/O priority")};
+#endif
+}
+
+// ---------------------------------------------------------------- process tree
+// Every descendant of `pid` (children, their children, ...), found through the parent ids list_processes()
+// reports. A process whose parent has exited is no longer attached to the tree (POSIX re-parents it; Windows keeps
+// a stale parent id, which is ignored unless that parent is still in the tree).
+inline result<std::vector<std::uint64_t>> process_descendants(std::uint64_t pid) {
+    auto all = list_processes();
+    if (!all) return {{}, all.err};
+    std::vector<std::uint64_t> out{pid};
+#if defined(FORGE_OS_WINDOWS)
+    // A parent id here is only "the pid my creator had": that pid may since belong to an unrelated process. A real
+    // child was created after its parent, so anything older (or whose start time cannot be read) is left out.
+    auto started = [](std::uint64_t p) -> std::uint64_t {
+        HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, DWORD(p)); if (!h) return 0;
+        FILETIME c{}, e{}, k{}, u{}; BOOL ok = GetProcessTimes(h, &c, &e, &k, &u); CloseHandle(h);
+        return ok ? (std::uint64_t(c.dwHighDateTime) << 32) | c.dwLowDateTime : 0;
+    };
+    std::vector<std::uint64_t> born{started(pid)};
+#endif
+    for (std::size_t i = 0; i < out.size(); ++i)
+        for (auto& p : all.value)
+            if (p.ppid == out[i] && p.pid != pid && p.pid != 0 && std::find(out.begin(), out.end(), p.pid) == out.end()) {
+#if defined(FORGE_OS_WINDOWS)
+                const std::uint64_t t = started(p.pid);
+                if (!t || !born[i] || t < born[i]) continue;
+                born.push_back(t);
+#endif
+                out.push_back(p.pid);
+            }
+    out.erase(out.begin());
+    return {std::move(out), {}};
+}
+// Kill `pid` and all its descendants (SIGKILL / TerminateProcess), parents first so they cannot start more.
+// Returns how many processes were signalled. For children you start yourself, spawn_wait / child kill the
+// process group or Job Object, which also catches processes that detached from the tree; this is for trees
+// started by someone else.
+inline result<std::size_t> kill_tree(std::uint64_t pid) {
+    if (pid <= 1 || pid == os::pid()) return {0, errno_error(EINVAL, "kill_tree: invalid pid")};
+    auto d = process_descendants(pid);
+    if (!d) return {0, d.err};
+    std::vector<std::uint64_t> v{pid}; v.insert(v.end(), d.value.begin(), d.value.end());
+    std::size_t n = 0;
+    for (auto p : v) {
+        if (p <= 1 || p == os::pid()) continue;
+#if defined(FORGE_OS_WINDOWS)
+        if (HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, DWORD(p))) { if (TerminateProcess(h, 137)) ++n; CloseHandle(h); }
+#else
+        if (::kill(pid_t(p), SIGKILL) == 0) ++n;
+#endif
+    }
+    return {n, {}};
+}
+
+// A duplicate of native handle `h` that a child started with spawn_spec::inherit can use: POSIX a dup() without
+// close-on-exec in the child only (the copy here stays close-on-exec, so other spawns never see it); Windows an
+// inheritable DuplicateHandle. Close it with close_inheritable_handle() once the child has started.
+inline result<std::intptr_t> inheritable_handle(std::intptr_t h) {
+#if defined(FORGE_OS_WINDOWS)
+    HANDLE d = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(h), GetCurrentProcess(), &d, 0, TRUE, DUPLICATE_SAME_ACCESS)) return {0, last_error("DuplicateHandle")};
+    return {reinterpret_cast<std::intptr_t>(d), {}};
+#else
+    int d = ::fcntl(int(h), F_DUPFD_CLOEXEC, 3);
+    if (d < 0) return {-1, last_error("dup")};
+    return {d, {}};
+#endif
+}
+inline void close_inheritable_handle(std::intptr_t h) {
+#if defined(FORGE_OS_WINDOWS)
+    if (h) CloseHandle(reinterpret_cast<HANDLE>(h));
+#else
+    if (h >= 0) ::close(int(h));
+#endif
 }
 
 } // namespace forge::os
