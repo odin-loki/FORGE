@@ -222,7 +222,7 @@ TEST(attn_cpu_chunked_long_context) {
         if (!codec) { kq = kf; vq = vf; kd = kf; vd = vf; }
         float sc = 1.f / std::sqrt(float(d));
         std::vector<float> out(s * hq * dv), one(hq * dv);
-        attn_cpu::attention(q.data(), s, hq, d, kq.data(), vq.data(), t, hk, dv, kc, kc, true, window, sc, out.data());
+        attn_cpu::attention(q.data(), s, hq, d, kq.data(), vq.data(), t, hk, dv, kc, kc, true, window, sc, out.data(), 0);   // 0: the float-query path whatever FORGE_CPU_ATTN says
         double err = 0;
         for (std::size_t i = 0; i < s; ++i) for (std::size_t h = 0; h < hq; ++h) {
             std::size_t pos = t - s + i, lo = window && pos + 1 > window ? pos + 1 - window : 0, kh = h / (hq / hk);
@@ -232,7 +232,7 @@ TEST(attn_cpu_chunked_long_context) {
             for (std::size_t e = 0; e < dv; ++e) { double a = 0; for (std::size_t j = lo; j <= pos; ++j) a += sco[j] * vd[(j * hk + kh) * dv + e]; err = std::max(err, std::fabs(a / sum - out[(i * hq + h) * dv + e])); }
             // the same token alone (decode) gives identical bits
             if (i == s - 1 || i == 0) {
-                attn_cpu::attention(q.data() + i * hq * d, 1, hq, d, kq.data(), vq.data(), pos + 1, hk, dv, kc, kc, true, window, sc, one.data());
+                attn_cpu::attention(q.data() + i * hq * d, 1, hq, d, kq.data(), vq.data(), pos + 1, hk, dv, kc, kc, true, window, sc, one.data(), 0);
                 CHECK(std::memcmp(one.data(), out.data() + i * hq * dv, hq * dv * 4) == 0);
             }
         }
@@ -250,6 +250,94 @@ TEST(attn_cpu_chunked_long_context) {
             k->attn_chunk(K, V, d, dv, sc, 256, std::min<std::size_t>(t, 512), ns, qp.data(), lo.data(), hi.data(), m2.data(), l2.data(), a2.data(), sc2.data());
             CHECK(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0);
             for (float x : {-0.f, -1.5f, -30.f, -79.f, 3.f}) CHECK(ref->exp1(x) == k->exp1(x));
+        }
+    }
+}
+
+// The int16-query path (FORGE_CPU_ATTN=q16; seq_kernels::attn_chunk_q16) over int8 keys: the query row is
+// quantised to int16 codes q16 with one scale qs, q.k is an exact int32 sum. Stated tolerances:
+//   score: |s_q16 - s_exact| <= 0.5 * qs * kscale * sum|k8| * scale (query rounding) + float rounding, checked
+//          per chunk on the chunk maximum against a float64 dot over the same decoded keys;
+//   output: 1e-3 absolute for N(0,1) values (measured ~1e-5).
+// A prefill block gives the same bits as each token alone, and scalar / avx2 / avx512 give the same bits.
+TEST(attn_cpu_int16_query) {
+    std::mt19937 rng(17); std::normal_distribution<float> nd(0.f, 1.f);
+    // {t, s, hq, hk, d, window, value codec}: d = 80 / 33 leave 16- and 32-lane tails, d = 600 lowers the code range
+    for (auto [t, s, hq, hk, d, window, vcodec] : std::vector<std::array<std::size_t, 7>>{
+             {700, 40, 8, 2, 64, 0, 1}, {1300, 3, 16, 4, 80, 0, 1}, {600, 9, 4, 4, 33, 300, 0}, {530, 5, 2, 1, 600, 0, 1}, {300, 7, 4, 2, 128, 0, 0}}) {
+        const auto kc = kv_codec::int8, vc = vcodec ? kv_codec::int8 : kv_codec::f32;
+        const std::size_t dv = d, kw = std::size_t(kv_head_words(i64(d))), vw = vcodec ? kw : dv;
+        std::vector<float> q(s * hq * d), kf(d), vf(dv), kq(t * hk * kw), vq(t * hk * vw), kd(t * hk * d), vd(t * hk * dv);
+        for (auto& x : q) x = nd(rng);
+        for (std::size_t r = 0; r < t * hk; ++r) {
+            for (auto& x : kf) x = nd(rng);
+            for (auto& x : vf) x = nd(rng);
+            kv_encode_head(kf.data(), i64(d), kc, kq.data() + r * kw); kv_decode_head(kq.data() + r * kw, i64(d), kc, kd.data() + r * d);
+            if (vcodec) { kv_encode_head(vf.data(), i64(dv), vc, vq.data() + r * vw); kv_decode_head(vq.data() + r * vw, i64(dv), vc, vd.data() + r * dv); }
+            else { std::copy(vf.begin(), vf.end(), vq.begin() + std::ptrdiff_t(r * vw)); std::copy(vf.begin(), vf.end(), vd.begin() + std::ptrdiff_t(r * dv)); }
+        }
+        if (d == 64) for (std::size_t e = 0; e < d; ++e) q[e] = 0.f;   // an all-zero query row: scores 0, uniform weights
+        const float sc = 1.f / std::sqrt(float(d));
+        std::vector<float> out(s * hq * dv), outf(s * hq * dv), one(hq * dv);
+        attn_cpu::attention(q.data(), s, hq, d, kq.data(), vq.data(), t, hk, dv, kc, vc, true, window, sc, out.data(), 1);
+        attn_cpu::attention(q.data(), s, hq, d, kq.data(), vq.data(), t, hk, dv, kc, vc, true, window, sc, outf.data(), 0);
+        double err = 0, dff = 0;
+        for (std::size_t i = 0; i < out.size(); ++i) dff = std::max(dff, double(std::fabs(out[i] - outf[i])));
+        for (std::size_t i = 0; i < s; ++i) for (std::size_t h = 0; h < hq; ++h) {
+            std::size_t pos = t - s + i, lo = window && pos + 1 > window ? pos + 1 - window : 0, kh = h / (hq / hk);
+            std::vector<double> sco(pos + 1); double mx = -1e300, sum = 0;
+            for (std::size_t j = lo; j <= pos; ++j) { double a = 0; for (std::size_t e = 0; e < d; ++e) a += double(q[(i * hq + h) * d + e]) * kd[(j * hk + kh) * d + e]; sco[j] = a * sc; mx = std::max(mx, sco[j]); }
+            for (std::size_t j = lo; j <= pos; ++j) { sco[j] = std::exp(sco[j] - mx); sum += sco[j]; }
+            for (std::size_t e = 0; e < dv; ++e) { double a = 0; for (std::size_t j = lo; j <= pos; ++j) a += sco[j] * vd[(j * hk + kh) * dv + e]; err = std::max(err, std::fabs(a / sum - out[(i * hq + h) * dv + e])); }
+            if (i == s - 1 || i == 0) {   // the same token alone (decode) gives identical bits
+                attn_cpu::attention(q.data() + i * hq * d, 1, hq, d, kq.data(), vq.data(), pos + 1, hk, dv, kc, vc, true, window, sc, one.data(), 1);
+                CHECK(std::memcmp(one.data(), out.data() + i * hq * dv, hq * dv * 4) == 0);
+            }
+        }
+        std::printf("  int16 query d %zu: max output error vs float64 %.2e, vs the float-query kernel %.2e\n", d, err, dff);
+        CHECK_MSG(err < 1e-3, "attn_cpu q16 err %g", err);
+        CHECK_MSG(dff < 1e-3, "attn_cpu q16 vs float kernel %g", dff);
+        // one chunk through every table: identical bits, and the chunk maximum within the stated score bound
+        const auto* ref = simd::seq_by_name("scalar");
+        const std::size_t ns = hq / hk, c0 = 256, c1 = std::min<std::size_t>(t, 512);
+        std::vector<const float*> qp; std::vector<std::size_t> lo(ns, 0), hi(ns, t);
+        for (std::size_t h = 0; h < ns; ++h) qp.push_back(q.data() + (hq + h) * d);   // token 1 (token 0 may be the zero row)
+        std::vector<float> m1(ns), l1(ns), a1(ns * dv), m2(ns), l2(ns), a2(ns * dv), sc1(ref->attn_scratch(ns, d, dv));
+        simd::seq_kv K{kq.data(), hk * kw, 1}, V{vq.data(), hk * vw, int(vcodec)};
+        ref->attn_chunk_q16(K, V, d, dv, sc, c0, c1, ns, qp.data(), lo.data(), hi.data(), m1.data(), l1.data(), a1.data(), sc1.data());
+        for (std::size_t h = 0; h < ns; ++h) {
+            float amax = 0; for (std::size_t e = 0; e < d; ++e) amax = std::max(amax, std::fabs(qp[h][e]));
+            const double qmax = double(std::min<std::uint64_t>(32767, 0x7fffffffull / (128ull * d)));
+            CHECK(d <= 512 ? qmax == 32767 : qmax < 32767);
+            double best = -1e300, bound = 0;
+            for (std::size_t j = c0; j < c1; ++j) {
+                double a = 0, l1n = 0;
+                for (std::size_t e = 0; e < d; ++e) { a += double(qp[h][e]) * kd[j * hk * d + e]; l1n += std::fabs(kd[j * hk * d + e]); }
+                best = std::max(best, a * sc); bound = std::max(bound, 0.5 * (amax / qmax) * l1n * sc);
+            }
+            CHECK_MSG(std::fabs(m1[h] - best) <= bound * 1.001 + 1e-5 * (1 + std::fabs(best)), "q16 chunk max %g vs %g (bound %g)", m1[h], best, bound);
+        }
+        for (const char* tg : {"avx2", "avx512"}) {
+            const auto* k = simd::seq_by_name(tg); if (!k) continue;
+            std::vector<float> sc2(k->attn_scratch(ns, d, dv));
+            k->attn_chunk_q16(K, V, d, dv, sc, c0, c1, ns, qp.data(), lo.data(), hi.data(), m2.data(), l2.data(), a2.data(), sc2.data());
+            CHECK_MSG(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0, "q16 %s differs from scalar (d %zu)", tg, d);
+            // a short, offset chunk with per-slot ranges (rows past the chunk end, masked lanes)
+            std::vector<std::size_t> lo2(ns), hi2(ns);
+            for (std::size_t h = 0; h < ns; ++h) { lo2[h] = 256 + 3 * h; hi2[h] = 256 + 21 + 5 * h; }
+            ref->attn_chunk_q16(K, V, d, dv, sc, 256, 256 + 37, ns, qp.data(), lo2.data(), hi2.data(), m1.data(), l1.data(), a1.data(), sc1.data());
+            k->attn_chunk_q16(K, V, d, dv, sc, 256, 256 + 37, ns, qp.data(), lo2.data(), hi2.data(), m2.data(), l2.data(), a2.data(), sc2.data());
+            CHECK_MSG(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0, "q16 %s differs from scalar on a short chunk (d %zu)", tg, d);
+            ref->attn_chunk_q16(K, V, d, dv, sc, c0, c1, ns, qp.data(), lo.data(), hi.data(), m1.data(), l1.data(), a1.data(), sc1.data());
+        }
+        // f32 keys: the q16 entry is the float kernel
+        if (!vcodec) {
+            simd::seq_kv Kf{kd.data(), hk * d, 0};
+            const auto& act = simd::seq_active();
+            std::vector<float> sa(act.attn_scratch(ns, d, dv));
+            act.attn_chunk(Kf, V, d, dv, sc, c0, c1, ns, qp.data(), lo.data(), hi.data(), m1.data(), l1.data(), a1.data(), sa.data());
+            act.attn_chunk_q16(Kf, V, d, dv, sc, c0, c1, ns, qp.data(), lo.data(), hi.data(), m2.data(), l2.data(), a2.data(), sa.data());
+            CHECK(m1 == m2 && l1 == l2 && std::memcmp(a1.data(), a2.data(), a1.size() * 4) == 0);
         }
     }
 }

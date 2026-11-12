@@ -47,7 +47,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_MMA_SK_MIN` | CUDA | Minimum 256-value k chunks per stream-K block (default 4) |
 | `FORGE_MMA_SPLITK=0` | CUDA | Turns off split-K for tensor-core matmuls whose grid cannot fill the GPU (k/v projections, DeltaNet a/b); on by default |
 | `FORGE_MMA_STAGES=2` | CUDA | Double-buffered q4_k tensor-core matmul (cp.async copies the next k-chunk while one is computed); default one stage |
-| `FORGE_CPU_ATTN` | CPU | Chunked GQA-shared attention (`graph/attn_cpu.hpp`): by default used with an int8 KV cache only; `new` uses it for f32 KV too (its f32 prefill has not yet been shown faster), `old` never |
+| `FORGE_CPU_ATTN` | CPU | Chunked GQA-shared attention (`graph/attn_cpu.hpp`): by default used with an int8 KV cache only; `new` uses it for f32 KV too (its f32 prefill has not yet been shown faster), `old` never. `q16` (opt-in, combines as `new,q16`) scores int8 keys with the int16-query integer kernel instead of converting them to float; see [inference.md](inference.md) |
 | `FORGE_CPU_DELTA` | CPU | `old` selects the previous two-pass delta_rule instead of the column-blocked one-pass kernel |
 | `FORGE_OP_TIME` | CPU executor | `1`: wall time per op kind (attention split by KV codec, state ops by fn), printed at exit |
 | `FORGE_DELTA_RULE_OLD` | CUDA | If set, Gated DeltaNet uses the original `forge_delta_rule` kernel instead of the register-state ones |
