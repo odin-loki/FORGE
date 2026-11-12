@@ -4,6 +4,8 @@
 set -u
 B=${1:-build/win64}
 export WINEPREFIX=${WINEPREFIX:-$HOME/.wine-forge64} WINEARCH=win64 WINEDEBUG=${WINEDEBUG:--all}
+# wine maps Windows file names through the host locale: without a UTF-8 one, non-ASCII names cannot be created.
+case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *[Uu][Tt][Ff]*) ;; *) export LC_ALL=C.UTF-8;; esac
 W=$(command -v /usr/lib/wine/wine64 || command -v wine64 || command -v wine)
 [ -d "$WINEPREFIX/drive_c" ] || timeout 300 "$W" wineboot -i >/dev/null 2>&1   # syswow64 rundll32 error is harmless
 fail=0

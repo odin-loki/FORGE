@@ -15,7 +15,13 @@
 #include "check.hpp"
 using namespace forge;
 namespace fs = forge::os::fs;
-bool on_wine();   // defined below: wine lacks some APIs real Windows always has
+static bool wine_host() {   // wine lacks some APIs real Windows always has
+#if defined(_WIN32)
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != nullptr;
+#else
+    return false;
+#endif
+}
 // ---- machine identity, budgets, virtualization, account database, sessions, scheduler, service logs (begin)
 #include <forge/os/sysinfo.hpp>
 #include <forge/os/virtualization.hpp>
@@ -231,7 +237,7 @@ TEST(users_dirs) {
     {   // Known Folders, as the shell resolves them (OneDrive / GPO redirection included)
         auto r = os::run({"powershell", "-NoProfile", "-Command", "[Console]::OutputEncoding=[Text.Encoding]::UTF8; foreach ($f in 'Desktop','MyDocuments','ApplicationData','LocalApplicationData') { [Environment]::GetFolderPath($f) }"});
         std::vector<std::string> want; std::string cur;
-        bool no_ps = on_wine() && (!r || r->exit_code != 0 || r->out.empty());   // wine ships no powershell
+        bool no_ps = wine_host() && (!r || r->exit_code != 0 || r->out.empty());   // wine ships no powershell
         if (no_ps) std::printf("  skip known-folder cross-check: no powershell under wine\n"); else CHECK(r);
         if (r && !no_ps) for (char c : r->out) { if (c == '\n') { if (!cur.empty()) want.push_back(cur); cur.clear(); } else if (c != '\r') cur += c; }
         if (!no_ps) CHECK(want.size() == 4);
@@ -296,7 +302,7 @@ TEST(sysinfo_ext) {
     auto u = os::self_usage(); CHECK(u);
     if (!u) return;
     CHECK(u->max_rss > 0);
-    if (on_wine() && u->minor_faults + u->major_faults == 0) std::printf("  skip fault counters: wine reports none\n");
+    if (wine_host() && u->minor_faults + u->major_faults == 0) std::printf("  skip fault counters: wine reports none\n");
     else CHECK(u->minor_faults + u->major_faults > 0);
     {   // current_rss grows with touched memory, on every OS
         std::uint64_t r0 = os::current_rss(); CHECK(r0 > 0);
@@ -306,7 +312,7 @@ TEST(sysinfo_ext) {
     CHECK(*os::uptime_seconds() > 0); CHECK(m.available > 0);
     CHECK(os::load_average());
     auto a = os::per_cpu_times();
-    if (!a && on_wine()) { std::printf("  skip per_cpu_times: wine: %s\n", a.err.what.c_str()); return; }
+    if (!a && wine_host()) { std::printf("  skip per_cpu_times: wine: %s\n", a.err.what.c_str()); return; }
     CHECK(a); if (!a || a->empty()) { CHECK_MSG(false, "per_cpu_times returned no CPUs"); return; }
     double x = os::cpu_usage((*a)[0], (*a)[0]); CHECK(x == 0);
     {   // the counters advance, and a busy loop shows up as busy time somewhere
@@ -329,7 +335,7 @@ TEST(fs_non_ascii_paths) {
     CHECK(fs::exists(*d + "/l\xC3\xA9.lock"));   // created under its real (UTF-8) name, not a byte-widened one
     auto t = fs::make_temp_file("t\xC3\xA9-", ".tmp"); CHECK(t); if (t) { CHECK(os::stat(*t).is_file); CHECK(t->find("t\xC3\xA9-") != std::string::npos); fs::remove_all(*t); }
 #if defined(FORGE_OS_WINDOWS)
-    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0444)); CHECK(!os::file::open(*d + "/ro.txt", os::wr));
+    CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0444)); CHECK(wine_host() || !os::file::open(*d + "/ro.txt", os::wr));   // wine as root opens read-only files
     SetFileAttributesW(os::widen(*d + "/ro.txt").c_str(), FILE_ATTRIBUTE_NORMAL);
 #else
     CHECK(fs::write_file_atomic(*d + "/ro.txt", "r", 0600)); CHECK((*fs::mode(*d + "/ro.txt") & 0077) == 0);
@@ -483,6 +489,7 @@ TEST(service_windows_scm_query) {   // read-only SCM paths (no admin needed); in
     fs::remove_all(*d);
 }
 TEST(service_windows_task) {   // a real per-user scheduled task: install, start, query, stop, env + exit code, remove
+    if (wine_host()) { std::printf("  skip under wine: its Task Scheduler cannot run tasks (E_NOTIMPL)\n"); return; }
     std::mt19937_64 rng(std::random_device{}() ^ os::monotonic_ns());
     svc::service_spec s; s.name = "forge-test-" + std::to_string(rng() % 1000000000ull); s.description = "FORGE test task (safe to delete)";
     s.argv = {"PING.EXE", "-n", "30", "127.0.0.1"}; s.start_at_login = false; s.working_dir = os::getenv("SystemRoot", "C:\\Windows");
@@ -527,6 +534,7 @@ TEST(load_average_emulation) {   // Windows: sampler started by the first call; 
     auto b = os::load_average(); stop = true; for (auto& t : spin) t.join();
     CHECK(b); if (!b) return;
     CHECK(b->one >= 0 && b->five >= 0 && b->fifteen >= 0);
+    if (wine_host() && b->one <= a->one + 0.05 * n) { std::printf("  skip under wine: no PDH queue length, busy time does not move the estimate\n"); return; }
     CHECK_MSG(b->one > a->one + 0.05 * n,"before %.2f after %.2f (n=%u)", a->one, b->one, n);
     CHECK(b->one - a->one > b->fifteen - a->fifteen);   // the 1-minute average reacts fastest
 #endif
