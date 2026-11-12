@@ -401,6 +401,8 @@ int cmd_embed(const args& a) {
         if (a.kv.count("token-types")) types = parse_ids(a.get("token-types"));
         v = s.embed(ids, types, a.kv.count("mask") ? parse_ids(a.get("mask")) : std::vector<int>{});
     }
+    if (auto& as = s.shared_model()->aot().stats(); as.used)   // precompiled plans (forge aot), as `forge run` reports them
+        std::fprintf(stderr, "[aot: %zu of the plans were precompiled (%zu native), from %s]\n", as.used, as.native, as.origin.c_str());
     if (a.kv.count("out")) {
         std::ofstream f(a.get("out"), std::ios::binary);
         f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));

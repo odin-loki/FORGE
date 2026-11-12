@@ -182,6 +182,32 @@ TEST(native_moe_golden_model) {   // the golden Mixtral / DeepSeek-V2 models, wh
 }
 #endif
 
+#if defined(FORGE_TEST_BINARY_DIR)
+// One compiled library per new kind of graph, when the golden tests have written the models: Gemma-2 (attention_bias
+// with soft-capping and a sliding window, final logit soft-capping), a RoPE frequency-scaling model (opset 2 attrs),
+// Qwen2 (Q/K/V biases) and the BERT embedding session.
+TEST(native_golden_template_families) {
+    const std::string dir = FORGE_TEST_BINARY_DIR;
+    int n = 0;
+    for (const char* name : {"golden_gemma/gemma2_f32.fpk", "golden_rope/rope4.fpk", "golden_qwen2/qwen2_q8_0.fpk"}) {
+        auto src = dir + "/" + name;
+        if (!fs::exists(src)) { std::printf("  (no %s: run its golden test first)\n", name); continue; }
+        auto so = tmp(std::string("fam") + std::to_string(n++) + so_ext);
+        build(src, {.shapes = {1, 6}}, {.out = so});
+        expect_identical(so, src, {6, 1, 1, 6}, {}, 2);
+    }
+    if (auto src = dir + "/golden_bert/bert_f32.fpk"; fs::exists(src)) {
+        auto so = tmp(std::string("bert") + so_ext);
+        build(src, {.shapes = {7}}, {.out = so});
+        auto ma = model::open(so); auto mr = jit_model(src);
+        session a(ma), r(mr);
+        std::vector<int> ids{2, 40, 7, 99, 150, 12, 3}, types{0, 0, 0, 0, 1, 1, 1}, mask{1, 1, 1, 1, 1, 1, 0};
+        CHECK(same_bits(a.embed(ids, types, mask), r.embed(ids, types, mask)));
+        CHECK_MSG(ma->aot().stats().native == 1, "native plans: %zu, precompiled %zu (%s)", ma->aot().stats().native, ma->aot().stats().used, ma->aot().stats().last_reject.c_str());
+    } else std::printf("  (no golden_bert/bert_f32.fpk: run golden_tiny_bert first)\n");
+}
+#endif
+
 #if defined(FORGE_TEST_FORGE_BIN)
 static std::string run(std::vector<std::string> argv, int* code = nullptr, std::string* err = nullptr) {
     forge::os::spawn_spec sp; sp.argv = std::move(argv);

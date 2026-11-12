@@ -74,6 +74,7 @@ Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `w
 | `--mask 1,1,0` | 1 = real token, 0 = padding (default all 1) |
 | `--input name=file.f32` | Raw f32 for a declared input, repeatable: `image=...` (`[channels, size, size]`, already resized and normalised), `mel=...` (`[n_mels, frames]`) |
 | `--out file.f32` | Write the vector instead of printing it |
+| (stderr) | `[aot: N of the plans were precompiled (M native), from ...]` when the model carries precompiled plans that were used ([aot-models.md](aot-models.md)) |
 | `--device D`, `--codec C`, `--verify`, `--policy F` | As for `forge run` |
 
 ```sh
