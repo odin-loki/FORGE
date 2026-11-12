@@ -7,7 +7,7 @@ Kernels are written once and compiled per target:
 
 | Layer | Header | Contents |
 |-------|--------|----------|
-| Tier P | `vec.hpp` | Portable fixed-width vectors and masks over native registers |
+| Tier P | `vec.hpp`, `vec_gn.hpp` | Portable fixed-width vectors and masks over native registers. `vec.hpp` has the AVX2, AVX-512, AArch64 NEON, SVE and RVV branches; `vec_gn.hpp` has the 128/256-bit backends listed under "Other architectures" |
 | Tier A | `algo.hpp`, `qdot.hpp` | Algorithms written against Tier P (dot, softmax, GEMM, quantised-row decode and dot, …) |
 | Tier R | `forge/simd/raw/x86.gen.hpp` (generated) | Raw x86 intrinsic wrappers from `ops/intrinsics/x86.json` (`ops/gen/intrin_gen.py`). Each wrapper requires its CPU feature, so using one the target lacks is a compile error |
 | Capabilities | `caps.hpp` | Feature tags; a target is a set of features |
@@ -19,9 +19,16 @@ Targets per architecture:
 
 | Arch | Targets (preferred first) | Requirements |
 |------|---------------------------|--------------|
-| x86_64 | `avx512`, `avx2`, `scalar` | `avx2`: the x86-64-v3 set (SSE2, SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI2). `avx512`: v3 plus AVX-512 F, BW, DQ, VL, CD |
+| x86_64 | `avx512`, `avx2`, `sse4.2`, `sse2`, `scalar` | `avx2`: the x86-64-v3 set (SSE2, SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI2). `avx512`: v3 plus AVX-512 F, BW, DQ, VL, CD. `sse4.2`: SSE2, SSE4.2, POPCNT (the TU is built with `-msse4.2 -mpopcnt`). `sse2`: the x86-64 baseline |
 | aarch64 | `sve`, `neon`, `scalar` | `sve`: a table built for exactly the hardware vector length (128, 256, 512 or 1024 bits) |
 | riscv64 | `rvv`, `scalar` | `rvv`: a table built for exactly the hardware VLEN (128, 256, 512 or 1024 bits) |
+| loongarch64 | `lasx`, `lsx`, `scalar` | `AT_HWCAP` bits LSX (1<<4) and LASX (1<<5) |
+| ppc64le | `vsx`, `scalar` | `AT_HWCAP` VSX and `AT_HWCAP2` ISA 2.07 (the TU is built for POWER8) |
+| s390x | `vxe`, `scalar` | `AT_HWCAP` VXRS and VXRS_EXT (z14: binary32 vectors) |
+| wasm32 | `simd128`, `scalar` | Chosen when the module is built (`-msimd128`); nothing is detected at run time |
+| mips64 | `msa`, `scalar` | `AT_HWCAP` MSA |
+| arm (32-bit) | `scalar`; `neon` only with `FORGE_SIMD_ARM32_NEON=1` | `AT_HWCAP` NEON and VFPv4. Never chosen automatically (see "Other architectures") |
+| x86 (32-bit) | `sse4.2`, `sse2`, `scalar` | As on x86_64. No AVX tables |
 | other | `scalar` | |
 
 SVE and RVV tables are built only for the lengths the compiler accepts (CMake prints `SVE kernel tables:` / `RVV kernel tables:`).
@@ -42,7 +49,8 @@ Matrix tile units are separate (`tile.hpp`, namespace `forge::simd::tile`). They
 |----------|---------|
 | `const cpu_features& detect()` | Cached feature flags (`avx2`, `avx512f`, …, `amx_permitted`, `sve_bytes`, `sve_hw_bytes`, `rvv_bytes`, `hybrid`, `vendor`, `brand`). `.summary()` is the one-line description `forge info` prints |
 | `const kernels& active()` | The table for this process. `FORGE_SIMD_TARGET` selects a table by name if it is usable here; otherwise the best usable target wins |
-| `const kernels* by_name(const char*)` | A specific table, or `nullptr` if it is not built or not usable here. Names: `scalar`; `avx2`, `avx512` (x86); `neon`, `sve` (aarch64); `rvv` (riscv64) |
+| `const kernels* by_name(const char*)` | A specific table, or `nullptr` if it is not built or not usable here. Names: `scalar`; `avx512`, `avx2`, `sse4.2` (also `sse42`), `sse2` (x86); `neon`, `sve` (aarch64); `rvv` (riscv64); `lasx`, `lsx`; `vsx`; `vxe`; `simd128`; `msa` |
+| `std::span<const char* const> target_names()` | Every table name, preferred first, `scalar` last. `active()` takes the first one `by_name` accepts; `forge info` prints the usable ones as `targets` |
 
 `kernels` fields:
 
@@ -94,12 +102,71 @@ float d = k.dot(x.data(), y.data(), x.size());            // 5000
 
 | Variable | Effect |
 |----------|--------|
-| `FORGE_SIMD_TARGET` | Force a table (`scalar`, `avx2`, …). Ignored if that table is not usable on this CPU |
+| `FORGE_SIMD_TARGET` | Force a table (`scalar`, `avx2`, `sse2`, `lsx`, …: any `by_name` name). Ignored if that table is not usable on this CPU |
 | `FORGE_LANE_TARGET` | Old name of `FORGE_SIMD_TARGET`, still read (after it) |
 | `FORGE_SVE_KEEP_VL=1` | aarch64 Linux: do not lower the SVE vector length at start-up (see below) |
+| `FORGE_SIMD_ARM32_NEON=1` | 32-bit Arm: make the `neon` table selectable with `FORGE_SIMD_TARGET=neon` (it flushes subnormals to zero) |
+
+## Other architectures (`vec_gn.hpp`)
+`vec_gn.hpp` is one more Tier P backend ("kind 6") with one implementation per ISA, selected by the compile flags of the translation unit. `simd/src/kernels_gn.cpp` is compiled once per table with that ISA's flags and exports the same `kernels` table as every other target (same Tier A templates, nothing forked). Only `float` vectors exist in Tier P, here as elsewhere.
+
+| ISA | Tag / preset | Lanes | Header, flags | Notes |
+|-----|--------------|-------|---------------|-------|
+| x86 SSE2 | `sse2` / `x86_64_v1` | 4 | `emmintrin.h`, none on x86-64 | Intrinsics only (also MSVC). No FMA instruction: `fma` goes through double (exact product, one extra rounding; within 2⁻²⁹ ulp of correctly rounded). Rounding and select are emulated |
+| x86 SSE4.2 | `sse2` / `x86_64_v2` | 4 | `smmintrin.h`, `-msse4.2 -mpopcnt` | As SSE2 with `roundps` and `blendvps` |
+| LoongArch LSX | `lsx` / `loongarch_lsx` | 4 | `lsxintrin.h`, `-mlsx` | |
+| LoongArch LASX | `lasx` / `loongarch_lasx` | 8 | `lasxintrin.h`, `-mlasx` | |
+| Power VSX | `vsx` / `power8` | 4 | `altivec.h`, `-mcpu=power8 -mvsx` | ppc64le only (big-endian ppc64 gets `scalar`) |
+| s390x vector | `s390_vxe` / `s390x_z14` | 4 | `vecintrin.h`, `-march=z14 -mzvector` | Needs z14 (binary32 vectors); z13 gets `scalar`. Big-endian |
+| WebAssembly SIMD128 | `wasm_simd128` / `wasm_simd` | 4 | `wasm_simd128.h`, `-msimd128` | `fma` through f64 as for SSE. relaxed-simd is not used: its `madd` may or may not fuse, so results would differ between engines |
+| MIPS MSA | `msa` / `mips_msa` | 4 | `msa.h`, `-mmsa` | |
+| Armv7 NEON + VFPv4 | `neon` / `armv7_neon` | 4 | `arm_neon.h`, `-mfpu=neon-vfpv4` | Opt-in (`FORGE_SIMD_ARM32_NEON=1`): Advanced SIMD on AArch32 flushes subnormals to zero, so `exp` below −87, `cbrt` and `erfc` of values with subnormal results miss the tolerance |
+
+Apart from SSE, the backends use GNU vector types for `+ - * /`, compares, bit operations and shifts, and the ISA's intrinsics for fused multiply-add, square root, rounding and mask extraction. Those TUs are built with `-ffp-contract=off`. All `vec_gn.hpp` functions have internal linkage, so the SSE2 and SSE4.2 tables (or LSX and LASX) never share a function body.
+
+Detection (`dispatch.cpp`) reads `AT_HWCAP` / `AT_HWCAP2` with `getauxval` (Linux) or `elf_aux_info` (FreeBSD; not run). A feature the whole build already requires (`__loongarch_sx`, `__VSX__` with POWER8) counts as present.
+
+What has run, all under emulation except SSE (2026-11-12; details in [STATUS.md](STATUS.md)):
+
+| Table | Compiled with | Run | `test_simd` |
+|-------|---------------|-----|-------------|
+| `sse2`, `sse4.2` (x86_64) | clang 23, g++ 13 (compile only) | Natively (forced with `FORGE_SIMD_TARGET`), and `qemu-x86_64 -cpu Nehalem` / `-cpu core2duo` (no AVX; core2duo has no SSE4.2) | 7/7 |
+| `sse2`, `sse4.2` (32-bit x86) | zig 0.17 (clang 22), by hand | `qemu-i386 -cpu Nehalem`, `-cpu core2duo` | 7/7. The 32-bit CMake branch has not been configured |
+| `lasx`, `lsx` | zig 0.17, CMake + toolchain file | `qemu-loongarch64 -cpu la464` | 7/7, each table also forced |
+| `vsx` | zig 0.17, CMake + toolchain file; g++ 13 by hand | `qemu-ppc64le -cpu power9` and `-cpu power8` | 7/7 |
+| `vxe` | zig 0.17, CMake + toolchain file; g++ 13 by hand | `qemu-s390x -cpu max` | 7/7. Not run on a z14-only CPU model (qemu-user rejects `-cpu z14`) |
+| `simd128` | zig 0.17 `wasm32-wasi`, `tests/wasm_simd.sh` | node 22 (V8) | 7/7 |
+| `msa` | zig 0.17, CMake + toolchain file | `qemu-mips64el -cpu Loongson-3A4000` | 7/7 |
+| `neon` (32-bit Arm) | zig 0.17 `-mcpu=cortex_a7`, by hand | `qemu-arm -cpu cortex-a7` | 5/7: the three subnormal sweeps fail, hence opt-in. CMake branch not configured |
+
+"By hand" means `kernels_gn.cpp`, `kernels_scalar.cpp`, `dispatch.cpp`, `qi8_dispatch.cpp`, `seq_scalar.cpp`, `seq_dispatch.cpp` and `tests/test_simd.cpp` compiled and linked directly with the flags the CMake branch uses. None of these tables has run on real hardware of its architecture, and no test other than `test_simd` has run on these architectures.
+
+Cross-build and test (zig wrappers as in [building.md](building.md); GNU cross compilers work the same way without the two `FORGE_CROSS_*` options):
+
+```sh
+cmake -S . -B build/loongarch64 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/loongarch64-lasx-qemu.cmake \
+  -DFORGE_CROSS_CC=/path/zig-cc-loongarch64 -DFORGE_CROSS_CXX=/path/zig-c++-loongarch64 \
+  -DCMAKE_EXE_LINKER_FLAGS=-static -DFORGE_BUILD_EXAMPLES=OFF
+ninja -C build/loongarch64 test_simd
+qemu-loongarch64 -cpu la464 build/loongarch64/test_simd      # or: ctest -R 'test_simd|lane_'
+```
+
+The same with `ppc64le-vsx-qemu.cmake` (`zig c++ -target powerpc64le-linux-musl`, `qemu-ppc64le -cpu power9`), `s390x-vxe-qemu.cmake` (`s390x-linux-musl`, `qemu-s390x -cpu max`) and `mips64el-msa-qemu.cmake` (`mips64el-linux-muslabi64`, `qemu-mips64el -cpu Loongson-3A4000`). Under an emulator ctest adds `lane_<table>`: `test_simd` with that table forced. Natively on x86_64, `lane_sse2` does the same.
+
+### WebAssembly
+FORGE as a whole is not ported to WebAssembly and there is no toolchain file. What works on `wasm32-wasi` is the simd layer: the headers under `forge/simd/` (with `forge/core/dtypes.hpp` and `fma.hpp`), the `scalar` and `simd128` kernel tables, `dispatch.cpp` (`detect()`, `active()`, `by_name()`), the scalar `seq` and `qi8` tables, and `tests/test_simd.cpp` including its oracle (`forge/verify/oracle.hpp`, `forge/ops`), which compile unchanged. `tests/wasm_simd.sh` builds exactly that and runs it:
+
+```sh
+cmake --preset dev                                  # generated headers
+CXX="zig c++ -target wasm32-wasi" tests/wasm_simd.sh      # runs under node; WASM_RUN="wasmtime run --dir=." for wasmtime
+```
+
+A module is validated as a whole, so SIMD128 is a build-time choice: with `-msimd128` the `simd128` table is compiled in and active, with `WASM_SIMD=0` (CMake: `-DFORGE_WASM_SIMD=OFF`) only `scalar` exists. zig's wasi C++ runtime has no exception support; the script links `tests/wasm_no_exceptions.cpp`, which aborts on a throw. Not run: wasmtime, a browser, Emscripten, the `WASM_SIMD=0` build, and the `wasm` branch of `CMakeLists.txt` (written, never configured).
 
 ## Platform notes and limits
 - Link `forge_simd_mv` whenever you use simd, directly or through gpu, graph or inference.
 - aarch64 Linux: if the hardware SVE length has no table (not a power of two, or above 1024 bits), a start-up constructor lowers the process VL with `prctl(PR_SVE_SET_VL)` to the largest length that has one. With `FORGE_SVE_KEEP_VL=1` the length is kept, `sve` is unusable, and NEON is used.
-- Run so far: x86_64 scalar/AVX2/AVX-512 natively. SVE (128–512 bits) and RVV (128–1024 bits) only under qemu-user. AMX natively on a Xeon and under Intel SDE. SME only under qemu. See [STATUS.md](STATUS.md).
+- MSVC (`cl`) builds have no CPUID detection in `dispatch.cpp`, so only `scalar` is usable there; the SSE tables are compiled but never selected.
+- Run so far: x86_64 scalar/SSE2/SSE4.2/AVX2/AVX-512 natively; the `vec_gn.hpp` tables for other architectures only under emulation (table above). SVE (128–512 bits) and RVV (128–1024 bits) only under qemu-user. AMX natively on a Xeon and under Intel SDE. SME only under qemu. See [STATUS.md](STATUS.md).
 - AMX on the Xeon VM failed intermittently. The cause was the VM losing tile registers across context switches, not FORGE (`tools/amx_state_probe.cpp` shows it with no FORGE code). `test_tile` retries before failing.

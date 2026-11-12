@@ -7,7 +7,7 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 | Variable | Read by | Effect |
 |----------|---------|--------|
 | `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
-| `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx2`, `avx512`, `neon`, `sve`, `rvv`. Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
+| `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx512`, `avx2`, `sse4.2`, `sse2`, `neon`, `sve`, `rvv`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` (32-bit Arm `neon` needs `FORGE_SIMD_ARM32_NEON=1` as well: [simd.md](simd.md)). Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
 | `FORGE_SVE_KEEP_VL=1` | simd (aarch64 Linux) | Do not change the SVE vector length at start-up when there is no kernel table for the hardware length |
 | `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
 | `FORGE_SPIN_US` | task pool | How long idle workers spin for the next `parallel_for` before sleeping (default 200; 0 = sleep at once) |

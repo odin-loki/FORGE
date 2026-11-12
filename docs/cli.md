@@ -12,7 +12,7 @@ Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage t
 ## Commands
 
 ### `forge info`
-Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
+Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), every kernel table this CPU can run, preferred first (line `targets`; pass one to `FORGE_SIMD_TARGET`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
 ### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [options]`
 Converts a model to `.fpk`.
