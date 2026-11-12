@@ -12,6 +12,9 @@
 #include <forge/os/detail.hpp>
 #endif
 #include <forge/os/clipboard_x11.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
+#endif
 
 namespace forge::os::clipboard {
 struct backend { std::function<result<std::string>()> get; std::function<status(const std::string&)> set; };

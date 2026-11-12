@@ -224,4 +224,29 @@ inline result<sleep_inhibitor> inhibit_sleep(const std::string& reason) {
     sleep_inhibitor s; s.token_ = t.value; s.kind_ = background::kind(t.value);
     return {std::move(s), {}};
 }
+// The machine's power profile: "power-saver", "balanced" or "performance" ("custom" for a Windows scheme that is
+// none of the three). Linux: power-profiles-daemon over D-Bus (os::desktop_bus), else the ACPI platform profile
+// in sysfs. Windows: PowerGetActiveScheme. macOS / iOS: low-power mode on or off. Elsewhere unsupported.
+inline result<std::string> profile() {
+#if defined(FORGE_OS_WINDOWS)
+    static HMODULE h = LoadLibraryExW(L"powrprof.dll", nullptr, 0x800 /*LOAD_LIBRARY_SEARCH_SYSTEM32*/);
+    auto f = h ? reinterpret_cast<DWORD(WINAPI*)(HKEY, GUID**)>(reinterpret_cast<void*>(GetProcAddress(h, "PowerGetActiveScheme"))) : nullptr;
+    if (!f) return {{}, unsupported("power profile (powrprof.dll)")};
+    GUID* g = nullptr; DWORD e = f(nullptr, &g);
+    if (e != ERROR_SUCCESS || !g) { if (e == ERROR_CALL_NOT_IMPLEMENTED || e == ERROR_SUCCESS) return {{}, unsupported("power profile")}; return {{}, error{int(e), "PowerGetActiveScheme: " + error_text(int(e))}}; }
+    const unsigned long d1 = g->Data1; LocalFree(g);
+    return {d1 == 0xa1841308ul ? "power-saver" : d1 == 0x381b4222ul ? "balanced" : d1 == 0x8c5e7fdaul ? "performance" : "custom", {}};
+#elif defined(__APPLE__)
+    return {power_status().low_power_mode ? "power-saver" : "balanced", {}};
+#elif defined(FORGE_OS_LINUX)
+    if (auto p = desktop_bus::power_profile()) return p;
+    std::string prof = detail::trim(detail::slurp("/sys/firmware/acpi/platform_profile"));
+    if (prof == "low-power" || prof == "quiet" || prof == "cool") return {"power-saver", {}};
+    if (prof == "balanced") return {"balanced", {}};
+    if (prof == "performance" || prof == "balanced-performance") return {"performance", {}};
+    return {{}, unsupported("power profile (no power-profiles-daemon and no ACPI platform profile)")};
+#else
+    return {{}, unsupported("power profile")};
+#endif
+}
 } // namespace forge::os::power

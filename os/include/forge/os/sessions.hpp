@@ -14,6 +14,9 @@
 //                     Android / iOS: unsupported.
 #include <forge/os/users.hpp>
 #include <forge/os/process.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
+#endif
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_ANDROID) && !defined(FORGE_OS_IOS)
 #include <utmpx.h>
 #define FORGE_OS_UTMPX 1

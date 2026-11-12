@@ -12,6 +12,9 @@
 #include <forge/os/detail.hpp>
 #include <forge/os/process.hpp>
 #include <forge/os/desktop_bus.hpp>
+#if defined(_MSC_VER)
+#pragma comment(lib, "user32.lib")   // MSVC links only kernel32 on its own
+#endif
 #if defined(FORGE_OS_WINDOWS)
 #include <shellapi.h>   // NOTIFYICONDATAW (types only)
 #endif
