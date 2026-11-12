@@ -7,12 +7,16 @@
 //                    (coarse: 0 until the desktop declares the session idle, then the time since it did).
 //   screen_locked()  Windows: the session's WTS lock flag (wtsapi32), else whether the input desktop can be
 //                    opened.  macOS: CGSSessionScreenIsLocked from CGSessionCopyCurrentDictionary.  Linux: logind
-//                    LockedHint (`loginctl show-session`).  FreeBSD: unsupported (no session manager records it).
+//                    LockedHint (login1 over D-Bus, else `loginctl show-session`), else the desktop's
+//                    org.freedesktop.ScreenSaver / org.gnome.ScreenSaver.  FreeBSD: that ScreenSaver service.
+//   D-Bus calls go through os::desktop_bus (no helper program); GNOME on Wayland also answers idle_seconds
+//   through org.gnome.Mutter.IdleMonitor.
 //   Android / iOS:   unsupported - an app is not told about other apps' input; use the lifecycle events of
 //                    forge_mobile (background / foreground) instead.
 // No graphical or login session (ssh, services, CI): unsupported.
 #include <forge/os/detail.hpp>
 #include <forge/os/process.hpp>
+#include <forge/os/desktop_bus.hpp>
 
 namespace forge::os {
 namespace detail_idle {
@@ -32,7 +36,10 @@ inline logind_session parse_loginctl(const std::string& text) {
 }
 #if defined(FORGE_OS_LINUX)
 inline result<logind_session> logind() {
-    if (find_executable("loginctl").empty()) return {{}, unsupported("session state (no loginctl)")};
+    if (auto d = desktop_bus::login_session()) {   // login1 over the system bus, spoken directly; loginctl is the fallback
+        logind_session s; s.found = true; s.idle = d->idle; s.locked = d->locked; s.idle_since_us = d->idle_since_monotonic_us; return {s, {}};
+    }
+    if (find_executable("loginctl").empty()) return {{}, unsupported("session state (no logind session)")};
     spawn_spec sp; sp.argv = {"loginctl", "show-session"};
     if (auto id = getenv("XDG_SESSION_ID"); !id.empty()) sp.argv.push_back(id);
     for (const char* p : {"IdleHint", "IdleSinceHintMonotonic", "LockedHint"}) { sp.argv.push_back("-p"); sp.argv.push_back(p); }
@@ -88,6 +95,7 @@ inline result<double> idle_seconds() {
     return {s < 0 ? 0 : s, {}};
 #elif defined(FORGE_OS_LINUX) || defined(FORGE_OS_FREEBSD)
     if (long long ms = detail_idle::x11_idle_ms(); ms >= 0) return {double(ms) / 1000.0, {}};
+    if (has_env("WAYLAND_DISPLAY") || has_env("DISPLAY")) { if (auto m = desktop_bus::mutter_idle_ms()) return {double(m.value) / 1000.0, {}}; }   // GNOME (Wayland)
 #if defined(FORGE_OS_LINUX)
     auto s = detail_idle::logind(); if (!s) return {0, s.err};
     if (!s->idle || !s->idle_since_us) return {0.0, {}};
@@ -133,8 +141,13 @@ inline result<bool> screen_locked() {
     cf.CFRelease(k); cf.CFRelease(d);
     return {locked, {}};
 #elif defined(FORGE_OS_LINUX)
-    auto s = detail_idle::logind(); if (!s) return {false, s.err};
-    return {s->locked, {}};
+    auto s = detail_idle::logind();
+    if (s) return {s->locked, {}};
+    if (auto a = desktop_bus::screensaver_active()) return {a.value, {}};   // no logind: the desktop's ScreenSaver service
+    return {false, s.err};
+#elif defined(FORGE_OS_FREEBSD)
+    if (auto a = desktop_bus::screensaver_active()) return {a.value, {}};
+    return {false, unsupported("screen lock state (no ScreenSaver service on the session bus)")};
 #else
     return {false, unsupported("screen lock state")};
 #endif

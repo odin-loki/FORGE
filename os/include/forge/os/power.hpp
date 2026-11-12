@@ -194,3 +194,34 @@ inline power_state power_status() {
     return p;
 }
 } // namespace forge::os
+
+#include <forge/os/background.hpp>
+namespace forge::os::power {
+// Holds the machine awake (no idle sleep) while it lives. What holds it: Windows a power request
+// (PowerCreateRequest + SystemRequired), macOS an IOPMAssertion (PreventUserIdleSystemSleep), Linux a logind
+// block inhibitor ("sleep:idle"), FreeBSD a ConsoleKit2 inhibitor when present, iOS a background task, Android the
+// app's foreground-service / wake-lock hooks (background::set_hooks). kind() names it; "not_required" means the
+// OS has nothing that would put the machine to sleep on its own (containers, servers without a session manager).
+class sleep_inhibitor {
+public:
+    sleep_inhibitor() = default;
+    sleep_inhibitor(const sleep_inhibitor&) = delete; sleep_inhibitor& operator=(const sleep_inhibitor&) = delete;
+    sleep_inhibitor(sleep_inhibitor&& o) noexcept : token_(std::exchange(o.token_, 0)), kind_(std::move(o.kind_)) {}
+    sleep_inhibitor& operator=(sleep_inhibitor&& o) noexcept { if (this != &o) { release(); token_ = std::exchange(o.token_, 0); kind_ = std::move(o.kind_); } return *this; }
+    ~sleep_inhibitor() { release(); }
+    bool active() const { return token_ != 0; }
+    const std::string& kind() const { return kind_; }
+    void release() { if (token_) { background::end(token_); token_ = 0; } }
+private:
+    friend result<sleep_inhibitor> inhibit_sleep(const std::string&);
+    std::uint64_t token_ = 0; std::string kind_;
+};
+// `reason` is shown by the OS where it lists what keeps the machine awake (powercfg /requests, pmset -g
+// assertions, systemd-inhibit --list).
+inline result<sleep_inhibitor> inhibit_sleep(const std::string& reason) {
+    auto t = background::begin(reason.empty() ? std::string("forge") : reason);
+    if (!t) return {{}, t.err};
+    sleep_inhibitor s; s.token_ = t.value; s.kind_ = background::kind(t.value);
+    return {std::move(s), {}};
+}
+} // namespace forge::os::power

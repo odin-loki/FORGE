@@ -1133,7 +1133,7 @@ endif()
 
 # ---- fuzz targets (fuzz/): libFuzzer entry points + a built-in mutational driver for CI ----
 if(FORGE_BUILD_TESTS)
-  foreach(ft json blueprint fpk safetensors gguf tokenizer grammar onnx)
+  foreach(ft json blueprint fpk safetensors gguf tokenizer grammar onnx dbus)
     if(FORGE_LIBFUZZER)
       add_executable(fuzz_${ft} fuzz/fuzz_${ft}.cpp)
       target_compile_options(fuzz_${ft} PRIVATE -fsanitize=fuzzer)
