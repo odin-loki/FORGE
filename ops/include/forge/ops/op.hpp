@@ -4,6 +4,7 @@
 #include <forge/core/tensor.hpp>
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <map>
 #include <optional>
 #include <string>
@@ -284,7 +285,12 @@ inline shape_t infer_shape(shape_rule r, const std::vector<shape_t>& in, const a
     }
     case shape_rule::reshape: {
         need(1); auto t = a.ints("shape"); i64 known = 1; int neg = -1;
-        for (std::size_t i = 0; i < t.size(); ++i) { if (t[i] == -1) neg = int(i); else known *= t[i]; }
+        for (std::size_t i = 0; i < t.size(); ++i) {
+            if (t[i] == -1) { neg = int(i); continue; }
+            // target dims come from model files and RPC peers: no negative sizes, no i64 overflow in the product
+            if (t[i] < 0 || (t[i] > 0 && known > std::numeric_limits<i64>::max() / t[i])) raise(errc::shape_mismatch, "bad reshape target {}", shape_str(t));
+            known *= t[i];
+        }
         i64 n = numel(in[0]);
         if (neg >= 0) { if (known == 0 || n % known) raise(errc::shape_mismatch, "bad reshape"); t[std::size_t(neg)] = n / known; }
         if (numel(t) != n) raise(errc::shape_mismatch, "reshape {} -> {} changes size", shape_str(in[0]), shape_str(t));

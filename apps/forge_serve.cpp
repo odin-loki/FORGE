@@ -20,6 +20,7 @@
 #include <forge/os/numa.hpp>
 #include <forge/os/service.hpp>
 #include <forge/security/security.hpp>
+#include "serve_http.hpp"
 #include <signal.h>
 #include <atomic>
 #include <cstdio>
@@ -37,34 +38,14 @@ struct conn {
     }
 };
 
-struct http_request { std::string method, path, body; std::map<std::string, std::string> headers; };
+using serve::http_request;
 
 bool read_request(forge_sock_t fd, http_request& r) {
-    std::string buf; char tmp[8192];
-    std::size_t hdr_end;
-    while ((hdr_end = buf.find("\r\n\r\n")) == std::string::npos) {
-        auto n = ::recv(fd, tmp, sizeof tmp, 0); if (n <= 0) return false; buf.append(tmp, std::size_t(n));
-        if (buf.size() > (1u << 20)) return false;
-    }
-    auto line_end = buf.find("\r\n");
-    auto first = buf.substr(0, line_end);
-    auto sp1 = first.find(' '), sp2 = first.find(' ', sp1 + 1);
-    if (sp1 == std::string::npos || sp2 == std::string::npos) return false;
-    r.method = first.substr(0, sp1); r.path = first.substr(sp1 + 1, sp2 - sp1 - 1);
-    std::size_t p = line_end + 2;
-    while (p < hdr_end) {
-        auto e = buf.find("\r\n", p); auto l = buf.substr(p, e - p); p = e + 2;
-        auto c = l.find(':'); if (c == std::string::npos) continue;
-        std::string k = l.substr(0, c); for (auto& ch : k) ch = char(std::tolower(static_cast<unsigned char>(ch)));
-        auto v = l.substr(c + 1); while (!v.empty() && v[0] == ' ') v.erase(0, 1);
-        r.headers[k] = v;
-    }
-    std::size_t len = r.headers.count("content-length") ? std::stoul(r.headers["content-length"]) : 0;
-    if (len > (64u << 20)) return false;
-    r.body = buf.substr(hdr_end + 4);
-    while (r.body.size() < len) { auto n = ::recv(fd, tmp, sizeof tmp, 0); if (n <= 0) return false; r.body.append(tmp, std::size_t(n)); }
-    r.body.resize(len);
-    return true;
+#if defined(_WIN32)
+    return serve::read_request([fd](char* b, std::size_t n) { return ::recv(fd, b, int(n), 0); }, r);
+#else
+    return serve::read_request([fd](char* b, std::size_t n) { return ::recv(fd, b, n, 0); }, r);
+#endif
 }
 
 std::string response(int code, const std::string& body, const char* type = "application/json") {

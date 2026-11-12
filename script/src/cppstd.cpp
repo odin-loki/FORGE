@@ -8,6 +8,7 @@
 #include "shells/shell.hpp"
 #include <forge/script/script.hpp>
 #include <forge/os/process.hpp>
+#include <forge/security/enforce.hpp>
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -590,10 +591,12 @@ void install_cpp_std(Shared& sh) {
     def("std::getenv", 1, 1, [](Interp& in, Args& a) -> Value {
         if (!in.caps.env) in.raise("PermissionError", "environment access is disabled in this sandbox");   // same gate as os.env
         auto k = in.str(a[0]); enforce_scope(in, SecScope::env, k); if (!os::has_env(k)) return Nil{}; return sv(os::getenv(k)); });
-    def("forge::shells", 0, 0, [](Interp&, Args&) -> Value {
+    def("forge::shells", 0, 0, [](Interp& in, Args&) -> Value {
         auto l = make<List>();
+        // Identity probes start the candidate shells: only where this script may start processes at all.
+        bool probe = in.caps.proc && !security::active_policy()->active();
         for (auto& b : shells().all()) {
-            auto m = make<Map>(); std::string exe = shell_exe(b);
+            auto m = make<Map>(); std::string exe = shell_exe(b, probe);
             m->set_str("name", sv(b.name)); m->set_str("family", sv(b.family)); m->set_str("available", !exe.empty()); m->set_str("exe", sv(exe));
             m->set_str("tested", b.golden_tested); m->set_str("emit", bool(b.emitter)); m->set_str("emit_tested", b.emit_tested); auto al = make<List>(); for (auto& x : b.aliases) al->push(sv(x)); m->set_str("aliases", obj(al));
             l->push(obj(m));

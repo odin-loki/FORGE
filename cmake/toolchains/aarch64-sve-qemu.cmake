@@ -7,4 +7,7 @@ set(FORGE_CROSS_CC aarch64-linux-gnu-gcc CACHE STRING "")
 set(FORGE_CROSS_CXX aarch64-linux-gnu-g++ CACHE STRING "")
 set(CMAKE_C_COMPILER ${FORGE_CROSS_CC})
 set(CMAKE_CXX_COMPILER ${FORGE_CROSS_CXX})
-set(CMAKE_CROSSCOMPILING_EMULATOR qemu-aarch64;-cpu;max,sve256=on)
+# The emulated CPU of the ordinary tests; -DFORGE_QEMU_CPU=max,sve512=on reruns them at another vector length
+# without rebuilding (the lane_sve_vl<N> / tile_sme_svl<N> tests set their own).
+set(FORGE_QEMU_CPU "max,sve256=on" CACHE STRING "qemu -cpu model for tests")
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-aarch64;-cpu;${FORGE_QEMU_CPU})

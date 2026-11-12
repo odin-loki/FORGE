@@ -404,6 +404,19 @@ TEST(json_schema_grammar) {
     CHECK(run2("[1,2.5e3]")); CHECK(run2("[1,2,3]")); CHECK(!run2("[1]")); CHECK(!run2("[1,2,3,4]")); CHECK(run2("null")); CHECK(run2(R"({"k":1})"));
     CHECK(run2("[1,2]") && !run2("[01,2]"));
     CHECK_THROWS(json_schema_to_gbnf(json::parse(R"({"$ref":"#/$defs/none"})")));
+    // Request-controlled schemas (found by fuzz_json_schema): item bounds outside long's range are refused before
+    // the conversion, a negative minItems means none, and nested "type" lists stop at the visit budget.
+    CHECK_THROWS(json_schema_to_gbnf(json::parse(R"({"type":"array","minItems":1e300})")));
+    CHECK_THROWS(json_schema_to_gbnf(json::parse(R"({"type":"array","maxItems":1e300})")));
+    {
+        grammar g3(json_schema_to_gbnf(json::parse(R"({"type":"array","items":{"type":"integer"},"minItems":-5,"maxItems":2})")));
+        auto run3 = [&](std::string s) { auto st = g3.start(); for (unsigned char ch : s) { st = g3.advance(st, ch); if (st.empty()) return false; } return grammar::can_end(st); };
+        CHECK(run3("[]")); CHECK(run3("[1,2]")); CHECK(!run3("[,1]")); CHECK(!run3("[1,2,3]"));
+    }
+    std::string deep = R"({"type":"string"})";
+    for (int i = 0; i < 24; ++i) deep = R"({"type":["object","object"],"properties":{"a":)" + deep + "}}";
+    auto deep_schema = json::parse(deep);   // 2^24 visits without the budget
+    CHECK_THROWS(json_schema_to_gbnf(deep_schema));
 }
 
 TEST(lora_hot_swap) {

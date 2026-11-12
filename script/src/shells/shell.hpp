@@ -19,6 +19,11 @@ struct shell_backend {
     std::function<std::vector<std::string>(const std::string& exe, const std::string& script)> argv;
     std::function<std::string(const std::string&)> quote;   // one literal argument, for {} interpolation
     std::string family;                       // posix, csh, fish, nu, python, elvish, powershell, cmd, rc
+    // Identity probe: a one-line script in this shell's own syntax and the stdout it must print (trailing
+    // whitespace ignored). A file on PATH that merely has the shell's name (npm's `rc`, the Windows Resource
+    // Compiler, an `es` or `nu` from another project) fails it and is not treated as this shell. Empty = the
+    // name alone is trusted (sh, bash, ...).
+    std::string probe, probe_out;
     bool golden_tested = false;               // true = covered by tests/test_shells.cpp on CI boxes that have it
     std::string notes;
     // Emitter for `forge script --emit <name>` (null = this shell has no emitter yet).
@@ -41,7 +46,13 @@ private:
 const shell_registry& shells();     // all registered backends (built once)
 // The executable to run for a backend ("" if none is installed). On Windows this is a full path and skips
 // the WSL bash relays (System32 and WindowsApps bash.exe), which run Linux bash and cannot take Windows paths or quoting.
-std::string shell_exe(const shell_backend& b);
+// With `probe` (the default) a candidate of a backend that has an identity probe is run once per process (the
+// verdict is cached by resolved path, 5 s timeout) and skipped if it is some other program; the search then goes
+// on along PATH, and a later match is returned as a full path. probe = false only looks at PATH and never
+// starts a process (for sandboxes that may not run one).
+std::string shell_exe(const shell_backend& b, bool probe = true);
+// True if `exe` (a name or path) passes b's identity probe, or b has none.
+bool shell_probe(const shell_backend& b, const std::string& exe);
 
 namespace shellq {
 inline std::string posix(const std::string& s) { std::string o = "'"; for (char c : s) { if (c == '\'') o += "'\\''"; else o += c; } return o + "'"; }

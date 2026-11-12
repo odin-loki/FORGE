@@ -134,6 +134,7 @@ void forge_shell_register_ysh(forge::script::shell_registry& r) {
     forge::script::shell_backend b; b.name = "ysh"; b.exes = {"ysh"}; b.family = "posix"; b.golden_tested = true;
     b.notes = "Oils new shell; J8 b'...' literals";
     b.quote = forge::script::jq; b.argv = forge::script::shellq::dash_c;
+    b.probe = "var x = 1 + 2; write -- $x"; b.probe_out = "3";
     b.emitter = [] { return std::make_unique<forge::script::ysh_dialect>(); }; b.emit_ext = ".ysh"; b.emit_tested = true;
     r.add(std::move(b));
 }

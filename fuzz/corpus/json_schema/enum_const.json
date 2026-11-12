@@ -1,0 +1,1 @@
+{"anyOf": [{"enum": ["a", 1, null, true, {"k": [1.5]}]}, {"const": "x\"y\\z\u00e9"}]}

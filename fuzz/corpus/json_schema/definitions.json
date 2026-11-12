@@ -1,0 +1,1 @@
+{"definitions": {"a": {"oneOf": [{"type": "boolean"}, {"type": "null"}]}}, "type": "array", "items": {"$ref": "#/definitions/a"}, "maxItems": 0}

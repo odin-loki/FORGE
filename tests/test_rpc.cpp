@@ -51,6 +51,43 @@ TEST(rpc_errors_propagate) {
     CHECK(y.data[0] == 0.f);
     srv.stop();
 }
+
+// A peer chooses the op, the number of inputs, every shape and the output shape. The server runs a frame only
+// if it is a well-formed call (found by fuzz_rpc: softmax with no inputs indexed past the input list; an output
+// shape smaller than the op's result is a heap overflow; reshape dims overflowed i64).
+TEST(rpc_malformed_calls_are_refused) {
+    graph::rpc::server srv(nullptr, 0); srv.start();
+    auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
+    CHECK(c != nullptr);
+    tensor x({2, 4}), w({3, 4}), y({2, 4}), small({1}), w5({5});
+    tensor_view vx{x.data.data(), x.shape}, vw{w.data.data(), w.shape}, vw5{w5.data.data(), w5.shape};
+    auto refused = [&](const char* op, std::vector<tensor_view> in, tensor& out, const ops::attrs& a = {}) {
+        try { c->run(op, in, {out.data.data(), out.shape}, a); } catch (const forge_exception& e) { return std::string(e.what()).find("rpc server:") != std::string::npos; }
+        return false;
+    };
+    CHECK(refused("softmax", {}, y));                    // no inputs
+    CHECK(refused("relu", {vx, vx}, y));                 // too many
+    CHECK(refused("relu", {vx}, small));                 // output smaller than the result
+    CHECK(refused("matmul_t", {vx, vw}, y));             // [2,4] x [3,4]^T is [2,3], not [2,4]
+    CHECK(refused("matmul_t", {vx, vw5}, y));            // weight of the wrong rank
+    CHECK(refused("rms_norm", {vx, vw5}, y));            // weight longer than the last axis
+    CHECK(refused("rope", {vx, vw5}, y));                // not [s, h, d]
+    ops::attrs big; big.set("shape", std::vector<i64>{i64(1) << 40, i64(1) << 40, 8});
+    CHECK(refused("reshape", {vx}, y, big));             // 2^83 elements
+    ops::attrs neg; neg.set("shape", std::vector<i64>{-2, -4});
+    CHECK(refused("reshape", {vx}, y, neg));
+    for (auto& v : x.data) v = -1.f;                     // every refusal left the connection usable
+    c->run("relu", std::span<const tensor_view>(&vx, 1), {y.data.data(), y.shape}, {});
+    CHECK(y.data[0] == 0.f);
+    srv.stop();
+    graph::rpc::server lim(nullptr, 0); lim.max_tensor_elems = 4; lim.start();   // a frame naming a larger tensor is dropped unread
+    auto c2 = graph::rpc::client::connect("127.0.0.1", std::to_string(lim.port()), nullptr);
+    CHECK(c2 != nullptr);
+    bool lost = false;
+    try { c2->run("relu", std::span<const tensor_view>(&vx, 1), {y.data.data(), y.shape}, {}); } catch (const forge_exception&) { lost = true; }
+    CHECK(lost);
+    lim.stop();
+}
 TEST(rpc_connect_failure_falls_back) {
     std::string why; auto r = graph::device_registry("rpc:127.0.0.1:1", &why);
     CHECK(!r); CHECK(!why.empty());

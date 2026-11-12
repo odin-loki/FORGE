@@ -90,6 +90,7 @@ struct py_dialect : block_dialect {
 void forge_shell_register_xonsh(forge::script::shell_registry& r) {
     forge::script::shell_backend b; b.name = "xonsh"; b.exes = {"xonsh"}; b.family = "python"; b.golden_tested = true;
     b.argv = [](const std::string& exe, const std::string& sc) -> std::vector<std::string> { return {exe, "--no-rc", "-c", sc}; };
+    b.probe = "print(__xonsh__ is not None)"; b.probe_out = "True";   // plain Python: NameError
     b.quote = [](const std::string& s) { std::string o = "'"; for (char c : s) { if (c == '\'' || c == '\\') o += '\\'; if (c == '\n') { o += "\\n"; continue; } o += c; } return o + "'"; };
     b.emitter = [] { return std::make_unique<py_dialect>(); }; b.emit_ext = ".xsh"; b.emit_tested = true;
     r.add(std::move(b));

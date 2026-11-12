@@ -126,6 +126,7 @@ void forge_shell_register_rc(forge::script::shell_registry& r) {
     for (auto n : {"rc", "es"}) {
         forge::script::shell_backend b; b.name = n; b.exes = {n}; b.family = "rc";
         b.argv = forge::script::shellq::dash_c; b.quote = [](const std::string& s) { return forge::script::shellq::doubled(s, '\''); };
+        b.probe = "echo a^b"; b.probe_out = "ab";   // ^ concatenates in rc and es only
         bool is_es = std::string(n) == "es";
         b.emitter = [is_es] { auto d = std::make_unique<rc_dialect>(); d->es = is_es; return d; };
         b.emit_ext = is_es ? ".es" : ".rc"; b.emit_tested = true; b.golden_tested = true;
