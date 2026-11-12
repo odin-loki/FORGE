@@ -157,6 +157,11 @@ GPU, and nothing was built by a compiler other than clang 23.
   [gpu.md](gpu.md#eviction-and-recorded-graphs)). On the mocks the CUDA / HIP re-record uses the generated
   parameter-size table, since the mock has no `cuFuncGetParamInfo`; the driver path of that lookup has not run.
   Still not possible: eviction while a CUDA / HIP stream capture is open. Not run on the RTX 3090.
+- **`gpu::prims` (FORGE_PLAN B.6)**: `gemv`, `gemm_batched` with an epilogue, `conv1d` / `conv2d`, `fft`,
+  `softmax`, `rms_norm`, `layer_norm`, `flash_attention` on the CPU (`prims.hpp`), and all but the FFT on a device
+  through the generated kernels (`prims_device.hpp`). CPU: 5 new `test_gpu` tests against the float64 references on
+  this x86_64 machine only. Device: `prims_check` 22/22 on the CUDA, HIP, OpenCL, Level Zero **mocks**
+  and on **lavapipe**; Metal never executed; no GPU. The device epilogue is separate launches, not a fused kernel.
 - The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
   tests pass unchanged after the move.
 

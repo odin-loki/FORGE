@@ -126,6 +126,7 @@ static int ported(std::shared_ptr<gpu::vk::runtime> rt) {
     fails += qgather_check(*reg, api);
     fails += moe_check(*reg, api, disp);
     fails += nn_ops_check(*reg, api);
+    fails += prims_check(*rt, api);
     {   // broadcast add/sub/mul/div through the vk.<op> lowerings (forge_bcast), both operand orders
         int bf = 0, n = 0;
         for (auto o : {ops::op::add, ops::op::sub, ops::op::mul, ops::op::div}) for (int swap = 0; swap < 2; ++swap) {

@@ -307,6 +307,7 @@ template<class RT, class Open> static int device_t(Open open) {
         if constexpr (requires { rt->run_fused(std::string(), std::vector<tensor_view>(), std::vector<tensor_view>(), ops::attrs()); })
             if (api == "cuda" || api == "hip") dec_fails += fusion_check(*rt, api);
     }
+    dec_fails += prims_check(*rt, api);   // gpu::prims on the device (gpu/prims_device.hpp)
     auto shared = std::shared_ptr<RT>(std::move(rt));
     auto reg = graph::gpu_registry(shared);
     auto mma_runs = [&]() -> std::size_t { auto d = shared->dispatches(); auto it = d.find("qmatmul_mma"); return it == d.end() ? 0 : it->second; };

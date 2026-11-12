@@ -5,6 +5,7 @@
 #pragma once
 #include <forge/graph/graph.hpp>
 #include <forge/graph/vulkan.hpp>
+#include <forge/gpu/prims_device.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace forge_test::gpu_checks {
@@ -466,6 +468,73 @@ inline int nn_ops_check(graph::registry& reg, const std::string& api) {
         run("attention_bias", {rnd({t, hq, d}, -1.f, 1.f), k, v, pad}, {}, "key padding mask, s = t");
     }
     std::printf("%s %d/%d %s encoder / vision cases (gelu, norms, conv, pooling, attention_bias) match the references\n", fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
+    return fails;
+}
+
+// gpu::prims on the device (gpu/prims_device.hpp): GEMV and batched GEMM with an epilogue, convolution, softmax, RMS and
+// layer norm, flash attention, each against the op's float64 reference, outside a run and inside one (resident
+// buffers). A primitive the device refuses is a failure here: every backend under test has these kernels.
+template<class RT> int prims_check(RT& rt, const std::string& api) {
+    namespace P = gpu::prims; namespace D = gpu::prims::device;
+    int fails = 0, n = 0;
+    std::uint32_t seed = 99;
+    auto chk = [&](bool ran, const std::vector<float>& got, const tensor& ref, double tol, const char* what) {
+        ++n;
+        double w = got.size() == ref.data.size() ? 0 : 1e9;
+        for (std::size_t i = 0; i < std::min(got.size(), ref.data.size()); ++i) w = std::max(w, std::fabs(double(got[i]) - ref.data[i]) / std::max(1.0, std::fabs(double(ref.data[i]))));
+        if (!ran || !(w <= tol)) { std::printf("FAIL %s prims::%s: %s (worst %.3g, bound %.3g)\n", api.c_str(), what, ran ? "wrong result" : "the device refused it", w, tol); ++fails; }
+    };
+    auto act_ref = [](const tensor& t, const char* name) { return ops::reference(*ops::op_from_name(name))({t}, {}); };
+    for (int in_run = 0; in_run < 2; ++in_run) {
+        // inputs and outputs stay alive until end_run: resident buffers are keyed by host address
+        std::deque<tensor> kt; std::deque<std::vector<float>> kv;
+        auto rnd = [&](shape_t sh, float lo, float hi) -> tensor& { tensor& t = kt.emplace_back(sh); for (auto& v : t.data) { seed = seed * 1664525u + 1013904223u; v = lo + (hi - lo) * float(seed >> 8) / float(1u << 24); } return t; };
+        auto out = [&](std::size_t cnt) -> std::vector<float>& { return kv.emplace_back(cnt, -7.f); };
+        if (in_run) rt.begin_run();
+        auto sync = [&](std::vector<float>& y) { if (in_run) rt.to_host(y.data(), y.size()); };
+        const std::size_t nn = 37, k = 96, batch = 3, m = 5;
+        auto& W = rnd({i64(nn), i64(k)}, -1, 1); auto& x = rnd({1, i64(k)}, -1, 1); auto& bias = rnd({i64(nn)}, -1, 1); auto& A = rnd({i64(batch), i64(m), i64(k)}, -1, 1);
+        { auto& y = out(nn); bool ok = D::gemv(rt, W.data.data(), x.data.data(), y.data(), nn, k, {bias.data.data(), P::act::silu}); sync(y);
+          chk(ok, y, act_ref(ops::ref::add({ops::ref::matmul_t({x, W}, {}), bias}, {}), "silu"), 2e-5, "gemv + bias + silu"); }
+        { auto& y = out(batch * m * nn); bool ok = D::gemm_batched(rt, A.data.data(), W.data.data(), y.data(), batch, m, nn, k, true, {bias.data.data(), P::act::relu}); sync(y);
+          chk(ok, y, act_ref(ops::ref::add({ops::ref::matmul_t({A, W}, {}), bias}, {}), "relu"), 2e-5, "gemm_batched + bias + relu"); }
+        { auto& Bb = rnd({i64(batch), i64(nn), i64(k)}, -1, 1); auto& y = out(batch * m * nn);
+          bool ok = D::gemm_batched(rt, A.data.data(), Bb.data.data(), y.data(), batch, m, nn, k, false, {nullptr, P::act::tanh}); sync(y);
+          tensor ref({i64(batch), i64(m), i64(nn)});
+          for (std::size_t b = 0; b < batch; ++b) { tensor ab({i64(m), i64(k)}), bb({i64(nn), i64(k)});
+              std::copy_n(A.data.data() + b * m * k, m * k, ab.data.data()); std::copy_n(Bb.data.data() + b * nn * k, nn * k, bb.data.data());
+              auto r = act_ref(ops::ref::matmul_t({ab, bb}, {}), "tanh"); std::copy(r.data.begin(), r.data.end(), ref.data.begin() + std::ptrdiff_t(b * m * nn)); }
+          chk(ok, y, ref, 2e-5, "gemm_batched, one weight per batch, + tanh"); }
+        { auto& cx = rnd({4, 12, 10}, -1, 1); auto& cw = rnd({6, 2, 2, 3}, -1, 1); auto& cb = rnd({1}, -1, 1);
+          P::conv_geom g; g.stride[0] = 2; g.pad[1] = 2; g.dilation[1] = 2;
+          ops::attrs a{{"stride", std::vector<i64>{2, 1}}, {"pad", std::vector<i64>{0, 2}}, {"dilation", std::vector<i64>{1, 2}}, {"groups", 2.0}};
+          tensor r = ops::ref::conv2d({cx, cw, cb}, a); auto& y = out(r.data.size());
+          bool ok = D::conv2d(rt, cx.data.data(), cw.data.data(), cb.data.data(), y.data(), 4, 12, 10, 6, 2, 2, 3, g, 1); sync(y);
+          chk(ok, y, r, 1e-4, "conv2d"); }
+        { auto& cx = rnd({6, 40}, -1, 1); auto& cw = rnd({4, 3, 5}, -1, 1); auto& cb = rnd({4}, -1, 1);
+          tensor r = ops::ref::conv1d({cx, cw, cb}, {{"stride", 2.0}, {"pad", 3.0}, {"dilation", 2.0}, {"groups", 2.0}}); auto& y = out(r.data.size());
+          bool ok = D::conv1d(rt, cx.data.data(), cw.data.data(), cb.data.data(), y.data(), 6, 40, 4, 3, 5, 2, 3, 2); sync(y);
+          chk(ok, y, r, 1e-4, "conv1d"); }
+        { const std::size_t rows = 7, cols = 133; auto& sx = rnd({i64(rows), i64(cols)}, -4, 4); auto& sw = rnd({i64(cols)}, 0.5f, 1.5f); auto& sb = rnd({i64(cols)}, -1, 1);
+          auto& y = out(rows * cols);
+          bool ok = D::softmax(rt, sx.data.data(), y.data(), rows, cols); sync(y); chk(ok, y, ops::ref::softmax({sx}, {}), 2e-5, "softmax");
+          auto& y2 = out(rows * cols);
+          ok = D::rms_norm(rt, sx.data.data(), sw.data.data(), y2.data(), rows, cols, 1e-6f); sync(y2); chk(ok, y2, ops::ref::rms_norm({sx, sw}, {{"eps", 1e-6}}), 2e-5, "rms_norm");
+          auto& y3 = out(rows * cols);
+          ok = D::layer_norm(rt, sx.data.data(), sw.data.data(), sb.data.data(), y3.data(), rows, cols, 1e-5f); sync(y3);
+          chk(ok, y3, ops::ref::layer_norm({sx, sw, sb}, {{"eps", 1e-5}}), 2e-5, "layer_norm"); }
+        for (auto [s, t, causal, window] : {std::tuple<i64, i64, bool, i64>{1, 37, true, 0}, {70, 90, true, 33}, {40, 40, false, 0}}) {
+            const i64 hq = 4, hk = 2, d = 32, dv = 32;
+            auto& q = rnd({s, hq, d}, -1, 1); auto& kk = rnd({t, hk, d}, -1, 1); auto& v = rnd({t, hk, dv}, -1, 1);
+            tensor r = ops::ref::attention({q, kk, v}, {{"causal", causal ? 1.0 : 0.0}, {"window", double(window)}}); auto& y = out(r.data.size());
+            P::attention_opts o; o.causal = causal; o.window = std::size_t(window);
+            bool ok = D::flash_attention(rt, q.data.data(), kk.data.data(), v.data.data(), y.data(), std::size_t(s), std::size_t(hq), std::size_t(d), std::size_t(t), std::size_t(hk), std::size_t(dv), o);
+            sync(y); chk(ok, y, r, 2e-3, "flash_attention");   // 2e-3: the fp16 tensor-core kernel's bound (attention_dec_check)
+        }
+        if (in_run) rt.end_run();
+    }
+    std::printf("%s %d/%d %s device prims (gemv, batched gemm + epilogue, convolution, softmax, norms, flash attention) match the references\n",
+                fails ? "FAIL" : "ok  ", n - fails, n, api.c_str());
     return fails;
 }
 

@@ -316,8 +316,26 @@ The runtimes read the switch at each launch, so it can be changed between runs; 
 | `graph::copy(src, dst)`, `graph::launch(kernel, extent, args...)`, `graph::host(fn)` | Return a node. Nodes run in recorded order by default; `node.after(other)` adds a dependency |
 | `graph::compile(device)` → `executable` | `run()` replays the flat order; `steps()` counts nodes |
 | `item<3>` | `global(d)`, `local(d)`, `group(d)`, `range(d)` |
-| `gpu::prims` | `reduce`, `scan(x, y, inclusive = true)`, `compact(x, out, pred)`, `radix_sort(keys, vals = {})`, `histogram`, `segmented_scan`, `segmented_reduce`, `bitonic_sort`, `top_k`, `gemm_nt`, `philox_uniform`, `hash_map`. CPU implementations |
+| `gpu::prims` | `reduce`, `scan(x, y, inclusive = true)`, `compact(x, out, pred)`, `radix_sort(keys, vals = {})`, `histogram`, `segmented_scan`, `segmented_reduce`, `bitonic_sort`, `top_k`, `gemm_nt`, `philox_uniform`, `hash_map`, and the linear-algebra / signal / normalisation / attention primitives of the next table. CPU implementations |
+| `gpu::prims::device` (`prims_device.hpp`) | The primitives of the next table on a device runtime, through the generated kernels |
 | `interop.hpp` | `vk_external`: allocate exportable Vulkan buffers and semaphores on the application's `VkDevice`, export/import them as OS handles (fd or NT handle). `cuda_import`: map them into CUDA (`cuImportExternalMemory`) |
+
+### Linear algebra, convolution, FFT, normalisation, attention (`prims.hpp`, `prims_device.hpp`)
+The FORGE_PLAN B.6 list beyond the scans and sorts. The CPU versions run on the `simd` kernel table with rows or tiles split over the task pool. The device versions (`gpu::prims::device::<name>(rt, ...)`, same arguments after the runtime) take any runtime with the `run_op` contract (CUDA, HIP, OpenCL, Level Zero, Metal, Vulkan) and return `false`, having computed nothing, when the device has no kernel for the primitive or shape.
+
+| Primitive | CPU (`gpu::prims`) | Device (`gpu::prims::device`) |
+|---|---|---|
+| `gemv(W, x, y, n, k, epilogue)` | `y = act(W·x + bias)`: a SIMD dot per output, columns over the pool | `forge_matmul_t`, then the epilogue |
+| `gemm_batched(A, B, C, batch, m, n, k, shared_b, epilogue)` | `C[b] = act(A[b]·Bᵀ + bias)`; `B` is `[n, k]` for every batch or `[batch, n, k]`; the blocked `gemm_nt`, the epilogue per output row | one `forge_matmul_t` over `batch × m` rows (shared `B`) or one per batch, then the epilogue |
+| `epilogue {bias, fn}` | bias add and `relu`, `silu`, `gelu_tanh`, `tanh` or `sigmoid` in place on the row (SIMD) | `forge_bcast` for the bias and the activation's unary kernel: separate launches, not fused into the matmul kernel |
+| `conv2d`, `conv1d` | im2col + `gemm_nt`, one product per group; stride / pad / dilation per axis, bias `[O]` or `[1]` | `forge_conv2d` / `forge_conv1d` (direct) |
+| `fft(x, inverse)` | complex f32 in place: iterative radix 2 for powers of two, Bluestein's chirp-z over it for every other length (O(n log n)); twiddles computed in double; inverse scaled by 1/n | none |
+| `softmax`, `rms_norm`, `layer_norm` | rows over the pool; `softmax_row` / `rms_norm_row` of the SIMD table, layer norm with sums in double | `forge_softmax`, `forge_rms_norm`, `forge_layer_norm` |
+| `flash_attention(q, k, v, y, s, hq, d, t, hk, dv, opts)` | keys in tiles (`opts.tile`, default 64) with an online softmax, so no `[s, t]` score matrix exists; causal, window, GQA; SIMD dot and saxpy | the `attention` kernels: one-pass `forge_attention_fa`, split over keys for decode shapes, tiled / tensor-core on CUDA `sm_80` |
+
+"Epilogue fusion" on the CPU means the epilogue runs on each output row right after the product. On a device it is separate kernel launches on the resident output; a matmul kernel with a fused epilogue exists only for the quantised FFN gate/up path. No vendor BLAS is used anywhere (the B.6 "vendor escape hatch" does not exist).
+
+Tested: every CPU primitive against the op's float64 reference in `test_gpu` (`prims_gemv_gemm_epilogue`, `prims_convolution`, `prims_fft` against the DFT definition in double for 10 lengths plus the inverse round trip, `prims_softmax_norms`, `prims_flash_attention` for 6 shapes and tile sizes). The device versions by `prims_check` (`tests/gpu_checks.hpp`: 22 cases, outside and inside a run) on the CUDA, HIP, OpenCL and Level Zero mocks and on lavapipe. Not on a GPU; Metal never executed. Nothing was timed: the CPU FFT and convolution are straightforward implementations, not tuned ones.
 
 ## Example
 `docs/examples/gpu_graph.cpp` (ctest `doc_example_gpu_graph`):

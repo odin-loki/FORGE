@@ -745,7 +745,13 @@ inline bool run_op(runtime& rt, const std::string& op, const std::vector<tensor_
     if (rt.resident()) rt.run_resident(op, b, pc, inv); else rt.run(op, b, pc, inv);
     return true;
 }
-inline bool runtime::run_op(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) { return vk::run_op(*this, op, in, a, out); }
+inline bool runtime::run_op(const std::string& op, const std::vector<tensor_view>& in, const ops::attrs& a, tensor_view out) {
+    if (cuda_hip::sig sg; cuda_hip::kernel_sig(op, sg) && cuda_hip::nn_sig(sg)) {   // the encoder / vision kernels (GLSL ports of PORT_NN)
+        std::vector<shape_t> ss; for (auto& v : in) ss.push_back(v.shape);
+        return cuda_hip::supports(op, ss, a) && this->run_nn(op, in, a, out);
+    }
+    return vk::run_op(*this, op, in, a, out);
+}
 inline bool run_op(runtime& rt, const std::string& op, const std::vector<forge::tensor>& in, const ops::attrs& a, forge::tensor& out) {
     auto o = ops::op_from_name(op);
     if (!o) return false;
