@@ -5,6 +5,7 @@
 // session : one sequence's mutable state (KV state store, position). Many sessions may share a model;
 //           runs are serialised on the model (plans own a scratch arena), state is per session.
 #include <forge/graph/graph.hpp>
+#include <forge/inference/aot.hpp>
 #include <forge/inference/sampler.hpp>
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
@@ -49,7 +50,13 @@ class model {
         return path;
     }
 public:
-    explicit model(const std::string& fpk_path, bool verify = false) : r_(admit(fpk_path)) {
+    // Precompiled models (docs/aot-models.md): `path` may name a natively compiled model library instead of a .fpk
+    // (the weights then come from the .fpk it was compiled from, or from the library itself), and `lib` attaches code
+    // that is linked into this program. A .fpk with an "aot" section or a sidecar uses its precompiled plans.
+    explicit model(const std::string& path, bool verify = false, std::shared_ptr<aot_native::library> lib = nullptr)
+        : lib_(open_native(path, std::move(lib))), fpk_path_(lib_ && aot_native::library::is_library(path) ? (lib_->embedded() ? lib_->path() : lib_->fpk_path()) : path),
+          r_(lib_ && lib_->embedded() ? modelfile::reader({lib_->model().fpk_data, std::size_t(lib_->model().fpk_size)}, fpk_path_) : modelfile::reader(admit(fpk_path_))) {
+        const std::string& fpk_path = fpk_path_;
         // Strict mode (FORGE_PLAN: "verify before load; refuse unsigned files"): FORGE_REQUIRE_SIGNED=1
         // and/or FORGE_TRUSTED_KEYS=<hex pubkey>[,<hex pubkey>...] require a valid (trusted) signature.
         std::vector<std::string> trusted;
@@ -94,8 +101,17 @@ public:
             tok_->set_add_bos(add_bos_default(man_));
         }
         vocab_ = i64(bp_.param_or("vocab", 0));
+        if (lib_ && (strict || r_.has_section("signature")))   // compiled code is not covered by the model's signature
+            raise(errc::integrity_error, "{}: a compiled model library cannot be loaded for a signed model or under strict loading", path);
+        aot_.attach(r_, fpk_path, strict, lib_);
+        if (lib_ && !aot_.native()) log::warn("{}: {}; running {} without the compiled code", path, aot_.stats().last_reject, fpk_path);
         if (auto* d = std::getenv("FORGE_DEVICE")) set_device(d);
     }
+    // Precompiled plans in use for this model (inference/aot.hpp). set_aot(false) compiles every plan here instead;
+    // like set_device() it clears the cached plans, so call it before sessions run.
+    const aot_source& aot() const { return aot_; }
+    void set_aot(bool on) { std::lock_guard lk(run_mu_); aot_.set_enabled(on); cache_.clear(); }
+    const std::string& fpk_path() const { return fpk_path_; }
     // Select the execution device ("cpu", "vulkan"). Unavailable devices fall back to the CPU with a warning.
     // Returns the device actually used. Clears cached plans.
     std::string set_device(const std::string& dev) {
@@ -189,11 +205,20 @@ public:
                 return inner(name);
             };
             graph::pass_options po; po.lowerings = reg_.get();
+            if (!decode_all) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
             return graph::compile(modelfile::build_graph(bp_, bo), st, po);
         });
     }
 private:
+    static std::shared_ptr<aot_native::library> open_native(const std::string& path, std::shared_ptr<aot_native::library> lib) {
+        if (lib || !aot_native::library::is_library(path)) return lib;
+        admit(path);
+        return aot_native::library::open(path);
+    }
+    std::shared_ptr<aot_native::library> lib_;   // before r_: an embedded model file lives in the library
+    std::string fpk_path_;
     modelfile::reader r_;
+    aot_source aot_;
     json::value man_;
     modelfile::blueprint bp_;
     std::optional<modelfile::bpe_tokenizer> tok_;

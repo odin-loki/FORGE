@@ -36,13 +36,13 @@ const std::string& work_dir() {
 // The work directory goes away on every exit path of the process (normal return, failed checks, the skip exit);
 // FORGE_TEST_KEEP=1 keeps it for a post-mortem.
 void remove_work_dir() { std::error_code ec; if (work_dir() != "." && os::getenv("FORGE_TEST_KEEP").empty()) fs::remove_all(work_dir(), ec); }
-struct Cleanup { ~Cleanup() { remove_work_dir(); } } cleanup_at_exit;
+struct Cleanup { Cleanup() { (void)work_dir(); } ~Cleanup() { remove_work_dir(); } } cleanup_at_exit;   // work_dir() first: it must outlive this object
 
 std::vector<std::string> compilers() {
     static const std::vector<std::string> found = [] {
         std::vector<std::string> names, out;
         if (auto e = os::getenv("FORGE_AOT_TEST_CXX"); !e.empty()) { std::stringstream ss(e); std::string n; while (std::getline(ss, n, ',')) if (!n.empty()) names.push_back(n); }
-        else names = {"clang++-23", "clang++", "g++"};
+        else names = {"clang++-23", "g++"};
         if (!script::aot_supported()) return out;
         for (auto& n : names) {
             auto p = os::find_executable(n);

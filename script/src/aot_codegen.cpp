@@ -923,7 +923,7 @@ translated translate_program(std::string_view src_in, const std::string& file, c
     pl.name = file; pl.source = src;
     auto& b = pl.baked;
     b.allow_fs = o.run.allow_fs; b.allow_net = o.run.allow_net; b.allow_proc = o.run.allow_proc; b.allow_env = o.run.allow_env;
-    b.max_steps = o.run.max_steps; b.timeout_ms = o.run.timeout_ms; b.heap_bytes = o.run.heap_bytes; b.max_depth = o.run.max_depth;
+    b.max_steps = o.run.max_steps; b.timeout_ms = o.run.timeout_ms; b.heap_bytes = o.run.heap_bytes; b.max_depth = o.run.max_depth; b.mem_limit_bytes = o.run.mem_limit_bytes;
     b.os_sandbox = std::uint8_t(o.run.os_sandbox); b.static_check = o.run.static_check; b.strict_check = o.run.strict_check; b.debug = o.run.debug;
     b.allow_widen = o.allow_widen;
     if (!o.policy_file.empty()) {

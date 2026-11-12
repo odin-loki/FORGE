@@ -56,6 +56,7 @@ std::vector<std::uint8_t> encode_payload(const payload& p) {
     w.u8(b.os_sandbox);
     w.u8(std::uint8_t((b.static_check ? 1 : 0) | (b.strict_check ? 2 : 0) | (b.debug ? 4 : 0) | (b.allow_widen ? 8 : 0)));
     w.str(b.policy_json); w.str(b.policy_origin);
+    w.u64(b.mem_limit_bytes);
     return std::move(w.b);
 }
 
@@ -76,6 +77,7 @@ bool decode_payload(const std::uint8_t* data, std::size_t size, payload& out, st
     std::uint8_t fl = r.u8();
     b.static_check = fl & 1; b.strict_check = fl & 2; b.debug = fl & 4; b.allow_widen = fl & 8;
     b.policy_json = r.str(); b.policy_origin = r.str();
+    b.mem_limit_bytes = r.u64();
     if (!r.ok) return bad("truncated payload");
     if (r.i != size) return bad("trailing bytes in payload");
     if (b.os_sandbox > 2) return bad("bad OS sandbox mode in payload");
@@ -190,7 +192,7 @@ void print_info(const payload& pl, std::size_t n_units, const unit* units) {
     std::printf("program: %s (%zu bytes of source, %zu bundled module(s))\n", pl.name.c_str(), pl.source.size(), pl.modules.size());
     if (n_units) { std::size_t fns = 0; for (std::size_t i = 0; i < n_units; ++i) fns += units[i].n_fns; std::printf("native functions: %zu in %zu unit(s)\n", fns, n_units); }
     std::printf("capabilities: fs=%s net=%s proc=%s env=%s\n", b.allow_fs ? "on" : "off", b.allow_net ? "on" : "off", b.allow_proc ? "on" : "off", b.allow_env ? "on" : "off");
-    std::printf("limits: timeout_ms=%llu max_steps=%llu heap_bytes=%llu max_depth=%d\n", static_cast<unsigned long long>(b.timeout_ms), static_cast<unsigned long long>(b.max_steps), static_cast<unsigned long long>(b.heap_bytes), int(b.max_depth));
+    std::printf("limits: timeout_ms=%llu max_steps=%llu heap_bytes=%llu mem_limit_bytes=%llu max_depth=%d\n", static_cast<unsigned long long>(b.timeout_ms), static_cast<unsigned long long>(b.max_steps), static_cast<unsigned long long>(b.heap_bytes), static_cast<unsigned long long>(b.mem_limit_bytes), int(b.max_depth));
     std::printf("os sandbox: %s\n", b.os_sandbox == 0 ? "off" : b.os_sandbox == 1 ? "best-effort" : "require");
     std::printf("security policy: %s\n", b.policy_json.empty() ? "none baked (the usual policy search applies)" : ("baked from " + b.policy_origin).c_str());
     std::printf("run-time widening: %s\n", b.allow_widen ? "allowed" : "not allowed");
@@ -240,6 +242,7 @@ int run_payload(int argc, char** argv, payload&& pl_in, const unit* units, std::
         options o;
         o.allow_fs = b.allow_fs; o.allow_net = b.allow_net; o.allow_proc = b.allow_proc; o.allow_env = b.allow_env;
         o.max_steps = b.max_steps; o.timeout_ms = b.timeout_ms; o.heap_bytes = b.heap_bytes; o.max_depth = b.max_depth;
+        o.mem_limit_bytes = b.mem_limit_bytes;
         o.static_check = b.static_check; o.strict_check = b.strict_check; o.debug = b.debug;
         int sandbox = b.os_sandbox;
         std::string policy_path;
@@ -255,6 +258,8 @@ int run_payload(int argc, char** argv, payload&& pl_in, const unit* units, std::
         if (auto v = os::getenv("FORGE_AOT_TIMEOUT"); !v.empty()) o.timeout_ms = narrow(o.timeout_ms, num_arg("FORGE_AOT_TIMEOUT", v), widen);
         if (auto v = os::getenv("FORGE_AOT_MAX_STEPS"); !v.empty()) o.max_steps = narrow(o.max_steps, num_arg("FORGE_AOT_MAX_STEPS", v), widen);
         if (auto v = os::getenv("FORGE_AOT_HEAP"); !v.empty()) o.heap_bytes = narrow(o.heap_bytes, num_arg("FORGE_AOT_HEAP", v), widen);
+        auto size_arg = [](const std::string& what, const std::string& v) { std::uint64_t n = 0; std::string why; if (!parse_size(v, n, &why) || !n) throw std::runtime_error(what + ": " + (why.empty() ? "the limit must be greater than 0" : why)); return n; };
+        if (auto v = os::getenv("FORGE_AOT_MEM_LIMIT"); !v.empty()) o.mem_limit_bytes = narrow(o.mem_limit_bytes, size_arg("FORGE_AOT_MEM_LIMIT", v), widen);
         if (auto v = os::getenv("FORGE_AOT_OS_SANDBOX"); !v.empty()) set_sandbox("FORGE_AOT_OS_SANDBOX", v);
         int i = 1;
         for (; i < argc; ++i) {
@@ -276,6 +281,7 @@ int run_payload(int argc, char** argv, payload&& pl_in, const unit* units, std::
             else if (k == "--forge-timeout") o.timeout_ms = narrow(o.timeout_ms, num_arg(k, val()), widen);
             else if (k == "--forge-max-steps") o.max_steps = narrow(o.max_steps, num_arg(k, val()), widen);
             else if (k == "--forge-heap") o.heap_bytes = narrow(o.heap_bytes, num_arg(k, val()), widen);
+            else if (k == "--forge-mem-limit") o.mem_limit_bytes = narrow(o.mem_limit_bytes, size_arg(k, val()), widen);
             else if (k == "--forge-os-sandbox") set_sandbox(k, val());
             else if (k == "--forge-policy") policy_path = val();
             else if (k == "--forge-debug") o.debug = true;

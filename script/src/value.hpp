@@ -98,8 +98,16 @@ public:
     std::uint64_t collections() const { return collections_.load(); }
     std::uint64_t collected() const { return collected_.load(); }
     // Script-level cap on top of the budget (limit {mem: ...}); 0 = none.
-    void set_soft_cap(std::uint64_t n) { cap_ = n; }
+    void set_soft_cap(std::uint64_t n);
     std::uint64_t soft_cap() const { return cap_; }
+    // Whole-run hard cap (options::mem_limit_bytes, --mem-limit): an absolute value of live_bytes() like the soft
+    // cap, but limit blocks never save, restore or widen it; charge() enforces whichever of the two is lower.
+    // `shown` is the limit as the user gave it (for the error message). 0 = none.
+    void set_hard_cap(std::uint64_t n, std::uint64_t shown = 0);
+    std::uint64_t hard_cap() const { return hard_; }
+    // While one is alive on this thread, charge() accounts but enforces no cap: building the OutOfMemoryError (and
+    // the engine's error report) must not itself run out of the heap it is reporting on.
+    struct exempt { exempt() noexcept; ~exempt(); exempt(const exempt&) = delete; exempt& operator=(const exempt&) = delete; };
     // Run the cycle collector. Only safe when no other task thread is mutating the heap.
     std::size_t collect();
     std::atomic<int> active_tasks{0};
@@ -113,7 +121,7 @@ private:
     std::mutex m_;
     std::unordered_set<Obj*> tracked_;   // non-owning
     std::atomic<std::uint64_t> bytes_{0}, objects_{0}, collections_{0}, collected_{0};
-    std::atomic<std::uint64_t> cap_{0};
+    std::atomic<std::uint64_t> cap_{0}, hard_{0}, hard_shown_{0};
     std::mutex lm_;
     mem::lease lease_;
     std::atomic<bool> collecting_{false};

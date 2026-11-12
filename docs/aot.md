@@ -6,7 +6,7 @@ same exit status, same errors, same capability checks, limits and OS sandbox.
 
 Code: `script/src/aot_codegen.cpp` (translator), `aot_compile.cpp` (driver), `aot_rt.cpp` (runtime),
 `script/rt/forge_aot_rt.hpp` (header for generated code), `script/rt/stub_main.cpp` (runner stub). Public header:
-`forge/script/aot.hpp`. This is AOT for scripts only; it does not compile model graphs.
+`forge/script/aot.hpp`. This is AOT for scripts only; model plans are compiled with `forge aot` ([aot-models.md](aot-models.md)).
 
 Status: both modes are implemented and tested on Linux x86-64 (see *Tests*). Everything under *Not verified* has
 been written but never run.
@@ -33,7 +33,7 @@ Options go before the script file, like every `forge script` option.
 | `--aot-cxx-flag FLAG` | extra compiler or linker argument (repeatable) |
 | `--aot-stub FILE` | embed: runner stub to copy (default: `forge-script-run` from the runtime directory or next to `forge`, else `forge` itself) |
 | `--aot-allow-widen` | let run-time options widen the baked policy (see *Security model*) |
-| `--no-fs`, `--no-net`, `--no-proc`, `--timeout MS`, `--max-steps N`, `--heap BYTES`, `--os-sandbox MODE`, `--policy FILE`, `--no-check`, `--strict-check`, `--debug` | baked into the binary as its policy |
+| `--no-fs`, `--no-net`, `--no-proc`, `--timeout MS`, `--max-steps N`, `--heap BYTES`, `--mem-limit SIZE`, `--os-sandbox MODE`, `--policy FILE`, `--no-check`, `--strict-check`, `--debug` | baked into the binary as its policy |
 | `--module-dir DIR` | extra directory searched for statically imported modules |
 
 `forge script --aot` prints one line on stderr saying what it wrote and how. Exit status: 0 on success; 2 for a
@@ -154,6 +154,9 @@ Differences from `forge script` that remain:
 - The program's name in stack traces is the path given at compile time, not the absolute path `forge script`
   prints.
 - `--tree`, the `.fsc` cache options, the REPL, `--emit` and `--check` do not exist in a binary.
+- `--mem-limit`: the interpreter part (managed heap cap, default memory cap of child processes) is baked and
+  enforced. The OS-level cap `forge script` also puts on its own process is CLI code and is **not** applied by an
+  AOT binary.
 - `forge::ask` and related calls have no in-process model (`--ask-model`): the runtime library does not link the
   inference module. An OpenAI-compatible endpoint in `$FORGE_AI_ENDPOINT` is used as in the interpreter.
 - Scripts cannot read stdin in any mode; a binary leaves stdin untouched, and children started by the script get
@@ -168,7 +171,7 @@ argument that starts with `--forge-` goes after it.
 | run-time option | environment | effect |
 |---|---|---|
 | `--forge-no-fs`, `--forge-no-net`, `--forge-no-proc`, `--forge-no-env` | `FORGE_AOT_NO_FS`, `..._NO_NET`, `..._NO_PROC`, `..._NO_ENV` (any value but empty or `0`) | turn a capability off |
-| `--forge-timeout=MS`, `--forge-max-steps=N`, `--forge-heap=BYTES` | `FORGE_AOT_TIMEOUT`, `FORGE_AOT_MAX_STEPS`, `FORGE_AOT_HEAP` | whole-run limits |
+| `--forge-timeout=MS`, `--forge-max-steps=N`, `--forge-heap=BYTES`, `--forge-mem-limit=SIZE` | `FORGE_AOT_TIMEOUT`, `FORGE_AOT_MAX_STEPS`, `FORGE_AOT_HEAP`, `FORGE_AOT_MEM_LIMIT` | whole-run limits |
 | `--forge-os-sandbox=off\|best-effort\|require` | `FORGE_AOT_OS_SANDBOX` | OS enforcement of the capability flags |
 | `--forge-policy=FILE` | the usual policy search (`$FORGE_SECURITY_POLICY`, ...) | FORGE Security Standard policy |
 | `--forge-debug`, `--forge-strict-check` | | debug detectors; refuse on static-check warnings |
@@ -287,9 +290,9 @@ PERF_SECTION
     passthrough; a damaged embed payload; deterministic generated source.
   - Native cases are skipped (with a message) when no host compiler is found.
 - ctest `test_script_aot_native_sweep` (label `slow`): the whole corpus in native mode with every host compiler
-  found among `clang++-23`, `clang++`, `g++` (`FORGE_AOT_TEST_CXX=a,b` overrides). Exit 77 (skipped) when there is
+  found among `clang++-23` and `g++` (`FORGE_AOT_TEST_CXX=a,b` overrides). Exit 77 (skipped) when there is
   none.
-- `fuzz/fuzz_aot.cpp` (ctest `fuzz_aot`, label `fuzz`): everything the parser accepts must translate or be refused
+- `fuzz/fuzz_script_aot.cpp` (ctest `fuzz_script_aot`, label `fuzz`): everything the parser accepts must translate or be refused
   with a diagnostic, deterministically; nothing is executed. `FORGE_FUZZ_AOT_DIFF=embed` or `=<compiler>` adds a
   slow differential mode that builds each input and compares it with the interpreter under a no-capability policy.
 

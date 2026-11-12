@@ -22,6 +22,7 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 - [modelfile.md](modelfile.md): the `.fpk` container, signing, encryption, importing
 - [format.md](format.md): `.fpk` byte layout
 - [inference.md](inference.md): models, sessions, samplers, generation
+- [aot-models.md](aot-models.md): `forge aot`: precompiled plans in the `.fpk`, and models compiled to native libraries and executables
 
 ## Serving, remote devices and embedding
 - [serve.md](serve.md): `forge-serve` HTTP server

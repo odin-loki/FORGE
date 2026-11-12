@@ -52,7 +52,7 @@ struct unit {
 // allow_widen was set at compile time.
 struct baked_policy {
     bool allow_fs = true, allow_net = true, allow_proc = true, allow_env = true;
-    std::uint64_t max_steps = 0, timeout_ms = 0, heap_bytes = 0;
+    std::uint64_t max_steps = 0, timeout_ms = 0, heap_bytes = 0, mem_limit_bytes = 0;
     std::int32_t max_depth = 800;
     std::uint8_t os_sandbox = 1;                    // options::os_sandbox_mode
     bool static_check = true, strict_check = false, debug = false;
