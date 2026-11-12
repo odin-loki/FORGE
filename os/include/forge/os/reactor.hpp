@@ -585,7 +585,7 @@ private:
             for (;;) {
 #if defined(FORGE_OS_WINDOWS)
                 sock_t c = ::accept(SOCKET(o->key), nullptr, nullptr);
-                if (c != bad_sock) SetHandleInformation(reinterpret_cast<HANDLE>(c), HANDLE_FLAG_INHERIT, 0);
+                if (c != bad_sock) { SetHandleInformation(reinterpret_cast<HANDLE>(c), HANDLE_FLAG_INHERIT, 0); ::WSAEventSelect(c, nullptr, 0); }   // an accepted socket inherits the listener's event association: drop it
 #else
                 sock_t c = cloexec_accept(int(o->key));
 #endif

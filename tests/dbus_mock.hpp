@@ -91,6 +91,7 @@ struct mock_bus {
                         int pp[2]; if (os::cloexec_pipe(pp) != 0) { reply(c, *m, {value::str("pipe")}, "org.example.Error.Failed"); continue; }
                         db::message r; r.type = db::msg_type::method_return; r.serial = 7777; r.reply_serial = m->serial; r.unix_fds = 1;
                         value h; h.type = 'h'; h.u = 0; r.body = {h};
+                        { int old = inhibit_read_end.exchange(pp[0]); if (old >= 0) ::close(old); }   // before the reply: the client may look at once
                         auto b = db::encode(r);
                         if (b) {
                             alignas(cmsghdr) char ctl[CMSG_SPACE(sizeof(int))] = {}; iovec iov{b->data(), b->size()}; msghdr mh{};
@@ -99,7 +100,7 @@ struct mock_bus {
                             std::memcpy(CMSG_DATA(cm), &pp[1], sizeof(int));
                             (void)!::sendmsg(c, &mh, 0);
                         }
-                        ::close(pp[1]); { int old = inhibit_read_end.exchange(pp[0]); if (old >= 0) ::close(old); }   // readable (EOF) once the client closes its copy
+                        ::close(pp[1]);   // readable (EOF) once the client closes its copy
                     }
                     else if (m->member != "Slow") reply(c, *m, {value::str("no such method")}, "org.freedesktop.DBus.Error.UnknownMethod");
                     // "Slow": no reply at all

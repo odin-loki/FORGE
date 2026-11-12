@@ -389,9 +389,10 @@ TEST(reactor_shutdown_with_pending_operations) {
     // the handles are still usable by someone else
     CHECK(p->write.write_all("ok")); CHECK(p->read.read_some(16, 2000) == "ok");
     {   // cancel_all + run delivers every callback before destruction
+        auto ls2 = os::socket::listen("127.0.0.1", 0); CHECK(ls2);   // a fresh listener: the first one may still hold the connection made above
         os::reactor r; int cancelled = 0, total = 0;
         r.read(p->read, buf, sizeof buf, [&](const os::error& e, std::size_t) { ++total; cancelled += os::is_cancelled(e); });
-        r.accept(*ls, [&](const os::error& e, os::socket) { ++total; cancelled += os::is_cancelled(e); });
+        r.accept(*ls2, [&](const os::error& e, os::socket) { ++total; cancelled += os::is_cancelled(e); });
         r.after(3600ull * 1000 * ms, [&](const os::error& e) { ++total; cancelled += os::is_cancelled(e); });
         r.on_event(*ev, [&](const os::error& e) { ++total; cancelled += os::is_cancelled(e); });
         r.offload([&] { while (!release.load()) os::sleep_ns(ms); }, [&](const os::error& e) { ++total; cancelled += os::is_cancelled(e); });
