@@ -652,6 +652,7 @@ void install_cpp_std(Shared& sh) {
     meth("list", "end", 1, 1, [](Interp&, Args& a) -> Value { return it(a[0], clen(a[0])); });
     meth("list", "insert", 3, 3, [idx](Interp& in, Args& a) -> Value {
         auto* l = as<List>(a[0]); mutable_(in, *l); auto p = idx(in, a[1], l->items.size(), "insert", true);
+        Heap::instance().charge(*l, sizeof(Value));
         l->items.insert(l->items.begin() + std::ptrdiff_t(p), in.copy_value(a[2])); return it(a[0], std::int64_t(p));
     });
     meth("list", "erase", 2, 3, [idx](Interp& in, Args& a) -> Value {
@@ -687,11 +688,15 @@ void install_cpp_std(Shared& sh) {
     meth("string", "at", 2, 2, [idx](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; return sv(std::string(1, s[idx(in, a[1], s.size(), "string::at")])); });
     meth("string", "front", 1, 1, [](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; if (s.empty()) in.raise("IndexError", "front() on an empty string"); return sv(s.substr(0, 1)); });
     meth("string", "back", 1, 1, [](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; if (s.empty()) in.raise("IndexError", "back() on an empty string"); return sv(s.substr(s.size() - 1)); });
-    meth("string", "push_back", 2, 2, [](Interp& in, Args& a) -> Value { auto* s = as<String>(a[0]); mutable_(in, *s); s->s += sref(in, a[1], "push_back"); return Nil{}; });
+    meth("string", "push_back", 2, 2, [](Interp& in, Args& a) -> Value { auto* s = as<String>(a[0]); mutable_(in, *s); auto& c = sref(in, a[1], "push_back"); Heap::instance().charge(*s, c.size()); s->s += c; return Nil{}; });
     meth("string", "append", 2, 3, [](Interp& in, Args& a) -> Value {
         auto* s = as<String>(a[0]); mutable_(in, *s);
-        if (a.size() == 3) { auto n = iv(in, a[1], "append"); auto& c = sref(in, a[2], "append"); for (std::int64_t k = 0; k < n; ++k) s->s += c; }
-        else s->s += as<String>(a[1]) ? as<String>(a[1])->s : in.str(a[1]);
+        // growth in place is charged to the heap first, like a new string would be (--heap, --mem-limit, limit {mem})
+        if (a.size() == 3) {
+            auto n = iv(in, a[1], "append"); auto& c = sref(in, a[2], "append");
+            if (n > 0) { if (c.size() && std::uint64_t(n) > (std::uint64_t(1) << 40) / c.size()) in.raise("ValueError", "append: bad count"); Heap::instance().charge(*s, std::size_t(n) * c.size()); }
+            for (std::int64_t k = 0; k < n; ++k) s->s += c;
+        } else { std::string t = as<String>(a[1]) ? as<String>(a[1])->s : in.str(a[1]); Heap::instance().charge(*s, t.size()); s->s += t; }
         return a[0];
     });
     meth("string", "pop_back", 1, 1, [](Interp& in, Args& a) -> Value { auto* s = as<String>(a[0]); mutable_(in, *s); if (s->s.empty()) in.raise("IndexError", "pop_back on an empty string"); s->s.pop_back(); return Nil{}; });
@@ -704,7 +709,8 @@ void install_cpp_std(Shared& sh) {
     meth("string", "insert", 3, 3, [](Interp& in, Args& a) -> Value {
         auto* s = as<String>(a[0]); mutable_(in, *s); auto p = iv(in, a[1], "insert");
         if (p < 0 || std::size_t(p) > s->s.size()) in.raise("IndexError", "insert: position out of range");
-        s->s.insert(std::size_t(p), sref(in, a[2], "insert")); return a[0];
+        auto& t = sref(in, a[2], "insert"); Heap::instance().charge(*s, t.size());
+        s->s.insert(std::size_t(p), t); return a[0];
     });
     meth("string", "replace", 3, 4, [](Interp& in, Args& a) -> Value {
         auto* s = as<String>(a[0]);
@@ -716,7 +722,8 @@ void install_cpp_std(Shared& sh) {
         }
         mutable_(in, *s); auto p = iv(in, a[1], "replace"), n = iv(in, a[2], "replace");
         if (p < 0 || std::size_t(p) > s->s.size() || n < 0) in.raise("IndexError", "replace: position out of range");
-        s->s.replace(std::size_t(p), std::size_t(n), sref(in, a[3], "replace")); return a[0];
+        auto& t = sref(in, a[3], "replace"); Heap::instance().charge(*s, t.size());
+        s->s.replace(std::size_t(p), std::size_t(n), t); return a[0];
     });
     meth("string", "compare", 2, 2, [](Interp& in, Args& a) -> Value { int c = as<String>(a[0])->s.compare(sref(in, a[1], "compare")); return std::int64_t((c > 0) - (c < 0)); });
     meth("string", "begin", 1, 1, [](Interp&, Args& a) -> Value { return it(a[0], 0); });

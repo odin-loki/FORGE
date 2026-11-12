@@ -7,7 +7,7 @@ FORGE is a C++23 library and toolset for running AI models on CPUs and GPUs. One
 - **Inference** from a self-describing model file, `.fpk`, which carries its own computation graph (`graph`, `modelfile`, `inference`)
 - **Serving**: an OpenAI-compatible HTTP server with a load-balancing proxy (`forge-serve`, `loadbalancer`)
 - **A portable OS layer** for Linux, Android, Windows, macOS, iOS and FreeBSD (`os`)
-- **Scripting**: `forge script`, an interpreted, memory-safe subset of C++23 that can also be translated to shell scripts (`script`)
+- **Scripting**: `forge script`, an interpreted, memory-safe subset of C++23 that can also be translated to shell scripts or compiled ahead of time to a native executable with `forge script --aot` (`script`, [docs/aot.md](docs/aot.md))
 
 Because the model file describes its own graph, a new architecture needs an import template, not new engine code. FORGE is a clean-room design, not a fork or wrapper of another project.
 
@@ -35,6 +35,14 @@ To run a real model, import it first, or pass a Hugging Face directory, `.gguf` 
 ./build/dev/forge-serve model.fpk --port 8080
 ```
 
+To skip plan compilation at start-up, compile the model ahead of time ([docs/aot-models.md](docs/aot-models.md)):
+
+```sh
+./build/dev/forge aot model.fpk                                   # precompiled plans, stored in the .fpk
+./build/dev/forge aot model.fpk --aot-mode native -o model.so     # plans compiled to native code; forge run model.so
+./build/dev/forge aot model.fpk --aot-mode native --emit exe -o model && ./model --prompt "Hello" -n 32
+```
+
 ## What is in the box
 
 | Layer | Headers | Provides |
@@ -48,13 +56,13 @@ To run a real model, import it first, or pass a Hugging Face directory, `.gguf` 
 | modelfile | `modelfile/include/forge/modelfile`, `modelfile/include/forge/import` | The `.fpk` container (BLAKE3, Ed25519 signing, XChaCha20-Poly1305 encryption), BPE tokenizer, importers for Hugging Face safetensors, GGUF and ONNX |
 | inference | `inference/include/forge/inference`, `inference/include/forge.h` | Sessions, samplers, continuous batching, speculative decoding, GBNF grammars, JSON Schema, LoRA, diffusion and streaming sessions, the C ABI |
 | loadbalancer | `loadbalancer/include/forge/loadbalancer` | Load-balancing pool (7 strategies, circuit breakers, retries, backpressure) and L4/L7 proxy |
-| script | `script/include/forge/script` | The `forge script` interpreter, bytecode VM, static checker and shell emitters (`forge_script`) |
+| script | `script/include/forge/script` | The `forge script` interpreter, bytecode VM, static checker, shell emitters and AOT compiler (`forge_script`, `forge_script_rt`) |
 | support | `support/include/forge/*` | Hashing, JSON, async I/O, thread pool, caches, linear algebra, FFT/audio, vision, profiler, RNGs |
 | verify | `verify/` | The oracle that checks every lowering against the op reference, and the golden-model scripts |
 
 Programs built by default (`FORGE_BUILD_APPS=ON`):
 
-- `forge`: command-line tool (`info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `script`). See [docs/cli.md](docs/cli.md).
+- `forge`: command-line tool (`info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `script`). See [docs/cli.md](docs/cli.md).
 - `forge-serve`: OpenAI-compatible HTTP server, and `forge-serve proxy` load balancer. See [docs/serve.md](docs/serve.md).
 - `libforge` (`forge_c` target; `libforge.so.1` on Linux, `forge.dll` on Windows): the C ABI used by the Python, Kotlin and Swift bindings.
 
@@ -63,7 +71,7 @@ Programs built by default (`FORGE_BUILD_APPS=ON`):
 ```
 core/ os/ ops/ simd/ gpu/ graph/ modelfile/ inference/ loadbalancer/ script/ support/ verify/   library layers
 apps/                  forge and forge-serve
-import/templates/      blueprint templates used by the importers (llama, qwen3, qwen3_5(+moe), qwen3_moe, mixtral, deepseek_v2,
+import/templates/      blueprint templates used by the importers (llama, qwen2, qwen3, qwen3_5(+moe), qwen3_moe, mixtral, deepseek_v2,
                        gpt2, gemma, gemma2, gemma3, phi3, bert, vit, whisper_encoder)
 python/ bindings/      Python (ctypes), Android (Kotlin + JNI) and Apple (Swift) bindings
 examples/              embedding examples (integrations/, built as example_*), script examples, a script plugin

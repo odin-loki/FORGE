@@ -26,6 +26,11 @@ struct importer {
     std::string pre;                                       // tensor name prefix of this checkpoint ("", "bert.", ...)
     std::unique_ptr<modelfile::stream_writer> w;
     import_report rep; std::string bp_text; modelfile::blueprint bp;
+    // Tensor accounting (hf.hpp check_unused): every source tensor is consumed, a known buffer, or part of something
+    // this family leaves out on purpose (`outside`: another tower, a task head, a tied copy); anything else fails the
+    // import unless --allow-unused. What `outside` left out is counted in a note.
+    mutable std::set<std::string> consumed;
+    std::function<bool(const std::string&)> outside; std::string outside_what;
 
     importer(const std::filesystem::path& d, const json::value& cf, const std::string& o, const import_options& op, const std::string& arch)
         : dir(d), out(o), opt(op), cfg(cf), c(cf.obj()) {
@@ -44,7 +49,7 @@ struct importer {
     bool raw_has(const std::string& n) const { for (auto& s : shards) if (s->has(n)) return true; return false; }
     bool has(const std::string& n) const { return raw_has(pre + n); }
     tensor raw_get(const std::string& n) const {
-        for (auto& s : shards) if (s->has(n)) return s->load(n);
+        for (auto& s : shards) if (s->has(n)) { consumed.insert(n); return s->load(n); }
         raise(errc::not_found, "missing tensor {}", n);
     }
     // config values nested under `key` (text_config, vision_config) become the config proper
@@ -56,7 +61,7 @@ struct importer {
         cfg = std::move(sub);
     }
     tensor get(const std::string& n) const {
-        for (auto& s : shards) if (s->has(pre + n)) return s->load(pre + n);
+        for (auto& s : shards) if (s->has(pre + n)) { consumed.insert(pre + n); return s->load(pre + n); }
         raise(errc::not_found, "missing tensor {}{}", pre, n);
     }
     // the first prefix under which `probe` exists
@@ -122,6 +127,17 @@ struct importer {
             if (type == "BPE" && m->find("merges") && m->find("vocab")) w->set_section("tokenizer", text);
             else { w->set_section("tokenizer_json", text); man.emplace_back("tokenizer_type", type); }
         }
+        std::size_t left_out = 0;
+        for (auto& s : shards)
+            for (auto& [n, e] : s->entries()) {
+                if (consumed.count(n) || ignored_tensor(n, opt)) continue;
+                if (outside && outside(n)) { ++left_out; continue; }
+                rep.unused.push_back(n + " " + shape_str(e.shape));
+            }
+        if (left_out) rep.notes.push_back(std::format("left out {} tensor(s) the {} template does not use: {}", left_out, rep.template_name, outside_what));
+        check_unused(dir.string(), rep.template_name, rep.unused, opt);
+        check_template_tensors(dir.string(), rep.template_name, bp, w->entries(), opt);
+        auto lic = hf_license(dir); lic.store(man, *w); rep.license = lic.summary();
         w->set_manifest(json::value(man));
         w->set_section("blueprint", bp_text);
         w->finish();
@@ -149,6 +165,8 @@ inline import_report import_gpt2(importer& I) {
     I.set("layer_norm_eps", I.num("layer_norm_epsilon", 1e-5));
     I.set("act", act_op(I.str("activation_function", "gelu_new"), "gpt2"));
     I.find_prefix({"transformer.", ""}, "wte.weight");
+    I.outside = [](const std::string& n) { return n.ends_with(".attn.bias") || n == "lm_head.weight"; };   // causal-mask buffers; consumed above when present
+    I.outside_what = "causal-mask buffers (h.N.attn.bias)";
     I.begin("gpt2");
     auto wte = I.get("wte.weight");
     I.emb("tok_emb", wte); I.put("pos_emb", I.get("wpe.weight"));
@@ -193,6 +211,11 @@ inline import_report import_gemma(importer& I, int gen) {
         if (gen == 3) I.set("rope_local_base_freq", I.num("rope_local_base_freq", 10000.0));
     }
     I.find_prefix({"model.", "model.language_model.", "language_model.model."}, "embed_tokens.weight");
+    I.outside = [](const std::string& n) {
+        for (const char* p : {"vision_tower.", "model.vision_tower.", "multi_modal_projector.", "model.multi_modal_projector."}) if (n.starts_with(p)) return true;
+        return n.ends_with("lm_head.weight");   // tied to the embedding, which is what the head is written from
+    };
+    I.outside_what = "the tied lm_head copy, and the vision tower / projector of multimodal checkpoints";
     I.begin(gen == 1 ? "gemma" : gen == 2 ? "gemma2" : "gemma3");
     auto te = I.get("embed_tokens.weight");
     I.emb("tok_emb", te);
@@ -273,6 +296,12 @@ inline import_report import_bert(importer& I, bool roberta) {
     std::string pool = mean ? "masked_mean(x, mask)" : "reshape(slice(x, 0, 0, 1), [d_model])";
     I.set("pool_expr", l2 ? "l2_normalize(" + pool + ")" : pool);
     I.find_prefix({"", "bert.", "roberta.", "xlm_roberta.", "model."}, "embeddings.word_embeddings.weight");
+    I.outside = [](const std::string& n) {
+        if (n.find("pooler.") != std::string::npos) return true;
+        for (const char* p : {"cls.", "classifier.", "lm_head.", "qa_outputs."}) if (n.starts_with(p)) return true;
+        return false;
+    };
+    I.outside_what = "the pooler and task heads (cls, classifier, lm_head, qa_outputs)";
     I.begin("bert");
     I.emb("tok_emb", I.get("embeddings.word_embeddings.weight"));
     I.put("pos_emb", I.get("embeddings.position_embeddings.weight"));
@@ -306,6 +335,12 @@ inline import_report import_vision(importer& I, const std::string& kind) {
     if (kind == "vit") I.find_prefix({"", "vit."}, "embeddings.patch_embeddings.projection.weight");
     else I.find_prefix({"vision_model.", "vision_tower.vision_model.", ""}, "embeddings.patch_embedding.weight");
     bool proj = kind == "clip" && I.raw_has("visual_projection.weight");
+    I.outside = [](const std::string& n) {
+        if (n.find("pooler.") != std::string::npos) return true;
+        for (const char* p : {"text_model.", "text_projection.", "logit_scale", "logit_bias", "classifier."}) if (n.starts_with(p)) return true;
+        return false;
+    };
+    I.outside_what = "the text tower, logit scale / bias, pooler and classifier head";
     bool map_head = kind == "siglip" && I.has("head.probe");
     std::string out = kind == "siglip" ? (map_head ? "map_pool(layer_norm(x, W.post_norm_w, W.post_norm_b, eps))" : "reduce_mean(layer_norm(x, W.post_norm_w, W.post_norm_b, eps), axis: 0)")
                                        : "layer_norm(reshape(slice(x, 0, 0, 1), [d_model]), W.post_norm_w, W.post_norm_b, eps)";
@@ -368,6 +403,8 @@ inline import_report import_whisper_encoder(importer& I) {
     I.set("max_source_positions", ctx); I.set("num_frames", 2 * ctx);
     I.set("act", act_op(I.str("activation_function", "gelu"), "whisper"));
     I.find_prefix({"model.encoder.", "encoder."}, "conv1.weight");
+    I.outside = [](const std::string& n) { for (const char* p : {"model.decoder.", "decoder.", "proj_out."}) if (n.starts_with(p)) return true; return false; };
+    I.outside_what = "the decoder (only the encoder is imported)";
     I.begin("whisper_encoder");
     I.put("conv1_w", I.get("conv1.weight")); I.put("conv1_b", I.get("conv1.bias"));
     I.put("conv2_w", I.get("conv2.weight")); I.put("conv2_b", I.get("conv2.bias"));

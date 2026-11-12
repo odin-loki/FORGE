@@ -22,6 +22,7 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 - [modelfile.md](modelfile.md): the `.fpk` container, signing, encryption, importing
 - [format.md](format.md): `.fpk` byte layout
 - [inference.md](inference.md): models, sessions, samplers, generation
+- [aot-models.md](aot-models.md): `forge aot`: precompiled plans in the `.fpk`, and models compiled to native libraries and executables
 
 ## Serving, remote devices and embedding
 - [serve.md](serve.md): `forge-serve` HTTP server
@@ -33,6 +34,7 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 ## Scripting
 - [scripting.md](scripting.md): `forge script`, the REPL, static checks, shell blocks and emitting shell scripts
 - [shells.md](shells.md): shell backends and emit targets
+- [aot.md](aot.md): `forge script --aot`: compile a script to a native executable (native and embed modes, baked policy, runtime library)
 
 ## Security
 - [security.md](security.md): what is enforced today: script capabilities, OS sandbox, plugins, AI confirmation, RPC auth, signing, known gaps

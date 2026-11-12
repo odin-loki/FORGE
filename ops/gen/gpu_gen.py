@@ -1673,7 +1673,7 @@ def opencl(names):
     body = body.replace("FORGE_GLOBAL void", "FORGE_K void").replace("FORGE_DEV", "static inline")
     body = body.replace("__builtin_bit_cast(unsigned, ", "as_uint(").replace("-__builtin_inff()", "-INFINITY")
     body = body.replace("double th = (double)pos[s] * (double)inv[j]", "FORGE_ANGLE th = (FORGE_ANGLE)pos[s] * (FORGE_ANGLE)inv[j]")
-    return CL_PRELUDE + body
+    return CL_PRELUDE + body + cl_port()
 
 def cl_mock_dispatch(names):
     """C trampolines for tests/mock_opencl.c: call each kernel with arguments from clSetKernelArg slots."""
@@ -1684,7 +1684,7 @@ def cl_mock_dispatch(names):
         fn, params = m.group(1), [p.strip() for p in m.group(2).split(",")]
         args = []
         for i, p in enumerate(params):
-            if "*" in p: args.append(f"(float*)MOCK_MEM(a[{i}])")
+            if "*" in p: args.append(f"(void*)MOCK_MEM(a[{i}])")
             elif p.startswith("float"): args.append(f"*(float*)a[{i}]")
             else: args.append(f"*(unsigned*)a[{i}]")
         out.append(f"static void t_{fn}(void** a) {{ {fn}({', '.join(args)}); }}")
@@ -1692,6 +1692,194 @@ def cl_mock_dispatch(names):
     out.append("static const struct { const char* name; forge_tramp f; int nargs; } forge_tramps[] = {")
     out += table + ["  {0, 0, 0}};"]
     return "\n".join(out) + "\n"
+
+# ==== BEGIN portable device kernels (quantised matmul / gather / GLU, attention, DeltaNet state ops, MoE) ==========
+# Plain one-work-item-per-output kernels with no workgroup-shared memory, barriers or vendor intrinsics, written once
+# in OpenCL C. kernels.cl takes them as they are (OpenCL, Level Zero); kernels.metal takes a mechanical translation
+# (msl_port); kernels.cu takes only PORT_SHARED (the MoE kernels: CUDA/HIP have their own tuned versions of the rest).
+# Arithmetic follows the CUDA reference kernels / tests/mock_cuda.c: f32 fma accumulation over k in index order.
+PORT_HELPERS = r"""// ---- portable kernels (ops/gen/gpu_gen.py PORT_*): codec decode helpers, bodies as in kernels.cu ----
+static inline float h2f(unsigned h) {
+  unsigned s = (h & 0x8000u) << 16, e = (h >> 10) & 31u, m = h & 1023u, b;
+  if (e == 0u) { if (m == 0u) b = s; else { e = 113u; while (!(m & 1024u)) { m <<= 1; --e; } m &= 1023u; b = s | (e << 23) | (m << 13); } }
+  else if (e == 31u) b = s | 0x7f800000u | (m << 13);
+  else b = s | ((e + 112u) << 23) | (m << 13);
+  return as_float(b); }
+static inline unsigned ld16(G const unsigned char* p) { return (unsigned)p[0] | ((unsigned)p[1] << 8); }
+static inline void scmin(unsigned j, G const unsigned char* q, unsigned* d, unsigned* m) {
+  if (j < 4u) { *d = q[j] & 63u; *m = q[j + 4u] & 63u; }
+  else { *d = (q[j + 4u] & 15u) | ((q[j - 4u] >> 6) << 4); *m = (q[j + 4u] >> 4) | ((q[j] >> 6) << 4); } }
+static inline void qgroup(unsigned fmt, G const unsigned char* row, unsigned g, float* v) {
+  if (fmt == 1u) { G const unsigned char* b = row + g * 34u; float d = h2f(ld16(b));
+    for (unsigned l = 0; l < 32u; ++l) v[l] = d * (float)(signed char)b[2u + l];
+    return; }
+  unsigned s = g & 7u;
+  if (fmt == 3u) {
+    G const unsigned char* b = row + (g >> 3) * 210u; unsigned h = s >> 2, t = s & 3u;
+    G const unsigned char* ql = b + 64u * h; G const unsigned char* qh = b + 128u + 32u * h; G const unsigned char* sc = b + 192u + 8u * h;
+    float d = h2f(ld16(b + 208u));
+    for (unsigned l = 0; l < 32u; ++l) {
+      unsigned lo = (t & 1u) ? ql[l + 32u] : ql[l]; lo = (t & 2u) ? (lo >> 4) : (lo & 15u);
+      int q = (int)(lo | (((qh[l] >> (2u * t)) & 3u) << 4)) - 32;
+      v[l] = d * (float)(signed char)sc[(l >> 4) + 2u * t] * (float)q; }
+    return; }
+  G const unsigned char* b = row + (g >> 3) * (fmt == 2u ? 144u : 176u);
+  float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned sc, mn; scmin(s, b + 4u, &sc, &mn);
+  float d1 = d * (float)sc, m1 = dm * (float)mn; unsigned hi = s & 1u;
+  if (fmt == 2u) { G const unsigned char* q = b + 16u + (s >> 1) * 32u;
+    for (unsigned l = 0; l < 32u; ++l) { unsigned n = hi ? (q[l] >> 4) : (q[l] & 15u); v[l] = d1 * (float)n - m1; } }
+  else { G const unsigned char* qh = b + 16u; G const unsigned char* q = b + 48u + (s >> 1) * 32u; unsigned u = 1u << s;
+    for (unsigned l = 0; l < 32u; ++l) { unsigned n = (hi ? (q[l] >> 4) : (q[l] & 15u)) + ((qh[l] & u) ? 16u : 0u); v[l] = d1 * (float)n - m1; } } }
+static inline float qelem(unsigned fmt, G const unsigned char* row, unsigned g, unsigned l) {
+  if (fmt == 1u) { G const unsigned char* b = row + g * 34u; return h2f(ld16(b)) * (float)(signed char)b[2u + l]; }
+  unsigned s = g & 7u;
+  if (fmt == 3u) {
+    G const unsigned char* b = row + (g >> 3) * 210u; unsigned h = s >> 2, t = s & 3u;
+    G const unsigned char* ql = b + 64u * h; G const unsigned char* qh = b + 128u + 32u * h; G const unsigned char* sc = b + 192u + 8u * h;
+    unsigned lo = (t & 1u) ? ql[l + 32u] : ql[l]; lo = (t & 2u) ? (lo >> 4) : (lo & 15u);
+    int q = (int)(lo | (((qh[l] >> (2u * t)) & 3u) << 4)) - 32;
+    return h2f(ld16(b + 208u)) * (float)(signed char)sc[(l >> 4) + 2u * t] * (float)q; }
+  G const unsigned char* b = row + (g >> 3) * (fmt == 2u ? 144u : 176u);
+  float d = h2f(ld16(b)), dm = h2f(ld16(b + 2u)); unsigned sc, mn; scmin(s, b + 4u, &sc, &mn);
+  unsigned hi = s & 1u, n;
+  if (fmt == 2u) { G const unsigned char* q = b + 16u + (s >> 1) * 32u; n = hi ? (q[l] >> 4) : (q[l] & 15u); }
+  else { G const unsigned char* q = b + 48u + (s >> 1) * 32u; n = (hi ? (q[l] >> 4) : (q[l] & 15u)) + ((b[16u + l] & (1u << s)) ? 16u : 0u); }
+  return d * (float)sc * (float)n - dm * (float)mn; }
+"""
+
+# Kernels every backend takes (CUDA/HIP included): the encoded-row dot product and the sparse mixture of experts.
+PORT_SHARED = r"""// x[0..k) . one encoded weight row (fmt 1 q8_0, 2 q4_k, 3 q6_k, 4 q5_k), f32 fma accumulation in index order
+static inline float pq_dot(G const float* x, G const unsigned char* row, unsigned k, unsigned fmt) {
+  float v[32]; float s = 0.0f;
+  for (unsigned g = 0; g < k / 32u; ++g) { qgroup(fmt, row, g, v); for (unsigned l = 0; l < 32u; ++l) s = fma_(x[g * 32u + l], v[l], s); }
+  return s; }
+// row `row` of a stacked weight: fmt 0 = plain f32 rows of k values, else encoded rows of rb bytes
+static inline float moe_dot(G const float* x, G const unsigned char* w, size_t row, unsigned k, unsigned fmt, unsigned rb) {
+  if (fmt == 0u) { G const float* wf = (G const float*)w + row * k; float s = 0.0f; for (unsigned i = 0; i < k; ++i) s = fma_(x[i], wf[i], s); return s; }
+  return pq_dot(x, w + row * rb, k, fmt); }
+// Sparse mixture of experts (graph/plan.hpp moe_ffn): the host routes each token to its top-k experts and uploads
+// route = 3 floats per (token, slot) pair p = token * kk + slot: expert id, token row, weight. Only the routed
+// experts' weight rows are read. forge_moe_hidden: hid[p, c] = silu(gate_e[c] . h[tok]) * (up_e[c] . h[tok]), a work
+// item per (pair, hidden column); gate/up are stacked [e, f, d]. forge_moe_down: y[r, c] = sum over the token's slots
+// (in slot order) of w * (down_e[c] . hid[p]), a work item per (token, output column); down is stacked [e, d, f].
+FORGE_K void forge_moe_hidden(G const float* h, G const float* route, G const unsigned char* wg, G const unsigned char* wu, G float* hid,
+                              unsigned np, unsigned f, unsigned d, unsigned fmtg, unsigned rbg, unsigned fmtu, unsigned rbu) {
+  unsigned i = gid(); if (i >= np * f) return; unsigned p = i / f, c = i % f;
+  unsigned e = (unsigned)route[3u * p], tok = (unsigned)route[3u * p + 1u];
+  G const float* x = h + (size_t)tok * d; size_t row = (size_t)e * f + c;
+  float a = moe_dot(x, wg, row, d, fmtg, rbg), b = moe_dot(x, wu, row, d, fmtu, rbu);
+  hid[i] = a / (1.0f + fexp(-a)) * b; }
+FORGE_K void forge_moe_down(G const float* hid, G const float* route, G const unsigned char* wd, G float* y,
+                            unsigned t, unsigned kk, unsigned d, unsigned f, unsigned fmt, unsigned rb) {
+  unsigned i = gid(); if (i >= t * d) return; unsigned r = i / d, c = i % d; float s = 0.0f;
+  for (unsigned j = 0; j < kk; ++j) { unsigned p = r * kk + j, e = (unsigned)route[3u * p];
+    s = fma_(route[3u * p + 2u], moe_dot(hid + (size_t)p * f, wd, (size_t)e * d + c, f, fmt, rb), s); }
+  y[i] = s; }
+"""
+
+# Kernels for the backends without tuned versions (OpenCL, Level Zero, Metal). Same contracts and argument order as
+# the kernels of the same name in CU_QUANT (cuda.hpp), except that the launch is one work item per output.
+PORT_KERNELS = r"""// y[rows, cols] = a[rows, k] . W[cols, k]^T, W encoded (rb bytes per row): a work item per output
+FORGE_K void forge_qmatmul_t(G const float* a, G const unsigned char* w, G float* y, unsigned rows, unsigned cols, unsigned k, unsigned fmt, unsigned rb) {
+  unsigned i = gid(); if (i >= rows * cols) return; unsigned r = i / cols, c = i % cols;
+  y[i] = pq_dot(a + (size_t)r * k, w + (size_t)c * rb, k, fmt); }
+// FFN gate/up/SiLU in one launch: y[rows, n] = silu(a . Wg^T) * (a . Wu^T), the expression of forge_silu_mul
+FORGE_K void forge_qglu(G const float* a, G const unsigned char* wg, G const unsigned char* wu, G float* y, unsigned rows, unsigned n, unsigned k, unsigned fmt, unsigned rb) {
+  unsigned i = gid(); if (i >= rows * n) return; unsigned r = i / n, c = i % n;
+  float g = pq_dot(a + (size_t)r * k, wg + (size_t)c * rb, k, fmt), u = pq_dot(a + (size_t)r * k, wu + (size_t)c * rb, k, fmt);
+  y[i] = g / (1.0f + fexp(-g)) * u; }
+// Embedding lookup from encoded rows: a work item per output element; out-of-range indices give zeros
+FORGE_K void forge_qgather(G const float* idx, G const unsigned char* w, G float* y, unsigned n, unsigned d, unsigned fmt, unsigned rb, unsigned nrows) {
+  unsigned i = gid(); if (i >= n * d) return; unsigned e = i % d; float fi = idx[i / d]; unsigned r = fi < 0.0f ? nrows : (unsigned)fi;
+  y[i] = r >= nrows ? 0.0f : qelem(fmt, w + (size_t)r * rb, e >> 5, e & 31u); }
+// Broadcast binary (op 0 add, 1 sub, 2 mul, 3 div): y[i] = a[i % ma] op b[i % mb]
+FORGE_K void forge_bcast(G const float* a, G const float* b, G float* y, unsigned n, unsigned ma, unsigned mb, unsigned op) {
+  unsigned i = gid(); if (i >= n) return; float x = a[i % ma], z = b[i % mb];
+  y[i] = op == 0u ? x + z : op == 1u ? x - z : op == 2u ? x * z : x / z; }
+// Prefill attention, one pass (online softmax; forge_attention reads every key twice): plain f32 K/V, same contract
+FORGE_K void forge_attention_fa(G const float* q, G const float* k, G const float* v, G float* y, unsigned s, unsigned hq, unsigned d,
+                                unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale) {
+  unsigned id = gid(); if (id >= s * hq) return;
+  unsigned i = id / hq, h = id % hq, kh = h / (hq / hk), causal = flags & 1u, window = flags >> 7;
+  int pos = (int)t - (int)s + (int)i;
+  unsigned jend = t; if (causal) { int lim = pos + 1; jend = lim < 0 ? 0u : ((unsigned)lim < t ? (unsigned)lim : t); }
+  unsigned jbeg = 0u; if (window && pos - (int)window + 1 > 0) jbeg = (unsigned)(pos - (int)window + 1);
+  G const float* qp = q + (size_t)id * d; G float* yp = y + (size_t)id * dv;
+  for (unsigned e = 0; e < dv; ++e) yp[e] = 0.0f;
+  float m = -INFINITY, ls = 0.0f;
+  for (unsigned j = jbeg; j < jend; ++j) {
+    G const float* kp = k + ((size_t)j * hk + kh) * d; G const float* vp = v + ((size_t)j * hk + kh) * dv; float dot = 0.0f;
+    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kp[e], dot);
+    float sc = dot * scale, mn = sc > m ? sc : m, rs = m == -INFINITY ? 0.0f : fexp(m - mn), pw = fexp(sc - mn);
+    ls = ls * rs + pw; m = mn;
+    for (unsigned e = 0; e < dv; ++e) yp[e] = fma_(pw, vp[e], yp[e] * rs); }
+  float inv = ls > 0.0f ? 1.0f / ls : 0.0f; for (unsigned e = 0; e < dv; ++e) yp[e] *= inv; }
+// Decode attention, split over keys: work item b = (row-head id, split sp) takes a contiguous chunk of the visible
+// keys with an online softmax and writes (max, sum, acc[dv]) to part[b]; forge_attention_comb merges the ns splits in
+// split order. The split count is fixed, so the launch shape does not change as the context grows. Plain f32 K/V.
+FORGE_K void forge_attention_dec(G const float* q, G const float* k, G const float* v, G float* part, unsigned s, unsigned hq,
+                                 unsigned d, unsigned t, unsigned hk, unsigned dv, unsigned flags, float scale, unsigned ns) {
+  unsigned b = gid(); if (b >= s * hq * ns) return; unsigned id = b / ns, sp = b % ns;
+  unsigned i = id / hq, h = id % hq, kh = h / (hq / hk), causal = flags & 1u, window = flags >> 7;
+  int pos = (int)t - (int)s + (int)i;
+  unsigned jend = t; if (causal) { int lim = pos + 1; jend = lim < 0 ? 0u : ((unsigned)lim < t ? (unsigned)lim : t); }
+  unsigned jbeg = 0u; if (window && pos - (int)window + 1 > 0) jbeg = (unsigned)(pos - (int)window + 1);
+  unsigned len = jend > jbeg ? jend - jbeg : 0u, ch = (len + ns - 1u) / ns, c0 = jbeg + sp * ch, c1 = c0 + ch < jend ? c0 + ch : jend;
+  G const float* qp = q + (size_t)id * d; G float* pp = part + (size_t)b * (dv + 2u);
+  for (unsigned e = 0; e < dv; ++e) pp[2u + e] = 0.0f;
+  float m = -INFINITY, ls = 0.0f;
+  for (unsigned j = c0; j < c1; ++j) {
+    G const float* kp = k + ((size_t)j * hk + kh) * d; G const float* vp = v + ((size_t)j * hk + kh) * dv; float dot = 0.0f;
+    for (unsigned e = 0; e < d; ++e) dot = fma_(qp[e], kp[e], dot);
+    float sc = dot * scale, mn = sc > m ? sc : m, rs = m == -INFINITY ? 0.0f : fexp(m - mn), pw = fexp(sc - mn);
+    ls = ls * rs + pw; m = mn;
+    for (unsigned e = 0; e < dv; ++e) pp[2u + e] = fma_(pw, vp[e], pp[2u + e] * rs); }
+  pp[0] = m; pp[1] = ls; }
+FORGE_K void forge_attention_comb(G const float* part, G float* y, unsigned nrow, unsigned ns, unsigned dv) {
+  unsigned i = gid(); if (i >= nrow * dv) return; unsigned id = i / dv, e = i % dv;
+  G const float* pp = part + (size_t)id * ns * (dv + 2u);
+  float M = -INFINITY; for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; M = mu > M ? mu : M; }
+  float L = 0.0f, a = 0.0f;
+  for (unsigned u = 0; u < ns; ++u) { float mu = pp[u * (dv + 2u)]; if (mu == -INFINITY) continue;
+    float fu = fexp(mu - M); L += pp[u * (dv + 2u) + 1u] * fu; a = fma_(pp[u * (dv + 2u) + 2u + e], fu, a); }
+  y[i] = L > 0.0f ? a * (1.0f / L) : 0.0f; }
+// Gated DeltaNet state ops (graph/state_ops.hpp semantics; the state slot stays resident). delta_rule: a work item
+// per (value head, state column j) owns column j of S[h] (dk x dv): S *= exp(g); delta = (v - S^T k) * beta;
+// S += k delta^T; out = S^T q, token by token. Each work item computes the token's q/k l2 norms itself.
+FORGE_K void forge_delta_rule(G const float* q, G const float* k, G const float* v, G const float* g, G const float* beta, G float* S, G float* out,
+                              unsigned s, unsigned hk, unsigned dk, unsigned hv, unsigned dv, unsigned l2, float scale) {
+  unsigned id = gid(); if (id >= hv * dv) return; unsigned h = id / dv, j = id % dv, kh = h / (hv / hk);
+  G float* Sh = S + (size_t)h * dk * dv;
+  for (unsigned t = 0; t < s; ++t) {
+    G const float* qt = q + ((size_t)t * hk + kh) * dk; G const float* kt = k + ((size_t)t * hk + kh) * dk;
+    float qf = scale, kf = 1.0f;
+    if (l2) { float qs = 0.0f, ks = 0.0f; for (unsigned i = 0; i < dk; ++i) { qs += qt[i] * qt[i]; ks += kt[i] * kt[i]; }
+      qf = scale / fsqrt(qs + 1e-6f); kf = 1.0f / fsqrt(ks + 1e-6f); }
+    float decay = fexp(g[t * hv + h]), bt = beta[t * hv + h], kv = 0.0f;
+    for (unsigned i = 0; i < dk; ++i) { float r = Sh[(size_t)i * dv + j] * decay; Sh[(size_t)i * dv + j] = r; kv = fma_(r, kt[i] * kf, kv); }
+    float dl = (v[((size_t)t * hv + h) * dv + j] - kv) * bt, acc = 0.0f;
+    for (unsigned i = 0; i < dk; ++i) { float r = fma_(kt[i] * kf, dl, Sh[(size_t)i * dv + j]); Sh[(size_t)i * dv + j] = r; acc = fma_(r, qt[i] * qf, acc); }
+    out[((size_t)t * hv + h) * dv + j] = acc; } }
+// causal_conv: a work item per channel; state [K-1, C] is the previous K-1 inputs. Requires K <= 9.
+FORGE_K void forge_causal_conv(G const float* x, G const float* w, G float* st, G float* out, unsigned s, unsigned C, unsigned K) {
+  unsigned c = gid(); if (c >= C) return;
+  unsigned P = K - 1u;
+  for (unsigned t = 0; t < s; ++t) { float acc = 0.0f;
+    for (unsigned j = 0; j < K; ++j) { unsigned p = t + j; float xv = p < P ? st[p * C + c] : x[(size_t)(p - P) * C + c]; acc = fma_(w[c * K + j], xv, acc); }
+    out[(size_t)t * C + c] = acc; }
+  float nw[8];
+  for (unsigned i = 0; i < P; ++i) { unsigned p = s + i; nw[i] = p < P ? st[p * C + c] : x[(size_t)(p - P) * C + c]; }
+  for (unsigned i = 0; i < P; ++i) st[i * C + c] = nw[i]; }
+"""
+
+def cl_port():
+    return PORT_HELPERS + PORT_SHARED + PORT_KERNELS
+
+def cu_port():
+    """PORT_SHARED in the CUDA/HIP dialect (the codec helpers of the same names already exist in CU_QUANT)."""
+    b = PORT_SHARED.replace("G ", "").replace("FORGE_K void", "FORGE_GLOBAL void").replace("static inline", "FORGE_DEV")
+    return b.replace("(size_t)", "(unsigned long long)").replace("size_t row", "unsigned long long row")
+# ==== END portable device kernels ===================================================================================
 
 MSL_PRELUDE = r"""// generated by ops/gen/gpu_gen.py from spec/ops -- do not edit
 // Metal Shading Language version of kernels.cu (same bodies); compiled by the Metal runtime at open()
@@ -1755,7 +1943,7 @@ def main():
     def put(path, text):
         if not os.path.exists(path) or open(path, encoding="utf-8").read() != text: open(path, "w", encoding="utf-8", newline="\n").write(text)
     for n in names: put(os.path.join(a.out, n + ".comp"), glsl(n))
-    put(os.path.join(a.out, "kernels.cu"), cuda(names) + "\n" + CU_QUANT)   # CUDA/HIP only (not OpenCL/Metal)
+    put(os.path.join(a.out, "kernels.cu"), cuda(names) + "\n" + CU_QUANT + cu_port())   # CUDA/HIP only (not OpenCL/Metal)
     put(os.path.join(a.out, "kernels.cl"), opencl(names))
     put(os.path.join(a.out, "kernels.metal"), msl(names))
     put(os.path.join(a.out, "kernels_cl_mock.inc"), cl_mock_dispatch(names))

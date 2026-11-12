@@ -3,7 +3,7 @@
 #   - one fused projection for the MLP's gate and up halves (gate_up_proj: rows [gate | up]; y = down(up * silu(gate))),
 #   - RoPE over the first `rot` dims of each head (Phi-4-mini: partial_rotary_factor 0.75; Phi-3: the whole head).
 # The importer picks `rope_part` or `rope_full` below. Double-brace placeholders come from config.json.
-blueprint "decoder-lm" opset 1
+blueprint "decoder-lm" opset 3
 
 params {
   d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}

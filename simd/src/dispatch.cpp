@@ -5,13 +5,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#define FORGE_X86_CPUID 1
 #endif
 #if defined(__linux__)
 #include <sys/auxv.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#elif defined(__FreeBSD__)
+#include <sys/auxv.h>
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
 #if defined(__APPLE__)
@@ -26,8 +29,36 @@ extern "C" __declspec(dllimport) int __stdcall IsProcessorFeaturePresent(unsigne
 
 namespace forge::simd {
 namespace mv_scalar { extern const kernels table; }
+// Which tables exist is decided by CMake (FORGE_SIMD_HAVE_<TABLE> on this file), one set per architecture.
+#if defined(FORGE_SIMD_HAVE_AVX2)
 namespace mv_avx2 { extern const kernels table; }
 namespace mv_avx512 { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_SSE)
+namespace mv_sse2 { extern const kernels table; }
+namespace mv_sse42 { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_LSX)
+namespace mv_lsx { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_LASX)
+namespace mv_lasx { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_VSX)
+namespace mv_vsx { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_VXE)
+namespace mv_vxe { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_WASM128)
+namespace mv_simd128 { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_MSA)
+namespace mv_msa { extern const kernels table; }
+#endif
+#if defined(FORGE_SIMD_HAVE_NEON32)
+namespace mv_neon { extern const kernels table; }
+#endif
 #if defined(__aarch64__)
 namespace mv_neon { extern const kernels table; }
 #endif
@@ -119,7 +150,7 @@ static const kernels* rvv_table(int bytes) {
     }
 }
 
-#if defined(__x86_64__)
+#if defined(FORGE_X86_CPUID)
 static unsigned long long xgetbv0() {
     unsigned eax, edx;
     __asm__ volatile("xgetbv" : "=a"(eax), "=d"(edx) : "c"(0));
@@ -127,9 +158,21 @@ static unsigned long long xgetbv0() {
 }
 #endif
 
+// ELF auxiliary vector (AT_HWCAP = 16, AT_HWCAP2 = 26); 0 where the OS has none.
+[[maybe_unused]] static unsigned long hwcap(int which) {
+#if defined(__linux__)
+    return getauxval(static_cast<unsigned long>(which));
+#elif defined(__FreeBSD__)
+    unsigned long v = 0;
+    return elf_aux_info(which, &v, int(sizeof v)) == 0 ? v : 0;
+#else
+    (void)which; return 0;
+#endif
+}
+
 static cpu_features do_detect() {
     cpu_features f;
-#if defined(__x86_64__)
+#if defined(FORGE_X86_CPUID)
     unsigned a, b, c, d;
     __cpuid(0, a, b, c, d);
     unsigned maxl = a;
@@ -162,7 +205,7 @@ static cpu_features do_detect() {
         if (f.avx10 && maxl >= 0x24) { __cpuid_count(0x24, 0, a, b, c, d); f.avx10_version = int(b & 0xff); }
         // AMX: XCR0 bits 17/18 must be enabled and Linux requires a permission request.
         f.amx_tile = amx_tile_hw && (xcr0 & 0x60000) == 0x60000;
-#if defined(__linux__)
+#if defined(__linux__) && defined(__x86_64__)
         if (f.amx_tile) {
             constexpr int ARCH_REQ_XCOMP_PERM = 0x1023, XFEATURE_XTILEDATA = 18;
             f.amx_permitted = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) == 0;
@@ -207,6 +250,42 @@ static cpu_features do_detect() {
     f.rvv = getauxval(AT_HWCAP) & (1ul << ('V' - 'A'));
     if (f.rvv) f.rvv_bytes = rvv_vlenb();
 #endif
+#elif defined(__loongarch__)
+    f.vendor = "loongarch64";
+    { unsigned long hw = hwcap(16);   // HWCAP_LOONGARCH_LSX = 1 << 4, HWCAP_LOONGARCH_LASX = 1 << 5
+      f.lsx = hw & (1ul << 4); f.lasx = hw & (1ul << 5); }
+#if defined(__loongarch_sx)
+    f.lsx = true;    // the build's baseline already requires it
+#endif
+#if defined(__loongarch_asx)
+    f.lasx = true;
+#endif
+#elif defined(__powerpc64__)
+    f.vendor = __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ? "ppc64le" : "ppc64";
+    { unsigned long hw = hwcap(16), hw2 = hwcap(26);
+      f.vsx = hw & 0x00000080ul;               // PPC_FEATURE_HAS_VSX
+      f.power8 = hw2 & 0x80000000ul;           // PPC_FEATURE2_ARCH_2_07
+      f.power9 = hw2 & 0x00800000ul;           // PPC_FEATURE2_ARCH_3_00
+      f.power10 = hw2 & 0x00040000ul; }        // PPC_FEATURE2_ARCH_3_1
+#if defined(__VSX__) && defined(_ARCH_PWR8)
+    f.vsx = f.power8 = true;   // baseline of the build (ELFv2 little-endian requires POWER8)
+#endif
+#elif defined(__s390x__)
+    f.vendor = "s390x";
+    { unsigned long hw = hwcap(16);   // HWCAP_S390_VXRS = 2048, _VXRS_EXT = 8192 (z14), _VXRS_EXT2 = 32768 (z15)
+      f.s390_vx = hw & 2048ul; f.s390_vxe = f.s390_vx && (hw & 8192ul); f.s390_vxe2 = f.s390_vxe && (hw & 32768ul); }
+#elif defined(__wasm__)
+    f.vendor = "wasm";
+#if defined(__wasm_simd128__) || defined(FORGE_SIMD_HAVE_WASM128)
+    f.wasm_simd128 = true;   // a module is validated as a whole: there is nothing to detect at run time
+#endif
+#elif defined(__mips__)
+    f.vendor = "mips";
+    f.msa = hwcap(16) & (1ul << 1);   // HWCAP_MIPS_MSA
+#elif defined(__arm__)
+    f.vendor = "arm";
+    { unsigned long hw = hwcap(16);   // HWCAP_NEON = 1 << 12, HWCAP_VFPv4 = 1 << 16
+      f.neon = hw & (1ul << 12); f.vfpv4 = hw & (1ul << 16); }
 #endif
     return f;
 }
@@ -225,28 +304,66 @@ std::string cpu_features::summary() const {
     add(sve, "sve"); add(sve2, "sve2"); if (sve_bytes) s += std::format("(vl={}b)", sve_bytes * 8);
     if (sve_hw_bytes && sve_hw_bytes != sve_bytes) s += std::format("(hw vl={}b, lowered)", sve_hw_bytes * 8);
     add(rvv, "rvv"); if (rvv_bytes) s += std::format("(vlen={}b)", rvv_bytes * 8);
+    add(lsx, "lsx"); add(lasx, "lasx"); add(vsx, "vsx"); add(power8, "power8"); add(power9, "power9"); add(power10, "power10");
+    add(s390_vx, "vx"); add(s390_vxe, "vxe"); add(s390_vxe2, "vxe2"); add(wasm_simd128, "simd128"); add(msa, "msa"); add(vfpv4, "vfpv4");
     return s;
 }
 
 const kernels* by_name(const char* t) {
-    const auto& f = detect();
-    std::string_view n = t;
+    [[maybe_unused]] const auto& f = detect();
+    std::string_view n = t ? t : "";
     if (n == "scalar") return &mv_scalar::table;
 #if defined(__aarch64__)
     if (n == "neon") return f.neon ? &mv_neon::table : nullptr;
     if (n == "sve") return f.sve ? sve_table(f.sve_bytes) : nullptr;  // table built for exactly this VL, if any
-    return nullptr;
 #elif defined(__riscv)
     if (n == "rvv") return f.rvv ? rvv_table(f.rvv_bytes) : nullptr;
-    return nullptr;
-#else
+#endif
+#if defined(FORGE_SIMD_HAVE_AVX2)
     // The whole x86-64-v3 / -v4 feature set the TUs are built for: nested VMs (e.g. the FreeBSD CI guest on AMD)
     // can report AVX2 while masking F16C/BMI2, and a kernel using them then dies with SIGILL.
     const bool v3 = f.sse2 && f.sse4_2 && f.popcnt && f.avx && f.avx2 && f.fma && f.f16c && f.bmi2;
     if (n == "avx2") return v3 ? &mv_avx2::table : nullptr;
     if (n == "avx512") return v3 && f.avx512f && f.avx512bw && f.avx512dq && f.avx512vl && f.avx512cd ? &mv_avx512::table : nullptr;
-    return nullptr;
 #endif
+#if defined(FORGE_SIMD_HAVE_SSE)
+    if (n == "sse4.2" || n == "sse42") return f.sse2 && f.sse4_2 && f.popcnt ? &mv_sse42::table : nullptr;   // x86-64-v2 TU
+    if (n == "sse2") return f.sse2 ? &mv_sse2::table : nullptr;
+#endif
+#if defined(FORGE_SIMD_HAVE_LASX)
+    if (n == "lasx") return f.lsx && f.lasx ? &mv_lasx::table : nullptr;
+#endif
+#if defined(FORGE_SIMD_HAVE_LSX)
+    if (n == "lsx") return f.lsx ? &mv_lsx::table : nullptr;
+#endif
+#if defined(FORGE_SIMD_HAVE_VSX)
+    if (n == "vsx") return f.vsx && f.power8 ? &mv_vsx::table : nullptr;   // TU is built for POWER8
+#endif
+#if defined(FORGE_SIMD_HAVE_VXE)
+    if (n == "vxe") return f.s390_vxe ? &mv_vxe::table : nullptr;          // TU is built for z14
+#endif
+#if defined(FORGE_SIMD_HAVE_WASM128)
+    if (n == "simd128") return &mv_simd128::table;
+#endif
+#if defined(FORGE_SIMD_HAVE_MSA)
+    if (n == "msa") return f.msa ? &mv_msa::table : nullptr;
+#endif
+#if defined(FORGE_SIMD_HAVE_NEON32)
+    // Opt-in: Advanced SIMD on AArch32 always flushes subnormals to zero, so results in the subnormal range
+    // (exp below -87, cbrt/erfc of tiny values) miss the oracle tolerance. Never chosen automatically.
+    if (n == "neon") {
+        const char* e = std::getenv("FORGE_SIMD_ARM32_NEON");
+        return e && *e == '1' && f.neon && f.vfpv4 ? &mv_neon::table : nullptr;
+    }
+#endif
+    return nullptr;
+}
+
+// Every table name this build knows, preferred first; `scalar` is last and always usable.
+std::span<const char* const> target_names() {
+    static const char* const names[] = {"avx512", "avx2", "sse4.2", "sse2", "sve", "neon", "rvv", "lasx", "lsx", "vsx", "vxe",
+                                        "simd128", "msa", "scalar"};
+    return names;
 }
 
 const kernels& active() {
@@ -255,7 +372,7 @@ const kernels& active() {
         for (const char* var : {"FORGE_SIMD_TARGET", "FORGE_LANE_TARGET"})
             if (const char* e = std::getenv(var))
                 if (auto* p = by_name(e)) return p;
-        for (const char* t : {"avx512", "avx2", "sve", "rvv", "neon"}) if (auto* p = by_name(t)) return p;
+        for (const char* t : target_names()) if (auto* p = by_name(t)) return p;
         return &mv_scalar::table;
     }();
     return *k;

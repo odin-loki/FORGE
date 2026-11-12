@@ -1,6 +1,6 @@
 # Seed for fuzz_blueprint: user-defined composite ops (defaults, keyword arguments, nesting, a body defined after
 # the graph block), the number helpers and scalar().
-blueprint "composites" opset 1
+blueprint "composites" opset 3
 params { d: 8  n_layers: 2  k: 3  rope: { base: 10000 } }
 state kv[n_layers] : kv_cache(heads: 2, dim: 4)
 input tokens    : f32[seq]

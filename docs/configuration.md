@@ -6,8 +6,8 @@ FORGE has no configuration file. Programs take command-line flags ([cli.md](cli.
 
 | Variable | Read by | Effect |
 |----------|---------|--------|
-| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
-| `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx2`, `avx512`, `neon`, `sve`, `rvv`. Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
+| `FORGE_DEVICE` | `inference::model` (so `forge run`, `forge bench`, `forge-serve`, the C ABI and the bindings) | Execution device: `cpu` (default), `auto` (scores every device that opens; software devices never beat the CPU), `vulkan`, `cuda[:N]`, `hip[:N]`, `opencl[:N]`, `ze[:N]` / `level_zero[:N]`, `metal[:N]`, `rpc:host:port`, or a pipeline `pipe:<dev>[*weight],<dev>...` (e.g. `pipe:vulkan*3,cpu`). An unavailable device logs a warning and falls back to the CPU |
+| `FORGE_SIMD_TARGET` | simd dispatch | Force a kernel table: `scalar`, `avx512`, `avx2`, `sse4.2`, `sse2`, `neon`, `sve`, `rvv`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` (32-bit Arm `neon` needs `FORGE_SIMD_ARM32_NEON=1` as well: [simd.md](simd.md)). Ignored if the table is not usable on this CPU. The old name `FORGE_LANE_TARGET` is still read |
 | `FORGE_SVE_KEEP_VL=1` | simd (aarch64 Linux) | Do not change the SVE vector length at start-up when there is no kernel table for the hardware length |
 | `FORGE_THREADS` | task pool | Worker thread count (default: physical cores this process may use on Linux, else hardware concurrency) |
 | `FORGE_SPIN_US` | task pool | How long idle workers spin for the next `parallel_for` before sleeping (default 200; 0 = sleep at once) |
@@ -25,9 +25,15 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 |----------|-----------|--------|
 | `FORGE_GPU_NO_RESIDENCY` | CUDA, HIP, OpenCL, Level Zero, Metal | If set, tensors are not kept on the device between ops; every op uploads and downloads. Vulkan always keeps tensors resident |
 | `FORGE_GPU_EAGER_SYNC` | CUDA, HIP | If set, every run ends by syncing all resident buffers to the host; turns off the fixed arena and whole-run replay |
-| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP | If set, Gated DeltaNet state ops run on the host instead of the device |
-| `FORGE_GPU_QMATMUL=0` | CUDA, HIP | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
-| `FORGE_GPU_QGATHER=0` | CUDA, HIP | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_NO_STATE_OPS` | CUDA, HIP, OpenCL, Level Zero | If set, Gated DeltaNet state ops run on the host instead of the device |
+| `FORGE_GPU_QMATMUL=0` | CUDA, HIP, OpenCL, Level Zero | Do not run quantised matmul on the device with encoded weights; weights are decoded to f32 within `FORGE_GPU_WEIGHT_BUDGET` instead |
+| `FORGE_GPU_QGATHER=0` | CUDA, HIP, OpenCL, Level Zero | Do not gather from encoded embedding tables on the device |
+| `FORGE_GPU_MOE=0` | CUDA, HIP, OpenCL, Level Zero | Run the sparse mixture of experts (`moe_ffn`) on the host instead of the device |
+| `FORGE_DETERMINISTIC=1` | all devices | Determinism mode: only order-stable device paths (no split-K / stream-K matmul, no split-over-keys decode attention, single-block argmax, fixed CPU chunking). Same device + same build gives bit-identical results; see [gpu.md](gpu.md#determinism-mode). `session_options::deterministic` and `gpu::set_deterministic` override it |
+| `FORGE_DEVICE_PREFER`, `FORGE_DEVICE_EXCLUDE` | `FORGE_DEVICE=auto` | Comma lists of backends (`cuda`) or devices (`opencl:1`): preferred ones win whenever eligible, excluded ones are never chosen ([gpu.md](gpu.md#automatic-device-selection)) |
+| `FORGE_DEVICE_ALLOW_SOFTWARE=1` | `FORGE_DEVICE=auto` | Let software devices (lavapipe, SwiftShader, OpenCL CPU runtimes) compete; by default they never win over the CPU |
+| `FORGE_DEVICE_BENCH=0` | `FORGE_DEVICE=auto` | Do not run the per-device micro-benchmark; score by device class only |
+| `FORGE_GPU_KERNEL_CACHE=0` | OpenCL, Level Zero | Disable the on-disk cache of driver-compiled kernel programs ([gpu.md](gpu.md#kernel-program-cache)) |
 | `FORGE_GPU_WEIGHT_BUDGET` | resident backends | f32 bytes of decoded quantised weights mirrored on the device, e.g. `4G`, `512M` (suffix `k`, `m`, `g`; default 8 GiB). The rest stay encoded and run on the CPU. Codecs with a device quantised matmul stay encoded on the device instead |
 | `FORGE_GPU_ARENA_MB` | CUDA, HIP | Largest activation arena held at fixed device addresses as one buffer, in MiB (default 1024; 0 disables) |
 | `FORGE_GPU_POOL_MB` | CUDA, HIP | MiB of freed device buffers kept for reuse (default 4096) |
@@ -71,7 +77,7 @@ These switch individual GPU code paths. Most are for benchmarking and bisecting;
 | `FORGE_VK_DEBUG` | Vulkan | If set, log why an op was not offloaded to Vulkan |
 | `FORGE_VK_SSBO_ALIGN=N` | Vulkan | Emulate a stricter storage-buffer offset alignment (testing) |
 | `FORGE_VK_PIPELINE_CACHE=0` | Vulkan | Disable the pipeline cache |
-| `FORGE_CACHE_DIR` | Vulkan | Pipeline cache directory (else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge`) |
+| `FORGE_CACHE_DIR` | Vulkan, OpenCL, Level Zero | Directory of the Vulkan pipeline cache and the OpenCL / Level Zero kernel program cache (else `$XDG_CACHE_HOME/forge`, else `~/.cache/forge`). Must not be writable by other users |
 | `FORGE_OPENCL_TYPE` | OpenCL | Devices to enumerate: `gpu`, `cpu` or `all` (default; GPUs listed first) |
 
 ## Sessions and memory
@@ -82,7 +88,11 @@ See [memory.md](memory.md) for how the budget is used.
 |----------|--------|
 | `FORGE_KV_CACHE_TYPE`, `FORGE_KV_CODEC` | KV cache codec when `session_options.kv_codec` is empty (`FORGE_KV_CACHE_TYPE` is checked first): `f32` (default), `int8`, `fp8`, `tbq4`, `tbq3`, `tbq4p`, `tbq3p`, or `k8v4` (int8 keys, tbq4 values) |
 | `FORGE_KV_OFFLOAD=1` | Keep the KV cache on the host and drop device copies after each attention (when `session_options.kv_offload` is unset) |
-| `FORGE_DECODE_WEIGHTS=1` | Decode every weight to f32 at load time, instead of reading quantised weights in place from the mapped file |
+| `FORGE_DECODE_WEIGHTS=1` | Decode every weight to f32 at load time, instead of reading quantised weights in place from the mapped file. Precompiled plans are not used |
+| `FORGE_AOT=0` | Ignore precompiled plans (`aot` section, sidecar, compiled library code): every plan is compiled at run time ([aot-models.md](aot-models.md)) |
+| `FORGE_AOT_PLAN=FILE` | Sidecar plan file to use instead of `<model>.fplan` |
+| `FORGE_AOT_FPK=FILE` | Model file for a natively compiled model library, instead of the one recorded in it |
+| `FORGE_AOT_SDK=FILE` | Build description (`forge_aot_sdk.txt`) for `forge aot --aot-mode native` |
 | `FORGE_HUGEPAGES=1` | Advise huge pages for memory mappings of 2 MiB or more |
 | `FORGE_MEM_LIMIT` | Host memory budget: `6G`, `512M`, `1.5GiB`, bytes, or `75%` of the detected limit; `0` / `off` disables. Default: `FORGE_MEM_FRACTION` of min(RAM, cgroup limit, `RLIMIT_AS`) |
 | `FORGE_MEM_FRACTION` | Share of the detected limit used when `FORGE_MEM_LIMIT` is unset (default `0.85`) |

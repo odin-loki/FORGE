@@ -116,6 +116,84 @@ TEST(oracle_matrix_all_ops) {
     std::printf("  %d/%zu ops pass\n", ok, ops::op_count);
 }
 
+// RoPE frequency scaling (ops/rope.hpp). The tables are transformers/modeling_rope_utils.py in float64 numpy, printed by
+// `verify/golden/tiny_rope.py --dump-tables` (head dimension 16, base 10000).
+static std::vector<i64> f32_bits(const std::vector<float>& v) {
+    std::vector<i64> b; for (float f : v) { std::uint32_t u; std::memcpy(&u, &f, 4); b.push_back(i64(u)); } return b;
+}
+TEST(rope_frequency_scaling) {
+    using ops::attrs;
+    struct variant { const char* name; attrs a; double seq_len; std::vector<double> want; };
+    const std::vector<variant> vs = {
+        {"linear", {{"base", 10000.0}, {"scaling", 1.0}, {"factor", 4.0}}, 0,
+         {0.25, 0.079056941504209485, 0.025000000000000001, 0.0079056941504209478, 0.0025000000000000001, 0.00079056941504209496, 0.00025000000000000001, 7.9056941504209485e-05}},
+        {"dynamic", {{"base", 10000.0}, {"scaling", 2.0}, {"factor", 2.0}, {"orig_ctx", 8.0}}, 13,
+         {1, 0.2816360286474236, 0.079318852632292408, 0.022339046652229074, 0.0062914803829033196, 0.001771907549354063, 0.00049903300533046704, 0.00014054567378526131}},
+        {"yarn", {{"base", 10000.0}, {"scaling", 3.0}, {"factor", 4.0}, {"orig_ctx", 64.0}}, 0,
+         {1, 0.23717082451262847, 0.050000000000000003, 0.0079056941504209478, 0.0025000000000000001, 0.00079056941504209496, 0.00025000000000000001, 7.9056941504209485e-05}},
+        {"yarn betas", {{"base", 10000.0}, {"scaling", 3.0}, {"factor", 8.0}, {"orig_ctx", 256.0}, {"beta_fast", 16.0}, {"beta_slow", 2.0}, {"truncate", 0.0}}, 0,
+         {1, 0.28740859576652095, 0.042441793456175964, 0.0039528470752104739, 0.00125, 0.00039528470752104748, 0.000125, 3.9528470752104742e-05}},
+        {"llama3", {{"base", 10000.0}, {"scaling", 4.0}, {"factor", 8.0}, {"low_freq", 1.0}, {"high_freq", 4.0}, {"orig_ctx", 64.0}}, 0,
+         {1, 0.24438459943539834, 0.013042256043820465, 0.0039528470752104739, 0.00125, 0.00039528470752104748, 0.000125, 3.9528470752104742e-05}},
+    };
+    const i64 d = 16;
+    // no scaling attrs: exactly the expression the op has always used (old files give the same bits)
+    auto plain = ops::rope_inv_freq({{"base", 10000.0}, {"neox", 1.0}}, d);
+    for (std::size_t j = 0; j < plain.size(); ++j) CHECK(plain[j] == std::pow(10000.0, -2.0 * double(j) / double(d)));
+    CHECK(ops::rope_inv_freq({{"base", 10000.0}, {"scaling", 0.0}}, d) == plain);
+    CHECK(!ops::rope_scaled({{"base", 10000.0}, {"neox", 0.0}}) && !ops::rope_scaled({{"scaling", 0.0}}));
+    // dynamic NTK below the trained length is the plain table
+    CHECK(ops::rope_inv_freq({{"base", 10000.0}, {"scaling", 2.0}, {"factor", 2.0}, {"orig_ctx", 8.0}}, d, 8) == plain);
+    std::mt19937 rng(7);
+    tensor x = verify::random_tensor({13, 3, d}, rng, -1.f, 1.f), pos({13});
+    for (int i = 0; i < 13; ++i) pos.data[std::size_t(i)] = float(i);
+    auto run_cpu = [&](attrs a) {   // the CPU lowering through the compile pipeline
+        tensor_graph g; auto xi = g.input("x", x.shape), pi = g.input("pos", pos.shape);
+        g.output("y", g.apply(ops::op::rope, {xi, pi}, a));
+        auto p = compile(g, nullptr, {false, false, false, false});
+        executor e(*p); e.set_input("x", x.data); e.set_input("pos", pos.data); e.run();
+        return e.output("y");
+    };
+    auto unscaled = ops::ref::rope({x, pos}, {{"base", 10000.0}, {"neox", 1.0}});
+    for (auto& v : vs) {
+        auto got = ops::rope_inv_freq(v.a, d, v.seq_len);
+        CHECK(got.size() == v.want.size());
+        for (std::size_t j = 0; j < got.size() && j < v.want.size(); ++j)
+            CHECK_MSG(std::fabs(got[j] - v.want[j]) <= 1e-13 * v.want[j], "%s: inv_freq[%zu] = %.17g, numpy %.17g", v.name, j, got[j], v.want[j]);
+        CHECK(ops::rope_scaled(v.a));
+        for (double neox : {1.0, 0.0}) {
+            attrs a = v.a; a.set("neox", neox);
+            // the reference from the numpy table: rotate pair j of row i by pos[i] * want[j]
+            tensor want(x.shape);
+            for (i64 i = 0; i < 13; ++i) for (i64 h = 0; h < 3; ++h) for (i64 j = 0; j < d / 2; ++j) {
+                std::size_t o = std::size_t((i * 3 + h) * d), i0 = o + std::size_t(neox != 0 ? j : 2 * j), i1 = o + std::size_t(neox != 0 ? j + d / 2 : 2 * j + 1);
+                double th = double(i) * v.want[std::size_t(j)], c = std::cos(th), s = std::sin(th);
+                want.data[i0] = float(x.data[i0] * c - x.data[i1] * s); want.data[i1] = float(x.data[i0] * s + x.data[i1] * c);
+            }
+            auto ref = ops::ref::rope({x, pos}, a);
+            auto r1 = verify::compare(ref, want, {ops::tol_kind::abs, 1e-6});
+            CHECK_MSG(r1.ok, "%s neox %g reference: %s", v.name, neox, r1.message.c_str());
+            auto r2 = verify::compare(run_cpu(a), ref, ops::info(ops::op::rope).tol);
+            CHECK_MSG(r2.ok, "%s neox %g cpu lowering: %s", v.name, neox, r2.message.c_str());
+            if (neox != 0) CHECK_MSG(!verify::compare(ref, unscaled, {ops::tol_kind::abs, 1e-3}).ok, "%s: scaling changed nothing", v.name);
+        }
+    }
+    // freq_factors: per-pair multipliers as float bit patterns (GGUF rope_freqs.weight), applied after any scaling
+    std::vector<float> ff{1.f, 1.f, 0.5f, 0.25f, 0.125f, 0.125f, 0.125f, 0.125f};
+    attrs af{{"base", 10000.0}, {"freq_factors", f32_bits(ff)}};
+    auto tf = ops::rope_inv_freq(af, d);
+    for (std::size_t j = 0; j < tf.size(); ++j) CHECK(tf[j] == plain[j] * double(ff[j]));
+    CHECK(ops::rope_scaled(af));
+    auto r3 = verify::compare(run_cpu(af), ops::ref::rope({x, pos}, af), ops::info(ops::op::rope).tol);
+    CHECK_MSG(r3.ok, "freq_factors cpu lowering: %s", r3.message.c_str());
+    // bad parameters are errors, not silently unscaled tables
+    CHECK_THROWS(ops::rope_inv_freq({{"scaling", 9.0}, {"factor", 2.0}}, d));
+    CHECK_THROWS(ops::rope_inv_freq({{"scaling", 1.0}, {"factor", 0.0}}, d));
+    CHECK_THROWS(ops::rope_inv_freq({{"scaling", 3.0}, {"factor", 4.0}}, d));                       // yarn without orig_ctx
+    CHECK_THROWS(ops::rope_inv_freq({{"scaling", 4.0}, {"factor", 8.0}, {"orig_ctx", 64.0}, {"low_freq", 2.0}, {"high_freq", 2.0}}, d));
+    CHECK_THROWS(ops::rope_inv_freq({{"freq_factors", std::vector<i64>{1, 2, 3}}}, d));             // wrong length
+}
+
 TEST(state_append_symbolic_length) {
     state_store st; st.capacity = 16;
     tensor_graph g;

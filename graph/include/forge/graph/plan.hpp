@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <forge/graph/codecs.hpp>
+#include <forge/gpu/determinism.hpp>
 #include <forge/graph/kernels.hpp>
 #include <forge/simd/qdot.hpp>
 #include <forge/simd/qdot_i8.hpp>
@@ -389,10 +390,16 @@ public:
         } catch (...) {}
     }
     bool pinned = false;
-    bool deterministic = true;        // CPU kernels use fixed reduction orders
+    // Determinism mode (gpu/determinism.hpp) at compile time: CPU kernels always use fixed reduction orders; when set,
+    // the device runtimes also take only order-stable paths while the mode stays on (they read it at each launch).
+    bool deterministic = gpu::deterministic();
+    // Natively compiled step ranges (aot_native.hpp): native(si) runs the compiled code that starts at step si and
+    // returns how many steps it covered (0 = none starts there: the executor interprets the step). CPU plans only.
+    std::function<std::size_t(std::size_t)> native;
+    bool aot = false;                 // instantiated from a precompiled plan (aot.hpp), not compiled here
     std::string describe() const {
-        std::string s = std::format("plan: {} nodes, {} steps, arena {} bytes (naive {}), {} in-place, {} aliases\n",
-                                    g.size(), steps.size(), mem.arena_bytes, mem.naive_bytes, mem.in_place, mem.aliases);
+        std::string s = std::format("plan: {} nodes, {} steps, arena {} bytes (naive {}), {} in-place, {} aliases{}\n",
+                                    g.size(), steps.size(), mem.arena_bytes, mem.naive_bytes, mem.in_place, mem.aliases, deterministic ? ", deterministic" : "");
         std::map<std::string, int> uses;
         for (auto& st : steps) if (st.low) uses[st.low->name]++;
         for (auto& [k, v] : uses) s += std::format("  {:<16} x{}\n", k, v);
@@ -429,6 +436,11 @@ inline void fuse_glu(plan& p, registry& reg) {
     }
 }
 
+// Lowering half of compile(): binds buffers and picks a kernel per step for a plan whose graph (optimised, verified)
+// and memory plan are already set. `pick`, when given, names the lowering of a generic op step (a precompiled plan,
+// aot.hpp); returning null leaves the choice to the registry.
+using lowering_pick = std::function<const lowering*(value_id, std::span<const shape_t>)>;
+inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const lowering_pick& pick = {});
 inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, const pass_options& po = {}) {
     auto p = std::make_unique<plan>();
     auto sshapes = st ? st->shapes() : std::map<std::string, shape_t>{};
@@ -436,6 +448,11 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
     p->part = partition(p->g, gpu::all());
     p->mem = plan_memory(p->g);
     if (!plan_is_safe(p->mem)) raise(errc::invalid_argument, "memory planner produced overlapping buffers");
+    lower_plan(*p, st, po);
+    return p;
+}
+inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const lowering_pick& pick) {
+    plan* p = &pl;
     p->arena.assign(p->mem.arena_bytes / sizeof(float) + 1, 0.f);
     auto& G = p->g;
     p->views.resize(G.size());
@@ -568,8 +585,9 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
             }
             if (n.op == ops::op::moe_ffn && n.inputs.size() == 5) {
                 bool dev = p->hooks && reg.device_moe;
-                for (std::size_t j = 2; j < 5; ++j) { auto& wn = G.at(n.inputs[j]);
-                    dev = dev && p->views[n.inputs[j]].qdata && std::find(reg.device_moe_codecs.begin(), reg.device_moe_codecs.end(), wn.qcodec) != reg.device_moe_codecs.end(); }
+                for (std::size_t j = 2; j < 5; ++j) { auto& wn = G.at(n.inputs[j]); auto& wv = p->views[n.inputs[j]];   // encoded, or f32 constants ("f32")
+                    const std::string cn = wv.qdata ? std::string(wn.qcodec) : ((wn.kind == node_kind::weight || wn.kind == node_kind::constant) && wv.data ? "f32" : "");
+                    dev = dev && std::find(reg.device_moe_codecs.begin(), reg.device_moe_codecs.end(), cn) != reg.device_moe_codecs.end(); }
                 p->steps.push_back({dev ? &*reg.device_moe : &qweights::moe_lowering(), n.inputs, value_id(i), at, 0});
             }
             else if (n.op == ops::op::matmul_t && n.inputs.size() == 2 && p->views[n.inputs[1]].qdata)
@@ -577,12 +595,14 @@ inline std::unique_ptr<plan> compile(tensor_graph g, state_store* st = nullptr, 
             else if (n.op == ops::op::gather && n.inputs.size() == 2 && p->views[n.inputs[0]].qdata)
                 p->steps.push_back({dev_q(G.at(n.inputs[0]).qcodec) && reg.device_qgather && G.at(n.inputs[0]).shape.size() == 2 && G.at(n.inputs[0]).shape[1] % 32 == 0
                                     ? &*reg.device_qgather : &qweights::gather_lowering(), n.inputs, value_id(i), at, 0});
-            else p->steps.push_back({&stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
+            else {
+                const lowering* lw = pick ? pick(value_id(i), ins) : nullptr;
+                p->steps.push_back({lw ? lw : &stage_of[i]->select(n.op, ins, n.shape, n.attrs), n.inputs, value_id(i), at, 0});
+            }
         }
     }
     fuse_glu(*p, reg);   // first: it removes steps; fuse_steps then pairs adjacent steps of the final list
     fuse_steps(*p);
-    return p;
 }
 
 // Elementwise fusions for device runs: mark adjacent device step pairs that the backend may run as one kernel
@@ -745,6 +765,7 @@ private:
         std::vector<tensor_view> ins;
         for (std::size_t si = 0; si < p_.steps.size(); ++si) {
             auto& s = p_.steps[si];
+            if (p_.native && !h && !op_time::on()) if (std::size_t k = p_.native(si)) { si += k - 1; continue; }
             std::optional<op_time> timer;
             if (op_time::on()) timer.emplace(op_key(s));
             ins.clear();

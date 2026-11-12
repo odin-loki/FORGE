@@ -56,7 +56,7 @@ def main():
         gguf.GGUFWriter.add_tensor = add_tensor
         try: tq.write_gguf(gp, W, os.path.join(a.work, "hf_g"))
         finally: gguf.GGUFWriter.add_tensor = writer_add
-        fp = os.path.join(a.work, "mixed_gguf.fpk"); tl.run([a.forge, "import", gp, "-o", fp])
+        fp = os.path.join(a.work, "mixed_gguf.fpk"); tl.run([a.forge, "import", gp, "-o", fp, "--allow-unused"])   # the probe tensors of tiny_qwen3.write_gguf are leftovers
         info = subprocess.run([a.forge, "inspect", fp, "--tensors"], capture_output=True, text=True).stdout
         have = all(c in info for c in ("q6_k", "q5_k"))
         res = {}

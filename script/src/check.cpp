@@ -1,6 +1,7 @@
 // forge::script static checker. See check.hpp and docs/scripting.md "Static checks".
 #include <forge/script/check.hpp>
 #include "ast.hpp"
+#include "capflow.hpp"
 #include "parser.hpp"
 #include <algorithm>
 #include <cctype>
@@ -46,14 +47,8 @@ bool err_is_a(std::string c, const std::string& anc) {
 
 // Capability of a builtin library call (builtins.cpp `need(...)`).
 const char* cap_of(const std::string& lib, const std::string& fn) {
-    if (lib == "fs") return "fs";
-    if (lib == "net") return "net";
-    if (lib == "proc" || lib == "service") return "proc";
-    if (lib == "os") {
-        if (fn == "env" || fn == "setenv" || fn == "unsetenv" || fn == "environ") return "env";
-        if (fn == "chdir") return "fs";
-        if (fn == "processes" || fn == "kill" || fn == "signal") return "proc";
-    }
+    unsigned b = capflow::lib_cap(lib, fn);
+    for (int i = 0; i < capflow::kCaps; ++i) if (b >> i & 1u) return capflow::cap_name(i);
     return nullptr;
 }
 
@@ -100,6 +95,11 @@ struct Checker {
     std::map<std::string, std::set<std::string>> lock_edges; std::map<std::pair<std::string, std::string>, int> edge_line;
     std::map<std::string, const FnDecl*> globals_fn; std::map<std::string, int> global_assigns;
     bool quiet = false;                                // second loop pass: dedupe only
+    // Indirect calls (capflow.hpp): what each call may reach, and the capabilities denied where the walk stands
+    // (the run's, plus those an enclosing forge::sandbox(<literal options>, [] { ... }) turns off).
+    const capflow::analysis* flow = nullptr;
+    unsigned run_denied = 0, denied = 0;
+    int cap_diags = 0;                                 // `capability` diagnostics raised so far (suppresses duplicates)
     std::vector<int> loop_depth_breaks;
 
     int col_of(int line, const std::string& needle) {
@@ -118,6 +118,7 @@ struct Checker {
 
     void D(L sev, const char* id, const Node& n, std::string msg, const std::string& needle = {}) {
         const Node* at = &n; if (n.k == NK::Call && !n.kids.empty() && n.kids[0]->col) at = n.kids[0].get();
+        if (std::string_view(id) == "capability") ++cap_diags;
         if (sev == L::warning && !opt.warnings) return;
         if (!seen.emplace(n.line, std::string(id) + msg).second) return;
         int sc = start_col(*at, n.line);
@@ -224,9 +225,35 @@ struct Checker {
     }
     static bool non_json_literal(const Node& a) { return a.k == NK::Lambda || a.k == NK::Shell; }
 
+    // `capability` warnings for what a call may reach indirectly: a built-in named in any spelling or held in a
+    // value, script functions (their summaries), callables handed to a built-in, an unresolved callee.
+    void indirect(const Node& n, int cap_before) {
+        if (!flow || !opt.warnings) return;
+        auto it = flow->calls.find(&n); if (it == flow->calls.end()) return;
+        const capflow::call_info& ci = it->second;
+        const unsigned args_denied = denied | ci.sandbox;   // forge::sandbox(<literal>, fn): fn runs under the literal's denials
+        const bool reported = cap_diags != cap_before;      // the direct checks already flagged this call
+        for (int i = 0; i < capflow::kCaps; ++i) {
+            const unsigned bit = 1u << i; const std::size_t k = std::size_t(i);
+            const std::string cap = std::string("'") + capflow::cap_name(i) + "' capability";
+            const std::string by = (run_denied & bit) ? " (denied by this run)" : " (denied by the enclosing sandbox block)";
+            if (denied & bit) {
+                if (ci.direct.bits & bit) { if (!reported) D(L::warning, "capability", n, ci.direct.why[k] + " needs the " + cap + by + "; raises PermissionError"); }
+                else if (ci.through.bits & bit) { if (!reported) D(L::warning, "capability", n, "'" + ci.callee + "' may be the built-in " + ci.through.why[k] + ", which needs the " + cap + by); }
+                // a script function: with the capability denied for the whole run, the place that uses it is flagged itself
+                else if ((ci.script.bits & bit) && !(run_denied & bit)) D(L::warning, "capability", n, "'" + ci.callee + "' may need the " + cap + by + ": " + ci.script.why[k]);
+                else if (ci.unknown && (flow->escaped.bits & bit))
+                    D(L::warning, "capability", n, "the target of '" + ci.callee + "' cannot be resolved; it may be any function whose address is taken, and one of them needs the " + cap + by + ": " + flow->escaped.why[k]);
+            }
+            const capflow::mask& am = (run_denied & bit) ? ci.args_builtin : ci.args;
+            if ((args_denied & am.bits & bit) && !reported)
+                D(L::warning, "capability", n, "a callable passed to " + ci.callee + " may need the " + cap + ((denied & bit) ? by : std::string(" (denied by this sandbox block)")) + ": " + am.why[k]);
+        }
+    }
     void call(const Node& n, State& st) {
         const Node* c = callee(n);
         std::size_t argc = n.kids.size() - 1;
+        const int cap_before = cap_diags;
         // ---- capability
         if (c && c->k == NK::Field && !c->kids.empty() && c->kids[0]->k == NK::Var && c->kids[0]->var.global()) {
             const std::string& lib = c->kids[0]->s;
@@ -247,6 +274,10 @@ struct Checker {
             Node fake; fake.k = NK::Import; fake.s = n.kids[1]->s; fake.line = n.line; fake.col = start_col(*c, n.line); import_check(fake);
         }
         if (c && is_builtin_var(*c, "run") && !caps.proc) D(L::error, "capability", n, "run() needs the 'proc' capability, which this run denies (raises PermissionError)", "run");
+        indirect(n, cap_before);
+        unsigned sandbox_off = 0;   // forge::sandbox(<literal options>, <lambda>): the lambda is walked with these denied too
+        if (flow) if (auto fi = flow->calls.find(&n); fi != flow->calls.end() && fi->second.is_sandbox) sandbox_off = fi->second.sandbox;
+        auto walk_lambda = [&](const Node& a, bool thread_ctx, std::size_t i) { unsigned saved = denied; if (i == 2) denied |= sandbox_off; lambda(a, thread_ctx); denied = saved; };
         // ---- format strings
         if (c && c->k == NK::Var && c->var.global() && (c->s == "std::format" || c->s == "std::println" || c->s == "std::print") && argc >= 1 && n.kids[1]->k == NK::Str)
             format_check(n.kids[1]->s, argc - 1, n.line);
@@ -292,9 +323,9 @@ struct Checker {
                     Caps saved = caps; auto& m = *n.kids[1];
                     for (std::size_t j = 0; j + 1 < m.kids.size(); j += 2) if (m.kids[j]->k == NK::Str && m.kids[j + 1]->k == NK::False) {
                         auto& s = m.kids[j]->s; if (s == "fs") caps.fs = false; else if (s == "net") caps.net = false; else if (s == "proc") caps.proc = false; else if (s == "env") caps.env = false; }
-                    lambda(a, false); caps = saved; continue;
+                    walk_lambda(a, false, i); caps = saved; continue;
                 }
-                lambda(a, thread); continue;
+                walk_lambda(a, thread, i); continue;
             }
             expr(a, st);
         }
@@ -492,7 +523,10 @@ struct Checker {
             break;
         case NK::Lambda: lambda(n, false); return;
         case NK::Call: call(n, st); return;
-        case NK::Shell: if (!caps.proc) D(L::error, "capability", n, "shell blocks need the 'proc' capability, which this run denies (raises PermissionError)"); break;
+        case NK::Shell:
+            if (!caps.proc) D(L::error, "capability", n, "shell blocks need the 'proc' capability, which this run denies (raises PermissionError)");
+            else if (denied & capflow::PROC) D(L::warning, "capability", n, "shell blocks need the 'proc' capability (denied by the enclosing sandbox block); raises PermissionError");
+            break;
         case NK::And: case NK::Or: case NK::Coalesce:
             if (n.kids.size() == 2) { expr(*n.kids[0], st); State b = st; expr(*n.kids[1], b); st = merge(st, b); return; }
             break;
@@ -758,6 +792,12 @@ std::vector<diagnostic> check_parsed(const FnDecl& top, std::string_view src, co
     if (top.body) s1.collect(*top.body, false);
     for (int round = 0; round < 2; ++round) s1.fn(top);   // twice: summaries that depend on other summaries
     Checker c; c.src = src; c.file = file; c.opt = o; c.caps = s1.caps;
+    // Indirect calls are reported as warnings only, so the call-graph pass is skipped when warnings are off.
+    capflow::analysis flow;
+    if (o.warnings) {
+        flow = capflow::analyze(top); c.flow = &flow;
+        c.run_denied = c.denied = (o.allow_fs ? 0u : capflow::FS) | (o.allow_net ? 0u : capflow::NET) | (o.allow_proc ? 0u : capflow::PROC) | (o.allow_env ? 0u : capflow::ENV);
+    }
     if (top.body) c.collect(*top.body, false);
     c.ret_caps = s1.ret_caps; c.lambda_ret = s1.lambda_ret; c.field_caps = s1.field_caps;
     c.fn(top);

@@ -7,6 +7,7 @@
 #include <forge/import/onnx.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
+#include <forge/inference/aot_build.hpp>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -22,6 +23,7 @@
 #include <forge/script/script.hpp>
 #include <forge/script/check.hpp>
 #include <forge/script/local_ai.hpp>
+#include <forge/script/aot.hpp>
 #include <forge/security/security.hpp>
 
 using namespace forge;
@@ -61,15 +63,23 @@ int usage() {
         "      --codec keep (default for .gguf and AWQ/GPTQ checkpoints): tensors stay in their stored quantisation; another codec re-quantises them\n"
         "      mixed precision (hf inputs): --codec q4_k_m|q5_k_m [--recipe forge|llama] [--output-tensor-type T] [--token-embedding-type T]\n"
         "      [--tensor-type REGEX=TYPE[,..]] [--pure] [--bf16-head]   (llama.cpp llama-quant.cpp rules; forge adds q6_k DeltaNet/attn_output, q8_0 head)\n"
-        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint]\n"
+        "      [--allow-unused] import although source tensors are left over (default: error listing them)\n"
+        "      [--ignore-tensor NAME[,NAME..]] leftovers known to be harmless (NAME, prefix* or *suffix)\n"
+        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
-        "      [--codec C (for hf/gguf inputs)]\n"
+        "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "  embed <model.fpk> (--text TEXT | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
         "      [--out file.f32] [--device D]     embedding models (BERT family, ViT / CLIP / SigLIP, Whisper encoder):\n"
         "      prints the vector, or writes it as raw f32; --input feeds a declared input (an image, mel frames)\n"
+        "  aot <model.fpk> [-o out] [--aot-mode plan|native]   compile the model's plans ahead of time (docs/aot-models.md)\n"
+        "      [--shapes 1,8,16 (sequence lengths; default 1,2,4,...,64)] [--all-rows] [--kv-codec f32,int8] [--ctx N]\n"
+        "      plan:   plans go into the .fpk's \"aot\" section (-o out.fpk, default in place) [--sidecar] [--key name.key | --drop-signature]\n"
+        "              [--strip] remove them  [--list] show them\n"
+        "      native: -o model.so|model.a|model [--emit shared|static|exe] [--embed-weights] [--cxx C] [--target TRIPLE] [--simd T]\n"
+        "              [--march M|none] [--cxxflag F]... [--sdk forge_aot_sdk.txt] [--work DIR]; `forge run model.so` loads the result\n"
         "  bench <model.fpk> [-p 32] [-n 32]  |  bench --gemm 512  |  bench --kernels 1024 (MB, quantised matvec GB/s)\n"
         "  dump <model.fpk> <tensor> <out.f32>       decode one tensor to raw f32\n"
         "  keygen -o <name>                       Ed25519 key pair: <name>.key (secret seed), <name>.pub\n"
@@ -83,7 +93,10 @@ int usage() {
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
+        "      [--mem-limit SIZE]  hard memory cap (\"512M\", \"2G\"): managed heap, child processes, and this process at OS level\n"
         "      [--policy F]  FSS policy: capabilities from the policy, lockdown() before the script runs\n"
+        "  script --aot <out> <file.cpp> [--aot-mode native|embed] [--cxx C] [-O<n>] [--target T] [--aot-runtime DIR]\n"
+        "      [--aot-keep-source DIR] [--aot-allow-widen]  compile a script to a native executable (docs/aot.md)\n"
         "  security check [--policy F] [--json]   FSS controls: state, backend, verdict (exit 1 if a required one cannot be met)\n"
         "  run, bench, script and rpc-serve take --policy F (else $FORGE_SECURITY_POLICY, ./forge-security.json, the config\n"
         "      dir, $FORGE_SECURITY_PROFILE; with none of them no FSS profile is active and nothing changes; docs/security-api.md)\n"
@@ -92,7 +105,7 @@ int usage() {
 }
 
 // `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
-std::string resolve_model(const std::string& path, const std::string& codec_opt) {
+std::string resolve_model(const std::string& path, const std::string& codec_opt, bool allow_unused = false) {
     namespace fs = std::filesystem;
     if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
     // `codec_opt` is --codec as given (empty when absent): Hugging Face inputs default to f32, a GGUF keeps its stored
@@ -102,6 +115,7 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt)
     const bool requant = quantised_src && !codec_opt.empty() && codec_opt != "keep";
     const std::string codec = codec_opt.empty() || codec_opt == "keep" ? "f32" : codec_opt;
     std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(modelfile::format_version)) + (requant ? "|requant" : "");
+    if (allow_unused) key += "|allow-unused";
     auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
                                                             (long long)fs::last_write_time(f).time_since_epoch().count()); };
     if (fs::is_directory(path)) { std::vector<fs::path> fl; for (auto& e : fs::directory_iterator(path)) if (e.is_regular_file()) fl.push_back(e.path());
@@ -114,6 +128,7 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt)
     fs::path out = dir / (fs::path(path).filename().string() + "-" + codec + "-" + h + ".fpk");
     if (!fs::exists(out)) {
         import::import_options o; o.codec = codec; if (requant) o.requant = codec;
+        o.allow_unused = allow_unused;
         auto tmp = out.string() + ".partial";
         auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
         fs::rename(tmp, out);
@@ -163,6 +178,9 @@ void server_lockdown(const security::policy& p, const char* who, const std::stri
 int cmd_info() {
     auto& f = simd::detect();
     std::printf("cpu      %s\nfeatures %s\nlane     %s\n", f.brand.c_str(), f.summary().c_str(), simd::active().target);
+    std::string usable;   // kernel tables this CPU can run, preferred first (FORGE_SIMD_TARGET picks one)
+    for (const char* t : simd::target_names()) if (simd::by_name(t)) { usable += usable.empty() ? "" : " "; usable += t; }
+    std::printf("targets  %s\n", usable.c_str());
     for (auto& b : gpu::probe_backends()) std::printf("grid     %-10s %s  %s\n", gpu::name(b.kind), b.available ? "yes" : "no ", b.detail.c_str());
     std::fputs(mem::governor::instance().describe().c_str(), stdout);
     return 0;
@@ -182,10 +200,20 @@ int cmd_import(const args& a) {
         auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
         tt = c == std::string::npos ? "" : tt.substr(c + 1);
     }
+    o.allow_unused = a.has("allow-unused");
+    for (std::string it = a.get("ignore-tensor"); !it.empty();) {   // NAME[,NAME...]
+        auto c = it.find(','); o.ignore_tensors.push_back(it.substr(0, c));
+        it = c == std::string::npos ? "" : it.substr(c + 1);
+    }
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     for (auto& n : r.notes) std::fprintf(stderr, "forge import: %s\n", n.c_str());
+    std::printf("license   %s\n", r.license.empty() ? "(none found in the source)" : r.license.c_str());
+    if (!r.unused.empty()) {   // only under --allow-unused: without it the import has already failed
+        std::fprintf(stderr, "warning: %zu source tensor(s) not used by the template:\n", r.unused.size());
+        for (auto& u : r.unused) std::fprintf(stderr, "  %s\n", u.c_str());
+    }
     return 0;
 }
 
@@ -198,8 +226,21 @@ int cmd_inspect(const args& a) {
     auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
     std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors\n", bp.name.c_str(), bp.opset,
                 bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size());
+    if (bp.opset < modelfile::opset_min || bp.opset > modelfile::opset_max)
+        std::printf("          opset %d is outside this engine's range %d..%d: the model will not run here\n", bp.opset, modelfile::opset_min, modelfile::opset_max);
+    {   // the model's licence as recorded at import (manifest fields + the optional `license` section)
+        const auto& m = r.manifest();
+        std::string lic = m.str_or("license", ""), ln = m.str_or("license_name", ""), ll = m.str_or("license_link", "");
+        std::string line = !lic.empty() ? lic : !ln.empty() ? ln : std::string();
+        if (!lic.empty() && !ln.empty()) line += " (" + ln + ")";
+        if (!ll.empty()) line += (line.empty() ? "" : " ") + ("<" + ll + ">");
+        if (auto* lf = m.find("license_files"); lf && lf->is_arr()) for (auto& f : lf->arr()) if (f.is_str()) line += (line.empty() ? "" : " ") + ("[" + f.str() + "]");
+        if (r.has_section("license")) line += std::format("{}text: {} bytes (--license prints it)", line.empty() ? "" : ", ", r.section_text("license").size());
+        std::printf("license   %s\n", line.empty() ? "(not recorded)" : line.c_str());
+    }
     if (a.has("tensors")) for (auto& [n, e] : r.tensors()) std::printf("  %-28s %-9s %s\n", n.c_str(), e.codec.c_str(), shape_str(e.shape).c_str());
     if (a.has("blueprint")) std::printf("%.*s\n", int(r.section_text("blueprint").size()), r.section_text("blueprint").data());
+    if (a.has("license") && r.has_section("license")) std::printf("%.*s\n", int(r.section_text("license").size()), r.section_text("license").data());
     if (a.has("verify")) {
         auto bad = r.verify();
         if (bad.empty()) std::puts("verify    ok (all sections and tensors match BLAKE3)");
@@ -372,7 +413,7 @@ int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
     activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
-    inference::session s(resolve_model(a.pos[0], a.get("codec")), so);
+    inference::session s(resolve_model(a.pos[0], a.get("codec"), a.has("allow-unused")), so);
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
@@ -432,12 +473,14 @@ int cmd_run(const args& a) {
     std::fprintf(stderr, "[%zu prompt tokens in %.3fs, %zu new tokens in %.3fs = %.1f tok/s; plans %zu compiled, %zu reused]\n",
                  st.prompt_tokens, st.prefill_s, st.new_tokens, st.decode_s, st.new_tokens > 1 ? double(st.new_tokens - 1) / st.decode_s : 0.0,
                  s.plans().misses(), s.plans().hits());
+    if (auto& as = s.shared_model()->aot().stats(); as.used)   // precompiled plans (forge aot)
+        std::fprintf(stderr, "[aot: %zu of the plans were precompiled (%zu native), from %s]\n", as.used, as.native, as.origin.c_str());
     return 0;
 }
 
 int cmd_bench_gemm(int n) {
     std::vector<float> A(std::size_t(n) * n, 0.5f), B(std::size_t(n) * n, 0.25f), C(std::size_t(n) * n);
-    for (const char* t : {"scalar", "avx2", "avx512", "neon", "sve", "rvv"}) {
+    for (const char* t : simd::target_names()) {
         auto* k = simd::by_name(t); if (!k) continue;
         k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n));
         auto t0 = std::chrono::steady_clock::now(); int reps = 0;
@@ -645,6 +688,8 @@ int cmd_rpc_serve(const args& a) {
             if (no_proc) sp.argv.push_back("--no-proc");
             if (no_fs) sp.argv.push_back("--no-fs");
             if (no_net) sp.argv.push_back("--no-net");
+            // the same cap inside the interpreter, so a runaway script gets OutOfMemoryError before the OS cap below
+            if (mem_mb) { sp.argv.push_back("--mem-limit"); sp.argv.push_back(std::to_string(mem_mb) + "M"); }
             if (!child_policy.empty()) { sp.argv.push_back("--policy"); sp.argv.push_back(child_policy); }
             // the client's detached signature (FSS INT-2), hex so it survives the command line; the child verifies it
             if (!signature.empty()) { sp.argv.push_back("--rpc-sig"); sp.argv.push_back(security::detail::hex({reinterpret_cast<const std::uint8_t*>(signature.data()), signature.size()})); }
@@ -717,11 +762,44 @@ void script_policy(forge::script::options& o, const std::string& cli_path, const
     security::lockdown(p);
 }
 
+// forge script --mem-limit, OS part: cap this process's memory the way spawn_spec::limits caps a child
+// (os::apply_limits -> RLIMIT_AS; Windows: the job object of os::detail_proc::win_job). RLIMIT_AS counts address
+// space and a job object counts committed memory, both including what the process already uses, so the cap is
+// what is in use now plus `bytes` plus headroom (half of `bytes`, at least 64 MiB). The headroom is for what the
+// managed-heap accounting does not count (allocator overhead and reserves, thread stacks, the interpreter's own
+// structures): without it this cap would fire before the interpreter's, as a bare std::bad_alloc in the middle of
+// native code instead of a clean OutOfMemoryError at an allocation the interpreter accounts for. Returns "" when
+// applied, "unsupported" where no mechanism exists for a running process (macOS, iOS, Android and the BSDs: see
+// docs/scripting.md "Resource limits"), else the failure.
+std::string limit_own_memory(std::uint64_t bytes) {
+    bytes += std::max<std::uint64_t>(bytes / 2, 64ull << 20);
+#if defined(__linux__) && !defined(__ANDROID__)
+    unsigned long long pages = 0;
+    if (std::FILE* f = std::fopen("/proc/self/statm", "r")) { if (std::fscanf(f, "%llu", &pages) != 1) pages = 0; std::fclose(f); }
+    if (!pages) return "cannot read /proc/self/statm";
+    long page = ::sysconf(_SC_PAGESIZE);
+    os::proc_limits lim; lim.memory_bytes = pages * std::uint64_t(page > 0 ? page : 4096) + bytes;
+    return os::apply_limits(lim) ? std::string() : std::string("setrlimit(RLIMIT_AS) failed");
+#elif defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pmc{}; pmc.cb = sizeof pmc;
+    std::uint64_t used = K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? std::uint64_t(pmc.PagefileUsage) : 0;
+    os::proc_limits lim; lim.memory_bytes = used + bytes;
+    HANDLE job = os::detail_proc::win_job(lim, false);   // kept open for the life of the process
+    if (!job) return "CreateJobObject failed";
+    if (!AssignProcessToJobObject(job, GetCurrentProcess())) { CloseHandle(job); return "AssignProcessToJobObject failed"; }
+    return {};
+#else
+    (void)bytes;
+    return "unsupported";
+#endif
+}
+
 // forge script [opts] <file> [args...] | -e <code> [args...] | (REPL)
 int cmd_script(int argc, char** argv) {
     forge::script::options o;
     std::string file, code, emit_target, emit_out; bool have_code = false, os_sandbox_set = false, check_only = false, check_json = false; std::vector<std::string> module_dirs;
     std::string rpc_child, policy_path, rpc_sig_hex;
+    std::string aot_out; forge::script::aot_options aot;   // --aot OUT: compile to an executable instead of running (docs/aot.md)
     int i = 2;
     for (; i < argc; ++i) {
         std::string s = argv[i];
@@ -732,6 +810,17 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--args") { ++i; break; }
         else if (s == "--emit") emit_target = val("--emit");
         else if (s == "-o") emit_out = val("-o");
+        else if (s == "--aot") aot_out = val("--aot");
+        else if (s == "--aot-mode") { auto m = val("--aot-mode"); aot.mode = m == "native" ? forge::script::aot_mode::native : m == "embed" ? forge::script::aot_mode::embed : m == "auto" ? forge::script::aot_mode::automatic : throw std::runtime_error("--aot-mode takes native|embed|auto"); }
+        else if (s == "--cxx") aot.cxx = val("--cxx");
+        else if (s == "--target") aot.target = val("--target");
+        else if (s == "--aot-keep-source") aot.keep_source_dir = val("--aot-keep-source");
+        else if (s == "--aot-runtime") aot.runtime_dir = val("--aot-runtime");
+        else if (s == "--aot-stub") aot.stub = val("--aot-stub");
+        else if (s == "--aot-allow-widen") aot.allow_widen = true;
+        else if (s == "--aot-pch") aot.pch_dir = val("--aot-pch");
+        else if (s == "--aot-cxx-flag") aot.cxx_flags.push_back(val("--aot-cxx-flag"));
+        else if (s.size() > 2 && s.starts_with("-O")) aot.opt_level = s.substr(2);
         else if (s == "--emit-targets") { for (auto& t : forge::script::emit_targets()) std::printf("%s\n", t.c_str()); return 0; }
         else if (s == "--check") check_only = true;           // static checks only (docs/scripting.md "Static checks")
         else if (s == "--json") check_json = true;
@@ -745,6 +834,11 @@ int cmd_script(int argc, char** argv) {
         else if (s == "--timeout") o.timeout_ms = std::stoull(val("--timeout"));
         else if (s == "--max-steps") o.max_steps = std::stoull(val("--max-steps"));
         else if (s == "--heap") o.heap_bytes = std::stoull(val("--heap"));
+        else if (s == "--mem-limit") {   // size string, as limit {mem: "2G"}
+            auto v = val("--mem-limit"); std::string why;
+            if (!forge::script::parse_size(v, o.mem_limit_bytes, &why)) throw std::runtime_error("--mem-limit: " + why);
+            if (!o.mem_limit_bytes) throw std::runtime_error("--mem-limit: the limit must be greater than 0");
+        }
         else if (s == "--no-proc") o.allow_proc = false;
         else if (s == "--cache-dir") o.fsc_cache_dir = val("--cache-dir");
         else if (s == "--cache-trust") o.fsc_trusted_keys.push_back(val("--cache-trust"));
@@ -775,6 +869,16 @@ int cmd_script(int argc, char** argv) {
         std::fwrite(txt.data(), 1, txt.size(), check_json ? stdout : stderr);
         return forge::script::has_errors(ds) || (o.strict_check && !ds.empty()) ? 2 : 0;
     }
+    if (!aot_out.empty()) {   // ahead-of-time compilation: write an executable instead of running (docs/aot.md)
+        if (!have_code) { if (file.empty()) throw std::runtime_error("--aot needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
+        aot.run = o; aot.run.argv.clear(); aot.policy_file = policy_path; aot.module_dirs = module_dirs; aot.self_is_runner = true;
+        try {
+            auto r = forge::script::aot_compile(code, have_code ? "<-e>" : file, aot_out, aot);
+            if (!r.fallback_reason.empty()) std::fprintf(stderr, "forge script --aot: native mode not used: %s\n", r.fallback_reason.c_str());
+            std::fprintf(stderr, "forge script --aot: wrote %s (%s)\n", r.output.c_str(), r.detail.c_str());
+            return 0;
+        } catch (const forge::script::aot_error& ex) { std::fprintf(stderr, "%s\n", ex.what()); return ex.exit_code; }
+    }
     if (!emit_target.empty()) {   // write once, emit anywhere: translate instead of running
         if (!have_code) { if (file.empty()) throw std::runtime_error("--emit needs a script file or -e"); std::ifstream f(file, std::ios::binary); if (!f) throw std::runtime_error("cannot read " + file); code.assign(std::istreambuf_iterator<char>(f), {}); }
         try {
@@ -794,6 +898,11 @@ int cmd_script(int argc, char** argv) {
         std::fprintf(stderr, "%s\n%s", t, e.what());
         return 1;
     }
+    // --mem-limit at OS level: after the policy lockdown (which may set its own, lower RLIMIT_AS), before any script
+    // code. The interpreter cap (options::mem_limit_bytes) applies either way.
+    if (o.mem_limit_bytes)
+        if (auto why = limit_own_memory(o.mem_limit_bytes); !why.empty() && why != "unsupported")
+            std::fprintf(stderr, "forge script: --mem-limit: no OS-level cap on this process (%s); the interpreter cap still applies\n", why.c_str());
     if (!rpc_child.empty()) {
         code.assign(std::istreambuf_iterator<char>(std::cin), {});
         o.confirm = nullptr;   // no terminal: AI-drafted code never runs remotely
@@ -817,9 +926,81 @@ int cmd_script(int argc, char** argv) {
     return r.exit_code;
 }
 
+// ---- forge aot: ahead-of-time compilation of a model's plans (docs/aot-models.md) ----
+int cmd_aot(const args& a) {
+    if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
+    const std::string& in = a.pos[0];
+    const std::string mode = a.get("aot-mode", "plan");
+    if (a.has("list")) {
+        modelfile::reader r(in);
+        if (!r.has_section(modelfile::aot::section)) { std::printf("%s: no precompiled plans\n", in.c_str()); return 0; }
+        graph::aot::image img(r.raw_section_bytes(modelfile::aot::section));
+        bool match = img.model() == modelfile::aot::model_key(r);
+        std::string why; bool covered = !r.has_section("signature") || modelfile::aot::covered_by_signature(r, &why);
+        std::printf("%s: %zu precompiled plan(s), FORGE %s, pipeline %u, built on %s, %s%s\n", in.c_str(), img.entries().size(), img.forge().c_str(), img.pipeline(),
+                    img.simd().c_str(), match ? "key matches this model and build" : "key does NOT match (other model, weights or FORGE version): ignored at load",
+                    covered ? "" : (", NOT covered by the signature: ignored at load (" + why + ")").c_str());
+        for (auto& e : img.entries()) std::printf("  %-28s %8llu bytes  key %s\n", e.t.name().c_str(), (unsigned long long)e.size, hash::blake3::hex(e.key).substr(0, 16).c_str());
+        return 0;
+    }
+    if (a.has("strip")) {
+        auto out = a.get("o").empty() ? in : a.get("o");
+        bool dropped = modelfile::aot::write_section(in, out, {});
+        std::printf("removed the precompiled plans -> %s%s\n", out.c_str(), dropped ? " (the signature was dropped: sign again)" : "");
+        return 0;
+    }
+    if (a.kv.count("adapter")) raise(errc::unsupported, "aot: LoRA adapters are not compiled ahead of time; sessions that select an adapter compile their plans at run time");
+    if (auto dev = a.get("device", "cpu"); dev != "cpu" && !dev.empty())
+        raise(errc::unsupported, "aot: plans can only be precompiled for the CPU, not for device '{}' (a device plan holds kernels the backend creates per process)", dev);
+    inference::aot_build_options bo;
+    for (int n : parse_ids(a.get("shapes"))) bo.shapes.push_back(n);
+    bo.all_rows = a.has("all-rows"); bo.context = i64(a.num("ctx", 0));
+    { std::string k = a.get("kv-codec"); for (std::size_t p = 0, q; p < k.size(); p = q + 1) { q = k.find(',', p); if (q == std::string::npos) q = k.size(); if (q > p) bo.kv_codecs.push_back(k.substr(p, q - p)); } }
+    if (mode == "native") {
+        inference::aot_native_options no;
+        no.emit = a.get("emit", "shared"); no.out = a.get("o");
+        if (no.out.empty()) return usage();
+        no.cxx = a.get("cxx"); no.target = a.get("target"); no.simd = a.get("simd"); no.march = a.get("march"); no.sdk = a.get("sdk"); no.work_dir = a.get("work");
+        no.embed_weights = a.has("embed-weights"); no.extra_flags = a.all("cxxflag");
+        if (a.kv.count("embed-limit-mb")) no.embed_limit = std::uint64_t(a.num("embed-limit-mb", 1024)) << 20;
+        no.temperature = float(a.num("temp", 0)); no.top_k = int(a.num("top-k", 0)); no.top_p = float(a.num("top-p", 1)); no.max_new_tokens = int(a.num("n", 32));
+        auto r = inference::aot_build_native(in, bo, no);
+        std::printf("compiled %zu plan(s) (%zu steps as direct calls, %zu as kernel calls) with %s in %.1fs -> %s (%s, SIMD target %s, weights %s)\n",
+                    r.plans.targets.size(), r.direct_steps, r.generic_steps, r.compiler.c_str(), r.compile_s, r.out.c_str(), no.emit.c_str(), r.simd.c_str(),
+                    no.embed_weights ? "embedded" : ("in " + os::absolute(in)).c_str());
+        if (!r.source.empty()) std::printf("source kept: %s\n", r.source.c_str());
+        if (!r.same_compiler) std::fprintf(stderr, "forge aot: note: %s is not the compiler this FORGE was built with; the code was compiled with -ffp-contract=off, but bit-identical results are only tested for the build's compiler\n", r.compiler.c_str());
+        return 0;
+    }
+    if (mode != "plan") raise(errc::invalid_argument, "aot: --aot-mode {} (plan or native)", mode);
+    bool is_signed = false;
+    { modelfile::reader r(in); is_signed = r.has_section("signature"); }
+    const bool sidecar = a.has("sidecar");
+    if (is_signed && !sidecar && a.get("key").empty() && !a.has("drop-signature"))
+        raise(errc::invalid_argument, "aot: {} is signed and adding plans changes what the signature covers; pass --key name.key to sign the result, or --drop-signature", in);
+    inference::aot_plans pl;
+    { inference::model m(in); pl = inference::aot_compile_plans(m, bo); }
+    std::string out = a.get("o");
+    if (sidecar) {
+        if (out.empty()) out = in + modelfile::aot::sidecar_ext;
+        modelfile::aot::write_sidecar(out, pl.blob);
+        if (is_signed) std::fprintf(stderr, "forge aot: note: %s is signed; a sidecar is not covered by its signature and is ignored when it is loaded\n", in.c_str());
+    } else {
+        if (out.empty()) out = in;
+        modelfile::aot::write_section(in, out, pl.blob);
+        if (!a.get("key").empty()) modelfile::sign_file(out, out, modelfile::load_secret_key(a.get("key")));
+    }
+    std::printf("precompiled %zu plan(s) (%zu nodes, %zu steps, %zu bytes) -> %s%s\n", pl.targets.size(), pl.nodes, pl.steps, pl.blob.size(), out.c_str(),
+                sidecar ? " (sidecar)" : is_signed ? (a.get("key").empty() ? " (signature dropped)" : " (signed again)") : "");
+    for (auto& t : pl.targets) std::printf("  %s\n", t.name().c_str());
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (forge::script::run_process_worker_if_requested(argc, argv)) return 0;   // ProcessPool spawn-mode worker
     forge::script::install_local_ai();   // forge::ask & co run FORGE_ASK_MODEL / --ask-model in-process
+    if (auto rc = forge::script::aot_run_embedded(argc, argv)) return *rc;   // a copy of forge carrying a script (--aot embed mode)
     if (argc < 2) return usage();
     std::string c = argv[1];
     if (c == "script") {
@@ -827,7 +1008,8 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);

@@ -5,7 +5,7 @@
 #   pooling the importer writes the pooling expression: the [CLS] row or the masked mean, optionally L2-normalised
 #           (sentence-transformers 1_Pooling / Normalize modules).
 # RoBERTa numbers positions from pad_token_id + 1 (pos_offset). Double-brace placeholders come from config.json.
-blueprint "encoder-embedding" opset 1
+blueprint "encoder-embedding" opset 3
 
 params {
   d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}

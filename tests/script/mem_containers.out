@@ -1,0 +1,26 @@
+limited: vector<int> push_back
+limited: vector<string> push_back
+limited: vector insert
+limited: vector resize
+limited: vector(n, value)
+limited: vector of vectors
+limited: vector of structs
+limited: deque push_back
+limited: list push_back
+limited: map operator[]
+limited: map insert
+limited: unordered_map emplace
+limited: set insert
+limited: unordered_set insert
+limited: string +=
+limited: string += char
+limited: string append
+limited: string append(n, c)
+limited: string push_back
+limited: string insert
+limited: string(n, c)
+limited: string concatenation
+limited: closures
+below the cap: 800
+first
+second

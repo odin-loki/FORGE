@@ -29,15 +29,27 @@ When `--no-fs`, `--no-net` or `--no-proc` is given, the engine also applies the 
 
 `sandbox({..., isolate: true}, fn)` runs the block in a forked child under the narrower OS sandbox and returns
 its result as JSON (`builtins.cpp`). Without `fork()` (Windows) it raises `PermissionError` and does not run
-the block. Plain nested `sandbox` blocks are interpreter-checked only.
+the block. Plain nested `sandbox` blocks are interpreter-checked only: seccomp, Landlock, Capsicum, pledge,
+`sandbox_init` and the Windows job object can only be tightened for the rest of the process (or thread), so a
+narrower OS policy applied on entry could not be lifted when the block returns and would outlast it.
 
 ### Static capability checks
 
 Before a run, the static checker (docs/scripting.md "Static checks", `script/src/check.cpp`) reports direct calls
 to `fs`, `net`, `proc`, `service` or environment built-ins, `run()` and shell blocks that the run's capabilities
 or an enclosing literal `sandbox({...}, fn)` deny. They are errors, so the script is refused before it starts.
-Indirect calls (a built-in in a variable, `eval`, imported modules) are not seen; the runtime checks remain the
-enforcement.
+The errors cover the `lib.fn(...)` spelling (`fs.read(p)`), `run(...)` and shell blocks.
+
+Indirect calls are followed by a second pass (`script/src/capflow.hpp`; docs/scripting.md "Static checks",
+*Indirect calls*): function references, lambdas in variables, containers and struct members, `std::function`,
+callbacks passed as arguments or to built-ins, methods through virtual dispatch, aliases
+(`auto f = forge::fs::read;`) and the qualified spellings (`forge::fs::read(p)`). It computes a capability summary
+per function to a fixed point over the call graph and reports a `capability` **warning** where a call in a denying
+context may reach a built-in that needs the capability; an unresolved callee counts as any address-taken function.
+Warnings show with `forge script --check` and refuse the run only with `--strict-check`. It is a may-analysis with
+documented gaps (`eval` of computed strings, imported modules, handle methods, per-field-name and per-container
+precision), so the runtime checks remain the enforcement. Tests: `static_capability_indirect_*` in
+`tests/test_script_security.cpp`, `tests/script/indirect_calls.fs`.
 
 ## OS sandbox (`os/include/forge/os/sandbox.hpp`)
 
@@ -190,9 +202,17 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
   process (`mmap(PROT_EXEC)`), which stays inside the same sandbox.
 - Windows AppContainer pool workers: the ACE added to the worker image stays (it names only the FORGE profile);
   the profiles persist per user like any package profile. Some CI images refuse AppContainer profiles.
-- `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows.
-- Nested non-isolated `sandbox` blocks are interpreter-checked only.
-- Static capability checks miss indirect calls.
+- `sandbox({isolate: true})` needs `fork()`, so it is unavailable on Windows. A re-spawn (the `ProcessPool`
+  AppContainer worker plus `forge::remote_call`'s function shipping) could run a block there, but only for blocks
+  whose captures are plain data, without the copied heap the POSIX child gets; it is not built.
+- Nested non-isolated `sandbox` blocks are interpreter-checked only. This is inherent without a separate process:
+  no OS sandbox mechanism FORGE uses can be relaxed again when the block returns (see "OS sandbox for scripts").
+- Static capability checks follow indirect calls only as warnings, and miss `eval` of computed strings, functions
+  of imported modules, methods of handles opened earlier and the `reflect` capability; direct calls are errors only
+  in the `lib.fn(...)` spelling (`forge::fs::read(p)` is a warning).
+- `forge script --mem-limit` caps the managed heap and each child everywhere, but the `forge script` process itself
+  only on Linux (`RLIMIT_AS`) and Windows (job object); the cap counts address space / committed memory, not
+  resident memory, and children are capped one by one, not as a sum.
 - Keystore file backend: unless a passphrase or the TPM wraps the store key, same-user code can read it. TPM
   sealing has no PCR policy, so it binds the key to the machine but not to a boot state, and a process running as
   the same user can still ask the TPM to unseal it.

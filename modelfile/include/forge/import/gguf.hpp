@@ -153,6 +153,9 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     if (auto extra = import_gguf_extra(g, path, out, opt, arch)) return *extra;
     if (arch != "llama" && arch != "qwen2" && arch != "qwen3" && arch != "mistral" && arch != "qwen35" && arch != "qwen3moe" && arch != "qwen35moe")
         raise(errc::unsupported, "GGUF architecture '{}' has no template", arch);
+    // qwen2: the llama graph + Q/K/V biases (blk.N.attn_{q,k,v}.bias). A qwen2 file that carries no bias tensors is the
+    // plain llama graph (NeoX RoPE); a file with only some of them fails on the missing one.
+    bool qwen2 = arch == "qwen2" && (g.find("blk.0.attn_q.bias") || g.find("blk.0.attn_k.bias") || g.find("blk.0.attn_v.bias"));
     bool q35 = arch == "qwen35" || arch == "qwen35moe";
     bool moe = arch == "qwen3moe" || arch == "qwen35moe";   // sparse MoE FFNs (moe_ffn over stacked *_exps tensors)
     auto K = [&](const std::string& k) { return g.need(arch + "." + k).num(); };
@@ -204,15 +207,56 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         cfg.emplace_back("norm_topk_prob", 1.0); cfg.emplace_back("routed_scaling_factor", ws > 0 ? ws : 1.0);
     }
     std::string tname = !opt.template_name.empty() ? opt.template_name : arch == "qwen3" ? "qwen3" : arch == "qwen3moe" ? "qwen3_moe"
-                      : arch == "qwen35moe" ? "qwen3_5_moe" : q35 ? "qwen3_5" : "llama";
-    auto bp_text = instantiate(read_file(template_path(tname)), json::value(cfg));
+                      : arch == "qwen35moe" ? "qwen3_5_moe" : q35 ? "qwen3_5" : qwen2 ? "qwen2" : "llama";
+    auto tpl_text = read_file(template_path(tname));   // FSS CAP-3: the name is joined safely onto template_dir()
+    // RoPE frequency scaling: <arch>.rope.scaling.{type, factor, original_context_length, attn_factor, yarn_attn_factor,
+    // yarn_log_multiplier, yarn_ext_factor, yarn_beta_fast, yarn_beta_slow}, and the per-pair multipliers llama.cpp's converter bakes into rope_freqs.weight
+    // for llama3-style scaling (the GGUF carries the table, not the low/high frequency factors).
+    rope_spec rsp;
+    const double head_dim = Kor("attention.key_length", hidden / heads);
+    {
+        auto* tv = g.get(arch + ".rope.scaling.type");
+        std::string type = tv && tv->is_str() ? tv->str() : "none";
+        auto knum = [&](const char* k, double d) { auto* v = g.get(arch + ".rope.scaling." + k); return v && v->is_num() ? v->num() : d; };
+        if (type == "linear" || type == "yarn") {
+            rsp.type = type == "yarn" ? ops::rope_scaling::yarn : ops::rope_scaling::linear;
+            rsp.factor = knum("factor", 0);
+            if (!(rsp.factor > 0)) raise(errc::format_error, "{}: rope scaling type '{}' without {}.rope.scaling.factor", path, type, arch);
+            if (type == "yarn") {
+                rsp.orig_ctx = knum("original_context_length", Kor("context_length", 0));
+                if (!(rsp.orig_ctx > 0)) raise(errc::format_error, "{}: YaRN rope scaling without an original context length", path);
+                rsp.beta_fast = knum("yarn_beta_fast", 32.0); rsp.beta_slow = knum("yarn_beta_slow", 1.0);
+                // magnitude as llama.cpp: attn_factor * (1 + 0.1 ln f), or with a log multiplier L (0.1 * mscale_all_dim in
+                // the converter) the Hugging Face ratio get_mscale(f, 1) / get_mscale(f, mscale_all_dim)
+                double lnf = rsp.factor > 1 ? std::log(rsp.factor) : 0.0, lm = knum("yarn_log_multiplier", 0);
+                rsp.attn_factor = knum("yarn_attn_factor", knum("attn_factor", 1.0)) * (1.0 + 0.1 * lnf) / (lm != 0 ? 1.0 + lm * lnf : 1.0);
+                // yarn_ext_factor mixes the extrapolated band in: 1 (default) is YaRN, 0 is plain interpolation (linear)
+                if (double ext = knum("yarn_ext_factor", 1.0); ext == 0) { rsp.type = ops::rope_scaling::linear; rsp.attn_factor = 1.0; }
+                else if (ext != 1.0) raise(errc::unsupported, "{}: {}.rope.scaling.yarn_ext_factor {} is not supported (0 or 1)", path, arch, ext);
+            }
+        } else if (type == "longrope") raise(errc::unsupported, "{}: rope scaling type 'longrope' (LongRoPE) is not supported", path);
+        else if (type != "none") raise(errc::unsupported, "{}: rope scaling type '{}' is not supported (supported: none, linear, yarn)", path, type);
+        if (auto* ft = g.find("rope_freqs.weight")) {
+            if (ft->shape.size() != 1) raise(errc::format_error, "{}: rope_freqs.weight has shape {}", path, shape_str(ft->shape));
+            auto st = g.stored(*ft);   // any loadable type (an unsupported one raises with its name)
+            rsp.freq_factors.resize(std::size_t(ft->shape[0]));
+            graph::codecs::find(st.codec)->decode(st.bytes.data(), rsp.freq_factors.size(), rsp.freq_factors.data());
+        }
+        if (q35 && (rsp.active() || rsp.attn_factor != 1.0)) raise(errc::unsupported, "{}: {}: rope scaling is not supported by the template", path, arch);
+        rsp.validate(tname, tpl_text, head_dim);
+        cfg.emplace_back("rope_args", rsp.rope_args()); cfg.emplace_back("attn_args", rsp.attn_args(head_dim));
+        cfg.emplace_back("opset", rsp.active() ? 2.0 : 1.0);
+    }
+    auto bp_text = instantiate(tpl_text, json::value(cfg));
     auto bp = modelfile::parse_blueprint(bp_text);
+    modelfile::check_opset(bp);
 
     // streamed: tensors go straight from the mapped GGUF to disk, so a 20 GB model never sits in memory twice
     modelfile::stream_writer w(out);
     expert_index xi;
     import_report rep{arch, tname, 0, 0};
     std::set<std::string> used;
+    if (!rsp.freq_factors.empty()) used.insert("rope_freqs.weight");   // consumed above, into the rope attrs
     // ---- tensor types and codecs (docs/modelfile.md) ----
     // --codec keep (the default): every tensor keeps its stored type. --codec C: the weight matrices are decoded and
     // re-encoded as C (tok_emb as --emb-codec; q8_0 by default when C is quantised), which quantises an already
@@ -256,13 +300,13 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     auto put = [&](const std::string& dst, const std::string& src) {
         used.insert(src);
         auto* t = g.find(src);
-        if (!t) raise(errc::not_found, "{}: missing tensor {}", path, src);
+        if (!t) raise(errc::not_found, "{}: template '{}' needs tensor {}, which the file does not have", path, tname, src);
         auto s = fetch(*t);
         store(dst, t->shape, s, s.bytes);
     };
     auto need = [&](const std::string& src) -> const gguf_file::tinfo& {
         auto* t = g.find(src);
-        if (!t) raise(errc::not_found, "{}: missing tensor {}", path, src);
+        if (!t) raise(errc::not_found, "{}: template '{}' needs tensor {}, which the file does not have", path, tname, src);
         used.insert(src);
         return *t;
     };
@@ -350,6 +394,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
         }
         put(Q + "attn_norm", P + "attn_norm.weight"); put(Q + "ffn_norm", P + "ffn_norm.weight");
         put(Q + "wq", P + "attn_q.weight"); put(Q + "wk", P + "attn_k.weight"); put(Q + "wv", P + "attn_v.weight");
+        if (qwen2) { put(Q + "bq", P + "attn_q.bias"); put(Q + "bk", P + "attn_k.bias"); put(Q + "bv", P + "attn_v.bias"); }
         if (tname == "qwen3" || arch == "qwen3moe") { put(Q + "q_norm", P + "attn_q_norm.weight"); put(Q + "k_norm", P + "attn_k_norm.weight"); }
         put(Q + "wo", P + "attn_output.weight");
         if (moe) { put_moe(l, P, Q); continue; }
@@ -361,8 +406,19 @@ inline import_report import_gguf(const std::string& path, const std::string& out
 
     // vision tower and multi-token-prediction heads are not part of the text model: never copied
     auto skipped = [&](const std::string& n) { return q35 && (n.starts_with("v.") || n.starts_with("mm.") || n.starts_with("mtp.")); };
-    for (auto& t : g.tensors())  // keep everything else (rope freqs, extra heads, ...) addressable
-        if (!used.count(t.name) && !skipped(t.name) && gguf_file::loadable(t.type)) { auto s = fetch(t); store("extra." + t.name, t.shape, s, s.bytes); }
+    // Every source tensor is accounted for: consumed, part of a skipped tower, a known buffer, or reported (with its GGUF
+    // type). Under allow_unused the leftovers stay addressable as extra.<name>; a leftover in a type FORGE cannot load
+    // is left out and noted.
+    for (auto& t : g.tensors())
+        if (!used.count(t.name) && !skipped(t.name) && !ignored_tensor(t.name, opt))
+            rep.unused.push_back(t.name + " " + shape_str(t.shape) + (gguf_file::loadable(t.type) ? "" : " (" + gguf_file::type_name(t.type) + ": type not supported)"));
+    check_unused(path, tname, rep.unused, opt);
+    for (auto& t : g.tensors())
+        if (!used.count(t.name) && !skipped(t.name) && !ignored_tensor(t.name, opt)) {
+            if (gguf_file::loadable(t.type)) { auto s = fetch(t); store("extra." + t.name, t.shape, s, s.bytes); }
+            else rep.notes.push_back(std::format("left out unused tensor {}: ggml type {} is not supported", t.name, gguf_file::type_name(t.type)));
+        }
+    check_template_tensors(path, tname, bp, w.entries(), opt);
 
     // tokenizer.json synthesised from the GGUF vocabulary (gpt2-style byte-level BPE)
     auto model = g.get("tokenizer.ggml.model") ? g.need("tokenizer.ggml.model").str() : std::string("gpt2");
@@ -404,6 +460,12 @@ inline import_report import_gguf(const std::string& path, const std::string& out
             if (double_q) rep.notes.push_back(std::format("warning: {} tensor(s) were already quantised and have been quantised a second time: the error of both formats adds up. "
                                                           "Import the original (unquantised) weights with --codec {} for best quality", double_q, rq));
         }
+    }
+    {   // licence: general.license (identifier), general.license.name, general.license.link
+        license_info lic;
+        auto gs = [&](const char* k) { auto* v = g.get(k); return v && v->is_str() ? v->str() : std::string(); };
+        lic.id = gs("general.license"); lic.name = gs("general.license.name"); lic.link = gs("general.license.link");
+        lic.store(man, w); rep.license = lic.summary();
     }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);

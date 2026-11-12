@@ -6,7 +6,7 @@
 #   blocks  pre-LayerNorm transformer blocks, bidirectional attention; the key projection has no bias
 # The output is the encoder state sequence [n_ctx, d_model] (what a decoder cross-attends to).
 # Double-brace placeholders are substituted by `forge import` from config.json.
-blueprint "audio-encoder" opset 1
+blueprint "audio-encoder" opset 3
 
 params {
   d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}

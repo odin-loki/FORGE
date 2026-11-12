@@ -71,7 +71,8 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
         auto* t = g.find(src);
         if (!t) raise(errc::not_found, "{}: missing tensor {}", path, src);
         used.insert(src);
-        w.add_raw(dst, t->shape, gguf_file::codec_of(t->type) ? gguf_file::codec_of(t->type) : "?", g.bytes(*t)); ++rep.tensors;
+        if (!gguf_file::loadable(t->type)) raise(errc::unsupported, "{}: tensor {} has ggml type {}, which this importer cannot copy", path, src, gguf_file::type_name(t->type));
+        w.add_raw(dst, t->shape, gguf_file::codec_of(t->type), g.bytes(*t)); ++rep.tensors;
     };
     auto pair = [&](const std::string& dw, const std::string& db, const std::string& src) { put(dw, src + ".weight"); put(db, src + ".bias"); };
     put("tok_emb", "token_embd.weight");
@@ -103,8 +104,19 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     else if (arch == "bert") { put("pos_emb", "position_embd.weight"); put("type_emb", "token_types.weight"); pair("emb_norm_w", "emb_norm_b", "token_embd_norm"); }
     else put("out_norm", "output_norm.weight");
     if (arch != "bert") put("lm_head", g.find("output.weight") ? "output.weight" : "token_embd.weight");
-    for (auto& t : g.tensors())   // everything else stays addressable, as in import_gguf
-        if (!used.count(t.name) && gguf_file::codec_of(t.type)) { w.add_raw("extra." + t.name, t.shape, gguf_file::codec_of(t.type), g.bytes(t)); ++rep.tensors; }
+    // Every source tensor is accounted for, as in import_gguf: consumed, a known buffer, or reported (an error unless
+    // --allow-unused, which keeps loadable leftovers as extra.<name>).
+    for (auto& t : g.tensors())
+        if (!used.count(t.name) && !ignored_tensor(t.name, opt))
+            rep.unused.push_back(t.name + " " + shape_str(t.shape) + (gguf_file::loadable(t.type) ? "" : " (" + gguf_file::type_name(t.type) + ": type not supported)"));
+    check_unused(path, tname, rep.unused, opt);
+    for (auto& t : g.tensors())
+        if (!used.count(t.name) && !ignored_tensor(t.name, opt)) {
+            if (gguf_file::loadable(t.type)) { w.add_raw("extra." + t.name, t.shape, gguf_file::codec_of(t.type), g.bytes(t)); ++rep.tensors; }
+            else rep.notes.push_back(std::format("left out unused tensor {}: ggml type {} is not supported", t.name, gguf_file::type_name(t.type)));
+        }
+    check_template_tensors(path, tname, bp, w.entries(), opt);
+    if (!opt.codec.empty() && opt.codec != "keep" && opt.codec != "f32") rep.notes.push_back(std::format("--codec {} is not applied to {} files: tensors keep the type the file uses", opt.codec, arch));
 
     // byte-level BPE vocabularies (tokenizer.ggml.model "gpt2") become a tokenizer section; SentencePiece / WordPiece
     // vocabularies are not converted, so such files take token ids
@@ -127,6 +139,12 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     if (auto* ab = g.get("tokenizer.ggml.add_bos_token"); ab && ab->is_bool()) man.emplace_back("add_bos", ab->b());
     else for (auto& kv : extra) if (kv.first == "add_bos") man.push_back(kv);
     for (auto& kv : extra) if (kv.first != "add_bos") man.push_back(kv);
+    {   // licence, as import_gguf records it
+        license_info lic;
+        auto gs = [&](const char* k) { auto* v = g.get(k); return v && v->is_str() ? v->str() : std::string(); };
+        lic.id = gs("general.license"); lic.name = gs("general.license.name"); lic.link = gs("general.license.link");
+        lic.store(man, w); rep.license = lic.summary();
+    }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
     w.finish();

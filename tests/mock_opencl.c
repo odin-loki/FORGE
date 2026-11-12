@@ -17,6 +17,7 @@ static __thread size_t mock_gid;
 #endif
 static size_t get_global_id(int d) { (void)d; return mock_gid; }
 static unsigned as_uint(float f) { unsigned u; memcpy(&u, &f, 4); return u; }
+static float as_float(unsigned u) { float f; memcpy(&f, &u, 4); return f; }
 #include "kernels.cl"
 
 typedef struct { size_t size; char* data; int sub; } mem;
@@ -37,13 +38,34 @@ int clGetDeviceInfo(void* d, unsigned what, size_t n, void* v, size_t* got) {
     if (what == 0x102B) snprintf((char*)v, n, "forge mock opencl %d", (int)(uintptr_t)d - 1);
     else if (what == 0x1019) *(unsigned*)v = 1024;
     else if (what == 0x101F) *(uint64_t*)v = (uint64_t)1 << 30;
+    else if (what == 0x102C) snprintf((char*)v, n, "forge");
+    else if (what == 0x102F) snprintf((char*)v, n, "OpenCL 1.2 mock");
+    else if (what == 0x102D) snprintf((char*)v, n, "%s", getenv("MOCK_DRIVER_VERSION") ? getenv("MOCK_DRIVER_VERSION") : "mock-1");   /* CL_DRIVER_VERSION */
     else return -30;
     return 0;
 }
 void* clCreateContext(const intptr_t* p, unsigned n, void* const* d, void* cb, void* u, int* e) { (void)p; (void)n; (void)d; (void)cb; (void)u; *e = 0; return malloc(1); }
 void* clCreateCommandQueue(void* c, void* d, uint64_t f, int* e) { (void)c; (void)d; (void)f; *e = 0; return malloc(1); }
+/* Program binaries (clGetProgramInfo / clCreateProgramWithBinary): the mock's "binary" is a 24-byte record, magic +
+   a hash of the source it was built from; MOCK_REJECT_BINARY makes the driver refuse every binary; mock_source_builds
+   (exported) counts clCreateProgramWithSource calls. */
+typedef struct { char magic[8]; uint64_t hash; uint64_t pad; } mock_bin;
+typedef struct { mock_bin b; } prog;
+int mock_source_builds = 0;
 void* clCreateProgramWithSource(void* c, unsigned n, const char** s, const size_t* l, int* e) {
-    (void)c; (void)n; *e = strstr(s[0], "forge_attention") && l[0] > 100 ? 0 : -30; return malloc(1); }
+    (void)c; (void)n; *e = strstr(s[0], "forge_attention") && l[0] > 100 ? 0 : -30;
+    prog* p = calloc(1, sizeof *p); memcpy(p->b.magic, "MOCKCLB1", 8); p->b.hash = 1469598103934665603ull;
+    for (size_t i = 0; i < l[0]; ++i) p->b.hash = (p->b.hash ^ (unsigned char)s[0][i]) * 1099511628211ull;
+    ++mock_source_builds; return p; }
+void* clCreateProgramWithBinary(void* c, unsigned n, void* const* d, const size_t* l, const unsigned char** b, int* st, int* e) {
+    (void)c; (void)d;
+    if (n != 1 || l[0] != sizeof(mock_bin) || memcmp(b[0], "MOCKCLB1", 8) || getenv("MOCK_REJECT_BINARY")) { if (st) *st = -42; *e = -42; return NULL; }   /* CL_INVALID_BINARY */
+    prog* p = calloc(1, sizeof *p); memcpy(&p->b, b[0], sizeof(mock_bin)); if (st) *st = 0; *e = 0; return p; }
+int clGetProgramInfo(void* p_, unsigned what, size_t n, void* v, size_t* got) {
+    prog* p = p_;
+    if (what == 0x1165) { if (n < sizeof(size_t)) return -30; *(size_t*)v = sizeof(mock_bin); if (got) *got = sizeof(size_t); return 0; }   /* CL_PROGRAM_BINARY_SIZES */
+    if (what == 0x1166) { if (n < sizeof(void*)) return -30; memcpy(*(unsigned char**)v, &p->b, sizeof(mock_bin)); if (got) *got = sizeof(void*); return 0; }   /* CL_PROGRAM_BINARIES */
+    return -30; }
 int clBuildProgram(void* p, unsigned n, void* const* d, const char* o, void* cb, void* u) { (void)p; (void)n; (void)d; (void)o; (void)cb; (void)u; return 0; }
 int clGetProgramBuildInfo(void* p, void* d, unsigned w, size_t n, void* v, size_t* g) { (void)p; (void)d; (void)w; (void)n; (void)v; if (g) *g = 0; return 0; }
 void* clCreateKernel(void* p, const char* name, int* e) {
@@ -62,7 +84,7 @@ int clEnqueueNDRangeKernel(void* q, void* k_, unsigned dim, const size_t* off, c
     return 0;
 }
 void* clCreateBuffer(void* c, uint64_t f, size_t n, void* host, int* e) {
-    (void)c; mem* m = calloc(1, sizeof *m); m->size = n; m->data = malloc(n);
+    (void)c; mem* m = calloc(1, sizeof *m); m->size = n; m->data = malloc(n + 16); memset(m->data + n, 0xA5, 16);   /* canary: checked at release */
     if ((f & 0x20) && host) memcpy(m->data, host, n);
     *e = 0; return m;
 }
@@ -79,7 +101,10 @@ int clEnqueueCopyBuffer(void* q, void* s, void* d, size_t so, size_t dof, size_t
     (void)q; (void)ne; (void)ev; (void)oe; mem* a = s; mem* b = d;
     if (so + n > a->size || dof + n > b->size) return -30; memmove(b->data + dof, a->data + so, n); return 0; }
 int clFinish(void* q) { (void)q; return 0; }
-int clReleaseMemObject(void* b) { mem* m = b; if (!m) return 0; if (!m->sub) free(m->data); free(m); return 0; }
+int clReleaseMemObject(void* b) { mem* m = b; if (!m) return 0;
+    if (!m->sub) { for (int i = 0; i < 16; ++i) if ((unsigned char)m->data[m->size + i] != 0xA5) { fprintf(stderr, "mock opencl: a kernel wrote past a %zu-byte buffer\n", m->size); abort(); }
+        free(m->data); }
+    free(m); return 0; }
 int clReleaseKernel(void* k) { free(k); return 0; }
 int clReleaseProgram(void* p) { free(p); return 0; }
 int clReleaseCommandQueue(void* q) { free(q); return 0; }

@@ -167,6 +167,7 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
     if (!strcmp(op, "qgather")) return 8; if (!strcmp(op, "bcast")) return 7; if (!strcmp(op, "copy2d")) return 5;
+    if (!strcmp(op, "moe_hidden")) return 12; if (!strcmp(op, "moe_down")) return 10;
     return 0; }
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args);
 int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh,
@@ -189,9 +190,32 @@ int N_(cuGraphLaunch, hipGraphLaunch)(void* e, void* s) {
     (void)s; graph* g = e;
     for (int k = 0; k < g->n; ++k) { void* a[MAXARGS]; for (int i = 0; i < g->r[k].nargs; ++i) a[i] = &g->r[k].vals[i]; run_kernel(g->r[k].f, g->r[k].gx, g->r[k].bx, a); }
     return 0; }
+/* forge_moe_hidden / forge_moe_down (gpu_gen.py PORT_SHARED; cuda.hpp run_moe): row `row` of a stacked weight, f32 or encoded */
+static float m_moe_dot(const float* x, const unsigned char* w, size_t row, unsigned k, unsigned fmt, unsigned rb) {
+    float s = 0, v[32]; unsigned g, l;
+    if (!fmt) { const float* wf = (const float*)w + row * k; for (l = 0; l < k; ++l) s = fmaf(x[l], wf[l], s); return s; }
+    for (g = 0; g < k / 32u; ++g) { m_qgroup(fmt, w + row * rb, g, v); for (l = 0; l < 32u; ++l) s = fmaf(x[g * 32u + l], v[l], s); }
+    return s; }
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     const char* op = (const char*)f + 6;   /* skip "forge_" */
     unsigned threads = gx * bx, i;
+    if (!strcmp(op, "moe_hidden")) { const float *h = P(ARG(0, dptr)), *route = P(ARG(1, dptr)); float* hid = P(ARG(4, dptr));
+        const unsigned char *wg = (const unsigned char*)(uintptr_t)ARG(2, dptr), *wu = (const unsigned char*)(uintptr_t)ARG(3, dptr);
+        unsigned np = ARG(5, unsigned), ff = ARG(6, unsigned), d = ARG(7, unsigned), fg = ARG(8, unsigned), rg = ARG(9, unsigned), fu = ARG(10, unsigned), ru = ARG(11, unsigned);
+        if ((size_t)threads < (size_t)np * ff) return 1;
+        for (i = 0; i < np * ff; ++i) { unsigned p = i / ff, c = i % ff, e = (unsigned)route[3u * p], tok = (unsigned)route[3u * p + 1u];
+            size_t row = (size_t)e * ff + c; float a = m_moe_dot(h + (size_t)tok * d, wg, row, d, fg, rg), b = m_moe_dot(h + (size_t)tok * d, wu, row, d, fu, ru);
+            hid[i] = a / (1.0f + exp2f(-a * 1.4426950408889634f)) * b; }
+        return 0; }
+    if (!strcmp(op, "moe_down")) { const float *hid = P(ARG(0, dptr)), *route = P(ARG(1, dptr)); float* y = P(ARG(3, dptr));
+        const unsigned char* wd = (const unsigned char*)(uintptr_t)ARG(2, dptr);
+        unsigned t = ARG(4, unsigned), kk = ARG(5, unsigned), d = ARG(6, unsigned), ff = ARG(7, unsigned), fd = ARG(8, unsigned), rd = ARG(9, unsigned), j;
+        if ((size_t)threads < (size_t)t * d) return 1;
+        for (i = 0; i < t * d; ++i) { unsigned r = i / d, c = i % d; float s = 0;
+            for (j = 0; j < kk; ++j) { unsigned p = r * kk + j, e = (unsigned)route[3u * p];
+                s = fmaf(route[3u * p + 2u], m_moe_dot(hid + (size_t)p * ff, wd, (size_t)e * d + c, ff, fd, rd), s); }
+            y[i] = s; }
+        return 0; }
     if (!strcmp(op, "qgather")) { float *idx = P(ARG(0, dptr)), *y = P(ARG(2, dptr)); const unsigned char* w = (const unsigned char*)(uintptr_t)ARG(1, dptr);
         unsigned n = ARG(3, unsigned), d = ARG(4, unsigned), fmt = ARG(5, unsigned), rb = ARG(6, unsigned), nrows = ARG(7, unsigned), g, l; float v[32];
         if (gx < n || bx != 256) return 1;

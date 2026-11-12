@@ -5,7 +5,7 @@
 #     rope.local), every pattern-th layer is global (whole context, RoPE base rope.base),
 #   - no soft-capping unless the config sets it.
 # Double-brace placeholders are substituted by `forge import` from config.json (text_config).
-blueprint "decoder-lm" opset 1
+blueprint "decoder-lm" opset 3
 
 params {
   d_model: {{hidden_size}}  n_layers: {{num_hidden_layers}}  n_heads: {{num_attention_heads}}

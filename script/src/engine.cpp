@@ -5,6 +5,7 @@
 #include <forge/script/check.hpp>
 #include "vm.hpp"
 #include "fsc.hpp"
+#include "aot.hpp"
 #include <forge/os/fs.hpp>
 #include "monocypher.h"
 #include "monocypher-ed25519.h"
@@ -34,11 +35,13 @@ struct engine::impl {
     std::string sandbox = "off";
     bool static_check = true, strict_check = false; check_options chk;
     bool cancel_signals = true;
+    bool set_soft_cap = false, set_hard_cap = false;   // caps this engine put on the (process-wide) heap
     std::string fsc_dir, cache = "off";
     fsc::trust fsc_trust;
     std::optional<security::secure_bytes<32>> fsc_seed;   // .fsc signing key: locked, non-dumpable, wiped (FSS-CRY-2)
     void fresh() { in = std::make_unique<Interp>(sh); in->file = "<repl>"; }
     result fail(std::exception_ptr ep) {
+        Heap::exempt no_cap;   // reporting an OutOfMemoryError must not hit the cap again (the globals are still alive)
         result r; r.ok = false;
         ScriptError e = in->from_cpp(ep);
         if (auto* i = as<Instance>(e.v)) {
@@ -78,6 +81,7 @@ struct engine::impl {
             if (refuse) { r.ok = false; r.exit_code = 2; r.error_type = "StaticCheckError"; r.line = ds.front().line;
                 r.error = "StaticCheckError: script refused by static checks (forge script --check for details)\n" + to_text(ds); return r; }
         }
+        aot::bind_program(top, name);   // AOT binaries: attach the natively compiled bodies (aot.hpp); a no-op elsewhere
         sh->keep.push_back(top);
         sh->start_ns = os::monotonic_ns();
         in->deadline_ns = sh->limits.timeout_ms ? sh->start_ns + sh->limits.timeout_ms * 1000000 : 0;
@@ -110,6 +114,7 @@ namespace { std::atomic<bool>* g_interrupt = nullptr; extern "C" void on_sigint(
 engine::engine(options o) : p_(std::make_unique<impl>()) {
     auto& sh = *p_->sh;
     sh.limits.max_steps = o.max_steps; sh.limits.timeout_ms = o.timeout_ms; sh.limits.heap_bytes = o.heap_bytes; sh.limits.max_depth = o.max_depth;
+    sh.limits.mem_bytes = o.mem_limit_bytes;
     sh.caps = Caps{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env};
     p_->sandbox = "off"; p_->cancel_signals = o.cancel_signals;
     p_->static_check = o.static_check; p_->strict_check = o.strict_check; p_->chk = check_options{o.allow_fs, o.allow_net, o.allow_proc, o.allow_env, true};
@@ -150,13 +155,20 @@ engine::engine(options o) : p_(std::make_unique<impl>()) {
     script_argv() = o.argv;
     if (o.out) sh.out = o.out;
     sh.ai = o.ai; sh.confirm = o.confirm; sh.ask_model = o.ask_model; sh.ask_max_tokens = o.ask_max_tokens;
-    if (o.heap_bytes) Heap::instance().set_soft_cap(Heap::instance().live_bytes() + o.heap_bytes);
+    if (o.heap_bytes) { Heap::instance().set_soft_cap(Heap::instance().live_bytes() + o.heap_bytes); p_->set_soft_cap = true; }
+    // --mem-limit: counted from here like --heap, so the built-in tables installed below count against it
+    if (o.mem_limit_bytes) { Heap::instance().set_hard_cap(Heap::instance().live_bytes() + o.mem_limit_bytes, o.mem_limit_bytes); p_->set_hard_cap = true; }
     install_builtins(sh);
     auto l = make<List>(); for (auto& a : o.argv) l->push(obj(make<String>(a)));
     sh.builtins["args"] = obj(l);
     p_->fresh();
 }
-engine::~engine() { { std::lock_guard g(p_->sh->cb_m); p_->sh->callbacks.clear(); } p_->in.reset(); p_->sh->modules.clear(); Heap::instance().collect(); }
+engine::~engine() {
+    { std::lock_guard g(p_->sh->cb_m); p_->sh->callbacks.clear(); } p_->in.reset(); p_->sh->modules.clear(); Heap::instance().collect();
+    // the heap is process-wide: a cap set for this engine must not outlive it
+    if (p_->set_soft_cap) Heap::instance().set_soft_cap(0);
+    if (p_->set_hard_cap) Heap::instance().set_hard_cap(0);
+}
 
 result engine::run_file(const std::string& path) {
     auto src = os::read_file(path);
