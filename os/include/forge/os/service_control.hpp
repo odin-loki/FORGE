@@ -17,6 +17,7 @@
 // MSVCRT quoting, PowerShell literals with every single-quote variant doubled.
 // set service_spec::dir to write the file somewhere else without registering it (also used by tests).
 // Guide: docs/os-wrapper.md.
+#include <forge/os/fs.hpp>
 #include <forge/os/process.hpp>
 #include <forge/os/service.hpp>
 #include <forge/os/users.hpp>
@@ -681,6 +682,79 @@ inline status uninstall(const service_spec& s) {
     if (s.dir.empty() && systemd_available_(s)) ctl_(systemctl_(s, {"daemon-reload"}));
 #endif
     return {};
+#endif
+}
+// Stop (when running) and start again. Unsupported exactly where start() is.
+inline status restart(const service_spec& s) {
+#if defined(FORGE_OS_ANDROID) || defined(FORGE_OS_IOS)
+    (void)s; return {{}, unsupported("service restart")};
+#elif defined(FORGE_OS_WINDOWS) || defined(__APPLE__)
+    auto st = query(s);
+    if (st == service_state::not_installed) return {{}, {ENOENT, "service: " + s.name + " not installed"}};
+    if (st == service_state::running) if (auto r = stop(s); !r) return r;
+    return start(s);
+#elif defined(FORGE_OS_FREEBSD)
+    if (!fs::exists(unit_path(s))) return {{}, {ENOENT, "service: " + unit_path(s) + " not installed"}};
+    return ctl_ok_({"service", s.name, "onerestart"});
+#else
+    if (!systemd_available_(s)) return {{}, unsupported("service restart (no systemd session)")};
+    return ctl_ok_(systemctl_(s, {"restart", s.name + ".service"}));
+#endif
+}
+
+// ---- logs ----
+// Where a service's output ends up, per manager: systemd keeps stdout / stderr in the journal; launchd services
+// that log through os_log / syslog (service::log) are in the unified log; FreeBSD's daemon(8) wrapper (-S -T
+// <rc name>) sends output to syslog, i.e. /var/log/messages; Windows services report to the Application event log
+// under their own source name (service::log does). logs_command() is the query for it; logs() runs it and
+// returns the newest max_lines lines, oldest first. Android / iOS: unsupported.
+inline std::string tail_lines_(const std::string& t, std::size_t n) {   // the last n lines of t
+    std::size_t end = t.size(); if (end && t[end - 1] == '\n') --end;
+    for (std::size_t pos = end, count = 0; pos > 0;) {
+        auto nl = t.rfind('\n', pos - 1); if (nl == std::string::npos) return t;
+        if (++count == n) return t.substr(nl + 1);
+        pos = nl;
+    }
+    return t;
+}
+inline std::vector<std::string> logs_command(const service_spec& s, int max_lines = 100) {
+    if (!valid_name(s.name)) return {};
+    std::string n = std::to_string(max_lines < 1 ? 1 : max_lines > 100000 ? 100000 : max_lines);
+#if defined(FORGE_OS_ANDROID) || defined(FORGE_OS_IOS)
+    (void)n; return {};
+#elif defined(FORGE_OS_WINDOWS)
+    return {"wevtutil.exe", "qe", "Application", "/q:*[System[Provider[@Name='" + s.name + "']]]", "/c:" + n, "/rd:true", "/f:text"};
+#elif defined(__APPLE__)
+    std::string proc = s.argv.empty() ? s.name : basename(s.argv[0]), esc;
+    for (char c : proc) { if (c == '"' || c == '\\') esc += '\\'; esc += c; }
+    return {"/usr/bin/log", "show", "--last", "10m", "--style", "compact", "--predicate", "process == \"" + esc + "\""};
+#elif defined(FORGE_OS_FREEBSD)
+    return {"grep", "-E", "--", " " + rc_name(s.name) + "(\\[[0-9]+\\])?:", "/var/log/messages"};
+#else
+    std::vector<std::string> v{"journalctl"}; if (s.scope == service_scope::user) v.push_back("--user");
+    v.insert(v.end(), {"-u", s.name + ".service", "-n", n, "--no-pager", "-o", "short-iso"});
+    return v;
+#endif
+}
+inline result<std::string> logs(const service_spec& s, int max_lines = 100) {
+    if (!valid_name(s.name)) return {{}, {EINVAL, "service: invalid name '" + s.name + "'"}};
+    auto cmd = logs_command(s, max_lines);
+    if (cmd.empty()) return {{}, unsupported("service logs")};
+#if defined(FORGE_OS_POSIX)
+    if (cmd[0].find('/') == std::string::npos && find_executable(cmd[0]).empty()) return {{}, unsupported("service logs (no " + cmd[0] + ")")};
+#if defined(FORGE_OS_FREEBSD)
+    if (!fs::exists("/var/log/messages")) return {{}, unsupported("service logs (no /var/log/messages)")};
+#endif
+#endif
+    spawn_spec sp; sp.argv = cmd; sp.timeout_ms = 60000; sp.max_output = 16u << 20;
+    auto r = spawn_wait(sp); if (!r) return {{}, r.err};
+    // grep exits 1 for "no lines"; journalctl exits 1 for a unit it has never seen: both mean an empty log.
+    if (r->exit_code != 0 && r->exit_code != 1) return {{}, {r->exit_code, "service logs: " + cmd[0] + ": " + (r->err.empty() ? r->out : r->err)}};
+    std::string text = r->exit_code == 0 ? r->out : std::string();
+#if defined(FORGE_OS_WINDOWS)
+    return {std::move(text), {}};   // wevtutil already limits to /c: events (several lines each)
+#else
+    return {tail_lines_(text, std::size_t(max_lines < 1 ? 1 : max_lines)), {}};
 #endif
 }
 } // namespace forge::os::service
