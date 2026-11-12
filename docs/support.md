@@ -99,6 +99,33 @@ Row-major `mat<T>` for `T` = `float` or `double`. Meant for small and medium pro
 
 Limits: no pivoted (rank-revealing) QR, no general (non-symmetric) eigensolver, no complex types, no tile-unit (AMX/SME) GEMM path, and the sparse kernels are serial and not vectorised by hand. `eigh` and `svd` have been checked up to 90×90 in the tests; nothing was benchmarked.
 
+## Profiler (`forge::prof`)
+```cpp
+auto& r = prof::recorder::get(); r.on = true;
+{ FORGE_ZONE("decode"); FORGE_COUNTER("tokens", 1); FORGE_GAUGE("queue_depth", q.size()); }
+r.on = false;
+write(r.perfetto_json()); std::puts(r.summary_table().c_str());
+```
+
+| API | Meaning |
+|---|---|
+| `FORGE_ZONE(name)`, `prof::zone` | Scoped zone on the calling thread |
+| `FORGE_COUNTER(name, delta)`, `prof::counter` | Named running total (one per name, process-wide) |
+| `FORGE_GAUGE(name, value)`, `prof::gauge` | Named value; last, min, max and sample count are kept |
+| `FORGE_INSTANT(name)` | Point event |
+| `prof::note_alloc(tag, ptr, bytes)`, `note_free(tag, ptr, bytes)`, `tracked_allocator<T>` | Allocation hooks: live bytes, peak, counts per tag. Nothing in FORGE calls them yet (`mem::arena`, `mem::tlsf` and the tensor allocator are not wired) |
+| `prof::gpu_zone(name, device, begin_ticks, end_ticks)`, `recorder::gpu_calibrate` | A finished GPU zone from device timestamps, mapped to the CPU clock. No GPU backend calls it yet |
+| `FORGE_HW_ZONE(name)`, `prof::hw_zone`, `hw_measure(f)`, `hw_available()` (`prof/hw.hpp`) | A zone that also reads cycles, instructions, cache misses and branch misses for the thread through `os::perf_counters`. Not nestable (an inner one records time only) |
+| `recorder::events()`, `stats()`, `counters()`, `gauges()`, `allocations()` | Snapshots. `stats()` gives count, total, mean, min, max, p50, p95, p99 (nearest rank) per zone name |
+| `summary_table()`, `chrome_json()`, `perfetto_json()` | Text table; Chrome trace-event JSON; the same events sorted by timestamp with process/thread-name metadata for Perfetto's JSON importer |
+| `set_capacity(n)`, `dropped()`, `clear()`, `name_thread(s)` | Ring size per thread (default 16384 events), overwritten-event count, reset, thread label |
+
+- **Cost.** Off at run time (`recorder::on == false`, the default): one relaxed atomic load per macro or hook, nothing recorded, counters and gauges do not accumulate. Off at compile time (`FORGE_PROF_DISABLE` defined before the include): the macros expand to nothing and do not evaluate their arguments. On: two clock reads and one uncontended lock of the thread's own ring per event. The overhead was not measured.
+- **Rings.** Each thread has its own ring; when it is full the oldest events are overwritten, so `stats()` and the exports describe what is still held. `recorder::ev` (the old public vector) is gone: use `events()`.
+- **Tracy.** With `FORGE_PROF_TRACY`, zones, counters, gauges and the allocation hooks are also forwarded to Tracy's C API (`<tracy/TracyC.h>`, or the header named by `FORGE_PROF_TRACY_INCLUDE`; define `FORGE_PROF_TRACY_SRCLOC_COLOR` for Tracy 0.11+, whose source-location call takes a colour). This was only compiled and run against a stub header written for the test (`tests/tracy_stub/TracyC.h`, `test_prof_tracy_stub`); it has not been built against Tracy.
+- **Not verified.** `perfetto_json()` follows the documented legacy JSON format and is checked for structure by `test_prof`, but was not loaded into Perfetto. On the machine the tests ran on, `perf_event` was unavailable, so `hw_zone` only exercised the cycle-counter fallback.
+- Tests: `test_prof`, `test_prof_off`, `test_prof_tracy_stub`, and `prof_chrome_trace` in `test_support`.
+
 ## Processes
 - `os::spawn_spec` and `spawn_wait` (argv, env, cwd, limits, output cap): see [os-wrapper.md](os-wrapper.md#processes-processhpp).
 - `os::wait_any(children, timeout_ms)` returns the index of the first `child` to exit (reaped), or `nullopt` on timeout. `os::wait_all(children, timeout_ms)` returns false on timeout. Both poll with a 1–10 ms back-off and never reap another waiter's child.
@@ -145,7 +172,7 @@ auto t = kTimeout.get();          // parsed and defaulted; re-parsed when the va
 | `linalg/linalg.hpp`, `linalg/sparse.hpp` | `forge::linalg` | Dense and sparse linear algebra, float and double: see [Linear algebra](#linear-algebra-forgelinalg) |
 | `mem/arena.hpp` | `forge::mem` | Bump `arena` with `save`/`restore` marks and RAII `scope`; any power-of-two alignment |
 | `mem/tlsf.hpp` | `forge::mem` | Fixed-block `pool` and O(1) `tlsf` allocator over a caller region, with stats and `leak_report` |
-| `prof/prof.hpp` | `forge::prof` | `FORGE_ZONE(name)` scoped zones per thread, exported as Chrome trace JSON; a disabled zone costs one relaxed load |
+| `prof/prof.hpp`, `prof/hw.hpp` | `forge::prof` | Zones, counters, gauges, allocation and GPU-zone hooks, statistics, trace exports: see [Profiler](#profiler-forgeprof) |
 | `rand/philox.hpp` | `forge::rand` | Counter-based `philox4x32` (10 rounds) and `threefry4x32` (20 rounds) |
 | `reflect/reflect.hpp` | `forge::reflect` | `FORGE_REFLECT(T, fields...)` (up to 12 fields), `to_json`, `from_json` |
 | `signal/fft.hpp` | `forge::signal` | FFT (radix-2, Bluestein for other lengths), `rfft`, Hann window, STFT power, Slaney mel filterbank |
