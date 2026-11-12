@@ -22,11 +22,44 @@ Readers find sections through the table, so section order on disk does not matte
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
 | `data` | yes | Tensor bytes in the codec's block layout (`graph/codecs.hpp`), each tensor on a file offset that is a multiple of the file's [tensor alignment](#tensor-alignment) (64 B unless the manifest says otherwise) |
 | `experts` | no | Minor revision 1 (manifest `forge_format_minor: 1`). JSON `{version, align: 4096, tensors: [{layer, proj (gate/up/down), name, codec, n_experts, offset, file_offset, expert_bytes, aligned}]}` indexing the stacked MoE expert tensors `[n_experts, rows, k]` read by `moe_ffn`. Expert e is bytes `[offset + e * expert_bytes, + expert_bytes)` of `data`; `aligned` means every expert slice starts on a 4 KiB file offset (one direct read per expert, groundwork for expert streaming). Older readers ignore the section |
+| `state` | no | JSON state schema: the session state slots the model keeps between runs ([State section](#state-section)). Written by importers for models that have state; older readers ignore it |
+| `adapters` | no | JSON list of the LoRA adapters carried in the file ([Adapters section](#adapters-section)); their factors are ordinary tensors named `adapter.<name>.<weight>.lora_a` / `.lora_b`. Older readers ignore the section and never read those tensors: they run the base model |
+| `calib` | no | JSON calibration statistics: per-tensor range, moments and a magnitude histogram of the full-precision weights ([Calib section](#calib-section)). Older readers ignore it |
 | `license` | no | The model's licence text as UTF-8, copied at import (Hugging Face `LICENSE*`, `LICENCE*`, `COPYING*`, `NOTICE*` files; an ONNX `doc_string` that mentions a licence). With several files each follows a `===== NAME =====` line. Never sealed; covered by the signature like every other section; `forge sign`, `forge encrypt` and `forge aot` copy it unchanged. No format revision: readers that predate it ignore the section |
 | `aot` | no | Precompiled plans written by `forge aot` (binary, see [The aot section](#the-aot-section)). Older readers ignore the section; a reader that cannot use it compiles plans as usual |
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | JSON header of the sealed `data` section; two schemes, told apart by `alg`: see [Encryption](#encryption) |
 | `enc_macs` | with chunked encryption | Binary: one 16-byte Poly1305 tag per sealed chunk, in chunk order |
+
+## State section
+```
+{"version": 1, "slots": [
+  {"name": "kv.0.k", "kind": "append",    "shape": [2, 8],  "dtype": "f32"},
+  {"name": "conv.1", "kind": "recurrent", "op": "causal_conv", "shape": [3, 32], "dtype": "f32"}]}
+```
+- `append`: rows are appended per token; `shape` is one logical row (the appended tensor without its sequence axis: `[heads, dim]` for a KV cache). `recurrent`: fixed-size state updated in place by the kernel `op`; `shape` is the whole buffer. `dtype` is `f32` (a session may store appended rows in a KV codec; the schema describes the logical rows).
+- Importers derive it from the blueprint (the graph is built once for one token; `modelfile/state_schema.hpp`) and write it when the model has state. Limits a reader enforces: 65536 slots, names up to 256 bytes, rank 1 to 8, dimensions 1 to 1e9, unique names; another `version` is refused.
+- A model whose section differs from what its blueprint builds does not open (`... the state section does not describe the state its blueprint builds`). `forge inspect` and `forge verify` still read such a file.
+- A file without the section opens as before; the schema is then derived from the blueprint when it is first needed.
+- Use: `session::load_prefix` checks every slot of a saved prefix against the schema (declared name, kind, row shape in the session's KV codec, no duplicates, sizes that fit the blob) before it restores anything.
+
+## Adapters section
+```
+{"version": 1, "adapters": [{"name": "style", "alpha": 16, "rank": 4, "targets": ["layer.0.wq", "layer.0.wv"]}]}
+```
+- For adapter `N` and target weight `W` (a rank-2 tensor `[out, in]`) the index holds `adapter.N.W.lora_a` (`[rank, in]`) and `adapter.N.W.lora_b` (`[out, rank]`), PEFT layout: `W' = W + alpha / rank * B·A`. They are tensors like any other: hashed, aligned, sealed by `forge encrypt`, covered by the signature.
+- Names: letters, digits, `_`, `-`, at most 64. A reader refuses a section with a duplicate name, a target or factor that is not in the index, or factors whose shapes do not fit the target or `rank` (the model then does not open).
+- `forge adapter add / remove` rewrite the container (`modelfile/adapters.hpp`). The base tensors keep their offsets; removed factors stay in `data` as dead bytes. Because the tensor index changes, a signature and an `aot` section are dropped, and an encrypted file is refused: embed, then encrypt, then sign.
+
+## Calib section
+```
+{"version": 1, "source": "weights", "bins": 64,
+ "tensors": {"layer.0.wq": {"n": 1024, "min": -0.41, "max": 0.39, "mean": 0.001, "rms": 0.12, "absmax": 0.41, "hist": [ ...64 counts... ]}}}
+```
+- One entry per weight that an import quantises (rank-2 projection matrices and the token embedding), computed from the f32 source before encoding. `hist` counts `|x|` in `bins` equal bins over `[0, absmax]`; its sum is `n`. Numbers are written with 9 significant digits.
+- Written by `forge import --calib` (Hugging Face sources) and by `forge requant` (carried over, or computed when the input still has f32 weights). Read by `forge requant`: see [modelfile.md](modelfile.md#re-quantising-a-model-file).
+- These are statistics of the weights. Activation statistics, which need calibration inputs run through the model, are not collected.
+- A reader bounds the entry count, name length and histogram length, and refuses non-finite numbers, a histogram that does not sum to `n` and another `version`.
 
 ## Tensor alignment
 The manifest key `tensor_alignment` (a power of two from 64 to 1048576) says that every tensor of the file starts on a file offset that is a multiple of it. The writers take 64, 4096 or 65536 (`forge import --align`):
@@ -123,7 +156,8 @@ Compatibility:
 - `enc_macs` and `encryption` are covered by the signature like every section; `forge sign` and `forge aot` copy them unchanged.
 
 ## Tools
-- `forge inspect <file> [--tensors] [--blueprint] [--verify]` shows the layout.
+- `forge inspect <file> [--tensors] [--blueprint] [--verify] [--state]` shows the layout, the alignment, the declared state, embedded adapters and calibration data.
+- `forge adapter list|add|remove`, `forge requant`: see [cli.md](cli.md).
 - `forge aot <file> --list` shows the precompiled plans and whether they would be used; `--strip` removes them.
 - `forge dump <file> <tensor> out.f32` extracts one tensor as raw f32.
 - `forge keygen`, `forge sign`, `forge verify`, `forge encrypt`: see [modelfile.md](modelfile.md#examples).

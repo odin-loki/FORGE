@@ -62,6 +62,7 @@ inline std::string make_tiny_model(const std::string& path, tiny_cfg c = {}) {
                                             {"eos_token_id", 257.0}, {"max_position_embeddings", 512.0}}));
     w.set_section("blueprint", bp);
     w.set_section("tokenizer", byte_tokenizer_json());
+    import::add_state_section(w, modelfile::parse_blueprint(bp));
     w.write(path);
     return path;
 }
@@ -110,6 +111,7 @@ inline std::string make_tiny_qwen35_model(const std::string& path, unsigned seed
                                             {"eos_token_id", 257.0}, {"max_position_embeddings", 512.0}}));
     w.set_section("blueprint", bp);
     w.set_section("tokenizer", byte_tokenizer_json());
+    import::add_state_section(w, modelfile::parse_blueprint(bp));
     w.write(path);
     return path;
 }

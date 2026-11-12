@@ -1,6 +1,7 @@
 #include "check.hpp"
 #include <forge/inference/inference.hpp>
 #include <forge/import/gguf.hpp>
+#include <forge/import/requant.hpp>
 #include <cstdio>
 #include <filesystem>
 #if !defined(_WIN32)
@@ -157,6 +158,266 @@ output w : f32[8]
     CHECK_THROWS(modelfile::build_graph(modelfile::parse_blueprint("blueprint \"e\"\nop f(a) { return f(a) }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
     CHECK_THROWS(modelfile::parse_blueprint("blueprint \"e\"\nop f(a) { return a }\nop f(a) { return a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"));
     CHECK_THROWS(modelfile::build_graph(modelfile::parse_blueprint("blueprint \"e\"\nop f(a) { b = a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
+}
+
+// ---- optional sections of FORGE_PLAN D.2: STATE, ADAPTERS, CALIB ----
+namespace {
+using sec_list = std::vector<std::pair<std::string, std::string>>;
+sec_list read_sections(const std::string& f) {
+    sec_list m; modelfile::reader r(f);
+    for (auto& [n, s] : r.sections()) { auto b = r.raw_section_bytes(n); m.emplace_back(n, std::string(reinterpret_cast<const char*>(b.data()), b.size())); }
+    return m;
+}
+std::string& sec(sec_list& m, const std::string& n) { for (auto& [k, v] : m) if (k == n) return v; m.emplace_back(n, ""); return m.back().second; }
+void drop_sec(sec_list& m, const std::string& n) { std::erase_if(m, [&](auto& kv) { return kv.first == n; }); }
+std::string replace_all(std::string s, const std::string& a, const std::string& b) { for (std::size_t p = 0; (p = s.find(a, p)) != std::string::npos; p += b.size()) s.replace(p, a.size(), b); return s; }
+}
+
+TEST(fpk_state_schema_section) {
+    auto llama = forge_test::make_tiny_model(tmp("st_llama.fpk")), qwen = forge_test::make_tiny_qwen35_model(tmp("st_qwen.fpk"));
+    for (auto& f : {llama, qwen}) {
+        modelfile::reader r(f);
+        CHECK(r.has_section("state"));
+        auto sc = modelfile::state_schema::parse(r.section_text("state"));
+        CHECK(!sc.slots.empty() && modelfile::state_schema::parse(sc.dump()) == sc);
+        // the declared slots are exactly what a session ends up holding, with the same row shapes
+        inference::session s(f); s.forward(std::vector<int>{1, 2, 3});
+        CHECK(s.state().slots.size() == sc.slots.size());
+        std::size_t recurrent = 0;
+        for (auto& [name, sl] : s.state().slots) {
+            auto* d = sc.find(name);
+            CHECK_MSG(d != nullptr, "slot %s is not declared", name.c_str());
+            if (!d) continue;
+            CHECK(d->recurrent == sl.fixed && d->dtype == "f32");
+            if (sl.fixed) { CHECK(sl.buf.shape == d->shape); ++recurrent; }
+            else CHECK(shape_t(sl.buf.shape.begin() + 1, sl.buf.shape.end()) == d->shape);
+        }
+        CHECK((recurrent > 0) == (f == qwen));
+        CHECK(s.shared_model()->state_schema() && *s.shared_model()->state_schema() == sc);
+        std::printf("  %s: %zu slots, %zu recurrent\n", f == llama ? "llama" : "qwen3.5", sc.slots.size(), recurrent);
+    }
+    {   // llama: kv.<layer>.k / .v, rows of [n_kv heads, head_dim]
+        modelfile::reader r(llama); auto sc = modelfile::state_schema::parse(r.section_text("state"));
+        CHECK(sc.slots.size() == 4 && sc.find("kv.0.k") && sc.find("kv.1.v") && sc.find("kv.0.k")->shape == shape_t({2, 8}) && !sc.find("kv.0.k")->recurrent);
+    }
+    // a file without the section (every file written before it existed): opens as before, the schema is derived
+    auto old = tmp("st_old.fpk");
+    { auto m = read_sections(llama); drop_sec(m, "state"); modelfile::detail::write_sections(old, m); }
+    {
+        inference::session a(llama), b(old);
+        CHECK(!b.file().has_section("state") && b.shared_model()->state_schema() && *b.shared_model()->state_schema() == *a.shared_model()->state_schema());
+        CHECK(a.forward(std::vector<int>{5, 6, 7}) == b.forward(std::vector<int>{5, 6, 7}));
+        auto blob = a.save_prefix();
+        inference::session c(old); c.load_prefix(blob);
+        CHECK(c.forward(std::vector<int>{8}) == a.forward(std::vector<int>{8}));
+    }
+    // a section that does not describe the blueprint's state is refused at open
+    auto bad = tmp("st_bad.fpk");
+    for (auto [from, to] : {std::pair<std::string, std::string>{"\"shape\":[2,8]", "\"shape\":[2,9]"}, {"kv.1.v", "kv.7.v"}, {"\"kind\":\"append\"", "\"kind\":\"recurrent\",\"op\":\"causal_conv\""}}) {
+        auto m = read_sections(llama); auto& t = sec(m, "state"); auto was = t; t = replace_all(t, from, to); CHECK(t != was);
+        modelfile::detail::write_sections(bad, m);
+        CHECK_THROWS(inference::model(bad));
+        modelfile::reader r(bad); CHECK(r.verify().empty());   // the container itself is fine: inspect / verify still work
+    }
+    for (const char* txt : {"", "[]", "{\"version\":2,\"slots\":[]}", "{\"version\":1}", "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[],\"dtype\":\"f32\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[1e12],\"dtype\":\"f32\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[2],\"dtype\":\"i8\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[2],\"dtype\":\"f32\"},{\"name\":\"a\",\"kind\":\"append\",\"shape\":[2],\"dtype\":\"f32\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"recurrent\",\"shape\":[2],\"dtype\":\"f32\"}]}"})
+        CHECK_THROWS(modelfile::state_schema::parse(txt));
+
+    // ---- a saved prefix is checked against the schema before it is restored
+    auto patch_blob = [](std::vector<std::byte> b, const std::string& from, const std::string& to) {
+        std::string t(reinterpret_cast<const char*>(b.data()), b.size()); auto p = t.find(from);
+        if (p != std::string::npos) std::memcpy(b.data() + p, to.data(), to.size());
+        return b;
+    };
+    for (const char* kc : {"f32", "int8"}) {
+        inference::session_options so; so.kv_codec = kc;
+        inference::session a(llama, so); a.forward(std::vector<int>{1, 2, 3, 4});
+        auto blob = a.save_prefix();
+        { inference::session b(llama, so); b.load_prefix(blob); CHECK(b.position() == 4 && b.forward(std::vector<int>{9}) == a.forward(std::vector<int>{9})); a.rewind(4); }
+        { inference::session b(llama, so); CHECK_THROWS(b.load_prefix(patch_blob(blob, "kv.0.k", "kv.9.k"))); CHECK(b.position() == 0); }   // a slot the model does not declare
+        { inference::session b(llama, so); CHECK_THROWS(b.load_prefix(patch_blob(blob, "kv.0.k", "kv.0.v"))); }                           // a slot twice
+        {   // a row dimension changed in the blob's shape (the u64 after the rank of the first slot)
+            auto t = blob; std::string txt(reinterpret_cast<const char*>(t.data()), t.size()); auto p = txt.find("kv.0.k");
+            CHECK(p != std::string::npos);
+            std::uint64_t d1; std::size_t at = p + 6 + 8 * 5 + 8;   // name | fixed codec len cap rank | dim0 | dim1
+            std::memcpy(&d1, t.data() + at, 8); CHECK(d1 == 2); d1 = 3; std::memcpy(t.data() + at, &d1, 8);
+            inference::session b(llama, so); CHECK_THROWS(b.load_prefix(t));
+        }
+        { inference::session q(qwen, so); CHECK_THROWS(q.load_prefix(blob)); }   // another model's state
+        { auto cut = blob; cut.resize(cut.size() / 2); inference::session b(llama, so); CHECK_THROWS(b.load_prefix(cut)); CHECK(b.position() == 0); }
+    }
+    {   // recurrent state: a full-length prefix restores; a blob whose recurrent buffer has another shape does not
+        inference::session a(qwen); a.forward(std::vector<int>{1, 2, 3});
+        auto blob = a.save_prefix();
+        inference::session b(qwen); b.load_prefix(blob); CHECK(b.forward(std::vector<int>{4}) == a.forward(std::vector<int>{4}));
+        inference::session l(llama); CHECK_THROWS(l.load_prefix(blob));
+    }
+}
+
+TEST(fpk_embedded_adapters) {
+    auto base = forge_test::make_tiny_model(tmp("ad_base.fpk")), lora = tmp("ad_lora.fpk"), lora2 = tmp("ad_lora2.fpk"), f = tmp("ad.fpk");
+    std::mt19937 rng(21); std::normal_distribution<float> N(0, 0.3f);
+    auto make_lora = [&](const std::string& path, std::vector<std::string> targets, i64 rank, double alpha) {
+        modelfile::writer w;
+        for (auto& t : targets) {
+            std::vector<float> a(std::size_t(rank * 32)), b(std::size_t(32 * rank));
+            for (auto& x : a) x = N(rng);
+            for (auto& x : b) x = N(rng);
+            w.add_tensor(t + ".lora_a", {rank, 32}, a); w.add_tensor(t + ".lora_b", {32, rank}, b);
+        }
+        w.set_manifest(json::value(json::object{{"format", "fpk"}, {"lora_alpha", alpha}}));
+        w.set_section("blueprint", "blueprint \"lora\"\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n");
+        w.write(path);
+    };
+    make_lora(lora, {"layer.0.wq", "layer.1.wo"}, 2, 4); make_lora(lora2, {"layer.1.wq"}, 3, 6);
+    const std::vector<int> ids{1, 2, 3, 4};
+    std::vector<float> ref_base, ref_a, ref_b;
+    {   // the reference: the same adapters registered from their own files
+        auto m = inference::model::open(base); m->add_adapter_file("a", lora); m->add_adapter_file("b", lora2);
+        inference::session s(m); ref_base = s.forward(ids); s.set_adapter("a"); ref_a = s.forward(ids); s.set_adapter("b"); ref_b = s.forward(ids);
+        CHECK(ref_a != ref_base && ref_b != ref_base && ref_a != ref_b);
+    }
+    auto info = modelfile::embed_adapter(base, f, "style", lora);
+    CHECK(info.rank == 2 && info.alpha == 4 && info.targets == std::vector<std::string>({"layer.0.wq", "layer.1.wo"}));
+    modelfile::embed_adapter(f, f, "tone-2", lora2);
+    CHECK_THROWS(modelfile::embed_adapter(f, f, "style", lora));                 // the name is taken
+    CHECK_THROWS(modelfile::embed_adapter(f, f, "bad name", lora));              // not an identifier
+    CHECK_THROWS(modelfile::embed_adapter(f, f, "../x", lora));
+    { make_lora(tmp("ad_bad.fpk"), {"layer.0.nope"}, 2, 1); CHECK_THROWS(modelfile::embed_adapter(f, f, "z", tmp("ad_bad.fpk"))); }   // targets a weight the model lacks
+    {
+        modelfile::reader r(f); auto all = modelfile::read_adapters(r);
+        CHECK(r.verify().empty() && all.size() == 2 && all[0].name == "style" && all[1].name == "tone-2" && all[1].rank == 3 && all[1].alpha == 6);
+        CHECK(r.tensors().count("adapter.style.layer.0.wq.lora_a") && r.tensors().count("adapter.tone-2.layer.1.wq.lora_b"));
+        modelfile::reader b(base);
+        for (auto& [n, e] : b.tensors()) CHECK(r.entry(n).blake3 == e.blake3 && r.entry(n).offset == e.offset);   // base tensors did not move
+    }
+    {   // selected by name; read on first use; same logits as the registered adapters; the base is unchanged
+        auto m = inference::model::open(f);
+        CHECK(m->embedded_adapters().size() == 2 && m->has_adapter("style") && m->has_adapter("tone-2") && !m->has_adapter("nope"));
+        inference::session s(m);
+        CHECK(s.forward(ids) == ref_base);
+        s.set_adapter("style"); CHECK(s.forward(ids) == ref_a);
+        s.set_adapter("tone-2"); CHECK(s.forward(ids) == ref_b);
+        s.set_adapter(""); CHECK(s.forward(ids) == ref_base);
+        CHECK_THROWS(s.set_adapter("nope"));
+        inference::session s2(m); s2.set_adapter("style"); CHECK(s2.forward(ids) == ref_a);   // a second session shares the loaded adapter
+    }
+    {   // signatures cover the adapters: sign after embedding, then any change to an adapter breaks the digest
+        auto kp = modelfile::generate_keypair(); auto g = tmp("ad_signed.fpk");
+        modelfile::sign_file(f, g, kp);
+        { modelfile::reader r(g); auto rep = modelfile::verify_signature(r); CHECK(rep.digest_ok && rep.valid_keys.size() == 1 && modelfile::read_adapters(r).size() == 2); }
+        auto m = read_sections(g); sec(m, "adapters") = replace_all(sec(m, "adapters"), "\"alpha\":4", "\"alpha\":5");
+        modelfile::detail::write_sections(g, m);
+        { modelfile::reader r(g); CHECK(!modelfile::verify_signature(r).digest_ok); }
+        modelfile::sign_file(f, g, kp);
+        modelfile::embed_adapter(g, g, "third", lora2);                                 // rewriting drops the signature
+        { modelfile::reader r(g); CHECK(!r.has_section("signature") && modelfile::read_adapters(r).size() == 3); }
+    }
+    {   // encrypted: embed first, then seal; a sealed file is refused by the tools and runs with the key
+        auto key = modelfile::generate_model_key(); auto e = tmp("ad_enc.fpk");
+        modelfile::encrypt_file(f, e, key, {.chunk_bytes = 4096});
+        CHECK_THROWS(modelfile::embed_adapter(e, e, "x", lora)); CHECK_THROWS(modelfile::remove_adapter(e, e, "style"));
+        forge_test::set_env("FORGE_MODEL_KEY", modelfile::detail::hex(key.data(), 32).c_str());
+        { inference::session s(e); s.set_adapter("style"); CHECK(s.forward(ids) == ref_a); }
+        forge_test::set_env("FORGE_MODEL_KEY", nullptr);
+    }
+    {   // a section that does not fit the tensor index is refused when the model opens
+        auto g = tmp("ad_bad2.fpk");
+        for (auto [from, to] : {std::pair<std::string, std::string>{"layer.1.wo", "layer.9.wo"}, {"\"rank\":2", "\"rank\":3"}, {"\"name\":\"style\"", "\"name\":\"tone-2\""}, {"\"version\":1", "\"version\":9"}}) {
+            auto m = read_sections(f); auto& t = sec(m, "adapters"); auto was = t; t = replace_all(t, from, to); CHECK(t != was);
+            modelfile::detail::write_sections(g, m);
+            CHECK_THROWS(inference::model(g));
+        }
+    }
+    modelfile::remove_adapter(f, f, "style");
+    { modelfile::reader r(f); auto all = modelfile::read_adapters(r); CHECK(all.size() == 1 && all[0].name == "tone-2" && !r.tensors().count("adapter.style.layer.0.wq.lora_a") && r.verify().empty()); }
+    CHECK_THROWS(modelfile::remove_adapter(f, f, "style"));
+    modelfile::remove_adapter(f, f, "tone-2");
+    { modelfile::reader r(f); CHECK(!r.has_section("adapters")); inference::session s(f); CHECK(s.forward(ids) == ref_base); }
+    {   // an aligned file stays aligned
+        auto al = tmp("ad_al.fpk");
+        { modelfile::writer w; w.set_alignment(4096); std::vector<float> wq(32 * 32, 0.5f); w.add_tensor("layer.0.wq", {32, 32}, wq); w.add_tensor("layer.1.wo", {32, 32}, wq);
+          w.set_manifest(json::value(json::object{{"format", "fpk"}})); w.set_section("blueprint", "blueprint \"t\"\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n"); w.write(al); }
+        modelfile::embed_adapter(al, al, "style", lora);
+        modelfile::reader r(al); CHECK(r.tensor_alignment() == 4096 && r.misaligned_tensors().empty() && r.verify().empty() && modelfile::read_adapters(r).size() == 1);
+    }
+}
+
+TEST(fpk_calibration_section_and_requant) {
+    // statistics
+    std::vector<float> v{-2, -1, 0, 1, 2, 4};
+    auto st = modelfile::tensor_stats::of(v);
+    CHECK(st.n == 6 && st.min == -2 && st.max == 4 && st.absmax == 4 && std::fabs(st.mean - 4.0 / 6) < 1e-12 && std::fabs(st.rms - std::sqrt(26.0 / 6)) < 1e-12);
+    CHECK(st.hist.size() == modelfile::calib_bins && st.hist[0] == 1 && st.hist[16] == 2 && st.hist[32] == 2 && st.hist[63] == 1);
+    CHECK(std::fabs(st.quantile(0.5) - 4.0 * 17 / 64) < 1e-12 && st.quantile(1.0) == 4);
+    CHECK(modelfile::tensor_stats::of({}).n == 0 && modelfile::tensor_stats::of(std::vector<float>(5, 0.f)).crest() == 0);
+    modelfile::calib_table ct; ct.tensors["a"] = st; ct.tensors["b"] = modelfile::tensor_stats::of(std::vector<float>(7, 1.5f));
+    auto back = modelfile::calib_table::parse(ct.dump());
+    CHECK(back.tensors.size() == 2 && back.find("a")->hist == st.hist && std::fabs(back.find("a")->rms - st.rms) < 1e-8 && back.find("b")->crest() == 1);
+    for (const char* txt : {"", "[]", "{\"version\":3,\"tensors\":{}}", "{\"version\":1}", "{\"version\":1,\"tensors\":{\"a\":{\"n\":-1}}}",
+                            "{\"version\":1,\"tensors\":{\"a\":{\"n\":2,\"hist\":[1,2]}}}", "{\"version\":1,\"tensors\":{\"a\":{\"n\":1,\"min\":2,\"max\":1}}}",
+                            "{\"version\":1,\"tensors\":{\"a\":{\"n\":1},\"a\":{\"n\":1}}}"})
+        CHECK_THROWS(modelfile::calib_table::parse(txt));
+
+    // the recipe reads them: one step up the ladder at the crest threshold, two at twice it; only the forge mixes
+    modelfile::calib_table rt;
+    auto with_crest = [](double c) { modelfile::tensor_stats s; s.n = 1; s.rms = 1; s.absmax = c; return s; };
+    rt.tensors["layer.5.wq"] = with_crest(13); rt.tensors["layer.6.wq"] = with_crest(30); rt.tensors["layer.7.wq"] = with_crest(5);
+    import::quant_recipe q; q.ftype = "q4_k_m"; q.n_layer = 12;
+    CHECK(import::recipe_type(q, "layer.5.wq", 256) == "q4_k");
+    q.calib = &rt;
+    CHECK(import::recipe_type(q, "layer.5.wq", 256) == "q5_k" && import::recipe_type(q, "layer.6.wq", 256) == "q6_k" && import::recipe_type(q, "layer.7.wq", 256) == "q4_k");
+    CHECK(import::recipe_type(q, "layer.8.wq", 256) == "q4_k");                                    // no statistics: no change
+    { auto p = q; p.calib_crest = 40; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); p.calib_crest = 0; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); }
+    { auto p = q; p.recipe = "llama"; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); }   // the port of llama.cpp's rules is left alone
+    { auto p = q; p.pure = true; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); }
+    { auto p = q; p.tensor_types = {{"layer\\.6\\.wq", "q8_0"}}; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q8_0"); }   // explicit overrides win
+    { auto p = q; p.ftype = "q5_k_m"; rt.tensors["layer.0.wv"] = with_crest(30); CHECK(import::recipe_type(p, "layer.0.wv", 256) == "q8_0"); }   // q6_k (more bits) -> q8_0, top of the ladder
+    CHECK(import::recipe_type(q, "layer.6.wq", 96) == "q8_0");                                    // the shape fallback still applies after the move
+
+    // forge requant: a model with f32 weights, one of them with a range set by two outliers
+    auto src = tmp("rq_src.fpk"), out = tmp("rq_out.fpk"), out2 = tmp("rq_out2.fpk"), out3 = tmp("rq_out3.fpk");
+    std::mt19937 rng(9); std::normal_distribution<float> N(0, 0.05f);
+    std::vector<float> plain(256 * 256), spiky(256 * 256), norm(256, 1.f), emb(64 * 256);
+    for (auto& x : plain) x = N(rng);
+    for (auto& x : spiky) x = N(rng);
+    for (auto& x : emb) x = N(rng);
+    spiky[1234] = 2.5f; spiky[40000] = -2.5f;
+    {
+        modelfile::writer w;
+        w.add_tensor("tok_emb", {64, 256}, emb); w.add_tensor("layer.0.wq", {256, 256}, spiky); w.add_tensor("layer.0.attn_norm", {256}, norm);
+        w.add_tensor("layer.1.wq", {256, 256}, plain); w.add_tensor("layer.1.w_gate", {256, 256}, plain, "q8_0"); w.add_tensor("adapter.s.layer.1.wq.lora_a", {2, 256}, std::vector<float>(512, 0.1f));
+        w.set_manifest(json::value(json::object{{"format", "fpk"}, {"codec", "f32"}}));
+        w.set_section("blueprint", "blueprint \"rq\"\nparams { n_layers: 2 }\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n");
+        w.set_section("license", "test licence"); w.write(src);
+    }
+    import::requant_options ro; ro.base.codec = "q4_k_m";
+    auto rep = import::requantise(src, out, ro);
+    CHECK(rep.tensors == 6 && rep.requantised == 3 && rep.kept == 3 && !rep.calib_from_file && rep.calib_moved == 1);
+    {
+        modelfile::reader r(out), s0(src);
+        CHECK(r.verify().empty() && r.entry("layer.1.wq").codec == "q4_k" && r.entry("layer.0.wq").codec == "q6_k");   // crest 2.5 / 0.052 = 48: two steps
+        CHECK(r.entry("tok_emb").codec == "q8_0" && r.entry("layer.0.attn_norm").codec == "f32" && r.entry("layer.1.w_gate").codec == "q8_0" && r.entry("adapter.s.layer.1.wq.lora_a").codec == "f32");
+        CHECK(r.entry("layer.1.w_gate").blake3 == s0.entry("layer.1.w_gate").blake3);                                 // already quantised: copied, not decoded and quantised again
+        CHECK(r.section_text("license") == "test licence" && r.manifest().str_or("codec", "") == "q4_k_m" && r.has_section("calib"));
+        auto c2 = modelfile::calib_table::parse(r.section_text("calib"));
+        CHECK(c2.tensors.size() == 3 && c2.find("layer.0.wq") && c2.find("layer.0.wq")->absmax == 2.5 && c2.find("layer.0.wq")->crest() > 24);
+        auto d = r.load("layer.1.wq"); double e = 0; for (std::size_t i = 0; i < plain.size(); ++i) e = std::max(e, double(std::fabs(d.data[i] - plain[i])));
+        CHECK(e < 0.05);
+    }
+    ro.use_calib = false;
+    auto rep2 = import::requantise(src, out2, ro);
+    { modelfile::reader r(out2); CHECK(rep2.calib_moved == 0 && r.entry("layer.0.wq").codec == "q4_k" && !r.has_section("calib")); }
+    // the statistics travel: quantising the q8_0 copy again (which has no f32 weights left to measure) still finds them
+    ro.use_calib = true; ro.base.codec = "q8_0";
+    { auto r1 = import::requantise(src, out3, ro); modelfile::reader r(out3); CHECK(r1.requantised == 3 && r.entry("layer.0.wq").codec == "q8_0" && r.has_section("calib")); }
+    ro.base.codec = "q4_k_m";
+    { auto r3 = import::requantise(out3, out2, ro); CHECK(r3.calib_from_file && r3.requantised == 0 && r3.kept == 6); }   // nothing float left: all copied, with a calib section read
+    CHECK_THROWS(import::requantise(src, src, ro));
+    { import::requant_options bad; bad.base.codec = "nope"; CHECK_THROWS(import::requantise(src, out2, bad)); }
 }
 
 // Tensor alignment: 64 (default of the writers), 4096, 65536; recorded in the manifest; kept by every tool that

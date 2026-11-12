@@ -139,6 +139,7 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
+    add_state_section(w, bp);
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

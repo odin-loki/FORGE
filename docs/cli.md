@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `adapter`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -25,6 +25,7 @@ Converts a model to `.fpk`.
 | `--allow-unused` | Import although the source has tensors the template does not use. Without it such an import fails and lists them (name and shape). Hugging Face leftovers are left out; GGUF leftovers are kept as `extra.<name>` |
 | `--ignore-tensor NAME[,NAME...]` | Source tensors known to be harmless: a whole name, `prefix*` or `*suffix`. `position_ids`, `masked_bias` and `inv_freq` buffers are always ignored |
 | `--align 64\|4096\|65536` | File alignment of every tensor (`4k`, `64k` also parse). Default: 4096 when the source weights are at least 64 MiB, else 64; see [format.md](format.md#tensor-alignment) |
+| `--calib` | Record statistics of the full-precision weights in a `calib` section, for a later `forge requant` (Hugging Face sources; a GGUF's weights are already quantised, so nothing is recorded) |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
 | `--output-tensor-type T`, `--token-embedding-type T` | Mixed precision: codec for the output head / token embedding |
 | `--tensor-type REGEX=TYPE[,REGEX=TYPE...]` | Mixed precision: per-tensor overrides |
@@ -33,8 +34,24 @@ Converts a model to `.fpk`.
 
 `forge import` prints the licence it recorded (`license   apache-2.0`, or `(none found in the source)`); see [modelfile.md](modelfile.md#what-an-import-checks-and-records). The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
 
-### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]`
+### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license] [--state]`
 Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprint summary (with a note when its opset is outside the range this build runs) and a `license` line: the licence recorded at import, or `(not recorded)`. `--license` also prints the stored licence text. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
+It also prints the tensor alignment and how many tensors comply, the state slots the file declares (`--state` lists them), every embedded adapter (name, rank, alpha, number of target weights), a summary of the calibration section, and for an encrypted file the scheme, the key id and whether a key was accepted.
+
+### `forge requant <in.fpk> -o out.fpk --codec C [options]`
+Re-encodes the float weights of a model file in another codec, without the source checkpoint: rank-2 tensors stored as `f32`, `f16` or `bf16` that are not normalisation weights or LoRA factors. Every other tensor is copied byte for byte (a tensor that is already quantised is not decoded and quantised again). `--codec` and the mixed-precision options are those of `forge import`.
+
+| Option | Meaning |
+|--------|---------|
+| `--emb-codec C`, `--recipe`, `--output-tensor-type`, `--token-embedding-type`, `--tensor-type`, `--pure`, `--bf16-head` | As for `forge import` |
+| `--no-calib` | Do not use calibration statistics |
+| `--calib-crest X` | Crest factor (`absmax / rms`) at which the `forge` recipe gives a tensor one step more precision (default 12; two steps at twice that) |
+| `--align 64\|4096\|65536` | Tensor alignment of the output (default: the input's) |
+
+With calibration (the default) the statistics come from the input's `calib` section; without one they are computed from the input's `f32` weights. The output carries them. The other sections are copied; a signature and precompiled plans are dropped, an encrypted input needs its key and the output is plain. Files with an `experts` index (stacked MoE experts) are refused: import the source again. See [modelfile.md](modelfile.md#re-quantising-a-model-file).
+
+### `forge adapter list <model.fpk>` / `add <model.fpk> --name N --from lora.fpk [-o out.fpk]` / `remove <model.fpk> --name N [-o out.fpk]`
+LoRA adapters carried in the model file. `add` copies the `<weight>.lora_a` / `<weight>.lora_b` tensors of `lora.fpk` (the layout `model::add_adapter_file` reads; `lora_alpha` from its manifest) into the model under the name `N`; `remove` takes one out; without `-o` the file is rewritten in place. Select one with `forge run --adapter N`. Both drop a signature and precompiled plans, refuse an encrypted file, and hold the whole file in memory while they work.
 
 ### `forge run <model> (--prompt TEXT | --tokens 1,2,3) [options]`
 
@@ -56,6 +73,7 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprin
 | `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
 | `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
 | `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
+| `--adapter NAME` | none | Run with a LoRA adapter carried in the model file (`forge adapter list` shows them) |
 | `--allow-unused` | off | On-the-fly import: accept source tensors the template does not use (as `forge import --allow-unused`) |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 

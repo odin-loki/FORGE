@@ -78,11 +78,14 @@ struct importer {
         w->set_alignment(import_alignment(opt, dir));
     }
     std::string qcodec() const { return is_mix_ftype(opt.codec) ? mix_base(opt.codec) : opt.codec; }
+    modelfile::calib_table calib;   // import_options::calib: statistics of the f32 weights that get quantised
     void put(const std::string& n, const tensor& t, bool quantisable = false) {
+        if (opt.calib && quantisable && t.shape.size() == 2) calib.tensors[n] = modelfile::tensor_stats::of(t.data);
         w->add_tensor(n, t.shape, t.data, quantisable && t.shape.size() == 2 ? qcodec() : std::string("f32")); ++rep.tensors;
     }
     void emb(const std::string& n, const tensor& t) {   // token embedding: q8_0 under a quantised codec, as hf.hpp
         std::string ec = !opt.emb_codec.empty() ? opt.emb_codec : (opt.codec == "f32" || opt.codec == "f16" || opt.codec == "bf16" ? opt.codec : std::string("q8_0"));
+        if (opt.calib) calib.tensors[n] = modelfile::tensor_stats::of(t.data);
         w->add_tensor(n, t.shape, t.data, ec); ++rep.tensors;
     }
     // a linear layer: weight (quantisable) + bias, under names <dst>w<sfx> / <dst>b<sfx>
@@ -129,6 +132,8 @@ struct importer {
         auto lic = hf_license(dir); lic.store(man, *w); rep.license = lic.summary();
         w->set_manifest(json::value(man));
         w->set_section("blueprint", bp_text);
+        add_state_section(*w, bp);
+        if (!calib.empty()) w->set_section(modelfile::calib_section, calib.dump());
         w->finish();
         rep.bytes = std::filesystem::file_size(out);
         return rep;

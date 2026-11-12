@@ -168,6 +168,7 @@ public:
         std::fclose(f);
     }
     std::size_t tensor_bytes() const { return data_.size(); }
+    const std::vector<tensor_entry>& entries() const { return tensors_; }   // every tensor added so far, in order
     // Pre-size the data buffer so growth never holds two copies of the weights at once.
     void reserve(std::size_t bytes) { data_.reserve(bytes); }
 private:

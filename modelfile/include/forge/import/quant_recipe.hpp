@@ -11,6 +11,7 @@
 // attn_output at q6_k, and the head and token embeddings at q8_0 (or bf16 with head_bf16). Norms, conv, A/dt and the
 // a/b gates are never quantised (the importer stores them as f32).
 #include <forge/core/error.hpp>
+#include <forge/modelfile/calib.hpp>
 #include <regex>
 #include <string>
 #include <utility>
@@ -27,7 +28,22 @@ struct quant_recipe {
     bool pure = false;               // --pure: base type everywhere except explicit overrides
     bool head_bf16 = false;          // FORGE: lm_head and tok_emb in bf16 (CUDA runs them on BF16 tensor cores)
     int n_layer = 0, n_attn_v = 0, n_expert = 0;   // model facts (n_attn_v: layers that have a V projection)
+    // Calibration statistics of the full-precision weights (the .fpk "calib" section, modelfile/calib.hpp), consulted
+    // by the "forge" recipe for the mixes: a tensor whose crest factor (absmax / rms) reaches calib_crest gets one
+    // step more precision on the ladder q4_k -> q5_k -> q6_k -> q8_0, two steps at twice that. Gaussian weights sit
+    // at 4 to 6, so the default only moves tensors whose range is set by a few outliers. A FORGE heuristic: it has
+    // not been tuned against model quality. Null or calib_crest <= 0: no effect. Explicit overrides still win.
+    const modelfile::calib_table* calib = nullptr;
+    double calib_crest = 12;
 };
+// Steps of extra precision the calibration data asks for (0 without data for the tensor).
+inline int calib_steps(const quant_recipe& r, const std::string& name) {
+    if (!r.calib || r.calib_crest <= 0) return 0;
+    auto* st = r.calib->find(name);
+    if (!st) return 0;
+    double c = st->crest();
+    return c >= 2 * r.calib_crest ? 2 : c >= r.calib_crest ? 1 : 0;
+}
 
 inline bool is_mix_ftype(const std::string& f) { return f == "q4_k_m" || f == "q5_k_m"; }
 inline std::string mix_base(const std::string& f) { return f == "q4_k_m" ? "q4_k" : f == "q5_k_m" ? "q5_k" : f; }
@@ -68,6 +84,11 @@ inline std::string recipe_type(const quant_recipe& r, const std::string& name, l
             if (is_out || is_emb) t = "q8_0";
             if (leaf == "wo" || (deltanet && (leaf == "w_qkv" || leaf == "w_z"))) t = "q6_k";
         }
+    }
+    if (forge && !r.pure && is_mix_ftype(r.ftype)) {
+        static const char* const ladder[] = {"q4_k", "q5_k", "q6_k", "q8_0"};
+        for (int s = calib_steps(r, name); s > 0; --s)
+            for (int i = 0; i < 3; ++i) if (t == ladder[i]) { t = ladder[i + 1]; break; }
     }
     if (forge && r.head_bf16 && (is_out || is_emb)) t = "bf16";
     if (is_emb && !r.token_embedding_type.empty()) t = r.token_embedding_type;

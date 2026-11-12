@@ -462,6 +462,8 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
+    add_state_section(w, bp);
+    if (opt.calib) rep.notes.push_back("--calib: not recorded for a GGUF source (its weights are already quantised)");
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

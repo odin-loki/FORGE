@@ -5,6 +5,7 @@
 #include <sys/stat.h>
 #include <forge/import/gguf.hpp>
 #include <forge/import/onnx.hpp>
+#include <forge/import/requant.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
 #include <forge/inference/aot_build.hpp>
@@ -66,7 +67,12 @@ int usage() {
         "      [--allow-unused] import although source tensors are left over (default: error listing them)\n"
         "      [--ignore-tensor NAME[,NAME..]] leftovers known to be harmless (NAME, prefix* or *suffix)\n"
         "      [--align 64|4096|65536] file alignment of every tensor (default: 4096 when the source weights are >= 64 MiB, else 64)\n"
-        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]\n"
+        "      [--calib] record statistics of the full-precision weights (\"calib\" section) for a later forge requant\n"
+        "  requant <in.fpk> -o <out.fpk> --codec C   re-encode the float weights of a model file (codecs and the mixed-precision\n"
+        "      options of import); reads the calib section, or measures f32 weights [--no-calib] [--calib-crest 12] [--align A]\n"
+        "  adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]\n"
+        "      LoRA adapters carried in the model file; select one with run --adapter N\n"
+        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license] [--state]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
@@ -212,6 +218,7 @@ int cmd_import(const args& a) {
     }
     // --align 64|4096|65536 (4k, 64k): tensor alignment of the output; default by size (import::import_alignment)
     if (!a.get("align").empty()) o.align = std::size_t(parse_size_arg(a.get("align"), "--align"));
+    o.calib = a.has("calib");   // record weight statistics for a later `forge requant` ("calib" section)
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
     auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
@@ -251,6 +258,22 @@ int cmd_inspect(const args& a) {
         std::printf("alignment %zu bytes%s: %zu of %zu tensors start on a multiple of it in the file%s\n", al, recorded ? "" : " (not recorded: file written before the option)",
                     r.tensors().size() - off.size(), r.tensors().size(), off.empty() ? "" : " (file rewritten by a tool that does not keep the alignment?)");
     }
+    {   // optional sections: declared state, embedded adapters, calibration statistics
+        if (r.has_section(modelfile::state_section)) {
+            auto sc = modelfile::state_schema::parse(r.section_text(modelfile::state_section));
+            std::size_t rec = 0; for (auto& sl : sc.slots) rec += sl.recurrent;
+            std::printf("state     %zu slots declared (%zu appended rows, %zu recurrent)%s\n", sc.slots.size(), sc.slots.size() - rec, rec, a.has("state") ? ":" : " (--state lists them)");
+            if (a.has("state")) for (auto& sl : sc.slots) std::printf("  %-28s %-9s %-12s %s %s\n", sl.name.c_str(), sl.recurrent ? "recurrent" : "append", sl.op.c_str(), sl.dtype.c_str(), shape_str(sl.shape).c_str());
+        } else if (!bp.states.empty()) std::printf("state     not declared in the file (derived from the blueprint when needed)\n");
+        for (auto& ad : modelfile::read_adapters(r))
+            std::printf("adapter   %-16s rank %lld alpha %g, %zu target weights (forge run --adapter %s)\n", ad.name.c_str(), (long long)ad.rank, ad.alpha, ad.targets.size(), ad.name.c_str());
+        if (r.has_section(modelfile::calib_section)) {
+            auto ct = modelfile::calib_table::parse(r.section_text(modelfile::calib_section));
+            double worst = 0; std::string wn;
+            for (auto& [n, st] : ct.tensors) if (st.crest() > worst) { worst = st.crest(); wn = n; }
+            std::printf("calib     statistics of %zu tensors (source: %s); largest crest factor %.1f (%s)\n", ct.tensors.size(), ct.source.c_str(), worst, wn.c_str());
+        }
+    }
     if (r.has_section("encryption")) {   // which sealing scheme, and whether this process holds the key
         json::value e; try { e = json::parse(r.section_text("encryption")); } catch (const std::exception&) {}
         auto alg = e.str_or("alg", "?");
@@ -266,6 +289,64 @@ int cmd_inspect(const args& a) {
         if (bad.empty()) std::puts("verify    ok (all sections and tensors match BLAKE3)");
         else { for (auto& b : bad) std::printf("verify    MISMATCH %s\n", b.c_str()); return 1; }
     }
+    return 0;
+}
+
+// forge adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]
+int cmd_adapter(const args& a) {
+    if (a.pos.size() < 2) return usage();
+    const std::string& verb = a.pos[0]; const std::string& f = a.pos[1];
+    auto out = a.get("o").empty() ? f : a.get("o");
+    if (verb == "list") {
+        modelfile::reader r(f); auto all = modelfile::read_adapters(r);
+        if (all.empty()) std::puts("no adapters in this file");
+        for (auto& ad : all) {
+            std::printf("%-16s rank %lld alpha %g\n", ad.name.c_str(), (long long)ad.rank, ad.alpha);
+            for (auto& w : ad.targets) std::printf("  %s\n", w.c_str());
+        }
+        return 0;
+    }
+    activate_policy(a.get("policy"));
+    if (verb == "add") {
+        if (a.get("name").empty() || a.get("from").empty()) return usage();
+        import::check_write(out);
+        auto ad = modelfile::embed_adapter(f, out, a.get("name"), a.get("from"));
+        std::printf("added adapter '%s' (rank %lld, alpha %g, %zu target weights) -> %s\n", ad.name.c_str(), (long long)ad.rank, ad.alpha, ad.targets.size(), out.c_str());
+        std::puts("note: a signature and precompiled plans do not survive this; sign / run forge aot again");
+        return 0;
+    }
+    if (verb == "remove") {
+        if (a.get("name").empty()) return usage();
+        import::check_write(out);
+        modelfile::remove_adapter(f, out, a.get("name"));
+        std::printf("removed adapter '%s' -> %s\n", a.get("name").c_str(), out.c_str());
+        return 0;
+    }
+    return usage();
+}
+
+// forge requant <in.fpk> -o <out.fpk> --codec C [mixed-precision options of import] [--no-calib] [--calib-crest X] [--align A]
+int cmd_requant(const args& a) {
+    if (a.pos.empty() || a.get("o").empty() || a.get("codec").empty()) return usage();
+    import::requant_options ro; auto& o = ro.base;
+    o.codec = a.get("codec"); o.emb_codec = a.get("emb-codec");
+    o.recipe.recipe = a.get("recipe", "forge");
+    o.recipe.output_type = a.get("output-tensor-type");
+    o.recipe.token_embedding_type = a.get("token-embedding-type");
+    o.recipe.pure = a.has("pure");
+    o.recipe.head_bf16 = a.has("bf16-head");
+    o.recipe.calib_crest = a.num("calib-crest", o.recipe.calib_crest);
+    for (std::string tt = a.get("tensor-type"); !tt.empty();) {
+        auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
+        tt = c == std::string::npos ? "" : tt.substr(c + 1);
+    }
+    if (!a.get("align").empty()) o.align = std::size_t(parse_size_arg(a.get("align"), "--align"));
+    ro.use_calib = !a.has("no-calib");
+    activate_policy(a.get("policy"));
+    auto r = import::requantise(a.pos[0], a.get("o"), ro);
+    std::printf("requantised %s -> %s: %zu tensors (%zu re-encoded as %s, %zu copied), %llu bytes\n", a.pos[0].c_str(), a.get("o").c_str(), r.tensors, r.requantised, o.codec.c_str(), r.kept, (unsigned long long)r.bytes);
+    if (ro.use_calib) std::printf("calib     %s; it changed the type of %zu tensor(s)\n", r.calib_from_file ? "statistics read from the input's calib section" : "no calib section: statistics computed from the f32 weights", r.calib_moved);
+    for (auto& n : r.notes) std::fprintf(stderr, "forge requant: %s\n", n.c_str());
     return 0;
 }
 
@@ -453,6 +534,7 @@ int cmd_run(const args& a) {
     activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
     inference::session s(resolve_model(a.pos[0], a.get("codec"), a.has("allow-unused")), so);
+    if (!a.get("adapter").empty()) s.set_adapter(a.get("adapter"));   // a LoRA adapter carried in the model file, by name
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
@@ -1054,7 +1136,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "single-aead"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "single-aead", "state", "calib", "no-calib", "pure", "bf16-head"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
@@ -1067,6 +1149,8 @@ int main(int argc, char** argv) {
         if (c == "sign") { activate_policy(a.get("policy")); return cmd_sign(a); }   // FIO-2 on the secret key under a policy
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
+        if (c == "adapter") return cmd_adapter(a);
+        if (c == "requant") return cmd_requant(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);
         if (c == "security") return cmd_security(a);
         return usage();

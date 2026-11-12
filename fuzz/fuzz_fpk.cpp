@@ -1,5 +1,8 @@
 #include "fuzz.hpp"
 #include <forge/modelfile/sign.hpp>
+#include <forge/modelfile/adapters.hpp>
+#include <forge/modelfile/calib.hpp>
+#include <forge/modelfile/state_schema.hpp>
 // The .fpk reader on an untrusted file: section table, tensor index, hashes, signature, and both encryption schemes.
 // Sealed seeds (fuzz/make_fpk_corpus.cpp) are written with the fixed key below, so mutated ciphertext, tags, headers
 // and indexes reach the AEAD paths instead of stopping at "wrong key"; each input is read once without a key (the
@@ -20,6 +23,11 @@ FORGE_FUZZ({
                 try { (void)r.load(n); } catch (const forge::forge_exception&) {}
                 try { (void)r.tensor_bytes(n); } catch (const forge::forge_exception&) {}
             }
+            // the optional JSON sections, parsed the way a model open does
+            try { (void)forge::modelfile::read_adapters(r); } catch (const forge::forge_exception&) {}
+            if (r.has_section("state")) { try { (void)forge::modelfile::state_schema::parse(r.section_text("state")).dump(); } catch (const forge::forge_exception&) {} }
+            if (r.has_section("calib")) { try { (void)forge::modelfile::calib_table::parse(r.section_text("calib")).dump(); } catch (const forge::forge_exception&) {} }
+            (void)r.tensor_alignment(); (void)r.misaligned_tensors(); (void)r.layout();
             (void)r.plaintext_resident();
             r.release_plaintext();
         } catch (const forge::forge_exception&) {}

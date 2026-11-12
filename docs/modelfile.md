@@ -48,6 +48,9 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 | `sign.hpp` | `generate_keypair()`, `load_secret_key(path)`, `load_public_key(path)`, `sign_file(in, out, key)`, `verify_signature(reader, trusted_keys)` → `signature_report` (`signed_`, `digest_ok`, `trusted`, `valid_keys`, `message`). With no trusted keys, any valid signature counts (integrity only, not provenance) |
 | `bundle.hpp` | Ed25519 over a directory: `sign_bundle(root, key)` writes `FORGE-SIGNATURE.json` (path, size, BLAKE3 per file); `verify_bundle(root, trusted)` re-hashes and reports modified, missing and extra files. Also detached `sign_bytes` / `verify_bytes` |
 | `blueprint.hpp` | `parse_blueprint(text)`: the blueprint language (params, state slots, `repeat` loops, any spec op by name, composites such as `linear`, `embed`, `heads`, user-defined `op name(args, k = default) { ... }` with keyword arguments (see [Writing a template](#writing-a-template)), fixed-size state ops `state[i].conv(...)` / `state[i].delta(...)`) |
+| `state_schema.hpp` | `state_schema` / `state_slot`: the `state` section. `derive_state_schema(blueprint, weight_shape)` builds the graph for one token and lists its state slots; `parse` / `dump` |
+| `adapters.hpp` | The `adapters` section: `read_adapters(reader)` → `adapter_info` (`name`, `alpha`, `rank`, `targets`), `embed_adapter(in, out, name, lora_fpk)`, `remove_adapter(in, out, name)` |
+| `calib.hpp` | The `calib` section: `tensor_stats::of(span)` (min, max, mean, rms, absmax, 64-bin magnitude histogram; `crest()`, `quantile(q)`), `calib_table` with `parse` / `dump` |
 | `entropy.hpp` | OS randomness for keys and nonces |
 
 ## Importers (`modelfile/include/forge/import/`)
@@ -223,6 +226,13 @@ The **chat template** (`tokenizer_config.json` `chat_template`, `chat_template.j
 ### Mixed precision (HF only, `quant_recipe.hpp`)
 `--codec q4_k_m` or `q5_k_m` chooses a type per tensor. `--recipe llama` is a port of llama.cpp's `llama_tensor_get_type()` rules. `--recipe forge` (default) applies the same rules, then puts Gated DeltaNet in/out projections and `attn_output` at q6_k and the head and token embedding at q8_0 (bf16 with `--bf16-head`). Norms, conv weights, A/dt and the a/b gates stay f32. Overrides: `--output-tensor-type`, `--token-embedding-type`, `--tensor-type REGEX=TYPE[,...]` (first match wins), `--pure`.
 
+### Re-quantising a model file
+`import::requantise(in, out, options)` (`requant.hpp`, `forge requant`) encodes the float weights of a `.fpk` again. It exists for the case where the checkpoint is gone or the file was imported as f32 on purpose: `forge import model -o m.fpk --calib`, then `forge requant m.fpk -o m-q4.fpk --codec q4_k_m` as often as needed.
+
+- **What the calibration data does.** `quant_recipe` has a `calib` pointer and a `calib_crest` threshold. For the mixes (`q4_k_m`, `q5_k_m`) under the `forge` recipe, a tensor whose crest factor `absmax / rms` reaches the threshold moves one step up the ladder `q4_k → q5_k → q6_k → q8_0`, two steps at twice the threshold. Gaussian weights have a crest factor of 4 to 6, so the default of 12 only moves tensors whose range is set by a few outliers. The `llama` recipe (the port of llama.cpp's rules), `--pure` and plain codecs are not affected; explicit `--tensor-type` overrides and the shape fallbacks still apply afterwards.
+- **This rule is a heuristic.** It was checked for its mechanics (`tests/test_modelfile.cpp`), not tuned or validated against the output quality of any model.
+- For a plain codec, requantising a file imported as f32 writes the same tensor bytes as importing with that codec (the golden test compares every tensor hash for `q8_0`). Requantising a file whose weights are already quantised copies them: decoding and quantising again would add a second error.
+
 ### CLI
 ```sh
 forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [--codec C] [--template NAME] [--emb-codec C] [--allow-unused] [--ignore-tensor NAME[,NAME...]]
@@ -292,6 +302,7 @@ Under a security policy, `integrity.plugins` and `integrity.scripts` decide whet
 ## Platform notes and limits
 - `FORGE_HUGEPAGES=1` asks for transparent huge pages on mappings of 2 MiB or more.
 - In encrypted files only `data` is sealed. The manifest, blueprint, tokenizer, tensor index and section table stay readable, which is why `inspect`, section-hash and signature checks work without the key.
+- **Adapters in the file.** `forge adapter add` holds the whole file in memory. There is no importer for PEFT `adapter_model.safetensors` directories: the LoRA `.fpk` it reads has to be written with `modelfile::writer` (tensors `<weight>.lora_a`, `<weight>.lora_b`, manifest `lora_alpha`). Adapters are merged into f32 copies of their target weights when first selected, so a target stored in a quantised codec runs as f32 under an adapter.
 - **Encrypted models and memory.** `forge encrypt` seals the data in chunks ([format.md](format.md#encryption)). A session then decrypts each weight when a plan first binds it and keeps that tensor's plaintext for as long as the model is open, because the kernels read weights in place. What this bounds: nothing is decrypted at open, tensors no plan uses are never decrypted, `reader::load()` (which decodes to f32) works from a scratch copy that is wiped, and the plaintext is not one heap block the size of the file. What it does not: a model that uses all of its weights ends up with all of them decrypted, and those pages are not file-backed, so the OS cannot drop and re-read them as it does for a plain mapped file. Tensors decoded to f32 (a weight in a codec the consuming op cannot read in place, LoRA-merged weights) live in ordinary memory in either case. `section_bytes("data")` on a chunk-encrypted file decrypts the whole section; nothing in FORGE calls it for such a file.
 - A file sealed with the older single-AEAD scheme is still decrypted whole, into ordinary heap memory, when it is opened. Re-seal it (`forge encrypt` on the plain file) to get the chunked behaviour.
 - Signing is cross-checked against pyca/cryptography (`modelfile_signing` ctest).

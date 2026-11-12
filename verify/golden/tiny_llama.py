@@ -219,6 +219,28 @@ def main():
     r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "import", hf, "-o", os.path.join(a.work, "tiny_al_bad.fpk"), "--align", "100"], capture_output=True, text=True, errors="replace")
     ok = ok and r.returncode != 0 and "64, 4096 or 65536" in r.stdout + r.stderr
     print(f"[{'ok' if ok else 'FAIL'}] --align 4096 / 64k: every tensor aligned in the file, logits unchanged; default stays 64 for a small model"); fails += not ok
+    # optional sections: the state schema is written by every import of a model with state; --calib records weight
+    # statistics, and forge requant re-encodes the float weights from the .fpk alone
+    info = run([a.forge, "inspect", base, "--state"])
+    ok = "state     4 slots declared (4 appended rows, 0 recurrent)" in info and "kv.1.v" in info and "calib  " not in info
+    cf = os.path.join(a.work, "tiny_calib.fpk"); rq = os.path.join(a.work, "tiny_requant.fpk"); lq = os.path.join(a.work, "logits_requant.f32")
+    run([a.forge, "import", hf, "-o", cf, "--calib"])
+    cal = json.loads(sections_of(cf)["calib"])
+    ok = ok and cal["version"] == 1 and "layer.0.wq" in cal["tensors"] and "tok_emb" in cal["tensors"] and "layer.0.attn_norm" not in cal["tensors"]
+    st = cal["tensors"]["layer.1.w_up"]; wref = W["model.layers.1.mlp.up_proj.weight"]
+    ok = ok and st["n"] == wref.size and abs(st["absmax"] - np.abs(wref).max()) < 1e-6 and abs(st["rms"] - np.sqrt((wref.astype(np.float64) ** 2).mean())) < 1e-6 and sum(st["hist"]) == wref.size
+    ok = ok and "calib     statistics of" in run([a.forge, "inspect", cf])
+    out_rq = run([a.forge, "requant", cf, "-o", rq, "--codec", "q8_0"])
+    ok = ok and "statistics read from the input's calib section" in out_rq
+    run([a.forge, "run", rq, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lq])
+    got = np.fromfile(lq, dtype=np.float32); cos = got @ ref / np.linalg.norm(got) / np.linalg.norm(ref)
+    idx = {t["name"]: t for t in json.loads(sections_of(rq)["tensors"])}
+    ok = ok and cos > 0.999 and idx["layer.0.wq"]["codec"] == "q8_0" and idx["layer.0.attn_norm"]["codec"] == "f32" and "calib" in sections_of(rq) and "state" in sections_of(rq)
+    direct = {t["name"]: t for t in json.loads(sections_of(os.path.join(a.work, "tiny_q8_0.fpk"))["tensors"])}
+    same = all(idx[n]["codec"] == direct[n]["codec"] and idx[n]["blake3"] == direct[n]["blake3"] for n in direct) and set(idx) == set(direct)
+    ok = ok and same   # requant from the f32 file == importing with that codec, tensor for tensor
+    ok = ok and "no adapters in this file" in run([a.forge, "adapter", "list", base])
+    print(f"[{'ok' if ok else 'FAIL'}] state section declared; --calib statistics match numpy; requant q8_0 from the .fpk: cosine {cos:.6f}"); fails += not ok
     # tokenizer + text path
     out = os.path.join(a.work, "tiny_f32.fpk")
     txt = run([a.forge, "run", out, "--prompt", "the theory of things", "-n", "4"])

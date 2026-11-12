@@ -10,6 +10,8 @@
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
 #include <forge/modelfile/sign.hpp>
+#include <forge/modelfile/adapters.hpp>
+#include <forge/modelfile/state_schema.hpp>
 #include <forge/modelfile/tokenizer.hpp>
 #include <algorithm>
 #include <forge/security/enforce.hpp>
@@ -118,6 +120,17 @@ public:
         }
         if (r_.has_section("chat_template")) chat_template_ = std::string(r_.section_text("chat_template"));
         vocab_ = i64(bp_.param_or("vocab", 0));
+        // Optional sections (docs/format.md): adapters carried in the file, and the declared state schema. Both are
+        // checked here, before anything runs: a section that does not fit the file is a format error, not a surprise
+        // at the first request. Files without them open exactly as before.
+        try {
+            embedded_ = modelfile::read_adapters(r_);
+            if (r_.has_section(modelfile::state_section)) {
+                declared_state_ = modelfile::state_schema::parse(r_.section_text(modelfile::state_section));
+                if (!(*declared_state_ == derive_state_()))
+                    raise(errc::format_error, "the state section does not describe the state its blueprint builds");
+            }
+        } catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
         if (lib_ && (strict || r_.has_section("signature")))   // compiled code is not covered by the model's signature
             raise(errc::integrity_error, "{}: a compiled model library cannot be loaded for a signed model or under strict loading", path);
         aot_.attach(r_, fpk_path, strict, lib_);
@@ -193,7 +206,33 @@ public:
         }
         add_adapter(name, d, float(ar.manifest().num_or("lora_alpha", 1)));
     }
-    bool has_adapter(const std::string& n) const { return n.empty() || adapters_.count(n); }
+    bool has_adapter(const std::string& n) const {
+        if (n.empty()) return true;
+        { std::lock_guard lk(w_mu_); if (adapters_.count(n)) return true; }
+        return std::any_of(embedded_.begin(), embedded_.end(), [&](auto& a) { return a.name == n; });
+    }
+    // Adapters carried in the model file's "adapters" section (modelfile/adapters.hpp). They are selected by name like
+    // registered ones (session::set_adapter); the factors are read and merged the first time a name is used.
+    const std::vector<modelfile::adapter_info>& embedded_adapters() const { return embedded_; }
+    // Makes adapter `n` usable: nothing for "" and for registered adapters, a load for an embedded one not used yet.
+    void ensure_adapter(const std::string& n) {
+        if (n.empty()) return;
+        { std::lock_guard lk(w_mu_); if (adapters_.count(n)) return; }
+        auto it = std::find_if(embedded_.begin(), embedded_.end(), [&](auto& a) { return a.name == n; });
+        if (it == embedded_.end()) raise(errc::not_found, "adapter '{}' not loaded", n);
+        std::map<std::string, lora> d;
+        for (auto& w : it->targets) d[w] = lora{r_.load(modelfile::adapter_info::tensor_a(n, w)), r_.load(modelfile::adapter_info::tensor_b(n, w))};
+        try { add_adapter(n, d, float(it->alpha)); }
+        catch (const forge_exception&) { std::lock_guard lk(w_mu_); if (!adapters_.count(n)) throw; }   // another thread loaded it first
+    }
+    // The model's state schema: the file's "state" section when it has one (checked against the blueprint at open),
+    // else derived from the blueprint on first use. Null when it cannot be derived (the old behaviour then applies:
+    // nothing is checked against it).
+    const modelfile::state_schema* state_schema() const {
+        if (declared_state_) return &*declared_state_;
+        std::call_once(state_once_, [&] { try { derived_state_ = derive_state_(); } catch (const std::exception&) {} });
+        return derived_state_ ? &*derived_state_ : nullptr;
+    }
     std::size_t loaded_weights() const { return weights_.size(); }
 
     // plan for `n` new tokens; all_rows keeps logits for every position
@@ -236,6 +275,9 @@ public:
         });
     }
 private:
+    modelfile::state_schema derive_state_() const {
+        return modelfile::derive_state_schema(bp_, [&](const std::string& n) { return r_.entry(n).shape; });
+    }
     static std::shared_ptr<aot_native::library> open_native(const std::string& path, std::shared_ptr<aot_native::library> lib) {
         if (lib || !aot_native::library::is_library(path)) return lib;
         admit(path);
@@ -252,7 +294,11 @@ private:
     graph::plan_cache cache_;
     std::map<std::string, tensor> weights_;
     std::map<std::string, std::map<std::string, tensor>> adapters_;
-    std::mutex w_mu_, run_mu_;
+    std::vector<modelfile::adapter_info> embedded_;
+    std::optional<modelfile::state_schema> declared_state_;
+    mutable std::optional<modelfile::state_schema> derived_state_;
+    mutable std::once_flag state_once_;
+    mutable std::mutex w_mu_; std::mutex run_mu_;
     std::unique_ptr<graph::registry> reg_;
     std::string device_ = "cpu";
     i64 vocab_ = 0;
@@ -291,6 +337,7 @@ public:
     // keys/values were computed with the previous weights.
     void set_adapter(const std::string& a) {
         if (!m_->has_adapter(a)) raise(errc::not_found, "adapter '{}' not loaded", a);
+        m_->ensure_adapter(a);   // an adapter embedded in the model file is read on first use
         if (a != adapter_) { adapter_ = a; execs_.clear(); reset(); }
     }
     const std::string& adapter() const { return adapter_; }
@@ -402,12 +449,18 @@ public:
         if (std::memcmp(magic, kv_blob_magic, 8)) raise(errc::parse_error, "load_prefix: not a KV blob");
         i64 n = i64(u64());
         if (graph::kv_codec(u64()) != st_.codec) raise(errc::invalid_argument, "load_prefix: the blob uses a different KV codec");
-        if (n > st_.capacity) raise(errc::out_of_memory, "load_prefix: {} tokens exceed the context {}", n, st_.capacity);
+        if (n < 0 || n > st_.capacity) raise(errc::out_of_memory, "load_prefix: {} tokens exceed the context {}", n, st_.capacity);
+        // The blob is checked against the model's state schema before anything is restored: every slot must be one
+        // the model declares, of the declared kind and row shape (in this session's KV codec), and appear once.
+        const modelfile::state_schema* schema = m_->state_schema();
+        if (schema) check_prefix_blob_(b.subspan(at), n, *schema);
         st_.forget(); st_.reset();
         for (std::uint64_t i = 0, ns = u64(); i < ns; ++i) {
-            std::string k(u64(), '\0'); get(k.data(), k.size());
+            std::uint64_t kl = u64(); if (kl > b.size() - at) raise(errc::parse_error, "load_prefix: truncated KV blob");
+            std::string k(std::size_t(kl), '\0'); get(k.data(), k.size());
             bool fixed = u64() != 0; auto codec = graph::kv_codec(u64()); i64 len = i64(u64()), cap = i64(u64());
-            shape_t sh(u64()); for (auto& d : sh) d = i64(u64());
+            std::uint64_t rank = u64(); if (rank > 8) raise(errc::parse_error, "load_prefix: slot '{}' has rank {}", k, rank);
+            shape_t sh(static_cast<std::size_t>(rank)); for (auto& d : sh) d = i64(u64());
             std::size_t nf = u64();
             auto& d = st_.slots[k];
             if (fixed) { d = {}; d.buf = tensor(sh); d.len = len; d.capacity = cap; d.codec = codec; d.fixed = true; }
@@ -418,6 +471,41 @@ public:
         pos_ = n;
     }
     graph::plan_cache& plans() { return m_->plans(); }
+private:
+    // Walks a prefix blob's slot table (after its header) without restoring anything and raises on the first slot
+    // the schema does not allow. Sizes are checked against the bytes present before they are used.
+    void check_prefix_blob_(std::span<const std::byte> b, i64 n, const modelfile::state_schema& schema) const {
+        std::size_t at = 0;
+        auto need = [&](std::uint64_t k) { if (k > b.size() - at) raise(errc::parse_error, "load_prefix: truncated KV blob"); };
+        auto u64 = [&] { need(8); std::uint64_t v; std::memcpy(&v, b.data() + at, 8); at += 8; return v; };
+        std::set<std::string> seen;
+        for (std::uint64_t i = 0, ns = u64(); i < ns; ++i) {
+            std::uint64_t kl = u64(); need(kl);
+            std::string k(reinterpret_cast<const char*>(b.data() + at), std::size_t(kl)); at += std::size_t(kl);
+            bool fixed = u64() != 0; auto codec = graph::kv_codec(u64()); i64 len = i64(u64()); (void)u64();
+            std::uint64_t rank = u64();
+            if (rank < 1 || rank > 8) raise(errc::format_error, "load_prefix: slot '{}' has rank {}", k, rank);
+            shape_t sh(static_cast<std::size_t>(rank)); for (auto& d : sh) d = i64(u64());
+            std::uint64_t nf = u64(); need(nf * sizeof(float) < nf ? ~std::uint64_t(0) : nf * sizeof(float)); at += std::size_t(nf * sizeof(float));
+            const auto* decl = schema.find(k);
+            if (!decl) raise(errc::format_error, "load_prefix: the blob holds state slot '{}', which this model does not declare", k);
+            if (!seen.insert(k).second) raise(errc::format_error, "load_prefix: state slot '{}' appears twice", k);
+            if (decl->recurrent != fixed) raise(errc::format_error, "load_prefix: state slot '{}' is {} in the model and {} in the blob", k, decl->recurrent ? "recurrent" : "appended rows", fixed ? "recurrent" : "appended rows");
+            if (fixed) {
+                if (sh != decl->shape || len < 0 || nf != std::uint64_t(numel(decl->shape)))
+                    raise(errc::format_error, "load_prefix: recurrent slot '{}' has shape {}, the model declares {}", k, shape_str(sh), shape_str(decl->shape));
+            } else {
+                shape_t logical{1}; logical.insert(logical.end(), decl->shape.begin(), decl->shape.end());
+                if (codec != graph::kv_codec::f32 && logical.size() != 3) raise(errc::format_error, "load_prefix: slot '{}' cannot be stored in a KV codec", k);
+                shape_t phys = graph::state_store::physical(logical, codec);
+                bool ok = sh.size() == phys.size() && sh[0] >= 0 && std::equal(sh.begin() + 1, sh.end(), phys.begin() + 1);
+                std::uint64_t row = 1; for (std::size_t j = 1; j < phys.size(); ++j) row *= std::uint64_t(phys[j]);
+                if (!ok || nf != row * std::uint64_t(n))
+                    raise(errc::format_error, "load_prefix: slot '{}' holds rows of shape {}, the model declares {}", k, shape_str(sh), shape_str(decl->shape));
+            }
+        }
+    }
+public:
 
     // Runs the graph on `ids` continuing from the current position; returns logits of the last position.
     std::vector<float> forward(std::span<const int> ids) { return run(ids, false); }

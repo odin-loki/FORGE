@@ -25,7 +25,9 @@ Architectures come from the import templates (Hugging Face: Llama/Mistral/Qwen2,
 | `vocab()`, `max_context()` | `max_context` is manifest `max_position_embeddings`, 2048 if absent |
 | `add_adapter(name, {weight → {a, b}}, alpha)` | LoRA: `W' = W + (alpha / r) · B·A` (PEFT layout, A `[r, in]`, B `[out, r]`). Only targeted matrices are copied; names are immutable once added |
 | `add_adapter_file(name, path)` | Loads `<weight>.lora_a` / `<weight>.lora_b` tensors from an `.fpk`; alpha from manifest `lora_alpha` (default 1) |
-| `has_adapter(name)` | `""` (base) is always present |
+| `has_adapter(name)` | `""` (base) is always present; true for registered adapters and for the ones carried in the model file |
+| `embedded_adapters()`, `ensure_adapter(name)` | Adapters of the file's `adapters` section ([format.md](format.md#adapters-section)): listed at open, read and merged the first time a name is selected (`session::set_adapter` calls `ensure_adapter`) |
+| `state_schema()` | The model's state slots: the file's `state` section, else derived from the blueprint on first use (null if that fails) |
 
 Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>...]` make `model` refuse files without a valid (trusted) signature, whatever `verify` says.
 
@@ -49,8 +51,8 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 | `forward_all(ids)` | Same; returns `[ids.size(), vocab]` logits |
 | `position()`, `context()`, `reset()`, `rewind(pos)` | `rewind` only moves backwards |
 | `copy_prefix(other, n)` | Copies the first `n` tokens of another session's KV (same model and KV codec) |
-| `save_prefix(n = -1)` / `load_prefix(blob)` | Serialise / restore KV state of a prefix (`FORGEKV1` blob). Restoring gives the same logits as `copy_prefix` |
-| `set_adapter(name)` | Select a LoRA adapter (`""` = base). Clears the KV cache when it changes |
+| `save_prefix(n = -1)` / `load_prefix(blob)` | Serialise / restore KV state of a prefix (`FORGEKV1` blob). Restoring gives the same logits as `copy_prefix`. `load_prefix` first checks the blob against the model's state schema: a slot the model does not declare, a slot twice, another kind or row shape, or sizes that do not fit the blob raise `format_error` and leave the session untouched |
+| `set_adapter(name)` | Select a LoRA adapter by name (`""` = base): one registered with `add_adapter*` or one carried in the model file. Clears the KV cache when it changes |
 | `infer({name → data}, seq = 1)` | One-shot graphs: binds every declared input, runs once, returns every output |
 | `tokenizer()` | `encode`, `decode`, `decode_one`, `bos()`, `eos()` |
 
