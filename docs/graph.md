@@ -9,6 +9,8 @@ graph treats a tensor graph as a program that is compiled once and replayed:
 4. **Lower** each op to an implementation from a lowering registry: CPU by default, or a device registry (Vulkan, CUDA, HIP, OpenCL, Level Zero, Metal, RPC, or a multi-device pipeline).
 5. **Replay** the flat plan with an `executor`. inference caches plans per shape bucket (`plan_cache`).
 
+Steps 2 to 4 can be done ahead of time: `forge aot` stores compiled plans in the model file, or compiles them to native code, and a session then rebuilds the plan without running the passes ([aot-models.md](aot-models.md)). `compile()` is split for that: `lower_plan(plan&, state_store*, pass_options, pick)` is its second half (buffer binding and kernel selection), shared by both paths.
+
 A lowering is used only if it agrees with the float64 scalar reference in `ops/` within the op's declared tolerance (the oracle, `verify/`). The check runs the first time the lowering is selected; a lowering that fails is disabled with a warning. Ops or shapes a device does not support run on the CPU. On a device run, `FORGE_PLAN_TRACE` lists those host ops at exit.
 
 Quantised weights (`tensor_graph::qweight`) stay encoded. On the CPU, `matmul_t` and `gather` read the encoded rows in place, so a q4_k model costs its file size in memory. On a device, see [Device execution](#device-execution).
@@ -23,6 +25,7 @@ Quantised weights (`tensor_graph::qweight`) stay encoded. On the CPU, `matmul_t`
 | `optimise(g, pass_options)` | `passes.hpp` | `pass_options{cse, fold, simplify, fuse}` all default to `true`; `lowerings` is the registry (`nullptr` = CPU) |
 | `compile(g, state_store* = nullptr, pass_options = {})` | `plan.hpp` | → `std::unique_ptr<plan>`; `plan::describe()` prints it |
 | `executor(plan&, state_store* = nullptr)` | `plan.hpp` | `set_input(name, data)`, `run()`, `output(name)` (tensor copy), `output_view(name)` |
+| `aot::builder`, `aot::image`, `aot::instantiate` | `aot.hpp` | Compiled plans as a checked, versioned blob, and back ([aot-models.md](aot-models.md)). `aot_codegen.hpp` writes the straight-line C++ for native compilation; `aot_rt.hpp` is what that code calls |
 | `state_store` | `plan.hpp` | Per-session slots: KV history (`state_append`) and fixed-size state (`state_op`). `reset()`, `truncate(len)`, paged growth (`page_rows`), KV codec, host offload |
 | `state_op` kernels | `state_ops.hpp` | `causal_conv` (depthwise causal conv1d) and `delta_rule` (gated delta rule recurrence), for Gated DeltaNet layers (Qwen3.5) |
 | `grad(g, loss, wrt)` | `autodiff.hpp` | Reverse-mode autodiff. Appends the backward graph and returns a map from each `wrt` value to its gradient. Supported ops: add sub mul div neg scale square sqrt rsqrt recip exp log tanh sigmoid silu relu abs, matmul (rank-2 b), matmul_t, transpose, reshape, reduce_sum, reduce_mean, logsumexp, softmax, rms_norm. Others raise `errc::unsupported` |

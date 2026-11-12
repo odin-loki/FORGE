@@ -17,7 +17,8 @@ Architectures come from the import templates (Hugging Face: Llama/Mistral/Qwen2,
 
 | Member | Meaning |
 |---|---|
-| `model::open(path, verify = false)` | Returns `std::shared_ptr<model>`. `verify` checks BLAKE3 hashes, and the signature if the file has one |
+| `model::open(path, verify = false)` | Returns `std::shared_ptr<model>`. `verify` checks BLAKE3 hashes, and the signature if the file has one. `path` may be a natively compiled model library ([aot-models.md](aot-models.md)) |
+| `aot()`, `set_aot(on)` | Precompiled plans ([aot-models.md](aot-models.md)): `aot().stats()` counts plans taken from the file's `aot` section, a sidecar or a compiled library (`used`, `native`), rejections and the last reason. `set_aot(false)` compiles every plan at run time; it clears cached plans, so call it before sessions run |
 | `set_device(name)` | Picks the execution device (`cpu`, `vulkan`, `cuda:0`, ...; see [configuration.md](configuration.md)). An unavailable device falls back to `cpu` with a warning. Returns the device used and clears cached plans. `FORGE_DEVICE` is applied on open |
 | `device()`, `blueprint()`, `manifest()`, `file()` | Accessors |
 | `tokenizer()` | `const modelfile::bpe_tokenizer*`, `nullptr` if the file has none |

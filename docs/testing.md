@@ -80,7 +80,7 @@ Only `linux-vulkan` installs `glslangValidator` and the Vulkan headers; every ot
 The full list is in [configuration.md](configuration.md).
 
 ## Fuzzing
-By default each fuzz target links a small built-in mutation driver (`fuzz/driver.cpp`) and runs `FORGE_FUZZ_ITERS` inputs over its corpus in `fuzz/corpus/<name>/`, with a 600 s timeout. With clang and `-DFORGE_LIBFUZZER=ON` they link libFuzzer instead and are not registered with ctest. `fuzz/make_corpus.py` regenerates the seed inputs.
+By default each fuzz target links a small built-in mutation driver (`fuzz/driver.cpp`) and runs `FORGE_FUZZ_ITERS` inputs over its corpus in `fuzz/corpus/<name>/`, with a 600 s timeout. With clang and `-DFORGE_LIBFUZZER=ON` they link libFuzzer instead and are not registered with ctest. `fuzz/make_corpus.py` regenerates the seed inputs. The `aot` target (precompiled plan blobs, `fuzz/fuzz_aot.cpp`) has its seed written by `FORGE_AOT_WRITE_SEED=fuzz/corpus/aot/seed.fplan build/dev/test_aot`; `test_aot` fails when the checked-in seed no longer loads.
 
 ## Performance tools (not part of ctest)
 - `tools/perf_baseline.py --forge build/release/forge --model <model.fpk> [--gemm N] [--reps R] [--baseline perf/baseline-x86_64.json] [--check] [--tolerance T]` runs `forge bench` and records or checks throughput against a stored baseline.
