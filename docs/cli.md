@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--ids`, `--no-bos`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -54,9 +54,17 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix) and a bluep
 | `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 
-Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr.
+Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr. When plans came precompiled ([`forge aot`](#forge-aot-modelfpk--o-out---aot-mode-plannative-options)) a second line says how many, how many of them ran as native code, and where they came from; `<model>` may also be a compiled model library (`model.so`).
 
 Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
+
+### `forge aot <model.fpk> [-o out] [--aot-mode plan|native] [options]`
+Compiles the model's plans ahead of time. The full description is in [aot-models.md](aot-models.md).
+
+- `--aot-mode plan` (default) stores the plans in the file's `aot` section (in place, or `-o out.fpk`), or in `<model>.fplan` with `--sidecar`. Sessions then skip plan compilation for the precompiled sequence lengths; nothing needs to be passed to `forge run`. `--list` shows the section, `--strip` removes it. A signed input needs `--key NAME.key` (sign the result) or `--drop-signature`.
+- `--aot-mode native -o model.so` also generates C++ for the plans and compiles it with the host compiler into a shared library (`--emit shared`, default), a static library (`--emit static`) or an executable (`--emit exe`) that runs the model: `./model --prompt TEXT -n 32`. `forge run model.so` loads a compiled library. `--embed-weights` puts the `.fpk` into the artefact. Compiler and target: `--cxx`, `--target`, `--simd`, `--march`, `--cxxflag`, `--sdk`, `--work`.
+- Both: `--shapes 1,8,16` (sequence lengths, default `1,2,4,8,16,32,64`), `--all-rows`, `--kv-codec f32,int8`, `--ctx N`.
+- CPU only: `--device` other than `cpu` (or `FORGE_DEVICE`) is an error. These options are flags: `--all-rows`, `--sidecar`, `--strip`, `--list`, `--embed-weights`, `--drop-signature`.
 
 ### `forge bench <model> [-p 32] [-n 32] [--warmup 1] [--codec C]` / `forge bench --gemm N`
 Measures prefill (`-p` prompt tokens) and decode (`-n` new tokens, always all of them) throughput after `--warmup` untimed runs. With `--gemm N` it instead times an N×N `gemm_nt` with each available simd table (one thread) and with `gpu::prims` (all threads).
