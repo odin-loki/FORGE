@@ -6,6 +6,7 @@ Utilities used across FORGE. All are header-only.
 |---|---|---|---|
 | `core/include/forge/core/log.hpp` | `forge::log` | Logger | `test_log`, `test_log_strip`, `log_min_level_cmake` |
 | `support/include/forge/task/pool.hpp` | `forge::task` | Thread pool | `test_pool` |
+| `support/include/forge/task/sched.hpp` | `forge::task` | Work-stealing scheduler, task graphs, frame pacing | `test_sched` |
 | `os/include/forge/os/process_pool.hpp` | `forge::os` | Process pool (see [os-wrapper.md](os-wrapper.md#process-pools-process_poolhpp)) | `test_process_pool` |
 | `os/include/forge/os/process.hpp`, `core/include/forge/core/memory.hpp` | `forge::os`, `forge::mem` | Waiting on processes, leased children | `test_os_process`, `test_memory` |
 | `support/include/forge/cache/cache.hpp` | `forge::cache` | Content-addressed disk cache | `test_cache` |
@@ -46,6 +47,125 @@ FORGE_LOG_DEBUG("graph", "fused {} ops", k);              // arguments not evalu
 | `pending()`, `wait_idle()`, `size()` | Queue length, wait for an empty queue, worker count |
 
 The destructor still runs (or skips, if cancelled) queued tasks before the workers exit.
+
+## Work-stealing scheduler (`forge::task::scheduler`, `task/sched.hpp`)
+A second executor next to `task::pool`. The engine (graph, inference, gpu) still uses `task::pool`; nothing was moved onto the scheduler, so the two have separate threads. Tests: `test_sched` (also run under TSan).
+
+```cpp
+task::scheduler s({.threads = 8});
+auto a = s.spawn([] { return 6; });                 // task<int>
+auto b = a.then([](int v) { return v * 7; });       // continuation
+auto c = s.when_all({a, b});                        // task<void>
+int v = b.get();                                    // waits by running other tasks
+s.parallel_for(n, grain, [&](std::size_t lo, std::size_t hi) { ... });
+```
+
+| API | Meaning |
+|---|---|
+| `scheduler(config)` | `threads` (0 = `FORGE_THREADS`, then physical cores), `pin` (each worker to its planned CPU), `numa_bind` (each worker to its node's CPUs), `topology` / `numa` (injected layouts, for tests), `spin` (idle rounds before a worker parks). `scheduler::global()` is a process-wide instance |
+| `spawn(f, {prio, place, stop})` | Queue `f()` or `f(std::stop_token)`; returns `task<R>`. A task whose token fired before it starts is skipped and its handle throws `task::cancelled` |
+| `spawn_after(deps, f, opts)` | Starts when every task in `deps` has finished (dependency counts; failed dependencies still count as finished) |
+| `task<R>::then(f)` | `f(value)` after the task; if the task failed or was cancelled the continuation fails with the same exception and `f` is not called |
+| `when_all(deps)`, `when_all(vector<task<R>>)` | A `task<void>` (fails with the first failed dependency in argument order), or a `task<vector<R>>` of the values |
+| `task<R>::get()`, `wait()`, `done()`, `failed()`, `error()` | `get` returns a reference to the value or rethrows |
+| `parallel_for(n, grain, f(begin, end))` | Chunk `k` is always `[k·grain, min(n, (k+1)·grain))`, for any thread count. The caller runs chunks too. The first exception is rethrown; chunks not yet started are skipped |
+| `parallel_reduce(n, grain, init, map, combine)` | Chunk results combined in chunk order: the result is bit-identical for any thread count and timing |
+| `simd_grain(grain, lanes)` | `grain` rounded up to a multiple of the vector width |
+| `wait(t)`, `wait_idle()`, `pending()` | `wait_idle` must not be called from inside a task |
+| `worker_local<T>` | One `T` per worker on its own cache line (`local()`, `for_each`); other threads get a slot each on first use |
+| `current_worker()`, `slots()`, `worker_stats(i)`, `total_stats()`, `pin_failures()` | Introspection: worker index, planned CPU / core class / NUMA node per worker, executed / stolen / parked counts |
+
+- **Queues.** Each worker owns Chase–Lev deques (LIFO for the owner, FIFO for thieves). An idle worker steals from a random victim, same NUMA node first. Other threads submit through a locked injector queue. Idle workers spin `spin` rounds, then park through `os::wait_on_address` (`os/sync.hpp`: futex and its equivalents). `FORGE_TASK_PARK_ATOMIC` selects `std::atomic` wait/notify and `FORGE_TASK_PARK_CONDVAR` a mutex and condition variable instead; only the futex path (Linux) and the two alternatives were run.
+- **Priorities** are `low`, `normal`, `high`. A worker looks for the highest priority first across its own deques, the injector and its victims. A running task is never preempted, and a worker checks its own queues before others', so the order is a preference, not a guarantee, except within one queue.
+- **Waiting helps.** `get`, `wait`, `wait_idle` and `parallel_for` run queued tasks while they wait, so nested `parallel_for` and tasks that wait on tasks do not deadlock when every worker is busy. Consequences: do not hold a lock across these calls (the helper may run a task that takes the same lock), and deep chains of waits use stack.
+- **P/E cores.** `plan_workers(topology, n, numa_nodes)` assigns CPUs: one logical CPU per performance core, then one per efficiency core, then SMT siblings. `placement::performance` tasks run only on workers planned for performance cores (and on outside threads that are waiting); `placement::efficiency` tasks go to efficiency workers first, and performance workers take them only when idle. On a machine with one core class both marks are ignored. Without `pin` the marks choose a worker, not a CPU: the OS may still run that thread anywhere.
+- **Frame pacing.** `frame_pacer(sched, budget_ns, clock)`: between `begin_frame()` and `end_frame()`, `run(f)` queues work that must finish in the frame (high priority, performance placement) and `defer(f, est_ns)` queues work that may slip. `end_frame` waits for the `run` tasks, then starts deferred tasks oldest first, at most one per worker at a time, while `elapsed + estimate <= budget`; the rest stay queued. An estimate of 0 uses a running average of measured deferred-task times. A started task is not interrupted, so a frame can overrun by one deferred task. After `starve_frames` (4) consecutive frames that started no deferred task, the next frame runs the oldest one regardless, so a task that never fits the budget is not starved. `frame_stats` reports counts, elapsed time and `over_budget`; `pace()` sleeps out the remainder.
+- **Not done / not measured.** No performance comparison against `task::pool` was made. Pinning and NUMA binding were only exercised on a 4-CPU single-node x86 VM (calls succeed or are counted in `pin_failures()`); placement was tested with injected topologies, not on hybrid hardware.
+
+## Linear algebra (`forge::linalg`)
+Row-major `mat<T>` for `T` = `float` or `double`. Meant for small and medium problems (the factorisations are unblocked O(n³) loops); it is not a LAPACK replacement. Link `forge_simd_mv` when you call `matmul`, `matvec` or `transpose`. Tests: `test_linalg` (analytic cases and reconstruction residuals such as ‖A − QR‖, each with its tolerance stated in the test), plus the older cases in `test_support` and `test_support2`.
+
+| Area | Functions |
+|---|---|
+| Products | `matmul` (float: the simd GEMM kernel, with packed 256×256×1024 panels once k > 256 or n > 1024; double: k-blocked rows combined by the dispatched f64 `axpy`), `matmul_naive`, `matvec`, `transpose`, `identity` |
+| LU | `lu` (in place, partial pivoting, throws on an exactly singular matrix), `lu_solve`, `lu_solve_transposed`, `lu_factor` → `lu_factors` (`solve` for a vector or a matrix of right-hand sides, `det`), `solve`, `inverse`, `det` (0 when singular), `rcond_1` (Hager–Higham estimate of 1/κ₁) |
+| Cholesky, triangular | `cholesky`, `cholesky_solve`, `solve_triangular(A, b, {lower, transposed, unit_diagonal})` |
+| QR, least squares | `qr` (explicit m×m Q), `qr_factor` → `qr_factors` (compact Householder; `apply_q`, `apply_qt`, `thin_q`, `r`), `lstsq` (QR for full column rank with m ≥ n, otherwise the minimum-norm solution through the SVD), `pinv` |
+| Eigen, SVD | `sym_eig` (cyclic Jacobi), `eigh` (Householder tridiagonalisation + implicit QL; Jacobi below 16×16), `svd` (one-sided Jacobi, m ≥ n), `svd_thin` (any shape) |
+| Norms | `norm2` (vector), `norm_fro`, `norm_1`, `norm_inf`, `norm_2`, `cond_2` (both through the SVD) |
+| Sparse formats (`sparse.hpp`) | `csr`, `csc`, `coo`, `bsr`; `to_csr` (from COO, summing duplicates; from CSC; from BSR), `to_coo`, `to_csc`, `to_bsr`, `to_dense`, `transpose`, `sort_indices`, `validate`, `diagonal` |
+| Sparse products | `spmv` (every format), `spmv_t`, `spmm` (sparse × dense, CSR and BSR), `spgemm` (sparse × sparse) |
+| Iterative solvers | `pcg` (SPD), `bicgstab`, `pgmres` (restarted, right-preconditioned), each taking a `csr` or any `op(const T* x, T* y)` and a preconditioner: `identity_prec`, `jacobi_prec`, `ilu0`. They return `solve_info {iterations, residual, converged}` with the residual recomputed from `x`. The older `cg` and `gmres` remain |
+
+Limits: no pivoted (rank-revealing) QR, no general (non-symmetric) eigensolver, no complex types, no tile-unit (AMX/SME) GEMM path, and the sparse kernels are serial and not vectorised by hand. `eigh` and `svd` have been checked up to 90×90 in the tests; nothing was benchmarked.
+
+## Profiler (`forge::prof`)
+```cpp
+auto& r = prof::recorder::get(); r.on = true;
+{ FORGE_ZONE("decode"); FORGE_COUNTER("tokens", 1); FORGE_GAUGE("queue_depth", q.size()); }
+r.on = false;
+write(r.perfetto_json()); std::puts(r.summary_table().c_str());
+```
+
+| API | Meaning |
+|---|---|
+| `FORGE_ZONE(name)`, `prof::zone` | Scoped zone on the calling thread |
+| `FORGE_COUNTER(name, delta)`, `prof::counter` | Named running total (one per name, process-wide) |
+| `FORGE_GAUGE(name, value)`, `prof::gauge` | Named value; last, min, max and sample count are kept |
+| `FORGE_INSTANT(name)` | Point event |
+| `prof::note_alloc(tag, ptr, bytes)`, `note_free(tag, ptr, bytes)`, `tracked_allocator<T>` | Allocation hooks: live bytes, peak, counts per tag. Nothing in FORGE calls them yet (`mem::arena`, `mem::tlsf` and the tensor allocator are not wired) |
+| `prof::gpu_zone(name, device, begin_ticks, end_ticks)`, `recorder::gpu_calibrate` | A finished GPU zone from device timestamps, mapped to the CPU clock. No GPU backend calls it yet |
+| `FORGE_HW_ZONE(name)`, `prof::hw_zone`, `hw_measure(f)`, `hw_available()` (`prof/hw.hpp`) | A zone that also reads cycles, instructions, cache misses and branch misses for the thread through `os::perf_counters`. Not nestable (an inner one records time only) |
+| `recorder::events()`, `stats()`, `counters()`, `gauges()`, `allocations()` | Snapshots. `stats()` gives count, total, mean, min, max, p50, p95, p99 (nearest rank) per zone name |
+| `summary_table()`, `chrome_json()`, `perfetto_json()` | Text table; Chrome trace-event JSON; the same events sorted by timestamp with process/thread-name metadata for Perfetto's JSON importer |
+| `set_capacity(n)`, `dropped()`, `clear()`, `name_thread(s)` | Ring size per thread (default 16384 events), overwritten-event count, reset, thread label |
+
+- **Cost.** Off at run time (`recorder::on == false`, the default): one relaxed atomic load per macro or hook, nothing recorded, counters and gauges do not accumulate. Off at compile time (`FORGE_PROF_DISABLE` defined before the include): the macros expand to nothing and do not evaluate their arguments. On: two clock reads and one uncontended lock of the thread's own ring per event. The overhead was not measured.
+- **Rings.** Each thread has its own ring; when it is full the oldest events are overwritten, so `stats()` and the exports describe what is still held. `recorder::ev` (the old public vector) is gone: use `events()`.
+- **Tracy.** With `FORGE_PROF_TRACY`, zones, counters, gauges and the allocation hooks are also forwarded to Tracy's C API (`<tracy/TracyC.h>`, or the header named by `FORGE_PROF_TRACY_INCLUDE`; define `FORGE_PROF_TRACY_SRCLOC_COLOR` for Tracy 0.11+, whose source-location call takes a colour). This was only compiled and run against a stub header written for the test (`tests/tracy_stub/TracyC.h`, `test_prof_tracy_stub`); it has not been built against Tracy.
+- **Not verified.** `perfetto_json()` follows the documented legacy JSON format and is checked for structure by `test_prof`, but was not loaded into Perfetto. On the machine the tests ran on, `perf_event` was unavailable, so `hw_zone` only exercised the cycle-counter fallback.
+- Tests: `test_prof`, `test_prof_off`, `test_prof_tracy_stub`, and `prof_chrome_trace` in `test_support`.
+
+## Vision (`forge::vision`)
+`vision.hpp` (older helpers) works on `image`, an HWC float image. `transform.hpp` adds pre-processing and `codec.hpp` reads and writes image files. Tests: `test_vision`; fuzz targets `fuzz_png`, `fuzz_bmp`, `fuzz_pnm`, `fuzz_inflate`.
+
+| Area | Functions (`transform.hpp`) |
+|---|---|
+| Formats, layouts | `to_float` (u8 or a decoded `raster` → float), `to_u8`, `to_raster`, `hwc_to_chw`, `chw_to_hwc` |
+| Normalisation | `normalize(img, mean, std)` per channel, `imagenet_mean()` / `imagenet_std()`, `standardize(img)` (zero mean, unit variance per channel), `preprocess_chw` (u8 HWC → normalised float CHW in one pass) |
+| Resize | `resize(img, H, W, interp, antialias = true)` with `interp::nearest`, `bilinear`, `bicubic` (Keys, a = −0.5), `area` (box). Antialiasing widens the filter when shrinking, as Pillow does; the 4×3 reference values in the test come from Pillow 12.3. `resize_bilinear` is the same as `bilinear` without antialiasing |
+| Geometry | `crop`, `pad` (`constant`, `edge`, `reflect`), `letterbox` (aspect-preserving fit with fill; returns scale and offsets) |
+| Colour | `swap_rb`, `rgb_to_gray`, `gray_to_rgb`, `yuv420_to_rgb`, `nv12_to_rgb`, `rgb_to_yuv420`, `rgb_to_nv12` (8-bit, BT.601 or BT.709, limited or full range; chroma is replicated on the way up and box-averaged on the way down) |
+
+Image files (`codec.hpp`) decode to a `raster` (8- or 16-bit interleaved samples; 1–4 channels):
+
+| Format | Decode | Encode |
+|---|---|---|
+| PNG | All colour types, bit depths 1/2/4/8/16, palettes, `tRNS` (palette alpha and colour keys become an alpha channel), Adam7 interlace. Chunk CRCs and the zlib Adler-32 are verified; unknown critical chunks are errors | 8/16-bit, 1–4 channels, adaptive row filters, not interlaced. Deflate uses fixed Huffman codes over a greedy LZ77 parse (or stored blocks), so files are larger than zlib's |
+| BMP | Uncompressed 1/4/8-bit palette, 16/24/32-bit, `BI_BITFIELDS` masks, top-down and bottom-up, core/info/V4/V5 headers. RLE is reported as unsupported. 5- and 6-bit channels are scaled by rounding (`v·255/31`), which differs by at most 1 from decoders that replicate bits (Pillow) | 8-bit grey palette, 24-bit, 32-bit with alpha |
+| PNM | `P2`/`P3`/`P5`/`P6`, maxval ≤ 65535, samples rescaled to the full 8- or 16-bit range. `P1`/`P4`/`P7` unsupported | Binary PGM/PPM |
+| JPEG | Not implemented (`decode_image` reports it as unsupported) | – |
+
+- `decode_image` picks the decoder from the first bytes. `inflate`, `zlib_decompress`, `zlib_compress`, `crc32` and `adler32` are usable on their own.
+- **Fuzzing.** `fuzz_png` reads one leading flag byte that turns checksum verification off (`decode_limits::verify_checksums`), so mutated inputs get past the CRC and reach the chunk and deflate parsers; leave verification on everywhere else.
+- **Untrusted input.** Malformed data raises `forge_exception` (`errc::format_error`, or `errc::unsupported`). `decode_limits::max_pixels` (default 2²⁶) is checked before anything is allocated, and the inflate output is capped at the size the header implies. A decoded 16-bit RGBA image at the default limit still needs about 1 GiB for the raw and converted buffers together; lower the limit for small devices.
+- **Test vectors.** `tools/gen_vision_vectors.py` writes `tests/data/vision/*` (99 files with the expected pixels) and the fuzz seeds with an independent Python encoder (every filter type, split IDAT, Adam7, palettes, low bit depths) and cross-checks them with Pillow when it is installed. Files written by the C++ encoders were read back with Pillow once by hand (30 files, no differences); that check is not part of ctest.
+- The inflate decoder reads codes bit by bit (simple, not fast); no throughput was measured.
+
+## Reflection (`forge::reflect`)
+```cpp
+struct cfg { int w = 0; std::string name; std::vector<float> v; std::optional<inner> in; mode m{}; };
+FORGE_REFLECT(cfg, w, name, v, in, m)        // up to 64 fields
+FORGE_REFLECT_ENUM(mode, fast, exact)        // optional: enumerators by name
+auto j = reflect::to_json(c);                auto c2 = reflect::from_json<cfg>(j);
+auto b = reflect::to_binary(c);              auto c3 = reflect::from_binary<cfg>(b);
+```
+- **Types:** bool, integers, `float`/`double`, enums, `std::string`, `vector`, `array`, `optional`, `variant`, `map`/`unordered_map` with string keys, nested reflected structs. `for_each_field(obj, f)` and `field_count<T>()` expose the field list.
+- **JSON:** objects by field name; missing keys keep defaults, unknown keys are ignored; named enums as strings; `optional` as null; `variant` as `{"index", "value"}`. Numbers go through `double`, so integers beyond 2⁵³ are not exact, and `json::dump` writes non-integers with 9 significant digits, so a `double` does not survive a trip through JSON text exactly (it does through the binary form).
+- **Binary (`FRB1`):** a header with the writer's schema hash, then the value. Struct fields are tagged with a hash of their name and a length, so a reader skips fields it does not have and keeps defaults for fields the writer did not have (add, remove and reorder are tolerated in both directions; a field that keeps its name but changes type is an error). `from_binary` bounds-checks everything and reports `binary_info::schema_matches`.
+- **Schema:** `schema_string<T>()` (for example `{x:f32,y:f32,z:f32,}`) and `schema_hash<T>()`.
+- **C++26 static reflection:** a branch behind `FORGE_REFLECT_STATIC` and `__cpp_impl_reflection` enumerates aggregate members with `std::meta`. It has never been compiled: clang 23 here has no `<meta>`. Expect to fix it when a compiler that supports P2996 is available.
+- Tests: `test_reflect`, `reflect_round_trip` in `test_support2`, and the fuzz target `fuzz_reflect` (`from_binary` on arbitrary bytes).
 
 ## Processes
 - `os::spawn_spec` and `spawn_wait` (argv, env, cwd, limits, output cap): see [os-wrapper.md](os-wrapper.md#processes-processhpp).
@@ -90,13 +210,14 @@ auto t = kTimeout.get();          // parsed and defaulted; re-parsed when the va
 | `hash/blake3.hpp` | `forge::hash` | Portable BLAKE3 (32-byte hash mode): `update`, `final`, `of`, `hex`. Used for `.fpk` integrity and the cache |
 | `io/aio.hpp` | `forge::io` | `async_reader`: io_uring through raw syscalls on Linux, else a `pread` thread pool. Short reads are resubmitted, so a completion covers the whole request |
 | `json/json.hpp` | `forge::json` | Small strict JSON reader/writer (`value`, typed accessors, `num_or`, ...) |
-| `linalg/linalg.hpp` | `forge::linalg` | Row-major `mat<T>`: `matmul`, LU, Cholesky, Householder QR, CSR `spmv`, conjugate gradients, GMRES, Jacobi `sym_eig` and `svd` |
+| `linalg/linalg.hpp`, `linalg/sparse.hpp` | `forge::linalg` | Dense and sparse linear algebra, float and double: see [Linear algebra](#linear-algebra-forgelinalg) |
 | `mem/arena.hpp` | `forge::mem` | Bump `arena` with `save`/`restore` marks and RAII `scope`; any power-of-two alignment |
 | `mem/tlsf.hpp` | `forge::mem` | Fixed-block `pool` and O(1) `tlsf` allocator over a caller region, with stats and `leak_report` |
-| `prof/prof.hpp` | `forge::prof` | `FORGE_ZONE(name)` scoped zones per thread, exported as Chrome trace JSON; a disabled zone costs one relaxed load |
+| `prof/prof.hpp`, `prof/hw.hpp` | `forge::prof` | Zones, counters, gauges, allocation and GPU-zone hooks, statistics, trace exports: see [Profiler](#profiler-forgeprof) |
 | `rand/philox.hpp` | `forge::rand` | Counter-based `philox4x32` (10 rounds) and `threefry4x32` (20 rounds) |
-| `reflect/reflect.hpp` | `forge::reflect` | `FORGE_REFLECT(T, fields...)` (up to 12 fields), `to_json`, `from_json` |
+| `reflect/reflect.hpp` | `forge::reflect` | `FORGE_REFLECT` (up to 64 fields), JSON and binary serialisation, schema hashes: see [Reflection](#reflection-forgereflect) |
 | `signal/fft.hpp` | `forge::signal` | FFT (radix-2, Bluestein for other lengths), `rfft`, Hann window, STFT power, Slaney mel filterbank |
 | `signal/audio.hpp` | `forge::signal` | Windowed-sinc `resample`, RBJ `biquad` filters |
 | `vision/vision.hpp` | `forge::vision` | Bilinear resize, RGB↔YUV (BT.601 full range), IoU, greedy NMS, `roi_align` |
+| `vision/transform.hpp`, `vision/codec.hpp` | `forge::vision` | Pre-processing and image file codecs: see [Vision](#vision-forgevision) |
 | `vision/video.hpp` | `forge::vision::video` | Hardware decode interface (NVDEC, MediaCodec, VideoToolbox; VA-API probe only), Annex-B and H.264 SPS parsing. Only the parsing is tested; the decoders have not run on hardware |
