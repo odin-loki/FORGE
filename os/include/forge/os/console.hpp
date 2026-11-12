@@ -3,8 +3,10 @@
 // flag), raw / no-echo input modes as RAII guards, password prompts, and colour helpers that respect NO_COLOR
 // and FORCE_COLOR. Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
+#include <algorithm>
 #include <cctype>
 #include <iostream>
+#include <optional>
 #if defined(FORGE_OS_POSIX)
 #include <sys/ioctl.h>
 #include <termios.h>
@@ -150,4 +152,68 @@ inline bool confirm(const std::string& question, bool dflt = false) {
     if (a.empty()) return dflt;
     return a == "y" || a == "yes";
 }
+
+// ---------------------------------------------------------------- mouse, bracketed paste, focus, alternate screen
+// Terminal features every modern terminal switches with the same escape sequences (xterm's private modes), so
+// one implementation serves POSIX terminals and the Windows console (Windows 10+: set_feature turns VT output on;
+// to *receive* mouse, paste and focus reports as input, hold a mode_guard(raw), which enables VT input there).
+//   mouse            SGR mouse reports: "\x1b[<b;x;yM" (press / move) and "...m" (release); any-motion tracking
+//   bracketed_paste  pasted text arrives between "\x1b[200~" and "\x1b[201~"
+//   focus_events     "\x1b[I" when the terminal gains focus, "\x1b[O" when it loses it
+//   alternate_screen a second screen buffer without scrollback (full-screen programs); off restores the first
+// Turn features off again before exiting (the terminal keeps the mode otherwise).
+enum class feature { mouse, bracketed_paste, focus_events, alternate_screen };
+inline std::string feature_sequence(feature f, bool on) {
+    const char c = on ? 'h' : 'l';
+    switch (f) {
+        case feature::mouse: return on ? "\x1b[?1000h\x1b[?1003h\x1b[?1006h" : "\x1b[?1006l\x1b[?1003l\x1b[?1000l";
+        case feature::bracketed_paste: return std::string("\x1b[?2004") + c;
+        case feature::focus_events: return std::string("\x1b[?1004") + c;
+        case feature::alternate_screen: return std::string("\x1b[?1049") + c;
+    }
+    return {};
+}
+// Write raw bytes to a terminal stream, past stdio's buffers (they must be flushed by the caller if it mixes both).
+inline status write_raw(std::string_view bytes, stream s = stream::out) {
+#if defined(FORGE_OS_POSIX)
+    const int fd = int(s == stream::in ? stream::out : s);
+    for (std::size_t off = 0; off < bytes.size();) {
+        auto n = ::write(fd, bytes.data() + off, bytes.size() - off);
+        if (n < 0) { if (errno == EINTR) continue; return {{}, last_error("console write")}; }
+        off += std::size_t(n);
+    }
+#else
+    HANDLE h = std_handle(s == stream::in ? stream::out : s);
+    for (std::size_t off = 0; off < bytes.size();) {
+        DWORD n = 0; if (!WriteFile(h, bytes.data() + off, DWORD(std::min<std::size_t>(bytes.size() - off, 1u << 20)), &n, nullptr)) return {{}, last_error("console write")};
+        off += n;
+    }
+#endif
+    return {};
+}
+// Switch a feature on a terminal. An error with ENOTTY when `s` is not a terminal (nothing is written, so
+// redirected output never fills with escape sequences); on Windows the console must accept VT processing.
+inline status set_feature(feature f, bool on, stream s = stream::out) {
+    if (!is_tty(s)) return {{}, errno_error(ENOTTY, "console: not a terminal")};
+#if defined(FORGE_OS_WINDOWS)
+    if (!is_mintty_pipe(std_handle(s))) if (auto e = enable_vt(s); !e) return e;
+#endif
+    return write_raw(feature_sequence(f, on), s);
+}
+// Terminal resizes. POSIX terminals announce them with SIGWINCH and Windows consoles with a
+// WINDOW_BUFFER_SIZE_EVENT input record; both only say "ask again", and taking either over would interfere with
+// the program's own signal handling or input loop. poll() therefore just asks: it returns the new size when it
+// differs from the last one seen, which is cheap enough to call once per frame or input wait.
+class resize_watcher {
+public:
+    explicit resize_watcher(stream s = stream::out) : s_(s), last_(console::size(s).value) {}
+    size_t2 current() const { return last_; }
+    std::optional<size_t2> poll() {
+        auto now = console::size(s_).value;
+        if (now.cols == last_.cols && now.rows == last_.rows) return std::nullopt;
+        last_ = now; return now;
+    }
+private:
+    stream s_; size_t2 last_;
+};
 } // namespace forge::os::console

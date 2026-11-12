@@ -239,3 +239,55 @@ TEST(malformed_inputs_never_read_out_of_bounds) {
 #if defined(FORGE_TEST_XFMT_DIR)
 TEST(foreign_fixture_count) { std::printf("  %d foreign-format fixtures checked\n", checked); }
 #endif
+// ---- loaded modules, loader flags (begin)
+#include <forge/os/dynlib.hpp>
+static int dyn_marker_function() { return 7; }
+TEST(loaded_modules_and_address_lookup) {
+    auto m = os::loaded_modules(); CHECK_MSG(bool(m), "%s", m.err.what.c_str()); if (!m) return;
+    std::printf("  %zu loaded module(s), first '%s' at %p (%zu bytes)\n", m->size(), m->empty() ? "" : (*m)[0].path.c_str(), m->empty() ? nullptr : (*m)[0].base, m->empty() ? std::size_t(0) : (*m)[0].size);
+    CHECK(!m->empty()); std::size_t with_path = 0, with_size = 0;
+    for (auto& x : *m) { CHECK(x.base != nullptr); with_path += !x.path.empty(); with_size += x.size > 0; }
+    CHECK(with_path >= 1); CHECK(with_size >= 1);
+    // The test program itself is in the list, and it contains this function.
+    auto a = reinterpret_cast<std::uintptr_t>(reinterpret_cast<void*>(&dyn_marker_function)); bool inside = false;
+    for (auto& x : *m) { auto b = reinterpret_cast<std::uintptr_t>(x.base); inside |= x.size && a >= b && a - b < x.size; }
+    CHECK(inside);
+    auto self = os::module_of_address(reinterpret_cast<const void*>(reinterpret_cast<void*>(&dyn_marker_function)));
+    CHECK_MSG(bool(self), "%s", self.err.what.c_str());
+    if (self) { std::printf("  this test is '%s' (%zu bytes)\n", self->path.c_str(), self->size); CHECK(self->base != nullptr); CHECK(!self->path.empty()); CHECK(os::basename(self->path) == os::basename(os::exe_path())); }
+#if !defined(_WIN32)
+    static int on_heap_probe = 0; int on_stack = 0; (void)on_heap_probe;
+    CHECK(!os::module_of_address(&on_stack));   // not inside any image
+#endif
+    CHECK(dyn_marker_function() == 7);
+}
+TEST(open_with_loader_flags) {
+    CHECK(!os::dynlib::open_with("", {}));
+    CHECK(!os::dynlib::open_with("forge-no-such-library-xyz", {}));
+    os::dynlib_load_flags sys; sys.system_only = true;
+    CHECK(!os::dynlib::open_with("some/dir/lib.so", sys));   // system_only takes a bare name
+#if defined(_WIN32)
+    const char* syslib = "kernel32.dll";
+#elif defined(__APPLE__)
+    const char* syslib = "libSystem.B.dylib";
+#elif defined(__ANDROID__)
+    const char* syslib = "libc.so";
+#elif defined(__FreeBSD__)
+    const char* syslib = "libc.so.7";
+#else
+    const char* syslib = "libm.so.6";
+#endif
+    os::dynlib_load_flags f; f.system_only = true; f.lazy = true; f.global = true; f.pinned = true;
+    auto l = os::dynlib::open_with(syslib, f);
+    std::printf("  open_with(%s): %s\n", syslib, l ? l->path().c_str() : l.err.what.c_str());
+#if defined(__GLIBC__) || defined(_WIN32) || defined(__APPLE__) || defined(__FreeBSD__) || defined(__ANDROID__)
+    CHECK(l); if (l) CHECK(l->valid());
+#endif
+#if defined(FORGE_TEST_FIXTURE_DIR)
+    os::dynlib_load_flags d; d.deps_beside = true;
+    auto fx = os::dynlib::open_with(std::string(FORGE_TEST_FIXTURE_DIR) + "/" + os::library::decorate("forge_fixture"), d);
+    CHECK_MSG(bool(fx), "%s", fx.err.what.c_str());
+    if (fx) { auto add = fx->get<int (*)(int, int)>("forge_fixture_add"); CHECK(add && add(2, 3) == 5); auto mm = os::module_of_address(reinterpret_cast<const void*>(reinterpret_cast<void*>(add))); CHECK(mm && os::basename(mm->path) == os::library::decorate("forge_fixture")); }
+#endif
+}
+// ---- loaded modules, loader flags (end)

@@ -8,11 +8,14 @@
 //     second pass merges. Many rows (prefill): an item is (head, token block) and walks its chunks merging as
 //     it goes. Both orders are the same arithmetic, so a token gets the same bits alone or inside a block.
 // Keys and values may each be f32 or int8 (kv_codec int8: one f32 scale per position and head, then d bytes).
-// FORGE_CPU_ATTN=old selects the previous per-(token, head) kernel.
+// FORGE_CPU_ATTN=old selects the previous per-(token, head) kernel. FORGE_CPU_ATTN=q16 (opt-in) scores int8
+// keys with the int16-query integer kernel (seq_kernels::attn_chunk_q16): the query row becomes int16 codes
+// and q.k an exact int32 sum, instead of converting the key bytes to float.
 #include <forge/graph/kv_codec.hpp>
 #include <forge/simd/seq.hpp>
 #include <forge/task/pool.hpp>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -24,23 +27,41 @@ namespace forge::graph::attn_cpu {
 
 // FORGE_CPU_ATTN: unset = this kernel for an int8 KV cache only (where it measured faster); "new" = also for
 // f32 KV (its f32 prefill measured slower than the old kernel on one noisy run, not yet explained); "old" = never.
+// "q16" = the default selection, with the int16-query path for int8 keys; it combines with new ("new,q16").
+// q16 is opt-in: a micro-benchmark of one chunk (docs/inference.md) showed it ahead for 1-2 query rows per item
+// and about level beyond, on a loaded machine; outputs move by ~1e-5 against the float-query kernel.
+inline bool env_has(const char* word) {   // FORGE_CPU_ATTN is a comma-separated list
+    const char* e = std::getenv("FORGE_CPU_ATTN");
+    if (!e) return false;
+    const std::string s = std::string(",") + e + ",";
+    return s.find(std::string(",") + word + ",") != std::string::npos;
+}
 inline int mode() {
-    static const int m = [] { const char* e = std::getenv("FORGE_CPU_ATTN");
-        return !e ? 1 : std::string(e) == "old" ? 0 : std::string(e) == "new" ? 2 : 1; }();
+    static const int m = env_has("old") ? 0 : env_has("new") ? 2 : 1;
     return m;
 }
 inline bool enabled() { return mode() != 0; }
+// int16-query path for int8 keys: -1 = follow FORGE_CPU_ATTN (the default), 0 = off, 1 = on (set_query_i16).
+inline std::atomic<int>& query_i16_override() { static std::atomic<int> v{-1}; return v; }
+inline void set_query_i16(int v) { query_i16_override().store(v < 0 ? -1 : v ? 1 : 0, std::memory_order_relaxed); }
+inline bool query_i16() {
+    static const bool env = env_has("q16");
+    const int o = query_i16_override().load(std::memory_order_relaxed);
+    return o < 0 ? env : o != 0;
+}
 inline bool supports(kv_codec kc, kv_codec vc) {
     const bool ok = (kc == kv_codec::f32 || kc == kv_codec::int8) && (vc == kv_codec::f32 || vc == kv_codec::int8);
     return ok && (mode() == 2 || kc == kv_codec::int8 || vc == kv_codec::int8);
 }
 
 // q [s, hq, d]; k/v hold t positions of [hk, row] (row = d / dv floats, or kv_head_words for int8);
-// out [s, hq, dv]. Query token i sits at position t - s + i.
+// out [s, hq, dv]. Query token i sits at position t - s + i. q16: 1 / 0 = int16-query path for int8 keys on / off,
+// -1 = query_i16().
 inline void attention(const float* q, std::size_t s, std::size_t hq, std::size_t d, const float* k, const float* v,
                       std::size_t t, std::size_t hk, std::size_t dv, kv_codec kc, kv_codec vc, bool causal,
-                      std::size_t window, float scale, float* out) {
+                      std::size_t window, float scale, float* out, int q16 = -1) {
     const auto& K = simd::seq_active();
+    const auto chunk = kc == kv_codec::int8 && (q16 < 0 ? query_i16() : q16 != 0) ? K.attn_chunk_q16 : K.attn_chunk;
     constexpr std::size_t CH = simd::seq_attn_chunk;
     const std::size_t grp = hq / hk, nch = (t + CH - 1) / CH;
     const std::size_t kw = kc == kv_codec::f32 ? d : std::size_t(kv_head_words(i64(d))),
@@ -86,7 +107,7 @@ inline void attention(const float* q, std::size_t s, std::size_t hq, std::size_t
                 const std::size_t ns = sl.q.size();
                 scratch.resize(K.attn_scratch(ns, d, dv)); m.resize(ns); l.resize(ns); acc.resize(ns * dv);
                 auto [kk, vv] = kv_of(kh);
-                K.attn_chunk(kk, vv, d, dv, scale, c * CH, std::min(t, c * CH + CH), ns, sl.q.data(), sl.lo.data(), sl.hi.data(),
+                chunk(kk, vv, d, dv, scale, c * CH, std::min(t, c * CH + CH), ns, sl.q.data(), sl.lo.data(), sl.hi.data(),
                              m.data(), l.data(), acc.data(), scratch.data());
                 for (std::size_t j = 0; j < ns; ++j) {
                     std::size_t r = sl.row[j] * nch + c;
@@ -117,7 +138,7 @@ inline void attention(const float* q, std::size_t s, std::size_t hq, std::size_t
             auto [kk, vv] = kv_of(kh);
             auto [c0, c1] = chunks_of(b);
             for (std::size_t c = c0; c < c1; ++c) {
-                K.attn_chunk(kk, vv, d, dv, scale, c * CH, std::min(t, c * CH + CH), ns, sl.q.data(), sl.lo.data(), sl.hi.data(),
+                chunk(kk, vv, d, dv, scale, c * CH, std::min(t, c * CH + CH), ns, sl.q.data(), sl.lo.data(), sl.hi.data(),
                              m.data(), l.data(), acc.data(), scratch.data());
                 for (std::size_t j = 0; j < ns; ++j) K.attn_merge(&M[j], &L[j], A.data() + j * dv, m[j], l[j], acc.data() + j * dv, dv);
             }

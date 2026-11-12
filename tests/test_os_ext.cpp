@@ -69,6 +69,14 @@ static int child_main(const std::string& mode) {
 #endif
     os::sandbox_policy p;
     if (mode == "noop") return 0;
+    if (mode == "tryexec") {   // 0: this process cannot start a program, 4: it can
+#if defined(_WIN32)
+        auto r = os::run({"cmd", "/d", "/c", "exit 0"});
+#else
+        auto r = os::run({"/bin/echo", "x"});
+#endif
+        return r && r->exit_code == 0 ? 4 : 0;
+    }
     if (mode == "sandbox_net") p.deny_network = true;
     else if (mode == "sandbox_exec") p.deny_exec = true;
     else if (mode.rfind("sandbox_write", 0) == 0) p.deny_fs_write = true;
@@ -403,7 +411,25 @@ TEST(run_sandboxed_child) {
     CHECK(!os::read_file(f));
     auto ok = os::run_sandboxed({"sh", "-c", "echo x > " + f}, none); CHECK(ok); if (ok) CHECK(ok.value == 0);
     CHECK(os::read_file(f));
+#if !defined(__APPLE__)   // macOS /bin/sh is a wrapper that execs the real shell, which deny_exec refuses
     auto rx = os::run_sandboxed({"sh", "-c", "exit 7"}, x); CHECK(rx); if (rx) CHECK(rx.value == 7);
+#endif
+#if defined(__linux__) || defined(__APPLE__)
+    {   // the target itself starts under deny_exec, and then cannot start anything
+        os::setenv("FORGE_OS_EXT_CHILD", "noop"); auto self = os::run_sandboxed({os::exe_path()}, x);
+        CHECK_MSG(self, "%s", self.err.what.c_str()); if (self) CHECK_MSG(self.value == 0, "rc=%d", self.value);
+        os::setenv("FORGE_OS_EXT_CHILD", "tryexec"); auto probe = os::run_sandboxed({os::exe_path()}, x);
+        os::unsetenv("FORGE_OS_EXT_CHILD");
+        CHECK(probe);
+#if defined(__linux__)
+        const bool denied = os::sandbox_status().landlock_abi || os::sandbox_exec_gate();
+        std::printf("  run_sandboxed deny_exec: landlock abi %d, exec gate %d\n", os::sandbox_status().landlock_abi, int(os::sandbox_exec_gate()));
+#else
+        const bool denied = true;
+#endif
+        if (probe) CHECK_MSG(probe.value == (denied ? 0 : 4), "rc=%d", probe.value);
+    }
+#endif
 #if defined(__FreeBSD__)
     auto ex = os::run_sandboxed({"sh", "-c", "/bin/echo hi"}, x); CHECK(ex); if (ex) CHECK(ex.value != 0);   // capability mode: no exec by path
 #elif defined(__linux__)
@@ -414,8 +440,15 @@ TEST(run_sandboxed_child) {
     auto sr = os::run_sandboxed({scr}, x); CHECK(sr); if (sr) CHECK_MSG(sr.value == 4, "rc=%d", sr.value);   // #! interpreter allowed
     os::sandbox_policy xw = x; xw.deny_fs_write = true;
     auto exw = os::run_sandboxed({"sh", "-c", "exit 6"}, xw); CHECK(exw); if (exw) CHECK(exw.value == 6);
-    if (os::sandbox_status().landlock_abi) { if (ex) CHECK_MSG(ex.value != 0, "rc=%d", ex.value); }
-    else { skip("run_sandboxed deny_exec on the target", "no Landlock"); if (ex) CHECK(ex.value == 0); }
+    if (os::sandbox_status().landlock_abi || os::sandbox_exec_gate()) { if (ex) CHECK_MSG(ex.value != 0, "rc=%d", ex.value); }
+    else { skip("run_sandboxed deny_exec on the target", "no Landlock, no seccomp user notification"); if (ex) CHECK(ex.value == 0); }
+    if (os::sandbox_exec_gate()) {   // the gate also stops `ld.so prog`, which Landlock allows (ld.so is in the exec chain)
+        std::vector<std::string> chain; os::detail::ll::exec_chain("/bin/echo", chain);
+        if (chain.size() >= 2) {
+            auto ld = os::run_sandboxed({"sh", "-c", chain.back() + " /bin/echo hi"}, x); CHECK(ld); if (ld) CHECK_MSG(ld.value != 0, "ld.so bypass rc=%d", ld.value);
+            auto ok2 = os::run_sandboxed({"sh", "-c", chain.back() + " /bin/echo hi >/dev/null"}, none); CHECK(ok2); if (ok2) CHECK_MSG(ok2.value == 0, "rc=%d", ok2.value);
+        }
+    }
 #endif
     CHECK(!os::run_sandboxed({"no-such-forge-cmd-xyz"}, net));
     os::remove_all(d);
@@ -692,4 +725,159 @@ TEST(service_integration) {
 #endif
     int ran = 0; auto r = os::service::run_as_service("forge-test", [&] { ++ran; return 0; }, [] {});
     CHECK(r); CHECK(ran == 1);
+}
+
+// ---------------------------------------------------------------- parity additions (every OS)
+#include <thread>
+TEST(address_wait_and_wake) {
+    std::printf("  backend: %s\n", os::address_wait_backend()); CHECK(std::string(os::address_wait_backend()).size() > 0);
+    std::atomic<std::uint32_t> a{0};
+    CHECK(os::wait_on_address(a, 1, 1000000) == os::wait_result::mismatch);      // the word is not 1: no sleep
+    auto t0 = os::monotonic_ns(); bool timed_out = false;
+    for (int i = 0; i < 20 && !timed_out; ++i) timed_out = os::wait_on_address(a, 0, 30000000) == os::wait_result::timed_out;   // spurious wake-ups are allowed
+    CHECK(timed_out); CHECK(os::monotonic_ns() - t0 >= 20000000ull);
+    std::atomic<int> woke{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 4; ++i) ts.emplace_back([&] { while (a.load() == 0) os::wait_on_address(a, 0); woke.fetch_add(1); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30)); CHECK(woke.load() == 0);
+    a.store(1); os::wake_all(a);
+    for (auto& t : ts) t.join();
+    CHECK(woke.load() == 4);
+    std::atomic<std::uint32_t> b{0};   // wake_one releases at least one of two waiters; the second needs its own wake
+    std::thread w1([&] { while (b.load() == 0) os::wait_on_address(b, 0, 50000000); });
+    b.store(1); os::wake_one(b); os::wake_one(b); w1.join();
+    os::wake_all(b);                   // nobody waiting: harmless
+}
+TEST(wait_event_and_timer) {
+    auto e = os::wait_event::create(); CHECK_MSG(e, "%s", e.err.what.c_str()); if (!e) return;
+    CHECK(e->valid()); CHECK(!e->is_set()); CHECK(!e->wait(20));
+    std::thread setter([&] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); e->set(); });
+    CHECK(e->wait(10000)); setter.join();
+    CHECK(e->is_set()); CHECK(e->wait(0)); CHECK(e->wait(-1));   // stays raised: every waiter sees it
+    e->set(); e->reset(); CHECK(!e->is_set());
+    os::wait_event moved = std::move(*e); CHECK(moved.valid()); moved.set(); CHECK(moved.is_set());
+    auto pre = os::wait_event::create(true); CHECK(pre && pre->is_set());
+    os::wait_event none; CHECK(!none.valid()); CHECK(!none.wait(1));
+
+    auto t = os::wait_timer::create(); CHECK_MSG(t, "%s", t.err.what.c_str()); if (!t) return;
+    auto idle = t->wait(20); CHECK(idle && idle.value == 0);          // not armed: only the timeout
+    auto t0 = os::monotonic_ns(); CHECK(t->arm(30000000)); CHECK(t->armed());
+    auto fired = t->wait(10000); CHECK(fired); CHECK_MSG(fired.value == 1, "%llu", static_cast<unsigned long long>(fired.value));
+    auto ms = (os::monotonic_ns() - t0) / 1000000; CHECK_MSG(ms >= 25 && ms < 5000, "one-shot after %llu ms", static_cast<unsigned long long>(ms));
+    auto once = t->wait(60); CHECK(once && once.value == 0);          // one shot: it does not fire again
+    t0 = os::monotonic_ns(); CHECK(t->arm(20000000, 20000000));
+    std::uint64_t total = 0; for (int i = 0; i < 3; ++i) { auto n = t->wait(10000); CHECK(n && n.value >= 1); total += n.value; }
+    ms = (os::monotonic_ns() - t0) / 1000000; CHECK_MSG(total >= 3 && ms >= 50 && ms < 5000, "%llu periodic expirations in %llu ms", static_cast<unsigned long long>(total), static_cast<unsigned long long>(ms));
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));        // fell behind: the count says by how much
+    auto late = t->wait(10000); CHECK(late); CHECK_MSG(late.value >= 2, "%llu", static_cast<unsigned long long>(late.value));
+    CHECK(t->arm(10000000, 40000000));                                 // first interval differs from the period
+    auto f1 = t->wait(10000), f2 = t->wait(10000); CHECK(f1 && f1.value >= 1); CHECK(f2 && f2.value >= 1);
+    CHECK(t->disarm()); CHECK(!t->armed()); auto off = t->wait(80); CHECK(off && off.value == 0);
+    os::wait_timer nt; CHECK(!nt.valid()); CHECK(!nt.arm(1000)); CHECK(!nt.wait(1));
+}
+TEST(signal_listener_queue) {
+    auto& l = os::signal_listener::instance();
+    CHECK(!l.wait(10));
+#if defined(_WIN32)
+    CHECK(l.listen(os::sig::interrupt));
+    auto p = l.listen(os::sig::pipe); CHECK(!p && os::is_unsupported(p.err));   // no SIGPIPE on Windows
+    CHECK(!l.wait(20));
+    l.ignore(os::sig::interrupt);
+#else
+    CHECK(l.listen(os::sig::hangup)); CHECK(l.listen(os::sig::pipe));
+    ::raise(SIGHUP);
+    auto s = l.wait(10000); CHECK(s && *s == os::sig::hangup);
+    CHECK(!l.wait(20));
+    ::raise(SIGPIPE); ::raise(SIGHUP);
+    auto s1 = l.wait(10000), s2 = l.wait(10000); CHECK(s1 && s2);
+    if (s1 && s2) CHECK((*s1 == os::sig::hangup && *s2 == os::sig::pipe) || (*s1 == os::sig::pipe && *s2 == os::sig::hangup));
+    std::thread later([] { std::this_thread::sleep_for(std::chrono::milliseconds(30)); ::kill(::getpid(), SIGHUP); });
+    auto s3 = l.wait(10000); later.join(); CHECK(s3 && *s3 == os::sig::hangup);
+    struct pollfd f{l.native(), POLLIN, 0}; CHECK(::poll(&f, 1, 0) == 0);   // drained: nothing readable for an event loop
+    l.ignore(os::sig::pipe); os::ignore_sigpipe();
+    ::signal(SIGHUP, SIG_IGN);
+#endif
+}
+TEST(shared_memory_anonymous_and_handles) {
+    CHECK(!os::shared_memory::anonymous(0));
+    auto m = os::shared_memory::anonymous(3 * 4096); CHECK_MSG(m, "%s", m.err.what.c_str()); if (!m) return;
+    CHECK(m->size() == 3 * 4096); CHECK(m->name().empty());
+    for (std::size_t i = 0; i < m->size(); ++i) if (m->data()[i]) { CHECK_MSG(false, "not zero-filled at %zu", i); break; }
+    auto h = m->share(); CHECK_MSG(h, "%s", h.err.what.c_str()); if (!h) return;
+#if defined(_WIN32)
+    auto v = os::shared_memory::attach(reinterpret_cast<HANDLE>(h.value), 3 * 4096);
+#else
+    auto v = os::shared_memory::attach(int(h.value));
+#endif
+    CHECK_MSG(v, "%s", v.err.what.c_str());
+    if (v) {
+        CHECK(v->size() >= 3 * 4096); CHECK(v->data() != m->data());
+        m->data()[100] = 7; CHECK(v->data()[100] == 7); v->data()[8000] = 9; CHECK(m->data()[8000] == 9);   // one region, two views
+    }
+    auto sl = m->seal();
+#if defined(__linux__)
+    CHECK_MSG(sl || os::is_unsupported(sl.err), "%s", sl.err.what.c_str());
+    if (sl) { CHECK(::ftruncate(m->native(), 4096) != 0); CHECK(::ftruncate(m->native(), 8 * 4096) != 0); m->data()[1] = 1; }   // size fixed, contents still writable
+#elif !defined(__FreeBSD__)
+    CHECK(!sl && os::is_unsupported(sl.err));
+#endif
+    auto named = os::shared_memory::create("anon-vs-named-" + std::to_string(os::pid()), 4096); CHECK(named);
+#if !defined(_WIN32)
+    if (named) { CHECK(named->native() < 0); auto ns = named->share(); CHECK(!ns); }   // named regions are opened by name
+    CHECK(!os::shared_memory::attach(-1));
+#else
+    CHECK(!os::shared_memory::attach(nullptr));
+#endif
+}
+TEST(local_ipc_passes_handles) {
+    auto ep = os::local_endpoint("forge-h-" + std::to_string(os::pid()));
+    auto l = os::local_listener::listen(ep); CHECK_MSG(l, "%s", l.err.what.c_str()); if (!l) return;
+    auto d = scratch("hpass"); const std::string path = os::join(d, "payload.txt");
+    CHECK(os::write_file(path, "sent through a socket"));
+    std::string got; std::string err;
+    std::thread server([&] {
+        auto c = l->accept(10000); if (!c) { err = c.err.what; return; }
+        auto h = c->recv_handle(); if (!h) { err = h.err.what; return; }
+#if defined(_WIN32)
+        os::file f(reinterpret_cast<HANDLE>(h.value));
+#else
+        os::file f{int(h.value)};
+#endif
+        char b[64] = {}; auto n = f.pread(b, sizeof b - 1, 0); if (!n) { err = n.err.what; return; }
+        got.assign(b, n.value);
+        char ack = 'k'; c->write_all(&ack, 1);
+        auto bad = c->recv_handle(); if (bad) err = "a plain byte was taken for a handle";   // the client sends 'x' next
+    });
+    auto c = os::local_stream::connect(ep, 10000); CHECK_MSG(c, "%s", c.err.what.c_str());
+    if (c) {
+        auto f = os::file::open(path); CHECK(f);
+        if (f) {
+#if defined(_WIN32)
+            auto s = c->send_handle(reinterpret_cast<std::intptr_t>(f->native()));
+#else
+            auto s = c->send_handle(f->native());
+#endif
+            CHECK_MSG(s, "%s", s.err.what.c_str());
+            char ack = 0; CHECK(c->read_exact(&ack, 1)); CHECK(ack == 'k');
+            CHECK(f->valid());                                    // the sender keeps its own handle
+            char x[9] = {'x'}; c->write_all(x, sizeof x);
+        }
+        c->close();
+    }
+    server.join();
+    CHECK_MSG(err.empty(), "%s", err.c_str()); CHECK_MSG(got == "sent through a socket", "[%s]", got.c_str());
+    os::remove_all(d);
+}
+TEST(core_dump_control) {
+    const bool before = os::core_dumps_enabled();
+    auto off = os::set_core_dumps(false); CHECK_MSG(off, "%s", off.err.what.c_str());
+    CHECK(!os::core_dumps_enabled());
+    auto on = os::set_core_dumps(true); CHECK_MSG(on, "%s", on.err.what.c_str());
+#if defined(_WIN32)
+    CHECK(os::core_dumps_enabled());
+#else
+    struct rlimit r{}; ::getrlimit(RLIMIT_CORE, &r);
+    CHECK(os::core_dumps_enabled() == (r.rlim_max != 0));          // a hard limit of 0 cannot be raised again
+#endif
+    if (!before) os::set_core_dumps(false);
 }

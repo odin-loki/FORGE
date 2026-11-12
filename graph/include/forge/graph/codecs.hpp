@@ -342,6 +342,258 @@ inline void enc_q5_k(const float* x, std::size_t n, u8* o) {
         }
     }
 }
+
+// ---- GGUF legacy, low-bit K, non-linear and ternary block formats ------------------------------------------------
+// The decoders follow the public GGUF block layouts and give the bits of the reference dequantisers (checked
+// against gguf-py in verify/golden/gguf_types.py). The encoders are FORGE's own (plain min/max or absmax fits).
+
+// Q4_0 / Q5_0: 32 values, { f16 d; [u8 qh[4];] u8 qs[16] }, x = d * (q - 2^(BITS-1)).
+// Q4_1 / Q5_1: 32 values, { f16 d; f16 m; [u8 qh[4];] u8 qs[16] }, x = d * q + m.
+// Element j (< 16) is the low nibble of qs[j], element j + 16 the high nibble; with 5 bits, bit i of the little-endian
+// u32 qh is the fifth bit of element i.
+template <int BITS, bool MIN> inline void dec_q45(const u8* in, std::size_t n, float* x) {
+    constexpr std::size_t H = MIN ? 4 : 2, QS = H + (BITS == 5 ? 4 : 0), BB = QS + 16;
+    [[maybe_unused]] constexpr int OFF = 1 << (BITS - 1);
+    for (std::size_t b = 0; b < n; b += 32, in += BB) {
+        float d = get16(in), out[32];
+        [[maybe_unused]] float m = MIN ? get16(in + 2) : 0.f;
+        u32 qh = BITS == 5 ? u32(in[H]) | u32(in[H + 1]) << 8 | u32(in[H + 2]) << 16 | u32(in[H + 3]) << 24 : 0;
+        for (int j = 0; j < 16; ++j) {
+            int q0 = int(in[QS + j] & 0xF) | int(((qh >> j) & 1) << 4), q1 = int(in[QS + j] >> 4) | int(((qh >> (j + 16)) & 1) << 4);
+            if constexpr (MIN) { out[j] = float(q0) * d + m; out[j + 16] = float(q1) * d + m; }
+            else { out[j] = float(q0 - OFF) * d; out[j + 16] = float(q1 - OFF) * d; }
+        }
+        std::copy_n(out, std::min<std::size_t>(32, n - b), x + b);
+    }
+}
+template <int BITS, bool MIN> inline void enc_q45(const float* x, std::size_t n, u8* o) {
+    constexpr std::size_t H = MIN ? 4 : 2, QS = H + (BITS == 5 ? 4 : 0), BB = QS + 16;
+    [[maybe_unused]] constexpr int L = (1 << BITS) - 1, OFF = 1 << (BITS - 1);
+    for (std::size_t b = 0; b < n; b += 32, o += BB) {
+        float blk[32] = {}; std::copy_n(x + b, std::min<std::size_t>(32, n - b), blk);
+        int q[32]; std::memset(o, 0, BB);
+        if constexpr (MIN) {
+            float lo = blk[0], hi = blk[0];
+            for (float v : blk) { lo = std::min(lo, v); hi = std::max(hi, v); }
+            put16(o, (hi - lo) / float(L)); put16(o + 2, lo);
+            float d = get16(o), m = get16(o + 2);
+            if (d * float(L) + m < hi) { put16(o, (hi - m) / float(L) * 1.001f + 1e-7f); d = get16(o); }   // cover the range after rounding to f16
+            for (int i = 0; i < 32; ++i) q[i] = std::clamp(d > 0 ? int(std::lround((blk[i] - m) / d)) : 0, 0, L);
+        } else {
+            float mx = 0;   // the largest magnitude, with its sign, maps to -2^(BITS-1) (the one code without a mirror)
+            for (float v : blk) if (std::fabs(v) > std::fabs(mx)) mx = v;
+            put16(o, mx / float(-OFF)); float d = get16(o);
+            for (int i = 0; i < 32; ++i) q[i] = std::clamp(d != 0 ? int(std::lround(blk[i] / d)) + OFF : OFF, 0, L);
+        }
+        for (int j = 0; j < 16; ++j) {
+            o[QS + j] = u8((q[j] & 0xF) | ((q[j + 16] & 0xF) << 4));
+            if constexpr (BITS == 5) { if (q[j] & 16) o[H + j / 8] |= u8(1u << (j % 8)); if (q[j + 16] & 16) o[H + 2 + j / 8] |= u8(1u << (j % 8)); }
+        }
+    }
+}
+
+// Q2_K: super-block of 256 = 16 sub-blocks of 16. struct { u8 scales[16]; u8 qs[64]; f16 d; f16 dmin; }
+// x = d * (scales[s] & 0xF) * q - dmin * (scales[s] >> 4), q in [0, 3]. Element e of half h (128 values) is bits
+// 2*(e/32).. of qs[32*h + e % 32].
+inline void dec_q2_k(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 84) {
+        float d = get16(in + 80), dmin = get16(in + 82), out[256];
+        for (int s = 0; s < 16; ++s) {
+            float dl = d * float(in[s] & 0xF), ml = dmin * float(in[s] >> 4);
+            const u8* q = in + 16 + (s / 8) * 32 + (s & 1) * 16; int sh = 2 * ((s & 7) / 2);
+            for (int l = 0; l < 16; ++l) out[s * 16 + l] = dl * float((q[l] >> sh) & 3) - ml;
+        }
+        std::copy_n(out, std::min<std::size_t>(256, n - b), x + b);
+    }
+}
+inline void enc_q2_k(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 84) {
+        float blk[256] = {}; std::copy_n(x + b, std::min<std::size_t>(256, n - b), blk);
+        float sc[16], mn[16], msc = 0, mmn = 0;
+        for (int s = 0; s < 16; ++s) {
+            float lo = 0, hi = 0;
+            for (int i = 0; i < 16; ++i) { lo = std::min(lo, blk[s * 16 + i]); hi = std::max(hi, blk[s * 16 + i]); }
+            sc[s] = (hi - lo) / 3.f; mn[s] = -lo; msc = std::max(msc, sc[s]); mmn = std::max(mmn, mn[s]);
+        }
+        std::memset(o, 0, 80);
+        put16(o + 80, msc / 15.f); put16(o + 82, mmn / 15.f);
+        float d = get16(o + 80), dmin = get16(o + 82);
+        for (int s = 0; s < 16; ++s) {
+            int ls = std::clamp(d ? int(std::lround(sc[s] / d)) : 0, 0, 15), lm = std::clamp(dmin ? int(std::lround(mn[s] / dmin)) : 0, 0, 15);
+            if (d && ls < 15 && float(ls) * d * 3.f < sc[s] * 3.f - 1e-6f) ++ls;
+            o[s] = u8(ls | (lm << 4));
+            float dl = d * float(ls), ml = dmin * float(lm);
+            u8* q = o + 16 + (s / 8) * 32 + (s & 1) * 16; int sh = 2 * ((s & 7) / 2);
+            for (int l = 0; l < 16; ++l) q[l] |= u8(std::clamp(dl ? int(std::lround((blk[s * 16 + l] + ml) / dl)) : 0, 0, 3) << sh);
+        }
+    }
+}
+
+// Q3_K: super-block of 256 = 16 sub-blocks of 16. struct { u8 hmask[32]; u8 qs[64]; u8 scales[12]; f16 d; }
+// x = d * (sc[s] - 32) * q, q in [-4, 3]: the low two bits sit in qs as for Q2_K, and bit (4*h + e/32) of
+// hmask[e % 32] is set when q >= 0 (q = low - 4 otherwise). The sixteen 6-bit scales: low four bits in the nibbles of
+// scales[0..7], high two bits packed four to a byte in scales[8..11].
+inline int q3_k_scale(const u8* sc, int s) {
+    int lo = s < 8 ? sc[s] & 0xF : sc[s - 8] >> 4;
+    return (lo | (((sc[8 + (s & 3)] >> (2 * (s / 4))) & 3) << 4)) - 32;
+}
+inline void dec_q3_k(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 110) {
+        float d = get16(in + 108), out[256];
+        for (int s = 0; s < 16; ++s) {
+            float dl = d * float(q3_k_scale(in + 96, s));
+            int h = s / 8, j = (s & 7) / 2, r0 = (s & 1) * 16; u8 m = u8(1u << (4 * h + j));
+            const u8* q = in + 32 + h * 32 + r0; const u8* hm = in + r0;
+            for (int l = 0; l < 16; ++l) out[s * 16 + l] = dl * float(int((q[l] >> (2 * j)) & 3) - ((hm[l] & m) ? 0 : 4));
+        }
+        std::copy_n(out, std::min<std::size_t>(256, n - b), x + b);
+    }
+}
+inline void enc_q3_k(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 110) {
+        float blk[256] = {}; std::copy_n(x + b, std::min<std::size_t>(256, n - b), blk);
+        float ss[16], big = 0;   // per sub-block step: the largest magnitude maps to -4; the largest step maps to -32
+        for (int s = 0; s < 16; ++s) {
+            float mx = 0; for (int i = 0; i < 16; ++i) if (std::fabs(blk[s * 16 + i]) > std::fabs(mx)) mx = blk[s * 16 + i];
+            ss[s] = mx / -4.f; if (std::fabs(ss[s]) > std::fabs(big)) big = ss[s];
+        }
+        std::memset(o, 0, 108);
+        put16(o + 108, big / -32.f); float d = get16(o + 108);
+        for (int s = 0; s < 16; ++s) {
+            int ls = std::clamp(d != 0 ? int(std::lround(ss[s] / d)) : 0, -32, 31);
+            if (ls == 0 && ss[s] != 0 && d != 0) ls = (ss[s] / d) < 0 ? -1 : 1;
+            int u = ls + 32;
+            if (s < 8) o[96 + s] |= u8(u & 0xF); else o[96 + s - 8] |= u8((u & 0xF) << 4);
+            o[104 + (s & 3)] |= u8((u >> 4) << (2 * (s / 4)));
+            float dl = d * float(ls);
+            int h = s / 8, j = (s & 7) / 2, r0 = (s & 1) * 16; u8 m = u8(1u << (4 * h + j));
+            u8* q = o + 32 + h * 32 + r0; u8* hm = o + r0;
+            for (int l = 0; l < 16; ++l) {
+                int v = std::clamp(dl != 0 ? int(std::lround(blk[s * 16 + l] / dl)) : 0, -4, 3);
+                q[l] |= u8((v & 3) << (2 * j)); if (v >= 0) hm[l] |= m;
+            }
+        }
+    }
+}
+
+// IQ4_NL: 32 values, { f16 d; u8 qs[16] }, x = d * K[q] with the 16-entry non-linear codebook K; nibble order as Q4_0.
+// IQ4_XS: super-block of 256 = 8 sub-blocks of 32. struct { f16 d; u16 scales_h; u8 scales_l[4]; u8 qs[128]; }
+// x = d * (ls[s] - 32) * K[q], ls[s] = nibble s of scales_l | bits 2s..2s+1 of scales_h << 4.
+inline constexpr i8 iq4_k[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+inline void dec_iq4_nl(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 32, in += 18) {
+        float d = get16(in), out[32];
+        for (int j = 0; j < 16; ++j) { out[j] = d * float(iq4_k[in[2 + j] & 0xF]); out[j + 16] = d * float(iq4_k[in[2 + j] >> 4]); }
+        std::copy_n(out, std::min<std::size_t>(32, n - b), x + b);
+    }
+}
+inline void dec_iq4_xs(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 136) {
+        float d = get16(in), out[256]; u32 sh = u32(in[2]) | u32(in[3]) << 8;
+        for (int s = 0; s < 8; ++s) {
+            int ls = int((in[4 + s / 2] >> (4 * (s & 1))) & 0xF) | int(((sh >> (2 * s)) & 3) << 4);
+            float dl = d * float(ls - 32); const u8* q = in + 8 + 16 * s;
+            for (int j = 0; j < 16; ++j) { out[s * 32 + j] = dl * float(iq4_k[q[j] & 0xF]); out[s * 32 + j + 16] = dl * float(iq4_k[q[j] >> 4]); }
+        }
+        std::copy_n(out, std::min<std::size_t>(256, n - b), x + b);
+    }
+}
+inline int iq4_nearest(float v) {   // index of the codebook value closest to v
+    int best = 0; float be = std::fabs(v - float(iq4_k[0]));
+    for (int i = 1; i < 16; ++i) { float e = std::fabs(v - float(iq4_k[i])); if (e < be) { be = e; best = i; } }
+    return best;
+}
+// Least-squares step for 32 values: the codebook is asymmetric (-127 .. 113), so both signs are tried.
+inline float iq4_fit(const float* x) {
+    float amax = 0; for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+    if (!(amax > 0)) return 0.f;
+    float best = 0; double be = -1;
+    const float cand[4] = {amax / 127.f, -amax / 127.f, amax / 113.f, -amax / 113.f};
+    for (float d0 : cand) {
+        double sxk = 0, skk = 0;
+        for (int i = 0; i < 32; ++i) { double k = iq4_k[iq4_nearest(x[i] / d0)]; sxk += double(x[i]) * k; skk += k * k; }
+        float d = skk > 0 ? float(sxk / skk) : d0; double e = 0;
+        if (d == 0) d = d0;
+        for (int i = 0; i < 32; ++i) { double r = double(x[i]) - double(d) * iq4_k[iq4_nearest(x[i] / d)]; e += r * r; }
+        if (be < 0 || e < be) { be = e; best = d; }
+    }
+    return best;
+}
+inline void iq4_pack(const float* x, float d, u8* qs) {
+    for (int j = 0; j < 16; ++j) qs[j] = u8((d != 0 ? iq4_nearest(x[j] / d) : 8) | ((d != 0 ? iq4_nearest(x[j + 16] / d) : 8) << 4));
+}
+inline void enc_iq4_nl(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 32, o += 18) {
+        float blk[32] = {}; std::copy_n(x + b, std::min<std::size_t>(32, n - b), blk);
+        put16(o, iq4_fit(blk)); iq4_pack(blk, get16(o), o + 2);
+    }
+}
+inline void enc_iq4_xs(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 136) {
+        float blk[256] = {}; std::copy_n(x + b, std::min<std::size_t>(256, n - b), blk);
+        float ds[8], big = 0;
+        for (int s = 0; s < 8; ++s) { ds[s] = iq4_fit(blk + 32 * s); if (std::fabs(ds[s]) > std::fabs(big)) big = ds[s]; }
+        std::memset(o, 0, 8);
+        put16(o, big / -32.f); float d = get16(o); u32 sh = 0;
+        for (int s = 0; s < 8; ++s) {
+            int ls = std::clamp(d != 0 ? int(std::lround(ds[s] / d)) : 0, -32, 31);
+            if (ls == 0 && ds[s] != 0 && d != 0) ls = (ds[s] / d) < 0 ? -1 : 1;
+            int u = ls + 32;
+            o[4 + s / 2] |= u8((u & 0xF) << (4 * (s & 1))); sh |= u32(u >> 4) << (2 * s);
+            iq4_pack(blk + 32 * s, d * float(ls), o + 8 + 16 * s);
+        }
+        o[2] = u8(sh); o[3] = u8(sh >> 8);
+    }
+}
+
+// TQ2_0: 256 ternary values, { u8 qs[64]; f16 d; }, x = d * (q - 1); element e of half h (128 values) is bits
+// 2*(e/32).. of qs[32*h + e % 32] (the Q2_K order).
+// TQ1_0: 256 ternary values in 1.6875 bits each, { u8 qs[48]; u8 qh[4]; f16 d; }. A byte holds five base-3 digits
+// t0..t4 as ceil((81 t0 + 27 t1 + 9 t2 + 3 t3 + t4) * 256 / 243); digit n is ((byte * 3^n mod 256) * 3) >> 8.
+// qs[0..31] hold elements n*32 + m (byte m, digit n), qs[32..47] elements 160 + n*16 + m, and qh[0..3] elements
+// 240 + n*4 + m (digits 0..3 only).
+inline int tq1_digit(u8 byte, int n) { constexpr u8 p3[5] = {1, 3, 9, 27, 81}; return int((u32(u8(byte * p3[n])) * 3) >> 8); }
+inline void tq1_pos(int i, int& byte, int& digit) {   // element -> (byte in qs|qh, digit)
+    if (i < 160) { byte = i % 32; digit = i / 32; }
+    else if (i < 240) { byte = 32 + (i - 160) % 16; digit = (i - 160) / 16; }
+    else { byte = 48 + (i - 240) % 4; digit = (i - 240) / 4; }
+}
+inline void dec_tq1_0(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 54) {
+        float d = get16(in + 52);
+        for (int i = 0; i < 256 && b + std::size_t(i) < n; ++i) { int by, dg; tq1_pos(i, by, dg); x[b + std::size_t(i)] = float(tq1_digit(in[by], dg) - 1) * d; }
+    }
+}
+inline void dec_tq2_0(const u8* in, std::size_t n, float* x) {
+    for (std::size_t b = 0; b < n; b += 256, in += 66) {
+        float d = get16(in + 64);
+        for (std::size_t i = 0; i < 256 && b + i < n; ++i) x[b + i] = float(int((in[i / 128 * 32 + i % 32] >> (2 * (i % 128 / 32))) & 3) - 1) * d;
+    }
+}
+// absmean ternarisation with a least-squares scale (as tq2), over the 256-value block; q in {0, 1, 2}
+inline float ternarise(const float* x, std::size_t m, int* q) {
+    double sa = 0; for (std::size_t i = 0; i < m; ++i) sa += std::fabs(x[i]);
+    float g0 = m ? float(sa / double(m)) : 0.f, ig = g0 > 0 ? 1.f / g0 : 0.f;
+    double nz = 0, cnt = 0;
+    for (std::size_t i = 0; i < m; ++i) { int t = std::clamp(int(std::lround(x[i] * ig)), -1, 1); q[i] = t + 1; if (t) { nz += std::fabs(x[i]); cnt += 1; } }
+    return float(cnt > 0 ? nz / cnt : 0.0);
+}
+inline void enc_tq2_0(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 66) {
+        std::size_t m = std::min<std::size_t>(256, n - b); int q[256]; std::fill_n(q, 256, 1);
+        put16(o + 64, ternarise(x + b, m, q)); std::memset(o, 0, 64);
+        for (int i = 0; i < 256; ++i) o[i / 128 * 32 + i % 32] |= u8(q[i] << (2 * (i % 128 / 32)));
+    }
+}
+inline void enc_tq1_0(const float* x, std::size_t n, u8* o) {
+    for (std::size_t b = 0; b < n; b += 256, o += 54) {
+        std::size_t m = std::min<std::size_t>(256, n - b); int q[256]; std::fill_n(q, 256, 1);
+        put16(o + 52, ternarise(x + b, m, q));
+        int acc[52] = {}; constexpr int w3[5] = {81, 27, 9, 3, 1};
+        for (int i = 0; i < 256; ++i) { int by, dg; tq1_pos(i, by, dg); acc[by] += q[i] * w3[dg]; }
+        for (int i = 0; i < 52; ++i) o[i] = u8((acc[i] * 256 + 242) / 243);
+    }
+}
 } // namespace detail
 
 inline const std::vector<codec>& all() {
@@ -363,6 +615,16 @@ inline const std::vector<codec>& all() {
         {"tq2", dtype::tq2, 64, 18, detail::enc_tq2, detail::dec_tq2},
         {"q6_k", dtype::q6_k, 256, 210, detail::enc_q6_k, detail::dec_q6_k},
         {"q5_k", dtype::q5_k, 256, 176, detail::enc_q5_k, detail::dec_q5_k},
+        {"q4_0", dtype::q4_0, 32, 18, detail::enc_q45<4, false>, detail::dec_q45<4, false>},
+        {"q4_1", dtype::q4_1, 32, 20, detail::enc_q45<4, true>, detail::dec_q45<4, true>},
+        {"q5_0", dtype::q5_0, 32, 22, detail::enc_q45<5, false>, detail::dec_q45<5, false>},
+        {"q5_1", dtype::q5_1, 32, 24, detail::enc_q45<5, true>, detail::dec_q45<5, true>},
+        {"q2_k", dtype::q2_k, 256, 84, detail::enc_q2_k, detail::dec_q2_k},
+        {"q3_k", dtype::q3_k, 256, 110, detail::enc_q3_k, detail::dec_q3_k},
+        {"iq4_nl", dtype::iq4_nl, 32, 18, detail::enc_iq4_nl, detail::dec_iq4_nl},
+        {"iq4_xs", dtype::iq4_xs, 256, 136, detail::enc_iq4_xs, detail::dec_iq4_xs},
+        {"tq1_0", dtype::tq1_0, 256, 54, detail::enc_tq1_0, detail::dec_tq1_0},
+        {"tq2_0", dtype::tq2_0, 256, 66, detail::enc_tq2_0, detail::dec_tq2_0},
     };
     return c;
 }
