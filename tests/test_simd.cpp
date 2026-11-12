@@ -22,15 +22,20 @@ static_assert(!Has<neoverse2, avx2> && Has<neoverse2, sve2>);
 
 static std::vector<const kernels*> tables() {
     std::vector<const kernels*> v;
-    for (const char* t : {"scalar", "avx2", "avx512", "neon", "sve", "rvv"}) if (auto* k = by_name(t)) v.push_back(k);
+    for (const char* t : target_names()) if (auto* k = by_name(t)) v.push_back(k);   // every table usable on this CPU
     return v;
 }
 
 TEST(detection_reports) {
     auto& f = detect();
     std::printf("  cpu: %s\n  active: %s\n", f.summary().c_str(), active().target);
+    std::printf("  tables:"); for (auto* k : tables()) std::printf(" %s", k->target); std::printf("\n");
+    CHECK(by_name("scalar") != nullptr && by_name("no-such-target") == nullptr);
+    CHECK(by_name(active().target) == &active());
 #if defined(__x86_64__)
     CHECK(f.sse2);
+    CHECK(by_name("sse2") != nullptr);                      // x86-64 baseline: the SSE2 table is always usable
+    CHECK((by_name("sse4.2") != nullptr) == (f.sse4_2 && f.popcnt));
 #elif defined(__aarch64__)
     CHECK(f.neon);
 #endif

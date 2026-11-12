@@ -151,6 +151,9 @@ void server_lockdown(const security::policy& p, const char* who, const std::stri
 int cmd_info() {
     auto& f = simd::detect();
     std::printf("cpu      %s\nfeatures %s\nlane     %s\n", f.brand.c_str(), f.summary().c_str(), simd::active().target);
+    std::string usable;   // kernel tables this CPU can run, preferred first (FORGE_SIMD_TARGET picks one)
+    for (const char* t : simd::target_names()) if (simd::by_name(t)) { usable += usable.empty() ? "" : " "; usable += t; }
+    std::printf("targets  %s\n", usable.c_str());
     for (auto& b : gpu::probe_backends()) std::printf("grid     %-10s %s  %s\n", gpu::name(b.kind), b.available ? "yes" : "no ", b.detail.c_str());
     std::fputs(mem::governor::instance().describe().c_str(), stdout);
     return 0;
@@ -381,7 +384,7 @@ int cmd_run(const args& a) {
 
 int cmd_bench_gemm(int n) {
     std::vector<float> A(std::size_t(n) * n, 0.5f), B(std::size_t(n) * n, 0.25f), C(std::size_t(n) * n);
-    for (const char* t : {"scalar", "avx2", "avx512", "neon", "sve", "rvv"}) {
+    for (const char* t : simd::target_names()) {
         auto* k = simd::by_name(t); if (!k) continue;
         k->gemm_nt(A.data(), B.data(), C.data(), std::size_t(n), std::size_t(n), std::size_t(n));
         auto t0 = std::chrono::steady_clock::now(); int reps = 0;

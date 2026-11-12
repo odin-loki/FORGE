@@ -7,7 +7,7 @@ Kernels are written once and compiled per target:
 
 | Layer | Header | Contents |
 |-------|--------|----------|
-| Tier P | `vec.hpp` | Portable fixed-width vectors and masks over native registers |
+| Tier P | `vec.hpp`, `vec_gn.hpp` | Portable fixed-width vectors and masks over native registers. `vec.hpp` has the AVX2, AVX-512, AArch64 NEON, SVE and RVV branches; `vec_gn.hpp` has the 128/256-bit backends listed under "Other architectures" |
 | Tier A | `algo.hpp`, `qdot.hpp` | Algorithms written against Tier P (dot, softmax, GEMM, quantised-row decode and dot, …) |
 | Tier R | `forge/simd/raw/x86.gen.hpp` (generated) | Raw x86 intrinsic wrappers from `ops/intrinsics/x86.json` (`ops/gen/intrin_gen.py`). Each wrapper requires its CPU feature, so using one the target lacks is a compile error |
 | Capabilities | `caps.hpp` | Feature tags; a target is a set of features |
@@ -19,9 +19,16 @@ Targets per architecture:
 
 | Arch | Targets (preferred first) | Requirements |
 |------|---------------------------|--------------|
-| x86_64 | `avx512`, `avx2`, `scalar` | `avx2`: the x86-64-v3 set (SSE2, SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI2). `avx512`: v3 plus AVX-512 F, BW, DQ, VL, CD |
+| x86_64 | `avx512`, `avx2`, `sse4.2`, `sse2`, `scalar` | `avx2`: the x86-64-v3 set (SSE2, SSE4.2, POPCNT, AVX, AVX2, FMA, F16C, BMI2). `avx512`: v3 plus AVX-512 F, BW, DQ, VL, CD. `sse4.2`: SSE2, SSE4.2, POPCNT (the TU is built with `-msse4.2 -mpopcnt`). `sse2`: the x86-64 baseline |
 | aarch64 | `sve`, `neon`, `scalar` | `sve`: a table built for exactly the hardware vector length (128, 256, 512 or 1024 bits) |
 | riscv64 | `rvv`, `scalar` | `rvv`: a table built for exactly the hardware VLEN (128, 256, 512 or 1024 bits) |
+| loongarch64 | `lasx`, `lsx`, `scalar` | `AT_HWCAP` bits LSX (1<<4) and LASX (1<<5) |
+| ppc64le | `vsx`, `scalar` | `AT_HWCAP` VSX and `AT_HWCAP2` ISA 2.07 (the TU is built for POWER8) |
+| s390x | `vxe`, `scalar` | `AT_HWCAP` VXRS and VXRS_EXT (z14: binary32 vectors) |
+| wasm32 | `simd128`, `scalar` | Chosen when the module is built (`-msimd128`); nothing is detected at run time |
+| mips64 | `msa`, `scalar` | `AT_HWCAP` MSA |
+| arm (32-bit) | `neon`, `scalar` | `AT_HWCAP` NEON and VFPv4 |
+| x86 (32-bit) | `sse4.2`, `sse2`, `scalar` | As on x86_64. No AVX tables |
 | other | `scalar` | |
 
 SVE and RVV tables are built only for the lengths the compiler accepts (CMake prints `SVE kernel tables:` / `RVV kernel tables:`).
@@ -42,7 +49,8 @@ Matrix tile units are separate (`tile.hpp`, namespace `forge::simd::tile`). They
 |----------|---------|
 | `const cpu_features& detect()` | Cached feature flags (`avx2`, `avx512f`, …, `amx_permitted`, `sve_bytes`, `sve_hw_bytes`, `rvv_bytes`, `hybrid`, `vendor`, `brand`). `.summary()` is the one-line description `forge info` prints |
 | `const kernels& active()` | The table for this process. `FORGE_SIMD_TARGET` selects a table by name if it is usable here; otherwise the best usable target wins |
-| `const kernels* by_name(const char*)` | A specific table, or `nullptr` if it is not built or not usable here. Names: `scalar`; `avx2`, `avx512` (x86); `neon`, `sve` (aarch64); `rvv` (riscv64) |
+| `const kernels* by_name(const char*)` | A specific table, or `nullptr` if it is not built or not usable here. Names: `scalar`; `avx512`, `avx2`, `sse4.2` (also `sse42`), `sse2` (x86); `neon`, `sve` (aarch64); `rvv` (riscv64); `lasx`, `lsx`; `vsx`; `vxe`; `simd128`; `msa` |
+| `std::span<const char* const> target_names()` | Every table name, preferred first, `scalar` last. `active()` takes the first one `by_name` accepts; `forge info` prints the usable ones as `targets` |
 
 `kernels` fields:
 
@@ -75,7 +83,7 @@ float d = k.dot(x.data(), y.data(), x.size());            // 5000
 
 | Variable | Effect |
 |----------|--------|
-| `FORGE_SIMD_TARGET` | Force a table (`scalar`, `avx2`, …). Ignored if that table is not usable on this CPU |
+| `FORGE_SIMD_TARGET` | Force a table (`scalar`, `avx2`, `sse2`, `lsx`, …: any `by_name` name). Ignored if that table is not usable on this CPU |
 | `FORGE_LANE_TARGET` | Old name of `FORGE_SIMD_TARGET`, still read (after it) |
 | `FORGE_SVE_KEEP_VL=1` | aarch64 Linux: do not lower the SVE vector length at start-up (see below) |
 
