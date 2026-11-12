@@ -1,7 +1,12 @@
 # FORGE test status
 
-What has been built and tested where. Current as of 2026-11-04, main at ccc0a7d (PR #53).
-CI is `.github/workflows/ci.yml`; it runs on every pull request and every push to main.
+What has been built and tested where. The platform and GPU tables are CI results as of 2026-11-04, main at ccc0a7d
+(PR #53), with later local results marked by their date. A large amount of code merged on 2026-11-12 has **not** been
+through CI: it was built and tested with clang 23 on one Linux x86_64 machine, and the other platforms saw it under
+emulators, wine, mock drivers or a cross compiler only. The first changelog entry below says, part by part, which.
+CI is `.github/workflows/ci.yml`; it runs on every pull request and every push to main. The workflow in the tree is
+newer than the last run: its emulation, wasm, cross-zig, perf, repro and fuzz jobs and the whole-suite sanitizer jobs
+have never run on GitHub, and it now uses clang 23 where the table below says Clang 18.
 "Skip" means a test exited 77 because its device or tool was missing.
 
 ## Platforms
@@ -104,6 +109,42 @@ Greedy output is identical with CUDA graphs on and off.
 
 ## Changelog of checks
 
+Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-12 (session summary: everything merged on this day, and how each part was verified)
+One machine did all of this: Linux x86_64 (4 cores, kernel 6.18), **clang 23**, no GPU. Nothing below has been
+through GitHub CI, and GCC 14, MSVC, MinGW on Windows, Apple clang and FreeBSD's compiler have not built most of it.
+The per-topic entries further down (simd tables, GPU parity) are the detailed records of two of the rows; this entry
+is the index of the whole day. "Native" means built and run on that machine.
+
+Whole tree after the last merge (`ctest -LE "slow|emu" -j2`, clang 23, RelWithDebInfo): 209 tests: 199 passed, 10 skipped, 0 failed. The skips are the nine real-device GPU tests (`test_gpu_{cuda,hip,opencl,ze,metal}` and their `features` variants: no driver) and `test_text_conformance` (the Unicode conformance files are not downloaded). `test_script` passes with 15 shells installed, including `rc` behind an unrelated npm tool of the same name on `PATH`. Also run by hand: `test_aot_native` (new family case) and `ctest -R script_aot` 3/3 (labels `slow`, `fuzz`). Not run: the rest of label `slow`, label `emu`.
+
+| Added | Verified how | Not verified |
+|---|---|---|
+| Model AOT: `forge aot` plan mode and native mode ([aot-models.md](aot-models.md)) | Native. `test_aot` (bitwise against run-time plans, hostile and corrupt blobs, signed files), `test_aot_native` (label `slow`; shared library, embedded weights, executable against `forge run`), `fuzz_aot`. After the merges: 25 tiny models of every template family in both modes by hand, all bit-identical | Cross compilation, another compiler than the build's, Mach-O / PE output, any non-x86 or non-Linux host, models larger than the tiny ones |
+| Script AOT: `forge script --aot` ([aot.md](aot.md)) | Native: `test_script_aot`, `test_script_aot_native_sweep` (clang++ 23 and g++ 13 as the script compiler), `fuzz_script_aot` | Windows, macOS, FreeBSD, Android, iOS: never run. Cross-compiling in native mode |
+| Script language fixes (catch-clause matching, fatal errors, `.fsc` version 4), conformance sweep | Native: `test_script*`, `script_conformance` (each program also built as real C++23 and the outputs compared) | Other platforms through CI only |
+| Tokenizers (Hugging Face pipeline, SentencePiece BPE, Unigram, WordPiece, WordLevel) and chat templates (Jinja subset) | Native: `test_tokenizer` and `test_chat_template` against goldens produced by the `tokenizers` 0.23, `sentencepiece` 0.2 and `jinja2` packages; `chat_template_http`; fuzz targets. Text to ids to model output through `forge run --prompt` / `forge embed --text` in the family goldens | Tokenizers of full-size published models; the llama.cpp regex table and the model chat templates were written from memory |
+| Template families GPT-2, Gemma 1 / 2 / 3, Phi-3, BERT, ViT / CLIP / SigLIP, Whisper encoder; 24 spatial and encoder ops; embedding sessions; opset 3 | Native: `test_ops_ext`, `golden_tiny_{gpt2,gemma,phi3,bert,vit,whisper}` against float64 numpy references (HF and GGUF imports, f32 and q8_0); the same goldens on the CUDA and OpenCL mock drivers | Any published checkpoint; any real GPU |
+| `/v1/embeddings`, `forge embed --text` / `--text-pair`, opset enforcement per feature | Native: `serve_embeddings`, `test_modelfile` (`blueprint_opset_enforced_per_feature`, `shipped_templates_declare_their_opset`), the family goldens | — |
+| Importer fixes: Qwen2 bias template, RoPE scaling, tensor accounting, GGUF tensor types and `--codec` for GGUF, AWQ / GPTQ checkpoints, licence capture | Native: `golden_tiny_qwen2`, `golden_rope_scaling`, `golden_gguf_types` (against gguf-py), `golden_hf_quant`, `test_modelfile` | Published checkpoints |
+| GPU: portable OpenCL / Level Zero kernels, device MoE, kernel program cache, determinism mode, automatic device selection | **Mock drivers only** (the OpenCL mock compiles the generated OpenCL C as C and runs it). The Level Zero mock is handed the OpenCL C source (`FORGE_ZE_TEST_IMAGE=opencl-c`): this build has no SPIR-V image because `llvm-spirv` is not installed, so the SPIR-V path itself did not run. See the GPU entry below | Any real HIP, OpenCL, Level Zero or Vulkan device; the CUDA changes on the RTX 3090; Metal (MSL syntax check only) |
+| Gemma-2 q8_0 "OpenCL less accurate": found to be the exact path against the int8-activation path, golden re-conditioned ([gpu.md](gpu.md#quantised-matmul-exact-and-int8-activation-paths)) | Native CPU (`FORGE_CPU_INT8=0` bit-equal to the OpenCL mock), CUDA and OpenCL mocks; `test_cuda_hip` `exact_reference_check` on the CUDA, HIP and OpenCL mocks | Real devices |
+| SIMD kernel tables: SSE2 / SSE4.2, LoongArch LSX / LASX, POWER VSX, s390x, wasm SIMD128, MIPS MSA, 32-bit Arm NEON | x86 tables native and under `qemu-x86_64`; the others **`test_simd` only, under qemu-user or node**, built with zig. See the simd entry below | Real hardware of those architectures; any other test there |
+| AArch64 int8 quantised kernels (NEON, dotprod, SVE) | qemu-user (`qemu-aarch64`); off by default | Hardware; timing |
+| Raw intrinsic wrappers for eight ISA families (103,666 wrappers) | x86 natively (`test_simd_raw`); every wrapper of every architecture **compiled only** with `clang++-23 --target=<triple> -fsyntax-only` (`raw_intrinsics_cross`) | Execution of any non-x86 wrapper; MSVC; GCC beyond the recorded rejections |
+| OS layer, waves 1 to 4 (processes, files, IPC, system, hardware, network, services, reactor, limit groups, D-Bus client, X11 clipboard, proxy, appearance, SNTP) | Linux native (`test_os*`; D-Bus also against a real `dbus-daemon`, clipboard against Xvfb, ASan + UBSan and TSan on the wave 4 tests). Windows: MinGW and clang-cl + MSVC STL builds **under wine 9**. macOS, FreeBSD: **cross-compiled and linked with zig, never run**. Android: **compiled with NDK r27c, never run**. iOS: **not compiled**. Table: [os-parity.md](os-parity.md) | Real Windows, macOS, FreeBSD, Android, iOS; `cl.exe`; cgroup v2 on a v2 hierarchy |
+| Support modules: work-stealing scheduler, Tier A algorithms, linear algebra, profiler, reflection, vision (PNG / BMP / PNM, video bitstream parsing) | Native: `test_sched` (also TSan), `test_simd_tiera`, `test_linalg`, `test_prof`, `test_reflect`, `test_vision`; image fuzz targets | Perfetto / Tracy output in the tools; `perf_event`; hardware video decode; the C++26 reflection branch (never compiled) |
+| RPC: SAN rules, revocation, fine-grained permissions; spill encryption; `safe_join` in template and bundle paths; script `--mem-limit` and indirect-call capability analysis | Native: `test_rpc`, `test_rpc_tls` (OpenSSL 3.0), `test_memory`, `test_script_security` | Other TLS stacks and platforms |
+| Install rules, CMake package, relocatable templates | Native: `install_consumer` | Other platforms |
+| CI workflow: emulation rows, wasm-simd, cross-zig, perf, repro, fuzz, whole-suite sanitizer jobs; SBOM (SPDX, CycloneDX); coverage table | The workflow has **never run on GitHub**. Checked here: it parses as YAML, every ctest name, label and build target it names exists in a clang 23 build tree, and the three copies are one file (`ci_workflow_copies`). `sbom_spdx`, `coverage_table`, `docs_links` pass | Every job on a runner; the apt package names for loongarch64 / mips64el cross compilers and `llvm-toolchain-noble-23` |
+| NOTICE / SBOM: attribution of derived data | Licence statements read from clang 23's headers and from unicode.org on this day | The licence of `rvv-intrinsic-doc` (recorded as not established); the WHATWG / vendor-table statements |
+
+Sanitizers on this day: after the last merge, clang 23 `-DFORGE_SANITIZE=ON` (ASan + UBSan, leak detection on) over `test_tokenizer`, `test_modelfile`, `test_chat_template`, `test_ops_ext`, `test_aot`, the gpt2 / gemma / phi3 / bert / llama goldens with the sanitized `forge`, and `serve_embeddings` with the sanitized `forge-serve`: no report. The whole-suite ASan run and the TSan run of the threaded suites that the workflow defines were last done before the final merges (see [testing.md](testing.md)); `test_sched`, `test_simd_tiera`, `test_linalg`, `test_prof`, `test_vision`, `test_reflect`, `test_script_aot` and the `test_os*` suites were not re-run under a sanitizer on the merged tree.
+
+Environment notes for reproducing the run: Python packages numpy, safetensors, onnx, cryptography, gguf, tokenizers,
+sentencepiece; `llvm-spirv` absent; shells found for the script emit goldens: sh, bash, zsh, dash, ash, ksh, mksh, yash, posh, fish, tcsh, csh, xonsh, elvish, rc.
+
 ### 2026-11-12 (simd tables for more architectures; emulation only)
 New Tier P backend `vec_gn.hpp` and kernel tables `sse2`, `sse4.2`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa` and
 (opt-in) 32-bit Arm `neon`. Only `test_simd` (7 cases: detection, tails, two ULP sweeps, special values, two oracle
@@ -123,8 +164,6 @@ than x86_64.
   results; that backend calls `bsel.v` directly.
 - Not done: any other test on these architectures; MSVC, Apple clang, NDK and FreeBSD builds of the new code (CI
   will be the first); the wasm, 32-bit Arm and 32-bit x86 CMake branches; a z14-only s390x CPU model.
-
-Newest first. Results are from the date given; later code may differ.
 
 ### 2026-11-12 (GPU backend parity work; mock drivers only, no hardware)
 Linux x86_64, clang 23, no GPU. Everything below ran against the mock drivers (`tests/mock_cuda.c` as CUDA and HIP,
