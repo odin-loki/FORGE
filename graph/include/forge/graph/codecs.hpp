@@ -21,8 +21,8 @@ struct codec {
 };
 
 namespace detail {
-inline void enc_f32(const float* x, std::size_t n, u8* o) { std::memcpy(o, x, n * 4); }
-inline void dec_f32(const u8* i, std::size_t n, float* x) { std::memcpy(x, i, n * 4); }
+inline void enc_f32(const float* x, std::size_t n, u8* o) { if (n) std::memcpy(o, x, n * 4); }   // n == 0: the pointers may be null (an empty tensor), which memcpy must not be given
+inline void dec_f32(const u8* i, std::size_t n, float* x) { if (n) std::memcpy(x, i, n * 4); }
 inline void enc_f16(const float* x, std::size_t n, u8* o) { for (std::size_t i = 0; i < n; ++i) { u16 b = f16(x[i]).bits; std::memcpy(o + 2 * i, &b, 2); } }
 inline void dec_f16(const u8* in, std::size_t n, float* x) { for (std::size_t i = 0; i < n; ++i) { u16 b; std::memcpy(&b, in + 2 * i, 2); x[i] = float(f16::from_bits(b)); } }
 inline void enc_bf16(const float* x, std::size_t n, u8* o) { for (std::size_t i = 0; i < n; ++i) { u16 b = bf16(x[i]).bits; std::memcpy(o + 2 * i, &b, 2); } }
