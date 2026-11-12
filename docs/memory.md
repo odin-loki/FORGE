@@ -29,7 +29,7 @@ Code: `core/include/forge/core/memory.hpp` (namespace `forge::mem`, header-only)
 | `budget::set_limit`, `set_soft_fraction`, `stats()` | Limit, watermark, counters (`reservations`, `denials`, `waits`, `evictions`, `evicted_bytes`, `peak`, `by_tag`) |
 | `governor::watch_pressure()` | Subscribe to `os::memory_pressure`: moderate trims every pool to its soft watermark, critical drops every cache. Off with `FORGE_MEM_PRESSURE=0` |
 | `budget_resource(budget, tag, upstream)` | `std::pmr::memory_resource` that charges a budget and throws `out_of_memory` past the limit. Alignment goes straight to the upstream (default `new_delete_resource`) |
-| `spill_store(dir)` | Numbered files for evicted blobs: `put` (returns 0 when over `FORGE_MEM_SPILL_MAX`), `take` (reads and deletes), `drop`, `bytes()`. Removes its files on destruction |
+| `spill_store(dir)` | Numbered files for evicted blobs: `put` (returns 0 when over `FORGE_MEM_SPILL_MAX`), `take` (reads and deletes), `drop`, `bytes()`. Removes its files on destruction. Files are encrypted and authenticated (`encrypted()`; see below) |
 | `spawn_leased(budget, spec, bytes, tag, wait)` | Reserve `bytes`, start an `os::child` with that as its memory cap, return a `leased_child` that releases the lease when the child is reaped |
 | `parse_size`, `format_size`, `detect_host_limits()` | `"6G"`, `"512M"`, `"1.5GiB"`, `"75%"`; physical, available, cgroup and `RLIMIT_AS` figures |
 
@@ -49,7 +49,7 @@ The detected limit is the smallest of physical RAM, the tightest cgroup limit fo
 | Batch scheduler: running KV | Reports live KV bytes each step with `set_usage("kv", ...)` |
 | Batch scheduler: admission control | Before admitting a queued request it projects the cost from the largest KV size seen per request. If that crosses the soft watermark it evicts prefix-cache entries one at a time (least recently used first), then leaves the request queued. At least one request always runs, so the queue drains. Output is identical, only less parallel. Counted in `deferred` |
 | Batch scheduler: prefix KV cache | Registered as a cache (priority 10). An eviction request from the budget or the pressure response drops the whole prefix cache at the next scheduler step |
-| Prefix KV spill | With `batch_options::spill` set (`forge-serve --kv-spill`), an evicted prefix is saved to the `spill_store` (`session::save_prefix`, up to `spill_entries`, default 64) instead of dropped. A prompt that shares a spilled prefix reads it back (`session::load_prefix`) and uses it like an in-memory hit, so logits are bit-identical to recomputing. If the store is full the prefix is dropped |
+| Prefix KV spill | With `batch_options::spill` set (`forge-serve --kv-spill`), an evicted prefix is saved to the `spill_store` (`session::save_prefix`, up to `spill_entries`, default 64) instead of dropped. A prompt that shares a spilled prefix reads it back (`session::load_prefix`) and uses it like an in-memory hit, so logits are bit-identical to recomputing. If the store is full the prefix is dropped. A spill file that cannot be read back or fails authentication is discarded and the prefix recomputed (`batch_stats::prefix_reload_failures`) |
 | `forge-serve` backpressure | `--max-queue N` rejects new requests with 503 and `Retry-After: 1` once N are waiting. `out_of_memory` or `std::bad_alloc` while handling a request returns 503 |
 | Paged KV | `session_options.page_rows` (default 256) grows the KV cache a page at a time |
 | Text library, mobile queues | Collators and encoder tables lease from `host` (tag `text`); mobile event queues allocate through `budget_resource` (tag `mobile`) |
@@ -73,7 +73,7 @@ Tested with mock drivers (`test_gpu_memory_{cuda,hip,opencl,ze}_mock`) and on Me
 ## Observability
 - `forge info` prints physical RAM, available RAM, any cgroup limit and usage, any `RLIMIT_AS`, the `host` budget and soft watermark, and where the limit came from.
 - `forge-serve` prints the memory budget (or `off`) at startup.
-- `GET /metrics` adds, per pool, `forge_mem_limit_bytes`, `forge_mem_used_bytes`, `forge_mem_peak_bytes`, `forge_mem_cache_bytes`, the counters `forge_mem_reservations_total`, `forge_mem_denials_total`, `forge_mem_waits_total`, `forge_mem_evictions_total`, `forge_mem_evicted_bytes_total`, and `forge_mem_used_bytes_by_tag{pool,tag}`. It also adds `forge_mem_pressure_events_total` and the scheduler metrics `forge_queue_waiting`, `forge_queue_active`, `forge_admission_deferred_total`, `forge_rejected_total`, `forge_kv_evictions_total`, `forge_kv_spills_total`, `forge_kv_reloads_total` and `forge_kv_spilled` (prefixes on disk).
+- `GET /metrics` adds, per pool, `forge_mem_limit_bytes`, `forge_mem_used_bytes`, `forge_mem_peak_bytes`, `forge_mem_cache_bytes`, the counters `forge_mem_reservations_total`, `forge_mem_denials_total`, `forge_mem_waits_total`, `forge_mem_evictions_total`, `forge_mem_evicted_bytes_total`, and `forge_mem_used_bytes_by_tag{pool,tag}`. It also adds `forge_mem_pressure_events_total` and the scheduler metrics `forge_queue_waiting`, `forge_queue_active`, `forge_admission_deferred_total`, `forge_rejected_total`, `forge_kv_evictions_total`, `forge_kv_spills_total`, `forge_kv_reloads_total`, `forge_kv_reload_failures_total` (spill files refused or unreadable) and `forge_kv_spilled` (prefixes on disk).
 
 ## Configuration
 | Setting | Default | Effect |
@@ -85,6 +85,7 @@ Tested with mock drivers (`test_gpu_memory_{cuda,hip,opencl,ze}_mock`) and on Me
 | `FORGE_MEM_PRESSURE` | on | `0` ignores OS pressure signals |
 | `FORGE_MEM_SPILL_DIR` | `<tmp>/forge-spill-<pid>` | Spill directory |
 | `FORGE_MEM_SPILL_MAX` | unlimited | Maximum bytes in the spill store |
+| `FORGE_MEM_SPILL_ENCRYPT` | on | `0` (or `off`, `false`, `no`) writes spill files in plain form. On: each file is `"FSP1"`, a 16-byte tag and the blob sealed with XChaCha20-Poly1305 (Monocypher) under a random 32-byte key made per `spill_store`, held only in memory (`os::locked_buffer`: locked and kept out of core dumps where the OS allows, wiped on destruction). The nonce is 16 random bytes per store plus the file's number; the number and the blob length are authenticated, so `take` throws `errc::integrity_error` for a modified, truncated, extended or swapped file. File sizes and counts are not hidden. Costs one extra copy of the blob and one ChaCha20-Poly1305 pass (portable C, not SIMD) per spill and per reload; not benchmarked |
 | `forge-serve --mem-limit` | env | Same values as `FORGE_MEM_LIMIT`; takes priority |
 | `forge-serve --max-queue N` | `0` (no cap) | Reject with 503 once N requests wait |
 | `forge-serve --kv-spill` | off | Spill evicted prefix KV to disk and reload it on a hit |
