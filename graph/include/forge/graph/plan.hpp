@@ -47,11 +47,33 @@ struct state_store {
         if (c == kv_codec::f32) return xs;
         return {xs[0], xs[1], kv_head_words(xs[2], c)};
     }
+    // Slot layout checks. Every plan of a session (one per sequence-length bucket, plus precompiled ones) shares
+    // this store, and the executor writes and reads a slot through raw pointers sized from its own graph's shapes.
+    // The graph comes from the model file's blueprint, which is untrusted: a blueprint whose state row shape
+    // depends on `seq`, that names one slot in two nodes, or that uses one slot both as appended rows and as
+    // recurrent state would otherwise make one plan write past a buffer another plan allocated. So a slot's layout
+    // is fixed by its first user, and every later user is checked against it: when a plan is lowered
+    // (lower_plan), again on every run (executor), and in ensure(). aot::detail::check_state is the same rule for
+    // precompiled plans.
+    static bool same_rows(const slot& sl, const shape_t& ps) {
+        return !ps.empty() && ps.size() == sl.buf.shape.size() && std::equal(ps.begin() + 1, ps.end(), sl.buf.shape.begin() + 1);
+    }
+    // rows of logical shape `xs` are about to be appended to slot `name`
+    static void check_append(const std::string& name, const slot& sl, const shape_t& xs) {
+        if (sl.fixed) raise(errc::format_error, "state slot '{}' is recurrent state, a plan appends rows to it", name);
+        if (xs.empty() || (sl.codec != kv_codec::f32 && xs.size() != 3)) raise(errc::format_error, "state slot '{}' cannot take rows of rank {}", name, xs.size());
+        if (sl.capacity && !same_rows(sl, physical(xs, sl.codec))) raise(errc::format_error, "state slot '{}' holds rows of another shape than the plan appends", name);
+    }
+    // slot `name` is about to be used as fixed-size recurrent state (state_op)
+    static void check_fixed(const std::string& name, const slot& sl) {
+        if (!sl.fixed && sl.capacity) raise(errc::format_error, "state slot '{}' holds appended rows, a plan uses it as recurrent state", name);
+    }
     i64 reserved_rows() const { i64 r = 0; for (auto& [k, s] : slots) r += s.capacity; return r; }
     std::size_t bytes() const { std::size_t b = 0; for (auto& [k, s] : slots) b += s.buf.data.size() * sizeof(float); return b; }
     // make room for `rows` rows in `sl` (row shape taken from `row_shape`)
     void ensure(slot& sl, const shape_t& row_shape, i64 rows) {
         if (rows > capacity) raise(errc::out_of_memory, "state exceeds context capacity {}", capacity);
+        if (sl.fixed || (sl.capacity && !same_rows(sl, row_shape))) raise(errc::format_error, "state slot holds rows of another layout");
         if (rows <= sl.capacity) return;
         i64 want = page_rows > 0 ? std::min(capacity, (rows + page_rows - 1) / page_rows * page_rows) : capacity;
         shape_t cap = row_shape; cap[0] = want;
@@ -63,7 +85,7 @@ struct state_store {
     }
     std::map<std::string, shape_t> shapes() const {
         std::map<std::string, shape_t> r;
-        for (auto& [k, s] : slots) { shape_t sh = s.buf.shape; sh[0] = s.len; r[k] = sh; }
+        for (auto& [k, s] : slots) { if (s.buf.shape.empty()) continue; shape_t sh = s.buf.shape; sh[0] = s.len; r[k] = sh; }   // (a slot named by a rejected plan has no buffer)
         return r;
     }
     void reset() { for (auto& [k, s] : slots) s.len = 0; }
@@ -503,6 +525,7 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
         q_budget = v > 0 ? std::size_t(v * mul) : 0;
     }
     // state slots read as attention values (input 2): they take the store's value codec in mixed modes (k8v4)
+    std::set<std::string> state_names;   // one node per slot
     std::set<value_id> value_slots;
     for (std::size_t i = 0; i < G.size(); ++i) {
         auto& n = G.nodes()[i];
@@ -528,10 +551,13 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
         else if (n.kind == node_kind::constant) v.data = n.constant->data.data();
         else if (n.kind == node_kind::state_append) {
             if (!st) raise(errc::invalid_argument, "graph uses state slot '{}' but no state store given", n.name);
+            if (!state_names.insert(n.name).second) raise(errc::format_error, "state slot '{}' is used by two nodes", n.name);
             auto& sl = st->slots[n.name];
             const auto& xs = G.at(n.inputs[0]).shape;
+            if (xs.empty() || n.shape.empty()) raise(errc::format_error, "state slot '{}' cannot take scalar rows", n.name);
+            if (!sl.capacity && !sl.fixed) sl.codec = st->codec_for(xs, value_slots.count(value_id(i)) != 0);
+            state_store::check_append(n.name, sl, xs);   // the slot may exist already: another plan of the session made it
             if (n.shape[0] > st->capacity) raise(errc::out_of_memory, "state slot '{}' exceeds capacity {}", n.name, st->capacity);
-            if (!sl.capacity) sl.codec = st->codec_for(xs, value_slots.count(value_id(i)) != 0);
             auto ps = state_store::physical(xs, sl.codec);
             st->ensure(sl, ps, std::max<i64>(n.shape[0], 1));
             v.shape = state_store::physical(n.shape, sl.codec);
@@ -552,6 +578,8 @@ inline void lower_plan(plan& pl, state_store* st, const pass_options& po, const 
         if (n.kind == node_kind::input) p->inputs[n.name] = value_id(i);
         if (n.kind == node_kind::state_op) {
             if (!st) raise(errc::invalid_argument, "graph uses state slot '{}' but no state store given", n.name);
+            if (!state_names.insert(n.name).second) raise(errc::format_error, "state slot '{}' is used by two nodes", n.name);
+            if (auto it = st->slots.find(n.name); it != st->slots.end()) state_store::check_fixed(n.name, it->second);
             for (auto in : n.inputs)
                 if (G.at(in).kind == node_kind::state_append)
                     raise(errc::unsupported, "state slot '{}' feeds state_op '{}'", G.at(in).name, n.name);
@@ -700,6 +728,7 @@ private:
             auto it = st_->slots.find(p_.g.at(s.out).name);
             if (it == st_->slots.end() || it->second.len == 0) return false;
             if (s.kind == 1 && (it->second.codec != kv_codec::f32 || it->second.len + p_.views[s.in[0]].shape[0] > it->second.capacity)) return false;
+            if (s.kind == 1 ? (it->second.fixed || !state_store::same_rows(it->second, p_.views[s.in[0]].shape)) : !it->second.fixed) return false;   // run() raises
         }
         return true;
     }
@@ -784,6 +813,7 @@ private:
                 std::vector<shape_t> shs; for (auto& v : ins) shs.push_back(v.shape);
                 auto ss = state_ops::state_shape(fn, shs);
                 auto& sl = st_->slots[node.name];
+                state_store::check_fixed(node.name, sl);   // not a slot another plan appends rows to
                 if (sl.len == 0 || sl.buf.shape != ss) {   // fresh: zeros (in place when the shape is unchanged, so a device copy stays keyed)
                     host_ops_ = true;
                     if (sl.buf.shape == ss && !sl.buf.data.empty()) { std::fill(sl.buf.data.begin(), sl.buf.data.end(), 0.f); if (h) h->host_wrote(sl.buf.data.data(), sl.buf.data.size()); }
@@ -812,6 +842,9 @@ private:
                 auto& node = p_.g.at(s.out);
                 auto& sl = st_->slots[node.name];
                 i64 rows = ins[0].shape[0];
+                // The slot was laid out by whichever plan used it first (and may since have been replaced by
+                // copy_prefix / load_prefix): never write rows of this plan's shape into a buffer of another.
+                state_store::check_append(node.name, sl, ins[0].shape);
                 auto ps = state_store::physical(ins[0].shape, sl.codec);
                 i64 row = numel(ps) / std::max<i64>(rows, 1);
                 if (sl.len + rows > sl.capacity) host_ops_ = true;   // the slot grows: its buffer moves

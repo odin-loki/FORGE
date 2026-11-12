@@ -71,8 +71,8 @@ std::int64_t clen(const Value& c) {
 Value elem(Interp& in, const Value& c, std::int64_t i) {
     if (i < 0 || i >= clen(c)) in.raise("IndexError", "dereferencing an iterator out of range (end() or past it)");
     if (auto* l = as<List>(c)) return l->items[std::size_t(i)];
-    if (auto* m = as<Map>(c)) { auto& [k, v] = m->entries[std::size_t(i)]; return obj(make<List>(std::vector<Value>{k, v})); }
-    if (auto* s = as<String>(c)) return sv(std::string(1, s->s[std::size_t(i)]));
+    if (auto* m = as<Map>(c)) { auto& [k, v] = m->entries[std::size_t(i)]; if (m->is_set) return k; return obj(make<List>(std::vector<Value>{k, v})); }
+    if (auto* s = as<String>(c)) return Interp::new_char(s->s[std::size_t(i)]);
     return Nil{};
 }
 Value it(const Value& c, std::int64_t i) { return obj(make<PosIt>(c, i)); }
@@ -101,7 +101,7 @@ Value Interp::copy_value(const Value& v, int depth) {
     if (o == moved_sentinel()) raise("BorrowError", "use of a moved-from value");
     if (o->own == Own::Unique) { if (strict || depth > 0) raise("BorrowError", "std::unique_ptr cannot be copied; use std::move"); return v; }
     if (o->own == Own::Shared) return v;
-    if (auto* s = dynamic_cast<String*>(o)) return new_string(s->s);
+    if (auto* s = dynamic_cast<String*>(o)) { Value c = new_string(s->s); as<String>(c)->ch = s->ch; return c; }
     if (auto* l = dynamic_cast<List*>(o)) {
         auto n = make<List>(); n->items.reserve(l->items.size());
         for (auto& x : l->items) n->push(copy_value(x, depth + 1));
@@ -179,6 +179,12 @@ void Interp::stream_write(Ostream& os, const Value& v) {
         else if (m->kind == "defaultfloat") { os.fixed = false; os.precision = -1; }
         else if (m->kind == "setprecision") os.precision = int(m->n);
         else if (m->kind == "setw") os.width = int(m->n);
+        else if (m->kind == "left") os.left = true;
+        else if (m->kind == "right") os.left = false;
+        else if (m->kind == "setfill") os.fill = char(m->n);
+        else if (m->kind == "hex") os.base = 16;
+        else if (m->kind == "oct") os.base = 8;
+        else if (m->kind == "dec") os.base = 10;
         return;
     }
     std::string s;
@@ -186,8 +192,12 @@ void Interp::stream_write(Ostream& os, const Value& v) {
     else if (auto* d = std::get_if<double>(&v)) {
         if (os.fixed) s = std::format("{:.{}f}", *d, os.precision < 0 ? 6 : os.precision);
         else s = std::format("{:.{}g}", *d, os.precision < 0 ? 6 : std::max(1, os.precision));
-    } else s = str(v);
-    if (os.width > 0 && int(s.size()) < os.width) s = std::string(std::size_t(os.width) - s.size(), ' ') + s;
+    } else if (auto* i = std::get_if<std::int64_t>(&v); i && os.base != 10) s = os.base == 16 ? std::format("{:x}", *i) : std::format("{:o}", *i);
+    else s = str(v);
+    if (os.width > 0 && int(s.size()) < os.width) {
+        std::string pad(std::size_t(os.width) - s.size(), os.fill);
+        s = os.left ? s + pad : pad + s;
+    }
     os.width = 0;
     if (os.err) { std::fwrite(s.data(), 1, s.size(), stderr); std::fflush(stderr); }
     else sh->out(s);
@@ -219,18 +229,29 @@ std::string cpp_format(Interp& in, const std::string& fmt, const std::vector<Val
         char c = fmt[i];
         if (c == '{') {
             if (i + 1 < fmt.size() && fmt[i + 1] == '{') { out += '{'; ++i; continue; }
-            auto close = fmt.find('}', i);
-            if (close == std::string::npos) in.raise("ValueError", "std::format: unmatched '{'");
+            std::size_t close = i + 1; int depth = 0;   // the matching '}': a spec may nest {} for a dynamic width / precision
+            for (; close < fmt.size(); ++close) { if (fmt[close] == '{') ++depth; else if (fmt[close] == '}' && depth-- == 0) break; }
+            if (close >= fmt.size()) in.raise("ValueError", "std::format: unmatched '{'");
             std::string body = fmt.substr(i + 1, close - i - 1), spec;
             auto colon = body.find(':');
             if (colon != std::string::npos) { spec = body.substr(colon + 1); body = body.substr(0, colon); }
-            std::size_t idx;
-            if (!body.empty()) {
-                std::size_t n = 0; auto [p, ec] = std::from_chars(body.data(), body.data() + body.size(), n);
-                if (ec != std::errc{} || p != body.data() + body.size()) in.raise("ValueError", "std::format: bad argument index '" + body + "'");
-                idx = first + n;
-            } else idx = next++;
+            auto arg_index = [&](const std::string& id) -> std::size_t {
+                if (id.empty()) return next++;
+                std::size_t n = 0; auto [p, ec] = std::from_chars(id.data(), id.data() + id.size(), n);
+                if (ec != std::errc{} || p != id.data() + id.size()) in.raise("ValueError", "std::format: bad argument index '" + id + "'");
+                return first + n;
+            };
+            std::size_t idx = arg_index(body);
             if (idx >= args.size()) in.raise("ValueError", "std::format: missing argument for '{" + body + "}'");
+            for (auto o = spec.find('{'); o != std::string::npos; o = spec.find('{')) {   // {:{}} / {:.{}f} / {:{1}}: an int argument
+                auto c2 = spec.find('}', o);
+                if (c2 == std::string::npos) in.raise("ValueError", "std::format: unmatched '{' in a format spec");
+                std::size_t wi = arg_index(spec.substr(o + 1, c2 - o - 1));
+                if (wi >= args.size()) in.raise("ValueError", "std::format: missing width / precision argument");
+                auto* w = std::get_if<std::int64_t>(&args[wi]);
+                if (!w || *w < 0) in.raise("ValueError", "std::format: a width / precision argument must be a non-negative int");
+                spec = spec.substr(0, o) + std::to_string(*w) + spec.substr(c2 + 1);
+            }
             out += format_one(in, args[idx], spec);
             i = close;
         } else if (c == '}') {
@@ -277,7 +298,22 @@ void install_cpp_std(Shared& sh) {
     // ---- iostream / print / format
     { auto o = make<Ostream>(false); B["std::cout"] = obj(o); B["stdout"] = obj(o); auto e = make<Ostream>(true); B["std::cerr"] = obj(e); B["stderr"] = obj(e); B["std::clog"] = obj(make<Ostream>(true)); }
     B["std::endl"] = sv("\n"); B["std::flush"] = sv("");
-    for (const char* m : {"boolalpha", "noboolalpha", "fixed", "defaultfloat"}) B[std::string("std::") + m] = obj(make<Manip>(m, 0));
+    for (const char* m : {"boolalpha", "noboolalpha", "fixed", "defaultfloat", "left", "right", "hex", "oct", "dec"}) B[std::string("std::") + m] = obj(make<Manip>(m, 0));
+    def("std::setfill", 1, 1, [](Interp& in, Args& a) -> Value {
+        auto* s = as<String>(a[0]); if (!s || s->s.size() != 1) in.raise("TypeError", "std::setfill expects a character");
+        return obj(make<Manip>("setfill", std::int64_t(static_cast<unsigned char>(s->s[0]))));
+    });
+    // <functional> comparison and arithmetic function objects: std::greater<int>() / std::greater<>() / std::greater{}
+    auto functor = [&](const char* n, Op op) {
+        def(std::string("std::") + n, 0, 2, [n = std::string("std::") + n, op](Interp& in, Args& a) -> Value {
+            if (a.empty()) return in.sh->builtins.at(n);
+            if (a.size() != 2) in.raise("TypeError", n + " takes two arguments");
+            return in.binary(op, a[0], a[1]);
+        });
+    };
+    functor("less", Op::Lt); functor("greater", Op::Gt); functor("less_equal", Op::Le); functor("greater_equal", Op::Ge);
+    functor("equal_to", Op::Eq); functor("not_equal_to", Op::Ne); functor("plus", Op::Add); functor("minus", Op::Sub);
+    functor("multiplies", Op::Mul); functor("divides", Op::Div); functor("modulus", Op::Mod);
     def("std::setprecision", 1, 1, [](Interp& in, Args& a) -> Value { return obj(make<Manip>("setprecision", iv(in, a[0], "setprecision"))); });
     def("std::setw", 1, 1, [](Interp& in, Args& a) -> Value { return obj(make<Manip>("setw", iv(in, a[0], "setw"))); });
     auto printer = [&](const std::string& name, bool nl) {
@@ -331,8 +367,20 @@ void install_cpp_std(Shared& sh) {
         if (ec != std::errc{}) in.raise("ValueError", n + ": invalid_argument ('" + s + "')");
         return v;
     });
-    def("std::string", 0, 2, [](Interp& in, Args& a) -> Value {
+    def("std::string", 0, 3, [](Interp& in, Args& a) -> Value {
         if (a.empty()) return sv("");
+        if (a.size() >= 2 && as<PosIt>(a[0])) {   // std::string(first, last)
+            auto sp = span(in, a[0], a[1], "std::string"); std::string out;
+            for (std::int64_t i = sp.lo; i < sp.hi; ++i) out += in.str(elem(in, sp.c, i));
+            return sv(std::move(out));
+        }
+        if (auto* s = as<String>(a[0]); s && !s->ch && a.size() >= 2) {   // std::string(str, pos[, n]): the substring
+            auto pos = iv(in, a[1], "std::string");
+            if (pos < 0 || std::size_t(pos) > s->s.size()) in.raise("IndexError", "std::string: position out of range");
+            auto n = a.size() > 2 ? iv(in, a[2], "std::string") : -1;
+            return sv(s->s.substr(std::size_t(pos), n < 0 ? std::string::npos : std::size_t(n)));
+        }
+        if (a.size() == 3) in.raise("TypeError", "std::string(a, b, c) expects (string, pos, count)");
         if (a.size() == 2) { auto n = iv(in, a[0], "std::string"); if (n < 0) in.raise("ValueError", "std::string: negative count"); return sv(std::string(std::size_t(n), sref(in, a[1], "std::string").empty() ? ' ' : sref(in, a[1], "std::string")[0])); }
         if (auto* s = as<String>(a[0])) return sv(s->s);
         return sv(in.str(a[0]));
@@ -363,7 +411,11 @@ void install_cpp_std(Shared& sh) {
     def("std::atan2", 2, 2, [](Interp& in, Args& a) -> Value { return std::atan2(dv(in, a[0], "atan2"), dv(in, a[1], "atan2")); });
     def("std::hypot", 2, 2, [](Interp& in, Args& a) -> Value { return std::hypot(dv(in, a[0], "hypot"), dv(in, a[1], "hypot")); });
     def("std::fmod", 2, 2, [](Interp& in, Args& a) -> Value { return std::fmod(dv(in, a[0], "fmod"), dv(in, a[1], "fmod")); });
+    def("std::nan", 0, 1, [](Interp&, Args&) -> Value { return std::numeric_limits<double>::quiet_NaN(); });
     def("std::isnan", 1, 1, [](Interp& in, Args& a) -> Value { return std::isnan(dv(in, a[0], "isnan")); });
+    def("std::lround", 1, 1, [](Interp& in, Args& a) -> Value { return std::int64_t(std::llround(dv(in, a[0], "lround"))); });
+    B["std::llround"] = B["std::lround"];
+    def("std::isfinite", 1, 1, [](Interp& in, Args& a) -> Value { return std::isfinite(dv(in, a[0], "isfinite")); });
     def("std::isinf", 1, 1, [](Interp& in, Args& a) -> Value { return std::isinf(dv(in, a[0], "isinf")); });
     def("std::abs", 1, 1, [](Interp& in, Args& a) -> Value {
         if (auto* i = std::get_if<std::int64_t>(&a[0])) { if (*i == std::numeric_limits<std::int64_t>::min()) in.raise("OverflowError", "std::abs overflow"); return *i < 0 ? -*i : *i; }
@@ -390,7 +442,7 @@ void install_cpp_std(Shared& sh) {
     auto ch = [&](const std::string& n, int (*f)(int), bool to_char) {
         def("std::" + n, 1, 1, [f, to_char, n](Interp& in, Args& a) -> Value {
             int c = as<String>(a[0]) ? (sref(in, a[0], n.c_str()).empty() ? 0 : (unsigned char)sref(in, a[0], n.c_str())[0]) : int(iv(in, a[0], n.c_str()));
-            int r = f(c); if (to_char) return sv(std::string(1, char(r))); return r != 0;
+            int r = f(c); if (to_char) return Interp::new_char(char(r)); return r != 0;
         });
     };
     ch("isdigit", [](int c) { return std::isdigit(c); }, false); ch("isalpha", [](int c) { return std::isalpha(c); }, false);
@@ -405,6 +457,10 @@ void install_cpp_std(Shared& sh) {
             if (is_nil(cmp)) return in.compare(x, y) < 0;
             Args c{x, y}; return Interp::truthy(in.call(cmp, c));
         };
+    };
+    auto put_out2 = [](Interp& in, const Value& out, std::int64_t k, Value v) {
+        auto* ob = as<PosIt>(out); auto& l = lref(in, ob->c, "std::transform"); auto o = std::size_t(ob->i + k);
+        if (o < l.items.size()) l.items[o] = std::move(v); else l.push(std::move(v));
     };
     for (std::string pre : {"std::", "std::ranges::"}) {
         def(pre + "sort", 1, 3, [with_cmp](Interp& in, Args& a) -> Value {
@@ -475,7 +531,15 @@ void install_cpp_std(Shared& sh) {
             while (lo < hi) { auto mid = lo + (hi - lo) / 2; int c = in.compare(elem(in, s.c, mid), a[nx]); if (c == 0) return true; if (c < 0) lo = mid + 1; else hi = mid; }
             return false;
         });
-        def(pre + "transform", 3, 4, [](Interp& in, Args& a) -> Value {   // transform(b, e, out_b, f): out may be the same range
+        def(pre + "transform", 3, 5, [put_out2](Interp& in, Args& a) -> Value {   // transform(b, e, out_b, f): out may be the same range
+            if (a.size() == 5) {   // transform(first1, last1, first2, out, f(x, y))
+                Span s = span(in, a[0], a[1], "std::transform"); auto* o2 = as<PosIt>(a[2]);
+                if (!o2 || !as<PosIt>(a[3])) in.raise("TypeError", "std::transform needs (first1, last1, first2, out, fn)");
+                std::vector<Value> rs;
+                for (auto k = s.lo; k < s.hi; ++k) { Args c{elem(in, s.c, k), elem(in, o2->c, o2->i + (k - s.lo))}; rs.push_back(in.call(a[4], c)); }
+                for (std::size_t k = 0; k < rs.size(); ++k) put_out2(in, a[3], std::int64_t(k), rs[k]);
+                return it(as<PosIt>(a[3])->c, as<PosIt>(a[3])->i + std::int64_t(rs.size()));
+            }
             if (a.size() == 4) {
                 Span s = span(in, a[0], a[1], "std::transform"); auto* ob = as<PosIt>(a[2]); if (!ob) in.raise("TypeError", "std::transform: output must be an iterator (use v.begin())");
                 auto& out = lref(in, ob->c, "std::transform"); mutable_(in, out);
@@ -488,12 +552,134 @@ void install_cpp_std(Shared& sh) {
             in.raise("TypeError", "std::transform needs (begin, end, out, fn)");
         });
     }
-    def("std::accumulate", 3, 4, [](Interp& in, Args& a) -> Value {
-        Span s = span(in, a[0], a[1], "std::accumulate"); Value acc = a[2];
+    // ---- more of <algorithm> / <numeric>, in the iterator and the std::ranges:: form. Output iterators: an iterator
+    // into a container (elements are overwritten, then appended at its end) or std::back_inserter(v).
+    def("std::back_inserter", 1, 1, [](Interp& in, Args& a) -> Value { lref(in, a[0], "std::back_inserter"); return it(a[0], clen(a[0])); });
+    auto put_out = [](Interp& in, const Value& out, std::int64_t k, Value v, const char* w) {
+        auto* ob = as<PosIt>(out); if (!ob) in.raise("TypeError", std::string(w) + ": the output must be an iterator or std::back_inserter(v)");
+        auto& l = lref(in, ob->c, w); auto o = std::size_t(ob->i + k);
+        if (o < l.items.size()) l.items[o] = std::move(v); else l.push(std::move(v));
+    };
+    for (std::string pre : {"std::", "std::ranges::"}) {
+        def(pre + "is_sorted", 1, 3, [](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::is_sorted");
+            for (auto k = s.lo + 1; k < s.hi; ++k) {
+                Value x = elem(in, s.c, k), y = elem(in, s.c, k - 1);
+                if (a.size() > nx) { Args c{x, y}; if (Interp::truthy(in.call(a[nx], c))) return false; } else if (in.compare(x, y) < 0) return false;
+            }
+            return true;
+        });
+        def(pre + "find_if_not", 2, 3, [](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::find_if_not");
+            for (auto k = s.lo; k < s.hi; ++k) { Args c{elem(in, s.c, k)}; if (!Interp::truthy(in.call(a[nx], c))) return it(s.c, k); }
+            return it(s.c, s.hi);
+        });
+        for (bool upper : {false, true})
+            def(pre + (upper ? "upper_bound" : "lower_bound"), 2, 4, [upper](Interp& in, Args& a) -> Value {
+                std::size_t nx; Span s = range_args(in, a, nx, "std::lower_bound"); auto lo = s.lo, hi = s.hi;
+                while (lo < hi) {
+                    auto mid = lo + (hi - lo) / 2; Value e = elem(in, s.c, mid); bool go_right;
+                    if (a.size() > nx + 1) { Args c = upper ? Args{a[nx], e} : Args{e, a[nx]}; bool r = Interp::truthy(in.call(a[nx + 1], c)); go_right = upper ? !r : r; }
+                    else go_right = upper ? in.compare(e, a[nx]) <= 0 : in.compare(e, a[nx]) < 0;
+                    if (go_right) lo = mid + 1; else hi = mid;
+                }
+                return it(s.c, lo);
+            });
+        def(pre + "equal", 2, 4, [](Interp& in, Args& a) -> Value {
+            if (!as<PosIt>(a[0])) return in.equal(a[0], a[1]);
+            if (a.size() < 3 || !as<PosIt>(a[2])) in.raise("TypeError", "std::equal needs (first1, last1, first2)");
+            Span s = span(in, a[0], a[1], "std::equal"); auto* o = as<PosIt>(a[2]);
+            if (o->i + (s.hi - s.lo) > clen(o->c)) return false;
+            for (auto k = s.lo; k < s.hi; ++k) if (!in.equal(elem(in, s.c, k), elem(in, o->c, o->i + (k - s.lo)))) return false;
+            return true;
+        });
+        def(pre + "replace", 3, 4, [](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::replace"); auto& l = span_list(in, s, "std::replace"); mutable_(in, l);
+            for (auto k = s.lo; k < s.hi; ++k) if (in.equal(l.items[std::size_t(k)], a[nx])) l.items[std::size_t(k)] = in.copy_value(a[nx + 1]);
+            return Nil{};
+        });
+        def(pre + "copy", 2, 3, [put_out](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::copy");
+            std::vector<Value> xs; for (auto k = s.lo; k < s.hi; ++k) xs.push_back(in.copy_value(elem(in, s.c, k)));
+            for (std::size_t k = 0; k < xs.size(); ++k) put_out(in, a[nx], std::int64_t(k), xs[k], "std::copy");
+            return it(as<PosIt>(a[nx])->c, as<PosIt>(a[nx])->i + std::int64_t(xs.size()));
+        });
+        def(pre + "copy_if", 3, 4, [put_out](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::copy_if"); std::vector<Value> xs;
+            for (auto k = s.lo; k < s.hi; ++k) { Value e = elem(in, s.c, k); Args c{e}; if (Interp::truthy(in.call(a[nx + 1], c))) xs.push_back(in.copy_value(e)); }
+            for (std::size_t k = 0; k < xs.size(); ++k) put_out(in, a[nx], std::int64_t(k), xs[k], "std::copy_if");
+            return it(as<PosIt>(a[nx])->c, as<PosIt>(a[nx])->i + std::int64_t(xs.size()));
+        });
+        // remove / remove_if / unique move the kept elements to the front and return the new logical end (erase it)
+        for (int mode : {0, 1, 2})
+            def(pre + (mode == 0 ? "remove" : mode == 1 ? "remove_if" : "unique"), 1, 3, [mode](Interp& in, Args& a) -> Value {
+                std::size_t nx; Span s = range_args(in, a, nx, "std::remove"); auto& l = span_list(in, s, "std::remove"); mutable_(in, l);
+                auto w = s.lo;
+                for (auto k = s.lo; k < s.hi; ++k) {
+                    Value e = l.items[std::size_t(k)]; bool drop;
+                    if (mode == 0) drop = in.equal(e, a[nx]);
+                    else if (mode == 1) { Args c{e}; drop = Interp::truthy(in.call(a[nx], c)); }
+                    else if (w == s.lo) drop = false;
+                    else if (a.size() > nx) { Args c{l.items[std::size_t(w - 1)], e}; drop = Interp::truthy(in.call(a[nx], c)); }
+                    else drop = in.equal(l.items[std::size_t(w - 1)], e);
+                    if (!drop) l.items[std::size_t(w++)] = e;
+                }
+                return it(s.c, w);
+            });
+        def(pre + "rotate", 3, 3, [](Interp& in, Args& a) -> Value {
+            Span s = span(in, a[0], a[2], "std::rotate"); auto* m = as<PosIt>(a[1]); auto& l = span_list(in, s, "std::rotate"); mutable_(in, l);
+            if (!m || m->i < s.lo || m->i > s.hi) in.raise("ValueError", "std::rotate: the middle iterator is outside the range");
+            std::rotate(l.items.begin() + s.lo, l.items.begin() + m->i, l.items.begin() + s.hi);
+            return it(s.c, s.lo + (s.hi - m->i));
+        });
+        def(pre + "partition", 2, 3, [](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::partition"); auto& l = span_list(in, s, "std::partition"); mutable_(in, l);
+            std::vector<Value> yes, no;
+            for (auto k = s.lo; k < s.hi; ++k) { Args c{l.items[std::size_t(k)]}; (Interp::truthy(in.call(a[nx], c)) ? yes : no).push_back(l.items[std::size_t(k)]); }
+            auto w = s.lo; for (auto& x : yes) l.items[std::size_t(w++)] = x; auto mid = w; for (auto& x : no) l.items[std::size_t(w++)] = x;
+            return it(s.c, mid);
+        });
+        def(pre + "next_permutation", 1, 2, [](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::next_permutation"); auto& l = span_list(in, s, "std::next_permutation"); mutable_(in, l);
+            return std::next_permutation(l.items.begin() + s.lo, l.items.begin() + s.hi, [&](const Value& x, const Value& y) { return in.compare(x, y) < 0; });
+        });
+        def(pre + "minmax_element", 1, 2, [](Interp& in, Args& a) -> Value {
+            std::size_t nx; Span s = range_args(in, a, nx, "std::minmax_element"); auto lo = s.lo, hi = s.lo;
+            for (auto k = s.lo + 1; k < s.hi; ++k) { Value e = elem(in, s.c, k); if (in.compare(e, elem(in, s.c, lo)) < 0) lo = k; if (in.compare(e, elem(in, s.c, hi)) >= 0) hi = k; }
+            return obj(make<List>(std::vector<Value>{it(s.c, lo), it(s.c, s.lo == s.hi ? s.hi : hi)}));
+        });
+    }
+    def("std::erase", 2, 2, [](Interp& in, Args& a) -> Value {
+        auto& l = lref(in, a[0], "std::erase"); mutable_(in, l); auto before = l.items.size();
+        l.items.erase(std::remove_if(l.items.begin(), l.items.end(), [&](const Value& x) { return in.equal(x, a[1]); }), l.items.end());
+        return std::int64_t(before - l.items.size());
+    });
+    def("std::erase_if", 2, 2, [](Interp& in, Args& a) -> Value {
+        auto& l = lref(in, a[0], "std::erase_if"); mutable_(in, l); std::vector<Value> keep;
+        for (auto& x : l.items) { Args c{x}; if (!Interp::truthy(in.call(a[1], c))) keep.push_back(x); }
+        auto n = std::int64_t(l.items.size() - keep.size()); l.items = std::move(keep); return n;
+    });
+    def("std::partial_sum", 3, 3, [put_out](Interp& in, Args& a) -> Value {
+        Span s = span(in, a[0], a[1], "std::partial_sum"); std::vector<Value> xs; Value acc;
+        for (auto k = s.lo; k < s.hi; ++k) { acc = k == s.lo ? elem(in, s.c, k) : in.binary(Op::Add, acc, elem(in, s.c, k)); xs.push_back(acc); }
+        for (std::size_t k = 0; k < xs.size(); ++k) put_out(in, a[2], std::int64_t(k), xs[k], "std::partial_sum");
+        return it(as<PosIt>(a[2])->c, as<PosIt>(a[2])->i + std::int64_t(xs.size()));
+    });
+    def("std::inner_product", 4, 4, [](Interp& in, Args& a) -> Value {
+        Span s = span(in, a[0], a[1], "std::inner_product"); auto* o = as<PosIt>(a[2]); if (!o) in.raise("TypeError", "std::inner_product needs (first1, last1, first2, init)");
+        Value acc = a[3];
+        for (auto k = s.lo; k < s.hi; ++k) acc = in.binary(Op::Add, acc, in.binary(Op::Mul, elem(in, s.c, k), elem(in, o->c, o->i + (k - s.lo))));
+        return acc;
+    });
+    def("std::gcd", 2, 2, [](Interp& in, Args& a) -> Value { return std::gcd(iv(in, a[0], "std::gcd"), iv(in, a[1], "std::gcd")); });
+    def("std::lcm", 2, 2, [](Interp& in, Args& a) -> Value { return std::lcm(iv(in, a[0], "std::lcm"), iv(in, a[1], "std::lcm")); });
+    def("std::accumulate", 2, 4, [](Interp& in, Args& a) -> Value {   // std::reduce(first, last) starts from 0
+        Span s = span(in, a[0], a[1], "std::accumulate"); Value acc = a.size() > 2 ? a[2] : Value(std::int64_t(0));
         for (auto k = s.lo; k < s.hi; ++k) { if (a.size() > 3) { Args c{acc, elem(in, s.c, k)}; acc = in.call(a[3], c); } else acc = in.binary(Op::Add, acc, elem(in, s.c, k)); }
         return acc;
     });
     B["std::reduce"] = B["std::accumulate"];
+    B["std::ranges::max"] = B["std::max"]; B["std::ranges::min"] = B["std::min"];
     def("std::distance", 2, 2, [](Interp& in, Args& a) -> Value { Span s = span(in, a[0], a[1], "std::distance"); return as<PosIt>(a[1])->i - as<PosIt>(a[0])->i; (void)s; });
     def("std::next", 1, 2, [](Interp& in, Args& a) -> Value { auto* p = as<PosIt>(a[0]); if (!p) in.raise("TypeError", "std::next needs an iterator"); return it(p->c, p->i + (a.size() > 1 ? iv(in, a[1], "next") : 1)); });
     def("std::prev", 1, 2, [](Interp& in, Args& a) -> Value { auto* p = as<PosIt>(a[0]); if (!p) in.raise("TypeError", "std::prev needs an iterator"); return it(p->c, p->i - (a.size() > 1 ? iv(in, a[1], "prev") : 1)); });
@@ -504,6 +690,11 @@ void install_cpp_std(Shared& sh) {
     B["std::tie"] = B["std::make_tuple"];
     def("std::vector", 0, 2, [](Interp& in, Args& a) -> Value {
         auto l = make<List>(); if (a.empty()) return obj(l);
+        if (a.size() == 2 && as<PosIt>(a[0]) && as<PosIt>(a[1])) {   // std::vector<T> v(first, last): any container's range
+            auto sp = span(in, a[0], a[1], "std::vector");
+            for (std::int64_t i = sp.lo; i < sp.hi; ++i) l->push(in.copy_value(elem(in, sp.c, i)));
+            return obj(l);
+        }
         if (auto* src = as<List>(a[0])) { for (auto& x : src->items) l->push(in.copy_value(x)); return obj(l); }
         auto n = iv(in, a[0], "std::vector"); if (n < 0 || n > (std::int64_t(1) << 32)) in.raise("ValueError", "std::vector: bad size");
         Value fill = a.size() > 1 ? a[1] : Value(std::int64_t(0));
@@ -529,6 +720,7 @@ void install_cpp_std(Shared& sh) {
     def("forge::__cast", 2, 2, [](Interp& in, Args& a) -> Value {
         const std::string& t = sref(in, a[0], "cast"); const Value& v = a[1];
         if (t == "string") { if (auto* s = as<String>(v)) return sv(s->s); return sv(in.str(v)); }
+        if (t == "char") return in.unary("char", std::get_if<double>(&v) ? in.unary("int", v) : v);
         if (t == "bool") return Interp::truthy(v);
         if (auto* s = as<String>(v)) { if (s->s.size() == 1) { int c = (signed char)s->s[0]; return t == "float" ? Value(double(c)) : Value(std::int64_t(c)); } }
         if (t == "float") return dv(in, v, "static_cast<double>");
@@ -560,6 +752,19 @@ void install_cpp_std(Shared& sh) {
         if (auto* b = as<SharedBox>(a[0])) { std::lock_guard g(b->m); return b->v; }
         return a[0];
     });
+    // *it = v (also through a shared_ptr<int>-style box); the value of the expression is v
+    def("forge::__deref_set", 2, 2, [](Interp& in, Args& a) -> Value {
+        if (is_nil(a[0])) in.raise("NullPointerError", "assigning through a null pointer (nullptr / empty optional)");
+        if (auto* p = as<PosIt>(a[0])) {
+            if (p->i < 0 || p->i >= clen(p->c)) in.raise("IndexError", "assigning through an iterator out of range (end() or past it)");
+            if (as<Map>(p->c)) in.raise("TypeError", "a map element is assigned through it->second, not *it");
+            in.set_index(p->c, p->i, a[1]);
+            return a[1];
+        }
+        if (auto* b = as<SharedBox>(a[0])) { std::lock_guard g(b->m); b->v = a[1]; return a[1]; }
+        in.raise("TypeError", "cannot assign through * of " + Interp::type_of(a[0]));
+    });
+    def("forge::__comma", 1, -1, [](Interp&, Args& a) -> Value { return a.back(); });
     def("forge::__weak", 1, 1, [&sh](Interp& in, Args& a) -> Value { if (is_nil(a[0])) return Nil{}; Args x{a[0]}; return in.call(sh.builtins["weak"], x); });
     def("forge::__downcast", 2, 2, [](Interp&, Args& a) -> Value {
         auto* i = as<Instance>(a[1]); auto* c = as<Class>(a[0]);
@@ -607,15 +812,17 @@ void install_cpp_std(Shared& sh) {
     def("std::chrono::seconds", 1, 1, [](Interp& in, Args& a) -> Value { return iv(in, a[0], "seconds") * 1000; });
     def("std::this_thread::sleep_for", 1, 1, [&sh](Interp& in, Args& a) -> Value { Args x{a[0]}; return in.call(sh.builtins["sleep"], x); });
     def("std::this_thread::yield", 0, 0, [](Interp& in, Args&) -> Value { in.step(); std::this_thread::yield(); return Nil{}; });
-    def("std::exit", 1, 1, [](Interp& in, Args& a) -> Value { in.raise("SystemExit", std::to_string(iv(in, a[0], "exit"))); });
+    def("std::exit", 1, 1, [](Interp& in, Args& a) -> Value { in.terminate("SystemExit", std::to_string(iv(in, a[0], "exit"))); });
     def("std::swap", 2, 2, [](Interp& in, Args&) -> Value { in.raise("TypeError", "std::swap must be used as a statement: std::swap(a, b);"); });
 
     // ---- exceptions: std::runtime_error etc. are the script error classes
     const std::pair<const char*, const char*> errs[] = {
         {"std::exception", "Error"}, {"std::runtime_error", "RuntimeError"}, {"std::logic_error", "LogicError"},
-        {"std::invalid_argument", "ValueError"}, {"std::out_of_range", "IndexError"}, {"std::length_error", "ValueError"},
-        {"std::domain_error", "ValueError"}, {"std::range_error", "ValueError"}, {"std::overflow_error", "OverflowError"},
-        {"std::bad_alloc", "OutOfMemoryError"}, {"std::system_error", "OSError"}};
+        {"std::invalid_argument", "ValueError"}, {"std::out_of_range", "IndexError"}, {"std::length_error", "LengthError"},
+        {"std::domain_error", "DomainError"}, {"std::range_error", "RangeError"}, {"std::overflow_error", "OverflowError"},
+        {"std::underflow_error", "UnderflowError"}, {"std::bad_alloc", "OutOfMemoryError"}, {"std::system_error", "OSError"},
+        {"std::bad_cast", "TypeError"}, {"std::bad_any_cast", "TypeError"}, {"std::bad_optional_access", "BadOptionalAccess"},
+        {"std::filesystem::filesystem_error", "IOError"}, {"std::ios_base::failure", "IOError"}};   // keep in step with parser.cpp exception_class
     for (auto& [cpp, ours] : errs) if (auto e = sh.errors.find(ours); e != sh.errors.end()) B[cpp] = obj(e->second);
     if (auto e = sh.errors.find("Error"); e != sh.errors.end())
         e->second->methods["what"] = nat("what", 1, 1, [](Interp& in, Args& a) -> Value { return in.get_field(a[0], "message"); });
@@ -653,8 +860,16 @@ void install_cpp_std(Shared& sh) {
     meth("list", "capacity", 1, 1, [](Interp&, Args& a) -> Value { return std::int64_t(as<List>(a[0])->items.capacity()); });
     meth("list", "begin", 1, 1, [](Interp&, Args& a) -> Value { return it(a[0], 0); });
     meth("list", "end", 1, 1, [](Interp&, Args& a) -> Value { return it(a[0], clen(a[0])); });
-    meth("list", "insert", 3, 3, [idx](Interp& in, Args& a) -> Value {
+    meth("list", "insert", 3, 4, [idx](Interp& in, Args& a) -> Value {
         auto* l = as<List>(a[0]); mutable_(in, *l); auto p = idx(in, a[1], l->items.size(), "insert", true);
+        if (a.size() == 4) {   // insert(pos, n, value) / insert(pos, first, last)
+            std::vector<Value> add;
+            if (as<PosIt>(a[2])) { auto sp = span(in, a[2], a[3], "insert"); for (std::int64_t i = sp.lo; i < sp.hi; ++i) add.push_back(in.copy_value(elem(in, sp.c, i))); }
+            else { auto n = iv(in, a[2], "insert"); if (n < 0 || n > (std::int64_t(1) << 32)) in.raise("ValueError", "insert: bad count"); for (std::int64_t i = 0; i < n; ++i) add.push_back(in.copy_value(a[3])); }
+            Heap::instance().charge(*l, sizeof(Value) * add.size());
+            l->items.insert(l->items.begin() + std::ptrdiff_t(p), add.begin(), add.end());
+            return it(a[0], std::int64_t(p));
+        }
         Heap::instance().charge(*l, sizeof(Value));
         l->items.insert(l->items.begin() + std::ptrdiff_t(p), in.copy_value(a[2])); return it(a[0], std::int64_t(p));
     });
@@ -665,7 +880,18 @@ void install_cpp_std(Shared& sh) {
         l->items.erase(l->items.begin() + std::ptrdiff_t(p), l->items.begin() + std::ptrdiff_t(q)); return it(a[0], std::int64_t(p));
     });
     meth("list", "swap", 2, 2, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); auto& o = lref(in, a[1], "swap"); mutable_(in, *l); mutable_(in, o); std::swap(l->items, o.items); return Nil{}; });
-    meth("list", "assign", 3, 3, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mutable_(in, *l); l->items.clear(); auto n = iv(in, a[1], "assign"); for (std::int64_t k = 0; k < n; ++k) l->push(in.copy_value(a[2])); return Nil{}; });
+    meth("list", "assign", 2, 3, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mutable_(in, *l);
+        if (a.size() == 2) {   // assign({a, b, c})
+            auto* src = as<List>(a[1]); if (!src) in.raise("TypeError", "assign expects (count, value), (first, last) or a braced list");
+            std::vector<Value> items; for (auto& x : src->items) items.push_back(in.copy_value(x));
+            l->items.clear(); for (auto& x : items) l->push(std::move(x)); return Nil{};
+        }
+        if (as<PosIt>(a[1])) {   // assign(first, last)
+            auto sp = span(in, a[1], a[2], "assign"); std::vector<Value> items;
+            for (std::int64_t i = sp.lo; i < sp.hi; ++i) items.push_back(in.copy_value(elem(in, sp.c, i)));
+            l->items.clear(); for (auto& x : items) l->push(std::move(x)); return Nil{};
+        }
+        l->items.clear(); auto n = iv(in, a[1], "assign"); for (std::int64_t k = 0; k < n; ++k) l->push(in.copy_value(a[2])); return Nil{}; });
 
     // std::string (strings are mutable values; literals are fresh copies)
     meth("string", "size", 1, 1, [](Interp&, Args& a) -> Value { return std::int64_t(as<String>(a[0])->s.size()); });
@@ -682,15 +908,16 @@ void install_cpp_std(Shared& sh) {
     auto finder = [&](const std::string& n, int mode) {
         meth("string", n, 2, 3, [mode](Interp& in, Args& a) -> Value {
             auto& s = as<String>(a[0])->s; std::string t = as<String>(a[1]) ? as<String>(a[1])->s : in.str(a[1]);
-            std::size_t pos = a.size() > 2 ? std::size_t(std::max<std::int64_t>(0, iv(in, a[2], "find"))) : (mode == 1 || mode == 3 ? std::string::npos : 0);
-            std::size_t r = mode == 0 ? s.find(t, pos) : mode == 1 ? s.rfind(t, pos) : mode == 2 ? s.find_first_of(t, pos) : mode == 3 ? s.find_last_of(t, pos) : s.find_first_not_of(t, pos);
+            std::size_t pos = a.size() > 2 ? std::size_t(std::max<std::int64_t>(0, iv(in, a[2], "find"))) : (mode == 1 || mode == 3 || mode == 5 ? std::string::npos : 0);
+            std::size_t r = mode == 0 ? s.find(t, pos) : mode == 1 ? s.rfind(t, pos) : mode == 2 ? s.find_first_of(t, pos) : mode == 3 ? s.find_last_of(t, pos)
+                          : mode == 4 ? s.find_first_not_of(t, pos) : s.find_last_not_of(t, pos);
             return r == std::string::npos ? std::int64_t(-1) : std::int64_t(r);
         });
     };
-    finder("find", 0); finder("rfind", 1); finder("find_first_of", 2); finder("find_last_of", 3); finder("find_first_not_of", 4);
-    meth("string", "at", 2, 2, [idx](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; return sv(std::string(1, s[idx(in, a[1], s.size(), "string::at")])); });
-    meth("string", "front", 1, 1, [](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; if (s.empty()) in.raise("IndexError", "front() on an empty string"); return sv(s.substr(0, 1)); });
-    meth("string", "back", 1, 1, [](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; if (s.empty()) in.raise("IndexError", "back() on an empty string"); return sv(s.substr(s.size() - 1)); });
+    finder("find", 0); finder("rfind", 1); finder("find_first_of", 2); finder("find_last_of", 3); finder("find_first_not_of", 4); finder("find_last_not_of", 5);
+    meth("string", "at", 2, 2, [idx](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; return Interp::new_char(s[idx(in, a[1], s.size(), "string::at")]); });
+    meth("string", "front", 1, 1, [](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; if (s.empty()) in.raise("IndexError", "front() on an empty string"); return Interp::new_char(s.front()); });
+    meth("string", "back", 1, 1, [](Interp& in, Args& a) -> Value { auto& s = as<String>(a[0])->s; if (s.empty()) in.raise("IndexError", "back() on an empty string"); return Interp::new_char(s.back()); });
     meth("string", "push_back", 2, 2, [](Interp& in, Args& a) -> Value { auto* s = as<String>(a[0]); mutable_(in, *s); auto& c = sref(in, a[1], "push_back"); Heap::instance().charge(*s, c.size()); s->s += c; return Nil{}; });
     meth("string", "append", 2, 3, [](Interp& in, Args& a) -> Value {
         auto* s = as<String>(a[0]); mutable_(in, *s);
@@ -705,13 +932,68 @@ void install_cpp_std(Shared& sh) {
     meth("string", "pop_back", 1, 1, [](Interp& in, Args& a) -> Value { auto* s = as<String>(a[0]); mutable_(in, *s); if (s->s.empty()) in.raise("IndexError", "pop_back on an empty string"); s->s.pop_back(); return Nil{}; });
     meth("string", "clear", 1, 1, [](Interp& in, Args& a) -> Value { auto* s = as<String>(a[0]); mutable_(in, *s); s->s.clear(); return Nil{}; });
     meth("string", "erase", 1, 3, [](Interp& in, Args& a) -> Value {
-        auto* s = as<String>(a[0]); mutable_(in, *s); auto p = a.size() > 1 ? iv(in, a[1], "erase") : 0;
+        auto* s = as<String>(a[0]); mutable_(in, *s);
+        if (a.size() > 1 && as<PosIt>(a[1])) {   // erase(it) / erase(first, last)
+            auto lo = as<PosIt>(a[1])->i, hi = a.size() > 2 && as<PosIt>(a[2]) ? as<PosIt>(a[2])->i : lo + 1;
+            if (lo < 0 || hi < lo || std::size_t(hi) > s->s.size()) in.raise("IndexError", "erase: iterator out of range");
+            s->s.erase(std::size_t(lo), std::size_t(hi - lo)); return it(a[0], lo);
+        }
+        auto p = a.size() > 1 ? iv(in, a[1], "erase") : 0;
         if (p < 0 || std::size_t(p) > s->s.size()) in.raise("IndexError", "erase: position out of range");
         auto n = a.size() > 2 ? iv(in, a[2], "erase") : -1; s->s.erase(std::size_t(p), n < 0 ? std::string::npos : std::size_t(n)); return a[0];
     });
-    meth("string", "insert", 3, 3, [](Interp& in, Args& a) -> Value {
+    meth("string", "resize", 2, 3, [](Interp& in, Args& a) -> Value {   // resize(n[, ch]): truncate, or pad with ch ('\0' by default)
+        auto* s = as<String>(a[0]); mutable_(in, *s); auto n = iv(in, a[1], "resize");
+        if (n < 0 || n > (std::int64_t(1) << 32)) in.raise("ValueError", "resize: bad size");
+        char fill = '\0';
+        if (a.size() > 2) { auto& c = sref(in, a[2], "resize"); if (c.size() != 1) in.raise("TypeError", "resize(n, ch) expects a character"); fill = c[0]; }
+        if (std::size_t(n) > s->s.size()) Heap::instance().charge(*s, std::size_t(n) - s->s.size());
+        s->s.resize(std::size_t(n), fill); return Nil{};
+    });
+    meth("string", "assign", 2, 3, [](Interp& in, Args& a) -> Value {   // assign(str) / assign(n, ch)
+        auto* s = as<String>(a[0]); mutable_(in, *s); std::string v;
+        if (a.size() == 3) {
+            auto n = iv(in, a[1], "assign"); auto& c = sref(in, a[2], "assign");
+            if (n < 0 || n > (std::int64_t(1) << 32) || c.size() != 1) in.raise("ValueError", "assign(count, ch): bad count or character");
+            v.assign(std::size_t(n), c[0]);
+        } else v = sref(in, a[1], "assign");
+        if (v.size() > s->s.size()) Heap::instance().charge(*s, v.size() - s->s.size());
+        s->s = std::move(v); return a[0];
+    });
+    // std::deque / std::list members
+    meth("list", "push_front", 2, 2, [](Interp& in, Args& a) -> Value {
+        auto* l = as<List>(a[0]); mutable_(in, *l); Heap::instance().charge(*l, sizeof(Value));
+        l->items.insert(l->items.begin(), in.copy_value(a[1])); return Nil{};
+    });
+    M["list"]["emplace_front"] = M["list"]["push_front"];
+    meth("list", "pop_front", 1, 1, [](Interp& in, Args& a) -> Value {
+        auto* l = as<List>(a[0]); mutable_(in, *l); if (l->items.empty()) in.raise("IndexError", "pop_front() on an empty container");
+        l->items.erase(l->items.begin()); return Nil{};
+    });
+    meth("list", "sort", 1, 2, [](Interp& in, Args& a) -> Value {   // std::list::sort([comp])
+        auto* l = as<List>(a[0]); mutable_(in, *l);
+        std::stable_sort(l->items.begin(), l->items.end(), [&](const Value& x, const Value& y) {
+            if (a.size() > 1) { Args c{x, y}; return Interp::truthy(in.call(a[1], c)); }
+            return in.compare(x, y) < 0;
+        });
+        return Nil{};
+    });
+    meth("list", "reverse", 1, 1, [](Interp& in, Args& a) -> Value { auto* l = as<List>(a[0]); mutable_(in, *l); std::reverse(l->items.begin(), l->items.end()); return Nil{}; });
+    meth("string", "swap", 2, 2, [](Interp& in, Args& a) -> Value {
+        auto* s = as<String>(a[0]); auto* o = as<String>(a[1]); if (!o) in.raise("TypeError", "swap expects a string");
+        mutable_(in, *s); mutable_(in, *o); std::swap(s->s, o->s); return Nil{};
+    });
+    meth("list", "fill", 2, 2, [](Interp& in, Args& a) -> Value {   // std::array::fill
+        auto* l = as<List>(a[0]); mutable_(in, *l); for (auto& x : l->items) x = in.copy_value(a[1]); return Nil{};
+    });
+    meth("string", "insert", 3, 4, [](Interp& in, Args& a) -> Value {
         auto* s = as<String>(a[0]); mutable_(in, *s); auto p = iv(in, a[1], "insert");
         if (p < 0 || std::size_t(p) > s->s.size()) in.raise("IndexError", "insert: position out of range");
+        if (a.size() == 4) {   // insert(pos, n, ch)
+            auto n = iv(in, a[2], "insert"); auto& c = sref(in, a[3], "insert");
+            if (n < 0 || n > (std::int64_t(1) << 32) || c.size() != 1) in.raise("ValueError", "insert(pos, count, ch): bad count or character");
+            Heap::instance().charge(*s, std::size_t(n)); s->s.insert(std::size_t(p), std::size_t(n), c[0]); return a[0];
+        }
         auto& t = sref(in, a[2], "insert"); Heap::instance().charge(*s, t.size());
         s->s.insert(std::size_t(p), t); return a[0];
     });
@@ -748,18 +1030,37 @@ void install_cpp_std(Shared& sh) {
         } else m.set(k, std::move(v));
         return true;
     };
-    meth("map", "insert", 2, 2, [put](Interp& in, Args& a) -> Value {
+    // insert / emplace / try_emplace / insert_or_assign return std::pair<iterator, bool>, as in C++
+    auto put_it = [put](Interp& in, const Value& mv, const Value& k, Value v, bool overwrite) -> Value {
+        auto& m = *as<Map>(mv);
+        bool fresh = put(in, m, k, std::move(v), overwrite);
+        std::int64_t pos = std::int64_t(m.entries.size());
+        if (auto key = key_of(k)) if (auto f = m.index.find(*key); f != m.index.end()) pos = std::int64_t(f->second);
+        return obj(make<List>(std::vector<Value>{it(mv, pos), Value(fresh)}));
+    };
+    meth("map", "insert", 2, 3, [put_it](Interp& in, Args& a) -> Value {
         auto* m = as<Map>(a[0]);
-        if (m->is_set) return put(in, *m, in.copy_value(a[1]), true, false);
-        auto* p = as<List>(a[1]); if (!p || p->items.size() != 2) in.raise("TypeError", "map::insert expects a {key, value} pair");
-        return put(in, *m, in.copy_value(p->items[0]), in.copy_value(p->items[1]), false);
+        if (a.size() == 3 && as<PosIt>(a[1]) && as<PosIt>(a[2])) {   // insert(first, last)
+            auto sp = span(in, a[1], a[2], "insert");
+            for (std::int64_t i = sp.lo; i < sp.hi; ++i) {
+                Value e = elem(in, sp.c, i); auto* p = as<List>(e);
+                if (m->is_set) put_it(in, a[0], in.copy_value(e), true, false);
+                else if (p && p->items.size() == 2) put_it(in, a[0], in.copy_value(p->items[0]), in.copy_value(p->items[1]), false);
+                else in.raise("TypeError", "map::insert(first, last) expects {key, value} pairs");
+            }
+            return Nil{};
+        }
+        const Value& x = a.size() == 3 ? a[2] : a[1];   // insert(hint, value)
+        if (m->is_set) return put_it(in, a[0], in.copy_value(x), true, false);
+        auto* p = as<List>(x); if (!p || p->items.size() != 2) in.raise("TypeError", "map::insert expects a {key, value} pair");
+        return put_it(in, a[0], in.copy_value(p->items[0]), in.copy_value(p->items[1]), false);
     });
-    meth("map", "emplace", 2, 3, [put](Interp& in, Args& a) -> Value {
-        auto* m = as<Map>(a[0]); if (a.size() == 2) return put(in, *m, in.copy_value(a[1]), true, false);
-        return put(in, *m, in.copy_value(a[1]), in.copy_value(a[2]), false);
+    meth("map", "emplace", 2, 3, [put_it](Interp& in, Args& a) -> Value {
+        if (a.size() == 2) return put_it(in, a[0], in.copy_value(a[1]), true, false);
+        return put_it(in, a[0], in.copy_value(a[1]), in.copy_value(a[2]), false);
     });
     M["map"]["try_emplace"] = M["map"]["emplace"];
-    meth("map", "insert_or_assign", 3, 3, [put](Interp& in, Args& a) -> Value { return put(in, *as<Map>(a[0]), in.copy_value(a[1]), in.copy_value(a[2]), true); });
+    meth("map", "insert_or_assign", 3, 3, [put_it](Interp& in, Args& a) -> Value { return put_it(in, a[0], in.copy_value(a[1]), in.copy_value(a[2]), true); });
     meth("map", "erase", 2, 2, [](Interp& in, Args& a) -> Value {
         auto* m = as<Map>(a[0]); mutable_(in, *m);
         Value k = a[1]; if (auto* p = as<PosIt>(a[1])) { if (p->i < 0 || std::size_t(p->i) >= m->entries.size()) in.raise("IndexError", "erase(end())"); k = m->entries[std::size_t(p->i)].first; }
@@ -776,12 +1077,24 @@ void install_cpp_std(Shared& sh) {
         for (std::size_t k = 0; k < m->entries.size(); ++k) if (in.equal(m->entries[k].first, a[1])) return it(a[0], std::int64_t(k));
         return it(a[0], std::int64_t(m->entries.size()));
     });
+    for (const char* t : {"list", "string", "map"}) {   // cbegin / cend
+        if (M[t].count("begin")) M[t]["cbegin"] = M[t]["begin"];
+        if (M[t].count("end")) M[t]["cend"] = M[t]["end"];
+    }
+    // lower_bound / upper_bound on an ordered map or set
+    for (bool upper : {false, true})
+        meth("map", upper ? "upper_bound" : "lower_bound", 2, 2, [upper](Interp& in, Args& a) -> Value {
+            auto* m = as<Map>(a[0]); if (!m->sorted) in.raise("TypeError", "lower_bound / upper_bound need an ordered container (std::map, std::set)");
+            std::int64_t lo = 0, hi = std::int64_t(m->entries.size());
+            while (lo < hi) { auto mid = lo + (hi - lo) / 2; int c = in.compare(m->entries[std::size_t(mid)].first, a[1]); if (upper ? c <= 0 : c < 0) lo = mid + 1; else hi = mid; }
+            return it(a[0], lo);
+        });
     meth("map", "begin", 1, 1, [](Interp&, Args& a) -> Value { return it(a[0], 0); });
     meth("map", "end", 1, 1, [](Interp&, Args& a) -> Value { return it(a[0], clen(a[0])); });
 
     // std::optional / smart pointers / everything else
     meth("any", "has_value", 1, 1, [](Interp&, Args& a) -> Value { return !is_nil(a[0]); });
-    meth("any", "value", 1, 1, [](Interp& in, Args& a) -> Value { if (is_nil(a[0])) in.raise("ValueError", "bad_optional_access: optional has no value"); return a[0]; });
+    meth("any", "value", 1, 1, [](Interp& in, Args& a) -> Value { if (is_nil(a[0])) in.raise("BadOptionalAccess", "bad optional access"); return a[0]; });
     meth("any", "value_or", 2, 2, [](Interp&, Args& a) -> Value { return is_nil(a[0]) ? a[1] : a[0]; });
     meth("any", "get", 1, 1, [](Interp&, Args& a) -> Value { return a[0]; });
     meth("any", "use_count", 1, 1, [](Interp&, Args& a) -> Value { auto* r = std::get_if<Ref<Obj>>(&a[0]); return r && *r ? std::int64_t((*r)->rc.load()) - 1 : std::int64_t(0); });

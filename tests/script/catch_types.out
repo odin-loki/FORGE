@@ -1,0 +1,54 @@
+bare name does not widen: rt
+by value / by reference / unnamed do not widen
+bare name matches its own class: denied
+bare name matches a derived class
+qualified name matches
+an unknown class name matches nothing
+runtime_error: runtime_error
+logic_error: logic_error
+invalid_argument: invalid_argument
+out_of_range: out_of_range
+length_error: logic_error
+overflow_error: overflow_error
+range_error: runtime_error
+exception: exception
+vector.at: out_of_range
+stoi: invalid_argument
+PermissionError: PermissionError
+TimeoutError: TimeoutError
+FileNotFoundError: OSError
+int: int 42
+double: double 2.5
+bool: bool true
+std::string: string text
+string literal: string literal
+enum: int 1
+plain struct: ...
+user runtime_error: runtime_error
+user derived: runtime_error
+user std::exception: exception
+namespaced user class: logic_error
+nothing: no error
+int is caught as int only
+double is caught as double only
+const char* catches a string literal: s
+string by value: s
+derived first: bad token at 12
+base before derived wins: bad token
+std base of a user class: p
+std::exception catches user exceptions
+plain struct by its class: 9
+unrelated class clause skipped
+namespaced class: ns
+overridden what(): other
+through 20 frames: bottom
+inner handler: inner
+rethrown with its dynamic type: line 5
+unmatched inner try propagates: first
+thrown from a handler: second
+through std::for_each and a lambda: lambda
+try in a loop with continue: 24
+return from a handler: 10
+  ~Guard inner
+  ~Guard outer
+handler after destructors: unwinding

@@ -1622,6 +1622,14 @@ if(FORGE_BUILD_TESTS)
         target_link_libraries(forge_coverage_dump PRIVATE forge_inference forge_verify forge_simd_mv)
         add_test(NAME coverage_table COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/gen_docs.py --check-coverage $<TARGET_FILE:forge_coverage_dump>)
       endif()
+      # forge script against the real compiler: every tests/script_conformance/*.cpp is built with the host
+      # compiler and run, then run by `forge script` on the tree-walker and the VM; the outputs must be equal.
+      # Skips (77) when the host compiler has no C++23 <print>. About a minute: one host compile per program.
+      if(TARGET forge AND NOT CMAKE_CROSSCOMPILING)
+        add_test(NAME script_conformance COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/script_conformance/run.py
+                 --forge $<TARGET_FILE:forge> --cxx ${CMAKE_CXX_COMPILER} --work ${PROJECT_BINARY_DIR}/script_conformance)
+        set_tests_properties(script_conformance PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+      endif()
     endif()
   endif()
 endif()

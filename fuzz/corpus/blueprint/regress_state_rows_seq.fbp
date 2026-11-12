@@ -1,0 +1,16 @@
+# Regression seed: the row shape of a state slot depends on `seq` ([rows, 1, 4 * seq]), so two sequence-length
+# buckets of one session would lay the same slot out differently. graph::lower_plan refuses the second plan.
+blueprint "hostile-state-rows" opset 1
+
+state kv[1] : kv_cache(heads: 1, dim: 4)
+
+input x : f32[seq, 8]
+
+graph {
+  k = heads(x, 1, seq * 4)
+  kk, vv = kv[0].append(k, k)
+  y = merge(attention(k, kk, vv, causal: true), 8)
+}
+
+output y : f32[seq, 8]
+session generative_sequence

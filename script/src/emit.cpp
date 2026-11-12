@@ -99,7 +99,7 @@ struct Emitter {
         case NK::Str: case NK::Interp: return ety::Str;
         case NK::True: case NK::False: return ety::Bool;
         case NK::Var: return look(mangle(n.s));
-        case NK::Unary: return n.s == "not" ? ety::Bool : type_of(*n.kids[0], env);
+        case NK::Unary: return n.s == "not" || n.s == "bool" ? ety::Bool : n.s == "int" ? ety::Int : type_of(*n.kids[0], env);
         case NK::And: case NK::Or: return ety::Bool;
         case NK::Binary: {
             Op o = op_of(n.s);
@@ -238,6 +238,7 @@ struct Emitter {
             if (n.s == "not") return {D.c_not(cond(*n.kids[0])), ety::Cond};
             if (n.s == "-") return {D.neg(intv(*n.kids[0])), ety::Int};
             if (n.s == "+") return {intv(*n.kids[0]), ety::Int};
+            if (n.s == "int" || n.s == "bool") return expr(*n.kids[0]);   // the parser's implicit conversion into an int / bool variable: the shell value already is one
             cant(n, "unary operator " + n.s);
         }
         case NK::And: case NK::Or: {

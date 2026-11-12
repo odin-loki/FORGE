@@ -646,3 +646,28 @@ TEST(fpk_unknown_codec_fails_cleanly) {
     CHECK(clean);
     std::filesystem::remove(path);
 }
+
+// A blueprint is untrusted input. This one makes the row shape of a state slot depend on `seq`, so the plan for
+// each sequence-length bucket would lay the same slot out differently: [rows, 1, 4] for seq 1, [rows, 1, 16] for
+// seq 4. The plans of a session share one state store; the second one must be refused, not left to append
+// 16-float rows to a buffer sized for 4-float rows (tests/test_graph.cpp has the executor-level cases). The
+// blueprint is also a fuzz seed; ctest runs with the source tree as the working directory.
+TEST(blueprint_state_rows_depending_on_seq_are_refused) {
+    std::ifstream f("fuzz/corpus/blueprint/regress_state_rows_seq.fbp");
+    std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (src.empty()) { std::printf("  (fuzz/corpus/blueprint/regress_state_rows_seq.fbp not found from this directory: skipped)\n"); return; }
+    auto bp = modelfile::parse_blueprint(src);
+    auto graph_for = [&](i64 seq) { modelfile::build_options bo; bo.dims["seq"] = seq; return modelfile::build_graph(bp, bo); };
+    for (i64 page : {i64(0), i64(2)}) {
+        graph::state_store st; st.capacity = 8; st.page_rows = page;
+        auto p1 = graph::compile(graph_for(1), &st);
+        CHECK(st.slots.count("kv.0.k") == 1);
+        CHECK_THROWS(graph::compile(graph_for(4), &st));
+        graph::executor e(*p1, &st);
+        std::vector<float> x(8, 0.5f);
+        for (int t = 0; t < 3; ++t) { e.set_input("x", x); e.run(); }
+        CHECK(st.slots["kv.0.k"].len == 6);
+        auto again = graph::compile(graph_for(1), &st);   // the same bucket again shares the slot
+        CHECK(again != nullptr);
+    }
+}

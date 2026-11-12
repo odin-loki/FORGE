@@ -29,7 +29,7 @@
 namespace forge::script::fsc {
 
 // Bump when Node/FnDecl/ClassDecl, the encoding, or the meaning of the tree for the compiler changes.
-inline constexpr std::uint32_t vm_version = 3;
+inline constexpr std::uint32_t vm_version = 4;   // 4: catch clause tags (parser catch_type)
 static_assert(int(NK::Import) == 45, "NK changed: bump fsc::vm_version and update this assert");
 inline constexpr std::uint64_t max_file_bytes = 64ull << 20;   // larger cache files are ignored (not read)
 

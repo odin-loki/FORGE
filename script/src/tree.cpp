@@ -45,12 +45,9 @@ Flow Interp::run_try(const Node& n, const Ref<Env>& env) {
     catch (...) {
         ScriptError e = from_cpp(std::current_exception());
         const Node* handler = nullptr;
-        for (std::size_t i = 1; i < n.kids.size(); ++i) {
-            const Node& c = *n.kids[i];
-            if (c.s.empty() || c.s == "Error") { handler = &c; break; }
-            if (auto* inst = as<Instance>(e.v); inst && inst->cls->derives(c.s)) { handler = &c; break; }
-            if (type_of(e.v) == c.s) { handler = &c; break; }
-        }
+        // A fatal error (ScriptError::fatal, or the whole run ending) is handled by no clause, catch (...) included.
+        if (!e.fatal && !sh->dead.load())
+            for (std::size_t i = 1; i < n.kids.size() && !handler; ++i) if (catch_matches(n.kids[i]->s, e.v)) handler = n.kids[i].get();
         if (handler) {
             store(handler->var, env, e.v);
             try { f = exec_block(*handler->kids[0], env); }
@@ -65,6 +62,31 @@ Flow Interp::run_try(const Node& n, const Ref<Env>& env) {
     }
     if (pending) std::rethrow_exception(pending);
     return f;
+}
+
+// Assignment as an expression. Its value is the target's new value (C++ yields the target itself; as an rvalue that
+// is the same), or the old value for postfix ++ / -- (Node::flag). The target's sub-expressions are evaluated once.
+Value Interp::assign_value(const Node& n, const Ref<Env>& env) {
+    const Node& t = *n.kids[0];
+    Op op = Op(n.i);
+    Value old, v;
+    if (t.k == NK::Var) {
+        v = eval(*n.kids[1], env);
+        if (op != Op::None) { old = load(t.var, env); v = binary(op, old, v); }
+        else if (n.flag) old = load(t.var, env);   // c++ on a char / typed variable is rewritten to c = (char)(c + 1)
+        store(t.var, env, v);
+    } else if (t.k == NK::Field) {
+        Value o = eval(*t.kids[0], env);
+        v = eval(*n.kids[1], env);
+        if (op != Op::None) { old = get_field(o, t.s); v = binary(op, old, v); }
+        set_field(o, t.s, v);
+    } else {
+        Value o = eval(*t.kids[0], env), i = eval(*t.kids[1], env);
+        v = eval(*n.kids[1], env);
+        if (op != Op::None) { old = get_index(o, i); v = binary(op, old, v); }
+        set_index(o, i, v);
+    }
+    return n.flag ? old : v;
 }
 
 Flow Interp::run_using(const Node& n, const Ref<Env>& env) {
@@ -158,12 +180,20 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
     case NK::Break: return Flow::Break;
     case NK::Continue: return Flow::Continue;
     case NK::Throw: {
-        Value v = eval(*n.kids[0], env);
-        if (auto* s = as<String>(v)) v = make_error("Error", s->s);
+        Value v = eval(*n.kids[0], env);   // any value can be thrown; a string stays a string (catch (const std::string&))
         if (auto* i = as<Instance>(v); i && i->cls->derives("Error")) {
-            if (auto it = i->fields.find("trace"); it == i->fields.end() || is_nil(it->second) || (as<String>(it->second) && as<String>(it->second)->s.empty()))
+            // `trace` and `line` are the built-in Error's fields; a user exception class may declare members of
+            // the same names (`int line;` in a parse error is common C++), and those are the user's.
+            auto user_field = [&](const char* f) {
+                for (const Class* c = i->cls.get(); c; c = c->base.get()) {
+                    if (auto it = sh->errors.find(c->name); it != sh->errors.end() && it->second.get() == c) return false;
+                    for (auto& x : c->fields) if (x == f) return true;
+                }
+                return false;
+            };
+            if (auto it = i->fields.find("trace"); !user_field("trace") && (it == i->fields.end() || is_nil(it->second) || (as<String>(it->second) && as<String>(it->second)->s.empty())))
                 i->fields["trace"] = new_string(trace_text());
-            i->fields["line"] = std::int64_t(n.line);
+            if (!user_field("line")) i->fields["line"] = std::int64_t(n.line);
         }
         throw ScriptError(v, error_message(v));
     }
@@ -186,11 +216,12 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
 Value Interp::eval(const Node& n, const Ref<Env>& env) {
     switch (n.k) {
     case NK::Nil: return Nil{};
+    case NK::Assign: return assign_value(n, env);
     case NK::True: return true;
     case NK::False: return false;
     case NK::Int: return n.i;
     case NK::Float: return n.d;
-    case NK::Str: return new_string(n.s);
+    case NK::Str: { Value s = new_string(n.s); if (n.flag) as<String>(s)->ch = true; return s; }
     case NK::Interp: { std::vector<Value> parts; for (auto& k : n.kids) parts.push_back(eval(*k, env)); return interpolate(parts); }
     case NK::Var: return load(n.var, env);
     case NK::List: { auto l = make<List>(); for (auto& k : n.kids) l->push(share(eval(*k, env))); return obj(l); }

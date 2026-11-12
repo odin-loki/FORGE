@@ -317,7 +317,13 @@ private:
     bp_val call(const std::string& fn) {
         int line = ps_.cur().line;
         ps_.expect("(");
-        std::vector<bp_val> pos; std::vector<std::pair<std::string, bp_val>> kw;
+        // positional arguments; at() reports a missing one as a blueprint error (a std::out_of_range escaped before)
+        struct arg_list : std::vector<bp_val> {
+            std::string fn; int line = 0;
+            const bp_val& at(std::size_t i) const { if (i >= size()) raise(errc::parse_error, "blueprint line {}: too few arguments for '{}'", line, fn); return (*this)[i]; }
+        } pos;
+        pos.fn = fn; pos.line = line;
+        std::vector<std::pair<std::string, bp_val>> kw;
         while (!ps_.is(")")) {
             // (composite bodies may sit after the graph block, so the bound is the token list, not graph_end)
             if (ps_.cur().kind == bp_token::k_ident && ps_.pos() + 1 < bp_.toks.size() && bp_.toks[ps_.pos() + 1].kind == bp_token::k_punct && bp_.toks[ps_.pos() + 1].text == ":") {
