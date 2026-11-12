@@ -82,6 +82,23 @@ s.parallel_for(n, grain, [&](std::size_t lo, std::size_t hi) { ... });
 - **Frame pacing.** `frame_pacer(sched, budget_ns, clock)`: between `begin_frame()` and `end_frame()`, `run(f)` queues work that must finish in the frame (high priority, performance placement) and `defer(f, est_ns)` queues work that may slip. `end_frame` waits for the `run` tasks, then starts deferred tasks oldest first, at most one per worker at a time, while `elapsed + estimate <= budget`; the rest stay queued. An estimate of 0 uses a running average of measured deferred-task times. A started task is not interrupted, so a frame can overrun by one deferred task. `frame_stats` reports counts, elapsed time and `over_budget`; `pace()` sleeps out the remainder.
 - **Not done / not measured.** No performance comparison against `task::pool` was made. Pinning and NUMA binding were only exercised on a 4-CPU single-node x86 VM (calls succeed or are counted in `pin_failures()`); placement was tested with injected topologies, not on hybrid hardware.
 
+## Linear algebra (`forge::linalg`)
+Row-major `mat<T>` for `T` = `float` or `double`. Meant for small and medium problems (the factorisations are unblocked O(n³) loops); it is not a LAPACK replacement. Link `forge_simd_mv` when you call `matmul`, `matvec` or `transpose`. Tests: `test_linalg` (analytic cases and reconstruction residuals such as ‖A − QR‖, each with its tolerance stated in the test), plus the older cases in `test_support` and `test_support2`.
+
+| Area | Functions |
+|---|---|
+| Products | `matmul` (float: the simd GEMM kernel, with packed 256×256×1024 panels once k > 256 or n > 1024; double: k-blocked rows combined by the dispatched f64 `axpy`), `matmul_naive`, `matvec`, `transpose`, `identity` |
+| LU | `lu` (in place, partial pivoting, throws on an exactly singular matrix), `lu_solve`, `lu_solve_transposed`, `lu_factor` → `lu_factors` (`solve` for a vector or a matrix of right-hand sides, `det`), `solve`, `inverse`, `det` (0 when singular), `rcond_1` (Hager–Higham estimate of 1/κ₁) |
+| Cholesky, triangular | `cholesky`, `cholesky_solve`, `solve_triangular(A, b, {lower, transposed, unit_diagonal})` |
+| QR, least squares | `qr` (explicit m×m Q), `qr_factor` → `qr_factors` (compact Householder; `apply_q`, `apply_qt`, `thin_q`, `r`), `lstsq` (QR for full column rank with m ≥ n, otherwise the minimum-norm solution through the SVD), `pinv` |
+| Eigen, SVD | `sym_eig` (cyclic Jacobi), `eigh` (Householder tridiagonalisation + implicit QL; Jacobi below 16×16), `svd` (one-sided Jacobi, m ≥ n), `svd_thin` (any shape) |
+| Norms | `norm2` (vector), `norm_fro`, `norm_1`, `norm_inf`, `norm_2`, `cond_2` (both through the SVD) |
+| Sparse formats (`sparse.hpp`) | `csr`, `csc`, `coo`, `bsr`; `to_csr` (from COO, summing duplicates; from CSC; from BSR), `to_coo`, `to_csc`, `to_bsr`, `to_dense`, `transpose`, `sort_indices`, `validate`, `diagonal` |
+| Sparse products | `spmv` (every format), `spmv_t`, `spmm` (sparse × dense, CSR and BSR), `spgemm` (sparse × sparse) |
+| Iterative solvers | `pcg` (SPD), `bicgstab`, `pgmres` (restarted, right-preconditioned), each taking a `csr` or any `op(const T* x, T* y)` and a preconditioner: `identity_prec`, `jacobi_prec`, `ilu0`. They return `solve_info {iterations, residual, converged}` with the residual recomputed from `x`. The older `cg` and `gmres` remain |
+
+Limits: no pivoted (rank-revealing) QR, no general (non-symmetric) eigensolver, no complex types, no tile-unit (AMX/SME) GEMM path, and the sparse kernels are serial and not vectorised by hand. `eigh` and `svd` have been checked up to 90×90 in the tests; nothing was benchmarked.
+
 ## Processes
 - `os::spawn_spec` and `spawn_wait` (argv, env, cwd, limits, output cap): see [os-wrapper.md](os-wrapper.md#processes-processhpp).
 - `os::wait_any(children, timeout_ms)` returns the index of the first `child` to exit (reaped), or `nullopt` on timeout. `os::wait_all(children, timeout_ms)` returns false on timeout. Both poll with a 1–10 ms back-off and never reap another waiter's child.
@@ -125,7 +142,7 @@ auto t = kTimeout.get();          // parsed and defaulted; re-parsed when the va
 | `hash/blake3.hpp` | `forge::hash` | Portable BLAKE3 (32-byte hash mode): `update`, `final`, `of`, `hex`. Used for `.fpk` integrity and the cache |
 | `io/aio.hpp` | `forge::io` | `async_reader`: io_uring through raw syscalls on Linux, else a `pread` thread pool. Short reads are resubmitted, so a completion covers the whole request |
 | `json/json.hpp` | `forge::json` | Small strict JSON reader/writer (`value`, typed accessors, `num_or`, ...) |
-| `linalg/linalg.hpp` | `forge::linalg` | Row-major `mat<T>`: `matmul`, LU, Cholesky, Householder QR, CSR `spmv`, conjugate gradients, GMRES, Jacobi `sym_eig` and `svd` |
+| `linalg/linalg.hpp`, `linalg/sparse.hpp` | `forge::linalg` | Dense and sparse linear algebra, float and double: see [Linear algebra](#linear-algebra-forgelinalg) |
 | `mem/arena.hpp` | `forge::mem` | Bump `arena` with `save`/`restore` marks and RAII `scope`; any power-of-two alignment |
 | `mem/tlsf.hpp` | `forge::mem` | Fixed-block `pool` and O(1) `tlsf` allocator over a caller region, with stats and `leak_report` |
 | `prof/prof.hpp` | `forge::prof` | `FORGE_ZONE(name)` scoped zones per thread, exported as Chrome trace JSON; a disabled zone costs one relaxed load |
