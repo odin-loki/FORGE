@@ -7,6 +7,7 @@
 #include <forge/os/oserror.hpp>
 #include <forge/os/pipe.hpp>
 #include <forge/os/service_control.hpp>
+#include <algorithm>
 #include <atomic>
 #include <random>
 #include <thread>
@@ -369,4 +370,234 @@ TEST(load_average_emulation) {   // Windows: sampler started by the first call; 
     CHECK_MSG(b->one > a->one + 0.05 * n,"before %.2f after %.2f (n=%u)", a->one, b->one, n);
     CHECK(b->one - a->one > b->fifteen - a->fifteen);   // the 1-minute average reacts fastest
 #endif
+}
+
+// ---------------------------------------------------------------- parity additions (every OS)
+#include <forge/os/sync.hpp>
+namespace {
+// A step the file system (not the OS layer) may lack: a clean `unsupported` is a skip, anything else a failure.
+bool ok_or_unsupported(const os::error& e, const char* what) {
+    if (!e) return true;
+    if (os::is_unsupported(e)) { std::printf("  skip %s: %s\n", what, e.what.c_str()); return false; }
+    CHECK_MSG(false, "%s: %s", what, e.what.c_str()); return false;
+}
+bool on_wine() {   // wine lacks stream enumeration and reparse points; real Windows must pass
+#if defined(_WIN32)
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != nullptr;
+#else
+    return false;
+#endif
+}
+std::string pattern(std::size_t n, unsigned seed) { std::string s(n, '\0'); std::mt19937 g(seed); for (auto& c : s) c = char(g()); return s; }
+}
+TEST(fs_copy_file_and_clone) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    const std::string data = pattern(3 * 1024 * 1024 + 123, 7);
+    CHECK(os::write_file(r + "/src.bin", data));
+    auto c = fs::copy_file(r + "/src.bin", r + "/dst.bin"); CHECK_MSG(c, "%s", c.err.what.c_str());
+    if (c) std::printf("  copy_file: %s\n", c.value == fs::copy_method::clone ? "clone" : c.value == fs::copy_method::kernel ? "kernel" : "user");
+    CHECK(os::read_file(r + "/dst.bin").value == data);
+    auto again = fs::copy_file(r + "/src.bin", r + "/dst.bin"); CHECK(!again);          // exists, overwrite = false
+    if (!again) CHECK(os::classify(again.err) == os::os_errc::already_exists);
+    CHECK(os::read_file(r + "/dst.bin").value == data);
+    CHECK(os::write_file(r + "/small.bin", "tiny"));
+    auto over = fs::copy_file(r + "/small.bin", r + "/dst.bin", true); CHECK_MSG(over, "%s", over.err.what.c_str());
+    CHECK(os::read_file(r + "/dst.bin").value == "tiny");
+    CHECK(os::write_file(r + "/empty.bin", "")); CHECK(fs::copy_file(r + "/empty.bin", r + "/empty2.bin")); CHECK(*fs::file_size(r + "/empty2.bin") == 0);
+    CHECK(!fs::copy_file(r + "/nope.bin", r + "/x.bin")); CHECK(!os::exists(r + "/x.bin"));
+    auto cl = fs::clone_file(r + "/src.bin", r + "/clone.bin");
+    if (ok_or_unsupported(cl.err, "clone_file")) {
+        CHECK(os::read_file(r + "/clone.bin").value == data);
+        CHECK(os::write_file(r + "/clone.bin", "changed")); CHECK(os::read_file(r + "/src.bin").value == data);   // copy-on-write
+        CHECK(!fs::clone_file(r + "/src.bin", r + "/clone.bin"));                                                 // must not exist
+    } else CHECK(!os::exists(r + "/clone.bin"));
+#if defined(_WIN32) || defined(__FreeBSD__)
+    CHECK(!cl && os::is_unsupported(cl.err));
+#endif
+    CHECK(fs::remove_all(r));
+}
+TEST(fs_preallocate_holes_and_ranges) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    auto f = os::file::open(r + "/sparse.bin", os::rdwr | os::create); CHECK(f); if (!f) return;
+    auto pre = fs::preallocate(*f, 1 << 20);
+    if (ok_or_unsupported(pre.err, "preallocate")) { auto sz = f->size(); CHECK(sz && sz.value == (1u << 20)); }
+    CHECK(fs::preallocate(*f, 0));                                         // never shrinks, never fails
+    const std::string data = pattern(4 << 20, 11);
+    CHECK(f->pwrite(data.data(), data.size(), 0)); CHECK(f->sync());
+    auto all = fs::data_ranges(*f); CHECK_MSG(all, "%s", all.err.what.c_str());
+    if (all) {
+        std::uint64_t sum = 0, prev_end = 0; bool ordered = true;
+        for (auto& x : *all) { if (x.offset < prev_end || !x.length) ordered = false; prev_end = x.offset + x.length; sum += x.length; }
+        CHECK(ordered); CHECK(!all->empty()); CHECK_MSG(sum >= data.size() && prev_end >= data.size(), "ranges cover %llu of %zu", static_cast<unsigned long long>(sum), data.size());
+    }
+    auto ph = fs::punch_hole(*f, 1 << 20, 2 << 20);
+    if (ok_or_unsupported(ph.err, "punch_hole")) {
+        auto sz = f->size(); CHECK(sz && sz.value == data.size());        // the size stays
+        std::string back(data.size(), 'x'); std::size_t got = 0;
+        while (got < back.size()) { auto n = f->pread(back.data() + got, back.size() - got, got); if (!n || !n.value) break; got += n.value; }
+        CHECK(got == back.size());
+        CHECK(back.compare(0, 1 << 20, data, 0, 1 << 20) == 0);
+        CHECK(back.compare(3 << 20, 1 << 20, data, 3 << 20, 1 << 20) == 0);
+        CHECK(back.find_first_not_of('\0', 1 << 20) >= (3u << 20));       // the hole reads as zeros
+        auto holes = fs::data_ranges(*f); CHECK(holes);
+        if (holes) {
+            std::uint64_t sum = 0; for (auto& x : *holes) sum += x.length;
+            std::printf("  after punch: %zu data range(s), %llu of %zu bytes\n", holes->size(), static_cast<unsigned long long>(sum), data.size());
+            CHECK(sum <= data.size() + (1u << 20));
+        }
+    }
+    CHECK(fs::punch_hole(*f, 0, 0));
+    auto e = os::file::open(r + "/empty.bin", os::rdwr | os::create); CHECK(e);
+    if (e) { auto er = fs::data_ranges(*e); CHECK(er && er->empty()); }
+    f->close(); if (e) e->close();
+    CHECK(fs::remove_all(r));
+}
+TEST(fs_file_identity_and_links) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    CHECK(os::write_file(r + "/a.txt", "a")); CHECK(os::write_file(r + "/b.txt", "b"));
+    auto a = fs::file_id(r + "/a.txt"), b = fs::file_id(r + "/b.txt"); CHECK(a); CHECK(b);
+    if (a && b) { CHECK(!(a.value == b.value)); CHECK(a->links == 1); CHECK(a->inode != 0 || a->device != 0); }
+    CHECK(fs::same_file(r + "/a.txt", r + "/a.txt")); CHECK(!fs::same_file(r + "/a.txt", r + "/b.txt")); CHECK(!fs::same_file(r + "/a.txt", r + "/nope"));
+    CHECK(!fs::file_id(r + "/nope"));
+    auto h = fs::hardlink(r + "/a.txt", r + "/a2.txt"); CHECK_MSG(h, "%s", h.err.what.c_str());
+    if (h) { CHECK(fs::same_file(r + "/a.txt", r + "/a2.txt")); auto a2 = fs::file_id(r + "/a2.txt"); CHECK(a2 && a2->links == 2); }
+    auto dir = fs::file_id(r); CHECK(dir);
+    CHECK(fs::remove_all(r));
+}
+TEST(fs_extended_attributes) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d, f = r + "/x.txt";
+    CHECK(os::write_file(f, "content"));
+    CHECK(!fs::xattr_set(f, "", "v")); CHECK(!fs::xattr_set(f, "a:b", "v")); CHECK(!fs::xattr_get(f, "a/b"));
+    auto s = fs::xattr_set(f, "forge.test", "value-1");
+    if (ok_or_unsupported(s.err, "xattr_set")) {
+        auto g = fs::xattr_get(f, "forge.test"); CHECK_MSG(g, "%s", g.err.what.c_str()); if (g) CHECK(g.value == "value-1");
+        std::string big = pattern(3000, 5);
+        CHECK(fs::xattr_set(f, "forge.big", big)); auto gb = fs::xattr_get(f, "forge.big"); CHECK(gb && gb.value == big);
+        CHECK(fs::xattr_set(f, "forge.test", "v2")); CHECK(fs::xattr_get(f, "forge.test").value == "v2");            // replace
+        CHECK(fs::xattr_set(f, "forge.empty", "")); auto ge = fs::xattr_get(f, "forge.empty"); CHECK(ge && ge.value.empty());
+        auto l = fs::xattr_list(f); CHECK_MSG(l, "%s", l.err.what.c_str());
+        if (l && l->empty() && on_wine()) std::printf("  skip xattr_list: wine does not enumerate streams\n");
+        else if (l) { for (const char* n : {"forge.test", "forge.big", "forge.empty"}) CHECK_MSG(std::find(l->begin(), l->end(), n) != l->end(), "%s not listed (%zu names)", n, l->size()); }
+        CHECK(os::read_file(f).value == "content");                                                                  // the file itself is untouched
+        CHECK(fs::xattr_remove(f, "forge.test")); CHECK(!fs::xattr_get(f, "forge.test")); CHECK(!fs::xattr_remove(f, "forge.test"));
+        auto l2 = fs::xattr_list(f); CHECK(l2); if (l2) CHECK(std::find(l2->begin(), l2->end(), "forge.test") == l2->end());
+    }
+    CHECK(!fs::xattr_get(f, "forge.never-set"));
+    CHECK(!fs::xattr_get(r + "/nope", "forge.test"));
+    CHECK(fs::remove_all(r));
+}
+TEST(fs_rename_noreplace_and_exchange) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    CHECK(os::write_file(r + "/a", "A")); CHECK(os::write_file(r + "/b", "B"));
+    auto no = fs::rename_noreplace(r + "/a", r + "/b"); CHECK(!no);
+    if (!no) CHECK_MSG(os::classify(no.err) == os::os_errc::already_exists, "%s", no.err.what.c_str());
+    CHECK(os::read_file(r + "/a").value == "A"); CHECK(os::read_file(r + "/b").value == "B");
+    auto yes = fs::rename_noreplace(r + "/a", r + "/c"); CHECK_MSG(yes, "%s", yes.err.what.c_str());
+    CHECK(!os::exists(r + "/a")); CHECK(os::read_file(r + "/c").value == "A");
+    CHECK(!fs::rename_noreplace(r + "/nope", r + "/z"));
+    auto x = fs::rename_exchange(r + "/b", r + "/c");
+    if (ok_or_unsupported(x.err, "rename_exchange")) { CHECK(os::read_file(r + "/b").value == "A"); CHECK(os::read_file(r + "/c").value == "B"); }
+    else { CHECK(os::read_file(r + "/b").value == "B"); CHECK(os::read_file(r + "/c").value == "A"); }
+#if defined(_WIN32) || defined(__FreeBSD__)
+    CHECK(!x && os::is_unsupported(x.err));
+#endif
+    CHECK(fs::make_dirs(r + "/dir1"));
+    auto dr = fs::rename_noreplace(r + "/dir1", r + "/dir2");
+    if (ok_or_unsupported(dr.err, "rename_noreplace (directory)")) CHECK(fs::is_dir(r + "/dir2"));
+    CHECK(fs::remove_all(r));
+}
+TEST(fs_sync_dir_and_anonymous_file) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    CHECK(os::write_file(r + "/f", "x"));
+    auto s = fs::sync_dir(r); CHECK_MSG(s, "%s", s.err.what.c_str());
+    CHECK(!fs::sync_dir(r + "/nope"));
+    auto before = os::list_dir(r);
+    auto a = fs::anonymous_file(r); CHECK_MSG(a, "%s", a.err.what.c_str());
+    if (a) {
+        CHECK(a->write_all("hello anonymous", 15)); char b[16] = {}; auto n = a->pread(b, 15, 0); CHECK(n && n.value == 15); CHECK(std::string(b) == "hello anonymous");
+        auto sz = a->size(); CHECK(sz && sz.value == 15);
+#if !defined(_WIN32)
+        auto during = os::list_dir(r); CHECK(before && during && before->size() == during->size());   // never visible (Windows: until close)
+#endif
+        a->close();
+    }
+    auto after = os::list_dir(r); CHECK(before && after && before->size() == after->size());
+    auto t = fs::anonymous_file(); CHECK(t);
+    CHECK(!fs::anonymous_file(r + "/no-such-dir"));
+    CHECK(fs::remove_all(r));
+}
+TEST(fs_symlink_junction_read_link) {
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d;
+    CHECK(os::write_file(r + "/t.txt", "target")); CHECK(fs::make_dirs(r + "/dir")); CHECK(os::write_file(r + "/dir/in.txt", "inside"));
+    auto s = fs::symlink("t.txt", r + "/link.txt");
+    if (!s) {
+#if defined(_WIN32)
+        std::printf("  skip file symlink: %s\n", s.err.what.c_str());   // needs Developer Mode or SeCreateSymbolicLinkPrivilege
+#else
+        CHECK_MSG(false, "%s", s.err.what.c_str());
+#endif
+    } else if (on_wine() && !os::exists(r + "/link.txt")) {
+        std::printf("  skip file symlink: wine's CreateSymbolicLinkW creates nothing\n");
+    } else {
+        auto t = fs::read_link(r + "/link.txt"); CHECK_MSG(t, "%s", t.err.what.c_str()); if (t) CHECK_MSG(t.value == "t.txt", "[%s]", t.value.c_str());
+        CHECK(os::stat(r + "/link.txt").is_link); CHECK(os::read_file(r + "/link.txt").value == "target");
+        auto li = fs::file_id(r + "/link.txt", false), ti = fs::file_id(r + "/link.txt", true), fi = fs::file_id(r + "/t.txt");
+        CHECK(li && ti && fi); if (li && ti && fi) { CHECK(ti.value == fi.value); CHECK(!(li.value == fi.value)); }
+    }
+    auto j = fs::junction(r + "/dir", r + "/jn");
+    if (!j && on_wine()) std::printf("  skip junction: wine has no reparse points (%s)\n", j.err.what.c_str());
+    else CHECK_MSG(j, "%s", j.err.what.c_str());
+    if (j) {
+        auto i = os::stat(r + "/jn"); CHECK(i.is_link); CHECK(i.is_dir);
+        CHECK(os::read_file(r + "/jn/in.txt").value == "inside");
+        auto t = fs::read_link(r + "/jn"); CHECK_MSG(t, "%s", t.err.what.c_str()); if (t) CHECK(fs::same_file(t.value, r + "/dir"));
+        CHECK(os::remove(r + "/jn")); CHECK(os::read_file(r + "/dir/in.txt").value == "inside");   // the link goes, the target stays
+    }
+    CHECK(!fs::read_link(r + "/t.txt")); CHECK(!fs::read_link(r + "/nope"));
+    CHECK(!fs::junction(r + "/dir", r + "/dir"));   // the link path exists
+    CHECK(fs::remove_all(r));
+}
+TEST(long_paths) {   // 400+ characters: past MAX_PATH on Windows, ordinary elsewhere
+    auto d = fs::make_temp_dir(); CHECK(d); std::string r = *d, p = r;
+    for (int i = 0; i < 8; ++i) p += "/" + std::string(48, char('a' + i)) + std::to_string(i);
+    CHECK(p.size() > 400);
+    auto m = os::mkdirs(p); CHECK_MSG(m, "%s", m.err.what.c_str());
+    CHECK(os::stat(p).is_dir);
+    CHECK_MSG(os::write_file(p + "/file.txt", "deep"), "write");
+    CHECK(os::read_file(p + "/file.txt").value == "deep");
+    auto i = os::stat(p + "/file.txt"); CHECK(i.exists && i.is_file && i.size == 4);
+    auto l = os::list_dir(p); CHECK(l); if (l) CHECK(l->size() == 1 && (*l)[0].name == "file.txt");
+    CHECK(os::rename(p + "/file.txt", p + "/renamed.txt")); CHECK(os::exists(p + "/renamed.txt"));
+    CHECK(fs::copy_file(p + "/renamed.txt", p + "/copy.txt")); CHECK(fs::file_id(p + "/copy.txt"));
+    auto mp = os::mapping::map_file(p + "/renamed.txt"); CHECK(mp); if (mp) CHECK(mp->size() == 4);
+    mp = {};
+    CHECK(os::remove(p + "/copy.txt"));
+    CHECK(os::remove_all(r)); CHECK(!os::exists(r));
+}
+TEST(clocks_across_suspend) {
+    const auto b0 = os::boottime_ns(), a0 = os::awake_ns();
+    CHECK(b0 > 0); CHECK(a0 > 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const auto b1 = os::boottime_ns(), a1 = os::awake_ns();
+    CHECK_MSG(b1 - b0 >= 20000000ull && b1 - b0 < 5000000000ull, "boottime advanced %llu ns", static_cast<unsigned long long>(b1 - b0));
+    CHECK_MSG(a1 - a0 >= 20000000ull && a1 - a0 < 5000000000ull, "awake advanced %llu ns", static_cast<unsigned long long>(a1 - a0));
+    CHECK(b1 + 1000000000ull >= a1);   // time asleep is only ever added
+}
+TEST(console_features_and_resize) {
+    namespace con = os::console;
+    CHECK(con::feature_sequence(con::feature::bracketed_paste, true) == "\x1b[?2004h");
+    CHECK(con::feature_sequence(con::feature::bracketed_paste, false) == "\x1b[?2004l");
+    CHECK(con::feature_sequence(con::feature::focus_events, true) == "\x1b[?1004h");
+    CHECK(con::feature_sequence(con::feature::alternate_screen, false) == "\x1b[?1049l");
+    CHECK(con::feature_sequence(con::feature::mouse, true).find("\x1b[?1006h") != std::string::npos);
+    CHECK(con::feature_sequence(con::feature::mouse, false).find("\x1b[?1000l") != std::string::npos);
+    if (!con::is_tty(con::stream::out)) {   // redirected (CI): nothing may be written
+        for (auto f : {con::feature::mouse, con::feature::bracketed_paste, con::feature::focus_events, con::feature::alternate_screen}) {
+            auto s = con::set_feature(f, true); CHECK(!s); if (!s) CHECK(!os::is_unsupported(s.err));
+        }
+    } else {
+        CHECK(con::set_feature(con::feature::bracketed_paste, true)); CHECK(con::set_feature(con::feature::bracketed_paste, false));
+    }
+    CHECK(con::write_raw("", con::stream::err));
+    con::resize_watcher w; CHECK(w.current().cols > 0 && w.current().rows > 0); CHECK(!w.poll());
 }
