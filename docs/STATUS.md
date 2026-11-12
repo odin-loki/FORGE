@@ -52,7 +52,7 @@ found and tested. The other shells in the job's install list were not present in
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
 | Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering) | MSL host syntax check | `macos` |
-| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe); SwiftShader in the Android emulator (local) | `linux-vulkan` on lavapipe; compiled out in every other job |
+| Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe; local 2026-11-12: 36 spec kernels, the 11 ported kernels and 13 Vulkan goldens, see the changelog); SwiftShader in the Android emulator (local, not since 2026-11-05) | `linux-vulkan` on lavapipe; compiled out in every other job |
 
 `test_gpu_metal` passing means the runtime opened a device and all checks passed; the device name is not in the
 CI log because ctest only prints output on failure.
@@ -110,6 +110,29 @@ Greedy output is identical with CUDA graphs on and off.
 ## Changelog of checks
 
 Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-12 (GPU follow-up: Vulkan and Metal ports, device conv / norm ops, eviction and captures, prims, pipe:auto, RPC residency)
+Linux x86_64, clang 23, no GPU. "lavapipe" = Mesa 25.2.8 llvmpipe (LLVM 20), a CPU implementation of Vulkan that
+executes the embedded SPIR-V; "mock" = the mock drivers of the entry below. Nothing in this entry ran on a physical
+GPU, and nothing was built by a compiler other than clang 23.
+- **Vulkan ports of the portable kernels** (`VK_PORT` in `ops/gen/gpu_gen.py`: quantised matmul_t / gather / FFN
+  gate-up for q8_0, q4_k, q5_k, q6_k, one-pass and split-over-keys attention, delta_rule, causal_conv, broadcast,
+  device MoE; host side `gpu::portable_kernels<>` on `gpu::vk::runtime`). **Lavapipe-verified**: all 47 shaders build
+  with glslang 15.1 and pass `spirv-val`; `test_vulkan` and `test_vulkan_align256` (`FORGE_VK_SSBO_ALIGN=256`: views
+  staged through scratch buffers) run the checks of `tests/gpu_checks.hpp`, which `test_cuda_hip` runs on the mocks:
+  14/14 attention shapes, 24/24 quantised matmul cases, 28/28 against the decoded-weight reference (worst 1.2e-6 of
+  the largest output), 20/20 fused FFN cases, state ops (3 shapes, 2e-8), 4/4 quantised gather, 21/21 MoE cases, 8/8
+  broadcast cases, every `vk.*` lowering through the oracle. Goldens with `FORGE_DEVICE=vulkan`: the existing three
+  plus `golden_{hf_quant,quant_inplace,tiny_qwen2,tiny_qwen3,tiny_gpt2,tiny_gemma,tiny_phi3,tiny_bert,tiny_vit,tiny_whisper}_vulkan`
+  (13 in all) pass. `tiny_qwen3_5` (DeltaNet end to end) was skipped: no torch here; the state ops are covered by the
+  check above only. First attempt failed the oracle on decode attention by 1.2e-5 against 1e-5 (one `fma` chain per
+  score); the ports sum scores in 4 partial sums like the spec shader. Never on a GPU: descriptor limits, real
+  drivers' SPIR-V compilers and buffers over the tested sizes are untested.
+- **Vulkan dispatch folding**: launches are folded over the second dispatch dimension (rows of 32768 groups); before,
+  a launch of more than 65535 × 64 work items exceeded what `maxComputeWorkGroupCount` guarantees. Lavapipe: a
+  2,098,152-item `add` (0 wrong). The 36 spec shaders were regenerated with the linear index and pass as before.
+- The checks shared by `test_cuda_hip` and `test_vulkan` moved to `tests/gpu_checks.hpp`; the 26 `test_gpu_*_mock`
+  tests pass unchanged after the move.
 
 ### 2026-11-12 (session summary: everything merged on this day, and how each part was verified)
 One machine did all of this: Linux x86_64 (4 cores, kernel 6.18), **clang 23**, no GPU. Nothing below has been

@@ -1560,6 +1560,20 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME golden_rope_scaling_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_rope.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_rope_vk)
       set_tests_properties(golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_rope_scaling_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      # Quantised weights kept encoded on the device (the GLSL ports of forge_qmatmul_t / forge_qglu / forge_qgather:
+      # q8_0 HF imports, in-place quantisation, AWQ / GPTQ checkpoints), QK-norm, and the other template families
+      # (their attention_bias / conv / layer_norm steps run on the CPU between device steps).
+      set(_vk_goldens hf_quant:${Python3_EXECUTABLE} quant_inplace:${FORGE_GOLDEN_PYTHON} tiny_qwen2:${Python3_EXECUTABLE} tiny_qwen3:${Python3_EXECUTABLE})
+      foreach(_g ${FORGE_GOLDEN_FAMILIES})
+        list(APPEND _vk_goldens tiny_${_g}:${Python3_EXECUTABLE})
+      endforeach()
+      foreach(_e ${_vk_goldens})
+        string(REGEX REPLACE "^([^:]+):(.*)$" "\\1" _g "${_e}")
+        string(REGEX REPLACE "^([^:]+):(.*)$" "\\2" _py "${_e}")
+        add_test(NAME golden_${_g}_vulkan COMMAND ${_py} ${PROJECT_SOURCE_DIR}/verify/golden/${_g}.py
+                 --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_${_g}_vk)
+        set_tests_properties(golden_${_g}_vulkan PROPERTIES ENVIRONMENT "FORGE_DEVICE=vulkan" LABELS gpu)
+      endforeach()
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)

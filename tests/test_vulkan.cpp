@@ -7,6 +7,7 @@
 int main() { std::puts("vulkan backend not built (no vulkan headers / glslangValidator)"); return 77; }
 #else
 #include "tiny_model.hpp"
+#include "gpu_checks.hpp"
 #include <forge/inference/inference.hpp>
 #include <cmath>
 #include <filesystem>
@@ -25,6 +26,7 @@ static int kernels(gpu::vk::runtime& rt) {
     int fails = 0, n = 0;
     for (auto& b : gpu::spv::table) {
         std::string name = b.name;
+        if (name.rfind("forge_", 0) == 0) continue;   // ports of the portable kernels: ported() below
         auto o = ops::op_from_name(name);
         if (!o) { std::printf("FAIL %s not in spec\n", b.name); ++fails; continue; }
         auto& info = ops::info(*o);
@@ -99,6 +101,63 @@ static int end_to_end() {
     return ok ? 0 : 1;
 }
 
+// The GLSL ports of the portable kernel families (ops/gen/gpu_gen.py VK_PORT; gpu::portable_kernels<> on the Vulkan
+// runtime): the same checks, references and bounds test_cuda_hip.cpp applies to CUDA / HIP / OpenCL / Level Zero
+// (tests/gpu_checks.hpp), plus that every family is really registered and dispatched, broadcast binaries against the
+// reference, and a launch large enough to be folded over the second dispatch dimension.
+static int ported(std::shared_ptr<gpu::vk::runtime> rt) {
+    using namespace forge_test::gpu_checks;
+    const std::string api = "vk";
+    auto reg = graph::vulkan_registry(rt);
+    auto disp = [&](const char* k) -> std::size_t { auto d = rt->dispatches(); auto it = d.find(k); return it == d.end() ? 0 : it->second; };
+    int fails = 0;
+    auto need = [&](bool c, const char* what) { if (!c) { std::printf("FAIL vk: %s\n", what); ++fails; } };
+    need(bool(reg->device_qgemm), "no device quantised matmul_t registered");
+    need(bool(reg->device_qglu), "no fused FFN gate/up registered");
+    need(bool(reg->device_qgather), "no device quantised gather registered");
+    need(bool(reg->device_moe), "no device mixture of experts registered");
+    need(reg->hooks && reg->hooks->state, "no device state ops registered");
+    if (fails) return fails;
+    fails += attention_dec_check(*rt, api);
+    fails += qmatmul_check<gpu::vk::runtime>(*reg, api, [] { return std::size_t(0); });
+    fails += exact_reference_check<gpu::vk::runtime>(*reg, api);
+    fails += glu_check(*reg, *rt, api);
+    fails += state_ops_check(*reg, api);
+    fails += qgather_check(*reg, api);
+    fails += moe_check(*reg, api, disp);
+    {   // broadcast add/sub/mul/div through the vk.<op> lowerings (forge_bcast), both operand orders
+        int bf = 0, n = 0;
+        for (auto o : {ops::op::add, ops::op::sub, ops::op::mul, ops::op::div}) for (int swap = 0; swap < 2; ++swap) {
+            tensor big({5, 3, 7}), sm({3, 7});
+            for (std::size_t i = 0; i < big.data.size(); ++i) big.data[i] = std::sin(float(i) * 0.37f) + 2.f;
+            for (std::size_t i = 0; i < sm.data.size(); ++i) sm.data[i] = std::cos(float(i) * 0.91f) + 1.5f;
+            std::vector<tensor> in = swap ? std::vector<tensor>{sm, big} : std::vector<tensor>{big, sm};
+            tensor ref = ops::reference(o)(in, {}), got(ref.shape);
+            std::vector<shape_t> ss{in[0].shape, in[1].shape}; std::vector<tensor_view> vs{{in[0].data.data(), in[0].shape}, {in[1].data.data(), in[1].shape}};
+            const graph::lowering* low = nullptr;
+            for (auto& l : reg->lowerings(o)) if (l.name.rfind("vk.", 0) == 0 && (!l.supports || l.supports(ss, ref.shape, {}))) low = &l;
+            ++n;
+            if (!low) { ++bf; continue; }
+            low->fn(vs, got.view(), {});
+            for (std::size_t i = 0; i < ref.data.size(); ++i) if (!(std::fabs(got.data[i] - ref.data[i]) <= 1e-6f * (1 + std::fabs(ref.data[i])))) { ++bf; break; }
+        }
+        std::printf("%s %d/%d vk broadcast binaries match the reference\n", bf ? "FAIL" : "ok  ", n - bf, n);
+        fails += bf;
+    }
+    {   // 64 * 32768 + 1000 work items: more groups than one dispatch row holds
+        const std::size_t N = 64u * 32768u + 1000u;
+        std::vector<float> a(N), b(N), y(N, -1.f);
+        for (std::size_t i = 0; i < N; ++i) { a[i] = float(i % 1021); b[i] = float(i % 13) * 0.5f; }
+        rt->run("add", {{a.data(), N}, {b.data(), N}, {y.data(), N}}, {.n = std::uint32_t(N)}, std::uint32_t(N));
+        std::size_t bad = 0; for (std::size_t i = 0; i < N; ++i) bad += y[i] != a[i] + b[i];
+        std::printf("%s vk folded dispatch of %zu work items (%zu wrong)\n", bad ? "FAIL" : "ok  ", N, bad);
+        fails += bad != 0;
+    }
+    for (auto k : {"attention_dec", "attention_fa", "qmatmul_t", "qglu", "qgather", "moe_ffn", "delta_rule", "causal_conv", "bcast"})
+        if (!disp(k)) { std::printf("FAIL vk: the %s port was never dispatched\n", k); ++fails; }
+    return fails;
+}
+
 static int pipeline_cache() {
     // A second runtime must pick up the cache file written by the first one.
     std::string path;
@@ -143,6 +202,8 @@ static int device_memory() {
 }
 
 int main() {
+    // as test_cuda_hip.cpp: the device kernels are checked against the CPU's exact f32 products, not its int8-activation path
+    if (!std::getenv("FORGE_CPU_INT8")) forge_test::gpu_checks::set_env("FORGE_CPU_INT8", "0");
     std::string why;
     auto tmp = std::filesystem::temp_directory_path() / ("forge-vkcache-" + std::to_string(::getpid()));
     
@@ -156,7 +217,7 @@ int main() {
     std::printf("vulkan device: %s\n", rt->device_name().c_str());
     int f = kernels(*rt);
     f += end_to_end();
-    rt.reset();
+    f += ported(std::shared_ptr<gpu::vk::runtime>(std::move(rt)));
     f += pipeline_cache();
     f += device_memory();
     std::error_code ec; std::filesystem::remove_all(tmp, ec);
