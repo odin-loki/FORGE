@@ -335,6 +335,12 @@ TEST(frame_pacer_runs_must_work_and_defers_by_budget) {
     for (int i = 0; i < 5; ++i) fp.defer([&] { now += 4000; ++bg; });
     fp.begin_frame(); st = fp.end_frame();
     CHECK(st.deferred_ran == 2); CHECK(st.deferred_left == 3);
+    for (int f = 0; f < 3 && fp.deferred(); ++f) { fp.begin_frame(); (void)fp.end_frame(); }
+    CHECK(fp.deferred() == 0);
+    // a task whose estimate exceeds the whole budget never fits; after starve_frames (4) empty-handed frames it runs anyway
+    fp.defer([&] { now += 50'000; ++bg; }, 50'000); const int before = bg;
+    for (int f = 0; f < 4; ++f) { fp.begin_frame(); st = fp.end_frame(); CHECK(st.deferred_ran == 0 && st.deferred_left == 1); }
+    fp.begin_frame(); st = fp.end_frame(); CHECK(st.deferred_ran == 1 && st.deferred_left == 0 && st.over_budget && bg == before + 1);
     fp.begin_frame(); fp.run([] { throw std::runtime_error("frame"); }); CHECK_THROWS(fp.end_frame());
 }
 

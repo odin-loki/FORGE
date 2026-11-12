@@ -547,7 +547,9 @@ private:
 // end_frame waits (helping) for the frame's run() tasks, then starts deferred tasks, oldest first, in waves of
 // at most one per worker while now + estimate <= frame start + budget; the rest stay queued for the next
 // frame. An estimate of 0 uses a running average of observed deferred-task times. A deferred task that has
-// started is never interrupted, so a frame can overrun by one deferred task's length. The clock can be
+// started is never interrupted, so a frame can overrun by one deferred task's length. A task that never fits
+// (its estimate exceeds what the frames leave) is not starved: after starve_frames frames in a row that
+// started no deferred task, the next frame runs the oldest one anyway. The clock can be
 // injected (tests).
 struct frame_stats { std::uint64_t frame = 0, elapsed_ns = 0, budget_ns = 0; std::size_t ran = 0, deferred_ran = 0, deferred_left = 0; bool over_budget = false; };
 class frame_pacer {
@@ -556,6 +558,7 @@ public:
     frame_pacer(scheduler& s, std::uint64_t budget_ns, clock_fn clock = {})
         : s_(s), budget_(budget_ns), clock_(clock ? std::move(clock) : clock_fn([] { return std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); })) {}
     void set_budget(std::uint64_t ns) { budget_ = ns; }
+    unsigned starve_frames = 4;   // after this many consecutive frames that started no deferred task, the next frame runs one regardless of the budget
     void begin_frame() { t0_ = clock_(); ++frame_; must_.clear(); }
     std::uint64_t remaining_ns() const { std::uint64_t e = clock_() - t0_; return e >= budget_ ? 0 : budget_ - e; }
     template <class F> void run(F&& f, spawn_options o = {.prio = priority::high, .place = placement::performance}) { must_.push_back(s_.spawn(std::forward<F>(f), std::move(o))); }
@@ -574,7 +577,8 @@ public:
                 std::uint64_t now = clock_() - t0_;
                 while (!deferred_.empty() && wave.size() < s_.size()) {
                     std::uint64_t est = deferred_.front().est ? deferred_.front().est : avg_;
-                    if (now + est > budget_ || now >= budget_) break;
+                    const bool overdue = starved_ >= starve_frames && st.deferred_ran == 0 && wave.empty();   // passed over too often: run one anyway
+                    if (!overdue && (now + est > budget_ || now >= budget_)) break;
                     wave.push_back(std::move(deferred_.front())); deferred_.pop_front();
                 }
             }
@@ -588,6 +592,7 @@ public:
             st.deferred_ran += ts.size();
         }
         st.deferred_left = deferred();
+        starved_ = st.deferred_left && st.deferred_ran == 0 ? starved_ + 1 : 0;
         st.elapsed_ns = clock_() - t0_; st.over_budget = st.elapsed_ns > budget_;
         if (err) std::rethrow_exception(err);
         return st;
@@ -597,7 +602,7 @@ public:
 private:
     struct item { std::function<void()> fn; std::uint64_t est; };
     scheduler& s_; std::uint64_t budget_; clock_fn clock_;
-    std::uint64_t t0_ = 0, frame_ = 0, avg_ = 0;
+    std::uint64_t t0_ = 0, frame_ = 0, avg_ = 0; unsigned starved_ = 0;
     std::vector<task_ref> must_;
     mutable std::mutex m_; std::deque<item> deferred_;
 };
