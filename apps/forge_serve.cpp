@@ -300,9 +300,16 @@ private:
                     raise(errc::unsupported, "\"dimensions\": {} is not available, the model's embeddings have {} values", d->num(), shape.empty() ? i64(0) : shape.back());
             }
             for (std::size_t i = 0; i < items.size(); ++i) {
-                std::vector<float> v; std::size_t n = items[i].ids.size();
-                if (items[i].text) v = embed_->embed_text(*items[i].text, nullptr, &n);
-                else v = embed_->embed(items[i].ids);
+                std::vector<int> types;
+                if (items[i].text) {   // the tokenizer's special tokens and token types
+                    if (!m_->tokenizer()) raise(errc::invalid_argument, "{} has no tokenizer: \"input\" must be token ids", name_);
+                    auto enc = m_->tokenizer()->encode_typed(*items[i].text);
+                    items[i].ids = std::move(enc.ids); types = std::move(enc.type_ids);
+                }
+                const std::size_t n = items[i].ids.size();
+                if (i64(n) > m_->max_context())   // a request error (400), not a capacity one
+                    raise(errc::invalid_argument, "\"input\"[{}] is {} tokens, more than the model's {} positions (inputs are not truncated)", i, n, m_->max_context());
+                auto v = embed_->embed(items[i].ids, types);
                 tokens += n;
                 json::object e{{"object", "embedding"}, {"index", double(i)}};
                 if (fmt == "base64") {
@@ -455,7 +462,8 @@ int main(int argc, char** argv) {
         }
         mem::governor::instance().watch_pressure();
         auto m = inference::model::open(path);
-        if (m->blueprint().session != "generative_sequence") raise(errc::unsupported, "model session '{}' is not generative", m->blueprint().session);
+        if (m->blueprint().session != "generative_sequence" && m->blueprint().session != "embedding")
+            raise(errc::unsupported, "model session '{}' is neither generative nor an embedding model", m->blueprint().session);
         inference::batch_options bo;
         bo.max_active = std::stoi(arg(argc, argv, "max-active", "8"));
         bo.session.context = std::stoll(arg(argc, argv, "ctx", "0"));
