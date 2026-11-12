@@ -159,14 +159,141 @@ output w : f32[8]
     CHECK_THROWS(modelfile::build_graph(modelfile::parse_blueprint("blueprint \"e\"\nop f(a) { b = a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
 }
 
+// Chunked encryption (the default of encrypt_file): tensors are decrypted one at a time, on use, and every way of
+// rearranging the sealed bytes is refused.
+TEST(fpk_chunked_encryption) {
+    using secs_t = std::map<std::string, std::string>;
+    auto src = forge_test::make_tiny_model(tmp("ce_src.fpk")), src2 = forge_test::make_tiny_model(tmp("ce_src2.fpk"), {.seed = 11});
+    auto key = modelfile::generate_model_key();
+    auto set = [](json::object& o, std::string_view k, json::value v) { for (auto& [kk, vv] : o) if (kk == k) { vv = std::move(v); return; } o.emplace_back(std::string(k), std::move(v)); };
+    auto get = [](json::object& o, std::string_view k) -> json::value& { for (auto& [kk, vv] : o) if (kk == k) return vv; raise(errc::not_found, "no key {}", k); };
+    auto read_secs = [](const std::string& f) { secs_t m; modelfile::reader r(f); for (auto& [n, s] : r.sections()) { auto b = r.raw_section_bytes(n); m[n].assign(reinterpret_cast<const char*>(b.data()), b.size()); } return m; };
+    auto write_secs = [](const std::string& f, const secs_t& m) { modelfile::detail::write_sections(f, {m.begin(), m.end()}); };
+    for (std::size_t chunk : {std::size_t(4096), std::size_t(1000), std::size_t(1) << 20}) {
+        auto dst = tmp("ce.fpk");
+        modelfile::encrypt_file(src, dst, key, {.chunk_bytes = chunk});
+        modelfile::reader plain(src), locked(dst), open(dst, key);
+        auto hdr = json::parse(locked.section_text("encryption"));
+        CHECK(hdr.str_or("alg", "") == "xchacha20-poly1305-chunked" && std::size_t(hdr.num_or("chunk_bytes", 0)) == chunk);
+        CHECK(std::size_t(hdr.num_or("chunks", 0)) == (plain.data_size() + chunk - 1) / chunk && locked.sections().at("enc_macs").size == 16 * std::size_t(hdr.num_or("chunks", 0)));
+        CHECK(locked.locked() && locked.verify().empty()); CHECK_THROWS(locked.load("lm_head")); CHECK_THROWS(locked.tensor_bytes("lm_head"));
+        CHECK(locked.manifest().str_or("format", "") == "fpk");
+        CHECK(open.encrypted() && open.chunked_encryption() && open.plaintext_resident() == 0);   // nothing is decrypted at open
+        // the tensor index and every offset are what the plain file has: only the bytes of `data` differ
+        CHECK(open.section_text("tensors") == plain.section_text("tensors"));
+        { auto raw = open.raw_section_bytes("data"), pd = plain.section_bytes("data"); CHECK(raw.size() == pd.size() && std::memcmp(raw.data(), pd.data(), pd.size()) != 0); }
+        auto one = open.tensor_bytes("layer.1.wq"), ref = plain.tensor_bytes("layer.1.wq");
+        CHECK(one.size() == ref.size() && std::memcmp(one.data(), ref.data(), ref.size()) == 0);
+        CHECK(open.plaintext_resident() == ref.size() && open.plaintext_resident() < plain.data_size() / 4);   // one tensor, not the file
+        CHECK(reinterpret_cast<std::uintptr_t>(one.data()) % 64 == 0);
+        CHECK(open.tensor_bytes("layer.1.wq").data() == one.data());                                          // cached, not decrypted again
+        for (auto& [n, e] : plain.tensors()) CHECK(open.load(n).data == plain.load(n).data);                  // load() decodes from a wiped scratch copy
+        CHECK(open.plaintext_resident() == ref.size());
+        CHECK(open.verify().empty());
+        open.release_plaintext(); CHECK(open.plaintext_resident() == 0);
+        const_cast<modelfile::reader&>(open).lock_plaintext(true);
+        auto lk = open.tensor_bytes("tok_emb"), lref = plain.tensor_bytes("tok_emb");
+        CHECK(lk.size() == lref.size() && std::memcmp(lk.data(), lref.data(), lref.size()) == 0);
+        std::printf("  chunk %zu: %zu chunks, locked plaintext: %s\n", chunk, std::size_t(hdr.num_or("chunks", 0)), open.plaintext_locked() ? "yes" : "refused by the OS (limit)");
+        auto bad = key; bad[0] ^= 1; CHECK_THROWS(modelfile::reader(dst, bad));
+        CHECK_THROWS(modelfile::encrypt_file(dst, tmp("ce2.fpk"), key));
+        // section_bytes("data") still works (whole-section fallback for old callers)
+        { modelfile::reader o2(dst, key); auto d = o2.section_bytes("data"), pd = plain.section_bytes("data"); CHECK(d.size() == pd.size() && std::memcmp(d.data(), pd.data(), pd.size()) == 0); }
+    }
+    // ---- tampering. Each case rewrites the container so that the section table and its hashes are consistent
+    // (what an attacker without the key can do); the AEAD has to catch it. `rejected` = the reader refuses to open,
+    // or verify() reports it and reading the tensors fails.
+    const std::size_t chunk = 4096;
+    auto a = tmp("ce_a.fpk"), b = tmp("ce_b.fpk"), c = tmp("ce_c.fpk"), t = tmp("ce_t.fpk");
+    modelfile::encrypt_file(src, a, key, {.chunk_bytes = chunk});
+    modelfile::encrypt_file(src, b, key, {.chunk_bytes = chunk});    // same model, same key, another nonce
+    modelfile::encrypt_file(src2, c, key, {.chunk_bytes = chunk});   // another model of the same layout, same key
+    const secs_t A = read_secs(a), B = read_secs(b), C = read_secs(c);
+    const std::size_t n_chunks = A.at("enc_macs").size() / 16;
+    CHECK(n_chunks > 8 && A.at("data") != B.at("data"));
+    auto rejected = [&](const secs_t& m, const char* what) {
+        write_secs(t, m);
+        try {
+            modelfile::reader r(t, key);
+            bool read_fails = false;
+            try { for (auto& [n, e] : r.tensors()) (void)r.load(n); } catch (const forge_exception& e) { read_fails = e.code == errc::integrity_error; }
+            bool tb_fails = false;
+            try { for (auto& [n, e] : r.tensors()) (void)r.tensor_bytes(n); } catch (const forge_exception& e) { tb_fails = e.code == errc::integrity_error; }
+            bool ok = read_fails && tb_fails && !r.verify().empty();
+            if (!ok) std::fprintf(stderr, "  tamper case '%s' was not rejected\n", what);
+            return ok;
+        } catch (const forge_exception&) { return true; }
+    };
+    { write_secs(t, A); modelfile::reader r(t, key); CHECK(r.verify().empty()); }   // the rewrite itself is harmless
+    { auto m = A; m["data"][chunk * 3 + 17] ^= 0x01; CHECK(rejected(m, "bit flip in a ciphertext chunk")); }
+    { auto m = A; m["data"].back() ^= 0x80; CHECK(rejected(m, "bit flip in the last (short) chunk")); }
+    { auto m = A; m["enc_macs"][16 * 2 + 5] ^= 0x10; CHECK(rejected(m, "bit flip in a tag")); }
+    {   // reorder: chunks 1 and 2 swapped together with their tags
+        auto m = A; auto& d = m["data"]; auto& mc = m["enc_macs"];
+        std::swap_ranges(d.begin() + chunk, d.begin() + 2 * chunk, d.begin() + 2 * chunk);
+        std::swap_ranges(mc.begin() + 16, mc.begin() + 32, mc.begin() + 32);
+        CHECK(rejected(m, "two chunks reordered"));
+    }
+    {   // truncate: the last chunk and its tag dropped, header untouched / header adjusted / header and index adjusted
+        auto m = A; auto last = (n_chunks - 1) * chunk;
+        m["data"].resize(last); m["enc_macs"].resize(16 * (n_chunks - 1));
+        CHECK(rejected(m, "truncated, header untouched"));
+        auto ho = json::parse(A.at("encryption")).obj();
+        set(ho, "chunks", double(n_chunks - 1)); set(ho, "data_bytes", double(last));
+        m["encryption"] = json::dump(json::value(ho));
+        CHECK(rejected(m, "truncated, header adjusted"));
+        json::array keep;   // drop the tensors that reached into the removed chunk, so every bounds check passes
+        for (auto& e : json::parse(A.at("tensors")).arr()) if (e["offset"].num() + e["bytes"].num() <= double(last)) keep.push_back(e);
+        CHECK(!keep.empty() && keep.size() < json::parse(A.at("tensors")).arr().size());
+        m["tensors"] = json::dump(json::value(keep));
+        CHECK(rejected(m, "truncated, header and index adjusted"));
+    }
+    {   // splice: a chunk (with its tag) of another file sealed with the same key
+        auto m = A; m["data"].replace(chunk * 4, chunk, B.at("data"), chunk * 4, chunk); m["enc_macs"].replace(16 * 4, 16, B.at("enc_macs"), 16 * 4, 16);
+        CHECK(rejected(m, "chunk spliced from the same model sealed again"));
+        m = A; m["data"].replace(chunk * 4, chunk, C.at("data"), chunk * 4, chunk); m["enc_macs"].replace(16 * 4, 16, C.at("enc_macs"), 16 * 4, 16);
+        CHECK(rejected(m, "chunk spliced from another model"));
+        m = A; m["data"] = B.at("data"); m["enc_macs"] = B.at("enc_macs");
+        CHECK(rejected(m, "all ciphertext of another sealing under this header"));
+        m = A; m["data"] = C.at("data"); m["enc_macs"] = C.at("enc_macs"); m["encryption"] = C.at("encryption");
+        CHECK(rejected(m, "another model's sealed data under this index"));   // the index (tensor hashes) is bound into every chunk
+    }
+    {   // header edits
+        auto ho = json::parse(A.at("encryption")).obj(); auto m = A;
+        set(ho, "chunk_bytes", double(chunk * 2)); m["encryption"] = json::dump(json::value(ho));
+        CHECK(rejected(m, "chunk size altered"));
+        ho = json::parse(A.at("encryption")).obj(); auto nn = get(ho, "nonce").str(); nn[47] = nn[47] == '0' ? '1' : '0'; set(ho, "nonce", nn);
+        m = A; m["encryption"] = json::dump(json::value(ho));
+        CHECK(rejected(m, "nonce altered"));
+    }
+    {   // index edit: two tensors of the same shape exchange their offsets
+        auto idx = json::parse(A.at("tensors")).arr(); json::object* p0 = nullptr; json::object* p1 = nullptr;
+        for (auto& e : idx) { if (e["name"].str() == "layer.0.wq") p0 = &e.obj_mut(); if (e["name"].str() == "layer.1.wq") p1 = &e.obj_mut(); }
+        CHECK(p0 && p1);
+        if (p0 && p1) { auto o0 = get(*p0, "offset"), o1 = get(*p1, "offset"); set(*p0, "offset", o1); set(*p1, "offset", o0); }
+        auto m = A; m["tensors"] = json::dump(json::value(idx));
+        CHECK(rejected(m, "index offsets exchanged"));
+    }
+    // a session on the sealed file: same logits as the plain file, and only tensor-sized plaintext is held
+    forge_test::set_env("FORGE_MODEL_KEY", modelfile::detail::hex(key.data(), 32).c_str());
+    {
+        inference::session s(a), p(src);
+        CHECK(s.forward(std::vector<int>{1, 2, 3}) == p.forward(std::vector<int>{1, 2, 3}));
+        CHECK(s.file().chunked_encryption() && s.file().plaintext_resident() > 0 && s.file().plaintext_resident() <= s.file().data_size());
+    }
+    forge_test::set_env("FORGE_MODEL_KEY", nullptr);
+}
+
 TEST(fpk_encryption_hook) {
     auto src = forge_test::make_tiny_model(tmp("enc_src.fpk")), dst = tmp("enc.fpk");
-    auto key = modelfile::generate_model_key(); modelfile::encrypt_file(src, dst, key);
+    // the single-AEAD scheme (what files sealed before the chunked scheme carry): still written on request, still read
+    auto key = modelfile::generate_model_key(); modelfile::encrypt_file(src, dst, key, {.single_aead = true});
     {   // readers map the file; Windows cannot replace a mapped file, so they close before dst is rewritten
     modelfile::reader plain(src), locked(dst);
+    CHECK(json::parse(locked.section_text("encryption")).str_or("alg", "") == "xchacha20-poly1305" && !locked.has_section("enc_macs"));
     CHECK(locked.locked()); CHECK(locked.verify().empty()); CHECK_THROWS(locked.load("lm_head"));
     CHECK(locked.manifest().str_or("format", "") == "fpk");                  // metadata stays readable
-    modelfile::reader open(dst, key); CHECK(open.encrypted()); CHECK(open.verify().empty());
+    modelfile::reader open(dst, key); CHECK(open.encrypted() && !open.chunked_encryption()); CHECK(open.verify().empty());
     for (auto& [n, e] : plain.tensors()) CHECK(open.load(n).data == plain.load(n).data);
     { auto raw = open.raw_section_bytes("data"), pd = plain.section_bytes("data"); CHECK(raw.size() == pd.size() && std::memcmp(raw.data(), pd.data(), pd.size()) != 0); }
     auto bad = key; bad[0] ^= 1; CHECK_THROWS(modelfile::reader(dst, bad));

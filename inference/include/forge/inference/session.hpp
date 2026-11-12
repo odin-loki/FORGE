@@ -135,7 +135,7 @@ public:
         std::lock_guard lk(run_mu_);
         std::string why, use = dev;
         if (dev == "auto") {   // score every device that opens for this model (gpu/select.hpp)
-            gpu::select_request rq; rq.model_bytes = r_.section_bytes("data").size();
+            gpu::select_request rq; rq.model_bytes = std::size_t(r_.data_size());
             for (auto& [nm, e] : r_.tensors()) if (std::find(rq.codecs.begin(), rq.codecs.end(), e.codec) == rq.codecs.end()) rq.codecs.push_back(e.codec);
             std::string table; use = graph::auto_device(rq, &table);
             log::info("FORGE_DEVICE=auto -> {}\n{}", use, table);
@@ -220,14 +220,14 @@ public:
                 if (!adapter.empty() && adapters_.at(adapter).count(name)) return {};
                 const auto& e = r_.entry(name);
                 if (e.codec == "f32") return {};  // handled by `weight` (zero-copy below)
-                return {e.shape, r_.section_bytes("data").data() + e.offset, e.codec};
+                return {e.shape, r_.tensor_bytes(name).data(), e.codec};
             };
             if (!decode_all) bo.weight = [&, inner = bo.weight](const std::string& name) -> std::pair<shape_t, const float*> {
                 const auto& e = r_.entry(name);
                 bool adapted = !adapter.empty() && adapters_.at(adapter).count(name);
-                const auto* base = r_.section_bytes("data").data() + e.offset;
-                if (!adapted && e.codec == "f32" && reinterpret_cast<std::uintptr_t>(base) % alignof(float) == 0)
-                    return {e.shape, reinterpret_cast<const float*>(base)};
+                if (!adapted && e.codec == "f32")
+                    if (const auto* base = r_.tensor_bytes(name).data(); reinterpret_cast<std::uintptr_t>(base) % alignof(float) == 0)
+                        return {e.shape, reinterpret_cast<const float*>(base)};
                 return inner(name);
             };
             graph::pass_options po; po.lowerings = reg_.get();

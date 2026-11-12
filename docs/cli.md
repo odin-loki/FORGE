@@ -115,8 +115,13 @@ Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or 
 ### `forge verify <file> [--sig file.sig] [--pubkey NAME.pub]... [--detached]`
 Checks a detached signature: `<file>.sig` (or `--sig`) must name this file's base name and match its BLAKE3 digest and size, and carry a valid signature (from a listed key when `--pubkey` is given). Prints `signature ok key <id>` / `signature BAD key <id>` per signer and `<file>: VERIFIED`, or the reason (`unsigned`, `content does not match the signed digest`, `signature is for 'x', not 'y'`, `not by a trusted key`), exit 0 or 1.
 
-### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey)`
+### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey) [--chunk SIZE] [--single-aead]`
 Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file (64 hex digits, mode 0600 where supported). Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
+
+- The data is sealed in chunks of `--chunk` plaintext bytes (default `1M`; `4096`, `64k`, `2M`; 64 bytes to 1 GiB), each with its own tag. A model loaded from such a file decrypts a tensor when it is first used, not the file at load; `FORGE_LOCK_WEIGHTS=1` puts the decrypted tensors in locked, dump-excluded memory (best effort: `mlock` can be refused by `RLIMIT_MEMLOCK`).
+- `--single-aead` writes the older scheme (one AEAD over all tensor data, decrypted whole into memory at load), for FORGE builds that predate the chunked one.
+- `forge inspect` prints the scheme, the key id and whether a key was accepted.
+- `forge encrypt` itself holds the whole tensor data in memory while it works.
 
 ### `forge security check [--policy FILE] [--json]`
 Loads the security policy (`--policy`, `$FORGE_SECURITY_POLICY`, `./forge-security.json`, `<config dir>/forge/forge-security.json`; `$FORGE_SECURITY_PROFILE` picks a base profile) and prints, for each FORGE Security Standard control, its state (`active`, `available`, `emulated`, `missing`, `n/a`, `failed`), backend, level and verdict. It changes nothing. Exits 0 when every required control can be met, 1 when one cannot, 2 when the policy is invalid. With no policy and no profile it reports "no FSS profile active" and exits 0. Details: [security-api.md](security-api.md).

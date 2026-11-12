@@ -91,6 +91,8 @@ int usage() {
         "  verify <file> [--sig file.sig] [--pubkey <name.pub>]...   check a detached signature (exit 1 on failure)\n"
         "  encrypt <in.fpk> -o <out.fpk> --key k.mkey | --new-key k.mkey   seal tensor data (XChaCha20-Poly1305);\n"
         "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
+        "      [--chunk 1M] sealed chunk size: tensors are decrypted one at a time when first used (FORGE_LOCK_WEIGHTS=1: into locked memory)\n"
+        "      [--single-aead] the older scheme (one AEAD over all tensor data, decrypted whole at load)\n"
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
@@ -239,6 +241,13 @@ int cmd_inspect(const args& a) {
         if (r.has_section("license")) line += std::format("{}text: {} bytes (--license prints it)", line.empty() ? "" : ", ", r.section_text("license").size());
         std::printf("license   %s\n", line.empty() ? "(not recorded)" : line.c_str());
     }
+    if (r.has_section("encryption")) {   // which sealing scheme, and whether this process holds the key
+        json::value e; try { e = json::parse(r.section_text("encryption")); } catch (const std::exception&) {}
+        auto alg = e.str_or("alg", "?");
+        std::string how = alg == "xchacha20-poly1305-chunked" ? std::format("{} chunks of {} bytes, decrypted per tensor on use", (unsigned long long)e.num_or("chunks", 0), (unsigned long long)e.num_or("chunk_bytes", 0))
+                        : alg == "xchacha20-poly1305" ? std::string("one AEAD over the data section, decrypted whole at load") : std::string("unknown scheme");
+        std::printf("encrypted %s, key id %s (%s); %s\n", alg.c_str(), e.str_or("key_id", "?").c_str(), how.c_str(), r.locked() ? "no key given: tensors unreadable" : "key accepted");
+    }
     if (a.has("tensors")) for (auto& [n, e] : r.tensors()) std::printf("  %-28s %-9s %s\n", n.c_str(), e.codec.c_str(), shape_str(e.shape).c_str());
     if (a.has("blueprint")) std::printf("%.*s\n", int(r.section_text("blueprint").size()), r.section_text("blueprint").data());
     if (a.has("license") && r.has_section("license")) std::printf("%.*s\n", int(r.section_text("license").size()), r.section_text("license").data());
@@ -301,6 +310,16 @@ int cmd_sign(const args& a) {
     std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
     return 0;
 }
+// "4096", "64k", "1M", "2G" -> bytes (binary multiples)
+std::uint64_t parse_size_arg(const std::string& v, const char* what) {
+    std::size_t used = 0; double n = 0;
+    try { n = std::stod(v, &used); } catch (const std::exception&) { throw std::runtime_error(std::string(what) + ": bad size '" + v + "'"); }
+    std::string unit = v.substr(used); for (auto& c : unit) c = char(std::tolower(static_cast<unsigned char>(c)));
+    double mul = unit.empty() || unit == "b" ? 1 : unit == "k" || unit == "kb" || unit == "kib" ? 1024.0 : unit == "m" || unit == "mb" || unit == "mib" ? 1048576.0
+               : unit == "g" || unit == "gb" || unit == "gib" ? 1073741824.0 : -1;
+    if (mul < 0 || n < 0 || n * mul > 9e15) throw std::runtime_error(std::string(what) + ": bad size '" + v + "'");
+    return std::uint64_t(n * mul);
+}
 int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key k.mkey | --new-key k.mkey]
     if (a.pos.empty() || a.get("o").empty() || (a.get("key").empty() && a.get("new-key").empty())) return usage();
     modelfile::model_key k;
@@ -316,8 +335,13 @@ int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key
         auto b = modelfile::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
         std::memcpy(k.data(), b.data(), 32);
     }
-    modelfile::encrypt_file(a.pos[0], a.get("o"), k);
-    std::printf("encrypted %s -> %s (key id %s)\n", a.pos[0].c_str(), a.get("o").c_str(), modelfile::detail::enc_key_id(k).c_str());
+    // --chunk SIZE: plaintext bytes per sealed chunk (default 1M); --single-aead: the old one-AEAD scheme
+    modelfile::encrypt_options eo;
+    if (!a.get("chunk").empty()) eo.chunk_bytes = std::size_t(parse_size_arg(a.get("chunk"), "--chunk"));
+    eo.single_aead = a.has("single-aead");
+    modelfile::encrypt_file(a.pos[0], a.get("o"), k, eo);
+    std::printf("encrypted %s -> %s (key id %s, %s)\n", a.pos[0].c_str(), a.get("o").c_str(), modelfile::detail::enc_key_id(k).c_str(),
+                eo.single_aead ? "single AEAD" : std::format("{}-byte chunks", eo.chunk_bytes).c_str());
     return 0;
 }
 int cmd_verify(const args& a) {
@@ -1020,7 +1044,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "single-aead"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);

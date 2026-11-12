@@ -31,6 +31,9 @@ Importers turn Hugging Face checkpoints, GGUF files and ONNX graphs into `.fpk`.
 | `load(name)` | The tensor decoded to f32 |
 | `verify()` | Names of sections and tensors whose hash fails (empty = intact). Tensor hashes are skipped while `locked()` |
 | `encrypted()`, `locked()` | `locked()`: encrypted and no key from the constructor, `FORGE_MODEL_KEY` or `FORGE_MODEL_KEY_FILE` |
+| `tensor_bytes(name)` | The encoded bytes of one tensor. A plain file: a view of the mapping. A chunk-encrypted file: the tensor is decrypted on the first call and kept until the reader closes or `release_plaintext()` |
+| `chunked_encryption()`, `plaintext_resident()`, `lock_plaintext(bool)`, `release_plaintext()` | Chunk-encrypted files: the scheme in use, bytes of decrypted tensor data held, whether new ones go into locked memory (default `FORGE_LOCK_WEIGHTS`), wipe and free them |
+| `data_size()` | Size of the tensor data without reading it |
 
 `modelfile::alignment` is 64; `modelfile::format_version` is 1.
 
@@ -286,4 +289,6 @@ Under a security policy, `integrity.plugins` and `integrity.scripts` decide whet
 ## Platform notes and limits
 - `FORGE_HUGEPAGES=1` asks for transparent huge pages on mappings of 2 MiB or more.
 - In encrypted files only `data` is sealed. The manifest, blueprint, tokenizer, tensor index and section table stay readable, which is why `inspect`, section-hash and signature checks work without the key.
+- **Encrypted models and memory.** `forge encrypt` seals the data in chunks ([format.md](format.md#encryption)). A session then decrypts each weight when a plan first binds it and keeps that tensor's plaintext for as long as the model is open, because the kernels read weights in place. What this bounds: nothing is decrypted at open, tensors no plan uses are never decrypted, `reader::load()` (which decodes to f32) works from a scratch copy that is wiped, and the plaintext is not one heap block the size of the file. What it does not: a model that uses all of its weights ends up with all of them decrypted, and those pages are not file-backed, so the OS cannot drop and re-read them as it does for a plain mapped file. Tensors decoded to f32 (a weight in a codec the consuming op cannot read in place, LoRA-merged weights) live in ordinary memory in either case. `section_bytes("data")` on a chunk-encrypted file decrypts the whole section; nothing in FORGE calls it for such a file.
+- A file sealed with the older single-AEAD scheme is still decrypted whole, into ordinary heap memory, when it is opened. Re-seal it (`forge encrypt` on the plain file) to get the chunked behaviour.
 - Signing is cross-checked against pyca/cryptography (`modelfile_signing` ctest).

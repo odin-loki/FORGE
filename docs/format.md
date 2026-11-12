@@ -25,7 +25,8 @@ Readers find sections through the table, so section order on disk does not matte
 | `license` | no | The model's licence text as UTF-8, copied at import (Hugging Face `LICENSE*`, `LICENCE*`, `COPYING*`, `NOTICE*` files; an ONNX `doc_string` that mentions a licence). With several files each follows a `===== NAME =====` line. Never sealed; covered by the signature like every other section; `forge sign`, `forge encrypt` and `forge aot` copy it unchanged. No format revision: readers that predate it ignore the section |
 | `aot` | no | Precompiled plans written by `forge aot` (binary, see [The aot section](#the-aot-section)). Older readers ignore the section; a reader that cannot use it compiles plans as usual |
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
-| `encryption` | no | `{alg, nonce, mac, key_id}`. `data` is sealed with XChaCha20-Poly1305; the `tensors` JSON is bound as associated data |
+| `encryption` | no | JSON header of the sealed `data` section; two schemes, told apart by `alg`: see [Encryption](#encryption) |
+| `enc_macs` | with chunked encryption | Binary: one 16-byte Poly1305 tag per sealed chunk, in chunk order |
 
 ## Tokenizer section
 The section is the text of a `tokenizer.json`. Two versions exist; readers tell them apart by the keys present.
@@ -53,7 +54,7 @@ A tensor's codec is the `codec` string of its `tensors` entry, one of the names 
 
 ## Hashing and signing
 - Each table entry carries the BLAKE3 hash of its section bytes as stored. Each `tensors` entry carries the hash of its (plaintext) bytes.
-- `reader::verify()` checks both. Tensor hashes of an encrypted file can be checked only with the key.
+- `reader::verify()` checks both. Tensor hashes of an encrypted file can be checked only with the key; with the key, `verify()` on a chunk-encrypted file also authenticates every chunk.
 - The signature covers a BLAKE3 digest of the scheme string followed by, for every section except `signature` in name order: name length, name, size and the BLAKE3 of its stored bytes. The digest is recomputed from the bytes on disk; the stored table hashes are not trusted.
 - `key_id` is the first 4 bytes (8 hex digits) of the BLAKE3 of the public key.
 - Several signatures can be present. `forge sign` on a signed file adds a signature if the digest still matches, and replaces an older signature by the same key.
@@ -84,7 +85,28 @@ attrs  : u32 n x { str key; u8 type (0 f64, 1 i64 list: u32 n, i64[n], 2 str); v
 
 ## Encryption
 - Only `data` is sealed. The manifest, blueprint, tokenizer, tensor index and section table stay readable, so `forge inspect`, section-hash checks and signature checks work without the key.
-- Readers take the key from the constructor, or from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Without one the reader opens in the `locked()` state, and reading `data` raises an error naming the key id.
+- Readers take the key from the constructor, or from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Without one the reader opens in the `locked()` state, and reading tensor data raises an error naming the key id.
+- `key_id` is the first 8 bytes (16 hex digits) of the BLAKE3 of the key; a reader given another key refuses the file before it decrypts anything.
+- The ciphertext has the size and offsets of the plaintext in both schemes, so the `tensors` index is the same before and after sealing.
+
+Two schemes exist. `forge encrypt` writes the chunked one; both are read.
+
+| | Chunked (written by default) | Single AEAD (`forge encrypt --single-aead`, and every file sealed before the chunked scheme) |
+|---|---|---|
+| `alg` | `xchacha20-poly1305-chunked` | `xchacha20-poly1305` |
+| `encryption` JSON | `{alg, scheme: "forge-fpk-enc-v2", nonce (24 B hex), chunk_bytes, chunks, data_bytes, key_id}` | `{alg, nonce (24 B hex), mac (16 B hex), key_id}` |
+| Tags | section `enc_macs`: `chunks` x 16 B | `mac` in the header |
+| Unit | `data` is cut into chunks of `chunk_bytes` plaintext bytes (the last one shorter); chunk `i` is sealed on its own | all of `data` in one AEAD |
+| Nonce | the file nonce with `i` (little-endian u64) XORed into its last 8 bytes | the file nonce |
+| Associated data | `"forge-fpk-enc-v2\0"` (17 B), file nonce (24 B), `i`, `chunks`, `data_bytes`, `chunk_bytes` (u64 LE each), BLAKE3 of the `tensors` section (32 B) | `"forge-fpk-enc-v1\0"` followed by the `tensors` JSON |
+| When decrypted | per tensor, on first use: only the chunks the tensor lies in | all of `data`, into heap memory, when the file is opened |
+
+What the chunked scheme's associated data rules out: a chunk moved to another position (index and nonce), a file cut short or extended (`chunks`, `data_bytes`; a reader also compares both with the section sizes before it reads anything), a chunk taken from another file or another sealing of the same file (file nonce), a changed chunk size, and an edited tensor index (its hash). A failed chunk raises an integrity error that names the chunk; nothing of the requested tensor is returned.
+
+Compatibility:
+- A file sealed with the single-AEAD scheme opens and behaves as before.
+- A reader that predates the chunked scheme opens a chunked file without a key as any locked file (`inspect`, hashes, signature); with a key it stops with `unknown encryption xchacha20-poly1305-chunked`. It ignores `enc_macs`.
+- `enc_macs` and `encryption` are covered by the signature like every section; `forge sign` and `forge aot` copy them unchanged.
 
 ## Tools
 - `forge inspect <file> [--tensors] [--blueprint] [--verify]` shows the layout.

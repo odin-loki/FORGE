@@ -123,7 +123,7 @@ revocation with reload, channel binding). `test_rpc_tls` runs the `openssl` CLI 
 |---|---|
 | `.fpk` signing: Ed25519 over a BLAKE3 digest of the section table (name, size, hash of each non-signature section). CLI `forge keygen/sign/verify`. | `modelfile/include/forge/modelfile/sign.hpp` |
 | `verify_signature(reader, trusted)`: with no trusted keys, any valid signature passes (integrity only, not provenance). | `sign.hpp` |
-| `.fpk` encryption: the data section sealed with XChaCha20-Poly1305 (vendored Monocypher). `forge encrypt`; key from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Metadata opens without the key. | `modelfile/include/forge/modelfile/fpk.hpp` |
+| `.fpk` encryption: the data section sealed with XChaCha20-Poly1305 (vendored Monocypher) in chunks, each authenticated with its index, the chunk count, the data length and the hash of the tensor index, so chunks cannot be reordered, dropped or taken from another file; tensors are decrypted one at a time on first use (`FORGE_LOCK_WEIGHTS=1`: into locked memory). Files sealed with the earlier single-AEAD scheme still load (decrypted whole). `forge encrypt`; key from `FORGE_MODEL_KEY` (hex) or `FORGE_MODEL_KEY_FILE`. Metadata opens without the key. | `modelfile/include/forge/modelfile/fpk.hpp` |
 | Signed bundles: Ed25519 over a `FORGE-SIGNATURE.json` manifest of (path, size, BLAKE3) for a directory. Verification re-hashes and reports modified, missing and unsigned extra files; multiple signers; paths that escape the root are refused. Also `sign_bytes`/`verify_bytes` with a domain-separation context. Library API only, no CLI command. Test: `test_bundle_sign`. | `modelfile/include/forge/modelfile/bundle.hpp` |
 | Script cache `.fsc`: BLAKE3 key, optional Ed25519 signature (`--cache-dir`, `--cache-trust`, `--cache-require-signed`, `--cache-sign-seed`). Signatures are required when the cache directory is not private. Tests: `tests/test_script_fsc.cpp`, fuzz `fuzz/fuzz_fsc.cpp`. | `script/src/fsc.cpp`, `engine.cpp` |
 | State slots of an untrusted graph. A model file's blueprint decides the graph, and the plans of one session (one per sequence-length bucket, plus precompiled ones) share its state store. A slot's layout is fixed by its first user; a plan that would append rows of another shape, name one slot in two nodes, or use a slot both as appended rows and as recurrent state is refused when it is lowered and again when it runs (it used to write rows of its own shape into the other plan's buffer). Tests: `state_slot_layout_is_fixed_by_its_first_plan` (`tests/test_graph.cpp`), `blueprint_state_rows_depending_on_seq_are_refused` (`tests/test_modelfile.cpp`), `aot_state_slot_layout_is_checked`; `fuzz/fuzz_blueprint.cpp` lowers two buckets against one store. | `graph/include/forge/graph/plan.hpp` (`state_store::check_append`, `check_fixed`), `aot.hpp` (`check_state`) |
@@ -228,7 +228,14 @@ sees a C++ exception from `run`/`eval` (docs/scripting.md, Errors).
 - Key memory (FSS-CRY-2): locking is best effort (RLIMIT_MEMLOCK, working-set quota) and reported; macOS has no
   per-range core-dump exclusion and Windows excludes the pages only from WER reports, not from debuggers or
   `MiniDumpWriteDump`. The TLS private key lives in OpenSSL's memory, `model_key` (`.fpk` encryption) and the keystore
-  passphrase in ordinary memory; short-lived copies are wiped, not locked.
+  passphrase in ordinary memory; short-lived copies are wiped, not locked. (A reader of a chunk-encrypted `.fpk` keeps
+  its own copy of the model key in a locked buffer; the caller's `model_key` and the `FORGE_MODEL_KEY` environment
+  variable are still ordinary memory.)
+- Encrypted models: decrypted weights are in the process's memory while the model is open (one buffer per tensor
+  used; locked and dump-excluded only with `FORGE_LOCK_WEIGHTS=1`, and the lock is best effort), and weights decoded
+  to f32, LoRA-merged weights and device copies (GPU memory) are never locked. A file sealed with the older
+  single-AEAD scheme is decrypted whole into ordinary heap memory at open. `key_id` (a BLAKE3 prefix of the key) is
+  stored in the file, so two files sealed with the same key can be told to share it.
 - Private files (FSS-FIO-2) are checked when a key, token or policy file is loaded, not continuously; the check and the
   open are separate steps (a same-user attacker could swap the file in between). Files that are not keys (models,
   scripts, the `.fsc` cache, imported weights) are scoped by `enforce`, not by ownership. Only profile strict refuses;
