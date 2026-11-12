@@ -20,12 +20,12 @@ def src(*rel):
 
 def coverage():
     """Which lowerings exist per op and backend, read from the code that registers them.
-    cpu: op -> lowering names (registry::make_cpu and the SIMD registrations in kernels.hpp);
+    cpu: op -> lowering names (registry::make_cpu and the SIMD registrations in kernels.hpp and kernels_ext.hpp);
     vulkan: ops with a generated GLSL kernel (one "vk.<op>" each) plus the lowerings vulkan_registry adds by name;
     gpu: ops in gpu::cuda_hip::kernel_sig, which graph::gpu_registry registers for CUDA, HIP, OpenCL, Level Zero
     and Metal alike; bcast: binaries the CUDA/HIP runtime also runs with broadcasting."""
     cpu = {}
-    for m in re.finditer(r'\br\.add\(\{"([\w.]+)",\s*ops::op::(\w+)', src("graph", "include", "forge", "graph", "kernels.hpp")):
+    for m in re.finditer(r'\br\.add\(\{"([\w.]+)",\s*ops::op::(\w+)', src("graph", "include", "forge", "graph", "kernels.hpp") + src("graph", "include", "forge", "graph", "kernels_ext.hpp")):
         cpu.setdefault(m.group(2), []).append(m.group(1))
     vsrc = src("graph", "include", "forge", "graph", "vulkan.hpp")
     vk = {n: ["vk." + n] for n in sorted(gpu_gen.UNARY) + sorted(gpu_gen.BINARY) + gpu_gen.OTHER}
@@ -58,7 +58,7 @@ def render_coverage(ops):
     n_cpu = sum(n in c["cpu"] for n in names); n_vk = sum(n in c["vulkan"] for n in names); n_gpu = sum(n in c["gpu"] for n in names)
     out = ["", "## Lowering coverage (op × backend)", "",
            "Generated from the code that registers the lowerings: `registry::make_cpu` and the SIMD registrations "
-           "(`graph/include/forge/graph/kernels.hpp`), the Vulkan kernel list (`ops/gen/gpu_gen.py`, `vulkan_registry`), "
+           "(`graph/include/forge/graph/kernels.hpp`, `kernels_ext.hpp`), the Vulkan kernel list (`ops/gen/gpu_gen.py`, `vulkan_registry`), "
            "and `gpu::cuda_hip::kernel_sig` (`gpu/include/forge/gpu/cuda.hpp`), the one table `graph::gpu_registry` registers "
            "from for CUDA, HIP, OpenCL, Level Zero and Metal. The `coverage_table` test compares this table with the registries "
            "of the built code (`forge_coverage_dump`).", "",
