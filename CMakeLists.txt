@@ -1569,8 +1569,9 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(golden_tiny_llama golden_tiny_qwen2 golden_rope_scaling golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla golden_gguf_types golden_hf_quant modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
-      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
-      set_tests_properties(capi_smoke PROPERTIES DEPENDS golden_tiny_llama)
+      # ABI 1-4: the generative golden, the tiny BERT for forge_embed_*, and a work dir for the adapter / plan sidecar it writes
+      add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
+      set_tests_properties(capi_smoke PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert")
       add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python_bindings.py
                ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk)
       set_tests_properties(python_bindings PROPERTIES DEPENDS golden_tiny_llama ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
