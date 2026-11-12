@@ -1,5 +1,6 @@
 #include "check.hpp"
 #include <forge/inference/inference.hpp>
+#include <forge/import/gguf.hpp>
 #include <cstdio>
 #include <filesystem>
 #if !defined(_WIN32)
@@ -270,4 +271,155 @@ TEST(fuzz_seed_composites_builds) {
     auto g = modelfile::build_graph(bp, o);
     int biased = 0; for (auto& n : g.nodes()) biased += n.kind == graph::node_kind::op && n.op == ops::op::attention_bias;
     CHECK(biased == 2 && g.outputs().size() == 1);
+}
+
+// ---- GGUF tensor types: sizes are checked before anything is read ----
+// A one-tensor GGUF v3 file: `type` / `dims` (ggml order) in the tensor table, then `data` at the first 32-byte boundary.
+static std::string tiny_gguf(const std::string& name, std::uint32_t type, const std::vector<std::uint64_t>& dims, const std::vector<std::uint8_t>& data,
+                             std::uint64_t offset = 0) {
+    std::string b = "GGUF";
+    auto put = [&](auto v) { b.append(reinterpret_cast<const char*>(&v), sizeof v); };
+    put(std::uint32_t(3)); put(std::uint64_t(1)); put(std::uint64_t(0));
+    put(std::uint64_t(1)); b += "t";
+    put(std::uint32_t(dims.size())); for (auto d : dims) put(d);
+    put(type); put(offset);
+    while (b.size() % 32) b.push_back('\0');
+    b.append(reinterpret_cast<const char*>(data.data()), data.size());
+    auto path = tmp(name);
+    std::ofstream(path, std::ios::binary).write(b.data(), std::streamsize(b.size()));
+    return path;
+}
+static errc gguf_error(const std::string& path, std::string* msg = nullptr) {
+    try { import::gguf_file g(path); (void)g.stored(g.tensors().at(0)); }
+    catch (const forge_exception& e) { if (msg) *msg = e.what(); return e.code; }
+    return errc(-1);
+}
+
+TEST(gguf_tensor_types_sizes_and_transcoding) {
+    using import::gguf_file;
+    const std::uint64_t big = std::uint64_t(1) << 40;
+    std::vector<std::uint8_t> blk(18, 0);
+    blk[0] = 0x00; blk[1] = 0x38;                       // f16 0.5
+    for (int i = 0; i < 16; ++i) blk[std::size_t(2 + i)] = std::uint8_t(i | ((15 - i) << 4));
+    {   // Q4_0, one block: verbatim under q4_0, x = d * (q - 8)
+        gguf_file g(tiny_gguf("q4_0.gguf", 2, {32}, blk));
+        auto s = g.stored(g.tensors()[0]);
+        CHECK(std::string(s.codec) == "q4_0" && !s.transcoded && s.bytes.size() == 18 && std::string(s.type) == "Q4_0");
+        float x[32]; graph::codecs::find("q4_0")->decode(s.bytes.data(), 32, x);
+        for (int i = 0; i < 16; ++i) CHECK(x[i] == 0.5f * float(i - 8) && x[i + 16] == 0.5f * float(7 - i));
+    }
+    std::string msg;
+    CHECK(gguf_error(tiny_gguf("q4_0_33.gguf", 2, {33}, blk), &msg) == errc::format_error && msg.find("whole number") != std::string::npos);   // not whole blocks
+    CHECK(gguf_error(tiny_gguf("q4_0_trunc.gguf", 2, {64}, blk)) == errc::format_error);                      // two blocks declared, one present
+    CHECK(gguf_error(tiny_gguf("q4_0_off.gguf", 2, {32}, blk, 1)) == errc::format_error);                     // offset pushes it past the end
+    CHECK(gguf_error(tiny_gguf("q4_0_off2.gguf", 2, {32}, blk, ~std::uint64_t(0))) == errc::format_error);    // offset near 2^64
+    CHECK(gguf_error(tiny_gguf("ovf.gguf", 2, {big, big, big}, blk)) == errc::format_error);                  // element count overflows 64 bits
+    CHECK(gguf_error(tiny_gguf("ovf2.gguf", 12, {std::uint64_t(1) << 63, 2}, blk)) == errc::format_error);
+    CHECK(gguf_error(tiny_gguf("ovf3.gguf", 0, {big, big >> 8, 1 << 20}, blk)) == errc::format_error);
+    CHECK(gguf_error(tiny_gguf("neg.gguf", 28, {~std::uint64_t(0)}, blk)) == errc::format_error);
+    { gguf_file g(tiny_gguf("empty.gguf", 11, {0, big}, {})); CHECK(g.stored(g.tensors()[0]).bytes.empty()); }   // an empty tensor is fine
+    // types that are recognised but not loadable say why; unknown ids list what is supported
+    CHECK(gguf_error(tiny_gguf("iq2.gguf", 16, {256}, std::vector<std::uint8_t>(66)), &msg) == errc::unsupported && msg.find("IQ2_XXS") != std::string::npos && msg.find("codebook") != std::string::npos);
+    CHECK(gguf_error(tiny_gguf("q8_1.gguf", 9, {32}, std::vector<std::uint8_t>(40)), &msg) == errc::unsupported && msg.find("Q8_1") != std::string::npos);
+    CHECK(gguf_error(tiny_gguf("t99.gguf", 99, {32}, blk), &msg) == errc::unsupported && msg.find("IQ4_XS") != std::string::npos);
+    for (std::uint32_t t : {16u, 17u, 18u, 19u, 21u, 22u, 29u, 9u, 39u}) CHECK(!gguf_file::loadable(t) && gguf_file::type_of(t) && gguf_file::type_of(t)->why);
+    // every native type's block size agrees with its codec
+    for (std::uint32_t t = 0; t < 64; ++t)
+        if (auto* ty = gguf_file::type_of(t); ty && ty->codec) {
+            auto* c = graph::codecs::find(ty->codec);
+            CHECK_MSG(c && c->block == ty->block && c->block_bytes == ty->block_bytes, "%s", ty->name);
+        }
+    {   // plain numeric types become f32
+        std::int16_t v16[3] = {-32768, 7, 1234}; std::vector<std::uint8_t> d(6); std::memcpy(d.data(), v16, 6);
+        gguf_file g(tiny_gguf("i16.gguf", 25, {3}, d)); auto s = g.stored(g.tensors()[0]);
+        float x[3]; std::memcpy(x, s.bytes.data(), 12);
+        CHECK(s.transcoded && std::string(s.codec) == "f32" && s.bytes.size() == 12 && x[0] == -32768.f && x[1] == 7.f && x[2] == 1234.f);
+        double v64[2] = {0.1, -3e10}; d.resize(16); std::memcpy(d.data(), v64, 16);
+        gguf_file g2(tiny_gguf("f64.gguf", 28, {2}, d)); auto s2 = g2.stored(g2.tensors()[0]);
+        std::memcpy(x, s2.bytes.data(), 8);
+        CHECK(x[0] == 0.1f && x[1] == -3e10f);
+        CHECK(gguf_error(tiny_gguf("i64_trunc.gguf", 27, {3}, d)) == errc::format_error);
+    }
+    {   // Q8_K: { f32 d; i8 qs[256]; i16 bsums[16]; }, x = d * q
+        std::vector<std::uint8_t> d(292, 0); float dd = 0.25f; std::memcpy(d.data(), &dd, 4);
+        for (int i = 0; i < 256; ++i) d[std::size_t(4 + i)] = std::uint8_t(std::int8_t(i - 128));
+        gguf_file g(tiny_gguf("q8_k.gguf", 15, {256}, d)); auto s = g.stored(g.tensors()[0]);
+        CHECK(s.transcoded && s.bytes.size() == 1024);
+        float x[256]; std::memcpy(x, s.bytes.data(), 1024);
+        for (int i = 0; i < 256; ++i) CHECK(x[i] == 0.25f * float(i - 128));
+    }
+}
+
+// AWQ / GPTQ unpacking (hf_quant.hpp) on hand-built words: one code at a known place.
+TEST(hf_quant_unpacking_positions) {
+    auto dir = std::filesystem::path(tmp("hfq")); std::filesystem::create_directories(dir);
+    auto write = [&](const std::string& file, const std::string& header, const std::vector<std::uint8_t>& data) {
+        std::string b; std::uint64_t n = header.size(); b.append(reinterpret_cast<const char*>(&n), 8); b += header;
+        b.append(reinterpret_cast<const char*>(data.data()), data.size());
+        std::ofstream(dir / file, std::ios::binary).write(b.data(), std::streamsize(b.size()));
+        return (dir / file).string();
+    };
+    auto bytes = [](auto... parts) { std::vector<std::uint8_t> d; (d.insert(d.end(), reinterpret_cast<const std::uint8_t*>(parts.data()), reinterpret_cast<const std::uint8_t*>(parts.data() + parts.size())), ...); return d; };
+    {   // AWQ gemm, in = 32, out = 8, one group: code 5 for (input 3, output 2) sits at nibble 1 of word [3][0]
+        std::vector<std::int32_t> qw(32, 0), qz(1, 0); std::vector<float> sc(8, 0.5f);
+        qw[3] = 5 << 4;            // nibble 1 -> output row 2
+        qz[0] = 3 << 28;           // nibble 7 -> output row 7 has zero 3
+        auto p = write("awq.safetensors", R"({"l.qweight":{"dtype":"I32","shape":[32,1],"data_offsets":[0,128]},"l.qzeros":{"dtype":"I32","shape":[1,1],"data_offsets":[128,132]},"l.scales":{"dtype":"F32","shape":[1,8],"data_offsets":[132,164]}})",
+                       bytes(qw, qz, sc));
+        import::quantised_checkpoint::shard_list sh; sh.push_back(std::make_unique<import::safetensors>(p));
+        import::quantised_checkpoint q(import::quant_scheme_of(json::parse(R"({"quantization_config":{"quant_method":"awq","bits":4,"group_size":32,"version":"gemm","zero_point":true}})")), sh);
+        CHECK(q.has("l.weight") && !q.has("m.weight"));
+        auto w = q.load("l.weight");
+        CHECK(w.shape == shape_t({8, 32}));
+        for (i64 o = 0; o < 8; ++o) for (i64 i = 0; i < 32; ++i) {
+            float want = (float(o == 2 && i == 3 ? 5 : 0) - float(o == 7 ? 3 : 0)) * 0.5f;
+            CHECK_MSG(w.data[std::size_t(o * 32 + i)] == want, "awq [%d][%d] = %g, want %g", int(o), int(i), double(w.data[std::size_t(o * 32 + i)]), double(want));
+        }
+        auto nat = q.take();
+        CHECK(nat && nat->codec == "q4_g32" && nat->blocks.size() == 8 * 20);
+        if (nat) { std::vector<float> x(256); graph::codecs::find("q4_g32")->decode(nat->blocks.data(), 256, x.data()); CHECK(x == w.data); }
+        CHECK(!q.take());
+    }
+    {   // GPTQ, in = 32, out = 8, 4 bits: code 9 for (input 10, output 5) is bits 8..11 of word [1][5]; zeros store z - 1
+        std::vector<std::int32_t> qw(4 * 8, 0), qz(1, 0x77777777), gi(32, 0); std::vector<float> sc(8, 0.25f);
+        qw[1 * 8 + 5] = 9 << 8;
+        qz[0] = 0x77777777 ^ (0x7 << 12) ^ (0x1 << 12);   // output row 3 stores 1 -> zero 2; the others store 7 -> zero 8
+        auto p = write("gptq.safetensors", R"({"l.qweight":{"dtype":"I32","shape":[4,8],"data_offsets":[0,128]},"l.qzeros":{"dtype":"I32","shape":[1,1],"data_offsets":[128,132]},"l.g_idx":{"dtype":"I32","shape":[32],"data_offsets":[132,260]},"l.scales":{"dtype":"F32","shape":[1,8],"data_offsets":[260,292]}})",
+                       bytes(qw, qz, gi, sc));
+        import::quantised_checkpoint::shard_list sh; sh.push_back(std::make_unique<import::safetensors>(p));
+        auto cfg = [](const char* extra) { return json::parse(std::string(R"({"quantization_config":{"quant_method":"gptq","bits":4,"group_size":32,"sym":true)") + extra + "}}"); };
+        import::quantised_checkpoint q(import::quant_scheme_of(cfg("")), sh);
+        auto w = q.load("l.weight");
+        for (i64 o = 0; o < 8; ++o) for (i64 i = 0; i < 32; ++i) {
+            float want = (float(o == 5 && i == 10 ? 9 : 0) - float(o == 3 ? 2 : 8)) * 0.25f;
+            CHECK_MSG(w.data[std::size_t(o * 32 + i)] == want, "gptq [%d][%d] = %g, want %g", int(o), int(i), double(w.data[std::size_t(o * 32 + i)]), double(want));
+        }
+        import::quantised_checkpoint q2(import::quant_scheme_of(cfg(R"(,"checkpoint_format":"gptq_v2")")), sh);   // v2 stores the zero itself
+        CHECK(q2.load("l.weight").data[0] == -7 * 0.25f);
+        CHECK_THROWS(import::quant_scheme_of(cfg(R"(,"checkpoint_format":"other")")));
+        CHECK_THROWS(import::quant_scheme_of(json::parse(R"({"quantization_config":{"quant_method":"gptq","bits":3}})")));
+        CHECK_THROWS(import::quant_scheme_of(json::parse(R"({"quantization_config":{"quant_method":"awq","version":"gemv"}})")));
+        CHECK(!import::quant_scheme_of(json::parse(R"({"quantization_config":{"quant_method":"bitsandbytes"}})")));
+        CHECK(!import::quant_scheme_of(json::parse(R"({"hidden_size":8})")));
+    }
+    std::filesystem::remove_all(dir);
+}
+
+// Codecs are names in the tensor index. A reader that does not know a name (a file written by a newer FORGE) still
+// opens and lists the file, and fails with `unsupported` when that tensor is loaded.
+TEST(fpk_unknown_codec_fails_cleanly) {
+    auto path = tmp("codec.fpk");
+    { modelfile::writer w; w.set_manifest(json::value(json::object{{"name", "c"}})); std::vector<float> a(64, 0.5f); w.add_tensor("w", {2, 32}, a, "q4_0"); w.write(path); }
+    { modelfile::reader r(path); CHECK(r.entry("w").codec == "q4_0"); CHECK(r.load("w").data[0] == 0.5f); }
+    std::string b; { std::ifstream f(path, std::ios::binary); b.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()); }
+    auto p = b.find("\"q4_0\""); CHECK(p != std::string::npos);
+    if (p == std::string::npos) return;
+    b.replace(p, 6, "\"zz_9\"");
+    std::ofstream(path, std::ios::binary).write(b.data(), std::streamsize(b.size()));
+    modelfile::reader r(path);
+    CHECK(r.entry("w").codec == "zz_9");
+    bool clean = false;
+    try { (void)r.load("w"); } catch (const forge_exception& e) { clean = e.code == errc::unsupported && std::string(e.what()).find("zz_9") != std::string::npos; }
+    CHECK(clean);
+    std::filesystem::remove(path);
 }

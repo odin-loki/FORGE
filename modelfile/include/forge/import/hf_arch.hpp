@@ -67,7 +67,7 @@ struct importer {
     // instantiate + validate the template, then open the output
     void begin(const std::string& tname) {
         rep.template_name = opt.template_name.empty() ? tname : opt.template_name;
-        bp_text = instantiate(read_file(template_dir() / (rep.template_name + ".fbp")), json::value(c));
+        bp_text = instantiate(read_file(template_path(rep.template_name)), json::value(c));
         bp = modelfile::parse_blueprint(bp_text);
         w = std::make_unique<modelfile::stream_writer>(out);
     }

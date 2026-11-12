@@ -360,4 +360,180 @@ inline std::uint64_t current_rss() {
     return 0;
 #endif
 }
+
+// ---------------------------------------------------------------- machine identity, boot time, resource budgets
+// A stable identifier of this OS installation (not of the hardware; treat it as confidential and hash it before it
+// leaves the machine).  Linux: /etc/machine-id (systemd / D-Bus).  macOS: the hardware UUID (kern.uuid).
+// FreeBSD: kern.hostuuid.  Windows: HKLM\SOFTWARE\Microsoft\Cryptography MachineGuid.  iOS: identifierForVendor
+// (per app vendor).  Android: unsupported until app glue passes Settings.Secure.ANDROID_ID to set_machine_id().
+namespace detail {
+inline std::string& machine_id_override_() { static std::string s; return s; }
+inline std::mutex& machine_id_mutex_() { static std::mutex m; return m; }
+}
+inline void set_machine_id(std::string id) { std::lock_guard<std::mutex> g(detail::machine_id_mutex_()); detail::machine_id_override_() = std::move(id); }
+inline result<std::string> machine_id() {
+    { std::lock_guard<std::mutex> g(detail::machine_id_mutex_()); if (!detail::machine_id_override_().empty()) return {detail::machine_id_override_(), {}}; }
+    [[maybe_unused]] auto clean = [](std::string s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\0')) s.pop_back();
+        for (auto& c : s) if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+        return s;
+    };
+#if defined(FORGE_OS_ANDROID)
+    return {{}, unsupported("machine id (pass Settings.Secure.ANDROID_ID to set_machine_id)")};
+#elif defined(__linux__)
+    for (const char* p : {"/etc/machine-id", "/var/lib/dbus/machine-id"}) {
+        std::ifstream f(p); std::string s; if (f >> s && s.size() >= 16) return {clean(s), {}};
+    }
+    return {{}, unsupported("machine id (no /etc/machine-id)")};
+#elif defined(FORGE_OS_IOS)
+    void* objc = ::dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY);
+    auto get_class = objc ? reinterpret_cast<void* (*)(const char*)>(::dlsym(objc, "objc_getClass")) : nullptr;
+    auto sel = objc ? reinterpret_cast<void* (*)(const char*)>(::dlsym(objc, "sel_registerName")) : nullptr;
+    auto msg = objc ? reinterpret_cast<void* (*)(void*, void*)>(::dlsym(objc, "objc_msgSend")) : nullptr;
+    if (get_class && sel && msg) if (void* cls = get_class("UIDevice")) if (void* dev = msg(cls, sel("currentDevice")))
+        if (void* uuid = msg(dev, sel("identifierForVendor"))) if (void* str = msg(uuid, sel("UUIDString")))
+            if (auto c = reinterpret_cast<const char*>(msg(str, sel("UTF8String")))) return {clean(c), {}};
+    return {{}, unsupported("machine id (UIDevice identifierForVendor not available)")};
+#elif defined(__APPLE__) || defined(FORGE_OS_FREEBSD)
+#if defined(__APPLE__)
+    const char* key = "kern.uuid";
+#else
+    const char* key = "kern.hostuuid";
+#endif
+    char b[128] = {}; std::size_t n = sizeof b - 1;
+    if (::sysctlbyname(key, b, &n, nullptr, 0) == 0 && b[0]) return {clean(b), {}};
+    return {{}, last_error(key)};
+#elif defined(FORGE_OS_WINDOWS)
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Cryptography", 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &k) != ERROR_SUCCESS) return {{}, unsupported("machine id (MachineGuid not readable)")};
+    wchar_t w[128] = {}; DWORD sz = sizeof w - sizeof(wchar_t), ty = 0;
+    LSTATUS rc = RegQueryValueExW(k, L"MachineGuid", nullptr, &ty, reinterpret_cast<BYTE*>(w), &sz); RegCloseKey(k);
+    if (rc != ERROR_SUCCESS || ty != REG_SZ || !w[0]) return {{}, unsupported("machine id (MachineGuid not set)")};
+    return {clean(narrow(w)), {}};
+#else
+    return {{}, unsupported("machine id")};
+#endif
+}
+// When the system booted, as wall-clock nanoseconds since the Unix epoch (Linux: btime in /proc/stat; Apple /
+// FreeBSD: kern.boottime; otherwise now - uptime, rounded to the second).
+inline result<std::int64_t> boot_time_ns() {
+#if defined(__linux__)
+    { std::ifstream f("/proc/stat"); std::string k; long long v = 0;
+      while (f >> k) { if (k == "btime" && f >> v && v > 0) return {std::int64_t(v) * 1000000000ll, {}}; std::string rest; std::getline(f, rest); } }
+#elif defined(__APPLE__) || defined(FORGE_OS_FREEBSD)
+    { timeval tv{}; std::size_t n = sizeof tv; int mib[2] = {CTL_KERN, KERN_BOOTTIME};
+      if (::sysctl(mib, 2, &tv, &n, nullptr, 0) == 0 && tv.tv_sec > 0) return {std::int64_t(tv.tv_sec) * 1000000000ll + std::int64_t(tv.tv_usec) * 1000ll, {}}; }
+#endif
+    auto up = uptime_seconds(); if (!up) return {0, up.err};
+    std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::int64_t b = now - std::int64_t(*up * 1e9); return {(b + 500000000ll) / 1000000000ll * 1000000000ll, {}};
+}
+
+// How many CPUs this process may actually use. affinity: logical CPUs in its affinity mask / cpuset; quota: CPU
+// time the container or job allows, in CPUs (0 = no quota); usable = max(1, min(affinity, ceil(quota))).
+//   Linux/Android: sched_getaffinity + cgroup v2 cpu.max (tightest on the path to the root) or the v1 cfs quota.
+//   Windows: the process affinity mask + the job object's hard CPU rate cap (Windows containers use one).
+//   FreeBSD: cpuset_getaffinity (jails with a cpuset) + an rctl pcpu rule on the process (needs kern.racct.enable).
+//   macOS/iOS: hw.activecpu; those systems have no quotas.
+struct cpu_budget { unsigned affinity = 1; double quota = 0; unsigned usable = 1; std::string source = "none"; };
+// Memory this process may use. limit: the tightest container / job / resource-limit cap (0 = none);
+// usable = the limit when one is set and below physical memory, else physical.
+//   Linux/Android: cgroup v2 memory.max / v1 limit_in_bytes.  Windows: job object process and job memory limits.
+//   FreeBSD: an rctl memoryuse rule on the process.  iOS: the jetsam budget (footprint + os_proc_available_memory).
+//   Every POSIX system: a finite RLIMIT_AS counts too.
+struct memory_budget { std::uint64_t physical = 0, limit = 0, usable = 0; std::string source = "none"; };
+namespace detail {
+// cgroup v2 cpu.max text ("max 100000" / "150000 100000"), or v1 "quota period" -> CPUs; 0 = unlimited.
+inline double parse_cpu_max(const std::string& text) {
+    std::istringstream in(text); std::string q; double period = 0; if (!(in >> q >> period) || q == "max" || period <= 0) return 0;
+    double quota = std::strtod(q.c_str(), nullptr); return quota > 0 ? quota / period : 0;
+}
+#if defined(__linux__)
+inline std::string slurp_small_(const std::string& p) { std::ifstream f(p); std::stringstream ss; ss << f.rdbuf(); return ss.str(); }
+// The cgroup v1 cpu controller directory of this process ("" when not mounted).
+inline std::string cgroup1_cpu_dir_() {
+    std::ifstream f("/proc/self/cgroup"); std::string line, rel;
+    while (std::getline(f, line)) {
+        auto a = line.find(':'), b = a == std::string::npos ? a : line.find(':', a + 1); if (b == std::string::npos) continue;
+        if (("," + line.substr(a + 1, b - a - 1) + ",").find(",cpu,") != std::string::npos) { rel = line.substr(b + 1); break; }
+    }
+    for (const char* root : {"/sys/fs/cgroup/cpu,cpuacct", "/sys/fs/cgroup/cpu"}) {
+        if (!rel.empty() && rel != "/" && os::stat(std::string(root) + rel + "/cpu.cfs_quota_us").exists) return std::string(root) + rel;
+        if (os::stat(std::string(root) + "/cpu.cfs_quota_us").exists) return root;
+    }
+    return {};
+}
+#endif
+#if defined(FORGE_OS_FREEBSD)
+extern "C" int rctl_get_limits(const char*, size_t, char*, size_t);
+// The amount of the first rctl rule on this process for `resource` ("memoryuse", "pcpu"); 0 when there is none
+// or resource accounting is off.
+inline std::uint64_t rctl_limit_(const char* resource) {
+    std::string filter = "process:" + std::to_string(::getpid()); char out[4096] = {};
+    if (rctl_get_limits(filter.c_str(), filter.size() + 1, out, sizeof out) != 0) return 0;
+    std::string s(out), key = std::string(":") + resource + ":"; auto p = s.find(key); if (p == std::string::npos) return 0;
+    auto eq = s.find('=', p); if (eq == std::string::npos) return 0;
+    return std::strtoull(s.c_str() + eq + 1, nullptr, 10);
+}
+#endif
+}
+inline cpu_budget cpu_limits() {
+    cpu_budget b; b.affinity = cpu_count();
+#if defined(__linux__)
+    if (auto d = detail::cgroup_dir_(true); !d.empty()) {
+        for (std::string p = d; p.size() >= 14 && p.rfind("/sys/fs/cgroup", 0) == 0; p = p.substr(0, p.rfind('/'))) {
+            double q = detail::parse_cpu_max(detail::slurp_small_(p + "/cpu.max")); if (q > 0 && (b.quota == 0 || q < b.quota)) { b.quota = q; b.source = "cgroup2"; }
+            if (p == "/sys/fs/cgroup") break;
+        }
+    }
+    if (b.quota == 0) if (auto d1 = detail::cgroup1_cpu_dir_(); !d1.empty()) {
+        double q = detail::parse_cpu_max(detail::slurp_small_(d1 + "/cpu.cfs_quota_us") + " " + detail::slurp_small_(d1 + "/cpu.cfs_period_us"));
+        if (q > 0) { b.quota = q; b.source = "cgroup1"; }
+    }
+#elif defined(FORGE_OS_WINDOWS)
+    DWORD_PTR pm = 0, sm = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &pm, &sm) && pm) {   // 0 when the process spans processor groups
+        unsigned n = 0; for (DWORD_PTR m = pm; m; m &= m - 1) ++n;
+        if (n) b.affinity = std::min(b.affinity, n);
+    }
+    struct { DWORD flags; DWORD rate; } cr{};   // JOBOBJECT_CPU_RATE_CONTROL_INFORMATION
+    if (QueryInformationJobObject(nullptr, static_cast<JOBOBJECTINFOCLASS>(15), &cr, sizeof cr, nullptr) && (cr.flags & 0x1)) {
+        const double total = double(cpu_count());
+        if ((cr.flags & 0x10) && HIWORD(cr.rate)) { b.quota = total * double(HIWORD(cr.rate)) / 10000.0; b.source = "job"; }   // MIN_MAX_RATE: MaxRate
+        else if ((cr.flags & 0x4) && !(cr.flags & 0x2) && cr.rate) { b.quota = total * double(cr.rate) / 10000.0; b.source = "job"; }   // HARD_CAP
+    }
+#elif defined(FORGE_OS_FREEBSD)
+    cpuset_t s; CPU_ZERO(&s);
+    if (::cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof s, &s) == 0) { int n = CPU_COUNT(&s); if (n > 0) b.affinity = unsigned(n); }
+    if (auto pc = detail::rctl_limit_("pcpu")) { b.quota = double(pc) / 100.0; b.source = "rctl"; }
+#elif defined(__APPLE__)
+    int n = 0; std::size_t len = sizeof n; if (::sysctlbyname("hw.activecpu", &n, &len, nullptr, 0) == 0 && n > 0) b.affinity = unsigned(n);
+#endif
+    b.usable = b.affinity ? b.affinity : 1;
+    if (b.quota > 0) { auto q = unsigned(b.quota); if (double(q) < b.quota) ++q; b.usable = std::max(1u, std::min(b.usable, q)); }
+    return b;
+}
+inline unsigned usable_cpu_count() { return cpu_limits().usable; }
+inline memory_budget memory_limits() {
+    memory_budget b; b.physical = total_memory();
+    [[maybe_unused]] auto take = [&](std::uint64_t v, const char* src) { if (v && v < (1ull << 60) && (!b.limit || v < b.limit)) { b.limit = v; b.source = src; } };
+#if defined(__linux__)
+    take(memory().cgroup_limit, "cgroup");
+#elif defined(FORGE_OS_WINDOWS)
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+    if (QueryInformationJobObject(nullptr, JobObjectExtendedLimitInformation, &li, sizeof li, nullptr)) {
+        if (li.BasicLimitInformation.LimitFlags & 0x100 /*JOB_OBJECT_LIMIT_PROCESS_MEMORY*/) take(li.ProcessMemoryLimit, "job");
+        if (li.BasicLimitInformation.LimitFlags & 0x200 /*JOB_OBJECT_LIMIT_JOB_MEMORY*/) take(li.JobMemoryLimit, "job");
+    }
+#elif defined(FORGE_OS_FREEBSD)
+    take(detail::rctl_limit_("memoryuse"), "rctl");
+#elif defined(FORGE_OS_IOS)
+    take(current_rss() + available_memory(), "jetsam");
+#endif
+#if defined(FORGE_OS_POSIX) && defined(RLIMIT_AS)
+    { rlimit rl{}; if (::getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) take(std::uint64_t(rl.rlim_cur), "rlimit"); }
+#endif
+    b.usable = b.limit && (!b.physical || b.limit < b.physical) ? b.limit : b.physical;
+    return b;
+}
 } // namespace forge::os

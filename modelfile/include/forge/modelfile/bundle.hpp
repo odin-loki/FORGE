@@ -14,6 +14,7 @@
 //   if (!rep.ok()) ...                                     // rep.modified / missing / extra / message
 #include <forge/modelfile/sign.hpp>
 #include <forge/os/fs.hpp>
+#include <forge/security/path.hpp>
 #include <filesystem>
 
 namespace forge::modelfile {
@@ -41,6 +42,12 @@ inline bool safe_rel_path(std::string_view p) {
         b = e + 1;
     }
     return true;
+}
+// FSS CAP-3: a bundle path (from a manifest, or a caller's file list) must be in the canonical form above and pass
+// security::try_safe_join against the bundle root: that adds the cross-OS rules (reserved device names, segments
+// ending in '.' or ' ', control characters) and refuses a path that leaves the root through a symlinked directory.
+inline bool bundle_path_ok(const std::string& root, std::string_view rel) {
+    return safe_rel_path(rel) && bool(security::try_safe_join(root.empty() ? std::string_view(".") : std::string_view(root), rel));
 }
 } // namespace detail
 
@@ -87,7 +94,7 @@ inline std::vector<bundle_entry> bundle_entries(const std::string& root, std::ve
     files.erase(std::unique(files.begin(), files.end()), files.end());
     std::vector<bundle_entry> out;
     for (auto& rel : files) {
-        if (!detail::safe_rel_path(rel)) raise(errc::invalid_argument, "bundle path '{}' must be relative and stay inside the bundle", rel);
+        if (!detail::bundle_path_ok(root, rel)) raise(errc::invalid_argument, "bundle path '{}' must be relative and stay inside the bundle", rel);
         if (rel == manifest) continue;
         auto p = base / os::fs::u8path(rel);
         if (sfs::is_symlink(p)) raise(errc::invalid_argument, "{}: symlinks are not allowed in a signed bundle", rel);
@@ -155,7 +162,7 @@ inline bundle_report verify_bundle(const std::string& root, const std::vector<st
     for (auto& f : fl->arr()) {
         if (!f.is_obj()) { rep.message = "bad manifest entry"; return rep; }
         bundle_entry e{f.str_or("path", ""), std::uint64_t(f.num_or("size", -1)), f.str_or("blake3", "")};
-        if (!detail::safe_rel_path(e.path) || e.path == manifest) { rep.message = "unsafe path in manifest: '" + e.path + "'"; return rep; }
+        if (!detail::bundle_path_ok(root, e.path) || e.path == manifest) { rep.message = "unsafe path in manifest: '" + e.path + "'"; return rep; }
         claimed.push_back(std::move(e));
     }
     std::sort(claimed.begin(), claimed.end(), [](auto& a, auto& b) { return a.path < b.path; });

@@ -61,7 +61,7 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
         extra.emplace_back("pooling", std::string(pt == 1 ? "mean" : "cls"));
     }
     if (!opt.template_name.empty()) tname = opt.template_name;
-    auto bp_text = instantiate(read_file(template_dir() / (tname + ".fbp")), json::value(cfg));
+    auto bp_text = instantiate(read_file(template_path(tname)), json::value(cfg));
     auto bp = modelfile::parse_blueprint(bp_text);
 
     modelfile::stream_writer w(out);

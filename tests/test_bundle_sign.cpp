@@ -94,6 +94,40 @@ TEST(bundle_manifest_tamper_and_unsafe_paths) {
     sfs::remove_all(d);
 }
 
+// CAP-3: bundle paths go through security::try_safe_join against the bundle root.
+TEST(bundle_paths_use_safe_join) {
+    auto d = fresh("cap3"); auto k = key(8);
+    auto out = sfs::temp_directory_path() / ("forge_bundle_cap3_out_" + std::to_string(forge::os::pid()));
+    sfs::remove_all(out); put(out / "x.txt", "outside the bundle");
+    // signing: an explicit file list is checked the same way
+    for (const char* bad : {"../x.txt", "/etc/passwd", "proofs/../../x.txt", "c:/x.txt", "proofs\\a.cert", "proofs/NUL", "aux.txt", "proofs/a.cert ", "proofs/a."})
+        CHECK_MSG(!modelfile::detail::bundle_path_ok(d.string(), bad), "accepted '%s'", bad);
+    CHECK(modelfile::detail::bundle_path_ok(d.string(), "proofs/a.cert") && modelfile::detail::bundle_path_ok(d.string(), "not/there/yet.txt"));
+    CHECK_THROWS(modelfile::bundle_entries(d.string(), {"../x.txt"}));
+    CHECK_THROWS(modelfile::bundle_entries(d.string(), {"aux.txt"}));
+    // verification: a manifest naming a reserved device name is refused outright
+    modelfile::sign_bundle(d.string(), k);
+    auto mp = d / "FORGE-SIGNATURE.json";
+    std::string m; { std::ifstream f(mp, std::ios::binary); m.assign(std::istreambuf_iterator<char>(f), {}); }
+    auto swap_path = [&](const std::string& to) { auto e = m; auto p = e.find("result.json"); e.replace(p, 11, to); put(mp, e); };
+    swap_path("proofs/CON.txt");
+    auto r = modelfile::verify_bundle(d.string(), {hexpub(k)});
+    CHECK(!r.ok() && r.message.find("unsafe path") != std::string::npos);
+    // a directory link inside the bundle that leads outside it: "link/x.txt" has no "..", but is not in the bundle
+    std::error_code ec; sfs::create_directory_symlink(out, d / "link", ec);
+    if (!ec) {
+        CHECK(!modelfile::detail::bundle_path_ok(d.string(), "link/x.txt"));
+        CHECK_THROWS(modelfile::bundle_entries(d.string(), {"link/x.txt"}));
+        swap_path("link/x.txt");
+        r = modelfile::verify_bundle(d.string(), {hexpub(k)});
+        CHECK(!r.ok() && r.message.find("unsafe path") != std::string::npos);
+        sfs::remove(d / "link");
+    } else std::printf("  skip symlink case: cannot create symlinks here\n");
+    put(mp, m);
+    CHECK(modelfile::verify_bundle(d.string(), {hexpub(k)}).ok());   // the untouched manifest still verifies
+    sfs::remove_all(d); sfs::remove_all(out);
+}
+
 TEST(bundle_multi_signer_and_explicit_files) {
     auto d = fresh("multi"); auto a = key(6), b = key(7);
     modelfile::sign_bundle(d.string(), a);

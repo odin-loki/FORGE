@@ -3,6 +3,7 @@
 #include <forge/os/pipe.hpp>
 #include <forge/os/signal.hpp>
 #include <thread>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <vector>
@@ -443,5 +444,199 @@ TEST(win_no_core_and_job_limits) {
     // no_core: DIE_ON_UNHANDLED_EXCEPTION in the job; the child still starts and exits normally
     os::spawn_spec s; s.argv = {"cmd", "/d", "/c", "exit 6"}; s.limits.no_core = true;
     auto r = os::spawn_wait(s); CHECK(r); if (r) CHECK(r->exit_code == 6);
+}
+#endif
+
+// ---------------------------------------------------------------- parity additions (every OS)
+// Child modes: this binary re-runs itself with FORGE_OS_PROC_CHILD=<mode>, dispatched before the test runner.
+#include <forge/os/shared_memory.hpp>
+#include <forge/os/pty.hpp>
+namespace {
+int proc_child_main(const std::string& mode) {
+    auto arg = mode.substr(mode.find(':') == std::string::npos ? mode.size() : mode.find(':') + 1);
+    if (mode == "sleep") { std::this_thread::sleep_for(std::chrono::seconds(60)); return 0; }
+    if (mode == "tree") {   // start a grandchild, print its pid, then wait to be killed
+        os::setenv("FORGE_OS_PROC_CHILD", "sleep");
+        auto g = os::child::start({os::exe_path()}); if (!g) return 3;
+        std::printf("%llu\n", static_cast<unsigned long long>(g->pid())); std::fflush(stdout);
+        std::this_thread::sleep_for(std::chrono::seconds(60)); return 0;
+    }
+    if (mode.rfind("shm:", 0) == 0) {   // shm:<handle>:<size>: map the inherited handle, check and answer
+        auto c = arg.find(':'); if (c == std::string::npos) return 3;
+        const long long h = std::atoll(arg.substr(0, c).c_str()); const std::size_t n = std::size_t(std::atoll(arg.substr(c + 1).c_str()));
+#if defined(_WIN32)
+        auto m = os::shared_memory::attach(reinterpret_cast<HANDLE>(static_cast<std::intptr_t>(h)), n);
+#else
+        auto m = os::shared_memory::attach(int(h), n);
+#endif
+        if (!m) return 4;
+        if (m->size() < n || m->data()[0] != 0x5a) return 5;
+        m->data()[1] = 0xa5; return 0;
+    }
+    if (mode == "prio") {   // priorities only go down without privilege: done here, not in the test process
+        if (!os::set_process_priority(os::process_priority::low)) return 3;
+        auto p = os::get_process_priority(); if (!p || p.value != os::process_priority::low) return 4;
+        if (!os::set_process_priority(os::process_priority::idle)) return 5;
+        p = os::get_process_priority(); if (!p || p.value != os::process_priority::idle) return 6;
+        auto io = os::set_io_priority(os::io_priority::low);
+#if defined(__FreeBSD__)
+        if (io || !os::is_unsupported(io.err)) return 7;
+#else
+        if (!io) { std::fprintf(stderr, "set_io_priority: %s\n", io.err.what.c_str()); return 7; }
+        if (!os::set_io_priority(os::io_priority::normal)) return 8;
+#endif
+        return 0;
+    }
+    if (mode == "limits") { os::proc_limits l; l.no_core = true; return os::apply_limits(l) ? 0 : 3; }
+    return 9;
+}
+const int proc_child_dispatch = [] {
+    auto m = os::getenv("FORGE_OS_PROC_CHILD"); if (m.empty()) return 0;
+    os::unsetenv("FORGE_OS_PROC_CHILD"); std::exit(proc_child_main(m));
+}();
+os::spawn_spec self_spec(const std::string& mode) { os::spawn_spec sp; sp.argv = {os::exe_path()}; sp.env_set["FORGE_OS_PROC_CHILD"] = mode; return sp; }
+bool on_wine() {
+#if defined(_WIN32)
+    return GetProcAddress(GetModuleHandleA("ntdll.dll"), "wine_get_version") != nullptr;
+#else
+    return false;
+#endif
+}
+}
+
+#if !defined(FORGE_OS_IOS)   // iOS: tests/test_os.cpp checks that these all report unsupported
+TEST(wait_for_exit_of_any_process) {
+    CHECK(!os::wait_for_exit(0, 10));                                   // invalid pid: an error, not "exited"
+    auto gone = os::wait_for_exit(0x7ffffff0ull, 10); CHECK(gone); CHECK(gone.value);   // no such process
+    auto c = os::child::start(self_spec("sleep")); CHECK_MSG(c, "%s", c.err.what.c_str()); if (!c) return;
+    auto t0 = os::monotonic_ns();
+    auto w = os::wait_for_exit(c->pid(), 150); CHECK(w); CHECK(!w.value);
+    auto ms = (os::monotonic_ns() - t0) / 1000000; CHECK_MSG(ms >= 100 && ms < 5000, "waited %llu ms", static_cast<unsigned long long>(ms));
+    std::thread killer([&] { std::this_thread::sleep_for(std::chrono::milliseconds(100)); c->kill(); });
+    t0 = os::monotonic_ns();
+    w = os::wait_for_exit(c->pid(), 20000); killer.join();
+    CHECK(w); CHECK(w.value);   // an unreaped child counts as exited
+    CHECK((os::monotonic_ns() - t0) / 1000000 < 10000);
+    CHECK(c->wait(5000) == 128 + 9);
+}
+TEST(child_wait_timeout_uses_exit_event) {
+    auto c = os::child::start(self_spec("sleep")); CHECK(c); if (!c) return;
+    auto t0 = os::monotonic_ns(); CHECK(c->wait(120) == -1);
+    auto ms = (os::monotonic_ns() - t0) / 1000000; CHECK_MSG(ms >= 100 && ms < 5000, "waited %llu ms", static_cast<unsigned long long>(ms));
+    CHECK(c->kill()); CHECK(c->wait(10000) == 128 + 9);
+}
+TEST(process_priority_and_io_priority) {
+    auto p = os::get_process_priority(); CHECK_MSG(p, "%s", p.err.what.c_str());
+    auto r = os::spawn_wait(self_spec("prio")); CHECK_MSG(r, "%s", r.err.what.c_str());
+    if (r && r->exit_code == 7 && on_wine()) std::printf("  skip io priority: wine has no background mode\n");
+    else if (r) CHECK_MSG(r->exit_code == 0, "prio child rc=%d %s", r->exit_code, r->err.c_str());
+    CHECK(!os::get_process_priority(0x7ffffff0ull));   // no such process
+}
+TEST(process_affinity) {
+    auto a = os::get_process_affinity();
+#if defined(__APPLE__)
+    CHECK(!a && os::is_unsupported(a.err));
+    auto s = os::set_process_affinity({0}); CHECK(!s && os::is_unsupported(s.err));
+#else
+    CHECK_MSG(a, "%s", a.err.what.c_str()); if (!a) return;
+    CHECK(!a->empty()); CHECK(a->size() <= 4096);
+    auto s = os::set_process_affinity(*a); CHECK_MSG(s, "%s", s.err.what.c_str());   // the same set: always allowed
+    auto b = os::get_process_affinity(); CHECK(b); if (b) CHECK(*b == *a);
+    CHECK(!os::set_process_affinity({}));
+    CHECK(!os::set_process_affinity({100000}));
+#endif
+}
+TEST(process_tree_listing_and_kill) {
+    auto c = os::child::start(self_spec("tree")); CHECK_MSG(c, "%s", c.err.what.c_str()); if (!c) return;
+    std::string line; for (int i = 0; i < 200 && line.find('\n') == std::string::npos; ++i) line += c->read(64, 100);
+    const std::uint64_t grand = std::strtoull(line.c_str(), nullptr, 10);
+    CHECK_MSG(grand > 1, "grandchild pid line [%s]", line.c_str());
+    if (grand > 1) {
+        auto d = os::process_descendants(c->pid()); CHECK_MSG(d, "%s", d.err.what.c_str());
+        if (d) CHECK_MSG(std::find(d->begin(), d->end(), grand) != d->end(), "%zu descendants, grandchild %llu missing", d->size(), static_cast<unsigned long long>(grand));
+        auto mine = os::process_descendants(os::pid()); CHECK(mine);
+        if (mine) { CHECK(std::find(mine->begin(), mine->end(), c->pid()) != mine->end()); CHECK(std::find(mine->begin(), mine->end(), grand) != mine->end()); }
+        auto k = os::kill_tree(c->pid()); CHECK_MSG(k, "%s", k.err.what.c_str()); if (k) CHECK_MSG(k.value >= 2, "killed %zu", k.value);
+        c->wait(10000);
+        auto w = os::wait_for_exit(grand, 10000); CHECK(w); CHECK_MSG(w.value, "grandchild still running");
+    } else c->kill();
+    CHECK(!os::kill_tree(0)); CHECK(!os::kill_tree(1)); CHECK(!os::kill_tree(os::pid()));
+}
+TEST(spawn_inherits_only_listed_handles) {
+    const std::size_t n = 8192;
+    auto m = os::shared_memory::anonymous(n); CHECK_MSG(m, "%s", m.err.what.c_str()); if (!m) return;
+    m->data()[0] = 0x5a; m->data()[1] = 0;
+    auto h = m->share(); CHECK_MSG(h, "%s", h.err.what.c_str()); if (!h) return;
+    const std::string mode = "shm:" + std::to_string(static_cast<long long>(h.value)) + ":" + std::to_string(n);
+    auto no = self_spec(mode);                       // not listed: the child must not have it
+    auto r0 = os::spawn_wait(no); CHECK(r0); if (r0) CHECK_MSG(r0->exit_code != 0, "an unlisted handle reached the child");
+    CHECK(m->data()[1] == 0);
+    auto yes = self_spec(mode); yes.inherit = {h.value};
+    auto r1 = os::spawn_wait(yes); CHECK_MSG(r1, "%s", r1.err.what.c_str()); if (r1) CHECK_MSG(r1->exit_code == 0, "rc=%d", r1->exit_code);
+    CHECK(m->data()[1] == 0xa5);                     // the child wrote through the shared mapping
+    m->data()[1] = 0;
+    auto c = os::child::start(yes); CHECK(c); if (c) { CHECK(c->wait(20000) == 0); CHECK(m->data()[1] == 0xa5); }
+    os::shared_memory::close_shared(h.value);
+    // inheritable_handle: the same for any handle
+    auto p = os::make_pipe(); CHECK(p);
+    if (p) {
+#if defined(_WIN32)
+        auto ih = os::inheritable_handle(reinterpret_cast<std::intptr_t>(p->write.native())); CHECK(ih);
+#else
+        auto ih = os::inheritable_handle(p->write.native()); CHECK(ih);
+#endif
+        if (ih) os::close_inheritable_handle(ih.value);
+    }
+}
+#if defined(_WIN32)
+TEST(win_apply_limits_joins_a_job) {
+    auto r = os::spawn_wait(self_spec("limits")); CHECK(r);
+    if (r && r->exit_code != 0 && on_wine()) { std::printf("  skip: wine refuses the job\n"); return; }
+    if (r) CHECK_MSG(r->exit_code == 0, "rc=%d", r->exit_code);
+    CHECK(!os::kill_group(1234));   // no process groups to signal on Windows
+}
+#endif
+TEST(pty_runs_a_program_on_a_terminal) {
+    if (!os::pty::available()) {
+        auto t = os::pty::spawn({"cmd"}); CHECK(!t && os::is_unsupported(t.err));
+        std::printf("  skip: no pseudo-terminal support on this system\n"); return;
+    }
+    CHECK(!os::pty::spawn({}));
+    CHECK(!os::pty::spawn({"no-such-forge-cmd-xyz"}));
+    auto read_until = [](os::pty& t, const std::string& want, std::string& acc) {
+        const auto end = os::monotonic_ns() + 20000000000ull;
+        while (acc.find(want) == std::string::npos && !t.eof() && os::monotonic_ns() < end) acc += t.read(4096, 200);
+        return acc.find(want) != std::string::npos;
+    };
+#if defined(_WIN32)
+    os::pty_opts o; o.cols = 100; o.rows = 30;
+    auto t = os::pty::spawn({"cmd", "/d", "/c", "echo PTY-OK"}, o);
+    if (!t && on_wine()) { std::printf("  skip: wine: %s\n", t.err.what.c_str()); return; }
+    CHECK_MSG(t, "%s", t.err.what.c_str()); if (!t) return;
+    std::string out; const bool seen = read_until(*t, "PTY-OK", out);
+    if (!seen && on_wine()) { std::printf("  skip: wine's pseudoconsole produced no output\n"); return; }
+    CHECK_MSG(seen, "output [%s]", out.c_str());
+    CHECK(t->resize(120, 40)); CHECK(!t->resize(0, 0));
+    CHECK(t->wait(20000) == 0);
+    while (!t->eof()) out += t->read(4096, 200);
+    CHECK(t->read().empty());
+#else
+    os::pty_opts o; o.cols = 100; o.rows = 30; o.env_set["FORGE_PTY_VAR"] = "v1";
+    auto t = os::pty::spawn({"sh", "-c", "if [ -t 0 ] && [ -t 1 ]; then echo TTY-YES; else echo TTY-NO; fi; echo var:$FORGE_PTY_VAR; stty size; read line; stty size; echo got:$line; exit 7"}, o);
+    CHECK_MSG(t, "%s", t.err.what.c_str()); if (!t) return;
+    std::string out;
+    CHECK_MSG(read_until(*t, "30 100", out), "output [%s]", out.c_str());
+    CHECK(out.find("TTY-YES") != std::string::npos); CHECK(out.find("var:v1") != std::string::npos);
+    CHECK(t->resize(120, 40)); CHECK(!t->resize(0, 0));
+    CHECK(t->write("hello\n"));
+    CHECK_MSG(read_until(*t, "got:hello", out), "output [%s]", out.c_str());
+    CHECK_MSG(out.find("40 120") != std::string::npos, "output [%s]", out.c_str());
+    CHECK(t->wait(20000) == 7);
+    while (!t->eof()) out += t->read(4096, 200);
+    CHECK(t->read().empty());
+    // a program left running is killed with its terminal
+    auto k = os::pty::spawn({"sleep", "60"}); CHECK(k);
+    if (k) { CHECK(k->read(16, 50).empty()); CHECK(!k->eof()); CHECK(k->wait(50) == -1); CHECK(k->kill()); CHECK(k->wait(10000) == 128 + 9); }
+#endif
 }
 #endif
