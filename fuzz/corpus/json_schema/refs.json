@@ -1,0 +1,1 @@
+{"$defs": {"node": {"type": "object", "properties": {"next": {"$ref": "#/$defs/node"}, "v": {"type": ["number", "null"]}}}}, "$ref": "#/$defs/node"}

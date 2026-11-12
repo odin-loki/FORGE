@@ -62,17 +62,41 @@ inline ops::attrs get_attrs(reader& r) {
     ops::attrs a; auto n = r.u32(); if (n > 4096) { r.ok = false; return a; }
     for (std::uint32_t i = 0; i < n && r.ok; ++i) {
         auto k = r.str(); auto tag = r.u32();
-        if (tag == 0) { double d; r.raw(&d, 8); a.v[k] = d; }
+        if (tag == 0) {   // ops cast number attrs to i64: no NaN, infinity or out-of-range value from the wire
+            double d = 0; r.raw(&d, 8); if (!(d >= -0x1p53 && d <= 0x1p53)) { r.ok = false; break; }
+            a.v[k] = d;
+        }
         else if (tag == 1) { auto m = r.u32(); if (m > (1u << 20)) { r.ok = false; break; } std::vector<i64> iv(m); for (auto& x : iv) x = r.i64(); a.v[k] = iv; }
         else if (tag == 2) a.v[k] = r.str();
         else r.ok = false;
     }
     return a;
 }
-inline bool valid_shape(const shape_t& s) { i64 n = 1; for (auto d : s) { if (d < 0 || d > (i64(1) << 32)) return false; n *= std::max<i64>(d, 1); if (n > (i64(1) << 32)) return false; } return true; }
+inline bool valid_shape(const shape_t& s, i64 cap = i64(1) << 32) { i64 n = 1; for (auto d : s) { if (d < 0 || d > cap) return false; n *= std::max<i64>(d, 1); if (n > cap) return false; } return true; }
 inline int op_index(std::string_view name) {
     for (std::size_t i = 0; i < ops::op_count; ++i) if (ops::info(ops::op(i)).name == name) return int(i);
     return -1;
+}
+// A frame is run only if it is a well-formed call of the op: the declared number of inputs, operands the op's
+// shape rule accepts, and an output of the size that rule gives. Lowerings index their inputs and write the
+// output without checks of their own (the planner guarantees them locally; a peer does not).
+inline void check_call(ops::op o, const std::vector<shape_t>& in, const shape_t& out, const ops::attrs& a) {
+    const auto& inf = ops::info(o);
+    if (inf.shape == ops::shape_rule::concat ? in.size() < 2 : in.size() != std::size_t(inf.inputs))
+        raise(errc::invalid_argument, "{} takes {} inputs, got {}", inf.name, inf.inputs, in.size());
+    for (auto& s : in) if (numel(s) == 0) raise(errc::shape_mismatch, "{}: empty input", inf.name);
+    auto want = ops::infer_shape(inf.shape, in, a);
+    if (!valid_shape(want) || numel(want) != numel(out))
+        raise(errc::shape_mismatch, "{}: output shape {} does not fit the inputs (expected {})", inf.name, shape_str(out), shape_str(want));
+    auto rank = [&](std::size_t i) { return in[i].size(); };
+    bool ok = true;   // operands of the ops whose shape rule only says "same as input 0"
+    if (inf.name == "rms_norm") ok = rank(0) >= 1 && rank(1) == 1 && in[1][0] == in[0].back();
+    else if (inf.name == "layer_norm") ok = rank(0) >= 1 && rank(1) == 1 && rank(2) == 1 && in[1][0] == in[0].back() && in[2][0] == in[0].back();
+    else if (inf.name == "softmax" || inf.name == "moe_gate") ok = rank(0) >= 1;
+    else if (inf.name == "rope") ok = rank(0) == 3 && in[0][2] % 2 == 0 && numel(in[1]) == in[0][0];
+    else if (inf.name == "moe_ffn") ok = rank(0) == 2 && rank(1) == 2 && rank(2) == 3 && rank(4) == 3 && in[3] == in[2] && in[1][0] == in[0][0] &&
+                                         in[1][1] == in[2][0] && in[2][2] == in[0][1] && in[4] == shape_t{in[2][0], in[0][1], in[2][1]};
+    if (!ok) raise(errc::shape_mismatch, "{}: operand shapes do not fit together", inf.name);
 }
 // Read and drop n bytes (the payload of a request that is refused anyway), without buffering them.
 inline void skip(reader& r, std::uint64_t n) {
@@ -199,6 +223,9 @@ public:
     // Security log (optional): authentications with the principal and its permissions, refusals, permission denials.
     // Called from connection threads.
     std::function<void(const std::string&)> log;
+    // Largest tensor, in elements, a request may name (inputs and the output); a frame naming a larger one is
+    // dropped before anything is allocated for it. Set before start().
+    std::uint64_t max_tensor_elems = std::uint64_t(1) << 32;
     server(registry* reg, int port = 0, const std::string& bind = "127.0.0.1", server_security sec = {}) : reg_(reg ? reg : &registry::cpu()), sec_(std::move(sec)) {
         detail::wsa();
         if (!sec_.tls.client_ca_file.empty() && sec_.tls.cert_file.empty()) raise(errc::invalid_argument, "rpc: client certificates (mTLS) need TLS (a server certificate and key)");
@@ -359,12 +386,18 @@ private:
             auto over = [&] { return cap && bytes > cap; };
             std::vector<tensor> ins; std::vector<tensor_view> views; std::vector<shape_t> shapes;
             for (std::uint32_t i = 0; i < n && r.ok; ++i) {
-                auto sh = r.shape(); if (!r.ok || !detail::valid_shape(sh)) return;
+                auto sh = r.shape(); if (!r.ok || !detail::valid_shape(sh, i64(max_tensor_elems))) return;
                 auto nb = std::uint64_t(numel(sh)) * 4; bytes += nb;
                 if (!deny.empty() || over()) { ins.clear(); detail::skip(r, nb); continue; }
-                ins.emplace_back(sh); r.raw(ins.back().data.data(), ins.back().data.size() * 4);
+                // grow with the bytes that actually arrive: a 40-byte frame may name a 16 GiB tensor
+                tensor t; t.shape = sh; const std::size_t want = std::size_t(numel(sh));
+                while (r.ok && t.data.size() < want) {
+                    const std::size_t at = t.data.size(), step = std::min<std::size_t>(want - at, std::size_t(1) << 22);
+                    t.data.resize(at + step); r.raw(t.data.data() + at, step * 4);
+                }
+                ins.push_back(std::move(t));
             }
-            auto os = r.shape(); if (!r.ok || !detail::valid_shape(os)) return;
+            auto os = r.shape(); if (!r.ok || !detail::valid_shape(os, i64(max_tensor_elems))) return;
             bytes += std::uint64_t(numel(os)) * 4;
             if (deny.empty() && over()) deny = "asked for an op over " + std::to_string(bytes) + " tensor bytes, above its limit (max-bytes=" + std::to_string(cap) + ")";
             for (auto& t : ins) { views.push_back({t.data.data(), t.shape}); shapes.push_back(t.shape); }
@@ -372,6 +405,7 @@ private:
             try {
                 if (!deny.empty()) { say("denied device op " + name + " for " + peer.who + ": " + deny); raise(errc::unsupported, "permission denied: {} {}", peer.who, deny); }
                 if (oi < 0) raise(errc::unsupported, "unknown op '{}'", name);
+                detail::check_call(ops::op(oi), shapes, os, a);
                 tensor out(os);
                 auto& l = reg_->select(ops::op(oi), shapes, os, a);
                 auto* h = l.on_device ? reg_->hooks.get() : nullptr;

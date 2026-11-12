@@ -84,6 +84,7 @@ struct fish_dialect : block_dialect {
 void forge_shell_register_fish(forge::script::shell_registry& r) {
     forge::script::shell_backend b; b.name = "fish"; b.exes = {"fish"}; b.family = "fish"; b.golden_tested = true;
     b.argv = forge::script::shellq::dash_c;
+    b.probe = "echo (count a b c)"; b.probe_out = "3";
     b.quote = fq;
     b.emitter = [] { return std::make_unique<fish_dialect>(); }; b.emit_ext = ".fish"; b.emit_tested = true;
     r.add(std::move(b));

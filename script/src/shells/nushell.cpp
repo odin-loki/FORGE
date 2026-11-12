@@ -74,6 +74,7 @@ struct nu_dialect : block_dialect {
 void forge_shell_register_nushell(forge::script::shell_registry& r) {
     forge::script::shell_backend b; b.name = "nu"; b.aliases = {"nushell"}; b.exes = {"nu"}; b.family = "nu"; b.golden_tested = true;
     b.argv = [](const std::string& exe, const std::string& sc) -> std::vector<std::string> { return {exe, "--no-config-file", "-c", sc}; };
+    b.probe = "print ([1 2 3] | length)"; b.probe_out = "3";
     b.quote = rq;
     b.emitter = [] { return std::make_unique<nu_dialect>(); }; b.emit_ext = ".nu"; b.emit_tested = true;
     r.add(std::move(b));

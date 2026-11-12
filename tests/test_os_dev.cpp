@@ -283,7 +283,7 @@ TEST(device_monitor_events) {
     CHECK(dd::parse_uevent(add, e)); CHECK(e.action == dv::device_action::added && e.subsystem == "usb" && e.name == "bus/usb/001/004");
     std::string rem("remove@/devices/virtual/block/loop3\0ACTION=remove\0DEVPATH=/devices/virtual/block/loop3\0SUBSYSTEM=block\0", 102);
     CHECK(dd::parse_uevent(rem, e)); CHECK(e.action == dv::device_action::removed && e.subsystem == "block" && e.name == "loop3");
-    CHECK(!dd::parse_uevent(std::string("libudev\0\xfe\xed\xca\xfe junk", 20), e)); CHECK(!dd::parse_uevent("no nul here", e)); CHECK(!dd::parse_uevent(std::string("x@/y\0SUBSYSTEM=usb\0", 19), e));
+    CHECK(!dd::parse_uevent(std::string("libudev\0\xfe\xed\xca\xfe junk", 17), e)); CHECK(!dd::parse_uevent("no nul here", e)); CHECK(!dd::parse_uevent(std::string("x@/y\0SUBSYSTEM=usb\0", 19), e));
     CHECK(!dd::parse_uevent(std::string("bind@/d\0ACTION=bind\0DEVPATH=/d\0", 31), e));
     CHECK(dd::parse_devd("+ugen0.2 at bus=0 hubaddr=1 port=2 vendor=0x80ee on uhub0\n", e)); CHECK(e.action == dv::device_action::added && e.subsystem == "usb" && e.name == "ugen0.2");
     CHECK(dd::parse_devd("-da0 at scbus2 on umass-sim0\n", e)); CHECK(e.action == dv::device_action::removed && e.subsystem == "block" && e.name == "da0");

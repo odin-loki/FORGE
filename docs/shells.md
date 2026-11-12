@@ -20,6 +20,15 @@ searched and the full path is used; the WSL `bash.exe` relays (in `System32` or 
 bash, and the Windows Kits Resource Compiler is not accepted as `rc`. On POSIX a match ending in `.exe` (a Windows
 program reached through WSL interop) is skipped.
 
+**Identity probe.** A name on `PATH` is not proof of a shell: npm installs an unrelated `rc`, and `es`, `nu`,
+`fish`, `elvish`, `ysh` and `xonsh` are names other projects use too. These seven backends carry a one-line
+probe in their own syntax (`echo a^b` must print `ab` for rc and es, `echo (count a b c)` must print `3` for
+fish, ...). The first time a process needs such a shell, the candidate runs the probe (5 s timeout, verdict
+cached per resolved path); a candidate that fails is skipped and the search goes on along `PATH`, returning the
+real shell by full path. If none passes, the shell counts as not installed. `forge::shells()` probes only where
+the script may start processes and no security policy is active; otherwise it reports the `PATH` lookup alone,
+and running the shell checks the policy's `exec` scope before the probe.
+
 | backend | aliases | executables | invocation | `tested` | emit ext |
 |---|---|---|---|---|---|
 | sh | | `sh` | `-c` | yes | `.sh` |

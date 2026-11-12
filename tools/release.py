@@ -6,7 +6,7 @@
   tools/release.py changelog [--since TAG] prepend a section to CHANGELOG.md from git history
   tools/release.py build [--preset release] [--skip-tests]
                                            configure/build/test, cpack binary + source archives,
-                                           SBOM, SHA256SUMS, optional detached Ed25519 signatures
+                                           SBOMs (SPDX 2.3 + CycloneDX 1.5), SHA256SUMS, optional detached Ed25519 signatures
   tools/release.py verify DIR              re-check SHA256SUMS (and signatures if a public key is given)
   tools/release.py tag                     create the annotated vX.Y.Z tag (never pushes)
 
@@ -90,8 +90,9 @@ def build(preset, skip_tests, sign_key, out):
     arts = []
     for p in sorted((bdir / "pkg").glob("forge-*")):
         if p.is_file() and p.suffix in (".gz", ".zip", ".deb"): shutil.copy2(p, out / p.name); arts.append(out / p.name)
-    sh(sys.executable, ROOT / "tools/sbom.py", "--out", out / f"forge-{version()}.spdx.json", env=env)
-    arts.append(out / f"forge-{version()}.spdx.json")
+    for fmt, ext in (("spdx", "spdx.json"), ("cyclonedx", "cdx.json")):   # SPDX 2.3 and CycloneDX 1.5
+        sh(sys.executable, ROOT / "tools/sbom.py", "--format", fmt, "--out", out / f"forge-{version()}.{ext}", env=env)
+        arts.append(out / f"forge-{version()}.{ext}")
     (out / "SHA256SUMS").write_text("".join(f"{sha256(a)}  {a.name}\n" for a in arts))
     if sign_key:
         for a in arts + [out / "SHA256SUMS"]: sign(a, sign_key)
