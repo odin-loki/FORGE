@@ -1130,6 +1130,15 @@ if(FORGE_BUILD_TESTS)
     add_test(NAME golden_tiny_llama
       COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
               --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden)
+    # GGUF tensor types against gguf-py (exits 77 = skipped without the gguf package); AWQ / GPTQ checkpoints against
+    # the packers in the test script.
+    add_test(NAME golden_gguf_types
+      COMMAND ${FORGE_GOLDEN_PYTHON} ${PROJECT_SOURCE_DIR}/verify/golden/gguf_types.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_gguf_types)
+    set_tests_properties(golden_gguf_types PROPERTIES SKIP_RETURN_CODE 77)
+    add_test(NAME golden_hf_quant
+      COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/hf_quant.py
+              --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hf_quant)
     if(FORGE_HAVE_VULKAN AND NOT CMAKE_CROSSCOMPILING)
       # Same goldens with the Vulkan lowerings (ops without a GPU kernel run on the CPU).
       add_test(NAME golden_tiny_llama_vulkan COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
@@ -1140,7 +1149,7 @@ if(FORGE_BUILD_TESTS)
     endif()
     if(CMAKE_CROSSCOMPILING_EMULATOR)
       list(JOIN CMAKE_CROSSCOMPILING_EMULATOR " " _forge_runner)
-      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
+      set_tests_properties(golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_quant_inplace golden_moe_mla golden_gguf_types golden_hf_quant modelfile_signing signing_cli onnx_import PROPERTIES ENVIRONMENT "FORGE_RUNNER=${_forge_runner}")
     endif()
     if(TARGET capi_smoke)
       add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
@@ -1170,6 +1179,7 @@ if(FORGE_BUILD_TESTS)
       endif()
     endfunction()
     forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
+      golden_gguf_types golden_hf_quant
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_inference_generate doc_example_capi_generate
       capi_smoke python_bindings serve_http security_cli modelfile_signing)
