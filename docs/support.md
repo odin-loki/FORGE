@@ -6,6 +6,7 @@ Utilities used across FORGE. All are header-only.
 |---|---|---|---|
 | `core/include/forge/core/log.hpp` | `forge::log` | Logger | `test_log`, `test_log_strip`, `log_min_level_cmake` |
 | `support/include/forge/task/pool.hpp` | `forge::task` | Thread pool | `test_pool` |
+| `support/include/forge/task/sched.hpp` | `forge::task` | Work-stealing scheduler, task graphs, frame pacing | `test_sched` |
 | `os/include/forge/os/process_pool.hpp` | `forge::os` | Process pool (see [os-wrapper.md](os-wrapper.md#process-pools-process_poolhpp)) | `test_process_pool` |
 | `os/include/forge/os/process.hpp`, `core/include/forge/core/memory.hpp` | `forge::os`, `forge::mem` | Waiting on processes, leased children | `test_os_process`, `test_memory` |
 | `support/include/forge/cache/cache.hpp` | `forge::cache` | Content-addressed disk cache | `test_cache` |
@@ -46,6 +47,40 @@ FORGE_LOG_DEBUG("graph", "fused {} ops", k);              // arguments not evalu
 | `pending()`, `wait_idle()`, `size()` | Queue length, wait for an empty queue, worker count |
 
 The destructor still runs (or skips, if cancelled) queued tasks before the workers exit.
+
+## Work-stealing scheduler (`forge::task::scheduler`, `task/sched.hpp`)
+A second executor next to `task::pool`. The engine (graph, inference, gpu) still uses `task::pool`; nothing was moved onto the scheduler, so the two have separate threads. Tests: `test_sched` (also run under TSan).
+
+```cpp
+task::scheduler s({.threads = 8});
+auto a = s.spawn([] { return 6; });                 // task<int>
+auto b = a.then([](int v) { return v * 7; });       // continuation
+auto c = s.when_all({a, b});                        // task<void>
+int v = b.get();                                    // waits by running other tasks
+s.parallel_for(n, grain, [&](std::size_t lo, std::size_t hi) { ... });
+```
+
+| API | Meaning |
+|---|---|
+| `scheduler(config)` | `threads` (0 = `FORGE_THREADS`, then physical cores), `pin` (each worker to its planned CPU), `numa_bind` (each worker to its node's CPUs), `topology` / `numa` (injected layouts, for tests), `spin` (idle rounds before a worker parks). `scheduler::global()` is a process-wide instance |
+| `spawn(f, {prio, place, stop})` | Queue `f()` or `f(std::stop_token)`; returns `task<R>`. A task whose token fired before it starts is skipped and its handle throws `task::cancelled` |
+| `spawn_after(deps, f, opts)` | Starts when every task in `deps` has finished (dependency counts; failed dependencies still count as finished) |
+| `task<R>::then(f)` | `f(value)` after the task; if the task failed or was cancelled the continuation fails with the same exception and `f` is not called |
+| `when_all(deps)`, `when_all(vector<task<R>>)` | A `task<void>` (fails with the first failed dependency in argument order), or a `task<vector<R>>` of the values |
+| `task<R>::get()`, `wait()`, `done()`, `failed()`, `error()` | `get` returns a reference to the value or rethrows |
+| `parallel_for(n, grain, f(begin, end))` | Chunk `k` is always `[k·grain, min(n, (k+1)·grain))`, for any thread count. The caller runs chunks too. The first exception is rethrown; chunks not yet started are skipped |
+| `parallel_reduce(n, grain, init, map, combine)` | Chunk results combined in chunk order: the result is bit-identical for any thread count and timing |
+| `simd_grain(grain, lanes)` | `grain` rounded up to a multiple of the vector width |
+| `wait(t)`, `wait_idle()`, `pending()` | `wait_idle` must not be called from inside a task |
+| `worker_local<T>` | One `T` per worker on its own cache line (`local()`, `for_each`); other threads get a slot each on first use |
+| `current_worker()`, `slots()`, `worker_stats(i)`, `total_stats()`, `pin_failures()` | Introspection: worker index, planned CPU / core class / NUMA node per worker, executed / stolen / parked counts |
+
+- **Queues.** Each worker owns Chase–Lev deques (LIFO for the owner, FIFO for thieves). An idle worker steals from a random victim, same NUMA node first. Other threads submit through a locked injector queue. Idle workers spin `spin` rounds, then park on `std::atomic` wait/notify (a mutex and condition variable when `FORGE_TASK_PARK_CONDVAR` is defined or the library has no atomic wait). `os/sync.hpp` is not used: it was not in this tree when the scheduler was written.
+- **Priorities** are `low`, `normal`, `high`. A worker looks for the highest priority first across its own deques, the injector and its victims. A running task is never preempted, and a worker checks its own queues before others', so the order is a preference, not a guarantee, except within one queue.
+- **Waiting helps.** `get`, `wait`, `wait_idle` and `parallel_for` run queued tasks while they wait, so nested `parallel_for` and tasks that wait on tasks do not deadlock when every worker is busy. Consequences: do not hold a lock across these calls (the helper may run a task that takes the same lock), and deep chains of waits use stack.
+- **P/E cores.** `plan_workers(topology, n, numa_nodes)` assigns CPUs: one logical CPU per performance core, then one per efficiency core, then SMT siblings. `placement::performance` tasks run only on workers planned for performance cores (and on outside threads that are waiting); `placement::efficiency` tasks go to efficiency workers first, and performance workers take them only when idle. On a machine with one core class both marks are ignored. Without `pin` the marks choose a worker, not a CPU: the OS may still run that thread anywhere.
+- **Frame pacing.** `frame_pacer(sched, budget_ns, clock)`: between `begin_frame()` and `end_frame()`, `run(f)` queues work that must finish in the frame (high priority, performance placement) and `defer(f, est_ns)` queues work that may slip. `end_frame` waits for the `run` tasks, then starts deferred tasks oldest first, at most one per worker at a time, while `elapsed + estimate <= budget`; the rest stay queued. An estimate of 0 uses a running average of measured deferred-task times. A started task is not interrupted, so a frame can overrun by one deferred task. `frame_stats` reports counts, elapsed time and `over_budget`; `pace()` sleeps out the remainder.
+- **Not done / not measured.** No performance comparison against `task::pool` was made. Pinning and NUMA binding were only exercised on a 4-CPU single-node x86 VM (calls succeed or are counted in `pin_failures()`); placement was tested with injected topologies, not on hybrid hardware.
 
 ## Processes
 - `os::spawn_spec` and `spawn_wait` (argv, env, cwd, limits, output cap): see [os-wrapper.md](os-wrapper.md#processes-processhpp).
