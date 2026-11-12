@@ -142,10 +142,10 @@ private:
             auto& s = sched_.stats();
             c.send(response(200, std::format("forge_steps {}\nforge_completed {}\nforge_prefix_hits {}\nforge_prefix_tokens_reused {}\nforge_peak_active {}\nforge_peak_kv_bytes {}\n"
                                              "forge_queue_waiting {}\nforge_queue_active {}\nforge_admission_deferred_total {}\nforge_rejected_total {}\nforge_kv_evictions_total {}\n"
-                                             "forge_kv_spills_total {}\nforge_kv_reloads_total {}\nforge_kv_spilled {}\n",
+                                             "forge_kv_spills_total {}\nforge_kv_reloads_total {}\nforge_kv_reload_failures_total {}\nforge_kv_spilled {}\n",
                                              s.steps, s.completed, s.prefix_hits, s.prefix_tokens_reused, s.peak_active, s.peak_kv_bytes,
                                              sched_.waiting(), sched_.active_count(), s.deferred, rejected_.load(), sched_.evictions(),
-                                             s.prefix_spills, s.prefix_reloads, sched_.spilled()) + mem::governor::instance().prometheus(), "text/plain")); return;
+                                             s.prefix_spills, s.prefix_reloads, s.prefix_reload_failures, sched_.spilled()) + mem::governor::instance().prometheus(), "text/plain")); return;
         }
         bool chat = path == "/v1/chat/completions";
         if (path != "/v1/completions" && !chat) { c.send(response(404, error_json("no route " + path))); return; }
@@ -363,6 +363,8 @@ int main(int argc, char** argv) {
         if (fs::is_directory(path) || path.ends_with(".gguf")) {   // import into a temp .fpk
             auto out = (fs::temp_directory_path() / (fs::path(path).filename().string() + ".serve.fpk")).string();
             import::import_options o; o.codec = arg(argc, argv, "codec", "f32");
+            o.requant = arg(argc, argv, "codec", "keep");   // GGUF / AWQ / GPTQ inputs keep their stored quantisation unless a codec is given
+            if (o.codec == "keep") o.codec = "f32";
             if (path.ends_with(".gguf")) import::import_gguf(path, out, o); else import::import_hf(path, out, o);
             path = out;
         }

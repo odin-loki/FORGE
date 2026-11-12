@@ -1,0 +1,74 @@
+# FORGE @PROJECT_VERSION@ CMake package.
+#
+#   find_package(forge CONFIG REQUIRED)
+#   target_link_libraries(app PRIVATE forge::inference forge::simd_mv)
+#
+# Header-only targets: forge::core forge::os forge::ops forge::simd forge::verify forge::gpu forge::graph
+# forge::modelfile forge::security forge::inference forge::loadbalancer (forge::rpc_tls when FORGE was built with
+# OpenSSL). Static libraries: forge::simd_mv (link it whenever you use simd, gpu, graph or inference) forge::trust
+# forge::text forge::mobile forge::script forge::video (forge::metal on Apple). Shared: forge::c, the C ABI (forge.h).
+#
+# Variables: FORGE_INCLUDE_DIR, FORGE_TEMPLATES_DIR (import blueprint templates), FORGE_HAVE_TLS, FORGE_HAVE_VULKAN.
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+if(@FORGE_PKG_HAVE_THREADS@)
+  find_dependency(Threads)
+endif()
+set(FORGE_HAVE_TLS @FORGE_PKG_HAVE_TLS@)
+if(FORGE_HAVE_TLS)
+  find_dependency(OpenSSL)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/forgeTargets.cmake")
+
+set_and_check(FORGE_INCLUDE_DIR "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+set(FORGE_TEMPLATES_DIR "@PACKAGE_FORGE_INSTALL_TEMPLATEDIR@")
+
+# What the FORGE build applies to all of its own targets and a consumer of the C++ headers needs as well. Everything
+# hangs off forge::os, the bottom C++ layer (forge::c and forge::trust are plain C and get none of it).
+get_property(_forge_langs GLOBAL PROPERTY ENABLED_LANGUAGES)
+if(CXX IN_LIST _forge_langs)
+  set_property(TARGET forge::os APPEND PROPERTY INTERFACE_COMPILE_FEATURES cxx_std_23)
+  include("${CMAKE_CURRENT_LIST_DIR}/forge_cxx_compat.cmake")
+  forge_cxx_compat(_forge_compat_cxx _forge_compat_link)
+  if(ANDROID)   # the NDK's libc++ gates more of C++20/23 than the probe looks at
+    list(APPEND _forge_compat_cxx -fexperimental-library)
+    list(APPEND _forge_compat_link -fexperimental-library)
+    list(REMOVE_DUPLICATES _forge_compat_cxx)
+    list(REMOVE_DUPLICATES _forge_compat_link)
+  endif()
+  if(MSVC)      # UTF-8 sources and literals, unwinding, large generated translation units
+    list(APPEND _forge_compat_cxx /utf-8 /EHsc /bigobj)
+  endif()
+  if(_forge_compat_cxx)
+    set_property(TARGET forge::os APPEND PROPERTY INTERFACE_COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CXX>:${_forge_compat_cxx}>")
+  endif()
+  if(_forge_compat_link)
+    set_property(TARGET forge::os APPEND PROPERTY INTERFACE_LINK_OPTIONS "$<$<LINK_LANGUAGE:CXX>:${_forge_compat_link}>")
+  endif()
+  unset(_forge_compat_cxx)
+  unset(_forge_compat_link)
+endif()
+unset(_forge_langs)
+if(WIN32)
+  set_property(TARGET forge::os APPEND PROPERTY INTERFACE_COMPILE_DEFINITIONS _USE_MATH_DEFINES NOMINMAX WIN32_LEAN_AND_MEAN)
+  set_property(TARGET forge::os APPEND PROPERTY INTERFACE_LINK_LIBRARIES userenv)   # os/sandbox.hpp
+endif()
+
+# Vulkan backend (forge/gpu/vulkan.hpp): compiled in when <vulkan/vulkan.h> is on the include path and the installed
+# headers carry the embedded SPIR-V. The loader is opened at run time; only the headers are needed here.
+set(FORGE_HAVE_VULKAN OFF)
+if(@FORGE_PKG_HAVE_VULKAN@)
+  find_path(FORGE_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+  if(FORGE_VULKAN_INCLUDE_DIR)
+    set(FORGE_HAVE_VULKAN ON)
+    # A directory the compiler searches anyway (/usr/include) must not be put ahead of the C++ standard library.
+    if(NOT FORGE_VULKAN_INCLUDE_DIR IN_LIST CMAKE_CXX_IMPLICIT_INCLUDE_DIRECTORIES
+       AND NOT FORGE_VULKAN_INCLUDE_DIR IN_LIST CMAKE_C_IMPLICIT_INCLUDE_DIRECTORIES)
+      set_property(TARGET forge::gpu APPEND PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${FORGE_VULKAN_INCLUDE_DIR}")
+    endif()
+  endif()
+endif()
+
+check_required_components(forge)

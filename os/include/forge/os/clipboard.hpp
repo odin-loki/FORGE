@@ -1,10 +1,25 @@
 #pragma once
 // forge::os::clipboard: get / set plain UTF-8 text. Windows uses the Win32 clipboard (CF_UNICODETEXT); macOS
 // runs pbcopy / pbpaste; Linux/FreeBSD run wl-copy / wl-paste under Wayland, else xclip or xsel under X11.
-// No display or helper → unsupported(). Mobile: unsupported. Guide: docs/os-wrapper.md.
+// No display or helper → unsupported(). iOS: UIPasteboard.generalPasteboard through the Objective-C runtime (the
+// system may show its paste banner). Android: the ClipboardManager is Java-only, so app glue installs
+// set_backend(); unsupported without it. A backend installed with set_backend() takes over on every OS.
+// Guide: docs/os-wrapper.md.
 #include <forge/os/process.hpp>
+#if defined(__APPLE__)
+#include <forge/os/detail.hpp>
+#endif
 
 namespace forge::os::clipboard {
+struct backend { std::function<result<std::string>()> get; std::function<status(const std::string&)> set; };
+inline std::mutex& backend_mutex_() { static std::mutex m; return m; }
+inline backend& backend_ref_() { static backend b; return b; }
+// Platform glue (Android JNI, tests) supplies the clipboard. Pass {} to remove it.
+inline void set_backend(backend b) { std::lock_guard<std::mutex> g(backend_mutex_()); backend_ref_() = std::move(b); }
+inline backend backend_() { std::lock_guard<std::mutex> g(backend_mutex_()); return backend_ref_(); }
+#if defined(FORGE_OS_IOS)
+inline void* pasteboard_() { auto& o = detail::objc_api::get(); void* c = o.ok() ? o.cls("UIPasteboard") : nullptr; return c ? o.send(c, "generalPasteboard") : nullptr; }
+#endif
 #if defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS) && !defined(FORGE_OS_ANDROID)
 // The helper command lines for reading and writing, or empty when none is usable.
 inline std::pair<std::vector<std::string>, std::vector<std::string>> helpers_() {
@@ -21,8 +36,11 @@ inline std::pair<std::vector<std::string>, std::vector<std::string>> helpers_() 
 }
 #endif
 inline bool available() {
+    if (auto b = backend_(); b.get && b.set) return true;
 #if defined(FORGE_OS_WINDOWS)
     return true;
+#elif defined(FORGE_OS_IOS)
+    return pasteboard_() != nullptr;
 #elif defined(FORGE_OS_POSIX) && !defined(FORGE_OS_IOS) && !defined(FORGE_OS_ANDROID)
     return !helpers_().first.empty();
 #else
@@ -52,7 +70,13 @@ inline bool empty_selection_(const std::string& err) {
 }
 #endif
 inline result<std::string> get() {
-#if defined(FORGE_OS_WINDOWS)
+    if (auto b = backend_(); b.get) return b.get();
+#if defined(FORGE_OS_IOS)
+    void* pb = pasteboard_(); if (!pb) return {{}, unsupported("clipboard (UIPasteboard not available)")};
+    auto& o = detail::objc_api::get(); void* str = o.send(pb, "string");   // nil when the pasteboard holds no text
+    const char* c = str ? o.send<const char*>(str, "UTF8String") : nullptr;
+    return {c ? std::string(c) : std::string(), {}};
+#elif defined(FORGE_OS_WINDOWS)
     if (!open_clipboard_()) return {{}, last_error("OpenClipboard")};
     std::string out; HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (h) if (auto* w = static_cast<const wchar_t*>(GlobalLock(h))) {
@@ -74,7 +98,14 @@ inline result<std::string> get() {
 #endif
 }
 inline status set(const std::string& text) {
-#if defined(FORGE_OS_WINDOWS)
+    if (auto b = backend_(); b.set) return b.set(text);
+#if defined(FORGE_OS_IOS)
+    void* pb = pasteboard_(); if (!pb) return {{}, unsupported("clipboard (UIPasteboard not available)")};
+    auto& o = detail::objc_api::get();
+    void* str = o.send<void*, const char*>(o.cls("NSString"), "stringWithUTF8String:", text.c_str());
+    if (!str) return {{}, errno_error(EINVAL, "clipboard: text is not valid UTF-8")};
+    o.send<void, void*>(pb, "setString:", str); return {};
+#elif defined(FORGE_OS_WINDOWS)
     int n = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
     HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, std::size_t(n) * sizeof(wchar_t)); if (!g) return {{}, last_error("GlobalAlloc")};
     MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, static_cast<wchar_t*>(GlobalLock(g)), n); GlobalUnlock(g);

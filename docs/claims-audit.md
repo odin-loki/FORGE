@@ -18,7 +18,7 @@ security and status docs:
 | macOS only cross-linked; iOS never built; Windows event log sink and dynlib Windows/Apple code never compiled | All built in CI; `test_log` and `test_os_dynlib` pass on macOS and Windows. iOS is build-only. |
 | CUDA/HIP/OpenCL/Level Zero/Metal never on hardware | CUDA ran on an RTX 3090; Metal passes on the GitHub macOS runner. HIP, OpenCL, Level Zero still mock-only. |
 | CI workflow must be moved by hand | It is at `.github/workflows/ci.yml`. |
-| Keystore fallback (implied encrypted) | The file fallback is XOR-padded, not encrypted. |
+| Keystore fallback (implied encrypted) | The file fallback is XOR-padded, not encrypted. (True at ccc0a7d; replaced the next day, in 0b76e23, by XChaCha20-Poly1305 under a store key file. See [security.md](security.md).) |
 
 ## 2026-10-31: audit on branch docs-verified (base 5940593), merged in PR #12
 
