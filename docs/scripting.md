@@ -35,6 +35,7 @@ syntax error, a script refused by the static checks, a failed `--emit`, or a bad
 | `--check [--json] [--module-dir DIR]` | static checks only, nothing runs; exit 2 on errors |
 | `--no-check`, `--strict-check` | skip the static checks before a run / refuse on warnings too |
 | `--emit TARGET [-o FILE]`, `--emit-targets` | translate to a shell script instead of running (see *Write once, emit anywhere*) |
+| `--aot OUT [--aot-mode native\|embed] ...` | compile to a native executable instead of running (see [aot.md](aot.md)) |
 | `--ask-model M.fpk`, `--ask-max-tokens N` | in-process model for `forge::ask` & co |
 | `--cache-dir DIR`, `--cache-trust HEX`, `--cache-require-signed`, `--cache-sign-seed HEX` | `.fsc` parse cache |
 | `--args` | end of options; the rest are script arguments |
@@ -190,6 +191,8 @@ derive from `Error` or from the `std::` exception names.
   output.
 - A verifier checks stack depth, jump targets, constant and local indices and operands before a chunk runs.
   Malformed bytecode is rejected. There is no JIT to machine code.
+- `forge script --aot` compiles a script ahead of time to a standalone executable, either by translating it to C++
+  over this same runtime (native mode) or by attaching it to a runner stub (embed mode): [aot.md](aot.md).
 
 ### `.fsc` parse cache
 
@@ -775,6 +778,7 @@ test script but are not asserted individually.
 - `tests/test_script_os_sandbox.cpp` (Linux): OS enforcement of the capability flags.
 - `tests/test_script_oserror.cpp`: OS error mapping, fault handling, `ProcessPool` and its time limit.
 - `fuzz/fuzz_script.cpp`: fuzzes the lexer, parser, resolver, compiler and verifier without executing anything.
+- `tests/test_script_aot.cpp`, `fuzz/fuzz_aot.cpp`: AOT binaries against the interpreter ([aot.md](aot.md), "Tests").
 
 ## Platform notes and limits
 

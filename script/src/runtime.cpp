@@ -7,6 +7,7 @@
 #include "shells/shell.hpp"
 #include "parser.hpp"
 #include "vm.hpp"
+#include "aot.hpp"
 #include <forge/core/error.hpp>
 #include <forge/os/os.hpp>
 #include <forge/os/process.hpp>
@@ -726,8 +727,9 @@ Value Interp::call_function(const Ref<Function>& f, std::vector<Value>& args, co
         env->slots.at(std::size_t(p.slot)) = p.by_ref ? std::move(v) : copy_value(v);
     }
     Value result;
-    if (!f->chunk && sh->use_vm && f->calls.fetch_add(1) + 1 >= sh->jit_threshold) f->chunk = compile(d);
-    if (f->chunk) result = vm_run(*this, *f->chunk, env);
+    if (!d.aot_body && !f->chunk && sh->use_vm && f->calls.fetch_add(1) + 1 >= sh->jit_threshold) f->chunk = compile(d);
+    if (d.aot_body) result = aot::call_native(d, *this, env);   // compiled ahead of time (aot.hpp)
+    else if (f->chunk) result = vm_run(*this, *f->chunk, env);
     else {
         ret = Nil{};
         Flow fl = exec_block(*d.body, env);
@@ -748,6 +750,7 @@ Value Interp::make_closure(const std::shared_ptr<const FnDecl>& fd, const Ref<En
 Value Interp::run_top(const std::shared_ptr<const FnDecl>& top, bool vm) {
     auto env = make<Env>(std::size_t(top->nslots), Ref<Env>());
     file = top->file;
+    if (top->aot_body) { Value r = aot::call_native(*top, *this, env); return top->has_main ? run_main() : r; }   // AOT binary
     if (vm) {
         auto c = compile(*top);
         Value r = vm_run(*this, *c, env);
@@ -1067,6 +1070,8 @@ std::vector<std::string> module_search_path(const Interp& in) {
 Value Interp::import_module(const std::string& path) {
     namespace fs = std::filesystem;
     if (!caps.fs) raise("PermissionError", "import needs file access, which this sandbox disables");
+    std::string key, bundled; const bool is_bundled = aot::bundled_module(*this, path, key, bundled);   // AOT binaries carry their static imports
+    if (!is_bundled) {
     fs::path p(path);
     // Names without an extension try `name.fs`, `name.cpp`, then a package directory `name/mod.fs|mod.cpp`.
     std::vector<fs::path> forms;
@@ -1078,11 +1083,12 @@ Value Interp::import_module(const std::string& path) {
     fs::path found;
     for (auto& c : cand) { std::error_code ec; if (fs::is_regular_file(c, ec)) { found = fs::weakly_canonical(c, ec); break; } }
     if (found.empty()) raise("ImportError", "module '" + path + "' not found (search path: FORGE_SCRIPT_PATH, script dir, ~/.forge/modules, cwd)");
-    std::string key = found.string();
+    key = found.string();
     enforce_scope(*this, SecScope::fs_read, key);
     if (is_native_module(key)) {
         if (!sh->load_plugin) raise("ImportError", "native plugins are not available in this build");
         return sh->load_plugin(*this, key);
+    }
     }
     {
         std::lock_guard g(sh->mod_m);
@@ -1092,14 +1098,15 @@ Value Interp::import_module(const std::string& path) {
         }
         sh->modules[key] = Ref<Globals>();
     }
-    auto src = os::read_file(key);
+    auto src = is_bundled ? os::result<std::string>{std::move(bundled), {}} : os::read_file(key);
     if (!src) { std::lock_guard lk(sh->mod_m); sh->modules.erase(key); raise("IOError", src.err.what); }
     // FSS INT-1/INT-2: integrity.scripts applies to imported modules too, checked on the buffer that gets parsed
-    try { security::verify_artefact(*security::active_policy(), security::artefact::script, key, {reinterpret_cast<const std::uint8_t*>(src.value.data()), src.value.size()}); }
+    try { if (!is_bundled) security::verify_artefact(*security::active_policy(), security::artefact::script, key, {reinterpret_cast<const std::uint8_t*>(src.value.data()), src.value.size()}); }   // a bundled module is covered by the binary's own signature
     catch (...) { std::lock_guard lk(sh->mod_m); sh->modules.erase(key); throw; }
     std::shared_ptr<const FnDecl> top;
     try { top = parse_program(src.value, key); }
     catch (const syntax_error& e) { std::lock_guard g(sh->mod_m); sh->modules.erase(key); raise("SyntaxError", e.what()); }
+    if (is_bundled) aot::bind_program(top, key);
     auto g = make<Globals>();
     Interp sub(sh, g); sub.caps = caps; sub.depth = depth; sub.task = task; sub.deadline_ns = deadline_ns;
     sub.cpu_deadline_ns = cpu_deadline_ns; sub.child_mem = child_mem; sub.child_cpu_s = child_cpu_s; sub.child_timeout_ms = child_timeout_ms;
