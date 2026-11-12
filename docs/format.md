@@ -16,7 +16,7 @@ Readers find sections through the table, so section order on disk does not matte
 | Name | Required | Contents |
 |------|----------|----------|
 | `manifest` | yes | JSON. Every importer writes `format` (`"fpk"`), `forge_format_version`, `architecture` and `session`. Optional licence fields, written when the source states them: `license` (identifier, e.g. `apache-2.0`), `license_name`, `license_link`, `license_files` (names of the files whose text is in the `license` section). HF imports add `template`, `codec`, `bos_token_id`, `eos_token_id`, `max_position_embeddings`, and `source_quantisation` for AWQ / GPTQ checkpoints. GGUF imports add `source: "gguf"`, `template`, the same token/position fields, `gguf_tensor_types`, and `transcoded` / `codec` / `requantised` when the import changed a tensor's type ([modelfile.md](modelfile.md#gguf-tensor-types)). Both add `add_bos` (bool) when the source says whether prompts start with BOS (GGUF `tokenizer.ggml.add_bos_token`, HF `tokenizer_config.json` `add_bos_token`); without it the tokenizer's post-processor decides if it has one, else Qwen-family models get no BOS and others do. `add_eos` (bool) likewise for a trailing EOS (`add_eos_token`). ONNX imports add `source: "onnx"`, `producer`, `onnx_opset`, `onnx_inputs`, `onnx_outputs` |
-| `blueprint` | yes | Graph text (`modelfile/blueprint.hpp`): name, opset, params, states, inputs, graph, outputs and session kind (e.g. `generative_sequence`). The engine runs opsets 1 to 3 and refuses any other, naming it; opset 2 adds the `rope` frequency-scaling attrs ([modelfile.md](modelfile.md#opsets)) |
+| `blueprint` | yes | The graph program, as text (`modelfile/blueprint.hpp`) or in the [binary form](#binary-blueprint) (`blueprint_bin.hpp`; the section then starts with `FORGEBPB`): name, opset, params, states, inputs, graph, outputs and session kind (e.g. `generative_sequence`). The engine runs opsets 1 to 3 and refuses any other, naming it; opset 2 adds the `rope` frequency-scaling attrs ([modelfile.md](modelfile.md#opsets)) |
 | `tokenizer` | text models | Hugging Face style `tokenizer.json`: see [Tokenizer section](#tokenizer-section). HF imports copy it (or convert a SentencePiece `.model`); GGUF imports synthesise one from the GGUF vocabulary |
 | `chat_template` | no | The model's Jinja chat template as UTF-8 text, from `tokenizer_config.json` / `chat_template.jinja` / GGUF `tokenizer.chat_template`. Older readers ignore the section; files without it have no template |
 | `tensors` | yes | JSON array `[{name, codec, shape, offset, bytes, blake3}]`; `offset` is relative to the start of `data` |
@@ -30,6 +30,30 @@ Readers find sections through the table, so section order on disk does not matte
 | `signature` | no | `{"alg":"ed25519", "scheme":"forge-fpk-v1", "digest", "signatures":[{key_id, public_key, sig}]}` |
 | `encryption` | no | JSON header of the sealed `data` section; two schemes, told apart by `alg`: see [Encryption](#encryption) |
 | `enc_macs` | with chunked encryption | Binary: one 16-byte Poly1305 tag per sealed chunk, in chunk order |
+
+## Binary blueprint
+A blueprint is a program (params, `repeat` loops, composites, expressions over symbolic dimensions), so its binary form encodes that program: the token stream of the text with names interned and numbers typed. `str` is a varint length followed by the bytes; varints are LEB128 (minimal, at most 10 bytes); fixed-size integers are little-endian.
+
+```
+"FORGEBPB" | u32 version (1) | u32 opset | str name | str session
+| varint n_strings | n_strings x { u8 kind; str text }   kind 0 identifier, 1 string literal, 2 identifier that is called
+| varint n_tokens  | tokens                                      (an op, a composite or a built-in)
+token : u8 tag
+  0x20 .. 0xff  identifier: string index tag - 0x20 (the first 224 strings)
+  0x01          identifier + varint string index (224 and up)
+  0x02          string literal + varint string index
+  0x03          number with an integral value below 2^53 + varint value
+  0x04          any other number + f64 (finite, positive)
+  0x10 .. 0x1e  { } ( ) [ ] , : = . + - * / ..
+```
+
+- **What a round trip keeps**: every token in order: names, strings, operators, brackets, and numbers as values. **What it drops**: comments, spacing and line breaks, and the spelling of a number (`1e-5` and `0.00001` are the same token).
+- **Canonical text.** `canonical_blueprint_text()` prints a token sequence in one fixed layout (one declaration or statement per line, two-space indent, numbers as digits or the shortest `%g` form that reads back as the same double). For every text that lexes, `canonical(text)` equals the text recovered from its binary form, byte for byte. `tests/test_modelfile.cpp` checks it for every template in `import/templates` (placeholders bound) and every seed in `fuzz/corpus/blueprint`; `fuzz_blueprint` checks it for every mutated input.
+- **Canonical binary.** The decoder accepts exactly one encoding of a token sequence: strings unique, all used and in first-use order; the kind of a string as its uses say; identifiers in the one-byte tag when their index allows; integral values in tag 0x03; `opset`, `name` and `session` equal to what the tokens declare; no trailing bytes. So for every byte string it accepts, encoding the recovered text gives the same bytes.
+- **Loading.** A reader turns a binary section back into canonical text and parses that with the one blueprint parser. The decoder is the untrusted-input boundary in front of it: every length, index and count is checked against the bytes present, and an unknown `version` is refused by number.
+- **Compatibility.** Importers write text. `forge blueprint model.fpk --to binary` rewrites the section (and sets manifest `blueprint_form: "binary"`, `forge_format_minor: 2`); `--to text` goes back (to the canonical text: the original comments are gone). A FORGE build that predates the binary form cannot parse it: `run`, `inspect` and anything else that reads the blueprint stop with a blueprint parse error (`unexpected character`, raised by the text lexer on the first byte after the magic); `verify` and `sign`, which do not parse it, still work. Files with a text blueprint are untouched by any of this.
+- A signature and precompiled plans cover the blueprint bytes, so converting drops both.
+- Size: over the 16 templates and 5 fuzz seeds the binary form is 73 % of the canonical text. It is the smaller form, not a compressed one.
 
 ## State section
 ```
@@ -156,6 +180,7 @@ Compatibility:
 - `enc_macs` and `encryption` are covered by the signature like every section; `forge sign` and `forge aot` copy them unchanged.
 
 ## Tools
+- `forge blueprint` converts a model's blueprint (or a bare `.fbp` / `.fbpb` file) between the forms; `forge inspect --blueprint text|binary|canonical [-o FILE]` shows or extracts one.
 - `forge inspect <file> [--tensors] [--blueprint] [--verify] [--state]` shows the layout, the alignment, the declared state, embedded adapters and calibration data.
 - `forge adapter list|add|remove`, `forge requant`: see [cli.md](cli.md).
 - `forge aot <file> --list` shows the precompiled plans and whether they would be used; `--strip` removes them.

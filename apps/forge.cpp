@@ -72,7 +72,9 @@ int usage() {
         "      options of import); reads the calib section, or measures f32 weights [--no-calib] [--calib-crest 12] [--align A]\n"
         "  adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]\n"
         "      LoRA adapters carried in the model file; select one with run --adapter N\n"
-        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license] [--state]\n"
+        "  blueprint <model.fpk> --to binary|text [-o out.fpk]     store the model's blueprint in the binary or the text form\n"
+        "  blueprint <file.fbp|file.fbpb> --to binary|text|canonical -o <out>   convert a bare blueprint file\n"
+        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint [text|binary|canonical] [-o FILE]] [--license] [--state]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
@@ -237,9 +239,10 @@ int cmd_inspect(const args& a) {
     std::printf("file      %s (%zu bytes)\nmanifest  %s\n", a.pos[0].c_str(), r.file_size(), json::dump(r.manifest()).c_str());
     for (auto& [n, s] : r.sections()) std::printf("section   %-10s offset %10llu size %10llu blake3 %s\n", n.c_str(),
                                                    (unsigned long long)s.offset, (unsigned long long)s.size, hash::blake3::hex(s.hash).substr(0, 16).c_str());
-    auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
-    std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors\n", bp.name.c_str(), bp.opset,
-                bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size());
+    auto bp = modelfile::load_blueprint(r);
+    std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors%s\n", bp.name.c_str(), bp.opset,
+                bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size(),
+                modelfile::is_binary_blueprint(r.section_text("blueprint")) ? " (stored in the binary form)" : "");
     if (bp.opset < modelfile::opset_min || bp.opset > modelfile::opset_max)
         std::printf("          opset %d is outside this engine's range %d..%d: the model will not run here\n", bp.opset, modelfile::opset_min, modelfile::opset_max);
     {   // the model's licence as recorded at import (manifest fields + the optional `license` section)
@@ -282,7 +285,26 @@ int cmd_inspect(const args& a) {
         std::printf("encrypted %s, key id %s (%s); %s\n", alg.c_str(), e.str_or("key_id", "?").c_str(), how.c_str(), r.locked() ? "no key given: tensors unreadable" : "key accepted");
     }
     if (a.has("tensors")) for (auto& [n, e] : r.tensors()) std::printf("  %-28s %-9s %s\n", n.c_str(), e.codec.c_str(), shape_str(e.shape).c_str());
-    if (a.has("blueprint")) std::printf("%.*s\n", int(r.section_text("blueprint").size()), r.section_text("blueprint").data());
+    if (a.has("blueprint")) {
+        // --blueprint [text|binary|canonical] [-o FILE]: the stored text (or, for a binary section, its canonical text);
+        // the binary form (a summary on the terminal, the bytes with -o); the canonical text of either.
+        std::string form = a.get("blueprint");
+        if (form.empty() && a.pos.size() > 1) form = a.pos[1];
+        if (form.empty()) form = "text";
+        auto stored = r.section_text("blueprint");
+        if (form == "binary") {
+            std::vector<std::uint8_t> bin = modelfile::is_binary_blueprint(stored) ? std::vector<std::uint8_t>(stored.begin(), stored.end()) : modelfile::encode_blueprint(stored);
+            modelfile::binary_blueprint_info bi; (void)modelfile::decode_blueprint(bin, &bi);
+            std::string ops; for (auto& c : bi.calls) ops += (ops.empty() ? "" : " ") + c;
+            std::printf("binary blueprint: version %u, %zu bytes (text form: %zu bytes), opset %u, \"%s\", session %s, %zu strings, %zu tokens\ncalls: %s\n",
+                        bi.version, bin.size(), modelfile::blueprint_text(stored).size(), bi.opset, bi.name.c_str(), bi.session.c_str(), bi.strings, bi.tokens, ops.c_str());
+            if (!a.get("o").empty()) { std::ofstream f(a.get("o"), std::ios::binary); f.write(reinterpret_cast<const char*>(bin.data()), std::streamsize(bin.size())); if (!f) throw std::runtime_error("cannot write " + a.get("o")); }
+        } else if (form == "text" || form == "canonical") {
+            std::string text = form == "canonical" ? modelfile::canonical_blueprint_text(modelfile::blueprint_text(stored)) : modelfile::blueprint_text(stored);
+            if (!a.get("o").empty()) { std::ofstream f(a.get("o"), std::ios::binary); f << text; if (!f) throw std::runtime_error("cannot write " + a.get("o")); }
+            else std::printf("%s\n", text.c_str());
+        } else throw std::runtime_error("--blueprint takes text, binary or canonical, not '" + form + "'");
+    }
     if (a.has("license") && r.has_section("license")) std::printf("%.*s\n", int(r.section_text("license").size()), r.section_text("license").data());
     if (a.has("verify")) {
         auto bad = r.verify();
@@ -323,6 +345,37 @@ int cmd_adapter(const args& a) {
         return 0;
     }
     return usage();
+}
+
+// forge blueprint <model.fpk | file.fbp | file.fbpb> --to binary|text|canonical [-o out]
+// A model file: its blueprint section is rewritten in that form. A bare blueprint file: converted to -o.
+bool is_fpk(const std::string& f);
+int cmd_blueprint(const args& a) {
+    if (a.pos.empty() || a.get("to").empty()) return usage();
+    const std::string to = a.get("to");
+    if (to != "binary" && to != "text" && to != "canonical") throw std::runtime_error("--to takes binary, text or canonical");
+    activate_policy(a.get("policy"));
+    if (is_fpk(a.pos[0])) {
+        if (to == "canonical") throw std::runtime_error("--to canonical is for bare blueprint files; a model file stores text or binary");
+        auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
+        import::check_write(out);
+        bool changed = modelfile::convert_blueprint_section(a.pos[0], out, to == "binary");
+        if (!changed) { std::printf("%s: the blueprint is already in the %s form\n", a.pos[0].c_str(), to.c_str()); return 0; }
+        modelfile::reader r(out);
+        std::printf("%s: blueprint now %s (%zu bytes) -> %s\n", a.pos[0].c_str(), to.c_str(), r.section_text("blueprint").size(), out.c_str());
+        std::puts("note: a signature and precompiled plans do not survive this; sign / run forge aot again");
+        return 0;
+    }
+    if (a.get("o").empty()) return usage();
+    auto src = import::read_file(a.pos[0]);
+    std::string text = modelfile::blueprint_text(src), res;
+    if (to == "binary") { auto b = modelfile::encode_blueprint(text); res.assign(reinterpret_cast<const char*>(b.data()), b.size()); }
+    else res = to == "canonical" ? modelfile::canonical_blueprint_text(text) : text;
+    import::check_write(a.get("o"));
+    std::ofstream f(a.get("o"), std::ios::binary); f << res;
+    if (!f) throw std::runtime_error("cannot write " + a.get("o"));
+    std::printf("%s (%zu bytes) -> %s (%s, %zu bytes)\n", a.pos[0].c_str(), src.size(), a.get("o").c_str(), to.c_str(), res.size());
+    return 0;
 }
 
 // forge requant <in.fpk> -o <out.fpk> --codec C [mixed-precision options of import] [--no-calib] [--calib-crest X] [--align A]
@@ -1150,6 +1203,7 @@ int main(int argc, char** argv) {
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
         if (c == "adapter") return cmd_adapter(a);
+        if (c == "blueprint") return cmd_blueprint(a);
         if (c == "requant") return cmd_requant(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);
         if (c == "security") return cmd_security(a);

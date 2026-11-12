@@ -13,6 +13,7 @@
 // (its byte offsets would have to be rebuilt: import the source again instead), and out == in.
 #include <forge/import/hf.hpp>
 #include <forge/modelfile/adapters.hpp>
+#include <forge/modelfile/blueprint_bin.hpp>
 
 namespace forge::import {
 
@@ -40,7 +41,7 @@ inline requant_report requantise(const std::string& in, const std::string& out, 
     if (r.has_section("experts")) raise(errc::unsupported, "{}: files with an experts index cannot be re-quantised in place; import the source again with the codec you want", in);
     if (auto bad = r.verify(); !bad.empty()) raise(errc::format_error, "{}: refusing to re-quantise a corrupt file ({})", in, bad.front());
     if (!is_mix_ftype(opt.codec) && !graph::codecs::find(opt.codec)) raise(errc::unsupported, "unknown codec '{}'", opt.codec);
-    auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
+    auto bp = modelfile::load_blueprint(r);
     requant_report rep;
 
     modelfile::calib_table calib;

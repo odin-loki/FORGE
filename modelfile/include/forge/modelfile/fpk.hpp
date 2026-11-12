@@ -50,7 +50,10 @@ inline constexpr std::uint32_t format_version = 1;
 // Minor revision of version 1 (manifest "forge_format_minor"): 1 adds the optional "experts" section (an index of
 // stacked MoE expert tensors whose per-expert slices start on expert_alignment file offsets). Readers that predate it
 // ignore the section; the tensors themselves are ordinary entries of "tensors".
+// 2 marks a file whose "blueprint" section is in the binary form (modelfile/blueprint_bin.hpp), which readers before
+// that form cannot parse (they stop with a blueprint parse error); files with a text blueprint stay at their minor.
 inline constexpr std::uint32_t format_minor = 1;
+inline constexpr std::uint32_t format_minor_binary_blueprint = 2;
 inline constexpr std::size_t alignment = 64;            // sections, and tensors of files that record no "tensor_alignment"
 inline constexpr std::size_t expert_alignment = 4096;
 // Tensor alignment (manifest "tensor_alignment"): every tensor starts on a file offset that is a multiple of it, so a

@@ -8,6 +8,7 @@
 #include <forge/inference/aot.hpp>
 #include <forge/inference/sampler.hpp>
 #include <forge/modelfile/blueprint.hpp>
+#include <forge/modelfile/blueprint_bin.hpp>
 #include <forge/modelfile/fpk.hpp>
 #include <forge/modelfile/sign.hpp>
 #include <forge/modelfile/adapters.hpp>
@@ -100,7 +101,7 @@ public:
             if (!rep.trusted && (strict || rep.signed_)) raise(errc::integrity_error, "{}: signature check failed: {}", fpk_path, rep.message);
         }
         man_ = r_.manifest();
-        bp_ = modelfile::parse_blueprint(r_.section_text("blueprint"));
+        bp_ = modelfile::load_blueprint(r_);   // text, or the binary form (modelfile/blueprint_bin.hpp)
         try { modelfile::check_opset(bp_); }   // before any plan is built: an opset this engine does not run
         catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
         // Files imported before the runtime had WordPiece / Unigram tokenizers keep such a tokenizer.json in a

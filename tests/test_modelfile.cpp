@@ -420,6 +420,129 @@ TEST(fpk_calibration_section_and_requant) {
     { import::requant_options bad; bad.base.codec = "nope"; CHECK_THROWS(import::requantise(src, out2, bad)); }
 }
 
+// ---- the binary blueprint form (FORGE_PLAN D.3 "two forms, lossless round-trip") ----
+namespace {
+// a template with its {{placeholders}} bound: the default when it has one, else 1 (a value every template lexes with)
+std::string bind_placeholders(std::string t) {
+    for (std::size_t p = 0; (p = t.find("{{", p)) != std::string::npos;) {
+        auto e = t.find("}}", p); if (e == std::string::npos) break;
+        auto key = t.substr(p + 2, e - p - 2); auto bar = key.find('|');
+        std::string v = bar == std::string::npos ? "1" : key.substr(bar + 1);
+        t.replace(p, e - p + 2, v); p += v.size();
+    }
+    return t;
+}
+std::string slurp(const std::filesystem::path& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()}; }
+}
+
+TEST(blueprint_binary_form_round_trips) {
+    namespace fs = std::filesystem;
+    std::vector<std::pair<std::string, std::string>> texts;   // (label, blueprint text)
+    for (auto& e : fs::directory_iterator(import::template_dir())) if (e.path().extension() == ".fbp") texts.emplace_back("template " + e.path().filename().string(), bind_placeholders(slurp(e.path())));
+    for (auto& e : fs::directory_iterator(fs::path(FORGE_SOURCE_DIR) / "fuzz" / "corpus" / "blueprint")) if (e.path().extension() == ".fbp") texts.emplace_back("fuzz seed " + e.path().filename().string(), slurp(e.path()));
+    CHECK(texts.size() >= 16 + 5);
+    std::size_t parsed = 0, text_bytes = 0, bin_bytes = 0;
+    for (auto& [label, text] : texts) {
+        auto canon = modelfile::canonical_blueprint_text(text);
+        auto bin = modelfile::encode_blueprint(text);
+        modelfile::binary_blueprint_info bi;
+        auto toks = modelfile::decode_blueprint(bin, &bi);
+        auto back = modelfile::canonical_blueprint_text(toks);
+        CHECK_MSG(back == canon, "%s: text -> binary -> text is not byte-identical after canonical formatting", label.c_str());
+        CHECK_MSG(modelfile::canonical_blueprint_text(canon) == canon, "%s: the canonical text is not a fixed point", label.c_str());
+        CHECK_MSG(modelfile::encode_blueprint(back) == bin, "%s: binary -> text -> binary changed the bytes", label.c_str());
+        CHECK_MSG(modelfile::blueprint_text(std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size())) == canon, "%s: blueprint_text", label.c_str());
+        // token for token: kinds, names, values
+        auto lexed = modelfile::bp_lex(text); lexed.pop_back();
+        bool same = lexed.size() == toks.size();
+        for (std::size_t i = 0; same && i < toks.size(); ++i)
+            same = lexed[i].kind == toks[i].kind && (lexed[i].kind == modelfile::bp_token::k_num ? lexed[i].num == toks[i].num : lexed[i].text == toks[i].text);
+        CHECK_MSG(same, "%s: the decoded tokens differ from the lexed ones", label.c_str());
+        text_bytes += canon.size(); bin_bytes += bin.size();
+        // where the text parses, the binary form parses to the same blueprint
+        try {
+            auto a = modelfile::parse_blueprint(text);
+            auto b = modelfile::load_blueprint(std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
+            ++parsed;
+            bool eq = a.name == b.name && a.opset == b.opset && a.params == b.params && a.str_params == b.str_params && a.session == b.session && a.states.size() == b.states.size() &&
+                      a.inputs.size() == b.inputs.size() && a.outputs.size() == b.outputs.size() && a.composites.size() == b.composites.size() &&
+                      a.graph_end - a.graph_begin == b.graph_end - b.graph_begin && bi.name == a.name && int(bi.opset) == a.opset && bi.session == a.session;
+            for (std::size_t i = 0; eq && i < a.inputs.size(); ++i) eq = a.inputs[i].name == b.inputs[i].name && a.inputs[i].dims == b.inputs[i].dims && a.inputs[i].dtype == b.inputs[i].dtype;
+            for (std::size_t i = 0; eq && i < a.states.size(); ++i) eq = a.states[i].name == b.states[i].name && a.states[i].count == b.states[i].count && a.states[i].kind == b.states[i].kind && a.states[i].args == b.states[i].args;
+            CHECK_MSG(eq, "%s: the binary form parses to another blueprint", label.c_str());
+        } catch (const forge_exception&) {}   // a template bound with placeholder 1s need not be a valid blueprint; the token round trip above still holds
+    }
+    CHECK(parsed >= 16);
+    std::printf("  %zu blueprints (%zu parse), canonical text %zu bytes, binary %zu bytes (%.0f%%)\n", texts.size(), parsed, text_bytes, bin_bytes, 100.0 * double(bin_bytes) / double(text_bytes));
+
+    // numbers keep their value, not their spelling; comments and layout go
+    {
+        auto t = "blueprint \"n\" opset 1 # a comment\nparams { a: 1e-5  b: 0.00001 c: 128256 d: 1.5e300 e: .5 f: 9007199254740993 }\ninput x : f32[seq]\ngraph { y = scale(x, alpha: a) // tail\n }\noutput y : f32[seq]\n";
+        auto bin = modelfile::encode_blueprint(t);
+        auto txt = modelfile::blueprint_text(std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
+        CHECK(txt.find("comment") == std::string::npos && txt.find("tail") == std::string::npos);
+        auto a = modelfile::parse_blueprint(t), b = modelfile::parse_blueprint(txt);
+        CHECK(a.params == b.params && b.param("a") == 1e-5 && b.param("b") == 0.00001 && b.param("c") == 128256 && b.param("d") == 1.5e300 && b.param("e") == 0.5 && b.param("f") == 9007199254740993.0);
+        CHECK(txt.find("a: 1e-05") != std::string::npos && txt.find("c: 128256") != std::string::npos && txt.find("e: 0.5") != std::string::npos);
+        std::printf("%s", txt.c_str());
+    }
+    // tokens that would fuse if printed carelessly
+    for (const char* t : {"a . . b", "x = 1 . y", "x = a / / b", "x = a . 5", "x = 0 .. n", "x = 0.5 .. n", "x = a .. . b", "x = 1 e5", "x = a - 1 - - 2", "f ( ) [ ] { }", "\"s\" \"t\" \"\"", "x = .. 8 .. .. 9"}) {
+        auto lexed = modelfile::bp_lex(t); lexed.pop_back();
+        auto back = modelfile::bp_lex(modelfile::canonical_blueprint_text(lexed)); back.pop_back();
+        bool same = lexed.size() == back.size();
+        for (std::size_t i = 0; same && i < lexed.size(); ++i) same = lexed[i].kind == back[i].kind && lexed[i].text == back[i].text && lexed[i].num == back[i].num;
+        CHECK_MSG(same, "'%s' does not survive canonical formatting", t);
+        auto bin = modelfile::encode_blueprint(t);
+        CHECK(modelfile::encode_blueprint(modelfile::canonical_blueprint_text(modelfile::decode_blueprint(bin))) == bin);
+    }
+
+    // the decoder refuses everything that is not the canonical encoding
+    auto good = modelfile::encode_blueprint("blueprint \"d\" opset 3\nparams { n: 2 eps: 0.5 }\ninput x : f32[seq]\ngraph { y = relu(x) z = relu(y) }\noutput z : f32[seq]\nsession embedding\n");
+    CHECK(modelfile::decode_blueprint(good).size() > 20);
+    // what a reader from before the binary form does with it: the text parser refuses it (a clean parse error)
+    { bool pe = false; try { (void)modelfile::parse_blueprint(std::string_view(reinterpret_cast<const char*>(good.data()), good.size())); } catch (const forge_exception& e) { pe = e.code == errc::parse_error; } CHECK(pe); }
+    for (std::size_t cut = 0; cut < good.size(); ++cut) { auto b = good; b.resize(cut); CHECK_THROWS(modelfile::decode_blueprint(b)); }   // every truncation
+    { auto b = good; b.push_back(0); CHECK_THROWS(modelfile::decode_blueprint(b)); }                                                         // trailing bytes
+    { auto b = good; b[8] = 2; CHECK_THROWS(modelfile::decode_blueprint(b)); }                                                               // another version
+    { auto b = good; b[12] = 1; CHECK_THROWS(modelfile::decode_blueprint(b)); }                                                              // header opset != the tokens' opset
+    std::size_t rejected = 0, accepted_same = 0;
+    for (std::size_t i = 8; i < good.size(); ++i) for (int bit = 0; bit < 8; ++bit) {
+        auto b = good; b[i] ^= std::uint8_t(1u << bit);
+        try {
+            auto toks = modelfile::decode_blueprint(b);
+            // a flip the decoder accepts is another valid canonical encoding (a changed name or number): it must still round-trip
+            if (modelfile::encode_blueprint(modelfile::canonical_blueprint_text(toks)) == b) ++accepted_same; else CHECK_MSG(false, "byte %zu bit %d: accepted but not canonical", i, bit);
+        } catch (const forge_exception&) { ++rejected; }
+    }
+    std::printf("  bit flips: %zu rejected, %zu accepted as another canonical blueprint\n", rejected, accepted_same);
+    CHECK(rejected > 100);
+
+    // a model file with a binary blueprint: same logits, same state; converting back gives the canonical text
+    auto src = forge_test::make_tiny_model(tmp("bb_src.fpk")), bin = tmp("bb_bin.fpk"), txt = tmp("bb_txt.fpk");
+    CHECK(modelfile::convert_blueprint_section(src, bin, true) && !modelfile::convert_blueprint_section(bin, bin, true));
+    {
+        modelfile::reader rb(bin), rs(src);
+        CHECK(modelfile::is_binary_blueprint(rb.section_text("blueprint")) && rb.verify().empty() && rb.manifest().str_or("blueprint_form", "") == "binary" && rb.manifest().num_or("forge_format_minor", 0) == 2);
+        CHECK(rb.section_text("blueprint").size() < rs.section_text("blueprint").size());
+        for (auto& [n, e] : rs.tensors()) CHECK(rb.entry(n).blake3 == e.blake3);
+        inference::session a(src), b(bin);
+        CHECK(a.forward(std::vector<int>{1, 2, 3}) == b.forward(std::vector<int>{1, 2, 3}));
+        CHECK(*a.shared_model()->state_schema() == *b.shared_model()->state_schema());
+    }
+    CHECK(modelfile::convert_blueprint_section(bin, txt, false));
+    {
+        modelfile::reader rt(txt), rs(src);
+        CHECK(!modelfile::is_binary_blueprint(rt.section_text("blueprint")) && rt.section_text("blueprint") == modelfile::canonical_blueprint_text(rs.section_text("blueprint")) && rt.manifest().str_or("blueprint_form", "") == "text");
+        inference::session a(src), c(txt); CHECK(a.forward(std::vector<int>{4, 5}) == c.forward(std::vector<int>{4, 5}));
+    }
+    {   // a hostile binary section fails at open with a format error, not in the parser
+        auto m = read_sections(bin); auto& b = sec(m, "blueprint"); b[b.size() / 2] ^= 0x55; b.push_back('\0');
+        modelfile::detail::write_sections(txt, m);
+        CHECK_THROWS(inference::model(txt));
+    }
+}
+
 // Tensor alignment: 64 (default of the writers), 4096, 65536; recorded in the manifest; kept by every tool that
 // rewrites the container (sign, encrypt, aot).
 TEST(fpk_tensor_alignment) {

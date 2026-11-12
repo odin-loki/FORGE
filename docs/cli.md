@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `adapter`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `adapter`, `blueprint`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -34,7 +34,12 @@ Converts a model to `.fpk`.
 
 `forge import` prints the licence it recorded (`license   apache-2.0`, or `(none found in the source)`); see [modelfile.md](modelfile.md#what-an-import-checks-and-records). The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
 
-### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license] [--state]`
+### `forge blueprint <model.fpk> --to binary|text [-o out.fpk]` / `forge blueprint <file> --to binary|text|canonical -o <out>`
+Stores a model's blueprint in the binary form, or back as text ([format.md](format.md#binary-blueprint)). Without `-o` the model file is rewritten in place. A signature and precompiled plans are dropped. Given a bare blueprint file (`.fbp` text or `.fbpb` binary) it converts that file to `-o`; `canonical` is the fixed-layout text without comments.
+
+### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint [text|binary|canonical] [-o FILE]] [--license] [--state]`
+`--blueprint` (or `--blueprint text`) prints the blueprint as text: the stored text, or the canonical text of a binary section. `--blueprint binary` prints a summary of the binary form (version, size against the text, opset, name, session, the names it calls) and with `-o FILE` writes its bytes; `--blueprint canonical` prints the fixed-layout text.
+
 Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprint summary (with a note when its opset is outside the range this build runs) and a `license` line: the licence recorded at import, or `(not recorded)`. `--license` also prints the stored licence text. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
 It also prints the tensor alignment and how many tensors comply, the state slots the file declares (`--state` lists them), every embedded adapter (name, rank, alpha, number of target weights), a summary of the calibration section, and for an encrypted file the scheme, the key id and whether a key was accepted.
 
