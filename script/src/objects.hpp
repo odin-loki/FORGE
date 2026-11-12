@@ -119,6 +119,18 @@ struct Class final : Obj {
     bool is_struct = false, is_dynamic = false, is_interface = false;
     std::vector<std::string> required;                // interface: method names
     std::shared_ptr<const ClassMeta> meta;            // fields' types, const, access, attributes (reflection)
+    std::unordered_map<std::string, char> field_conv; // members declared double ('f') or int ('i'): a store converts, as C++ does
+    // The value a store into member `n` leaves there: `double w; p.w = 3;` holds 3.0, `int k; p.k = 2.9;` holds 2.
+    void convert_member(const std::string& n, Value& v) const {
+        for (const Class* c = this; c; c = c->base.get()) {
+            if (c->field_conv.empty()) continue;
+            auto it = c->field_conv.find(n);
+            if (it == c->field_conv.end()) continue;
+            if (it->second == 'f') { if (auto* i = std::get_if<std::int64_t>(&v)) v = double(*i); }
+            else if (auto* d = std::get_if<double>(&v); d && *d == *d && *d > -9.2e18 && *d < 9.2e18) v = std::int64_t(*d);
+            return;
+        }
+    }
     Class() { Heap::instance().track(*this); }
     ~Class() override { Heap::instance().untrack(*this); }
     const char* type_name() const override { return is_interface ? "interface" : "class"; }

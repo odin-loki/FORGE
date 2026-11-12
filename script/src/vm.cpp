@@ -65,6 +65,7 @@ private:
         switch (n.k) {
         case NK::ExprStmt: emit(Opc::Line, n.line); expr(*n.kids[0]); emit(Opc::Pop); return;
         case NK::Let:
+            if (n.ref) { exec_node(n); return; }   // reference binding (Interp::store alias): tree-walker
             emit(Opc::Line, n.line);
             if (n.kids.empty()) emit(Opc::Nil); else expr(*n.kids[0]);
             if (n.type) emit(Opc::CheckType, node(keep(n)));

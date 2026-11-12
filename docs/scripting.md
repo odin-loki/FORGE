@@ -61,8 +61,9 @@ Supported:
 - A variable keeps its declared arithmetic type: storing into an `int`, `double`, `bool` or `char` variable (`=`,
   compound assignment, `++`/`--`) and returning from a function declared with one converts as C++ does
   (`double x = 7; x = 1;` leaves `1.0`, `int i; i = 2.9;` leaves `2`, `int f() { return 2.7; }` returns `2`). The
-  conversion is added by the parser for named variables and return values; it is not applied to struct members,
-  container elements or values that reach a variable through a reference (see *Differences from C++*).
+  conversion is added by the parser for named variables and return values, and by the runtime for `double` and
+  `int` data members of a class (`p.w = 3;` leaves `3.0`); it is not applied to container elements (see
+  *Differences from C++*).
 - `char` is a character and a small integer: `'a' + 1` is `98`, `c - '0'` is the digit, `char n = c + 1;` and
   `static_cast<char>(...)` convert back, `s[i]`, `s.at(i)`, `s.front()`, `*it` and `for (char c : s)` yield chars.
   `const char*` is accepted as a string type.
@@ -143,15 +144,21 @@ Accepted but different, or failing at run time with an `AttributeError` / `TypeE
 - Integers are 64-bit and checked: overflow raises `OverflowError`, unsigned types do not wrap, `int` does not
   truncate to 32 bits.
 - Types are checked dynamically. The parser converts on stores into named `int` / `double` / `bool` / `char`
-  variables and on returns; a `double` struct member or `std::vector<double>` element initialised or assigned from
-  an `int` keeps the `int` (`p.w = 3; p.w / 2` is `1`). Write `3.0`.
+  variables and on returns, and a store into a `double` or `int` data member converts as C++ does (`p.w = 3;
+  p.w / 2` is `1.5`, also from a constructor's initialiser list and from aggregate initialisation). A
+  `std::vector<double>` element (or a map value, a pair member) initialised or assigned from an `int` keeps the
+  `int` (`v[0] = 3; v[0] / 2` is `1`). Write `3.0`.
 - Functions and constructors are not overloaded on parameter types. Constructors may differ in argument count;
   a user-defined copy constructor replaces a one-argument constructor (copying is member-wise, done by the
   runtime). Other overloads (a unary and a binary `operator-` in one class, const / non-const pairs that differ in
-  behaviour) are not distinguished: the last one wins. User `operator++`/`--`, `operator[]`, conversion operators
-  and delegating constructors (`T() : T(0) {}`) are not supported; `<=>` works only as `= default`.
-- A base class with constructors of several argument counts cannot be initialised from a derived constructor's
-  initialiser list, and a vector member cannot be initialised as `rows(n, value)` there (build it in the body).
+  behaviour) are not distinguished: the last one wins. User `operator++`/`--`, `operator[]` and conversion
+  operators are not supported; `<=>` works only as `= default`. Constructors are chosen by argument count, so a
+  delegating constructor (`T() : T(0) {}`) and a base initialiser (`D() : B(1, 2) {}`) name the constructor of that
+  arity; a constructor without a base initialiser runs the base's default constructor first.
+- Member initialisers follow the member's declared type when it is a vector or string built from two arguments
+  (`cells(n, 0)`), a class member (`pos(1, 2)`, `origin()`), or empty (`count()` value-initialises). A
+  one-argument initialiser is a copy of its argument (`v(n)` does not build `n` elements, and a class member is not
+  constructed from one argument of another type): write those in the constructor body.
 - Templates are type-erased: `T x{};` has no value, and a template cannot be specialised.
 - A moved-from variable cannot be read at all (`BorrowError`), not even compared with `nullptr`.
 - `std::optional<int>` holding a value is the value: `o.reset()` and `o.emplace(x)` work on a named variable only
@@ -160,8 +167,17 @@ Accepted but different, or failing at run time with an `AttributeError` / `TypeE
   map keys other than numbers, bools and strings (no `std::pair` keys), `std::span::subspan`/`first`/`last` and
   writing through a span, `std::string_view::remove_prefix`/`remove_suffix`, `std::sort` on a string,
   `std::stoi` with a base, `reserve`/`capacity` on strings, nested brace elision for `std::array<std::array>`.
-- Structured bindings by reference (`auto& [a, b] = s;`) copy scalar members. A reference to an object with a
-  destructor (`Base& b = d;`) can run that destructor twice at scope exit (known bug).
+- References. `T& r = x;` and `const T& r = x;` where `x` is a variable of the same function (or, at file scope,
+  a global) make `r` another name for `x`: reads, writes and assignment go to the one variable, scalars included,
+  and nothing is copied or destroyed when `r` leaves scope. A reference to anything else (a member, an element,
+  `v.back()`, a global from inside a function, a variable captured from an enclosing function) shares the object:
+  member updates and calls through it reach the original and no destructor runs for the reference, but the
+  reference cannot be assigned through (`r = v;`, `r += v;`, `++r` are syntax errors that say so, because they
+  would only rebind the name), and a reference to an `int` / `double` / `bool` member or element is a snapshot of
+  its value. Structured bindings by reference (`auto& [a, b] = s;`) share object members and copy scalar ones.
+- A lambda stored in a local variable and capturing by reference forms a cycle with the function's variables: the
+  destructors of that function's own locals then do not run at its closing brace, only when the cycle collector
+  reclaims them (which may be never before the program ends). Locals of a nested block are not affected.
 - The order in which a container destroys its elements is forward (libc++ and libstdc++ destroy a vector in
   reverse).
 - `throw "text";` throws a string: `catch (const char*)` and `catch (const std::string&)` both match it.

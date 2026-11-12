@@ -118,7 +118,7 @@ struct Interp {
     void iter_writeback(Obj& it, const Value& a, const Value* b);
     bool in_finalizers_ = false;
     Value load(const VarRef& v, const Ref<Env>& env);
-    void store(const VarRef& v, const Ref<Env>& env, Value x, bool define = false, bool is_const = false);
+    void store(const VarRef& v, const Ref<Env>& env, Value x, bool define = false, bool is_const = false, bool alias = false);   // alias: a reference binding (no value-type copy)
     static bool truthy(const Value& v) {
         switch (v.index()) { case 0: return false; case 1: return std::get<bool>(v); case 2: return std::get<std::int64_t>(v) != 0; case 3: return std::get<double>(v) != 0.0; }
         return !is_nil(v);

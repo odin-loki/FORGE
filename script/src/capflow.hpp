@@ -470,7 +470,7 @@ private:
             if (unsigned cap = lib_cap(plain(c.kids[0]->s), c.s)) { info.direct.add(cap, bname); info.dotted = true; }
         } else if (c.k == NK::Super) {
             const ClassDecl* k = c.type ? class_named(c.type->name) : nullptr;
-            if (auto* m = lookup(k ? class_named(k->base) : nullptr, c.s)) target.fns.insert(m);
+            if (auto* m = lookup(k ? (c.flag ? k : class_named(k->base)) : nullptr, c.s)) target.fns.insert(m);   // flag: delegating constructor
             else builtin = true;
         } else if (c.k == NK::Field || c.k == NK::OptField) {
             if (!c.kids.empty() && c.kids[0]) recv = go(*c.kids[0]);
