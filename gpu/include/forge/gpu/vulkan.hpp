@@ -559,7 +559,8 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     if (op == "softmax") return !x.empty() && (a.num("axis", -1) == -1 || a.num("axis", -1) == double(x.size()) - 1);
     if (op == "rms_norm") return in.size() == 2 && !x.empty() && in[1].size() == 1 && in[1][0] == x.back();
     if (op == "matmul_t") return in.size() == 2 && x.size() >= 2 && in[1].size() == 2 && in[1][1] == x.back();
-    if (op == "rope") return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0];
+    // The GLSL kernel computes base^(-2j/d) itself: frequency scaling (ops/rope.hpp) runs on the CPU.
+    if (op == "rope") return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0] && !ops::rope_scaled(a);
     if (op == "gather") return in.size() == 2 && x.size() == 2;
     if (op == "slice") return in.size() == 1 && !x.empty() && a.num("step", 1) == 1;
     if (op == "attention") return in.size() == 3 && x.size() == 3 && in[1].size() == 3 && in[2].size() == 3 && in[1][1] > 0 && x[1] % in[1][1] == 0;

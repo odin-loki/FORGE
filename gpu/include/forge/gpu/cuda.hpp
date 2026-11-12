@@ -93,7 +93,7 @@ inline bool supports(const std::string& op, const std::vector<shape_t>& in, cons
     case sig::rows: return !x.empty() && (a.num("axis", -1) == -1 || a.num("axis", -1) == double(x.size()) - 1);
     case sig::rms: return in.size() == 2 && !x.empty() && in[1].size() == 1 && in[1][0] == x.back();
     case sig::matmul: return in.size() == 2 && x.size() >= 2 && in[1].size() == 2 && in[1][1] == x.back();
-    case sig::rope: return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0];
+    case sig::rope: return in.size() == 2 && x.size() == 3 && x[2] % 2 == 0 && numel(in[1]) == x[0] && !ops::rope_dynamic(a);   // dynamic NTK: CPU
     case sig::gather: return in.size() == 2 && x.size() == 2;
     case sig::slice: return in.size() == 1 && !x.empty() && a.num("step", 1) == 1;
     case sig::attention: return in.size() == 3 && x.size() == 3 && in[1].size() == 3 && in[2].size() == 3 && in[1][1] > 0 && x[1] % in[1][1] == 0;
@@ -135,8 +135,8 @@ inline launch_args kernel_args(const std::string& op, const std::vector<tensor_v
         L.threads = rows * cols; U(rows); U(cols); U(k); break; }
     case sig::rope: {
         std::uint32_t rows = std::uint32_t(x.shape[0]), cols = std::uint32_t(x.shape[1]), k = std::uint32_t(x.shape[2]);
-        double base = a.num("base", 10000.0); L.rope_inv.resize(k / 2);
-        for (std::uint32_t j = 0; j < k / 2; ++j) L.rope_inv[j] = float(std::pow(base, -2.0 * double(j) / double(k)));
+        const auto inv = ops::rope_inv_freq(a, i64(k)); L.rope_inv.resize(k / 2);   // scaling variants included (ops/rope.hpp)
+        for (std::uint32_t j = 0; j < k / 2; ++j) L.rope_inv[j] = float(inv[j]);
         L.threads = rows * cols * (k / 2); U(rows); U(cols); U(k); U(a.num("neox", 1) != 0); break; }
     case sig::gather: U(n); U(std::uint32_t(x.shape[0])); U(std::uint32_t(x.shape[1])); break;
     case sig::slice: {
@@ -908,8 +908,8 @@ public:
             k = std::uint32_t(x.shape.back()); rows = std::uint32_t(x.size()) / k; cols = std::uint32_t(in[1].shape[0]); threads = rows * cols; break;
         case sig::rope: {
             rows = std::uint32_t(x.shape[0]); cols = std::uint32_t(x.shape[1]); k = std::uint32_t(x.shape[2]); u4 = a.num("neox", 1) != 0;
-            double base = a.num("base", 10000.0); extra.resize(k / 2);
-            for (std::uint32_t j = 0; j < k / 2; ++j) extra[j] = float(std::pow(base, -2.0 * double(j) / double(k)));
+            const auto inv = ops::rope_inv_freq(a, i64(k)); extra.resize(k / 2);   // scaling variants included (ops/rope.hpp)
+            for (std::uint32_t j = 0; j < k / 2; ++j) extra[j] = float(inv[j]);
             threads = rows * cols * (k / 2); break; }
         case sig::gather: rows = std::uint32_t(x.shape[0]); cols = std::uint32_t(x.shape[1]); break;
         case sig::slice: {
@@ -1076,8 +1076,9 @@ public:
             unsigned block = 256;
             std::uint32_t mode = rms_mode(std::uint32_t(s * H), std::uint32_t(d), &block);
             if (block != 256) return false;
-            std::vector<float> invf(std::size_t(d / 2)); const double base = a.num("base", 10000.0);
-            for (std::size_t j = 0; j < invf.size(); ++j) invf[j] = float(std::pow(base, -2.0 * double(j) / double(d)));   // as run_op's rope
+            if (ops::rope_dynamic(a)) return false;   // the table depends on the positions: the rope step runs on the CPU
+            std::vector<float> invf(std::size_t(d / 2)); const auto inv64 = ops::rope_inv_freq(a, d);
+            for (std::size_t j = 0; j < invf.size(); ++j) invf[j] = float(inv64[j]);   // as run_op's rope
             auto& tb = rope_[invf];
             if (!tb) { tb = dmalloc(invf.size() * 4, "scratch"); ck(htod_s(tb, invf.data(), invf.size() * 4, stream_), "memcpy HtoD"); }
             std::uint64_t tbl = tb;

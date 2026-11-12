@@ -20,6 +20,8 @@ Nothing links against a vendor SDK. Each runtime `dlopen`s its driver library at
 
 The 33 spec kernels are: 18 unary (`neg abs sqrt rsqrt recip square exp exp2 log log2 sin cos tanh sigmoid silu relu softplus gelu_tanh`), 6 binary (`add sub mul div maximum minimum`) and `scale softmax rms_norm matmul_t silu_mul rope gather attention slice`. CUDA, HIP, OpenCL, Level Zero and Metal have no `sin`/`cos`, so they register **31** lowerings. [reference.md](reference.md) marks which ops have a GPU kernel.
 
+`rope` with frequency scaling (`scaling`, `freq_factors`; `ops/include/forge/ops/rope.hpp`): the CUDA, HIP, OpenCL, Level Zero and Metal kernels read the inverse frequencies from a table the host builds, so they run every variant unchanged except dynamic NTK, whose table depends on the positions of each call and runs on the CPU. The Vulkan kernel computes `base^(-2j/d)` itself and hands any scaled `rope` to the CPU. The mock drivers cover the CUDA, HIP, OpenCL and Level Zero paths; the Metal and Vulkan paths for scaled `rope` have not been run.
+
 `kernels.cu` also holds CUDA/HIP-only kernels that the runtime picks itself: see [CUDA and HIP](#cuda-and-hip).
 
 ### Backends

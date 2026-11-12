@@ -55,7 +55,7 @@ Every op has a float64 scalar reference that each lowering is tested against.
 | `gather` | data_movement | 2 | gather | exact | no |  | yes | rows of table[n, d] selected by idx[...] -> [..., d] (embedding lookup) |
 | `concat` | data_movement | 2 | concat | exact | no | axis |  | concatenate along axis |
 | `slice` | data_movement | 1 | slice | exact | no | axis,start,end | yes | x[start:end] along axis |
-| `rope` | data_movement | 2 | same | abs:1e-5 | no | base,neox | yes | rotary embedding of x[s, h, d] at positions pos[s] |
+| `rope` | data_movement | 2 | same | abs:1e-5 | no | base,neox,scaling,factor,orig_ctx,low_freq,high_freq,beta_fast,beta_slow,truncate,freq_factors | yes | rotary embedding of x[s, h, d] at positions pos[s]; scaling 0 none, 1 linear, 2 dynamic NTK, 3 YaRN, 4 llama3 (forge/ops/rope.hpp) |
 | `silu_mul` | elementwise | 2 | broadcast | abs:1e-5 | yes |  | yes | silu(a) * b (fused SwiGLU gate) |
 | `expand` | data_movement | 1 | expand | exact | no | axis,n |  | repeat a size-1 axis n times (broadcast_to along one axis) |
 | `reduce_sum` | reduction | 1 | reduce | rel:1e-5 | no | axis |  | sum over axis (keepdims=false) |
