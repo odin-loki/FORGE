@@ -63,6 +63,7 @@ inline bool kernel_sig(const std::string& op, sig& s) {
         std::map<std::string, sig> r;
         for (auto n : {"neg", "abs", "sqrt", "rsqrt", "recip", "square", "exp", "exp2", "log", "log2", "tanh", "sigmoid",
                        "silu", "relu", "softplus", "gelu_tanh"}) r[n] = sig::unary;
+        for (auto n : {"quick_gelu", "mish", "hard_swish"}) r[n] = sig::unary;   // ops/defs/sequence.fspec
         for (auto n : {"add", "sub", "mul", "div", "maximum", "minimum", "silu_mul"}) r[n] = sig::binary;
         r["scale"] = sig::scale; r["softmax"] = sig::rows; r["rms_norm"] = sig::rms; r["matmul_t"] = sig::matmul;
         r["rope"] = sig::rope; r["gather"] = sig::gather; r["slice"] = sig::slice; r["attention"] = sig::attention;

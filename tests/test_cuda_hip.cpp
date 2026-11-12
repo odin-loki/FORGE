@@ -20,7 +20,7 @@ namespace cuda_hip = forge::gpu::cuda_hip;
 
 static const char* kernel_ops[] = {"neg", "abs", "sqrt", "rsqrt", "recip", "square", "exp", "exp2", "log", "log2", "tanh", "sigmoid",
     "silu", "relu", "softplus", "gelu_tanh", "add", "sub", "mul", "div", "maximum", "minimum", "silu_mul", "scale", "softmax",
-    "rms_norm", "matmul_t", "rope", "gather", "slice", "attention", "qmatmul_t"};
+    "rms_norm", "matmul_t", "rope", "gather", "slice", "attention", "qmatmul_t", "quick_gelu", "mish", "hard_swish"};
 
 static bool has(std::string_view hay, const std::string& needle) { return hay.find(needle) != std::string_view::npos; }
 
