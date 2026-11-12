@@ -3,7 +3,7 @@
 ## Concepts
 `forge-serve` (`apps/forge_serve.cpp`) serves one generative model over HTTP with an OpenAI-style API. All requests go through one continuous-batching scheduler (`inference::batch_scheduler`, see [inference.md](inference.md)), which reuses KV rows for prompts that share a prefix with a recent request.
 
-- The model argument may be an `.fpk`, a Hugging Face directory or a `.gguf`. The last two are imported into `<tmp>/<name>.serve.fpk` at startup, using `--codec` (default `f32`).
+- The model argument may be an `.fpk`, a Hugging Face directory or a `.gguf`. The last two are imported into `<tmp>/<name>.serve.fpk` at startup, using `--codec` (default `f32`; a GGUF or an AWQ / GPTQ checkpoint keeps its stored quantisation unless `--codec` is given).
 - Models whose session kind is not `generative_sequence` are refused.
 - One thread per connection; every response closes the connection (`Connection: close`).
 - `forge-serve proxy ...` runs the same binary as a load-balancing proxy: see [loadbalancer.md](loadbalancer.md).

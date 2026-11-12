@@ -196,6 +196,9 @@ inline error unsupported(std::string_view what) { return {unsupported_code, std:
 inline bool is_unsupported(const error& e) { return e.code == unsupported_code; }
 
 // ---------------------------------------------------------------- platform identity
+#ifdef linux   // GNU dialects (-std=gnu++23, the CMake default for a consumer) predefine the legacy macro "linux"
+#undef linux
+#endif
 enum class platform { windows, linux, android, macos, ios, freebsd, other };
 constexpr platform current() {
 #if defined(FORGE_OS_WINDOWS)
