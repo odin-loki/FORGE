@@ -52,7 +52,20 @@ Value WeakRef::get() const {
     return Value(std::move(r));
 }
 
-namespace { constexpr std::uint64_t kChunk = 1ull << 20; thread_local bool t_grace = false; }
+namespace {
+constexpr std::uint64_t kChunk = 1ull << 20;
+// After a cap fires on this thread it is not enforced again (up to 4 MiB over) until the heap is back at least
+// kRearm below it, so the handler and the error path can allocate. Without the margin, a heap that unwinding left
+// a few bytes under the cap would re-arm at once and fail the handler's first allocation.
+constexpr std::uint64_t kRearm = 16ull << 10;
+thread_local bool t_grace = false;
+thread_local int t_exempt = 0;
+}
+Heap::exempt::exempt() noexcept { ++t_exempt; }
+Heap::exempt::~exempt() { --t_exempt; }
+// A new cap starts armed on the thread that sets it (entering or leaving a limit block, creating an engine).
+void Heap::set_soft_cap(std::uint64_t n) { cap_ = n; t_grace = false; }
+void Heap::set_hard_cap(std::uint64_t n, std::uint64_t shown) { hard_shown_ = shown ? shown : n; hard_ = n; t_grace = false; }
 
 void Heap::grow_lease(std::uint64_t want) {
     std::lock_guard g(lm_);
@@ -67,12 +80,20 @@ void Heap::grow_lease(std::uint64_t want) {
 void Heap::charge(Obj& o, std::size_t n) {
     std::uint64_t now = bytes_.load() + n;
     std::uint64_t cap = cap_.load();
+    const std::uint64_t hard = hard_.load();
+    const bool by_hard = hard && (!cap || hard <= cap);   // --mem-limit is the tighter (or only) cap
+    if (by_hard) cap = hard;
+    if (t_exempt) cap = 0;
     if (cap && now > cap && !t_grace) {
         if (active_tasks.load() == 0 && !collecting_) collect();
         now = bytes_.load() + n;
-        if (now > cap) { t_grace = true; throw heap_exhausted("script heap: limit of " + std::to_string(cap) + " bytes exceeded"); }
+        if (now > cap) {
+            t_grace = true;
+            throw heap_exhausted(by_hard ? "script memory limit of " + std::to_string(hard_shown_.load()) + " bytes exceeded (--mem-limit)"
+                                         : "script heap: limit of " + std::to_string(cap) + " bytes exceeded");
+        }
     }
-    if (cap && now < cap) t_grace = false;
+    if (cap && now + kRearm < cap) t_grace = false;
     if (cap && t_grace && now > cap + (4ull << 20)) throw heap_exhausted("script heap: limit exceeded while handling OutOfMemoryError");
     try { grow_lease(now); }
     catch (const heap_exhausted&) {

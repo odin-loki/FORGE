@@ -16,7 +16,7 @@ CMake target `forge_c` builds the shared library from `inference/capi/forge_c.cp
 | Function | ABI | Purpose |
 |---|---|---|
 | `forge_abi_version()`, `forge_version()`, `forge_last_error()` | 1 | Version (`forge_version` returns `"0.1.0"`) and last error |
-| `forge_open(path, context, verify_hashes)` | 1 | Open a `.fpk`. `context` 0 = the model's maximum. Returns `NULL` on error |
+| `forge_open(path, context, verify_hashes)` | 1 | Open a `.fpk`, or a model compiled to a shared library by `forge aot --aot-mode native` ([aot-models.md](aot-models.md)). `context` 0 = the model's maximum. Returns `NULL` on error |
 | `forge_close(m)` | 1 | Free the handle |
 | `forge_reset(m)` | 1 | Clear the KV state (position 0) |
 | `forge_vocab_size(m)` | 1 | Vocabulary size |
