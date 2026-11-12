@@ -1220,6 +1220,20 @@ if(FORGE_BUILD_TESTS)
     set_tests_properties(test_gpu_features_hip_mock PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockhip;MOCK_DEVICES=2" LABELS gpu SKIP_RETURN_CODE 77)
     # Device memory pools: allocation accounting, LRU eviction under a small budget, driver out-of-memory retry.
     foreach(m cuda hip opencl ze)
+      if(NOT m STREQUAL "cuda" AND NOT m STREQUAL "hip")   # kernel program cache (gpu/kernel_cache.hpp)
+        add_test(NAME test_gpu_kernel_cache_${m}_mock COMMAND test_cuda_hip cache ${m})
+        set_tests_properties(test_gpu_kernel_cache_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+          ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};MOCK_DEVICES=1;FORGE_ZE_TEST_IMAGE=opencl-c")
+      endif()
+      add_test(NAME test_gpu_stale_${m}_mock COMMAND test_cuda_hip stale ${m})   # dead plans leave no device copies / pins
+      set_tests_properties(test_gpu_stale_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+        ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};FORGE_ZE_TEST_IMAGE=opencl-c")
+      add_test(NAME test_gpu_select_${m}_mock COMMAND test_cuda_hip select ${m})   # FORGE_DEVICE=auto (gpu/select.hpp)
+      set_tests_properties(test_gpu_select_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+        ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};MOCK_DEVICES=2;FORGE_ZE_TEST_IMAGE=opencl-c")
+      add_test(NAME test_gpu_determinism_${m}_mock COMMAND test_cuda_hip determinism ${m})   # gpu/determinism.hpp
+      set_tests_properties(test_gpu_determinism_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
+        ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};FORGE_ZE_TEST_IMAGE=opencl-c")
       add_test(NAME test_gpu_memory_${m}_mock COMMAND test_cuda_hip memory ${m})
       set_tests_properties(test_gpu_memory_${m}_mock PROPERTIES LABELS gpu SKIP_RETURN_CODE 77
         ENVIRONMENT "LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m};FORGE_ZE_TEST_IMAGE=opencl-c")
@@ -1237,6 +1251,17 @@ if(FORGE_BUILD_TESTS)
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_zemock)
       set_tests_properties(golden_tiny_llama_ze_mock PROPERTIES LABELS gpu
         ENVIRONMENT "FORGE_DEVICE=level_zero;FORGE_ZE_TEST_IMAGE=opencl-c;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mockze")
+      # MoE / MLA+MoE goldens with the device mixture-of-experts path (run_moe: forge_moe_hidden / forge_moe_down)
+      foreach(m cuda hip opencl ze)
+        set(_moe_dev ${m})
+        if(m STREQUAL "ze")
+          set(_moe_dev level_zero)
+        endif()
+        add_test(NAME golden_moe_mla_${m}_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_moe.py
+                 --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_moe_${m}mock)
+        set_tests_properties(golden_moe_mla_${m}_mock PROPERTIES LABELS gpu
+          ENVIRONMENT "FORGE_DEVICE=${_moe_dev};FORGE_ZE_TEST_IMAGE=opencl-c;LD_LIBRARY_PATH=${PROJECT_BINARY_DIR}/mock${m}")
+      endforeach()
       add_test(NAME golden_tiny_llama_hip_mock COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/verify/golden/tiny_llama.py
                --forge $<TARGET_FILE:forge> --work ${PROJECT_BINARY_DIR}/golden_hipmock)
       set_tests_properties(golden_tiny_llama_hip_mock PROPERTIES LABELS gpu
@@ -1430,7 +1455,7 @@ if(FORGE_BUILD_TESTS)
     forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
       golden_gguf_types golden_hf_quant
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
-      golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock doc_example_inference_generate doc_example_capi_generate
+      golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
       capi_smoke python_bindings serve_http security_cli modelfile_signing)
     forge_py_needs("cryptography" modelfile_signing)
     forge_py_needs("numpy;onnx" onnx_import)

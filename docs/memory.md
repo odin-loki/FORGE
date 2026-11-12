@@ -55,7 +55,7 @@ The detected limit is the smallest of physical RAM, the tightest cgroup limit fo
 | Text library, mobile queues | Collators and encoder tables lease from `host` (tag `text`); mobile event queues allocate through `budget_resource` (tag `mobile`) |
 
 ## GPU memory
-CUDA, HIP, OpenCL, Level Zero and Vulkan charge the pool `<backend>:<ordinal>` (`cuda:0`, `hip:0`, `opencl:0`, `level_zero:0`, `vulkan:0`) for every driver allocation, with one lease per allocation released on free. Tags: `resident` (tensors kept on the device by the residency protocol, and freed buffers that the CUDA/HIP runtime pools for reuse), `weights` (encoded weights for the quantised kernels), `scratch` (per-op temporaries and staging) and `raw` (`device_alloc`).
+CUDA, HIP, OpenCL, Level Zero and Vulkan charge the pool `<backend>:<ordinal>` (`cuda:0`, `hip:0`, `opencl:0`, `level_zero:0`, `vulkan:0`) for every driver allocation, with one lease per allocation released on free. Tags: `resident` (tensors kept on the device by the residency protocol, and freed buffers that the CUDA/HIP runtime pools for reuse), `weights` (encoded weights, and f32 expert weights of the device mixture of experts, for the quantised kernels), `scratch` (per-op temporaries and staging) and `raw` (`device_alloc`).
 
 Each runtime registers its buffers with the pool as a cache. Before an allocation would cross the limit, and when the driver itself reports out of memory, the runtime makes room:
 1. It frees its pooled free buffers (CUDA/HIP).

@@ -5,6 +5,7 @@
 #if __has_include(<vulkan/vulkan.h>) && __has_include(<forge/gpu/spirv.gen.hpp>) && (defined(__linux__) || defined(__APPLE__) || defined(_WIN32))
 #define FORGE_GPU_VULKAN 1
 #define VK_NO_PROTOTYPES
+#include <forge/gpu/select.hpp>
 #include <vulkan/vulkan.h>
 #include <forge/gpu/spirv.gen.hpp>
 #include <forge/core/tensor.hpp>
@@ -60,6 +61,20 @@ public:
         if (lib_) dlclose(lib_);
     }
     const std::string& device_name() const { return name_; }
+    // For automatic device selection (gpu/select.hpp): VkPhysicalDeviceType (CPU = lavapipe / SwiftShader) and the
+    // device-local heap sizes.
+    gpu::device_class device_class() const {
+        VkPhysicalDeviceProperties pr; vkGetPhysicalDeviceProperties(phys_, &pr);
+        if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU || software_name(name_)) return gpu::device_class::software;
+        if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) return gpu::device_class::discrete;
+        if (pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) return gpu::device_class::integrated;
+        return pr.deviceType == VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU ? gpu::device_class::virtual_gpu : gpu::device_class::unknown;
+    }
+    std::uint64_t device_memory_bytes() const {
+        VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(phys_, &mp); std::uint64_t t = 0;
+        for (std::uint32_t i = 0; i < mp.memoryHeapCount; ++i) if (mp.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) t += mp.memoryHeaps[i].size;
+        return t;
+    }
     // On-disk pipeline cache: keyed by vendor/device/driver version, the pipelineCacheUUID and a hash of
     // the embedded SPIR-V, under $FORGE_CACHE_DIR (else $XDG_CACHE_HOME/forge, else ~/.cache/forge).
     // FORGE_VK_PIPELINE_CACHE=0 disables it. Written atomically at destruction.
@@ -180,6 +195,13 @@ public:
             if (!e.host_valid) { std::memcpy(e.host, e.map, e.count * 4); ++stats_.downloads; }
             ks.push_back(reinterpret_cast<std::uintptr_t>(e.host)); });
         for (auto k : ks) { free_entry(res_[k]); res_.erase(k); }
+    }
+    // release() plus the pin records inside the range: for host memory that is going away for good (a plan's constants),
+    // so a later buffer at the same address does not inherit a pin (graph::plan::~plan, device_hooks::forget).
+    void forget(const float* p, std::size_t n) {
+        release(p, n);
+        std::lock_guard lk(mu_);
+        std::erase_if(pinned_, [&](const auto& pr) { return pr.first >= p && pr.first + pr.second <= p + n; });
     }
     // evictions / evicted_bytes: resident buffers dropped to fit the device budget (gpu/device_memory.hpp)
     struct residency_stats { std::size_t uploads = 0, downloads = 0, submits = 0, upload_bytes = 0, resident = 0, resident_bytes = 0, peak_resident_bytes = 0,

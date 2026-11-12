@@ -1,6 +1,7 @@
 #pragma once
 // gpu: graph-first GPU programming model. CPU backend implemented; CUDA/HIP/Level Zero/Vulkan/Metal
 // backends are discovered by dynamic loading and report "absent" when their runtimes are missing.
+#include <forge/gpu/determinism.hpp>
 #include <forge/core/dtypes.hpp>
 #include <forge/core/error.hpp>
 #include <forge/simd/dispatch.hpp>
@@ -33,10 +34,10 @@ template <int N> struct item {
     i64 range(int d) const { return ext[std::size_t(d)]; }
 };
 
-enum class backend_kind { cpu, cuda, hip, level_zero, vulkan, metal };
+enum class backend_kind { cpu, cuda, hip, level_zero, vulkan, metal, opencl };
 inline const char* name(backend_kind k) {
     switch (k) { case backend_kind::cpu: return "cpu"; case backend_kind::cuda: return "cuda"; case backend_kind::hip: return "hip";
-                 case backend_kind::level_zero: return "level_zero"; case backend_kind::vulkan: return "vulkan"; default: return "metal"; }
+                 case backend_kind::level_zero: return "level_zero"; case backend_kind::vulkan: return "vulkan"; case backend_kind::opencl: return "opencl"; default: return "metal"; }
 }
 
 // Normalised capability report.
@@ -61,12 +62,13 @@ inline std::vector<backend_probe> probe_backends() {
     r.push_back({backend_kind::cpu, true, simd::active().target});
     struct lib { backend_kind k; const char* so; };
     for (auto [k, so] : {lib{backend_kind::cuda, FORGE_DLNAME("libcuda.so.1", "nvcuda.dll")}, lib{backend_kind::hip, FORGE_DLNAME("libamdhip64.so", "amdhip64.dll")},
-                         lib{backend_kind::level_zero, FORGE_DLNAME("libze_loader.so.1", "ze_loader.dll")}, lib{backend_kind::vulkan, FORGE_DLNAME("libvulkan.so.1", "vulkan-1.dll")}}) {
+                         lib{backend_kind::level_zero, FORGE_DLNAME("libze_loader.so.1", "ze_loader.dll")}, lib{backend_kind::vulkan, FORGE_DLNAME("libvulkan.so.1", "vulkan-1.dll")},
+                         lib{backend_kind::opencl, FORGE_DLNAME("libOpenCL.so.1", "OpenCL.dll")}}) {
         void* h = dlopen(so, RTLD_LAZY | RTLD_LOCAL);
         r.push_back({k, h != nullptr, h ? std::string("loaded ") + so : std::string("runtime not found: ") + so});
         if (h) dlclose(h);
     }
-    r.push_back({backend_kind::metal, false, "metal backend not built on this platform"});
+    r.insert(r.begin() + 5, {backend_kind::metal, false, "metal backend not built on this platform"});   // order: the enum's
     return r;
 }
 
@@ -101,14 +103,18 @@ public:
     template <class K, class... Args> node_ref launch(K k, extent e, Args... args) {
         return add([k, e, args...] {
             i64 total = e.total();
-            task::parallel_for(std::size_t(total), 4096, [&](std::size_t b, std::size_t en) {
+            auto body = [&](std::size_t b, std::size_t en) {
                 for (std::size_t f = b; f < en; ++f) {
                     item<3> it;
                     i64 x = i64(f) % e.n[0], y = (i64(f) / e.n[0]) % e.n[1], z = i64(f) / (e.n[0] * e.n[1]);
                     it.gid = {x, y, z}; it.ext = e.n; it.lid = it.gid; it.grp = {0, 0, 0};
                     k(it, as_span(args)...);
                 }
-            });
+            };
+            if (deterministic()) {   // fixed chunks of 4096 items, whatever the worker count (gpu/determinism.hpp)
+                const std::size_t n = std::size_t(total), nc = (n + 4095) / 4096;
+                task::parallel_for(nc, 1, [&](std::size_t cb, std::size_t ce) { for (std::size_t c = cb; c < ce; ++c) body(c * 4096, std::min(n, (c + 1) * 4096)); });
+            } else task::parallel_for(std::size_t(total), 4096, body);
         }, "launch");
     }
     node_ref host(std::function<void()> f) { return add(std::move(f), "host"); }
@@ -187,6 +193,9 @@ inline std::vector<device> all() {
     c.score = c.compute_units * c.subgroup_width;
     return {device(c)};
 }
+// The programming model (graph / launch / prims) executes on the CPU, so this is always the CPU device. Model
+// execution picks a real device through graph::device_registry: FORGE_DEVICE=auto scores every device that opens
+// (gpu/select.hpp, graph::auto_device).
 inline device select(prefer = prefer::any) { return all().front(); }
 
 } // namespace forge::gpu

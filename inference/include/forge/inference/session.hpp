@@ -18,6 +18,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <forge/gpu/determinism.hpp>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -30,6 +31,9 @@ struct session_options {
     i64 page_rows = 256;   // KV page size in rows; 0 = reserve the whole context up front
     std::string kv_codec;  // "", "f32", "int8", "fp8", "tbq4", "tbq3", "tbq4p", "tbq3p" (tbq + QJL residual, CPU only) or "k8v4"; empty = $FORGE_KV_CACHE_TYPE, $FORGE_KV_CODEC or f32
     int kv_offload = -1;   // 1 = keep KV on the host, drop device copies after each attention; -1 = $FORGE_KV_OFFLOAD
+    // Determinism mode (gpu/determinism.hpp): 1 = order-stable device paths only (same device + same build -> bit-identical
+    // results), 0 = off, -1 = $FORGE_DETERMINISTIC. Process-wide: it applies to every runtime in the process.
+    int deterministic = -1;
 };
 
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
@@ -116,10 +120,16 @@ public:
     // Returns the device actually used. Clears cached plans.
     std::string set_device(const std::string& dev) {
         std::lock_guard lk(run_mu_);
-        std::string why;
-        reg_ = graph::device_registry(dev, &why);
+        std::string why, use = dev;
+        if (dev == "auto") {   // score every device that opens for this model (gpu/select.hpp)
+            gpu::select_request rq; rq.model_bytes = r_.section_bytes("data").size();
+            for (auto& [nm, e] : r_.tensors()) if (std::find(rq.codecs.begin(), rq.codecs.end(), e.codec) == rq.codecs.end()) rq.codecs.push_back(e.codec);
+            std::string table; use = graph::auto_device(rq, &table);
+            log::info("FORGE_DEVICE=auto -> {}\n{}", use, table);
+        }
+        reg_ = graph::device_registry(use, &why);
         if (!reg_ && !why.empty()) log::warn("{}; using cpu", why);
-        device_ = reg_ ? dev : "cpu";
+        device_ = reg_ ? use : "cpu";
         cache_.clear();
         return device_;
     }
@@ -238,6 +248,7 @@ class session {
 public:
     explicit session(const std::string& fpk_path, session_options o = {}) : session(model::open(fpk_path, o.verify), o) {}
     explicit session(std::shared_ptr<model> m, session_options o = {}) : m_(std::move(m)), opt_(o) {
+        if (o.deterministic >= 0) gpu::set_deterministic(o.deterministic != 0);
         st_.capacity = o.context ? o.context : m_->max_context();
         st_.page_rows = o.page_rows;
         std::string kc = o.kv_codec;

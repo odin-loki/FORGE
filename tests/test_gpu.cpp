@@ -1,5 +1,6 @@
 #include "check.hpp"
 #include <forge/gpu/prims.hpp>
+#include <forge/gpu/select.hpp>
 #include <random>
 
 using namespace forge;
@@ -29,10 +30,58 @@ TEST(graph_first_record_compile_replay) {
 }
 TEST(backend_probe_and_caps) {
     auto pr = gpu::probe_backends();
-    CHECK(pr.size() == 6 && pr[0].available);
+    CHECK(pr.size() == 7 && pr[0].available);
+    for (std::size_t i = 0; i < pr.size(); ++i) CHECK(int(pr[i].kind) == int(i));   // one entry per backend_kind, OpenCL included
     for (auto& p : pr) std::printf("  %-10s %s %s\n", gpu::name(p.kind), p.available ? "yes" : "no ", p.detail.c_str());
     auto d = gpu::select();
     CHECK(d.caps().compute_units >= 1);
+}
+// Automatic device selection (gpu/select.hpp): the scoring rule over synthetic capability records.
+static gpu::device_record rec(const char* dev, const char* backend, gpu::device_class cls, std::uint64_t mem_gb, std::vector<std::string> q = {}, double gflops = 0, int ord = 0) {
+    gpu::device_record r; r.device = dev; r.backend = backend; r.cls = cls; r.memory_bytes = mem_gb << 30; r.qcodecs = std::move(q); r.gflops = gflops; r.ordinal = ord; return r;
+}
+TEST(device_selection_scoring) {
+    using gpu::device_class; using gpu::select_device; using gpu::select_request;
+    const std::vector<std::string> kq{"q8_0", "q4_k", "q5_k", "q6_k"};
+    auto disc = rec("cuda:0", "cuda", device_class::discrete, 24, kq), integ = rec("opencl:0", "opencl", device_class::integrated, 8, kq);
+    auto soft = rec("vulkan", "vulkan", device_class::software, 16), mock = rec("opencl:1", "opencl", device_class::software, 1, kq, 0, 1);
+    select_request rq;
+    CHECK(select_device({}, rq) == "cpu");                                   // nothing but the CPU
+    CHECK(select_device({disc, integ, soft}, rq) == "cuda:0");               // discrete > integrated > cpu
+    CHECK(select_device({integ, soft}, rq) == "opencl:0");
+    // software devices never win over the CPU ...
+    CHECK(select_device({soft, mock}, rq) == "cpu");
+    { auto fast = soft; fast.gflops = 1e6; CHECK(select_device({fast}, rq) == "cpu"); }   // ... whatever they measure
+    // ... unless allowed; then they still have to beat it (prior 0.5 < 4), or be preferred
+    { auto a = rq; a.allow_software = true; CHECK(select_device({soft}, a) == "cpu");
+      a.prefer = {"vulkan"}; CHECK(select_device({soft, mock}, a) == "vulkan"); }
+    // memory: a model that does not fit sends the choice to the next device
+    { auto a = rq; a.model_bytes = std::uint64_t(20) << 30; CHECK(select_device({disc, integ}, a) == "cuda:0");
+      a.model_bytes = std::uint64_t(30) << 30; CHECK(select_device({disc}, a) == "cpu"); }   // 200 * 0.01 < the CPU's 4
+    { auto a = rq; a.model_bytes = std::uint64_t(30) << 30;
+      auto small = rec("cuda:0", "cuda", device_class::discrete, 24, kq), big = rec("cuda:1", "cuda", device_class::discrete, 48, kq, 0, 1);
+      CHECK(select_device({small, big}, a) == "cuda:1"); }
+    // codec coverage: the device with a quantised matmul for the model's codec wins over one of the same class without
+    { auto a = rq; a.codecs = {"q4_k"};
+      auto none = rec("vulkan", "vulkan", device_class::discrete, 24), has = rec("opencl:0", "opencl", device_class::discrete, 24, kq);
+      CHECK(select_device({none, has}, a) == "opencl:0");
+      CHECK(gpu::score(none, a).score < gpu::score(has, a).score); }
+    // exclusion by backend or by device; the CPU cannot be excluded
+    { auto a = rq; a.exclude = {"cuda"}; CHECK(select_device({disc, integ}, a) == "opencl:0");
+      a.exclude = {"cuda", "opencl:0", "cpu"}; CHECK(select_device({disc, integ}, a) == "cpu"); }
+    // preference is a strong override among eligible devices
+    { auto a = rq; a.prefer = {"opencl"}; CHECK(select_device({disc, integ}, a) == "opencl:0"); }
+    // measured throughput is used only when every candidate has one: here it reverses the class priors
+    { auto d = disc, i = integ; d.gflops = 3; i.gflops = 9; auto cpu = rec("cpu", "cpu", device_class::cpu, 0, {}, 5);
+      CHECK(select_device({d, i, cpu}, rq) == "opencl:0");
+      i.gflops = 0; CHECK(select_device({d, i, cpu}, rq) == "cuda:0");   // one unmeasured: back to priors
+      d.gflops = 3; i.gflops = 4; cpu.gflops = 50; CHECK(select_device({d, i, cpu}, rq) == "cpu"); }   // a fast CPU beats slow devices
+    // ties: backend order, then ordinal, not enumeration order
+    { auto a0 = rec("opencl:0", "opencl", device_class::discrete, 8, kq), a1 = rec("opencl:1", "opencl", device_class::discrete, 8, kq, 0, 1), c0 = rec("cuda:0", "cuda", device_class::discrete, 8, kq);
+      CHECK(select_device({a1, a0}, rq) == "opencl:0"); CHECK(select_device({a1, a0, c0}, rq) == "cuda:0"); }
+    CHECK(gpu::software_name("llvmpipe (LLVM 17.0.6, 256 bits)") && gpu::software_name("SwiftShader Device") && gpu::software_name("forge mock cuda 0") && !gpu::software_name("NVIDIA GeForce RTX 3090"));
+    std::string why; select_device({disc, soft}, rq, &why);
+    CHECK(why.find("cuda:0 (discrete") != std::string::npos && why.find("skipped, software device") != std::string::npos);
 }
 TEST(prims_reduce_scan_compact) {
     std::vector<std::int64_t> x(1 << 18); std::mt19937 r(5);
