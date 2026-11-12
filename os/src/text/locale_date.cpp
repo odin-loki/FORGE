@@ -197,7 +197,8 @@ namespace {
 const char* style_name(date_style s) { switch (s) { case date_style::full: return "full"; case date_style::long_: return "long"; case date_style::medium: return "medium"; default: return "short"; } }
 // Applies a -u-hc override to a time pattern.
 std::string apply_hc(std::string p, std::string_view tagstr) {
-    auto hc = parse_tag(tagstr).keyword("hc");
+    const tag t = parse_tag(tagstr);   // keyword() returns a view into the tag: keep it alive (was a view into a temporary)
+    auto hc = t.keyword("hc");
     if (hc.empty()) return p;
     char want = hc == "h11" ? 'K' : hc == "h12" ? 'h' : hc == "h23" ? 'H' : 'k';
     bool twelve = want == 'h' || want == 'K', in_q = false; std::string r;
