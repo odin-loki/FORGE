@@ -125,7 +125,8 @@ VFPv4; the table has Tier A, `seq` and int8 companions (`isa_extra.cpp`).
   0 of 25.5 million type checks failed and 0 of 13.5 million lane results differ from VFP arithmetic. ctest
   `lane_neon`, `tables_neon`, `tiera_neon`, `types_neon32` and the four `_a15` ones pass. No tolerance or sweep
   was changed; `math_special_values` gained three exact subnormal cases for every table.
-- GCC_RESULT
+- g++ 13 `arm-linux-gnueabihf` (glibc, the table's files with `-mfpu=neon-vfpv4`), the same CMake configure,
+  `QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf`: the same executables and the eight ctest entries pass (13 ctest entries in all).
 - x86_64, clang 23: `forge_simd_tests`, `ctest -R "simd|lane|^types_|^tiera_|^tables_"` 16/16.
 - Not done: any run on 32-bit Arm hardware; any timing (every checked operation carries one to four extra NEON
   compares and a branch, so whether `neon` beats `scalar` on a real core is unknown); any test other than the simd
