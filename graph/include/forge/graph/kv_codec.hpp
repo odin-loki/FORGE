@@ -197,22 +197,24 @@ inline void kv_encode_head(const float* x, i64 d, kv_codec c, float* dst) {
     float amax = 0; for (i64 e = 0; e < d; ++e) amax = std::max(amax, std::fabs(x[e]));
     float scale = amax > 0 ? amax / (c == kv_codec::int8 ? 127.f : 448.f) : 1.f;
     std::memcpy(dst, &scale, 4);
-    auto* w = reinterpret_cast<std::uint32_t*>(dst + 1);
+    // code e at byte e after the scale (the CPU attention kernels read the codes as bytes; on a little-endian host
+    // this is also byte e % 4 of word e / 4, as the GPU kernels read it)
+    auto* w = reinterpret_cast<std::uint8_t*>(dst + 1);
     std::memset(w, 0, std::size_t((d + 3) / 4) * 4);
     float inv = 1.f / scale;
     for (i64 e = 0; e < d; ++e) {
         std::uint32_t byte;
         if (c == kv_codec::int8) byte = std::uint32_t(std::uint8_t(std::int8_t(std::clamp(std::lround(x[e] * inv), -127l, 127l))));
         else { byte = fp8_e4m3(x[e] * inv).bits; if ((byte & 0x7fu) == 0x7fu) byte -= 1; }   // never emit NaN
-        w[e / 4] |= byte << (8 * (e % 4));
+        w[e] = std::uint8_t(byte);
     }
 }
 inline void kv_decode_head(const float* src, i64 d, kv_codec c, float* out) {
     if (kv_is_tbq(c)) { kv_tbq_decode(src, d, c, out); return; }
     float scale; std::memcpy(&scale, src, 4);
-    auto* w = reinterpret_cast<const std::uint32_t*>(src + 1);
+    auto* w = reinterpret_cast<const std::uint8_t*>(src + 1);
     for (i64 e = 0; e < d; ++e) {
-        std::uint32_t b = (w[e / 4] >> (8 * (e % 4))) & 0xffu;
+        std::uint32_t b = w[e];
         out[e] = (c == kv_codec::int8 ? float(std::int8_t(b)) : kv_fp8_decode(b)) * scale;
     }
 }

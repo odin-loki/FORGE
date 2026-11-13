@@ -1,3 +1,4 @@
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -680,7 +681,10 @@ TEST(qdot_i8_matches_reference_on_every_isa) {
             std::vector<float> yref(nv * rows), y(nv * rows);
             ref->matvec(fmt, enc.data(), rb, rows, aref, ab, k, nv, yref.data(), rows);
             if (pat < 3)   // fixed inputs (vectors 0..4): the same bits on every architecture and standard library
-                for (std::size_t i = 0; i < 5 * rows * 4; ++i) ref_hash = (ref_hash ^ reinterpret_cast<const u8*>(yref.data())[i]) * 1099511628211ull;
+                for (std::size_t i = 0; i < 5 * rows; ++i) {   // each float's bits low byte first, so a big-endian host gets the same hash
+                    const std::uint32_t w = std::bit_cast<std::uint32_t>(yref[i]);
+                    for (int sh = 0; sh < 32; sh += 8) ref_hash = (ref_hash ^ u8(w >> sh)) * 1099511628211ull;
+                }
             for (const char* tgt : qi8_targets) {
                 const auto* ker = simd::qi8_by_name(tgt);
                 if (!ker) continue;

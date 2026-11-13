@@ -11,7 +11,7 @@
 #endif
 
 using namespace forge;
-using namespace forge::inference;
+using namespace forge::inference;   // session is written inference::session: macOS / FreeBSD <sys/proc.h> declare a global struct session
 namespace fs = std::filesystem;
 
 static std::string tmp(const std::string& n) { return (fs::temp_directory_path() / ("forge_aot_" + std::to_string(::getpid()) + "_" + n)).string(); }
@@ -34,7 +34,7 @@ static std::shared_ptr<model> jit_model(const std::string& path) { auto m = mode
 static void expect_identical(const std::string& aot_path, const std::string& ref_path, const std::vector<int>& chunks, session_options so = {},
                              std::size_t min_used = 1, bool all_rows = false) {
     auto ma = model::open(aot_path); auto mr = jit_model(ref_path);
-    session a(ma, so), r(mr, so);
+    inference::session a(ma, so), r(mr, so);
     int tok = 3;
     for (int n : chunks) {
         std::vector<int> ids; for (int i = 0; i < n; ++i) ids.push_back((tok = (tok * 37 + 11) % 250));
@@ -63,7 +63,7 @@ TEST(aot_blob_round_trip_is_bit_identical) {
     expect_identical(f, model_f32(), {4, 1, 1, 7, 1, 4}, {}, 3);
     expect_identical(f, model_f32(), {7, 4, 1}, {}, 3, true);
     // a session over the precompiled file compiled nothing for the shapes it has
-    auto m = model::open(f); session s(m);
+    auto m = model::open(f); inference::session s(m);
     std::vector<int> ids = {1, 2, 3, 4};
     s.forward(ids); s.forward(std::span<const int>(ids.data(), 1));
     CHECK(m->aot().stats().used == 2 && m->aot().stats().rejected == 0);
@@ -74,7 +74,7 @@ TEST(aot_unlisted_shape_compiles_at_run_time) {
     auto pl = plans_of(model_f32(), {.shapes = {1}});
     auto f = with_plans(model_f32(), pl.blob, "one.fpk");
     expect_identical(f, model_f32(), {5, 1, 1, 3}, {}, 1);   // 5 and 3 are not precompiled
-    auto m = model::open(f); session s(m);
+    auto m = model::open(f); inference::session s(m);
     std::vector<int> ids = {1, 2, 3};
     s.forward(ids);
     CHECK(m->aot().stats().used == 0 && m->aot().stats().rejected == 0);   // not a rejection: just not there
@@ -134,7 +134,7 @@ session one_shot)";
     CHECK(pl.targets.size() == 1);
     auto f = with_plans(src, pl.blob, "oneshot_aot.fpk");
     auto ma = model::open(f); auto mr = jit_model(src);
-    session a(ma), r(mr);
+    inference::session a(ma), r(mr);
     std::vector<float> x(24); for (std::size_t i = 0; i < x.size(); ++i) x[i] = float(i) * 0.05f - 0.5f;
     auto ya = a.infer({{"x", x}}, 3), yr = r.infer({{"x", x}}, 3);
     CHECK(same_bits(ya.at("y"), yr.at("y")) && ya.at("y").size() == 24);
@@ -160,7 +160,7 @@ TEST(aot_adapter_sessions_compile_at_run_time) {
         return m;
     };
     auto ma = mk(f), mr = mk(model_f32()); mr->set_aot(false);
-    session a(ma), r(mr); a.set_adapter("ad"); r.set_adapter("ad");
+    inference::session a(ma), r(mr); a.set_adapter("ad"); r.set_adapter("ad");
     std::vector<int> ids = {4, 8, 15, 16};
     CHECK(same_bits(a.forward(ids), r.forward(ids)));
     CHECK(ma->aot().stats().used == 0);   // the precompiled plans are for the base weights
@@ -174,14 +174,14 @@ TEST(aot_other_model_falls_back) {
     auto pl = plans_of(model_f32(), {.shapes = {1, 4}});
     auto f = with_plans(other, pl.blob, "mismatch.fpk");   // same architecture, other weights: another key
     expect_identical(f, other, {4, 1, 1}, {}, 0);
-    auto m = model::open(f); session s(m);
+    auto m = model::open(f); inference::session s(m);
     std::vector<int> ids = {1, 2, 3, 4};
     s.forward(ids);
     CHECK(m->aot().stats().used == 0 && m->aot().stats().rejected >= 1);
     // FORGE_AOT=0 ignores a matching blob too
     auto g = with_plans(model_f32(), pl.blob, "off.fpk");
     forge_test::set_env("FORGE_AOT", "0");
-    { auto m2 = model::open(g); session s2(m2); s2.forward(ids); CHECK(!m2->aot().available() && m2->aot().stats().used == 0); }
+    { auto m2 = model::open(g); inference::session s2(m2); s2.forward(ids); CHECK(!m2->aot().available() && m2->aot().stats().used == 0); }
     forge_test::set_env("FORGE_AOT", nullptr);
 }
 
@@ -220,9 +220,9 @@ TEST(aot_hostile_plans_are_rejected) {
     auto expect_rejected = [&](const char* what) {
         graph::aot::builder b(key); b.add(t, p);
         auto f = with_plans(model_f32(), b.finish(), "hostile.fpk");
-        auto mm = model::open(f); session s(mm);
+        auto mm = model::open(f); inference::session s(mm);
         std::vector<int> ids = {1, 2, 3, 4};
-        auto mr = jit_model(model_f32()); session r(mr);
+        auto mr = jit_model(model_f32()); inference::session r(mr);
         CHECK_MSG(same_bits(s.forward(ids), r.forward(ids)), "%s: wrong logits", what);
         CHECK_MSG(mm->aot().stats().used == 0 && mm->aot().stats().rejected == 1, "%s: not rejected (%s)", what, mm->aot().stats().last_reject.c_str());
         ++n_case;
@@ -235,7 +235,7 @@ TEST(aot_hostile_plans_are_rejected) {
     CHECK(arena_i && alias_i);
     {   // sanity: unaltered, it is accepted
         graph::aot::builder b(key); b.add(t, p);
-        auto mm = model::open(with_plans(model_f32(), b.finish(), "sane.fpk")); session s(mm);
+        auto mm = model::open(with_plans(model_f32(), b.finish(), "sane.fpk")); inference::session s(mm);
         std::vector<int> ids = {1, 2, 3, 4}; s.forward(ids);
         CHECK(mm->aot().stats().used == 1);
     }
@@ -326,7 +326,7 @@ TEST(aot_signed_files) {
     modelfile::sign_file(with, signed1, kp);
     { modelfile::reader r(signed1); CHECK(modelfile::aot::covered_by_signature(r)); }
     forge_test::set_env("FORGE_TRUSTED_KEYS", pub.c_str());
-    { auto m = model::open(signed1); session s(m); s.forward(ids); CHECK(m->aot().stats().used == 1); }
+    { auto m = model::open(signed1); inference::session s(m); s.forward(ids); CHECK(m->aot().stats().used == 1); }
     forge_test::set_env("FORGE_TRUSTED_KEYS", nullptr);
     expect_identical(signed1, model_f32(), {4, 1, 1}, {}, 2);
     // 2. forge aot on a signed file drops the signature (it could not stay valid)
@@ -352,7 +352,7 @@ TEST(aot_signed_files) {
     forge_test::set_env("FORGE_TRUSTED_KEYS", pub.c_str());
     CHECK_THROWS(model(forged));
     forge_test::set_env("FORGE_TRUSTED_KEYS", nullptr);
-    { auto m = model::open(forged); session s(m); s.forward(ids); CHECK(m->aot().stats().used == 0 && m->aot().stats().rejected == 1); }
+    { auto m = model::open(forged); inference::session s(m); s.forward(ids); CHECK(m->aot().stats().used == 0 && m->aot().stats().rejected == 1); }
     expect_identical(forged, model_f32(), {4, 1}, {}, 0);
     // 4. the same, with the section replaced after signing (signature and table hash both stale for it)
     auto swapped = tmp("s4.fpk");
@@ -363,7 +363,7 @@ TEST(aot_signed_files) {
         for (auto& [name, s] : r.sections()) { auto b = name == "aot" ? std::span<const std::uint8_t>(pl2.blob) : r.raw_section_bytes(name); secs.emplace_back(name, std::string(reinterpret_cast<const char*>(b.data()), b.size())); }
         modelfile::detail::write_sections(swapped, std::move(secs));
     }
-    { auto m = model::open(swapped); session s(m); s.forward(std::span<const int>(ids.data(), 1)); CHECK(m->aot().stats().used == 0 && m->aot().stats().rejected == 1); }
+    { auto m = model::open(swapped); inference::session s(m); s.forward(std::span<const int>(ids.data(), 1)); CHECK(m->aot().stats().used == 0 && m->aot().stats().rejected == 1); }
 }
 
 TEST(aot_sidecar) {
@@ -379,7 +379,7 @@ TEST(aot_sidecar) {
     modelfile::aot::write_sidecar(sg + ".fplan", pl.blob);
     { auto m = model::open(sg); CHECK(!m->aot().available() && m->aot().stats().rejected == 1); }
     forge_test::set_env("FORGE_TRUSTED_KEYS", modelfile::detail::to_hex(kp.pub).c_str());
-    { auto m = model::open(sg); session s(m); std::vector<int> ids = {1, 2, 3, 4}; s.forward(ids); CHECK(m->aot().stats().used == 0); }
+    { auto m = model::open(sg); inference::session s(m); std::vector<int> ids = {1, 2, 3, 4}; s.forward(ids); CHECK(m->aot().stats().used == 0); }
     forge_test::set_env("FORGE_TRUSTED_KEYS", nullptr);
     // a damaged sidecar is ignored
     { std::ofstream f(src + ".fplan", std::ios::binary | std::ios::trunc); f << "FORGEAOT garbage"; }
@@ -463,7 +463,7 @@ TEST(aot_golden_template_families) {
         if (!fs::exists(src)) continue;
         auto pl = plans_of(src, {.shapes = {7}});
         auto ma = model::open(with_plans(src, pl.blob, "emb" + std::to_string(e) + ".fpk")); auto mr = jit_model(src);
-        session a(ma), r(mr);
+        inference::session a(ma), r(mr);
         std::vector<int> ids{2, 40, 7, 99, 150, 12, 3}, types{0, 0, 0, 0, 1, 1, 1}, mask{1, 1, 1, 1, 1, 1, 0};
         if (std::string(name).find("roberta") != std::string::npos) types.assign(ids.size(), 0);   // one token type
         CHECK_MSG(same_bits(a.embed(ids, types, mask), r.embed(ids, types, mask)), "%s", name);
@@ -478,7 +478,7 @@ TEST(aot_golden_template_families) {
         if (!fs::exists(src)) continue;
         auto pl = plans_of(src);
         auto ma = model::open(with_plans(src, pl.blob, "vis" + std::to_string(v) + ".fpk")); auto mr = jit_model(src);
-        session a(ma), r(mr);
+        inference::session a(ma), r(mr);
         std::map<std::string, std::vector<float>> in;
         for (auto& d : mr->blueprint().inputs) {
             std::size_t count = 1;
@@ -549,13 +549,13 @@ TEST(aot_startup_and_throughput) {
     std::vector<int> prompt; for (int i = 0; i < 16; ++i) prompt.push_back(1 + i * 7);
     using clk = std::chrono::steady_clock;
     auto ms = [](clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-    { session warm(model_f32()); warm.forward(prompt); }   // oracle checks of the lowerings, thread pool: once per process
+    { inference::session warm(model_f32()); warm.forward(prompt); }   // oracle checks of the lowerings, thread pool: once per process
     std::vector<float> ref;
     double best[2] = {1e9, 1e9}, tps[2] = {0, 0};
     for (int rep = 0; rep < 5; ++rep) for (int aot = 0; aot < 2; ++aot) {
         auto t0 = clk::now();
         auto m = model::open(aot ? f : src); if (!aot) m->set_aot(false);
-        session s(m);
+        inference::session s(m);
         s.forward(prompt);
         int one = 9; auto l = s.forward(std::span<const int>(&one, 1));
         best[aot] = std::min(best[aot], ms(clk::now() - t0));
@@ -620,7 +620,7 @@ session embedding)";
     CHECK(pl.targets.size() == 1);
     auto f = with_plans(src, pl.blob, "embed_aot.fpk");
     auto ma = model::open(f); auto mr = jit_model(src);
-    session a(ma), r(mr);
+    inference::session a(ma), r(mr);
     std::vector<int> ids{1, 7, 3, 11, 0}, mask{1, 1, 1, 0, 0};
     auto ea = a.embed(ids, {}, mask), er = r.embed(ids, {}, mask);
     CHECK(same_bits(ea, er) && ea.size() == 8);

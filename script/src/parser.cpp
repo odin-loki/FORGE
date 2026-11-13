@@ -82,6 +82,7 @@ private:
     static bool idchar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
     std::string word() { std::size_t b = p_; while (p_ < s_.size() && idchar(s_[p_])) ++p_; return std::string(s_.substr(b, p_ - b)); }
     std::string escape(int line) {
+        if (p_ >= s_.size()) throw syntax_error(line, where(line) + "unterminated escape at the end of the input");   // `'\` as the last bytes
         char e = s_[p_++];
         switch (e) {
         case 'n': return "\n"; case 't': return "\t"; case 'r': return "\r"; case '0': return std::string(1, '\0');

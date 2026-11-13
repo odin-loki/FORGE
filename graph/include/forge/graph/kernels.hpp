@@ -319,7 +319,9 @@ inline kernel_fn gather() {
     return [](std::span<const tensor_view> in, tensor_view out, const ops::attrs&) {
         std::size_t d = std::size_t(in[0].shape[1]), rowsn = std::size_t(in[0].shape[0]);
         for (std::size_t i = 0; i < in[1].size(); ++i) {
-            auto r = std::size_t(in[1].data[i]);
+            const float fi = in[1].data[i];   // checked as a float: converting a negative, NaN or huge one is undefined
+            if (!(fi >= 0.f && fi < float(rowsn))) raise(errc::invalid_argument, "gather index {} out of range", double(fi));
+            auto r = std::size_t(fi);
             if (r >= rowsn) raise(errc::invalid_argument, "gather index {} out of range", r);
             std::copy_n(in[0].data + r * d, d, out.data + i * d);
         }

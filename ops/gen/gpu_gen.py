@@ -1690,7 +1690,7 @@ def cl_mock_dispatch(names):
         out.append(f"static void t_{fn}(void** a) {{ {fn}({', '.join(args)}); }}")
         table.append(f'  {{"{fn}", t_{fn}, {len(params)}}},')
     out.append("static const struct { const char* name; forge_tramp f; int nargs; } forge_tramps[] = {")
-    out += table + ["  {0, 0, 0, 0}};"]
+    out += table + ["  {0, 0, 0}};"]
     return "\n".join(out) + "\n"
 
 # ==== BEGIN portable device kernels (quantised matmul / gather / GLU, attention, DeltaNet state ops, MoE) ==========

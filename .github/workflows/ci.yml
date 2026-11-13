@@ -67,8 +67,8 @@ jobs:
           [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
           grep -q "^vulkan device: llvmpipe" vk.log
       - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
-      - name: all fifteen Vulkan tests ran
-        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 15
+      - name: all sixteen Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 16
   linux-tsan:
     # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
     # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the

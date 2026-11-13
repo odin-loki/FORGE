@@ -254,27 +254,27 @@ TEST(pipeline_auto_partition) {
         device_record d; d.device = device; d.backend = backend; d.ordinal = ord; d.cls = cls; d.memory_bytes = std::uint64_t(gib * double(1ull << 30)); d.gflops = gflops; return d; };
     device_record cpu; cpu.device = cpu.backend = "cpu"; cpu.cls = device_class::cpu; cpu.gflops = 5;
     std::vector<device_record> two{cpu, dev("cuda:0", "cuda", 0, device_class::discrete, 24, 100), dev("cuda:1", "cuda", 1, device_class::discrete, 8, 50)};
-    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-3; };
+    auto close_to = [](double a, double b) { return std::fabs(a - b) < 1e-3; };
     select_request rq;
     {   // no model size: throughput alone
         auto st = plan_pipeline(two, rq);
-        CHECK(st.size() == 2 && st[0].device == "cuda:0" && st[1].device == "cuda:1" && near(st[0].share, 2.0 / 3) && near(st[1].share, 1.0 / 3));
+        CHECK(st.size() == 2 && st[0].device == "cuda:0" && st[1].device == "cuda:1" && close_to(st[0].share, 2.0 / 3) && close_to(st[1].share, 1.0 / 3));
         CHECK(pipeline_string(st) == "pipe:cuda:0*0.6667,cuda:1*0.3333");
     }
     {   // 20 GiB: both shares fit (caps 1.0 and 0.36)
         rq.model_bytes = 20ull << 30; auto st = plan_pipeline(two, rq);
-        CHECK(st.size() == 2 && near(st[0].share, 2.0 / 3) && near(st[1].share, 1.0 / 3));
+        CHECK(st.size() == 2 && close_to(st[0].share, 2.0 / 3) && close_to(st[1].share, 1.0 / 3));
     }
     {   // 28 GiB: the 8 GiB card is capped at 0.9 * 8 / 28 and the rest moves to the 24 GiB one
         rq.model_bytes = 28ull << 30; std::string why; auto st = plan_pipeline(two, rq, &why);
-        CHECK(st.size() == 2 && near(st[1].share, 0.9 * 8 / 28) && near(st[0].share, 1 - 0.9 * 8 / 28));
+        CHECK(st.size() == 2 && close_to(st[1].share, 0.9 * 8 / 28) && close_to(st[0].share, 1 - 0.9 * 8 / 28));
         CHECK(why.find("cuda:1") != std::string::npos && why.find("limited by its memory") != std::string::npos);
     }
     {   // 40 GiB: neither can take its share; what is left goes to a last CPU stage
         rq.model_bytes = 40ull << 30; auto st = plan_pipeline(two, rq);
-        CHECK(st.size() == 3 && st[2].device == "cpu" && near(st[0].share, 0.9 * 24 / 40) && near(st[1].share, 0.9 * 8 / 40) && near(st[2].share, 1 - 0.9 * 32 / 40));
+        CHECK(st.size() == 3 && st[2].device == "cpu" && close_to(st[0].share, 0.9 * 24 / 40) && close_to(st[1].share, 0.9 * 8 / 40) && close_to(st[2].share, 1 - 0.9 * 32 / 40));
         double sum = 0; for (auto& s : st) sum += s.share;
-        CHECK(near(sum, 1.0));
+        CHECK(close_to(sum, 1.0));
     }
     rq.model_bytes = 0;
     {   // the same GPUs listed under a second API are not counted twice; a software device is never a stage
@@ -286,9 +286,9 @@ TEST(pipeline_auto_partition) {
     {   // an excluded device, a missing benchmark (class priors: equal shares), one device, none
         rq.exclude = {"cuda:1"}; CHECK(pipeline_string(plan_pipeline(two, rq)) == "cuda:0"); rq.exclude.clear();
         auto v = two; v[2].gflops = 0; auto st = plan_pipeline(v, rq);
-        CHECK(st.size() == 2 && near(st[0].share, 0.5) && near(st[1].share, 0.5));
+        CHECK(st.size() == 2 && close_to(st[0].share, 0.5) && close_to(st[1].share, 0.5));
         CHECK(pipeline_string(plan_pipeline({cpu}, rq)) == "cpu");
         rq.model_bytes = 100ull << 30; auto one = plan_pipeline({cpu, two[1]}, rq);   // one card, model too large: the card and the CPU
-        CHECK(one.size() == 2 && one[0].device == "cuda:0" && one[1].device == "cpu" && near(one[0].share, 0.9 * 24 / 100));
+        CHECK(one.size() == 2 && one[0].device == "cuda:0" && one[1].device == "cpu" && close_to(one[0].share, 0.9 * 24 / 100));
     }
 }

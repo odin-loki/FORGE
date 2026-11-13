@@ -482,9 +482,9 @@ private:
         return r;
     }
     shape bcast(const node_t& n, const shape& a, const shape& b) {
-        shape big = a.size() >= b.size() ? a : b; const shape& small = a.size() >= b.size() ? b : a;
-        for (std::size_t i = 0; i < small.size(); ++i) {
-            auto& x = big[big.size() - small.size() + i]; const auto& y = small[i];
+        shape big = a.size() >= b.size() ? a : b; const shape& smaller = a.size() >= b.size() ? b : a;
+        for (std::size_t i = 0; i < smaller.size(); ++i) {
+            auto& x = big[big.size() - smaller.size() + i]; const auto& y = smaller[i];
             if (x == y || y.is(1)) continue;
             if (x.is(1)) { x = y; continue; }
             fail(n, "cannot broadcast " + onnx_detail::list_text(a) + " with " + onnx_detail::list_text(b));

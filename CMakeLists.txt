@@ -567,13 +567,14 @@ set(_aot_cfg_build "${_aot_cfg}${_aot_cfg_san}lib=$<TARGET_FILE:forge_script_rt>
 foreach(_i IN LISTS FORGE_AOT_INCLUDE_DIRS)
   string(APPEND _aot_cfg_build "include=${_i}\n")
 endforeach()
-file(GENERATE OUTPUT ${PROJECT_BINARY_DIR}/aot-runtime/forge-aot-runtime.cfg CONTENT "${_aot_cfg_build}")
-# Single-config generators put every executable in the build root, where find_runtime's <exe dir>/aot-runtime finds
-# this; only multi-config generators (exes in <config>/) get the absolute path compiled in, since it would make the
-# forge binary depend on the build directory (the repro job builds in two directories and compares).
+# Next to the executables, where find_runtime's <exe dir>/aot-runtime finds it: the build root, or <config>/ with a
+# multi-config generator (Xcode, Visual Studio), one file per configuration since the paths in it differ. No absolute
+# path is compiled in: it would make the forge binary depend on the build directory (the repro job compares two).
 get_property(_aot_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
 if(_aot_multi)
-  set_source_files_properties(script/src/aot_compile.cpp PROPERTIES COMPILE_DEFINITIONS "FORGE_AOT_BUILD_RUNTIME_DIR=\"${PROJECT_BINARY_DIR}/aot-runtime\"")
+  file(GENERATE OUTPUT ${PROJECT_BINARY_DIR}/$<CONFIG>/aot-runtime/forge-aot-runtime.cfg CONTENT "${_aot_cfg_build}")
+else()
+  file(GENERATE OUTPUT ${PROJECT_BINARY_DIR}/aot-runtime/forge-aot-runtime.cfg CONTENT "${_aot_cfg_build}")
 endif()
 # Example native plugin (C ABI in script/include/forge/script/plugin.h); also used by test_script.
 add_library(forge_script_example_plugin MODULE examples/script_plugin/hello_plugin.c)
@@ -1985,7 +1986,14 @@ if(FORGE_BUILD_APPS AND TARGET forge)
   foreach(x IN LISTS _aot_sys)
     string(APPEND _aot_txt "syslib=${x}\n")
   endforeach()
-  file(GENERATE OUTPUT "${PROJECT_BINARY_DIR}/forge_aot_sdk.txt" CONTENT "${_aot_txt}")
+  # next to forge, where aot_load_sdk looks: <config>/ with a multi-config generator (one file per configuration)
+  get_property(_sdk_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+  if(_sdk_multi)
+    set(_aot_sdk_file "${PROJECT_BINARY_DIR}/$<CONFIG>/forge_aot_sdk.txt")
+  else()
+    set(_aot_sdk_file "${PROJECT_BINARY_DIR}/forge_aot_sdk.txt")
+  endif()
+  file(GENERATE OUTPUT "${_aot_sdk_file}" CONTENT "${_aot_txt}")
   # The same for an installed tree (<prefix>/share/forge/forge_aot_sdk.txt, found next to ../bin/forge): paths are
   # written relative to the prefix as ${prefix}/..., which the reader resolves from the file's own location.
   include(GNUInstallDirs)
@@ -2012,16 +2020,12 @@ if(FORGE_BUILD_APPS AND TARGET forge)
     file(GENERATE OUTPUT "${PROJECT_BINARY_DIR}/forge_aot_sdk.install.txt" CONTENT "${_aot_itxt}")
     install(FILES "${PROJECT_BINARY_DIR}/forge_aot_sdk.install.txt" DESTINATION ${CMAKE_INSTALL_DATADIR}/forge RENAME forge_aot_sdk.txt COMPONENT dev)
   endif()
-  # Single-config generators: forge sits next to forge_aot_sdk.txt, where aot_load_sdk looks; the absolute path only for
-  # multi-config ones (forge in <config>/), as it makes the binary depend on the build directory (the repro job).
-  get_property(_sdk_multi GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
-  if(_sdk_multi)
-    target_compile_definitions(forge PRIVATE FORGE_AOT_SDK_FILE="${PROJECT_BINARY_DIR}/forge_aot_sdk.txt")
-  endif()
+  # forge finds forge_aot_sdk.txt next to itself; no FORGE_AOT_SDK_FILE: an absolute path would make the binary depend
+  # on the build directory (the repro job builds in two and compares)
   add_dependencies(forge forge_simd_mv forge_trust)
   if(FORGE_BUILD_TESTS AND TARGET test_aot_native)
     # generate + compile + load with the host compiler; exits 77 without one (or without process spawning)
-    target_compile_definitions(test_aot_native PRIVATE FORGE_AOT_SDK_FILE="${PROJECT_BINARY_DIR}/forge_aot_sdk.txt"
+    target_compile_definitions(test_aot_native PRIVATE FORGE_AOT_SDK_FILE="${_aot_sdk_file}"
                                FORGE_TEST_FORGE_BIN="$<TARGET_FILE:forge>" FORGE_TEST_BINARY_DIR="${PROJECT_BINARY_DIR}")
     add_dependencies(test_aot_native forge)
     set_tests_properties(test_aot_native PROPERTIES LABELS slow SKIP_RETURN_CODE 77 TIMEOUT 3000)

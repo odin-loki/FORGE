@@ -1,4 +1,5 @@
 // forge::os phase 2: fs, users, time, sysinfo, console.
+#include <cerrno>
 #include <forge/os/fs.hpp>
 #include <forge/os/users.hpp>
 #include <forge/os/time.hpp>
@@ -627,7 +628,12 @@ TEST(fs_file_identity_and_links) {
     if (a && b) { CHECK(!(a.value == b.value)); CHECK(a->links == 1); CHECK(a->inode != 0 || a->device != 0); }
     CHECK(fs::same_file(r + "/a.txt", r + "/a.txt")); CHECK(!fs::same_file(r + "/a.txt", r + "/b.txt")); CHECK(!fs::same_file(r + "/a.txt", r + "/nope"));
     CHECK(!fs::file_id(r + "/nope"));
-    auto h = fs::hardlink(r + "/a.txt", r + "/a2.txt"); CHECK_MSG(h, "%s", h.err.what.c_str());
+    auto h = fs::hardlink(r + "/a.txt", r + "/a2.txt");
+#if defined(__ANDROID__)
+    if (!h && h.err.code == EACCES) std::printf("  skip hardlink: %s (SELinux denies link() here)\n", h.err.what.c_str());   // adb shell in /data/local/tmp
+    else
+#endif
+    CHECK_MSG(h, "%s", h.err.what.c_str());
     if (h) { CHECK(fs::same_file(r + "/a.txt", r + "/a2.txt")); auto a2 = fs::file_id(r + "/a2.txt"); CHECK(a2 && a2->links == 2); }
     auto dir = fs::file_id(r); CHECK(dir);
     CHECK(fs::remove_all(r));

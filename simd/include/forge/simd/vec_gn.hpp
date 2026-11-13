@@ -292,7 +292,11 @@ FORGE_GN_FN vf mul(vf a, vf b) { return a * b; }
 FORGE_GN_FN vf splat(float s) { return vf{} + s; }
 FORGE_GN_FN vm lt(vf a, vf b) { return raw_lt(a, b); }
 #endif
+#if defined(__mips_msa)
+FORGE_GN_FN vm isnan(vf a) { return vm(__msa_fcun_w(v4f32(a), v4f32(a))); }   // GCC 14 lowers a != a to fcne, false for NaN
+#else
 FORGE_GN_FN vm isnan(vf a) { return vm(a != a); }
+#endif
 FORGE_GN_FN vm mor(vm a, vm b) { return a | b; }
 FORGE_GN_FN vm mand(vm a, vm b) { return a & b; }
 #if defined(__mips_msa)

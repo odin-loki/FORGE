@@ -209,7 +209,9 @@ inline policy parse_policy(std::string_view text, std::string_view origin = "<po
         ps.fail_at(off, "JSON syntax error: " + m);
     }
     if (!doc.is_obj()) ps.fail_at(0, "the policy must be a JSON object");
-    ps.only_keys(doc, "policy", {"profile", "fs", "net", "exec", "dynamic_code", "env", "allow_root", "integrity", "limits", "audit", "emulation"});
+    // "source" is what to_json reports the policy came from; it is accepted (so that output reads back) and ignored:
+    // the origin of this text is the source now
+    ps.only_keys(doc, "policy", {"profile", "source", "fs", "net", "exec", "dynamic_code", "env", "allow_root", "integrity", "limits", "audit", "emulation"});
     profile pr = base.value_or(profile::strict);
     if (auto* v = doc.find("profile")) {
         auto s = ps.string(*v, "profile", "profile");
@@ -273,7 +275,7 @@ inline policy parse_policy(std::string_view text, std::string_view origin = "<po
     return r;
 }
 
-// The policy as JSON (the same shape parse_policy reads, plus "source").
+// The policy as JSON (the shape parse_policy reads; its "source" is ignored when read back).
 inline std::string to_json(const policy& p) {
     auto str = [](std::string& o, std::string_view s) { detail::json_str(o, s); };
     auto list = [&](std::string& o, const std::vector<std::string>& v) {

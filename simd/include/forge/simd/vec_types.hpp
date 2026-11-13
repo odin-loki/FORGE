@@ -501,7 +501,22 @@ FORGE_VT_TI inline vec<T, Tg> operator>>(vec<T, Tg> a, int n) { return shr(a, n)
         FORGE_VT_LANES o.m.v[i] = vt::mi<T>(-vt::mi<T>(a.r.v[i] OP b.r.v[i]));                                \
         return o;                                                                                             \
     }
-FORGE_VT_CMP(eq, ==) FORGE_VT_CMP(ne, !=) FORGE_VT_CMP(lt, <) FORGE_VT_CMP(le, <=) FORGE_VT_CMP(gt, >) FORGE_VT_CMP(ge, >=)
+FORGE_VT_CMP(eq, ==) FORGE_VT_CMP(lt, <) FORGE_VT_CMP(le, <=) FORGE_VT_CMP(gt, >) FORGE_VT_CMP(ge, >=)
+#if FORGE_VT_GNU && defined(__mips_msa)
+// GCC 14 lowers a floating-point != on MSA vectors to fcne (ordered: false for NaN); C needs fcune
+FORGE_VT_T inline mask<T, Tg> ne(vec<T, Tg> a, vec<T, Tg> b) {
+    mask<T, Tg> o;
+    if constexpr (!vec<T, Tg>::E && vec<T, Tg>::bytes == 16 && std::is_same_v<T, double>) { o.m = (typename mask<T, Tg>::native_t)__msa_fcune_d((v2f64)a.r, (v2f64)b.r); return o; }
+    else if constexpr (!vec<T, Tg>::E && vec<T, Tg>::bytes == 16 && std::is_same_v<T, float>) { o.m = (typename mask<T, Tg>::native_t)__msa_fcune_w((v4f32)a.r, (v4f32)b.r); return o; }
+    else {
+        FORGE_VT_IFG(o.m = (typename mask<T, Tg>::native_t)(a.r != b.r);)
+        FORGE_VT_LANES o.m.v[i] = vt::mi<T>(-vt::mi<T>(a.r.v[i] != b.r.v[i]));
+        return o;
+    }
+}
+#else
+FORGE_VT_CMP(ne, !=)
+#endif
 #undef FORGE_VT_CMP
 #define FORGE_VT_MOP(OP)                                                                                      \
     FORGE_VT_T inline mask<T, Tg> operator OP(mask<T, Tg> a, mask<T, Tg> b) {                                 \

@@ -597,7 +597,9 @@ inline status clone_file(const std::string& from, const std::string& to) {
     ::close(in); ::close(out);
     if (r == 0) return {};
     ::unlink(to.c_str());
-    if (detail::cannot_clone(en)) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
+    // EACCES although both files opened: a security module refuses the ioctl (Android's SELinux policy for app and shell
+    // domains), so cloning is not available here
+    if (detail::cannot_clone(en) || en == EACCES) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
     errno = en; return {{}, last_error("clone " + from)};
 #elif defined(__APPLE__)
     if (::clonefile(from.c_str(), to.c_str(), 0) == 0) return {};
