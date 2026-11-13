@@ -623,7 +623,9 @@ TEST(pty_runs_a_program_on_a_terminal) {
     };
 #if defined(_WIN32)
     os::pty_opts o; o.cols = 100; o.rows = 30;
-    auto t = os::pty::spawn({"cmd", "/d", "/c", "echo PTY-OK"}, o);
+    // the child stays a moment after the echo: ConPTY renders the screen asynchronously, and a child that is gone at
+    // once can leave only its start-up sequences (ESC[?9001h ESC[?1004h) in the pipe
+    auto t = os::pty::spawn({"cmd", "/d", "/c", "echo PTY-OK& ping -n 3 127.0.0.1 >NUL"}, o);
     if (!t && on_wine()) { std::printf("  skip: wine: %s\n", t.err.what.c_str()); return; }
     CHECK_MSG(t, "%s", t.err.what.c_str()); if (!t) return;
     std::string out; const bool seen = read_until(*t, "PTY-OK", out);

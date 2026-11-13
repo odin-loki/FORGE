@@ -1219,8 +1219,8 @@ TEST(licence_is_captured_and_kept) {
     {
         hf_opts l; l.readme = "---\nlicense:\n  - mit\n  - cc-by-4.0\n---\n";
         auto dir = make_hf_dir("hf_lic2", l);
-        { std::ofstream f(fs::path(dir) / "LICENSE.txt"); f << "MIT text\n"; }
-        { std::ofstream f(fs::path(dir) / "NOTICE"); f << "notice text\n"; }
+        { std::ofstream f(fs::path(dir) / "LICENSE.txt", std::ios::binary); f << "MIT text\n"; }
+        { std::ofstream f(fs::path(dir) / "NOTICE", std::ios::binary); f << "notice text\n"; }
         CHECK(import::import_hf(dir, out).license == "mit, cc-by-4.0");
         modelfile::reader r(out);
         CHECK(r.manifest()["license_files"].arr().size() == 2);

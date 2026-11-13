@@ -499,8 +499,11 @@ inline HANDLE win_job(const proc_limits& lim, bool kill_on_close) {
 }
 // Put a suspended process into its job; on failure (a parent job that forbids nesting or breakaway) it is
 // terminated: running it without its limits and tree kill would be silently weaker than asked.
+// With a limit group the group's job comes first: a process already in a job can only join a job that is empty or
+// in its own job hierarchy, so the fresh per-spawn job (empty) then nests under the group's. The other order works
+// for the group's first member only (its job is still empty) and is refused (access denied) from the second on.
 inline error win_assign(HANDLE job, const PROCESS_INFORMATION& pi, const spawn_attach* att = nullptr) {
-    if (AssignProcessToJobObject(job, pi.hProcess) && (!att || !att->job || AssignProcessToJobObject(att->job, pi.hProcess))) return {};
+    if ((!att || !att->job || AssignProcessToJobObject(att->job, pi.hProcess)) && AssignProcessToJobObject(job, pi.hProcess)) return {};
     error e = last_error("AssignProcessToJobObject");
     TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000);
     return e;

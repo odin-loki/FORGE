@@ -9,14 +9,14 @@ enum class kind : std::uint8_t { a, b, c };
 struct leaf { std::string name; std::vector<std::int32_t> v; std::optional<double> w; };
 FORGE_REFLECT(leaf, name, v, w)
 struct top {
-    bool flag = false; std::int64_t big = 0; std::uint16_t small = 0; float f = 0; kind k = kind::a; std::array<std::uint8_t, 3> rgb{};
+    bool flag = false; std::int64_t big = 0; std::uint16_t small_ = 0; float f = 0; kind k = kind::a; std::array<std::uint8_t, 3> rgb{};
     std::variant<int, std::string, leaf> var; std::map<std::string, leaf> dict; std::vector<leaf> leaves; std::vector<top> kids;
 };
-FORGE_REFLECT(top, flag, big, small, f, k, rgb, var, dict, leaves, kids)
+FORGE_REFLECT(top, flag, big, small_, f, k, rgb, var, dict, leaves, kids)
 }
 #if defined(FORGE_FUZZ_REFLECT_WRITE_SEED)
 int main(int, char** argv) {
-    fz::top t; t.flag = true; t.big = -5; t.small = 7; t.f = 1.5f; t.k = fz::kind::c; t.rgb = {1, 2, 3}; t.var = fz::leaf{"v", {1, -2}, 0.5};
+    fz::top t; t.flag = true; t.big = -5; t.small_ = 7; t.f = 1.5f; t.k = fz::kind::c; t.rgb = {1, 2, 3}; t.var = fz::leaf{"v", {1, -2}, 0.5};
     t.dict["x"] = fz::leaf{"d", {}, std::nullopt}; t.leaves = {fz::leaf{"l", {9}, 2.0}}; t.kids.emplace_back(); t.kids[0].var = std::string("s");
     auto b = forge::reflect::to_binary(t);
     std::ofstream(argv[1], std::ios::binary).write(reinterpret_cast<const char*>(b.data()), std::streamsize(b.size()));

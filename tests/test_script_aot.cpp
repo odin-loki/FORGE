@@ -78,6 +78,10 @@ Run run_binary(const std::string& exe, std::vector<std::string> args = {}, std::
     Run r;
     if (!p) { r.code = -1; r.err = "spawn failed: " + p.err.what; return r; }
     r.out = p->out; r.err = p->err; r.code = p->timed_out ? -2 : p->exit_code;
+#if defined(_WIN32)
+    // the binary's stdout / stderr are in text mode: "\r\n" through the pipe where the in-process interpreter has "\n"
+    for (auto* s : {&r.out, &r.err}) { std::string t; t.reserve(s->size()); for (std::size_t i = 0; i < s->size(); ++i) if (!((*s)[i] == '\r' && i + 1 < s->size() && (*s)[i + 1] == '\n')) t += (*s)[i]; *s = std::move(t); }
+#endif
     return r;
 }
 

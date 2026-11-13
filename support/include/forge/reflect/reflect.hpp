@@ -186,6 +186,7 @@ template <class T> json::value to_json(const T& v) {
     }
     else if constexpr (std::is_arithmetic_v<T>) return json::value(double(v));
     else if constexpr (std::is_same_v<T, std::string>) return json::value(v);
+    else if constexpr (std::is_same_v<T, std::vector<bool>>) { json::array a; for (bool e : v) a.push_back(json::value(e)); return json::value(std::move(a)); }   // libc++: elements are __bit_const_reference
     else if constexpr (is_vec<T>::value || is_arr<T>::value) { json::array a; for (const auto& e : v) a.push_back(to_json(e)); return json::value(std::move(a)); }
     else if constexpr (is_opt<T>::value) return v ? to_json(*v) : json::value(nullptr);
     else if constexpr (is_var<T>::value) {

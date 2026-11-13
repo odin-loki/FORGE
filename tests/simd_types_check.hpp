@@ -18,6 +18,15 @@
 
 namespace forge_types {
 namespace {   // internal linkage: this header is compiled once per ISA with different flags
+// An optimisation barrier: the value is taken to have been read and changed through memory, so no fold can see
+// across it (GNU-style compilers; elsewhere a no-op).
+template <class X> inline void opaque(X& x) {
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : : "r"(&x) : "memory");
+#else
+    (void)x;
+#endif
+}
 using namespace forge::simd;
 
 struct ctx {
@@ -162,7 +171,9 @@ template <class T, Target Tg> struct checker {
         compare("gt", a, b, [](V x, V y) { return gt(x, y); }, [](T x, T y) { return x > y; });
         compare("ge", a, b, [](V x, V y) { return ge(x, y); }, [](T x, T y) { return x >= y; });
         compare("lt&!eq|gt", a, b, [](V x, V y) { return (lt(x, y) & !eq(x, y)) | gt(x, y); }, [](T x, T y) { return x < y || x > y; });
-        compare("le^ge", a, b, [](V x, V y) { return le(x, y) ^ ge(x, y); }, [](T x, T y) { return (x <= y) != (x >= y); });
+        // le and ge each go through memory: msys2's GCC (15) folds (x <= y) ^ (x >= y) on double vectors into x != y,
+        // which is true for NaN lanes where the xor is false (MinGW only so far; le and ge on their own are right)
+        compare("le^ge", a, b, [](V x, V y) { auto l = le(x, y); auto g = ge(x, y); opaque(l); opaque(g); return l ^ g; }, [](T x, T y) { return (x <= y) != (x >= y); });
         binary("select", a, b, [](V x, V y) { return select(lt(x, y), y, x); }, [](T x, T y) { return x < y ? y : x; });
         unary("abs", a, [](V x) { return abs(x); }, [](T x) { return r_abs(x); });
         unary("neg", a, [](V x) { return -x; }, [](T x) { if constexpr (std::is_floating_point_v<T>) return T(-x); else return r_sub(T(0), x); });

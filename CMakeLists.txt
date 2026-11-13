@@ -1846,7 +1846,7 @@ if(FORGE_BUILD_TESTS)
     forge_py_needs("numpy;safetensors" golden_tiny_llama golden_tiny_qwen2 golden_rope_scaling golden_rope_scaling_cuda_mock
       golden_rope_scaling_opencl_mock golden_rope_scaling_vulkan golden_tiny_qwen3 golden_tiny_qwen3_5 golden_moe_mla golden_quant_inplace
       golden_gguf_types golden_hf_quant
-      golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
+      golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_pipe_auto_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
       capi_smoke python_bindings serve_http serve_api serve_auth security_cli modelfile_signing)
     if(TEST jni_smoke)

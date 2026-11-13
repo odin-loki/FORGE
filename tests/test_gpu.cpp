@@ -62,8 +62,8 @@ TEST(device_selection_scoring) {
     { auto a = rq; a.model_bytes = std::uint64_t(20) << 30; CHECK(select_device({disc, integ}, a) == "cuda:0");
       a.model_bytes = std::uint64_t(30) << 30; CHECK(select_device({disc}, a) == "cpu"); }   // 200 * 0.01 < the CPU's 4
     { auto a = rq; a.model_bytes = std::uint64_t(30) << 30;
-      auto small = rec("cuda:0", "cuda", device_class::discrete, 24, kq), big = rec("cuda:1", "cuda", device_class::discrete, 48, kq, 0, 1);
-      CHECK(select_device({small, big}, a) == "cuda:1"); }
+      auto small_ = rec("cuda:0", "cuda", device_class::discrete, 24, kq), big = rec("cuda:1", "cuda", device_class::discrete, 48, kq, 0, 1);
+      CHECK(select_device({small_, big}, a) == "cuda:1"); }
     // codec coverage: the device with a quantised matmul for the model's codec wins over one of the same class without
     { auto a = rq; a.codecs = {"q4_k"};
       auto none = rec("vulkan", "vulkan", device_class::discrete, 24), has = rec("opencl:0", "opencl", device_class::discrete, 24, kq);
