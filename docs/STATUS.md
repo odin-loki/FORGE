@@ -176,9 +176,13 @@ VFPv4; the table has Tier A, `seq` and int8 companions (`isa_extra.cpp`).
   (in the conv + batch-norm folding test), also with `FORGE_SIMD_TARGET=scalar`, so not in the `neon` table. Not
   investigated: nothing but the simd layer has been ported to 32 bits.
 - x86_64, clang 23: `forge_simd_tests`, `ctest -R "simd|lane|^types_|^tiera_|^tables_"` 16/16.
+- wasm32-wasi (zig, node 22.23), `tests/wasm_simd.sh`, because the helpers shared by the GNU-vector backends were
+  reworded: `test_simd` 7/7 with `simd128` active, tables 3/3, types 0 failed, Tier A 13 of 14 one test per process:
+  node segfaults (exit 139) in `sort_matches` every time, and does the same with the previous `vec_gn.hpp`, so
+  that is not from this change (the 2026-11-12 note says each test passed alone).
 - Not done: any run on 32-bit Arm hardware; any timing (every checked operation carries one to four extra NEON
   compares and a branch, so whether `neon` beats `scalar` on a real core is unknown); the rest of the test suite on 32-bit Arm
-  (only the six suites above were built); the other `vec_gn.hpp` tables (LSX / LASX, VSX, VXE, SIMD128, MSA) were not re-run after the
+  (only the six suites above were built); the other `vec_gn.hpp` tables (LSX / LASX, VSX, VXE, MSA) were not re-run after the
   shared `ldexp_int` / rounding helpers were reworded (same operations, compare spelled `raw_lt`); the `emu` CI row
   added for 32-bit Arm has never run on GitHub.
 
