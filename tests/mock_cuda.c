@@ -197,6 +197,7 @@ static int nargs_of(const char* op) {
    argument read 4 bytes past the caller's `unsigned` locals (found by ASan). Bit i = argument i; an argument the
    mock never reads counts as 4 bytes. */
 static unsigned ptr_args_of(const char* op, int n) {
+    for (int ti = 0; forge_nn_tramps[ti].name; ++ti) if (!strcmp(op, forge_nn_tramps[ti].name + 6)) return forge_nn_tramps[ti].ptrs;   /* generated kernels: from their signature */
     if (!strcmp(op, "moe_hidden")) return 0x1fu; if (!strcmp(op, "moe_down")) return 0xfu;
     if (!strcmp(op, "qgather") || !strcmp(op, "bcast") || !strcmp(op, "gather")) return 0x7u;
     if (!strcmp(op, "copy2d") || !strcmp(op, "slice") || !strcmp(op, "copy_words")) return 0x3u;

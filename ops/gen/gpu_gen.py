@@ -1690,7 +1690,7 @@ def cl_mock_dispatch(names):
         out.append(f"static void t_{fn}(void** a) {{ {fn}({', '.join(args)}); }}")
         table.append(f'  {{"{fn}", t_{fn}, {len(params)}}},')
     out.append("static const struct { const char* name; forge_tramp f; int nargs; } forge_tramps[] = {")
-    out += table + ["  {0, 0, 0}};"]
+    out += table + ["  {0, 0, 0, 0}};"]
     return "\n".join(out) + "\n"
 
 # ==== BEGIN portable device kernels (quantised matmul / gather / GLU, attention, DeltaNet state ops, MoE) ==========
@@ -2276,14 +2276,14 @@ def nn_mock_dispatch():
     table = []
     for m in re.finditer(r"FORGE_K void (forge_\w+)\(([^)]*)\)", PORT_NN):
         fn, params = m.group(1), [p.strip() for p in m.group(2).split(",")]
-        args = []
+        args = []; ptrs = 0
         for i, p in enumerate(params):
-            if "*" in p: args.append(f"(float*)(uintptr_t)*(uint64_t*)a[{i}]")
+            if "*" in p: args.append(f"(float*)(uintptr_t)*(uint64_t*)a[{i}]"); ptrs |= 1 << i
             elif p.startswith("float"): args.append(f"*(float*)a[{i}]")
             else: args.append(f"*(unsigned*)a[{i}]")
         out.append(f"static void tn_{fn}(void** a) {{ {fn}({', '.join(args)}); }}")
-        table.append(f'  {{"{fn}", tn_{fn}, {len(params)}}},')
-    out.append("static const struct { const char* name; forge_nn_tramp f; int nargs; } forge_nn_tramps[] = {")
+        table.append(f'  {{"{fn}", tn_{fn}, {len(params)}, 0x{ptrs:x}u}},')
+    out.append("static const struct { const char* name; forge_nn_tramp f; int nargs; unsigned ptrs; } forge_nn_tramps[] = {")
     out += table + ["  {0, 0, 0}};"]
     return "\n".join(out) + "\n"
 
