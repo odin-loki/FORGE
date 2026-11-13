@@ -32,7 +32,12 @@ public:
                 for (auto& d : v["shape"].arr()) e.shape.push_back(d.i());
                 const auto& off = v["data_offsets"].arr();   // exactly [begin, end]; [n] threw std::out_of_range (fuzz, libc++)
                 if (off.size() != 2) raise(errc::format_error, "{}: tensor {} needs 2 data_offsets", path, k);
-                e.begin = std::uint64_t(off[0].num()); e.end = std::uint64_t(off[1].num());
+                auto offset = [&](const json::value& x) {   // checked as a double: converting a negative, NaN or huge one is undefined
+                    const double d = x.num();
+                    if (!(d >= 0 && d < 18446744073709551616.0)) raise(errc::format_error, "{}: tensor {} has a bad data offset", path, k);
+                    return std::uint64_t(d);
+                };
+                e.begin = offset(off[0]); e.end = offset(off[1]);
                 if (e.begin > e.end || e.end > size_ - base_) raise(errc::format_error, "{}: tensor {} out of bounds", path, k);
                 entries_[k] = e;
             }

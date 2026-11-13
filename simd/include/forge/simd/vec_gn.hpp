@@ -100,8 +100,8 @@ FORGE_GN_FN vf round_nearest(vf x) {
     // cvtps_epi32 rounds to nearest even (default MXCSR); |x| >= 2^23 and NaN are already integral / kept
     const __m128 sign = _mm_set1_ps(-0.0f);
     __m128 r = _mm_or_ps(_mm_cvtepi32_ps(_mm_cvtps_epi32(x)), _mm_and_ps(sign, x));
-    __m128 small = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(8388608.f));
-    return _mm_or_ps(_mm_and_ps(small, r), _mm_andnot_ps(small, x));
+    __m128 below_2p23 = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(8388608.f));
+    return _mm_or_ps(_mm_and_ps(below_2p23, r), _mm_andnot_ps(below_2p23, x));
 #endif
 }
 FORGE_GN_FN vf ldexp_int(vf x, vf n) {

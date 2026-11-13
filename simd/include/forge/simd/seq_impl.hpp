@@ -115,8 +115,8 @@ inline V exp_v(V x) {
 }
 // exp(x) with lanes x < -80 (including -inf) set to 0
 inline V exp_cut(V x) {
-    __mmask16 small = _mm512_cmp_ps_mask(x.v, _mm512_set1_ps(-80.0f), _CMP_LT_OQ);
-    return {_mm512_mask_blend_ps(small, exp_v(x).v, _mm512_setzero_ps())};
+    __mmask16 underflow = _mm512_cmp_ps_mask(x.v, _mm512_set1_ps(-80.0f), _CMP_LT_OQ);
+    return {_mm512_mask_blend_ps(underflow, exp_v(x).v, _mm512_setzero_ps())};
 }
 // int16 query x int8 keys: t[p] = sum_e q[e] * k[p][e] for 16 key rows (exact int32; q holds round32(d) int16, zero padded)
 inline V cvt_i32(const std::int32_t* p) { return {_mm512_cvtepi32_ps(_mm512_loadu_si512(p))}; }

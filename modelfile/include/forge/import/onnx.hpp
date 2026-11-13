@@ -461,7 +461,7 @@ private:
         if (!has_in(n, i)) raise(errc::format_error, "onnx: {} node {} is missing input {}", n.op, n.name, i);
         return get(n.in[i]);
     }
-    val T(const node_t& n, std::size_t i) { return as_tensor(in(n, i), n.in[i]); }
+    val T(const node_t& n, std::size_t i) { const val& x = in(n, i); return as_tensor(x, n.in[i]); }   // in() first: it checks i (argument order is unspecified)
     // the integers of a constant operand (axes, pads, shapes, ...)
     std::vector<i64> ints(const node_t& n, std::size_t i, const char* what) {
         const val& c = in(n, i);

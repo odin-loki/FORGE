@@ -67,8 +67,8 @@ jobs:
           [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
           grep -q "^vulkan device: llvmpipe" vk.log
       - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
-      - name: all fifteen Vulkan tests ran
-        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 15
+      - name: all sixteen Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 16
   linux-tsan:
     # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
     # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
@@ -453,7 +453,7 @@ jobs:
             pkg install -y $py-numpy $py-cryptography || true
           run: |
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF
-            cmake --build build -j4
+            cmake --build build -j2   # -j4 ran the 8 GB VM out of memory (forge_c.cpp killed, exit 137)
             ctest --test-dir build -LE "slow|emu|gpu" -j2 --timeout 1200 --output-on-failure
   android:
     runs-on: ubuntu-24.04

@@ -554,6 +554,25 @@ inline int exit_event(pid_t pid, std::uint64_t timeout_ns) {
 inline void await_exit(pid_t pid, std::uint64_t timeout_ns) {
     if (exit_event(pid, timeout_ns) < 0) sleep_ns(std::min<std::uint64_t>(timeout_ns, 1000000ull));
 }
+// write() to the child's stdin: a child that exits (or closes stdin) between poll() and write() must give EPIPE,
+// not a SIGPIPE that kills the parent. SIGPIPE is blocked in this thread for the call and a SIGPIPE it raised is
+// taken back; macOS has no sigtimedwait, so there the pipe is set F_SETNOSIGPIPE instead.
+inline ssize_t write_no_sigpipe(int fd, const void* p, std::size_t n) {
+#if defined(__APPLE__)
+    (void)::fcntl(fd, F_SETNOSIGPIPE, 1);
+    return ::write(fd, p, n);
+#else
+    sigset_t pipe_only, old, pending;
+    sigemptyset(&pipe_only); sigaddset(&pipe_only, SIGPIPE);
+    sigemptyset(&pending); (void)sigpending(&pending);
+    const bool already = sigismember(&pending, SIGPIPE) == 1;   // someone else's: leave it pending
+    pthread_sigmask(SIG_BLOCK, &pipe_only, &old);
+    const ssize_t r = ::write(fd, p, n); const int e = errno;
+    if (r < 0 && e == EPIPE && !already) { const timespec zero{0, 0}; while (sigtimedwait(&pipe_only, nullptr, &zero) < 0 && errno == EINTR) {} }
+    pthread_sigmask(SIG_SETMASK, &old, nullptr);
+    errno = e; return r;
+#endif
+}
 }
 #endif
 
@@ -782,7 +801,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         if (ie >= 0 && fds[ie].revents) drain(perr[0], res.err);
         if (ii >= 0 && fds[ii].revents) {
             if (fds[ii].revents & (POLLERR | POLLHUP)) cl(pin[1]);
-            else { auto n = ::write(pin[1], in.data() + in_off, std::min<std::size_t>(in.size() - in_off, 65536));
+            else { auto n = detail_proc::write_no_sigpipe(pin[1], in.data() + in_off, std::min<std::size_t>(in.size() - in_off, 65536));
                    if (n > 0) in_off += std::size_t(n); else if (n < 0 && errno != EAGAIN && errno != EINTR) cl(pin[1]);
                    if (in_off >= in.size()) cl(pin[1]); }
         }

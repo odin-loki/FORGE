@@ -632,7 +632,7 @@ int run_one_shot(inference::session& s, const args& a) {
                 } else if (n_unknown > 1) raise(errc::invalid_argument, "input {} has {} unbound dimensions; give them with --dim name=N", name, n_unknown);
             } else {   // files imported before dimension names were recorded: one symbolic dimension, `seq`
                 i64 k = 1; bool sym = false;
-                for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= i64(x.num()); }
+                for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= x.i(); }
                 if (sym && k) dims["seq"] = i64(v.size()) / k;
             }
         }

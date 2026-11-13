@@ -13,7 +13,7 @@
 #endif
 
 using namespace forge;
-using namespace forge::inference;
+using namespace forge::inference;   // session is written inference::session: macOS / FreeBSD <sys/proc.h> declare a global struct session
 namespace fs = std::filesystem;
 
 static std::string tmp(const std::string& n) { return (fs::temp_directory_path() / ("forge_aotn_" + std::to_string(::getpid()) + "_" + n)).string(); }
@@ -46,7 +46,7 @@ static std::shared_ptr<model> jit_model(const std::string& path) { auto m = mode
 // The same token stream through the compiled library and through plans compiled at run time.
 static void expect_identical(const std::string& lib, const std::string& fpk, const std::vector<int>& chunks, session_options so = {}, std::size_t min_native = 1) {
     auto ma = model::open(lib); auto mr = jit_model(fpk);
-    session a(ma, so), r(mr, so);
+    inference::session a(ma, so), r(mr, so);
     int tok = 3;
     for (int n : chunks) {
         std::vector<int> ids; for (int i = 0; i < n; ++i) ids.push_back((tok = (tok * 37 + 11) % 250));
@@ -87,7 +87,7 @@ TEST(native_shared_library_is_bit_identical) {
         forge_test::set_env("FORGE_AOT_FPK", other.c_str());
         auto m2 = model::open(so);   // warns and runs `other` without the compiled code
         CHECK(!m2->aot().native() && m2->aot().stats().rejected == 1);
-        session s2(m2); auto mr = jit_model(other); session sr(mr);
+        inference::session s2(m2); auto mr = jit_model(other); inference::session sr(mr);
         std::vector<int> ids = {1, 2, 3, 4};
         CHECK(same_bits(s2.forward(ids), sr.forward(ids)));
         forge_test::set_env("FORGE_AOT_FPK", nullptr);
@@ -99,7 +99,7 @@ TEST(native_shared_library_is_bit_identical) {
     // the C++ session API on top: grammar-constrained generation gives the same tokens
     {
         auto ma = model::open(so); auto mr = jit_model(deep_f32());
-        session a(ma), b(mr);
+        inference::session a(ma), b(mr);
         auto gen = [](session& s) {
             auto g = std::make_shared<grammar>("root ::= [a-z]+ \" \" [0-9]+");
             grammar_constraint gc(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
@@ -117,14 +117,14 @@ TEST(native_shared_library_is_bit_identical) {
         std::vector<int> prompt; for (int i = 0; i < 16; ++i) prompt.push_back(1 + i * 7);
         using clk = std::chrono::steady_clock;
         auto ms = [](clk::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
-        { session warm(deep_f32()); warm.forward(prompt); }
+        { inference::session warm(deep_f32()); warm.forward(prompt); }
         const char* name[3] = {"compiled at run time", "precompiled plans", "native code"};
         double start[3] = {1e9, 1e9, 1e9}, tps[3] = {0, 0, 0};
         std::vector<float> ref;
         for (int rep = 0; rep < 5; ++rep) for (int k = 0; k < 3; ++k) {
             auto t0 = clk::now();
             auto m = model::open(k == 2 ? so : k == 1 ? planned : deep_f32()); if (k == 0) m->set_aot(false);
-            session s(m);
+            inference::session s(m);
             s.forward(prompt);
             int one = 9; auto l = s.forward(std::span<const int>(&one, 1));
             start[k] = std::min(start[k], ms(clk::now() - t0));
@@ -160,7 +160,7 @@ TEST(native_recurrent_state_model) {   // state_op steps between the compiled se
     auto so = tmp(std::string("q35") + so_ext);
     build(src, {.shapes = {1, 5}}, {.out = so});
     auto ma = model::open(so); auto mr = jit_model(src);
-    session a(ma), r(mr);
+    inference::session a(ma), r(mr);
     for (auto ids : {std::vector<int>{1, 2, 3, 4, 5}, std::vector<int>{6}, std::vector<int>{7}, std::vector<int>{8, 9, 10, 11, 12}})
         CHECK(same_bits(a.forward(ids), r.forward(ids)));
     CHECK(ma->aot().stats().native == 2);
@@ -200,7 +200,7 @@ TEST(native_golden_template_families) {
         auto so = tmp(std::string("bert") + so_ext);
         build(src, {.shapes = {7}}, {.out = so});
         auto ma = model::open(so); auto mr = jit_model(src);
-        session a(ma), r(mr);
+        inference::session a(ma), r(mr);
         std::vector<int> ids{2, 40, 7, 99, 150, 12, 3}, types{0, 0, 0, 0, 1, 1, 1}, mask{1, 1, 1, 1, 1, 1, 0};
         CHECK(same_bits(a.embed(ids, types, mask), r.embed(ids, types, mask)));
         CHECK_MSG(ma->aot().stats().native == 1, "native plans: %zu, precompiled %zu (%s)", ma->aot().stats().native, ma->aot().stats().used, ma->aot().stats().last_reject.c_str());

@@ -245,7 +245,7 @@ template <class G> std::string gguf_tokenizer_json(const G& g, std::string* warn
         m.remove_extra_ws = flag("tokenizer.ggml.remove_extra_whitespaces", false);
         if (auto* cm = g.get("tokenizer.ggml.precompiled_charsmap")) {
             if (cm->is_str()) m.charsmap = cm->str();
-            else if (cm->is_arr()) for (auto& b : cm->arr()) m.charsmap += char(int(b.num()) & 0xFF);
+            else if (cm->is_arr()) for (auto& b : cm->arr()) m.charsmap += char(b.i() & 0xFF);
         }
         return json::dump(sentencepiece_json(m));
     }
@@ -326,7 +326,7 @@ inline std::string wordpiece_vocab_tokenizer_json(std::string_view vocab_txt, co
         if (v && v->is_obj()) if (auto* c = v->find("content"); c && c->is_str()) return c->str();
         return d;
     };
-    auto id_of = [&](const std::string& t) { for (auto& [k, v] : vocab) if (k == t) return int(v.num()); return -1; };
+    auto id_of = [&](const std::string& t) { for (auto& [k, v] : vocab) if (k == t) return v.i32(); return -1; };
     bool lower = cfg_flag("do_lower_case", true);
     json::value strip = nullptr;   // null: accents go when lower-casing, as BertNormalizer does
     if (auto* v = tokenizer_config ? tokenizer_config->find("strip_accents") : nullptr; v && v->is_bool()) strip = v->b();

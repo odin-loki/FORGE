@@ -453,7 +453,7 @@ jobs:
             pkg install -y $py-numpy $py-cryptography || true
           run: |
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF
-            cmake --build build -j4
+            cmake --build build -j2   # -j4 ran the 8 GB VM out of memory (forge_c.cpp killed, exit 137)
             ctest --test-dir build -LE "slow|emu|gpu" -j2 --timeout 1200 --output-on-failure
   android:
     runs-on: ubuntu-24.04

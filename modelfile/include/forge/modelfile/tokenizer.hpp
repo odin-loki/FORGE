@@ -613,7 +613,7 @@ public:
         }
         if (auto* at = j.find("added_tokens"); at && at->is_arr())
             for (auto& t : at->arr()) {
-                added a; a.content = t["content"].str(); a.id = int(t["id"].num());
+                added a; a.content = t["content"].str(); a.id = t["id"].i32();
                 auto fl = [&](const char* key, bool d) { auto* v = t.find(key); return v && v->is_bool() ? v->b() : d; };
                 a.special = fl("special", legacy_); a.normalized = fl("normalized", !a.special) && !legacy_;
                 a.single_word = fl("single_word", false); a.lstrip = fl("lstrip", false); a.rstrip = fl("rstrip", false);
