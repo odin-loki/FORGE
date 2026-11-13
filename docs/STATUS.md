@@ -33,7 +33,8 @@ have never run on GitHub, and it now uses clang 23 where the table below says Cl
 | Linux s390x (z14 vector) | locally, zig cross and g++ 13: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
 | wasm32-wasi (SIMD128) | simd layer and its tests only, `tests/wasm_simd.sh` | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14 (one test per process), `vec_types` checks under node 22 (2026-11-12) | zig `wasm32-wasi` |
 | Linux mips64el (MSA) | locally, zig cross: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
-| 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: i386 7/7, arm 5/7 with the opt-in `neon` table, 7/7 without it (2026-11-12) | `qemu-i386`, `qemu-arm -cpu cortex-a7` |
+| 32-bit x86 (SSE) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: 7/7 (2026-11-12) | `qemu-i386` |
+| 32-bit Arm (NEON + VFPv4) | The simd tests only (`forge_simd_tests`), CMake + `armv7-neon-qemu.cmake` | qemu-user only: `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, types 0 failed, `neon` the default table (2026-11-13). Never on hardware; never timed | `qemu-arm -cpu cortex-a7`, `-cpu cortex-a15` |
 | Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
 Windows emit goldens (`FORGE_TEST_ONLY=emit test_script`, `windows-msvc`): sh, bash, dash, pwsh and PowerShell 5.1
@@ -110,6 +111,27 @@ Greedy output is identical with CUDA graphs on and off.
 ## Changelog of checks
 
 Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-13 (simd: the 32-bit Arm `neon` table gives IEEE results and is selected automatically; emulation only)
+Advanced SIMD on AArch32 runs flush-to-zero whatever `FPSCR` says, so the `neon` table failed `exp-sub`, `cbrt-sub`
+and `erfc` and was opt-in. The Armv7 backend of `vec_gn.hpp` now tests each `add` / `sub` / `mul` / `fma` / `lt` and
+recomputes the lanes NEON may have got wrong (subnormal operand, flushed result, NaN) with VFP instructions
+([simd.md](simd.md), "32-bit Arm"). `FORGE_SIMD_ARM32_NEON` is gone; `neon` is chosen when `AT_HWCAP` has NEON and
+VFPv4; the table has Tier A, `seq` and int8 companions (`isa_extra.cpp`).
+- zig 0.17.1 (clang 22) `arm-linux-musleabihf`, static, CMake with the new `cmake/toolchains/armv7-neon-qemu.cmake`,
+  `ninja forge_simd_tests`, under `qemu-arm -cpu cortex-a7` and `-cpu cortex-a15`, same results on both: `test_simd`
+  7/7 with `neon` active by default and forced, 7/7 with `FORGE_SIMD_TARGET=scalar`; `test_simd_tables` 3/3 (`seq` and
+  int8 tables bit-identical to scalar); `test_simd_tiera` 14/14; `test_simd_types` 3/3; `test_simd_types_neon32`
+  0 of 25.5 million type checks failed and 0 of 13.5 million lane results differ from VFP arithmetic. ctest
+  `lane_neon`, `tables_neon`, `tiera_neon`, `types_neon32` and the four `_a15` ones pass. No tolerance or sweep
+  was changed; `math_special_values` gained three exact subnormal cases for every table.
+- GCC_RESULT
+- x86_64, clang 23: `forge_simd_tests`, `ctest -R "simd|lane|^types_|^tiera_|^tables_"` 16/16.
+- Not done: any run on 32-bit Arm hardware; any timing (every checked operation carries one to four extra NEON
+  compares and a branch, so whether `neon` beats `scalar` on a real core is unknown); any test other than the simd
+  ones on 32-bit Arm; the other `vec_gn.hpp` tables (LSX / LASX, VSX, VXE, SIMD128, MSA) were not re-run after the
+  shared `ldexp_int` / rounding helpers were reworded (same operations, compare spelled `raw_lt`); the `emu` CI row
+  added for 32-bit Arm has never run on GitHub.
 
 ### 2026-11-12 (model container, importer and session kinds: the plan-versus-code gaps of FORGE_PLAN Parts D and E)
 Same machine as below: Linux x86_64, **clang 23** (`-fsyntax-only` with g++ 13 on the new headers also passes). Nothing
