@@ -80,7 +80,8 @@ const qi8_kernels* qi8_by_name(const char* t) {
     (void)f;
 #endif
     // the GNU-vector kernels (qi8_gn.inc), one per Tier P table outside AArch64 and the x86 AVX tables
-    for (const char* g : {"sse4.2", "sse2", "rvv", "lasx", "lsx", "vsx", "vxe", "simd128", "msa"})
+    // ("neon" here is the 32-bit Arm table: AArch64 returned above)
+    for (const char* g : {"sse4.2", "sse2", "rvv", "lasx", "lsx", "vsx", "vxe", "simd128", "msa", "neon"})
         if (n == g) { const isa_tables* e = isa_extra_by_name(g); return e ? e->qi8 : nullptr; }
     return nullptr;
 }
