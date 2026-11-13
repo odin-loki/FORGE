@@ -48,9 +48,10 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 - [reference.md](reference.md): op table, GPU kernel list and C ABI, **generated** by `tools/gen_docs.py` (do not edit by hand; the `docs_up_to_date` test checks it)
 - [../ops/README.md](../ops/README.md): op specs and code generators
 - [STATUS.md](STATUS.md): what has been tested where, and how each part was verified (native, emulator, wine, mock driver, cross-compile only, never compiled)
+- [UNTESTED.md](UNTESTED.md): the single list of what has not been tested, by platform, CPU architecture, GPU backend and feature, with the command that would verify each item; sanitizer and fuzzing coverage; what was measured and what was never timed; what was written from memory
 - [RELEASING.md](RELEASING.md): release procedure
 - [../CONTRIBUTING.md](../CONTRIBUTING.md): how to change code and docs, and how to merge
-- [../TODO.md](../TODO.md): open work items, gathered from the "not run" and "not done" notes of the guides
+- [../TODO.md](../TODO.md): open work items (features not built, with the guide that describes each) and the list of things decided against
 - [../NOTICE](../NOTICE): third-party code and derived data, with licences
 - [../FORGE_PLAN.md](../FORGE_PLAN.md): the original design plan (a roadmap, not a description of current behaviour)
 - [claims-audit.md](claims-audit.md): historical record of audits of doc claims against the code; not a description of current behaviour
