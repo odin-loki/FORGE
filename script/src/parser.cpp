@@ -249,6 +249,7 @@ struct FnScope {
     std::unordered_map<int, char> kinds;   // slot -> 'i' / 'f' / 'c': locals declared int / double / char (TI::conv)
     std::unordered_set<int> ptrs;          // slots declared std::optional / shared_ptr / unique_ptr: p.reset() is p = nullptr
     bool limit_stmt = false;    // body of a `limit {...} { }` statement: `return` would only leave the block
+    std::unordered_set<int> ref_slots;     // slots of references that share an object (T& r = obj.member): `r = v` cannot write through
 };
 
 struct ClassInfo {
@@ -257,6 +258,7 @@ struct ClassInfo {
     std::set<std::string> members;     // fields + methods (own), statics included
     std::set<std::string> statics;
     int ctors = 0;
+    std::map<std::string, TI> member_ti;   // declared types of the data members seen so far (member initialisers)
 };
 
 class Parser {
@@ -761,7 +763,9 @@ private:
     // `= expr` initialiser: braces become a typed construction, lvalues are copied.
     NodeP initializer(const TI& ti, int line) {
         if (is_op("{")) return construct(ti, brace_list(), true, line);
-        NodeP e = expr();
+        return init_from(ti, expr(), line);
+    }
+    NodeP init_from(const TI& ti, NodeP e, int line) {
         if (ti.k == TK::Weak) return builtin_call("forge::__weak", {e}, line);
         if (ti.k == TK::Int && e->k == NK::Float) fail_at(line, "narrowing conversion from double to int; use static_cast<int>(...)");
         if (ti.k == TK::Float && e->k == NK::Int) { auto f = mk(NK::Float, line); f->d = double(e->i); return f; }
@@ -977,7 +981,9 @@ private:
         if (ti.k == TK::Fn && is_op("=")) early = declare(name, ti.cnst);
         if (ti.is_static && !ti.cnst && !fns_.back().top && fns_.back().cls.empty())
             fail_at(line, "static local variables are not supported (the variable would be initialised on every call); use a global variable");
-        if (accept_op("=")) init = initializer(ti, line);
+        bool ref_lvalue = false;   // T& r = <lvalue>: bound as written, before any arithmetic conversion
+        if (ti.ref && is_op("=") && !ahead_op(1, "{")) { take(); NodeP e = expr(); ref_lvalue = is_lvalue(e); init = ref_lvalue ? e : init_from(ti, e, line); }
+        else if (accept_op("=")) init = initializer(ti, line);
         else if (is_op("{")) init = construct(ti, brace_list(), true, line);
         else if (is_op("(")) init = construct(ti, paren_args(), false, line);
         else {
@@ -985,7 +991,28 @@ private:
             if (ti.ref) fail_at(line, "reference '" + name + "' must be initialised");
             init = default_value(ti, line);
         }
-        if (ti.ref && !ti.cnst && init->k == NK::Copy) init = init->kids[0];   // T& r = x: alias (objects share; scalars copy)
+        if (ti.ref && init->k == NK::Copy) init = init->kids[0];   // T& r = x / const T& r = x: no copy, no second destructor run
+        // A reference to a local of the same function is another name for its slot: reads and writes (scalars
+        // included) go to the one variable, and nothing is released when the reference leaves scope.
+        if (ti.ref && !early && init->k == NK::Var && !init->var.global() && init->var.depth == 0 && !top_level_global()
+            && init->var.slot >= 0 && (!ti.conv() || ti.conv() == kind_of(init->var))) {
+            auto& f = fns_.back();
+            f.blocks.back()[name] = init->var.slot;
+            if (ti.cnst || is_const_var(init->var)) f.consts.insert(name + "#" + std::to_string(init->var.slot));
+            else f.consts.erase(name + "#" + std::to_string(init->var.slot));
+            auto none = mk(NK::Block, line);
+            return none;
+        }
+        if (ti.ref && init->k == NK::Var && init->var.global() && top_level_global() && ns_.empty() && !aliases_.count(name)
+            && global_vars_.count(init->var.name) && (!ti.conv() || ti.conv() == kind_of(init->var))) {   // the same at file scope: another name for the global
+            aliases_[name] = init->var.name;
+            auto none = mk(NK::Block, line);
+            return none;
+        }
+        // Any other reference (to a member, an element, a global, a captured variable, a temporary) is a slot that
+        // shares the object (Let::ref: stored without the value-type copy); a scalar there is still a copy.
+        if (ref_lvalue) init = init_from(ti, init, line);
+        if (ti.ref && init->k == NK::Copy) init = init->kids[0];
         auto let = mk(NK::Let, line);
         let->s = name; let->flag = ti.cnst; let->ref = ti.ref;
         let->kids.push_back(init);
@@ -994,6 +1021,8 @@ private:
         if (ti.conv() == 'c' || ti.conv() == 'b') let->kids[0] = convert(ti.conv(), let->kids[0], line);   // char c = 'a' + 1; bool b = n;
         let->var = early ? *early : declare(name, ti.cnst);   // declared after the initialiser: `int x = x;` refers to an outer x
         set_kind(let->var, kind);
+        if (let->var.global()) global_vars_.insert(let->var.name);
+        if (ref_lvalue && !ti.cnst) { if (let->var.global()) global_refs_.insert(let->var.name); else fns_.back().ref_slots.insert(let->var.slot); }
         const Node* src = init.get();
         while (src && (src->k == NK::Copy || src->k == NK::Move) && !src->kids.empty()) src = src->kids[0].get();   // auto q = p; auto q = std::move(p);
         bool ptr = ti.smart || ti.nullable || (ti.k == TK::Auto && src && ((src->k == NK::Call && src->kids[0]->k == NK::Var && src->kids[0]->s == "forge::__own") || (src->k == NK::Var && is_ptr_var(src->var))));
@@ -1013,7 +1042,7 @@ private:
         for (std::size_t k = 0; k < names.size(); ++k) {
             auto d = mk(NK::Let, line); d->s = names[k]; d->flag = ti.cnst;
             auto g = builtin_call("forge::__get", {hidden_ref(tmp, line), int_node(std::int64_t(k), line)}, line);
-            d->kids.push_back(ti.ref ? g : copy_of_call(g));
+            d->kids.push_back(ti.ref ? g : copy_of_call(g)); d->ref = ti.ref;
             d->var = declare(names[k], ti.cnst);
             extra_.push_back(d);
         }
@@ -1477,6 +1506,7 @@ private:
                 i_ = save;
                 auto fd = function_body(mname, ml, full, ti.is_static, ti);
                 fd->name = mname; fd->access = access; fd->is_virtual = is_virtual;
+                if (mname == "operator[]" && !ti.is_static) index_accessors(*fd, ti, *cd);
                 if (ti.is_static) {   // static member function: kept on the class as a plain function
                     auto lam = mk(NK::Lambda, ml); lam->fn = fd;
                     auto f = mk(NK::Field, ml); f->s = mname; f->kids.push_back(hidden_ref(cv, ml));
@@ -1494,6 +1524,7 @@ private:
                 if (accept_op("=")) init = initializer(ti, ml);
                 else if (is_op("{")) init = construct(ti, brace_list(), true, ml);
                 else init = default_value(ti, ml);
+                if (!ti.is_static) { classes_[full].member_ti[mname] = ti; if (full != name) classes_[name].member_ti[mname] = ti; }
                 if (ti.is_static) {
                     auto f = mk(NK::Field, ml); f->s = mname; f->kids.push_back(hidden_ref(cv, ml));
                     post.push_back(assign_node(f, init, ml));
@@ -1505,6 +1536,12 @@ private:
             semi();
         }
         semi();
+        for (auto& pi : pending_inits_) {   // member initialisers written before the member's declaration
+            if (pi.cls != full) continue;
+            auto mt = classes_[full].member_ti.find(pi.member);
+            if (mt != classes_[full].member_ti.end()) if (NodeP v = member_init_value(mt->second, pi.args, pi.brace, pi.line)) pi.assign->kids[1] = v;
+        }
+        std::erase_if(pending_inits_, [&](const PendingInit& pi) { return pi.cls == full; });
         if (ctors.size() == 1) ctors[0]->name = "init";
         else for (auto& c : ctors) c->name = "init/" + std::to_string(c->params.size());
         for (auto& c : ctors) cd->methods.push_back(c);
@@ -1525,6 +1562,54 @@ private:
         if (is_kw("bool") || at(T::Ident)) { TI t = parse_type(); (void)t; return "operator bool"; }
         fail("bad operator name");
     }
+    // The value a member initialiser `m(args)` / `m{args}` stores, where the member's declared type decides it:
+    // `cells(n, 0)` builds a vector, `origin()` value-initialises, `pos(1, 2)` calls the member's constructor.
+    // Null: keep the untyped form (one argument: a copy; several: a list).
+    NodeP member_init_value(const TI& ti, const std::vector<NodeP>& args, bool brace, int line) {
+        if (ti.nullable || ti.smart) return nullptr;
+        if (args.empty()) return ti.k == TK::Auto || ti.k == TK::Any || ti.k == TK::Fn || ti.k == TK::Void ? NodeP() : default_value(ti, line);
+        switch (ti.k) {
+        case TK::List: return !brace && args.size() <= 2 ? construct(ti, args, false, line) : NodeP();   // (n), (n, value), (first, last); (other) copies (std::vector built-in)
+        case TK::String: return !brace && args.size() == 2 ? construct(ti, args, false, line) : NodeP();
+        case TK::Map: case TK::Set: return brace && args.size() != 1 ? construct(ti, args, true, line) : NodeP();
+        case TK::Class: return args.size() != 1 && (classes_.count(ti.name) || types_.count(ti.name)) && !enums_.count(ti.name) ? construct(ti, args, brace, line) : NodeP();
+        default: return nullptr;
+        }
+    }
+    // `T& operator[](K i) { return data[i]; }`: in C++ the element can be assigned and updated because the operator
+    // returns a reference. A script function returns a copy of a member or element, so for an operator[] that
+    // returns a reference and whose whole body is `return <assignable expression>;` two more methods are written:
+    //   "operator[]&"  the same body without the copy: `obj[i]` is then the element itself, as `v[i]` of a vector is
+    //                  (the parser already copies an index expression wherever C++ would copy the element)
+    //   "operator[]="  (non-const reference only) the parameters plus a value, body `<expression> = value;`
+    // Any other operator[] is read-only: assigning through it is a TypeError at run time (Interp::set_index).
+    void index_accessors(const FnDecl& get, const TI& ret, ClassDecl& cd) {
+        if (!ret.ref || !get.body || get.body->kids.size() != 1 || get.params.size() != 1) return;
+        const NodeP& rs = get.body->kids[0];
+        if (!rs || rs->k != NK::Return || rs->kids.size() != 1 || !rs->kids[0]) return;
+        NodeP target = rs->kids[0];
+        while (target->k == NK::Copy && !target->kids.empty()) target = target->kids[0];
+        if (!is_lvalue(target)) return;
+        auto drop = [&](const char* name) { std::erase_if(cd.methods, [&](const std::shared_ptr<const FnDecl>& m) { return m && m->name == name; }); };
+        auto fresh = [&](const char* name) {
+            auto f = std::make_shared<FnDecl>(get);
+            f->name = name; f->aot_body = nullptr; f->src.reset(); f->src_b = f->src_e = 0;
+            return f;
+        };
+        auto ref = fresh("operator[]&");
+        { auto body = mk(NK::Block, get.line); auto r = mk(NK::Return, get.line); r->kids.push_back(target); body->kids.push_back(r); ref->body = body; }
+        drop("operator[]&"); cd.methods.push_back(ref);
+        if (ret.cnst) return;
+        auto st = fresh("operator[]=");
+        st->ret_name = "void"; st->is_const = false;
+        Param v; v.name = "__value"; v.slot = st->nslots++;
+        st->params.push_back(v);
+        auto val = mk(NK::Var, get.line); val->s = v.name; val->var = VarRef{v.name, 0, v.slot};
+        auto body = mk(NK::Block, get.line);
+        body->kids.push_back(assign_node(target, val, get.line));
+        st->body = body;
+        drop("operator[]="); cd.methods.push_back(st);
+    }
     void expect_kw_operator() { if (!accept_kw("operator")) fail("expected 'operator'"); }
     // Constructor after `Name`: params, member-initialiser list, body.
     std::shared_ptr<FnDecl> constructor(const std::string& cls, int line) {
@@ -1544,6 +1629,7 @@ private:
         fd->params = std::move(ps);
         fn_qualifiers(nullptr);
         std::vector<NodeP> inits;
+        bool base_done = false;   // a base initialiser or a delegation was written
         if (accept_op(":")) {
             for (;;) {
                 int il = cur().line;
@@ -1554,8 +1640,24 @@ private:
                 if (brace) args = brace_list(); else args = paren_args();
                 auto& ci = classes_[cls];
                 std::string em = exception_class(m);
-                if (em == ci.base || m == ci.base) {   // base-class initialiser
+                if (m == cls || m == short_name(cls)) {   // delegating constructor: T() : T(0) {}
+                    base_done = true;
+                    auto s = mk(NK::Super, il); s->s = "init/" + std::to_string(args.size()); s->var = lookup("self"); s->flag = true;
+                    s->type = std::make_shared<TypeAnn>(); s->type->name = cls;
+                    inits.push_back(expr_stmt_of(call_node(s, args, il), il));
+                } else if (em == ci.base || m == ci.base) {   // base-class initialiser
+                    base_done = true;
                     auto s = mk(NK::Super, il); s->s = "init"; s->var = lookup("self");
+                    // a base with constructors of several arities names them init/<argc>: pick the one this call takes
+                    for (std::string b = ci.base; !b.empty();) {
+                        auto bi = classes_.find(b);
+                        if (bi == classes_.end() || !bi->second.decl) break;
+                        bool one = false, any = false;
+                        for (auto& bm : bi->second.decl->methods) { if (bm->name == "init") one = true; else if (bm->name.rfind("init/", 0) == 0) any = true; }
+                        if (one) break;
+                        if (any) { s->s = "init/" + std::to_string(args.size()); break; }
+                        b = bi->second.base;
+                    }
                     s->type = std::make_shared<TypeAnn>(); s->type->name = cls;
                     inits.push_back(expr_stmt_of(call_node(s, args, il), il));
                 } else {
@@ -1564,9 +1666,33 @@ private:
                     if (!v) { auto l = mk(NK::List, il); for (auto& a : args) l->kids.push_back(a); v = l; }
                     if (brace && args.size() == 1) v = copy_of(args[0]);
                     if (brace && args.empty()) v = mk(NK::Nil, il);
-                    inits.push_back(assign_node(f, v, il));
+                    auto a = assign_node(f, v, il);
+                    if (auto mt = ci.member_ti.find(m); mt != ci.member_ti.end()) { if (NodeP tv = member_init_value(mt->second, args, brace, il)) a->kids[1] = tv; }
+                    else pending_inits_.push_back({cls, m, a, args, brace, il});   // declared further down: class_stmt() finishes it
+                    inits.push_back(a);
                 }
                 if (!accept_op(",")) break;
+            }
+        }
+        if (!base_done) {   // no base initialiser: the base's default constructor runs first, as in C++
+            auto& ci = classes_[cls];
+            for (std::string b = ci.base; !b.empty();) {
+                auto bi = classes_.find(b);
+                if (bi == classes_.end() || !bi->second.decl) break;
+                std::string ctor; bool any = false;
+                for (auto& bm : bi->second.decl->methods) {
+                    if (bm->name.rfind("init", 0) != 0 || (bm->name != "init" && bm->name.rfind("init/", 0) != 0)) continue;
+                    any = true;
+                    bool nullary = true; for (auto& bp : bm->params) if (!bp.dflt) nullary = false;
+                    if (bm->name == "init/0" || (bm->name == "init" && nullary)) ctor = bm->name;
+                }
+                if (!ctor.empty()) {
+                    auto s = mk(NK::Super, line); s->s = ctor; s->var = lookup("self");
+                    s->type = std::make_shared<TypeAnn>(); s->type->name = cls;
+                    inits.insert(inits.begin(), expr_stmt_of(call_node(s, {}, line), line));
+                }
+                if (any) break;
+                b = bi->second.base;
             }
         }
         auto body = block_body(line, false);
@@ -1763,6 +1889,10 @@ private:
     }
     void check_assignable(const NodeP& t, int line) const {
         if (t->k == NK::Var && is_const_var(t->var)) fail_at(line, "cannot assign to const '" + t->s + "'");
+        if (t->k == NK::Var && (t->var.global() ? global_refs_.count(t->var.name) > 0
+                : t->var.depth >= 0 && std::size_t(t->var.depth) < fns_.size() && fns_[fns_.size() - 1 - std::size_t(t->var.depth)].ref_slots.count(t->var.slot) > 0))
+            fail_at(line, "cannot assign through reference '" + t->s + "': it refers to a member, an element or a variable of another function, and "
+                          "assignment would only rebind the name (update the object's members through it, or assign to the original)");
     }
     NodeP ternary() {
         NodeP c = binary(0);
@@ -2214,6 +2344,10 @@ private:
         return fns_[fns_.size() - 1 - std::size_t(v.depth)].ptrs.count(v.slot) > 0;
     }
     std::unordered_map<std::string, std::string> aliases_, aliases_ns_;
+    struct PendingInit { std::string cls, member; std::shared_ptr<Node> assign; std::vector<NodeP> args; bool brace; int line; };
+    std::vector<PendingInit> pending_inits_;
+    std::unordered_set<std::string> global_vars_;   // file-scope variables (not functions or classes): a reference to one is an alias
+    std::unordered_set<std::string> global_refs_;   // file-scope references that share an object (see FnScope::ref_slots)
     std::unordered_map<std::string, std::set<std::string>> ns_members_;
     std::vector<std::string> using_ns_;
     std::unordered_map<std::string, ClassInfo> classes_;

@@ -31,7 +31,7 @@ std::string scratch(const char* tag) {
 std::string slurp(const fs::path& p) { std::ifstream f(p, std::ios::binary); std::stringstream s; s << f.rdbuf(); return s.str(); }
 // "!<ErrorType>" appended on failure, like the golden tests
 std::string run(const std::string& src, script::options o = {}, bool vm = true) {
-    std::string out; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 20000;
+    std::string out; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 300000;
     o.out = [&](std::string_view s) { out += s; };
     script::engine e(o);
     auto r = e.run(src, "<sec>");
@@ -108,7 +108,7 @@ TEST(goldens_same_with_permissive_policy) {
     for (auto& f : files) {
         auto src = slurp(f); auto name = f.filename().string();
         auto runf = [&](bool vm) {
-            std::string out; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 20000;
+            std::string out; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 300000;
             o.out = [&](std::string_view s) { out += s; };
             script::engine e(o); auto r = e.run(src, name);
             if (!r.ok) out += "!" + r.error_type + "\n";

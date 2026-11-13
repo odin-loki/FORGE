@@ -1,0 +1,22 @@
+ctor d
+2 d
+x 7
+after block x
+9
+6 6
+0.5
+11 1 m
+22
+leaving
+~Derived x
+dtor x
+--
+20
+6 7 8
+1.5 2
+Range(0, 10)
+Range()
+Range(0, 5)
+10 5
+unnamed square/4 9 0.5
+3 7 0

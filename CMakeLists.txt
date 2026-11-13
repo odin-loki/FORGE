@@ -552,7 +552,16 @@ endforeach()
 if(UNIX AND NOT APPLE AND NOT ANDROID)
   string(APPEND _aot_cfg "ldflag=-pthread\n")
 endif()
-set(_aot_cfg_build "${_aot_cfg}lib=$<TARGET_FILE:forge_script_rt>\nstub=$<TARGET_FILE:forge-script-run>\n")
+# A sanitizer build's runtime library is instrumented, so the link of an AOT binary needs the sanitizer runtime
+# (without it every native-mode compile in the build tree failed with undefined __asan_* / __ubsan_* symbols and
+# test_script_aot could not pass in the linux-asan job). Build-tree configuration only.
+set(_aot_cfg_san "")
+if(FORGE_SANITIZE)
+  set(_aot_cfg_san "ldflag=-fsanitize=address,undefined\n")
+elseif(FORGE_TSAN)
+  set(_aot_cfg_san "ldflag=-fsanitize=thread\n")
+endif()
+set(_aot_cfg_build "${_aot_cfg}${_aot_cfg_san}lib=$<TARGET_FILE:forge_script_rt>\nstub=$<TARGET_FILE:forge-script-run>\n")
 foreach(_i IN LISTS FORGE_AOT_INCLUDE_DIRS)
   string(APPEND _aot_cfg_build "include=${_i}\n")
 endforeach()
@@ -1742,10 +1751,15 @@ if(FORGE_BUILD_TESTS)
       # ABI 1-4: the generative golden, the tiny BERT for forge_embed_*, and a work dir for the adapter / plan sidecar it writes
       add_test(NAME capi_smoke COMMAND capi_smoke ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
       set_tests_properties(capi_smoke PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert")
-      add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python_bindings.py
-               ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk
-               ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
-      set_tests_properties(python_bindings PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert" ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
+      # Not in sanitizer builds: an uninstrumented python cannot dlopen a libforge.so that needs the ASan / TSan
+      # runtime (it would have to be preloaded, and then conflicts with the sanitized forge the test also starts).
+      # capi_smoke covers the same C API there.
+      if(NOT FORGE_SANITIZE AND NOT FORGE_TSAN)
+        add_test(NAME python_bindings COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/python_bindings.py
+                 ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_q8_0.fpk
+                 ${PROJECT_BINARY_DIR}/golden_bert/bert_f32.fpk ${PROJECT_BINARY_DIR})
+        set_tests_properties(python_bindings PROPERTIES DEPENDS "golden_tiny_llama;golden_tiny_bert" ENVIRONMENT "FORGE_LIB=$<TARGET_FILE:forge_c>")
+      endif()
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)

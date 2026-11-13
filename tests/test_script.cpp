@@ -475,6 +475,67 @@ TEST(catch_clause_types) {
     EXPECT("int f(int x) try { if (x > 1) throw std::invalid_argument(\"big\"); return x; } catch (const std::invalid_argument& e) { return -1; }\nstd::println(\"{} {}\", f(1), f(5));", "1 -1\n");
 }
 
+// References (golden: tests/script/references.fs). `Base& b = d;` used to copy d: writes through b were lost and the
+// destructor ran once per reference. The parts a golden cannot show: the diagnostics.
+TEST(reference_binding) {
+    EXPECT("struct G { std::string n; G(std::string s) : n(s) {} ~G() { std::println(\"~{}\", n); } };\nvoid f() { G g(\"g\"); G& r = g; const G& c = g; { auto& a = g; a.n = \"h\"; } std::println(\"{} {}\", r.n, c.n); }\nf(); std::println(\"end\");", "h h\n~h\nend\n");
+    EXPECT("struct P { int x = 0; };\nvoid f() { std::vector<P> v(2); P& e = v[1]; e.x = 4; const P& c = v[1]; v[1].x += 1; std::println(\"{} {}\", v[1].x, c.x); }\nf();", "5 5\n");
+    EXPECT("void f() { int n = 1; int& r = n; r = 5; const int& c = n; n += 1; std::println(\"{} {} {}\", n, r, c); }\nf();", "6 6 6\n");
+    EXPECT("struct P { int x = 0; };\nvoid f() { auto u = std::make_unique<P>(); const std::unique_ptr<P>& r = u; r->x = 3; std::println(\"{}\", u->x); }\nf();", "3\n");
+    // a const reference cannot be assigned through, whatever the original is
+    { auto r = run1("void f() { int n = 1; const int& c = n; c = 2; }", true); CHECK_MSG(r.r.error_type == "SyntaxError" && r.r.error.find("const") != std::string::npos, "%s", r.r.error.c_str()); }
+    // assigning through a reference to a member or an element would only rebind the name: refused, not silently dropped
+    for (auto* bad : {"struct B { int n = 0; std::string s; };\nvoid f() { B b; int& r = b.n; r = 2; }", "struct B { int n = 0; std::string s; };\nvoid f() { B b; std::string& r = b.s; r += \"x\"; }",
+                      "void f() { std::vector<int> v(3); int& e = v[0]; ++e; }", "struct B { int n = 0; }; B g;\nvoid f() { B& r = g; r = B{}; }"}) {
+        auto r = run1(bad, true);
+        CHECK_MSG(r.r.error_type == "SyntaxError" && r.r.error.find("cannot assign through reference") != std::string::npos, "%s -> %s", bad, r.r.error.c_str());
+    }
+    // delegating to a constructor that does not exist, a base constructor arity that does not exist
+    EXPECT("struct R { int a; R() : R(1, 2, 3) {} R(int x) : a(x) {} };\nR r;", "!TypeError");
+    EXPECT("struct B { int a; B() : a(0) {} B(int x) : a(x) {} };\nstruct D : B { D() : B(1, 2) {} };\nD d;", "!TypeError");
+}
+
+// fork() while another thread is inside the script heap. ProcessPool's fork-mode workers and sandbox({isolate: true})
+// build an interpreter in the forked child; when some other thread of the parent held the heap's object-set mutex
+// at the moment of the fork, the child waited for it for ever (test_script hung in an ASan run: a pool dispatcher
+// forked a worker while the main thread was allocating). The heap now takes its mutexes around fork (pthread_atfork).
+#if !defined(_WIN32) && !defined(FORGE_OS_IOS)
+#include <sys/wait.h>
+#include <unistd.h>
+#include <csignal>
+#include <atomic>
+#include <chrono>
+#include <thread>
+TEST(fork_while_another_thread_allocates) {
+    std::atomic<bool> stop{false};
+    std::thread busy([&] {   // allocates script objects until told to stop
+        script::options o; o.timeout_ms = 60000; o.out = [](std::string_view) {};
+        while (!stop.load()) { script::engine e(o); (void)e.run("std::vector<std::string> v; for (int i = 0; i < 3000; ++i) v.push_back(std::to_string(i));", "<busy>"); }
+    });
+    int hung = 0, bad = 0;
+    for (int k = 0; k < 150 && !hung; ++k) {
+        pid_t pid = ::fork();
+        if (pid < 0) break;
+        if (pid == 0) {   // what a fork-mode pool worker does first: build an interpreter and run a script
+            script::options o; o.out = [](std::string_view) {};
+            script::engine e(o);
+            ::_exit(e.run("std::vector<int> v(100, 1); int s = 0; for (int x : v) s += x;", "<child>").ok ? 0 : 3);
+        }
+        int st = 0; auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            pid_t r = ::waitpid(pid, &st, WNOHANG);
+            if (r == pid) break;
+            if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(60)) { ::kill(pid, SIGKILL); ::waitpid(pid, &st, 0); ++hung; break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (!hung && !(WIFEXITED(st) && WEXITSTATUS(st) == 0)) ++bad;
+    }
+    stop = true; busy.join();
+    CHECK_MSG(hung == 0, "%d forked child(ren) never finished: deadlock on a heap mutex copied in the locked state", hung);
+    CHECK_MSG(bad == 0, "%d forked child(ren) failed", bad);
+}
+#endif
+
 // Holes found by the conformance sweep (tests/script_conformance compares whole programs with the host compiler; these
 // are the same points without needing one).
 TEST(cpp_conformance_holes) {

@@ -415,10 +415,10 @@ Value Interp::load_qualified(const std::string& name) {
     }
     raise("NameError", "'" + name + "' was not declared in this scope");
 }
-void Interp::store(const VarRef& v, const Ref<Env>& env, Value x, bool define, bool is_const) {
+void Interp::store(const VarRef& v, const Ref<Env>& env, Value x, bool define, bool is_const, bool alias) {
     if (v.global()) {
         debug::check_write(*this, globals.get());
-        if (define) { globals->vars[v.name] = share(x); if (is_const) globals->consts.insert(v.name); else globals->consts.erase(v.name); return; }
+        if (define) { globals->vars[v.name] = alias ? x : share(x); if (is_const) globals->consts.insert(v.name); else globals->consts.erase(v.name); return; }
         auto it = globals->vars.find(v.name);
         if (it == globals->vars.end()) raise("NameError", "'" + v.name + "' is not defined (declare it with let)");
         if (globals->consts.count(v.name)) raise("TypeError", "cannot assign to const '" + v.name + "'");
@@ -427,7 +427,7 @@ void Interp::store(const VarRef& v, const Ref<Env>& env, Value x, bool define, b
     Env* e = env.get();
     for (int d = v.depth; d > 0 && e; --d) e = e->parent.get();
     if (!e) raise("NameError", "bad scope for '" + v.name + "'");
-    e->slots.at(std::size_t(v.slot)) = share(x);
+    e->slots.at(std::size_t(v.slot)) = alias ? std::move(x) : share(x);
 }
 Value Interp::share(const Value& v) {
     auto* i = as<Instance>(v);
@@ -723,6 +723,7 @@ void Interp::set_field(const Value& o, const std::string& name, Value v) {
     if (auto* i = as<Instance>(o)) {
         if (i->frozen) raise("TypeError", "object is frozen");
         if (!i->cls->is_dynamic && !i->cls->has_field(name)) raise("AttributeError", i->cls->name + " has no field '" + name + "' (declare it in the class, or mark the class dynamic)");
+        i->cls->convert_member(name, v);
         i->fields[name] = share(v); return;
     }
     if (auto* m = as<Map>(o)) { if (m->frozen) raise("TypeError", "map is frozen"); m->set_str(name, share(v)); return; }
@@ -749,6 +750,10 @@ Value Interp::get_index(const Value& o, const Value& i) {
     }
     if (auto* s = as<String>(o)) { auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int"); return new_char(s->s.at(norm_index(*this, *k, s->s.size()))); }
     if (auto* g = as<Globals>(o)) { if (auto* s = as<String>(i)) return get_field(o, s->s); }
+    if (as<Instance>(o)) {   // user operator[]; "operator[]&" (parser: index_accessors) yields the element itself, as v[i] does
+        bool found = false; Value r = call_operator(o, "operator[]&", {i}, found); if (found) return r;
+        r = call_operator(o, "operator[]", {i}, found); if (found) return r;
+    }
     raise("TypeError", "cannot index " + type_of(o));
 }
 void Interp::set_index(const Value& o, const Value& i, Value v) {
@@ -763,6 +768,13 @@ void Interp::set_index(const Value& o, const Value& i, Value v) {
         auto* k = std::get_if<std::int64_t>(&i); if (!k) raise("TypeError", "string index must be int");
         auto* c = as<String>(v); if (!c || c->s.size() != 1) raise("TypeError", "s[i] = needs a single char");
         s->s.at(norm_index(*this, *k, s->s.size())) = c->s[0]; return;
+    }
+    if (auto* inst = as<Instance>(o)) {
+        // user operator[]: the parser writes "operator[]=" next to an operator[] whose body is `return <lvalue>;`
+        bool found = false; call_operator(o, "operator[]=", {i, std::move(v)}, found);
+        if (found) return;
+        if (inst->cls->find_method("operator[]"))
+            raise("TypeError", inst->cls->name + "::operator[] cannot be assigned through: only an operator[] that returns a reference and whose body is a single `return member[i];` (or another assignable expression) can");
     }
     raise("TypeError", "cannot assign by index on " + type_of(o));
 }
@@ -945,6 +957,9 @@ Value Interp::define_class(const ClassDecl& cd, const Ref<Env>& env) {
     c->def_env = env;
     for (auto& [n, d] : cd.fields) {
         c->fields.push_back(n);
+        if (const MemberMeta* mm = cd.meta ? cd.meta->field(n) : nullptr; mm && !mm->is_static && mm->ann && !mm->ann->nullable && mm->ann->args.empty()) {
+            if (mm->ann->name == "float") c->field_conv[n] = 'f'; else if (mm->ann->name == "int") c->field_conv[n] = 'i';
+        }
         bool lit = !d || d->k == NK::Nil || d->k == NK::True || d->k == NK::False || d->k == NK::Int || d->k == NK::Float || d->k == NK::Str;
         c->field_defaults.push_back(lit && d ? eval(*d, env) : Value(Nil{}));
         c->field_inits.push_back(lit ? nullptr : d.get());   // `G g{"x"};` constructs a fresh member for every object
@@ -998,7 +1013,7 @@ Value Interp::instantiate(const Ref<Class>& c, std::vector<Value>& args) {
     } else if (!args.empty()) {
         std::vector<std::string> all; for (auto it = chain.rbegin(); it != chain.rend(); ++it) for (auto& f : (*it)->fields) all.push_back(f);
         if (args.size() > all.size()) raise("TypeError", c->name + "() takes at most " + std::to_string(all.size()) + " argument(s)");
-        for (std::size_t i = 0; i < args.size(); ++i) inst->fields[all[i]] = share(args[i]);
+        for (std::size_t i = 0; i < args.size(); ++i) { c->convert_member(all[i], args[i]); inst->fields[all[i]] = share(args[i]); }
     }
     inst->finalize = c->find_method("~") != nullptr;
     return self;

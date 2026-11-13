@@ -15,19 +15,28 @@ struct Chunk;    // bytecode (vm.hpp)
 struct ClassMeta;   // reflection metadata (ast.hpp)
 struct Interp;
 
+// Heap::charge() from a constructor. It throws when the heap cap is reached, and then the object's own destructor
+// does not run: a tracked object stayed in the cycle collector's set as a dangling pointer (use-after-free in the
+// next Heap::collect(), found by ASan on tests/script/mem_containers.fs), and ~Obj() counted one object down that
+// make() had not counted up yet.
+inline void charge_in_ctor(Obj& o, std::size_t bytes, bool tracked) {
+    try { Heap::instance().charge(o, bytes); }
+    catch (...) { if (tracked) Heap::instance().untrack(o); Heap::instance().note_object(1); throw; }
+}
+
 struct String final : Obj {
     std::string s;
     // A `char` value: a one-byte string that takes part in arithmetic as its code ('a' + 1 == 98, c - '0'), as in
     // C++. Set for character literals, s[i], s.at(i), s.front(), *it over a string and static_cast<char>.
     bool ch = false;
-    explicit String(std::string v) : s(std::move(v)) { Heap::instance().charge(*this, s.size()); }
+    explicit String(std::string v) : s(std::move(v)) { charge_in_ctor(*this, s.size(), false); }
     const char* type_name() const override { return "string"; }
 };
 
 struct List final : Obj {
     std::vector<Value> items;
     List() { Heap::instance().track(*this); }
-    explicit List(std::vector<Value> v) : items(std::move(v)) { Heap::instance().track(*this); Heap::instance().charge(*this, items.size() * sizeof(Value)); }
+    explicit List(std::vector<Value> v) : items(std::move(v)) { Heap::instance().track(*this); charge_in_ctor(*this, items.size() * sizeof(Value), true); }
     ~List() override { Heap::instance().untrack(*this); }
     const char* type_name() const override { return "list"; }
     void push(Value v) { Heap::instance().charge(*this, sizeof(Value)); items.push_back(std::move(v)); }
@@ -76,7 +85,7 @@ struct Globals final : Obj {
 struct Env final : Obj {
     std::vector<Value> slots;
     Ref<Env> parent;
-    explicit Env(std::size_t n, Ref<Env> p) : slots(n), parent(std::move(p)) { Heap::instance().track(*this); Heap::instance().charge(*this, n * sizeof(Value)); }
+    explicit Env(std::size_t n, Ref<Env> p) : slots(n), parent(std::move(p)) { Heap::instance().track(*this); charge_in_ctor(*this, n * sizeof(Value), true); }
     ~Env() override { Heap::instance().untrack(*this); }
     const char* type_name() const override { return "env"; }
     void trace(const Visit& f) const override { for (auto& v : slots) if (auto* r = std::get_if<Ref<Obj>>(&v)) if (*r) f(**r); if (parent) f(*parent); }
@@ -119,6 +128,18 @@ struct Class final : Obj {
     bool is_struct = false, is_dynamic = false, is_interface = false;
     std::vector<std::string> required;                // interface: method names
     std::shared_ptr<const ClassMeta> meta;            // fields' types, const, access, attributes (reflection)
+    std::unordered_map<std::string, char> field_conv; // members declared double ('f') or int ('i'): a store converts, as C++ does
+    // The value a store into member `n` leaves there: `double w; p.w = 3;` holds 3.0, `int k; p.k = 2.9;` holds 2.
+    void convert_member(const std::string& n, Value& v) const {
+        for (const Class* c = this; c; c = c->base.get()) {
+            if (c->field_conv.empty()) continue;
+            auto it = c->field_conv.find(n);
+            if (it == c->field_conv.end()) continue;
+            if (it->second == 'f') { if (auto* i = std::get_if<std::int64_t>(&v)) v = double(*i); }
+            else if (auto* d = std::get_if<double>(&v); d && *d == *d && *d > -9.2e18 && *d < 9.2e18) v = std::int64_t(*d);
+            return;
+        }
+    }
     Class() { Heap::instance().track(*this); }
     ~Class() override { Heap::instance().untrack(*this); }
     const char* type_name() const override { return is_interface ? "interface" : "class"; }

@@ -32,15 +32,23 @@ int cuOccupancyMaxActiveBlocksPerMultiprocessor(int* n, void* f, int bs, size_t 
 #else
 int hipSetDevice(int d) { g_cur = d; return 0; }
 #endif
+/* A function handle is the kernel's name. The names are interned and freed when the last module is unloaded (they
+   used to be one strdup per lookup, never freed: LeakSanitizer reported every kernel of every test). */
+static char** g_fn_names = NULL; static int g_fn_count = 0, g_modules = 0;
 int N_(cuModuleLoadData, hipModuleLoadData)(void** m, const void* img) {
 #ifdef MOCK_HIP
     (void)img;
 #else
     if (!strstr((const char*)img, ".entry forge_")) return 200;
 #endif
-    *m = (void*)2; return 0; }
-int N_(cuModuleUnload, hipModuleUnload)(void* m) { (void)m; return 0; }
-int N_(cuModuleGetFunction, hipModuleGetFunction)(void** f, void* m, const char* name) { (void)m; *f = strdup(name); return 0; }
+    ++g_modules; *m = (void*)2; return 0; }
+int N_(cuModuleUnload, hipModuleUnload)(void* m) { (void)m;
+    if (g_modules > 0 && --g_modules == 0) { for (int i = 0; i < g_fn_count; ++i) free(g_fn_names[i]); free(g_fn_names); g_fn_names = NULL; g_fn_count = 0; }
+    return 0; }
+int N_(cuModuleGetFunction, hipModuleGetFunction)(void** f, void* m, const char* name) { (void)m;
+    for (int i = 0; i < g_fn_count; ++i) if (!strcmp(g_fn_names[i], name)) { *f = g_fn_names[i]; return 0; }
+    g_fn_names = realloc(g_fn_names, sizeof(char*) * (size_t)(g_fn_count + 1));
+    *f = g_fn_names[g_fn_count++] = strdup(name); return 0; }
 static size_t g_live = 0;
 /* MOCK_MEM_LIMIT (bytes): allocations past it fail with CUDA_ERROR_OUT_OF_MEMORY / hipErrorOutOfMemory (2). */
 int N_(cuMemAlloc_v2, hipMalloc)(dptr* p, size_t n) {
@@ -184,6 +192,27 @@ static int nargs_of(const char* op) {
     if (!strcmp(op, "qgather")) return 8; if (!strcmp(op, "bcast")) return 7; if (!strcmp(op, "copy2d")) return 5;
     if (!strcmp(op, "moe_hidden")) return 12; if (!strcmp(op, "moe_down")) return 10;
     return 0; }
+/* Which arguments of a kernel are device pointers (8 bytes); the rest are unsigned / float (4 bytes). A graph capture
+   copies each argument by its own size, as a driver does from the kernel's signature: copying 8 bytes of every
+   argument read 4 bytes past the caller's `unsigned` locals (found by ASan). Bit i = argument i; an argument the
+   mock never reads counts as 4 bytes. */
+static unsigned ptr_args_of(const char* op, int n) {
+    if (!strcmp(op, "moe_hidden")) return 0x1fu; if (!strcmp(op, "moe_down")) return 0xfu;
+    if (!strcmp(op, "qgather") || !strcmp(op, "bcast") || !strcmp(op, "gather")) return 0x7u;
+    if (!strcmp(op, "copy2d") || !strcmp(op, "slice") || !strcmp(op, "copy_words")) return 0x3u;
+    if (!strcmp(op, "rope")) return 0xfu;
+    if (!strcmp(op, "attention_comb") || !strcmp(op, "attention_comb_q81")) return 0x23u;
+    if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13) || !strcmp(op, "attention_dec")) return 0xfu;
+    if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq") || !strcmp(op, "qmatmul_q81") || !strcmp(op, "matmul_t")) return 0x7u;
+    if (!strcmp(op, "rms_norm_q81")) return 0x47u; if (!strcmp(op, "rms_norm_f")) return 0x61fu; if (!strcmp(op, "rms_rope")) return 0x1fu;
+    if (!strcmp(op, "silu_mul_q81")) return 0x17u; if (!strcmp(op, "quant_q8r")) return 0x7u;
+    if (!strncmp(op, "qmatmul_mma", 11)) return 0xc0fu; if (!strncmp(op, "qmatmul_glu", 11)) return 0x1e0fu;
+    if (!strcmp(op, "glu_q81")) return 0x13u; if (!strcmp(op, "argmax")) return 0x5u;
+    if (!strcmp(op, "sum_splits") || !strcmp(op, "quant_q81") || !strcmp(op, "scale") || !strcmp(op, "softmax")) return 0x3u;
+    if (!strncmp(op, "delta_rule", 10)) return 0x7fu; if (!strncmp(op, "causal_conv", 11)) return 0xfu;
+    if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b")) return 0x7u;
+    return n == 3 ? 0x3u : 0x7u;   /* elementwise: (x, y, n) or (a, b, y, n) */
+}
 static int run_kernel(void* f, unsigned gx, unsigned bx, void** args);
 int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by, unsigned bz, unsigned sh,
                    void* stream, void** args, void** extra) {
@@ -193,7 +222,8 @@ int N_(cuLaunchKernel, hipModuleLaunchKernel)(void* f, unsigned gx, unsigned gy,
         if (!n) n = (!isnan(un(op, 1)) && isnan(bin(op, 1, 1))) ? 3 : 4;
         g_cap->r = realloc(g_cap->r, sizeof(rec) * (size_t)(g_cap->n + 1));
         rec* r = &g_cap->r[g_cap->n++]; r->f = f; r->gx = gx; r->bx = bx; r->nargs = n;
-        for (int i = 0; i < n; ++i) memcpy(&r->vals[i], args[i], 8);   /* every arg is <= 8 bytes */
+        { unsigned pm = ptr_args_of(op, n);
+          for (int i = 0; i < n; ++i) { r->vals[i] = 0; memcpy(&r->vals[i], args[i], ((pm >> i) & 1u) ? 8 : 4); } }
         return 0;
     }
     if (getenv("MOCK_TRACE")) fprintf(stderr, "mock: launch %s grid %u block %u\n", (const char*)f, gx, bx);

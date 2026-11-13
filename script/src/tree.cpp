@@ -107,7 +107,7 @@ Flow Interp::exec(const Node& n, const Ref<Env>& env) {
     case NK::Let: {
         Value v = n.kids.empty() ? Value(Nil{}) : eval(*n.kids[0], env);
         if (n.type) check_type(v, *n.type, "let " + n.s);
-        store(n.var, env, std::move(v), true, n.flag);
+        store(n.var, env, std::move(v), true, n.flag, n.ref);   // T& r = obj.member: share the object, do not copy it
         return Flow::Normal;
     }
     case NK::Assign: {
@@ -273,9 +273,15 @@ Value Interp::eval(const Node& n, const Ref<Env>& env) {
         if (!inst) raise("TypeError", "super needs an object");
         const Class* owner = inst->cls.get();
         while (owner && owner->name != n.type->name) owner = owner->base.get();
+        if (n.flag) {   // delegating constructor: another constructor of the same class, on the same object
+            auto it = owner ? owner->methods.find(n.s) : decltype(owner->methods.end()){};
+            if (!owner || it == owner->methods.end()) raise("TypeError", "no constructor of " + n.type->name + " takes " + n.s.substr(n.s.find('/') + 1) + " argument(s)");
+            return obj(make<Bound>(self, it->second));
+        }
         const Class* base = owner ? owner->base.get() : nullptr;
         if (!base) raise("AttributeError", n.type->name + " has no base class for super");
         auto* m = base->find_method(n.s);
+        if (!m && n.s.rfind("init/", 0) == 0) raise("TypeError", "no constructor of " + base->name + " takes " + n.s.substr(5) + " argument(s)");
         if (!m) raise("AttributeError", "base class has no method '" + n.s + "'");
         return obj(make<Bound>(self, *m));
     }

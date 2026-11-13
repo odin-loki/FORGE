@@ -14,7 +14,7 @@ TEST_PROCESS_WORKER(script::run_process_worker_if_requested);   // sandbox_escap
 
 static std::string slurp(const fs::path& p) { std::ifstream f(p, std::ios::binary); std::stringstream s; s << f.rdbuf(); return s.str(); }
 static std::string run_path(const std::string& src, const std::string& name, bool vm) {
-    std::string out; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 20000;
+    std::string out; script::options o; o.use_vm = vm; o.jit_threshold = 1; o.timeout_ms = 300000;   // only a backstop against a hang: 20 s was too little for mem_containers.fs in an ASan build on a loaded machine
     // Echo progress to stderr as it happens, so a run that hangs shows which script and line it reached.
     std::fprintf(stderr, "== %s (%s)\n", name.c_str(), vm ? "vm" : "tree"); std::fflush(stderr);
     o.out = [&](std::string_view s) { out += s; std::fwrite(s.data(), 1, s.size(), stderr); std::fflush(stderr); };

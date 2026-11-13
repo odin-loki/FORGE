@@ -538,6 +538,12 @@ private:
         case NK::ExprStmt: open(n.line); L("rt::ls(in, " + ln + ");"); expr(kid(n, 0)); close(); return;
         case NK::Let: {
             open(n.line); L("rt::ls(in, " + ln + ");");
+            if (n.ref) {   // reference binding: stored without the value-type copy (Interp::store alias)
+                std::string v = expr(kid(n, 0));
+                if (n.type) L("rt::let_check(in, " + v + ", " + N(n) + ");");
+                L("in.store(" + N(n) + ".var, env, std::move(" + v + "), true, " + (n.flag ? "true" : "false") + ", true);   // " + comment_safe(n.var.name));
+                close(); return;
+            }
             if (is_int_slot(n.var)) {
                 const Node& init = kid(n, 0);
                 if (pure_int(init)) { std::string x = iexpr(init); L(islot(n.var.slot) + " = " + x + ";   // " + comment_safe(n.var.name)); }
@@ -690,7 +696,8 @@ private:
             std::string v;
             if (n.kids.empty()) { v = T(); L("Value " + v + " = Nil{};"); } else v = expr(kid(n, 0));
             if (n.type) L("rt::let_check(in, " + v + ", " + N(n) + ");");
-            store_var(n, n.var, v, true, n.flag);
+            if (n.ref) L("in.store(" + N(n) + ".var, env, std::move(" + v + "), true, " + (n.flag ? "true" : "false") + ", true);   // reference: no value-type copy");
+            else store_var(n, n.var, v, true, n.flag);
             close(); return;
         }
         case NK::Assign: {
