@@ -166,7 +166,7 @@ cmake -S . -B build/android-x86_64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolcha
 cmake --build build/android-x86_64 -j4
 ANDROID_HOME=/path/to/sdk tests/android_emulator.sh native build/android-x86_64
 ```
-- The toolchain defaults to `arm64-v8a`, API 26, and needs NDK r26 or newer.
+- The toolchain defaults to `arm64-v8a`, API 26. Its comment says NDK r26 or newer, but since 2026-11-12 configure refuses a clang older than 19, and NDK r27c, the one used for the compile checks in [os-parity.md](os-parity.md), ships clang 18: a CMake build needs an NDK whose clang is 19 or newer. No NDK build of the current tree through CMake has been run ([UNTESTED.md](UNTESTED.md#2-platforms-and-compilers)).
 - `tests/mobile_build.sh android <abi>` cross-builds and checks the JNI exports (ctest `mobile_android_<abi>`).
 - `android_emulator.sh native` pushes every `test_*`/`example_*` binary, the shared libraries, `libc++_shared.so` and the import templates, runs each with `FORGE_THREADS=2` and `FORGE_TEMPLATES` set, retries when adb drops, and exits 77 when no device is attached. `FORGE_TEST_TIMEOUT` sets the per-test limit (default 600 s). `android_emulator.sh apk` builds and installs the example APK without gradle.
 - The `android` CI job cross-builds arm64-v8a and x86_64, then on an API 34 x86_64 emulator runs the `--emit android` goldens with `/system/bin/sh` and the native `test_script` (`.github/android_check.sh`).
