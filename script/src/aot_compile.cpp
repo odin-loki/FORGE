@@ -204,6 +204,7 @@ aot_result build_native(const aot::translated& tr, const std::string& out, const
         cmd.push_back("/Fo" + (fs::path(tmp.value) / (stem + ".obj")).string());
         cmd.push_back("/Fe" + out);
         cmd.push_back("/link");
+        cmd.push_back("/STACK:8388608");   // as FORGE's own Windows programs: the 1 MiB default overflowed the recursion limit test
         for (auto& l : cfg.libs) cmd.push_back(l);
         for (auto& f : cfg.ldflags) cmd.push_back(f);
     } else {
@@ -259,6 +260,13 @@ aot_result build_native(const aot::translated& tr, const std::string& out, const
         };
         for (auto& l : cfg.libs) link_arg(l);
         for (auto& f : cfg.ldflags) link_arg(f);
+        {   // a Windows program gets the 8 MiB stack FORGE's own Windows programs have (the default is 1 MiB)
+            bool windows = o.target.find("windows") != std::string::npos || o.target.find("mingw") != std::string::npos;
+#if defined(_WIN32)
+            if (o.target.empty()) windows = true;
+#endif
+            if (windows) cmd.push_back("-Wl,--stack,8388608");
+        }
         // The runtime library carries the interpreter's debug info; leave it out of the program unless asked (-Og).
         if (O != "g") {
             bool apple = o.target.find("apple") != std::string::npos || o.target.find("darwin") != std::string::npos;
