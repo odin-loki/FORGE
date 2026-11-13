@@ -42,7 +42,11 @@ std::vector<std::string> compilers() {
     static const std::vector<std::string> found = [] {
         std::vector<std::string> names, out;
         if (auto e = os::getenv("FORGE_AOT_TEST_CXX"); !e.empty()) { std::stringstream ss(e); std::string n; while (std::getline(ss, n, ',')) if (!n.empty()) names.push_back(n); }
+#if defined(_MSC_VER)
+        else names = {"cl"};   // the runtime library is MSVC-built: a MinGW g++ on PATH cannot link against it
+#else
         else names = {"clang++-23", "g++"};
+#endif
         if (!script::aot_supported()) return out;
         for (auto& n : names) {
             auto p = os::find_executable(n);

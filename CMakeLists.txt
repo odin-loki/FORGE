@@ -2079,9 +2079,10 @@ if(FORGE_BUILD_TESTS)
     if(NOT FORGE_LIBFUZZER)
       set(_fz_iters ${FORGE_FUZZ_ITERS})
       if(ft STREQUAL "rpc" AND APPLE)
-        # one loopback connection per input is far slower on the macOS runners (test_rpc 78 s there, 1 s on Linux;
-        # cause not found yet): 4000 inputs ran past the 600 s limit, so fewer here
-        math(EXPR _fz_iters "${FORGE_FUZZ_ITERS} / 8")
+        # each input (one loopback connection) seems to wait out the client's 2 s receive timeout on the macOS runners
+        # instead of seeing the server close (test_rpc takes 78 s there, 1 s on Linux; cause not found yet): 4000 and
+        # then 500 inputs ran past the 600 s limit, so 1/40 of them here. Linux runs them all.
+        math(EXPR _fz_iters "${FORGE_FUZZ_ITERS} / 40")
       endif()
       add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${_fz_iters} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
                WORKING_DIRECTORY ${PROJECT_BINARY_DIR})

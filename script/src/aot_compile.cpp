@@ -254,8 +254,11 @@ aot_result build_native(const aot::translated& tr, const std::string& out, const
         for (auto& i : cfg.includes) cmd.push_back("-I" + i);
         cmd.push_back(src);
         cmd.push_back("-o"); cmd.push_back(out);
-        for (auto& l : cfg.libs) cmd.push_back(l);
-        for (auto& f : cfg.ldflags) cmd.push_back(f);
+        auto link_arg = [&](const std::string& a) {   // "-framework Metal" (macOS) is two arguments
+            if (a.rfind("-framework ", 0) == 0) { cmd.push_back("-framework"); cmd.push_back(a.substr(11)); } else cmd.push_back(a);
+        };
+        for (auto& l : cfg.libs) link_arg(l);
+        for (auto& f : cfg.ldflags) link_arg(f);
         // The runtime library carries the interpreter's debug info; leave it out of the program unless asked (-Og).
         if (O != "g") {
             bool apple = o.target.find("apple") != std::string::npos || o.target.find("darwin") != std::string::npos;

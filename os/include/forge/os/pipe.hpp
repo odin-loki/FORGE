@@ -1,6 +1,10 @@
 #pragma once
 // forge::os anonymous pipes with RAII ends and deadline reads, and named FIFOs (os::fifo). Guide: docs/os-wrapper.md.
 #include <forge/os/os.hpp>
+#if defined(__APPLE__)
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#endif
 
 namespace forge::os {
 
@@ -216,9 +220,23 @@ inline result<pipe_end> open_read(const std::string& name, int timeout_ms = -1) 
     int fd = ::open(p.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC); if (fd < 0) return {{}, last_error("open " + p)};
     const std::uint64_t end = monotonic_ns() + std::uint64_t(timeout_ms) * 1000000ull;
     for (;;) {
-        struct pollfd f{fd, POLLIN, 0}; auto now = monotonic_ns();
-        int r = ::poll(&f, 1, now >= end ? 0 : int((end - now + 999999ull) / 1000000ull));
+        auto now = monotonic_ns();
+        const int wait_ms = now >= end ? 0 : int((end - now + 999999ull) / 1000000ull);
+#if defined(__APPLE__)
+        // macOS poll() does not report a FIFO becoming readable (the reader timed out with a writer writing);
+        // select() does. A FIFO without a writer selects as readable at EOF, so data is checked for below.
+        int r;
+        {
+            fd_set rs; FD_ZERO(&rs); FD_SET(fd, &rs);
+            struct timeval tv{wait_ms / 1000, (wait_ms % 1000) * 1000};
+            r = ::select(fd + 1, &rs, nullptr, nullptr, &tv);
+            if (r > 0) { int avail = 0; if (::ioctl(fd, FIONREAD, &avail) == 0 && avail > 0) break; }
+        }
+#else
+        struct pollfd f{fd, POLLIN, 0};
+        int r = ::poll(&f, 1, wait_ms);
         if (r > 0 && (f.revents & POLLIN)) break;
+#endif
 #if defined(__linux__)
         if (r > 0) break;   // hang-up: a writer came and left without data (Linux reports this only after a writer)
 #else
