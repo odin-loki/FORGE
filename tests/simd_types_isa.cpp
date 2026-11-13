@@ -16,7 +16,16 @@ static_assert(forge::simd::vec<float, FORGE_ISA_TG>::K == 1, "compile with the a
 #include "../simd/src/isa_target.inc"
 #endif
 #include "simd_types_check.hpp"
+#if defined(FORGE_GN_ARM32)
+#include "simd_arm32_ieee.hpp"   // the Armv7 backend's subnormal lanes against VFP arithmetic
+#endif
 
 extern "C" const char* forge_types_table() { return FORGE_ISA_NAME; }
 extern "C" int forge_types_bits() { return forge::simd::vec<float, FORGE_ISA_TG>::N * 32; }
-extern "C" int forge_types_run() { return forge_types::check<FORGE_ISA_TG>(FORGE_ISA_NAME); }
+extern "C" int forge_types_run() {
+    int fails = forge_types::check<FORGE_ISA_TG>(FORGE_ISA_NAME);
+#if defined(FORGE_GN_ARM32)
+    fails += forge_arm32::ieee_check();
+#endif
+    return fails;
+}

@@ -194,6 +194,20 @@ TEST(math_special_values) {
         CHECK(std::isnan(out[3])); CHECK(std::isnan(out[4])); CHECK(std::fabs(out[5] - std::log(1e-40f)) < 1e-4f);
         k->exp(in, out, 6);
         CHECK(out[0] == 1.f); CHECK(std::isinf(out[2])); CHECK(out[3] == 0.f);
+        // Subnormal operands and results. Every value below is exact in IEEE arithmetic, so each table must give
+        // exactly it; instructions that flush to zero (Advanced SIMD on 32-bit Arm, used unchecked) give 0.
+        for (std::size_t n : {std::size_t(1), std::size_t(4), std::size_t(37)}) {
+            std::vector<float> x(n), y(n), h(n), z(n, 0.f);
+            for (std::size_t i = 0; i < n; ++i) {
+                x[i] = std::ldexp(float(i + 1), -140); y[i] = std::ldexp(float(3 * i), -140);
+                h[i] = std::ldexp(float(64 + i), -132);                                  // FLT_MIN * (1 + i/64)
+            }
+            k->saxpy(1.f, x.data(), y.data(), n);                                        // subnormal + subnormal
+            for (std::size_t i = 0; i < n; ++i) CHECK_MSG(y[i] == std::ldexp(float(4 * i + 1), -140), "%s subnormal saxpy i=%zu: %g", k->target, i, double(y[i]));
+            k->saxpy(0.5f, h.data(), z.data(), n);                                       // normal * 0.5 -> subnormal
+            for (std::size_t i = 0; i < n; ++i) CHECK_MSG(z[i] == std::ldexp(float(64 + i), -133), "%s underflowing saxpy i=%zu: %g", k->target, i, double(z[i]));
+            CHECK_MSG(k->sum(x.data(), n) == std::ldexp(float(n * (n + 1) / 2), -140), "%s subnormal sum n=%zu: %g", k->target, n, double(k->sum(x.data(), n)));
+        }
     }
 }
 

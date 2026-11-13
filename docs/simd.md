@@ -24,7 +24,7 @@ Every kernel table has three companion tables for the same ISA, each with its ow
 | Attention and delta rule | `seq.hpp` | `seq_active()`, `seq_by_name()` | `seq_impl.hpp` |
 | int8 matvec | `qdot_i8.hpp` | `qi8_active()`, `qi8_by_name()`, `qi8_target_names()` | `qi8_x86.inc` (AVX), `qi8_arm.inc` (NEON, dotprod, SVE), `qi8_gn.inc` (every other ISA) |
 
-`scalar`, `avx2` and `avx512` have their own source files. For every other table (`sse2`, `sse4.2`, `neon`, `sve`, `rvv`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa`) one file, `simd/src/isa_extra.cpp`, is compiled next to the kernel table with the same flags (plus `-ffp-contract=off`) and instantiates the same templates for that backend; `isa_target.inc` reads the target from the compile flags. Nothing is forked per ISA. The 32-bit Arm `neon` table (opt-in) has no companions.
+`scalar`, `avx2` and `avx512` have their own source files. For every other table (`sse2`, `sse4.2`, `neon`, `sve`, `rvv`, `lasx`, `lsx`, `vsx`, `vxe`, `simd128`, `msa`) one file, `simd/src/isa_extra.cpp`, is compiled next to the kernel table with the same flags (plus `-ffp-contract=off`) and instantiates the same templates for that backend; `isa_target.inc` reads the target from the compile flags. Nothing is forked per ISA.
 
 Targets per architecture:
 
@@ -38,7 +38,7 @@ Targets per architecture:
 | s390x | `vxe`, `scalar` | `AT_HWCAP` VXRS and VXRS_EXT (z14: binary32 vectors) |
 | wasm32 | `simd128`, `scalar` | Chosen when the module is built (`-msimd128`); nothing is detected at run time |
 | mips64 | `msa`, `scalar` | `AT_HWCAP` MSA |
-| arm (32-bit) | `scalar`; `neon` only with `FORGE_SIMD_ARM32_NEON=1` | `AT_HWCAP` NEON and VFPv4. Never chosen automatically (see "Other architectures") |
+| arm (32-bit) | `neon`, `scalar` | `AT_HWCAP` NEON and VFPv4 (see "32-bit Arm" under "Other architectures") |
 | x86 (32-bit) | `sse4.2`, `sse2`, `scalar` | As on x86_64. No AVX tables |
 | other | `scalar` | |
 
@@ -230,7 +230,6 @@ float d = k.dot(x.data(), y.data(), x.size());            // 5000
 | `FORGE_SIMD_TARGET` | Force a table (`scalar`, `avx2`, `sse2`, `lsx`, …: any `by_name` name). Ignored if that table is not usable on this CPU |
 | `FORGE_LANE_TARGET` | Old name of `FORGE_SIMD_TARGET`, still read (after it) |
 | `FORGE_SVE_KEEP_VL=1` | aarch64 Linux: do not lower the SVE vector length at start-up (see below) |
-| `FORGE_SIMD_ARM32_NEON=1` | 32-bit Arm: make the `neon` table selectable with `FORGE_SIMD_TARGET=neon` (it flushes subnormals to zero) |
 
 ## Other architectures (`vec_gn.hpp`)
 `vec_gn.hpp` is one more Tier P backend ("kind 6") with one implementation per ISA, selected by the compile flags of the translation unit. `simd/src/kernels_gn.cpp` is compiled once per table with that ISA's flags and exports the same `kernels` table as every other target (same Tier A templates, nothing forked). `vec_gn.hpp` itself has `float` vectors only; the other element types of these ISAs come from `vec_types.hpp`.
@@ -245,9 +244,27 @@ float d = k.dot(x.data(), y.data(), x.size());            // 5000
 | s390x vector | `s390_vxe` / `s390x_z14` | 4 | `vecintrin.h`, `-march=z14 -mzvector` | Needs z14 (binary32 vectors); z13 gets `scalar`. Big-endian |
 | WebAssembly SIMD128 | `wasm_simd128` / `wasm_simd` | 4 | `wasm_simd128.h`, `-msimd128` | `fma` through f64 as for SSE. relaxed-simd is not used: its `madd` may or may not fuse, so results would differ between engines |
 | MIPS MSA | `msa` / `mips_msa` | 4 | `msa.h`, `-mmsa` | |
-| Armv7 NEON + VFPv4 | `neon` / `armv7_neon` | 4 | `arm_neon.h`, `-mfpu=neon-vfpv4` | Opt-in (`FORGE_SIMD_ARM32_NEON=1`): Advanced SIMD on AArch32 flushes subnormals to zero, so `exp` below −87, `cbrt` and `erfc` of values with subnormal results miss the tolerance |
+| Armv7 NEON + VFPv4 | `neon` / `armv7_neon` | 4 | `arm_neon.h`, `-mfpu=neon-vfpv4`, no auto-vectorisation | Advanced SIMD on AArch32 flushes subnormals to zero; the backend recomputes those lanes with VFP instructions (see "32-bit Arm" below). No vector divide, square root or rounding instruction |
 
 Apart from SSE, the backends use GNU vector types for `+ - * /`, compares, bit operations and shifts, and the ISA's intrinsics for fused multiply-add, square root, rounding and mask extraction. Those TUs are built with `-ffp-contract=off`. All `vec_gn.hpp` functions have internal linkage, so the SSE2 and SSE4.2 tables (or LSX and LASX) never share a function body.
+
+### 32-bit Arm
+On AArch32 every Advanced SIMD floating-point instruction runs in flush-to-zero, default-NaN mode whatever `FPSCR` holds: a subnormal operand is read as zero and a result below `FLT_MIN` becomes zero. VFP instructions on the same registers follow `FPSCR` (Linux starts with FZ clear) and are IEEE. Used as it is, the `neon` table failed the three sweeps of `test_simd` whose results are subnormal (`exp-sub`, `cbrt-sub`, `erfc`).
+
+The Armv7 backend in `vec_gn.hpp` therefore checks every `add`, `sub`, `mul`, `fma` and `lt`:
+
+| Operation | Test after the NEON instruction (one branch) | Lanes recomputed with a VFP instruction |
+|-----------|----------------------------------------------|------------------------------------------|
+| `add`, `sub` | `|r| > 2^-100` in every lane (one absolute compare). A subnormal operand cannot change a larger sum, and a flushed sum is zero | result NaN, an operand subnormal, or result zero with both operands non-zero |
+| `mul` | `|r| > 0` (one absolute compare): a wrong product is zero or NaN | result NaN, or result zero with both operands non-zero |
+| `fma` | `|r| > 0` and all three operands `>= FLT_MIN` in magnitude (four absolute compares): a subnormal addend can break a tie of the exact product, so it is never ignored | result NaN, an operand subnormal, or result zero that the operands do not make zero |
+| `lt` | either operand `>= FLT_MIN` in magnitude: a compare is wrong only between a subnormal and a zero or subnormal | an operand subnormal |
+
+A lane that fails the first test goes to a second, exact test in a non-inlined function; only lanes that fail that one are redone, one at a time, by `vadd.f32` / `vmul.f32` / `vfma.f32` / `vcmp.f32` on the `s` registers (functions compiled without NEON). Zeros fail the first test of `mul`, `fma` and `lt` and pass the second, so zero lanes cost the call but not the VFP instructions. `splat` is a move (`vdup`), `max` / `min` / `abs` / negation go through the checked operations, `ldexp_int` ends in the checked multiply, `reduce_add` uses the checked add and one VFP add, and division and square root were VFP instructions already. NaN lanes are also redone, so NaN payloads are the VFP ones. The table's translation units are compiled with `-fno-tree-vectorize -fno-tree-slp-vectorize`: scalar code turned into NEON instructions by the compiler would flush again.
+
+`tests/simd_arm32_ieee.hpp` (part of `test_simd_types_neon32`, ctest `types_neon32`) compares these operations and `max`, `div`, `sqrt`, `splat`, `reduce_add`, `ldexp_int`, `round_nearest` with VFP arithmetic, lane by lane and bit for bit apart from NaN payloads, over operands weighted towards zero, subnormals, `FLT_MIN`, exact cancellations, infinity and NaN (13.5 million lane results; a run of 135 million found no difference either). `test_simd`'s `math_special_values` has three exact subnormal cases (`saxpy` and `sum`) that every table runs.
+
+Cost: the first test adds 1 (add, sub, mul) to 4 (fma) NEON compares, a reduction to a core register and a branch to every operation. Nothing has been timed: there is no 32-bit Arm hardware here and qemu-user timings mean nothing. The table is selected automatically like any other; whether it beats the `scalar` table on a real Cortex-A core is not known (`FORGE_SIMD_TARGET=scalar` selects the scalar table).
 
 Detection (`dispatch.cpp`) reads `AT_HWCAP` / `AT_HWCAP2` with `getauxval` (Linux) or `elf_aux_info` (FreeBSD; not run). A feature the whole build already requires (`__loongarch_sx`, `__VSX__` with POWER8) counts as present.
 
