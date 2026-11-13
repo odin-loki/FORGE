@@ -171,10 +171,14 @@ VFPv4; the table has Tier A, `seq` and int8 companions (`isa_extra.cpp`).
   was changed; `math_special_values` gained three exact subnormal cases for every table.
 - g++ 13 `arm-linux-gnueabihf` (glibc, the table's files with `-mfpu=neon-vfpv4`), the same CMake configure,
   `QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf`: the same executables and the eight ctest entries pass (13 ctest entries in all).
+  The other suites of the `emu` CI row, built for 32-bit Arm for the first time: `test_dtypes`, `test_kvquant`,
+  `test_support`, `test_tile`, `test_util` pass; **`test_graph` segfaults** after `fusion_shared_int8_activations`
+  (in the conv + batch-norm folding test), also with `FORGE_SIMD_TARGET=scalar`, so not in the `neon` table. Not
+  investigated: nothing but the simd layer has been ported to 32 bits.
 - x86_64, clang 23: `forge_simd_tests`, `ctest -R "simd|lane|^types_|^tiera_|^tables_"` 16/16.
 - Not done: any run on 32-bit Arm hardware; any timing (every checked operation carries one to four extra NEON
-  compares and a branch, so whether `neon` beats `scalar` on a real core is unknown); any test other than the simd
-  ones on 32-bit Arm; the other `vec_gn.hpp` tables (LSX / LASX, VSX, VXE, SIMD128, MSA) were not re-run after the
+  compares and a branch, so whether `neon` beats `scalar` on a real core is unknown); the rest of the test suite on 32-bit Arm
+  (only the six suites above were built); the other `vec_gn.hpp` tables (LSX / LASX, VSX, VXE, SIMD128, MSA) were not re-run after the
   shared `ldexp_int` / rounding helpers were reworded (same operations, compare spelled `raw_lt`); the `emu` CI row
   added for 32-bit Arm has never run on GitHub.
 

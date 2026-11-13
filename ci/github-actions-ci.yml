@@ -171,8 +171,9 @@ jobs:
     # g++-<triple> (the install step tries them in that order and exports the one it found). The loongarch64 and
     # mips64el rows are `experimental`: whether those cross packages exist on the runner image has not been
     # checked (this job has never run on GitHub), so they do not fail the workflow.
-    # The armv7-neon row (32-bit Arm, `neon` table, Cortex-A7 and Cortex-A15 models) is `experimental` too: only the
-    # simd tests have ever been built for 32-bit Arm, so the other suites of EMU_TESTS may not build there.
+    # The armv7-neon row (32-bit Arm, `neon` table, Cortex-A7 and Cortex-A15 models) is `experimental` too: locally
+    # (g++ 13, qemu-arm) its simd tests pass, but test_graph of the last step segfaults on 32-bit Arm, with the
+    # scalar table as well, which has not been looked into.
     name: emu-${{ matrix.name }}
     runs-on: ubuntu-24.04
     continue-on-error: ${{ matrix.experimental == true }}
