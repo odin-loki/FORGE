@@ -100,7 +100,7 @@ TEST(native_shared_library_is_bit_identical) {
     {
         auto ma = model::open(so); auto mr = jit_model(deep_f32());
         inference::session a(ma), b(mr);
-        auto gen = [](session& s) {
+        auto gen = [](inference::session& s) {
             auto g = std::make_shared<grammar>("root ::= [a-z]+ \" \" [0-9]+");
             grammar_constraint gc(g, *s.tokenizer(), int(s.vocab()), s.tokenizer()->eos());
             sampler smp; smp.filter = [&](std::span<float> l) { gc.apply(l); }; smp.allow = [&](int t) { return gc.allows(t); };

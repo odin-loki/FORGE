@@ -69,7 +69,10 @@ public:
     // that is linked into this program. A .fpk with an "aot" section or a sidecar uses its precompiled plans.
     explicit model(const std::string& path, bool verify = false, std::shared_ptr<aot_native::library> lib = nullptr)
         : lib_(open_native(path, std::move(lib))), fpk_path_(lib_ && aot_native::library::is_library(path) ? (lib_->embedded() ? lib_->path() : lib_->fpk_path()) : path),
-          r_(lib_ && lib_->embedded() ? modelfile::reader({lib_->model().fpk_data, std::size_t(lib_->model().fpk_size)}, fpk_path_) : modelfile::reader(admit(fpk_path_))) {
+          r_([&]() -> modelfile::reader {   // not `c ? reader(..) : reader(..)`: MSVC wants the deleted copy constructor for it
+              if (lib_ && lib_->embedded()) return modelfile::reader({lib_->model().fpk_data, std::size_t(lib_->model().fpk_size)}, fpk_path_);
+              return modelfile::reader(admit(fpk_path_));
+          }()) {
         const std::string& fpk_path = fpk_path_;
         // Strict mode (FORGE_PLAN: "verify before load; refuse unsigned files"): FORGE_REQUIRE_SIGNED=1
         // and/or FORGE_TRUSTED_KEYS=<hex pubkey>[,<hex pubkey>...] require a valid (trusted) signature.
