@@ -96,7 +96,7 @@ suite on aarch64 and riscv64 (50/54, STATUS) predate it.
 | mips64el `msa` | zig 0.17 | qemu (`-cpu Loongson-3A4000`) | the same four | everything else; hardware |
 | wasm32 `simd128` | zig 0.17 `wasm32-wasi` | node 22 | `tests/wasm_simd.sh`: `test_simd` 7/7, tables 3/3, Tier A 14/14 one test per process (node segfaults on the whole binary), `vec_types`; also with `WASM_SIMD=0` | any other engine; FORGE as a whole is not ported to WebAssembly |
 | 32-bit x86 `sse2`, `sse4.2` | zig 0.17, by hand | qemu (`qemu-i386`) | `test_simd` 7/7 | no CMake configure; companion tables and `vec_types` not built |
-| 32-bit Arm `neon` | — | — | being fixed, see [STATUS.md](STATUS.md) | — |
+| 32-bit Arm `neon` (NEON + VFPv4; subnormal lanes recomputed with VFP, [simd.md](simd.md#32-bit-arm)) | zig 0.17; g++ 13 cross | qemu (`qemu-arm -cpu cortex-a7`, `cortex-a15`) | `test_simd` 7/7 (default table and forced), `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` and the IEEE lane check 0 failed | **hardware; any timing** (the checks may make it slower than `scalar`: unknown); the rest of FORGE on 32-bit Arm (`test_graph` segfaults there, also with the scalar table) |
 | Raw intrinsic wrappers (Tier R, eight ISA families, 103,666 wrappers) | clang 23 `--target=<triple> -fsyntax-only` (`raw_intrinsics_cross`) | x86 only (`test_simd_raw`) | — | **no non-x86 wrapper has executed**; MSVC; GCC beyond the recorded per-entry rejections |
 
 Defaults that wait on hardware: every int8 table outside the x86 AVX ones (`sse2`, `sse4.2`, AArch64, `rvv`, `lsx`,
@@ -118,7 +118,7 @@ ctest --test-dir build/dev -R raw_intrinsics_cross             # syntax of every
 ```
 
 The toolchain files for the other emulated rows are `aarch64-sve-qemu.cmake`, `riscv64-rvv-qemu.cmake`,
-`ppc64le-vsx-qemu.cmake`, `s390x-vxe-qemu.cmake` and `mips64el-msa-qemu.cmake` in `cmake/toolchains/`.
+`ppc64le-vsx-qemu.cmake`, `s390x-vxe-qemu.cmake`, `mips64el-msa-qemu.cmake` and `armv7-neon-qemu.cmake` in `cmake/toolchains/`.
 
 ## 4. GPU backends
 

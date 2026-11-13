@@ -69,7 +69,6 @@
 #define FORGE_ISA_NS mv_neon
 #define FORGE_ISA_TG forge::simd::armv7_neon
 #define FORGE_ISA_NAME "neon"
-#define FORGE_ISA_ARM32 1
 #endif
 #else
 #error "isa_target.inc: the compile flags enable no Tier P backend (NEON, fixed-length SVE / RVV or a vec_gn.hpp ISA)"

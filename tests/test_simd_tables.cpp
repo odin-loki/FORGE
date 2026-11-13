@@ -47,10 +47,8 @@ TEST(every_kernel_table_has_its_companions) {
         if (k) { kt += ' '; kt += n; }
         if (tier_a_by_name(n)) { at += ' '; at += n; }
         if (seq_by_name(n)) { st += ' '; st += n; }
-#if !defined(__arm__)   // the opt-in Armv7 NEON table has no companions
         CHECK_MSG(k == (tier_a_by_name(n) != nullptr), "tier A table for %s", n);
         CHECK_MSG(k == (seq_by_name(n) != nullptr), "seq table for %s", n);
-#endif
         if (auto* t = tier_a_by_name(n)) CHECK(std::string_view(t->target) == by_name(n)->target);
         if (auto* t = seq_by_name(n)) CHECK(std::string_view(t->target) == by_name(n)->target);
     }
@@ -65,7 +63,7 @@ TEST(every_kernel_table_has_its_companions) {
         CHECK_MSG(best == tier_a_active().target, "tier A active %s, kernels %s", tier_a_active().target, active().target);
         CHECK_MSG(best == seq_active().target, "seq active %s, kernels %s", seq_active().target, active().target);
     }
-#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__aarch64__) && !defined(_M_ARM64) && !defined(__arm__) && defined(__GNUC__)
+#if !defined(__x86_64__) && !defined(_M_X64) && !defined(__aarch64__) && !defined(_M_ARM64) && defined(__GNUC__)
     if (best != "scalar" && !std::getenv("FORGE_QI8_TARGET")) CHECK_MSG(best == qi8_active().target, "qi8 active %s, kernels %s", qi8_active().target, active().target);
 #endif
 }

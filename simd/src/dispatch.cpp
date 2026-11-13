@@ -58,7 +58,7 @@ namespace mv_simd128 { extern const kernels table; extern const isa_tables extra
 namespace mv_msa { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(FORGE_SIMD_HAVE_NEON32)
-namespace mv_neon { extern const kernels table; }
+namespace mv_neon { extern const kernels table; extern const isa_tables extra; }
 #endif
 #if defined(__aarch64__)
 namespace mv_neon { extern const kernels table; extern const isa_tables extra; }
@@ -351,12 +351,9 @@ const kernels* by_name(const char* t) {
     if (n == "msa") return f.msa ? &mv_msa::table : nullptr;
 #endif
 #if defined(FORGE_SIMD_HAVE_NEON32)
-    // Opt-in: Advanced SIMD on AArch32 always flushes subnormals to zero, so results in the subnormal range
-    // (exp below -87, cbrt/erfc of tiny values) miss the oracle tolerance. Never chosen automatically.
-    if (n == "neon") {
-        const char* e = std::getenv("FORGE_SIMD_ARM32_NEON");
-        return e && *e == '1' && f.neon && f.vfpv4 ? &mv_neon::table : nullptr;
-    }
+    // Advanced SIMD on AArch32 flushes subnormals to zero; the backend recomputes those lanes with VFP
+    // instructions (vec_gn.hpp, "Armv7"), so the table gives the scalar table's results and is selected like any other.
+    if (n == "neon") return f.neon && f.vfpv4 ? &mv_neon::table : nullptr;
 #endif
     return nullptr;
 }
@@ -367,7 +364,7 @@ const isa_tables* isa_extra_by_name(const char* t) {
     [[maybe_unused]] const kernels* k = by_name(t);
     if (!k) return nullptr;
 #define FORGE_ISA_EXTRA(ns) if (k == &ns::table) return &ns::extra;
-#if defined(__aarch64__)
+#if defined(__aarch64__) || defined(FORGE_SIMD_HAVE_NEON32)
     FORGE_ISA_EXTRA(mv_neon)
 #endif
 #if defined(FORGE_SIMD_HAVE_SSE)

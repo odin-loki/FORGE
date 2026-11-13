@@ -55,7 +55,8 @@ emulation rows are local and dated.
 | Linux s390x (z14 vector) | locally, zig cross and g++ 13: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-s390x -cpu max` |
 | wasm32-wasi (SIMD128) | simd layer and its tests only, `tests/wasm_simd.sh` | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14 (one test per process), `vec_types` checks under node 22 (2026-11-12) | zig `wasm32-wasi` |
 | Linux mips64el (MSA) | locally, zig cross: the simd tests only | `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, `vec_types` checks under qemu-user only (2026-11-12) | `qemu-mips64el -cpu Loongson-3A4000` |
-| 32-bit x86 (SSE), 32-bit Arm (NEON) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: i386 7/7, arm 5/7 with the opt-in `neon` table, 7/7 without it (2026-11-12) | `qemu-i386`, `qemu-arm -cpu cortex-a7` |
+| 32-bit x86 (SSE) | `test_simd` only, compiled by hand, no CMake configure | qemu-user only: 7/7 (2026-11-12) | `qemu-i386` |
+| 32-bit Arm (NEON + VFPv4) | The simd tests only (`forge_simd_tests`), CMake + `armv7-neon-qemu.cmake` | qemu-user only: `test_simd` 7/7, `test_simd_tables` 3/3, `test_simd_tiera` 14/14, types 0 failed, `neon` the default table (2026-11-13). Never on hardware; never timed | `qemu-arm -cpu cortex-a7`, `-cpu cortex-a15` |
 | Windows under wine | locally, mingw cross | historical full-suite passes (2026-10-29/31) | `tests/wine_run.sh` |
 
 Windows emit goldens (`FORGE_TEST_ONLY=emit test_script`, `windows-msvc`): sh, bash, dash, pwsh and PowerShell 5.1
@@ -155,6 +156,36 @@ The full list, with commands, is [UNTESTED.md](UNTESTED.md). The headline items:
 
 Newest first. Results are from the date given; later code may differ.
 
+### 2026-11-13 (simd: the 32-bit Arm `neon` table gives IEEE results and is selected automatically; emulation only)
+Advanced SIMD on AArch32 runs flush-to-zero whatever `FPSCR` says, so the `neon` table failed `exp-sub`, `cbrt-sub`
+and `erfc` and was opt-in. The Armv7 backend of `vec_gn.hpp` now tests each `add` / `sub` / `mul` / `fma` / `lt` and
+recomputes the lanes NEON may have got wrong (subnormal operand, flushed result, NaN) with VFP instructions
+([simd.md](simd.md), "32-bit Arm"). `FORGE_SIMD_ARM32_NEON` is gone; `neon` is chosen when `AT_HWCAP` has NEON and
+VFPv4; the table has Tier A, `seq` and int8 companions (`isa_extra.cpp`).
+- zig 0.17.1 (clang 22) `arm-linux-musleabihf`, static, CMake with the new `cmake/toolchains/armv7-neon-qemu.cmake`,
+  `ninja forge_simd_tests`, under `qemu-arm -cpu cortex-a7` and `-cpu cortex-a15`, same results on both: `test_simd`
+  7/7 with `neon` active by default and forced, 7/7 with `FORGE_SIMD_TARGET=scalar`; `test_simd_tables` 3/3 (`seq` and
+  int8 tables bit-identical to scalar); `test_simd_tiera` 14/14; `test_simd_types` 3/3; `test_simd_types_neon32`
+  0 of 25.5 million type checks failed and 0 of 13.5 million lane results differ from VFP arithmetic. ctest
+  `lane_neon`, `tables_neon`, `tiera_neon`, `types_neon32` and the four `_a15` ones pass. No tolerance or sweep
+  was changed; `math_special_values` gained three exact subnormal cases for every table.
+- g++ 13 `arm-linux-gnueabihf` (glibc, the table's files with `-mfpu=neon-vfpv4`), the same CMake configure,
+  `QEMU_LD_PREFIX=/usr/arm-linux-gnueabihf`: the same executables and the eight ctest entries pass (13 ctest entries in all).
+  The other suites of the `emu` CI row, built for 32-bit Arm for the first time: `test_dtypes`, `test_kvquant`,
+  `test_support`, `test_tile`, `test_util` pass; **`test_graph` segfaults** after `fusion_shared_int8_activations`
+  (in the conv + batch-norm folding test), also with `FORGE_SIMD_TARGET=scalar`, so not in the `neon` table. Not
+  investigated: nothing but the simd layer has been ported to 32 bits.
+- x86_64, clang 23: `forge_simd_tests`, `ctest -R "simd|lane|^types_|^tiera_|^tables_"` 16/16.
+- wasm32-wasi (zig, node 22.23), `tests/wasm_simd.sh`, because the helpers shared by the GNU-vector backends were
+  reworded: `test_simd` 7/7 with `simd128` active, tables 3/3, types 0 failed, Tier A 13 of 14 one test per process:
+  node segfaults (exit 139) in `sort_matches` every time, and does the same with the previous `vec_gn.hpp`, so
+  that is not from this change (the 2026-11-12 note says each test passed alone).
+- Not done: any run on 32-bit Arm hardware; any timing (every checked operation carries one to four extra NEON
+  compares and a branch, so whether `neon` beats `scalar` on a real core is unknown); the rest of the test suite on 32-bit Arm
+  (only the six suites above were built); the other `vec_gn.hpp` tables (LSX / LASX, VSX, VXE, MSA) were not re-run after the
+  shared `ldexp_int` / rounding helpers were reworded (same operations, compare spelled `raw_lt`); the `emu` CI row
+  added for 32-bit Arm has never run on GitHub.
+
 ### 2026-11-13 (final state of the integration branch; what was not run; owner decisions)
 Integration branch `ccr-54bb5525-7f3iii` at c452a61: about 27 feature branches merged over 2026-11-12/13, roughly
 191,000 lines added across about 1,030 files since main at b135941. This entry is the record of the final state; the
@@ -217,7 +248,7 @@ Integration branch `ccr-54bb5525-7f3iii` at c452a61: about 27 feature branches m
   2. The seven grid-codebook GGUF types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) will not be supported:
      FORGE is clean-room and the codebooks will not be copied. The importer keeps refusing them with an error that
      names the type ([modelfile.md](modelfile.md#gguf-tensor-types)).
-  3. The 32-bit Arm NEON table is being fixed separately; see its own entry.
+  3. The 32-bit Arm NEON table is kept and fixed; see its own entry above.
   4. The clang floor stays as described above.
 - **Documentation.** [UNTESTED.md](UNTESTED.md) is the single list of what has not been tested, organised by
   platform, CPU architecture, GPU backend and feature, with commands. README.md, TODO.md, docs/index.md and the
