@@ -1,6 +1,8 @@
 #include "check.hpp"
 #include <forge/inference/inference.hpp>
 #include <forge/import/gguf.hpp>
+#include <forge/import/requant.hpp>
+#include <forge/modelfile/shard.hpp>
 #include <cstdio>
 #include <filesystem>
 #if !defined(_WIN32)
@@ -159,14 +161,751 @@ output w : f32[8]
     CHECK_THROWS(modelfile::build_graph(modelfile::parse_blueprint("blueprint \"e\"\nop f(a) { b = a }\ninput x : f32[2]\ngraph { y = f(x) }\noutput y : f32[2]"), {}));
 }
 
+// ---- optional sections of FORGE_PLAN D.2: STATE, ADAPTERS, CALIB ----
+namespace {
+using sec_list = std::vector<std::pair<std::string, std::string>>;
+sec_list read_sections(const std::string& f) {
+    sec_list m; modelfile::reader r(f);
+    for (auto& [n, s] : r.sections()) { auto b = r.raw_section_bytes(n); m.emplace_back(n, std::string(reinterpret_cast<const char*>(b.data()), b.size())); }
+    return m;
+}
+std::string& sec(sec_list& m, const std::string& n) { for (auto& [k, v] : m) if (k == n) return v; m.emplace_back(n, ""); return m.back().second; }
+void drop_sec(sec_list& m, const std::string& n) { std::erase_if(m, [&](auto& kv) { return kv.first == n; }); }
+std::string replace_all(std::string s, const std::string& a, const std::string& b) { for (std::size_t p = 0; (p = s.find(a, p)) != std::string::npos; p += b.size()) s.replace(p, a.size(), b); return s; }
+}
+
+TEST(fpk_state_schema_section) {
+    auto llama = forge_test::make_tiny_model(tmp("st_llama.fpk")), qwen = forge_test::make_tiny_qwen35_model(tmp("st_qwen.fpk"));
+    for (auto& f : {llama, qwen}) {
+        modelfile::reader r(f);
+        CHECK(r.has_section("state"));
+        auto sc = modelfile::state_schema::parse(r.section_text("state"));
+        CHECK(!sc.slots.empty() && modelfile::state_schema::parse(sc.dump()) == sc);
+        // the declared slots are exactly what a session ends up holding, with the same row shapes
+        inference::session s(f); s.forward(std::vector<int>{1, 2, 3});
+        CHECK(s.state().slots.size() == sc.slots.size());
+        std::size_t recurrent = 0;
+        for (auto& [name, sl] : s.state().slots) {
+            auto* d = sc.find(name);
+            CHECK_MSG(d != nullptr, "slot %s is not declared", name.c_str());
+            if (!d) continue;
+            CHECK(d->recurrent == sl.fixed && d->dtype == "f32");
+            if (sl.fixed) { CHECK(sl.buf.shape == d->shape); ++recurrent; }
+            else CHECK(shape_t(sl.buf.shape.begin() + 1, sl.buf.shape.end()) == d->shape);
+        }
+        CHECK((recurrent > 0) == (f == qwen));
+        CHECK(s.shared_model()->state_schema() && *s.shared_model()->state_schema() == sc);
+        std::printf("  %s: %zu slots, %zu recurrent\n", f == llama ? "llama" : "qwen3.5", sc.slots.size(), recurrent);
+    }
+    {   // llama: kv.<layer>.k / .v, rows of [n_kv heads, head_dim]
+        modelfile::reader r(llama); auto sc = modelfile::state_schema::parse(r.section_text("state"));
+        CHECK(sc.slots.size() == 4 && sc.find("kv.0.k") && sc.find("kv.1.v") && sc.find("kv.0.k")->shape == shape_t({2, 8}) && !sc.find("kv.0.k")->recurrent);
+    }
+    // a file without the section (every file written before it existed): opens as before, the schema is derived
+    auto old = tmp("st_old.fpk");
+    { auto m = read_sections(llama); drop_sec(m, "state"); modelfile::detail::write_sections(old, m); }
+    {
+        inference::session a(llama), b(old);
+        CHECK(!b.file().has_section("state") && b.shared_model()->state_schema() && *b.shared_model()->state_schema() == *a.shared_model()->state_schema());
+        CHECK(a.forward(std::vector<int>{5, 6, 7}) == b.forward(std::vector<int>{5, 6, 7}));
+        auto blob = a.save_prefix();
+        inference::session c(old); c.load_prefix(blob);
+        CHECK(c.forward(std::vector<int>{8}) == a.forward(std::vector<int>{8}));
+    }
+    // a section that does not describe the blueprint's state is refused at open
+    auto bad = tmp("st_bad.fpk");
+    for (auto [from, to] : {std::pair<std::string, std::string>{"\"shape\":[2,8]", "\"shape\":[2,9]"}, {"kv.1.v", "kv.7.v"}, {"\"kind\":\"append\"", "\"kind\":\"recurrent\",\"op\":\"causal_conv\""}}) {
+        auto m = read_sections(llama); auto& t = sec(m, "state"); auto was = t; t = replace_all(t, from, to); CHECK(t != was);
+        modelfile::detail::write_sections(bad, m);
+        CHECK_THROWS(inference::model(bad));
+        modelfile::reader r(bad); CHECK(r.verify().empty());   // the container itself is fine: inspect / verify still work
+    }
+    for (const char* txt : {"", "[]", "{\"version\":2,\"slots\":[]}", "{\"version\":1}", "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[],\"dtype\":\"f32\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[1e12],\"dtype\":\"f32\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[2],\"dtype\":\"i8\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"append\",\"shape\":[2],\"dtype\":\"f32\"},{\"name\":\"a\",\"kind\":\"append\",\"shape\":[2],\"dtype\":\"f32\"}]}",
+                            "{\"version\":1,\"slots\":[{\"name\":\"a\",\"kind\":\"recurrent\",\"shape\":[2],\"dtype\":\"f32\"}]}"})
+        CHECK_THROWS(modelfile::state_schema::parse(txt));
+
+    // ---- a saved prefix is checked against the schema before it is restored
+    auto patch_blob = [](std::vector<std::byte> b, const std::string& from, const std::string& to) {
+        std::string t(reinterpret_cast<const char*>(b.data()), b.size()); auto p = t.find(from);
+        if (p != std::string::npos) std::memcpy(b.data() + p, to.data(), to.size());
+        return b;
+    };
+    for (const char* kc : {"f32", "int8"}) {
+        inference::session_options so; so.kv_codec = kc;
+        inference::session a(llama, so); a.forward(std::vector<int>{1, 2, 3, 4});
+        auto blob = a.save_prefix();
+        { inference::session b(llama, so); b.load_prefix(blob); CHECK(b.position() == 4 && b.forward(std::vector<int>{9}) == a.forward(std::vector<int>{9})); a.rewind(4); }
+        { inference::session b(llama, so); CHECK_THROWS(b.load_prefix(patch_blob(blob, "kv.0.k", "kv.9.k"))); CHECK(b.position() == 0); }   // a slot the model does not declare
+        { inference::session b(llama, so); CHECK_THROWS(b.load_prefix(patch_blob(blob, "kv.0.k", "kv.0.v"))); }                           // a slot twice
+        {   // a row dimension changed in the blob's shape (the u64 after the rank of the first slot)
+            auto t = blob; std::string txt(reinterpret_cast<const char*>(t.data()), t.size()); auto p = txt.find("kv.0.k");
+            CHECK(p != std::string::npos);
+            std::uint64_t d1; std::size_t at = p + 6 + 8 * 5 + 8;   // name | fixed codec len cap rank | dim0 | dim1
+            std::memcpy(&d1, t.data() + at, 8); CHECK(d1 == 2); d1 = 3; std::memcpy(t.data() + at, &d1, 8);
+            inference::session b(llama, so); CHECK_THROWS(b.load_prefix(t));
+        }
+        { inference::session q(qwen, so); CHECK_THROWS(q.load_prefix(blob)); }   // another model's state
+        { auto cut = blob; cut.resize(cut.size() / 2); inference::session b(llama, so); CHECK_THROWS(b.load_prefix(cut)); CHECK(b.position() == 0); }
+    }
+    {   // recurrent state: a full-length prefix restores; a blob whose recurrent buffer has another shape does not
+        inference::session a(qwen); a.forward(std::vector<int>{1, 2, 3});
+        auto blob = a.save_prefix();
+        inference::session b(qwen); b.load_prefix(blob); CHECK(b.forward(std::vector<int>{4}) == a.forward(std::vector<int>{4}));
+        inference::session l(llama); CHECK_THROWS(l.load_prefix(blob));
+    }
+}
+
+TEST(fpk_embedded_adapters) {
+    auto base = forge_test::make_tiny_model(tmp("ad_base.fpk")), lora = tmp("ad_lora.fpk"), lora2 = tmp("ad_lora2.fpk"), f = tmp("ad.fpk");
+    std::mt19937 rng(21); std::normal_distribution<float> N(0, 0.3f);
+    auto make_lora = [&](const std::string& path, std::vector<std::string> targets, i64 rank, double alpha) {
+        modelfile::writer w;
+        for (auto& t : targets) {
+            std::vector<float> a(std::size_t(rank * 32)), b(std::size_t(32 * rank));
+            for (auto& x : a) x = N(rng);
+            for (auto& x : b) x = N(rng);
+            w.add_tensor(t + ".lora_a", {rank, 32}, a); w.add_tensor(t + ".lora_b", {32, rank}, b);
+        }
+        w.set_manifest(json::value(json::object{{"format", "fpk"}, {"lora_alpha", alpha}}));
+        w.set_section("blueprint", "blueprint \"lora\"\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n");
+        w.write(path);
+    };
+    make_lora(lora, {"layer.0.wq", "layer.1.wo"}, 2, 4); make_lora(lora2, {"layer.1.wq"}, 3, 6);
+    const std::vector<int> ids{1, 2, 3, 4};
+    std::vector<float> ref_base, ref_a, ref_b;
+    {   // the reference: the same adapters registered from their own files
+        auto m = inference::model::open(base); m->add_adapter_file("a", lora); m->add_adapter_file("b", lora2);
+        inference::session s(m); ref_base = s.forward(ids); s.set_adapter("a"); ref_a = s.forward(ids); s.set_adapter("b"); ref_b = s.forward(ids);
+        CHECK(ref_a != ref_base && ref_b != ref_base && ref_a != ref_b);
+    }
+    auto info = modelfile::embed_adapter(base, f, "style", lora);
+    CHECK(info.rank == 2 && info.alpha == 4 && info.targets == std::vector<std::string>({"layer.0.wq", "layer.1.wo"}));
+    modelfile::embed_adapter(f, f, "tone-2", lora2);
+    CHECK_THROWS(modelfile::embed_adapter(f, f, "style", lora));                 // the name is taken
+    CHECK_THROWS(modelfile::embed_adapter(f, f, "bad name", lora));              // not an identifier
+    CHECK_THROWS(modelfile::embed_adapter(f, f, "../x", lora));
+    { make_lora(tmp("ad_bad.fpk"), {"layer.0.nope"}, 2, 1); CHECK_THROWS(modelfile::embed_adapter(f, f, "z", tmp("ad_bad.fpk"))); }   // targets a weight the model lacks
+    {
+        modelfile::reader r(f); auto all = modelfile::read_adapters(r);
+        CHECK(r.verify().empty() && all.size() == 2 && all[0].name == "style" && all[1].name == "tone-2" && all[1].rank == 3 && all[1].alpha == 6);
+        CHECK(r.tensors().count("adapter.style.layer.0.wq.lora_a") && r.tensors().count("adapter.tone-2.layer.1.wq.lora_b"));
+        modelfile::reader b(base);
+        for (auto& [n, e] : b.tensors()) CHECK(r.entry(n).blake3 == e.blake3 && r.entry(n).offset == e.offset);   // base tensors did not move
+    }
+    {   // selected by name; read on first use; same logits as the registered adapters; the base is unchanged
+        auto m = inference::model::open(f);
+        CHECK(m->embedded_adapters().size() == 2 && m->has_adapter("style") && m->has_adapter("tone-2") && !m->has_adapter("nope"));
+        inference::session s(m);
+        CHECK(s.forward(ids) == ref_base);
+        s.set_adapter("style"); CHECK(s.forward(ids) == ref_a);
+        s.set_adapter("tone-2"); CHECK(s.forward(ids) == ref_b);
+        s.set_adapter(""); CHECK(s.forward(ids) == ref_base);
+        CHECK_THROWS(s.set_adapter("nope"));
+        inference::session s2(m); s2.set_adapter("style"); CHECK(s2.forward(ids) == ref_a);   // a second session shares the loaded adapter
+    }
+    {   // signatures cover the adapters: sign after embedding, then any change to an adapter breaks the digest
+        auto kp = modelfile::generate_keypair(); auto g = tmp("ad_signed.fpk");
+        modelfile::sign_file(f, g, kp);
+        { modelfile::reader r(g); auto rep = modelfile::verify_signature(r); CHECK(rep.digest_ok && rep.valid_keys.size() == 1 && modelfile::read_adapters(r).size() == 2); }
+        auto m = read_sections(g); sec(m, "adapters") = replace_all(sec(m, "adapters"), "\"alpha\":4", "\"alpha\":5");
+        modelfile::detail::write_sections(g, m);
+        { modelfile::reader r(g); CHECK(!modelfile::verify_signature(r).digest_ok); }
+        modelfile::sign_file(f, g, kp);
+        modelfile::embed_adapter(g, g, "third", lora2);                                 // rewriting drops the signature
+        { modelfile::reader r(g); CHECK(!r.has_section("signature") && modelfile::read_adapters(r).size() == 3); }
+    }
+    {   // encrypted: embed first, then seal; a sealed file is refused by the tools and runs with the key
+        auto key = modelfile::generate_model_key(); auto e = tmp("ad_enc.fpk");
+        modelfile::encrypt_file(f, e, key, {.chunk_bytes = 4096});
+        CHECK_THROWS(modelfile::embed_adapter(e, e, "x", lora)); CHECK_THROWS(modelfile::remove_adapter(e, e, "style"));
+        forge_test::set_env("FORGE_MODEL_KEY", modelfile::detail::hex(key.data(), 32).c_str());
+        { inference::session s(e); s.set_adapter("style"); CHECK(s.forward(ids) == ref_a); }
+        forge_test::set_env("FORGE_MODEL_KEY", nullptr);
+    }
+    {   // a section that does not fit the tensor index is refused when the model opens
+        auto g = tmp("ad_bad2.fpk");
+        for (auto [from, to] : {std::pair<std::string, std::string>{"layer.1.wo", "layer.9.wo"}, {"\"rank\":2", "\"rank\":3"}, {"\"name\":\"style\"", "\"name\":\"tone-2\""}, {"\"version\":1", "\"version\":9"}}) {
+            auto m = read_sections(f); auto& t = sec(m, "adapters"); auto was = t; t = replace_all(t, from, to); CHECK(t != was);
+            modelfile::detail::write_sections(g, m);
+            CHECK_THROWS(inference::model(g));
+        }
+    }
+    modelfile::remove_adapter(f, f, "style");
+    { modelfile::reader r(f); auto all = modelfile::read_adapters(r); CHECK(all.size() == 1 && all[0].name == "tone-2" && !r.tensors().count("adapter.style.layer.0.wq.lora_a") && r.verify().empty()); }
+    CHECK_THROWS(modelfile::remove_adapter(f, f, "style"));
+    modelfile::remove_adapter(f, f, "tone-2");
+    { modelfile::reader r(f); CHECK(!r.has_section("adapters")); inference::session s(f); CHECK(s.forward(ids) == ref_base); }
+    {   // an aligned file stays aligned
+        auto al = tmp("ad_al.fpk");
+        { modelfile::writer w; w.set_alignment(4096); std::vector<float> wq(32 * 32, 0.5f); w.add_tensor("layer.0.wq", {32, 32}, wq); w.add_tensor("layer.1.wo", {32, 32}, wq);
+          w.set_manifest(json::value(json::object{{"format", "fpk"}})); w.set_section("blueprint", "blueprint \"t\"\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n"); w.write(al); }
+        modelfile::embed_adapter(al, al, "style", lora);
+        modelfile::reader r(al); CHECK(r.tensor_alignment() == 4096 && r.misaligned_tensors().empty() && r.verify().empty() && modelfile::read_adapters(r).size() == 1);
+    }
+}
+
+TEST(fpk_calibration_section_and_requant) {
+    // statistics
+    std::vector<float> v{-2, -1, 0, 1, 2, 4};
+    auto st = modelfile::tensor_stats::of(v);
+    CHECK(st.n == 6 && st.min == -2 && st.max == 4 && st.absmax == 4 && std::fabs(st.mean - 4.0 / 6) < 1e-12 && std::fabs(st.rms - std::sqrt(26.0 / 6)) < 1e-12);
+    CHECK(st.hist.size() == modelfile::calib_bins && st.hist[0] == 1 && st.hist[16] == 2 && st.hist[32] == 2 && st.hist[63] == 1);
+    CHECK(std::fabs(st.quantile(0.5) - 4.0 * 17 / 64) < 1e-12 && st.quantile(1.0) == 4);
+    CHECK(modelfile::tensor_stats::of({}).n == 0 && modelfile::tensor_stats::of(std::vector<float>(5, 0.f)).crest() == 0);
+    modelfile::calib_table ct; ct.tensors["a"] = st; ct.tensors["b"] = modelfile::tensor_stats::of(std::vector<float>(7, 1.5f));
+    auto back = modelfile::calib_table::parse(ct.dump());
+    CHECK(back.tensors.size() == 2 && back.find("a")->hist == st.hist && std::fabs(back.find("a")->rms - st.rms) < 1e-8 && back.find("b")->crest() == 1);
+    for (const char* txt : {"", "[]", "{\"version\":3,\"tensors\":{}}", "{\"version\":1}", "{\"version\":1,\"tensors\":{\"a\":{\"n\":-1}}}",
+                            "{\"version\":1,\"tensors\":{\"a\":{\"n\":2,\"hist\":[1,2]}}}", "{\"version\":1,\"tensors\":{\"a\":{\"n\":1,\"min\":2,\"max\":1}}}",
+                            "{\"version\":1,\"tensors\":{\"a\":{\"n\":1},\"a\":{\"n\":1}}}"})
+        CHECK_THROWS(modelfile::calib_table::parse(txt));
+
+    // the recipe reads them: one step up the ladder at the crest threshold, two at twice it; only the forge mixes
+    modelfile::calib_table rt;
+    auto with_crest = [](double c) { modelfile::tensor_stats s; s.n = 1; s.rms = 1; s.absmax = c; return s; };
+    rt.tensors["layer.5.wq"] = with_crest(13); rt.tensors["layer.6.wq"] = with_crest(30); rt.tensors["layer.7.wq"] = with_crest(5);
+    import::quant_recipe q; q.ftype = "q4_k_m"; q.n_layer = 12;
+    CHECK(import::recipe_type(q, "layer.5.wq", 256) == "q4_k");
+    q.calib = &rt;
+    CHECK(import::recipe_type(q, "layer.5.wq", 256) == "q5_k" && import::recipe_type(q, "layer.6.wq", 256) == "q6_k" && import::recipe_type(q, "layer.7.wq", 256) == "q4_k");
+    CHECK(import::recipe_type(q, "layer.8.wq", 256) == "q4_k");                                    // no statistics: no change
+    { auto p = q; p.calib_crest = 40; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); p.calib_crest = 0; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); }
+    { auto p = q; p.recipe = "llama"; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); }   // the port of llama.cpp's rules is left alone
+    { auto p = q; p.pure = true; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q4_k"); }
+    { auto p = q; p.tensor_types = {{"layer\\.6\\.wq", "q8_0"}}; CHECK(import::recipe_type(p, "layer.6.wq", 256) == "q8_0"); }   // explicit overrides win
+    { auto p = q; p.ftype = "q5_k_m"; rt.tensors["layer.0.wv"] = with_crest(30); CHECK(import::recipe_type(p, "layer.0.wv", 256) == "q8_0"); }   // q6_k (more bits) -> q8_0, top of the ladder
+    CHECK(import::recipe_type(q, "layer.6.wq", 96) == "q8_0");                                    // the shape fallback still applies after the move
+
+    // forge requant: a model with f32 weights, one of them with a range set by two outliers
+    auto src = tmp("rq_src.fpk"), out = tmp("rq_out.fpk"), out2 = tmp("rq_out2.fpk"), out3 = tmp("rq_out3.fpk");
+    std::mt19937 rng(9); std::normal_distribution<float> N(0, 0.05f);
+    std::vector<float> plain(256 * 256), spiky(256 * 256), norm(256, 1.f), emb(64 * 256);
+    for (auto& x : plain) x = N(rng);
+    for (auto& x : spiky) x = N(rng);
+    for (auto& x : emb) x = N(rng);
+    spiky[1234] = 2.5f; spiky[40000] = -2.5f;
+    {
+        modelfile::writer w;
+        w.add_tensor("tok_emb", {64, 256}, emb); w.add_tensor("layer.0.wq", {256, 256}, spiky); w.add_tensor("layer.0.attn_norm", {256}, norm);
+        w.add_tensor("layer.1.wq", {256, 256}, plain); w.add_tensor("layer.1.w_gate", {256, 256}, plain, "q8_0"); w.add_tensor("adapter.s.layer.1.wq.lora_a", {2, 256}, std::vector<float>(512, 0.1f));
+        w.set_manifest(json::value(json::object{{"format", "fpk"}, {"codec", "f32"}}));
+        w.set_section("blueprint", "blueprint \"rq\"\nparams { n_layers: 2 }\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n");
+        w.set_section("license", "test licence"); w.write(src);
+    }
+    import::requant_options ro; ro.base.codec = "q4_k_m";
+    auto rep = import::requantise(src, out, ro);
+    CHECK(rep.tensors == 6 && rep.requantised == 3 && rep.kept == 3 && !rep.calib_from_file && rep.calib_moved == 1);
+    {
+        modelfile::reader r(out), s0(src);
+        CHECK(r.verify().empty() && r.entry("layer.1.wq").codec == "q4_k" && r.entry("layer.0.wq").codec == "q6_k");   // crest 2.5 / 0.052 = 48: two steps
+        CHECK(r.entry("tok_emb").codec == "q8_0" && r.entry("layer.0.attn_norm").codec == "f32" && r.entry("layer.1.w_gate").codec == "q8_0" && r.entry("adapter.s.layer.1.wq.lora_a").codec == "f32");
+        CHECK(r.entry("layer.1.w_gate").blake3 == s0.entry("layer.1.w_gate").blake3);                                 // already quantised: copied, not decoded and quantised again
+        CHECK(r.section_text("license") == "test licence" && r.manifest().str_or("codec", "") == "q4_k_m" && r.has_section("calib"));
+        auto c2 = modelfile::calib_table::parse(r.section_text("calib"));
+        CHECK(c2.tensors.size() == 3 && c2.find("layer.0.wq") && c2.find("layer.0.wq")->absmax == 2.5 && c2.find("layer.0.wq")->crest() > 24);
+        auto d = r.load("layer.1.wq"); double e = 0; for (std::size_t i = 0; i < plain.size(); ++i) e = std::max(e, double(std::fabs(d.data[i] - plain[i])));
+        CHECK(e < 0.05);
+    }
+    ro.use_calib = false;
+    auto rep2 = import::requantise(src, out2, ro);
+    { modelfile::reader r(out2); CHECK(rep2.calib_moved == 0 && r.entry("layer.0.wq").codec == "q4_k" && !r.has_section("calib")); }
+    // the statistics travel: quantising the q8_0 copy again (which has no f32 weights left to measure) still finds them
+    ro.use_calib = true; ro.base.codec = "q8_0";
+    { auto r1 = import::requantise(src, out3, ro); modelfile::reader r(out3); CHECK(r1.requantised == 3 && r.entry("layer.0.wq").codec == "q8_0" && r.has_section("calib")); }
+    ro.base.codec = "q4_k_m";
+    { auto r3 = import::requantise(out3, out2, ro); CHECK(r3.calib_from_file && r3.requantised == 0 && r3.kept == 6); }   // nothing float left: all copied, with a calib section read
+    CHECK_THROWS(import::requantise(src, src, ro));
+    { import::requant_options bad; bad.base.codec = "nope"; CHECK_THROWS(import::requantise(src, out2, bad)); }
+}
+
+// ---- the binary blueprint form (FORGE_PLAN D.3 "two forms, lossless round-trip") ----
+namespace {
+// a template with its {{placeholders}} bound: the default when it has one, else 1 (a value every template lexes with)
+std::string bind_placeholders(std::string t) {
+    for (std::size_t p = 0; (p = t.find("{{", p)) != std::string::npos;) {
+        auto e = t.find("}}", p); if (e == std::string::npos) break;
+        auto key = t.substr(p + 2, e - p - 2); auto bar = key.find('|');
+        std::string v = bar == std::string::npos ? "1" : key.substr(bar + 1);
+        t.replace(p, e - p + 2, v); p += v.size();
+    }
+    return t;
+}
+std::string slurp(const std::filesystem::path& p) { std::ifstream f(p, std::ios::binary); return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()}; }
+}
+
+TEST(blueprint_binary_form_round_trips) {
+    namespace fs = std::filesystem;
+    std::vector<std::pair<std::string, std::string>> texts;   // (label, blueprint text)
+    for (auto& e : fs::directory_iterator(import::template_dir())) if (e.path().extension() == ".fbp") texts.emplace_back("template " + e.path().filename().string(), bind_placeholders(slurp(e.path())));
+    for (auto& e : fs::directory_iterator(fs::path(FORGE_SOURCE_DIR) / "fuzz" / "corpus" / "blueprint")) if (e.path().extension() == ".fbp") texts.emplace_back("fuzz seed " + e.path().filename().string(), slurp(e.path()));
+    CHECK(texts.size() >= 16 + 5);
+    std::size_t parsed = 0, text_bytes = 0, bin_bytes = 0;
+    for (auto& [label, text] : texts) {
+        auto canon = modelfile::canonical_blueprint_text(text);
+        auto bin = modelfile::encode_blueprint(text);
+        modelfile::binary_blueprint_info bi;
+        auto toks = modelfile::decode_blueprint(bin, &bi);
+        auto back = modelfile::canonical_blueprint_text(toks);
+        CHECK_MSG(back == canon, "%s: text -> binary -> text is not byte-identical after canonical formatting", label.c_str());
+        CHECK_MSG(modelfile::canonical_blueprint_text(canon) == canon, "%s: the canonical text is not a fixed point", label.c_str());
+        CHECK_MSG(modelfile::encode_blueprint(back) == bin, "%s: binary -> text -> binary changed the bytes", label.c_str());
+        CHECK_MSG(modelfile::blueprint_text(std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size())) == canon, "%s: blueprint_text", label.c_str());
+        // token for token: kinds, names, values
+        auto lexed = modelfile::bp_lex(text); lexed.pop_back();
+        bool same = lexed.size() == toks.size();
+        for (std::size_t i = 0; same && i < toks.size(); ++i)
+            same = lexed[i].kind == toks[i].kind && (lexed[i].kind == modelfile::bp_token::k_num ? lexed[i].num == toks[i].num : lexed[i].text == toks[i].text);
+        CHECK_MSG(same, "%s: the decoded tokens differ from the lexed ones", label.c_str());
+        text_bytes += canon.size(); bin_bytes += bin.size();
+        // where the text parses, the binary form parses to the same blueprint
+        try {
+            auto a = modelfile::parse_blueprint(text);
+            auto b = modelfile::load_blueprint(std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
+            ++parsed;
+            bool eq = a.name == b.name && a.opset == b.opset && a.params == b.params && a.str_params == b.str_params && a.session == b.session && a.states.size() == b.states.size() &&
+                      a.inputs.size() == b.inputs.size() && a.outputs.size() == b.outputs.size() && a.composites.size() == b.composites.size() &&
+                      a.graph_end - a.graph_begin == b.graph_end - b.graph_begin && bi.name == a.name && int(bi.opset) == a.opset && bi.session == a.session;
+            for (std::size_t i = 0; eq && i < a.inputs.size(); ++i) eq = a.inputs[i].name == b.inputs[i].name && a.inputs[i].dims == b.inputs[i].dims && a.inputs[i].dtype == b.inputs[i].dtype;
+            for (std::size_t i = 0; eq && i < a.states.size(); ++i) eq = a.states[i].name == b.states[i].name && a.states[i].count == b.states[i].count && a.states[i].kind == b.states[i].kind && a.states[i].args == b.states[i].args;
+            CHECK_MSG(eq, "%s: the binary form parses to another blueprint", label.c_str());
+        } catch (const forge_exception&) {}   // a template bound with placeholder 1s need not be a valid blueprint; the token round trip above still holds
+    }
+    CHECK(parsed >= 16);
+    std::printf("  %zu blueprints (%zu parse), canonical text %zu bytes, binary %zu bytes (%.0f%%)\n", texts.size(), parsed, text_bytes, bin_bytes, 100.0 * double(bin_bytes) / double(text_bytes));
+
+    // numbers keep their value, not their spelling; comments and layout go
+    {
+        auto t = "blueprint \"n\" opset 1 # a comment\nparams { a: 1e-5  b: 0.00001 c: 128256 d: 1.5e300 e: .5 f: 9007199254740993 }\ninput x : f32[seq]\ngraph { y = scale(x, alpha: a) // tail\n }\noutput y : f32[seq]\n";
+        auto bin = modelfile::encode_blueprint(t);
+        auto txt = modelfile::blueprint_text(std::string_view(reinterpret_cast<const char*>(bin.data()), bin.size()));
+        CHECK(txt.find("comment") == std::string::npos && txt.find("tail") == std::string::npos);
+        auto a = modelfile::parse_blueprint(t), b = modelfile::parse_blueprint(txt);
+        CHECK(a.params == b.params && b.param("a") == 1e-5 && b.param("b") == 0.00001 && b.param("c") == 128256 && b.param("d") == 1.5e300 && b.param("e") == 0.5 && b.param("f") == 9007199254740993.0);
+        CHECK(txt.find("a: 1e-05") != std::string::npos && txt.find("c: 128256") != std::string::npos && txt.find("e: 0.5") != std::string::npos);
+        std::printf("%s", txt.c_str());
+    }
+    // tokens that would fuse if printed carelessly
+    for (const char* t : {"a . . b", "x = 1 . y", "x = a / / b", "x = a . 5", "x = 0 .. n", "x = 0.5 .. n", "x = a .. . b", "x = 1 e5", "x = a - 1 - - 2", "f ( ) [ ] { }", "\"s\" \"t\" \"\"", "x = .. 8 .. .. 9"}) {
+        auto lexed = modelfile::bp_lex(t); lexed.pop_back();
+        auto back = modelfile::bp_lex(modelfile::canonical_blueprint_text(lexed)); back.pop_back();
+        bool same = lexed.size() == back.size();
+        for (std::size_t i = 0; same && i < lexed.size(); ++i) same = lexed[i].kind == back[i].kind && lexed[i].text == back[i].text && lexed[i].num == back[i].num;
+        CHECK_MSG(same, "'%s' does not survive canonical formatting", t);
+        auto bin = modelfile::encode_blueprint(t);
+        CHECK(modelfile::encode_blueprint(modelfile::canonical_blueprint_text(modelfile::decode_blueprint(bin))) == bin);
+    }
+
+    // the decoder refuses everything that is not the canonical encoding
+    auto good = modelfile::encode_blueprint("blueprint \"d\" opset 3\nparams { n: 2 eps: 0.5 }\ninput x : f32[seq]\ngraph { y = relu(x) z = relu(y) }\noutput z : f32[seq]\nsession embedding\n");
+    CHECK(modelfile::decode_blueprint(good).size() > 20);
+    // what a reader from before the binary form does with it: the text parser refuses it (a clean parse error)
+    { bool pe = false; try { (void)modelfile::parse_blueprint(std::string_view(reinterpret_cast<const char*>(good.data()), good.size())); } catch (const forge_exception& e) { pe = e.code == errc::parse_error; } CHECK(pe); }
+    for (std::size_t cut = 0; cut < good.size(); ++cut) { auto b = good; b.resize(cut); CHECK_THROWS(modelfile::decode_blueprint(b)); }   // every truncation
+    { auto b = good; b.push_back(0); CHECK_THROWS(modelfile::decode_blueprint(b)); }                                                         // trailing bytes
+    { auto b = good; b[8] = 2; CHECK_THROWS(modelfile::decode_blueprint(b)); }                                                               // another version
+    { auto b = good; b[12] = 1; CHECK_THROWS(modelfile::decode_blueprint(b)); }                                                              // header opset != the tokens' opset
+    std::size_t rejected = 0, accepted_same = 0;
+    for (std::size_t i = 8; i < good.size(); ++i) for (int bit = 0; bit < 8; ++bit) {
+        auto b = good; b[i] ^= std::uint8_t(1u << bit);
+        try {
+            auto toks = modelfile::decode_blueprint(b);
+            // a flip the decoder accepts is another valid canonical encoding (a changed name or number): it must still round-trip
+            if (modelfile::encode_blueprint(modelfile::canonical_blueprint_text(toks)) == b) ++accepted_same; else CHECK_MSG(false, "byte %zu bit %d: accepted but not canonical", i, bit);
+        } catch (const forge_exception&) { ++rejected; }
+    }
+    std::printf("  bit flips: %zu rejected, %zu accepted as another canonical blueprint\n", rejected, accepted_same);
+    CHECK(rejected > 100);
+
+    // a model file with a binary blueprint: same logits, same state; converting back gives the canonical text
+    auto src = forge_test::make_tiny_model(tmp("bb_src.fpk")), bin = tmp("bb_bin.fpk"), txt = tmp("bb_txt.fpk");
+    CHECK(modelfile::convert_blueprint_section(src, bin, true) && !modelfile::convert_blueprint_section(bin, bin, true));
+    {
+        modelfile::reader rb(bin), rs(src);
+        CHECK(modelfile::is_binary_blueprint(rb.section_text("blueprint")) && rb.verify().empty() && rb.manifest().str_or("blueprint_form", "") == "binary" && rb.manifest().num_or("forge_format_minor", 0) == 2);
+        CHECK(rb.section_text("blueprint").size() < rs.section_text("blueprint").size());
+        for (auto& [n, e] : rs.tensors()) CHECK(rb.entry(n).blake3 == e.blake3);
+        inference::session a(src), b(bin);
+        CHECK(a.forward(std::vector<int>{1, 2, 3}) == b.forward(std::vector<int>{1, 2, 3}));
+        CHECK(*a.shared_model()->state_schema() == *b.shared_model()->state_schema());
+    }
+    CHECK(modelfile::convert_blueprint_section(bin, txt, false));
+    {
+        modelfile::reader rt(txt), rs(src);
+        CHECK(!modelfile::is_binary_blueprint(rt.section_text("blueprint")) && rt.section_text("blueprint") == modelfile::canonical_blueprint_text(rs.section_text("blueprint")) && rt.manifest().str_or("blueprint_form", "") == "text");
+        inference::session a(src), c(txt); CHECK(a.forward(std::vector<int>{4, 5}) == c.forward(std::vector<int>{4, 5}));
+    }
+    {   // a hostile binary section fails at open with a format error, not in the parser
+        auto m = read_sections(bin); auto& b = sec(m, "blueprint"); b[b.size() / 2] ^= 0x55; b.push_back('\0');
+        modelfile::detail::write_sections(txt, m);
+        CHECK_THROWS(inference::model(txt));
+    }
+}
+
+// ---- sharded models and the content-addressed blob store (FORGE_PLAN D.3) ----
+TEST(fpk_shards_and_blob_store) {
+    namespace fs = std::filesystem;
+    auto root = fs::path(tmp("shards")); fs::remove_all(root); fs::create_directories(root);
+    auto P = [&](const char* n) { return (root / n).string(); };
+    auto count_blobs = [](const fs::path& d) { std::size_t n = 0; std::error_code ec; for (auto it = fs::recursive_directory_iterator(d, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) if (it->is_regular_file() && it->path().extension() == ".fpkb") ++n; return n; };
+    auto base = forge_test::make_tiny_model(P("base.fpk"));
+    const std::vector<int> ids{1, 2, 3, 4};
+    std::vector<float> ref; std::size_t n_tensors = 0; std::uint64_t data_bytes = 0;
+    { inference::session s(base); ref = s.forward(ids); n_tensors = s.file().tensors().size(); data_bytes = s.file().data_size(); }
+
+    // ---- one blob per tensor
+    auto rep = modelfile::shard_split(base, P("a.fpk"));
+    CHECK(rep.tensors == n_tensors && rep.shards == n_tensors && rep.written == n_tensors && rep.reused == 0 && rep.blob_dir == (root / "blobs").string());
+    CHECK(count_blobs(root / "blobs") == n_tensors && fs::file_size(P("a.fpk")) < 32768 && fs::file_size(P("a.fpk")) * 4 < fs::file_size(base));
+    {
+        modelfile::reader r(P("a.fpk")), b(base);
+        CHECK(r.sharded() && r.shards().size() == n_tensors && r.missing_shards().empty() && r.verify().empty() && r.section_bytes("data").empty() && r.data_size() <= data_bytes);
+        CHECK(r.manifest().find("sharded") && r.manifest().num_or("forge_format_minor", 0) == 3 && r.has_section("state"));
+        for (auto& [n, e] : b.tensors()) {
+            CHECK(r.entry(n).blake3 == e.blake3 && r.entry(n).offset == 0 && r.shards()[std::size_t(r.entry(n).shard)].blake3 == e.blake3);   // the blob is named by the tensor's own hash
+            auto x = r.tensor_bytes(n), y = b.tensor_bytes(n);
+            CHECK(x.size() == y.size() && std::memcmp(x.data(), y.data(), y.size()) == 0);
+        }
+        CHECK(fs::exists(modelfile::blob_path((root / "blobs").string(), b.entry("lm_head").blake3)));
+        inference::session s(P("a.fpk")); CHECK(s.forward(ids) == ref);
+    }
+    CHECK_THROWS(modelfile::shard_split(P("a.fpk"), P("x.fpk")));        // already sharded
+    CHECK_THROWS(modelfile::shard_split(base, base));
+
+    // ---- dedup: a "fine-tune" that changes one tensor adds one blob; a second copy of the base adds none
+    auto tuned = P("tuned.fpk");
+    {
+        modelfile::reader b(base); modelfile::writer w;
+        std::vector<const modelfile::tensor_entry*> order; for (auto& [n, e] : b.tensors()) order.push_back(&e);
+        std::sort(order.begin(), order.end(), [](auto* x, auto* y) { return x->offset < y->offset; });
+        for (auto* e : order) {
+            if (e->name == "layer.1.wo") { auto t = b.load(e->name); for (auto& v : t.data) v *= 1.5f; w.add_tensor(e->name, e->shape, t.data); }
+            else w.add_raw(e->name, e->shape, e->codec, b.tensor_bytes(e->name));
+        }
+        for (auto& [n, sc] : b.sections()) if (n != "data" && n != "tensors") w.set_section(n, std::string(b.section_text(n)));
+        w.write(tuned);
+    }
+    std::vector<float> ref_tuned; { inference::session s(tuned); ref_tuned = s.forward(ids); CHECK(ref_tuned != ref); }
+    auto rep2 = modelfile::shard_split(tuned, P("b.fpk"));
+    CHECK(rep2.shards == n_tensors && rep2.written == 1 && rep2.reused == n_tensors - 1 && count_blobs(root / "blobs") == n_tensors + 1);
+    auto rep3 = modelfile::shard_split(base, P("c.fpk"));
+    CHECK(rep3.written == 0 && rep3.reused == n_tensors && rep3.bytes_written == 0 && count_blobs(root / "blobs") == n_tensors + 1);
+    { inference::session a(P("a.fpk")), b(P("b.fpk")), c(P("c.fpk")); CHECK(a.forward(ids) == ref && b.forward(ids) == ref_tuned && c.forward(ids) == ref); }
+    std::printf("  %zu tensors: base %zu blobs, fine-tune +%zu, second copy +%zu\n", n_tensors, rep.written, rep2.written, rep3.written);
+
+    // ---- a blob that is absent only matters when one of its tensors is used; verify() names it
+    std::string lm_blob, wq_blob;
+    { modelfile::reader r(P("a.fpk")); lm_blob = r.find_shard(std::size_t(r.entry("lm_head").shard)); wq_blob = r.find_shard(std::size_t(r.entry("layer.0.wq").shard)); }
+    fs::rename(lm_blob, lm_blob + ".away");
+    {
+        modelfile::reader r(P("a.fpk"));   // opens: partial download
+        CHECK(r.missing_shards().size() == 1 && r.load("layer.0.wq").size() == 32 * 32);
+        bool nf = false; try { (void)r.tensor_bytes("lm_head"); } catch (const forge_exception& e) { nf = e.code == errc::not_found && std::string(e.what()).find(r.entry("lm_head").blake3) != std::string::npos; }
+        CHECK(nf);
+        auto bad = r.verify(); CHECK(bad.size() == 1 && bad[0].find("missing") != std::string::npos);
+        CHECK_THROWS(modelfile::shard_join(P("a.fpk"), P("j.fpk")));
+        inference::session s(P("a.fpk")); CHECK_THROWS(s.forward(ids));
+    }
+    fs::rename(lm_blob + ".away", lm_blob);
+
+    // ---- a corrupt or substituted blob is refused when its tensor is read, whatever its name and size say
+    auto flip = [](const std::string& f, std::streamoff at) { std::fstream io(f, std::ios::in | std::ios::out | std::ios::binary); io.seekg(at); char c; io.get(c); io.seekp(at); io.put(char(c ^ 0x20)); };
+    flip(wq_blob, 100);
+    {
+        modelfile::reader r(P("a.fpk"));
+        bool ie = false; try { (void)r.tensor_bytes("layer.0.wq"); } catch (const forge_exception& e) { ie = e.code == errc::integrity_error; }
+        CHECK(ie); CHECK_THROWS(r.load("layer.0.wq")); CHECK(r.load("layer.1.wq").size() == 32 * 32);   // other tensors are fine
+        auto bad = r.verify(); CHECK(bad.size() == 2);   // the blob and its tensor
+        inference::session s(P("a.fpk")); CHECK_THROWS(s.forward(ids));
+    }
+    flip(wq_blob, 100);
+    {   // two blobs of the same size exchanged (layer.0.wq and layer.1.wq): names and sizes still match
+        modelfile::reader r0(P("a.fpk")); auto other = r0.find_shard(std::size_t(r0.entry("layer.1.wq").shard));
+        fs::rename(wq_blob, wq_blob + ".t"); fs::rename(other, wq_blob); fs::rename(wq_blob + ".t", other);
+        { modelfile::reader r(P("a.fpk")); CHECK(r.missing_shards().empty()); CHECK_THROWS(r.tensor_bytes("layer.0.wq")); CHECK_THROWS(r.tensor_bytes("layer.1.wq")); CHECK(r.verify().size() == 4); }
+        fs::rename(wq_blob, wq_blob + ".t"); fs::rename(other, wq_blob); fs::rename(wq_blob + ".t", other);
+        modelfile::reader r(P("a.fpk")); CHECK(r.verify().empty());
+    }
+
+    // ---- the signature of the main file covers every blob and tensor hash
+    {
+        auto kp = modelfile::generate_keypair(); auto sg = P("signed.fpk");
+        modelfile::sign_file(P("a.fpk"), sg, kp);
+        { modelfile::reader r(sg); auto rp = modelfile::verify_signature(r, {modelfile::detail::to_hex(kp.pub)}); CHECK(rp.trusted && r.verify().empty()); inference::session s(sg); CHECK(s.forward(ids) == ref); }
+        // an index edited so that layer.0.wq is layer.1.wq's blob, hash and all: every content check passes (the blob
+        // is what the index says), the weights are wrong, and only the signature over the index can tell
+        auto m = read_sections(sg);
+        auto idx = json::parse(sec(m, "tensors")).arr(); json::object* e0 = nullptr; json::object* e1 = nullptr;
+        for (auto& e : idx) { if (e["name"].str() == "layer.0.wq") e0 = &e.obj_mut(); if (e["name"].str() == "layer.1.wq") e1 = &e.obj_mut(); }
+        CHECK(e0 && e1);
+        if (e0 && e1) for (auto& [k, v] : *e0) if (k == "blake3" || k == "shard") for (auto& [k1, v1] : *e1) if (k1 == k) v = v1;
+        sec(m, "tensors") = json::dump(json::value(idx));
+        modelfile::detail::write_sections(P("forged.fpk"), m);
+        modelfile::reader rf(P("forged.fpk"));
+        CHECK(rf.verify().empty() && rf.load("layer.0.wq").data == rf.load("layer.1.wq").data);
+        CHECK(!modelfile::verify_signature(rf).digest_ok);
+    }
+
+    // ---- packed shards
+    auto rp = modelfile::shard_split(base, P("p.fpk"), {.shard_bytes = 64 << 10, .blob_dir = (root / "packs").string()});
+    CHECK(rp.shards >= 2 && rp.shards < n_tensors && rp.written == rp.shards && count_blobs(root / "packs") == rp.shards);
+    {
+        modelfile::reader r(P("p.fpk"));
+        CHECK(!r.missing_shards().empty());                                    // the packs are not in the default places (a pack of one tensor is the same blob as that tensor's, so some may be)
+        r.set_blob_dirs({(root / "packs").string()});
+        CHECK(r.missing_shards().empty() && r.verify().empty() && r.misaligned_tensors().empty());
+        for (auto& sh : r.shards()) CHECK(sh.bytes <= (64u << 10));
+        modelfile::reader b(base); for (auto& [n, e] : b.tensors()) { auto x = r.tensor_bytes(n); CHECK(x.size() == e.bytes && hash::blake3::hex(hash::blake3::of(x)) == e.blake3); }
+    }
+    forge_test::set_env("FORGE_BLOB_DIR", (root / "packs").string().c_str());   // the environment names the store
+    { inference::session s(P("p.fpk")); CHECK(s.forward(ids) == ref); }
+    {   // join: back to one file with the same tensors
+        auto rj = modelfile::shard_join(P("p.fpk"), P("joined.fpk"));
+        modelfile::reader j(P("joined.fpk")), b(base);
+        CHECK(rj.tensors == n_tensors && !j.sharded() && j.verify().empty() && !j.manifest().find("sharded") && j.misaligned_tensors().empty());
+        for (auto& [n, e] : b.tensors()) CHECK(j.entry(n).blake3 == e.blake3 && j.entry(n).codec == e.codec);
+        inference::session s(P("joined.fpk")); CHECK(s.forward(ids) == ref);
+        CHECK_THROWS(modelfile::shard_join(base, P("x.fpk")));
+    }
+    forge_test::set_env("FORGE_BLOB_DIR", nullptr);
+
+    // ---- names from the file are untrusted
+    CHECK_THROWS(modelfile::blob_path(root.string(), "../../../../etc/passwd"));
+    CHECK_THROWS(modelfile::blob_path(root.string(), std::string(64, 'G')));
+    CHECK_THROWS(modelfile::blob_path(root.string(), std::string(63, 'a') + "/"));
+    CHECK(modelfile::blob_path(root.string(), std::string(64, 'a')).find("aa") != std::string::npos);
+    for (auto [from, to] : {std::pair<std::string, std::string>{"\"version\":1", "\"version\":2"}, {"\"blake3\":\"", "\"blake3\":\"../"}, {"\"bytes\":", "\"bytes\":-"}}) {
+        auto m = read_sections(P("a.fpk")); auto& t = sec(m, "shards"); auto was = t; t = replace_all(t, from, to); CHECK(t != was);
+        modelfile::detail::write_sections(P("hostile.fpk"), m);
+        CHECK_THROWS(modelfile::reader(P("hostile.fpk")));
+    }
+    { auto m = read_sections(P("a.fpk")); auto& t = sec(m, "tensors"); t = replace_all(t, "\"shard\":0}", "\"shard\":999}"); modelfile::detail::write_sections(P("hostile.fpk"), m); CHECK_THROWS(modelfile::reader(P("hostile.fpk"))); }
+    { auto m = read_sections(base); auto& t = sec(m, "tensors"); t = replace_all(t, "\"bytes\":", "\"shard\":0,\"bytes\":"); modelfile::detail::write_sections(P("hostile.fpk"), m); CHECK_THROWS(modelfile::reader(P("hostile.fpk"))); }   // a shard index without a shards section
+#if !defined(_WIN32)
+    {   // a blob directory entry that is a symlink out of the store is not followed
+        modelfile::reader r0(P("a.fpk")); auto h = r0.entry("tok_emb").blake3; auto real = r0.find_shard(std::size_t(r0.entry("tok_emb").shard));
+        auto outside = root / "outside"; fs::create_directories(outside / h.substr(0, 2));
+        fs::rename(real, outside / h.substr(0, 2) / fs::path(real).filename());
+        auto sub = fs::path(real).parent_path(); bool only = fs::is_empty(sub);
+        if (only) {
+            fs::remove(sub); fs::create_directory_symlink(outside / h.substr(0, 2), sub);
+            modelfile::reader r(P("a.fpk")); CHECK(r.missing_shards().size() == 1); CHECK_THROWS(r.tensor_bytes("tok_emb"));
+            fs::remove(sub); fs::create_directories(sub);
+        }
+        fs::rename(outside / h.substr(0, 2) / fs::path(real).filename(), real);
+        modelfile::reader r(P("a.fpk")); CHECK(r.verify().empty());
+    }
+#endif
+    // ---- what does not combine with shards says so
+    auto key = modelfile::generate_model_key();
+    CHECK_THROWS(modelfile::encrypt_file(P("a.fpk"), P("x.fpk"), key));
+    modelfile::encrypt_file(base, P("enc.fpk"), key); CHECK_THROWS(modelfile::shard_split(P("enc.fpk"), P("x.fpk")));
+    CHECK_THROWS(modelfile::remove_adapter(P("a.fpk"), P("x.fpk"), "nope"));
+    {   // tools that copy sections keep working on the small main file: binary blueprint, precompiled-plan section
+        CHECK(modelfile::convert_blueprint_section(P("a.fpk"), P("a_bin.fpk"), true));
+        inference::session s(P("a_bin.fpk")); CHECK(s.forward(ids) == ref);
+        std::vector<std::uint8_t> blob(64, 3); modelfile::aot::write_section(P("a.fpk"), P("a_aot.fpk"), blob);
+        modelfile::reader r(P("a_aot.fpk")); CHECK(r.sharded() && r.has_section("aot") && r.verify().empty());
+    }
+    {   // requant reads a sharded model and writes one file
+        import::requant_options ro; ro.base.codec = "q8_0";
+        auto rq = import::requantise(P("a.fpk"), P("rq.fpk"), ro);
+        modelfile::reader r(P("rq.fpk")); CHECK(rq.requantised > 0 && !r.sharded() && !r.manifest().find("sharded") && r.verify().empty() && r.entry("layer.0.wq").codec == "q8_0");
+    }
+    fs::remove_all(root);
+}
+
+// Tensor alignment: 64 (default of the writers), 4096, 65536; recorded in the manifest; kept by every tool that
+// rewrites the container (sign, encrypt, aot).
+TEST(fpk_tensor_alignment) {
+    std::mt19937 rng(3); std::normal_distribution<float> N(0, 1);
+    std::vector<float> a(1000), b(64), c(7);
+    for (auto* v : {&a, &b, &c}) for (auto& x : *v) x = N(rng);
+    auto fill = [&](auto& w) { w.add_tensor("a", {10, 100}, a); w.add_tensor("b", {2, 32}, b, "q8_0"); w.add_tensor("c", {7}, c, "f16");
+                               w.set_manifest(json::value(json::object{{"format", "fpk"}})); w.set_section("blueprint", "blueprint \"t\"\ninput x : f32[1]\ngraph { y = relu(x) }\noutput y : f32[1]\n"); };
+    auto check = [&](const std::string& f, std::size_t al, const char* what) {
+        modelfile::reader r(f);
+        bool ok = r.tensor_alignment() == al && r.misaligned_tensors().empty() && r.verify().empty() && r.load("a").data == a;
+        for (auto& [n, e] : r.tensors()) ok = ok && (r.sections().at("data").offset + e.offset) % al == 0;
+        for (auto& [n, sc] : r.sections()) ok = ok && sc.offset % 64 == 0;
+        if (!ok) std::fprintf(stderr, "  alignment %zu not kept by %s\n", al, what);
+        return ok;
+    };
+    auto key = modelfile::generate_model_key(); auto kp = modelfile::generate_keypair();
+    std::size_t size64 = 0;
+    for (std::size_t al : {std::size_t(64), std::size_t(4096), std::size_t(65536)}) {
+        auto f = tmp("al.fpk"), g = tmp("al_s.fpk"), h = tmp("al_e.fpk"), s2 = tmp("al_st.fpk");
+        { modelfile::writer w; w.set_alignment(al); CHECK(w.tensor_alignment() == al); fill(w); w.write(f); }
+        CHECK(check(f, al, "writer"));
+        { modelfile::reader r(f); CHECK(r.manifest().num_or("tensor_alignment", 0) == double(al)); }
+        if (al == 64) size64 = std::size_t(std::filesystem::file_size(f));
+        else CHECK(std::filesystem::file_size(f) > size64 + al);   // the padding is real: why small files stay at 64
+        modelfile::sign_file(f, g, kp); CHECK(check(g, al, "sign_file"));
+        { std::vector<std::uint8_t> blob(100, 7); modelfile::aot::write_section(g, g, blob); CHECK(check(g, al, "aot::write_section")); }   // forge aot keeps offsets
+        modelfile::encrypt_file(g, h, key);
+        { modelfile::reader r(h, key); CHECK(r.tensor_alignment() == al && r.misaligned_tensors().empty() && r.verify().empty() && r.load("a").data == a); }
+        modelfile::sign_file(h, h, kp);
+        { modelfile::reader r(h, key); CHECK(r.misaligned_tensors().empty() && modelfile::verify_signature(r).digest_ok); }
+        { modelfile::stream_writer w(s2); w.set_alignment(al); fill(w); w.finish(); }
+        CHECK(check(s2, al, "stream_writer"));
+        modelfile::sign_file(s2, s2, kp); CHECK(check(s2, al, "sign_file after stream_writer"));   // data moves, its phase is kept
+        modelfile::encrypt_file(s2, h, key);
+        { modelfile::reader r(h, key); CHECK(r.misaligned_tensors().empty() && r.verify().empty()); }
+    }
+    {   // the option is set before the first tensor, and only to a valid value
+        modelfile::writer w; CHECK_THROWS(w.set_alignment(100)); CHECK_THROWS(w.set_alignment(32)); CHECK_THROWS(w.set_alignment(std::size_t(1) << 21));
+        w.add_tensor("a", {10, 100}, a); CHECK_THROWS(w.set_alignment(4096));
+    }
+    {   // a file without the manifest key is a 64-byte-aligned file, as before
+        auto f = tmp("al_old.fpk");
+        { modelfile::writer w; fill(w); w.write(f); }
+        std::vector<std::pair<std::string, std::string>> secs;
+        { modelfile::reader r(f); for (auto& [n, sc] : r.sections()) { auto bts = r.raw_section_bytes(n); secs.emplace_back(n, n == "manifest" ? std::string("{\"format\":\"fpk\"}") : std::string(reinterpret_cast<const char*>(bts.data()), bts.size())); } }
+        modelfile::detail::write_sections(f, secs);
+        modelfile::reader r(f); CHECK(r.tensor_alignment() == 64 && r.misaligned_tensors().empty() && r.verify().empty() && r.layout().align == 64 && r.layout().phase == 0);
+    }
+    CHECK(modelfile::default_tensor_alignment(0) == 64 && modelfile::default_tensor_alignment((64u << 20) - 1) == 64 && modelfile::default_tensor_alignment(64u << 20) == 4096);
+    CHECK(import::import_alignment({}, "no/such/file") == 64);
+    { import::import_options o; o.align = 65536; CHECK(import::import_alignment(o, "x") == 65536); o.align = 128; CHECK_THROWS(import::import_alignment(o, "x")); }
+}
+
+// Chunked encryption (the default of encrypt_file): tensors are decrypted one at a time, on use, and every way of
+// rearranging the sealed bytes is refused.
+TEST(fpk_chunked_encryption) {
+    using secs_t = std::map<std::string, std::string>;
+    auto src = forge_test::make_tiny_model(tmp("ce_src.fpk")), src2 = forge_test::make_tiny_model(tmp("ce_src2.fpk"), {.seed = 11});
+    auto key = modelfile::generate_model_key();
+    auto set = [](json::object& o, std::string_view k, json::value v) { for (auto& [kk, vv] : o) if (kk == k) { vv = std::move(v); return; } o.emplace_back(std::string(k), std::move(v)); };
+    auto get = [](json::object& o, std::string_view k) -> json::value& { for (auto& [kk, vv] : o) if (kk == k) return vv; raise(errc::not_found, "no key {}", k); };
+    auto read_secs = [](const std::string& f) { secs_t m; modelfile::reader r(f); for (auto& [n, s] : r.sections()) { auto b = r.raw_section_bytes(n); m[n].assign(reinterpret_cast<const char*>(b.data()), b.size()); } return m; };
+    auto write_secs = [](const std::string& f, const secs_t& m) { modelfile::detail::write_sections(f, {m.begin(), m.end()}); };
+    for (std::size_t chunk : {std::size_t(4096), std::size_t(1000), std::size_t(1) << 20}) {
+        auto dst = tmp("ce.fpk");
+        modelfile::encrypt_file(src, dst, key, {.chunk_bytes = chunk});
+        modelfile::reader plain(src), locked(dst), open(dst, key);
+        auto hdr = json::parse(locked.section_text("encryption"));
+        CHECK(hdr.str_or("alg", "") == "xchacha20-poly1305-chunked" && std::size_t(hdr.num_or("chunk_bytes", 0)) == chunk);
+        CHECK(std::size_t(hdr.num_or("chunks", 0)) == (plain.data_size() + chunk - 1) / chunk && locked.sections().at("enc_macs").size == 16 * std::size_t(hdr.num_or("chunks", 0)));
+        CHECK(locked.locked() && locked.verify().empty()); CHECK_THROWS(locked.load("lm_head")); CHECK_THROWS(locked.tensor_bytes("lm_head"));
+        CHECK(locked.manifest().str_or("format", "") == "fpk");
+        CHECK(open.encrypted() && open.chunked_encryption() && open.plaintext_resident() == 0);   // nothing is decrypted at open
+        // the tensor index and every offset are what the plain file has: only the bytes of `data` differ
+        CHECK(open.section_text("tensors") == plain.section_text("tensors"));
+        { auto raw = open.raw_section_bytes("data"), pd = plain.section_bytes("data"); CHECK(raw.size() == pd.size() && std::memcmp(raw.data(), pd.data(), pd.size()) != 0); }
+        auto one = open.tensor_bytes("layer.1.wq"), ref = plain.tensor_bytes("layer.1.wq");
+        CHECK(one.size() == ref.size() && std::memcmp(one.data(), ref.data(), ref.size()) == 0);
+        CHECK(open.plaintext_resident() == ref.size() && open.plaintext_resident() < plain.data_size() / 4);   // one tensor, not the file
+        CHECK(reinterpret_cast<std::uintptr_t>(one.data()) % 64 == 0);
+        CHECK(open.tensor_bytes("layer.1.wq").data() == one.data());                                          // cached, not decrypted again
+        for (auto& [n, e] : plain.tensors()) CHECK(open.load(n).data == plain.load(n).data);                  // load() decodes from a wiped scratch copy
+        CHECK(open.plaintext_resident() == ref.size());
+        CHECK(open.verify().empty());
+        open.release_plaintext(); CHECK(open.plaintext_resident() == 0);
+        const_cast<modelfile::reader&>(open).lock_plaintext(true);
+        auto lk = open.tensor_bytes("tok_emb"), lref = plain.tensor_bytes("tok_emb");
+        CHECK(lk.size() == lref.size() && std::memcmp(lk.data(), lref.data(), lref.size()) == 0);
+        std::printf("  chunk %zu: %zu chunks, locked plaintext: %s\n", chunk, std::size_t(hdr.num_or("chunks", 0)), open.plaintext_locked() ? "yes" : "refused by the OS (limit)");
+        auto bad = key; bad[0] ^= 1; CHECK_THROWS(modelfile::reader(dst, bad));
+        CHECK_THROWS(modelfile::encrypt_file(dst, tmp("ce2.fpk"), key));
+        // section_bytes("data") still works (whole-section fallback for old callers)
+        { modelfile::reader o2(dst, key); auto d = o2.section_bytes("data"), pd = plain.section_bytes("data"); CHECK(d.size() == pd.size() && std::memcmp(d.data(), pd.data(), pd.size()) == 0); }
+    }
+    // ---- tampering. Each case rewrites the container so that the section table and its hashes are consistent
+    // (what an attacker without the key can do); the AEAD has to catch it. `rejected` = the reader refuses to open,
+    // or verify() reports it and reading the tensors fails.
+    const std::size_t chunk = 4096;
+    auto a = tmp("ce_a.fpk"), b = tmp("ce_b.fpk"), c = tmp("ce_c.fpk"), t = tmp("ce_t.fpk");
+    modelfile::encrypt_file(src, a, key, {.chunk_bytes = chunk});
+    modelfile::encrypt_file(src, b, key, {.chunk_bytes = chunk});    // same model, same key, another nonce
+    modelfile::encrypt_file(src2, c, key, {.chunk_bytes = chunk});   // another model of the same layout, same key
+    const secs_t A = read_secs(a), B = read_secs(b), C = read_secs(c);
+    const std::size_t n_chunks = A.at("enc_macs").size() / 16;
+    CHECK(n_chunks > 8 && A.at("data") != B.at("data"));
+    auto rejected = [&](const secs_t& m, const char* what) {
+        write_secs(t, m);
+        try {
+            modelfile::reader r(t, key);
+            bool read_fails = false;
+            try { for (auto& [n, e] : r.tensors()) (void)r.load(n); } catch (const forge_exception& e) { read_fails = e.code == errc::integrity_error; }
+            bool tb_fails = false;
+            try { for (auto& [n, e] : r.tensors()) (void)r.tensor_bytes(n); } catch (const forge_exception& e) { tb_fails = e.code == errc::integrity_error; }
+            bool ok = read_fails && tb_fails && !r.verify().empty();
+            if (!ok) std::fprintf(stderr, "  tamper case '%s' was not rejected\n", what);
+            return ok;
+        } catch (const forge_exception&) { return true; }
+    };
+    { write_secs(t, A); modelfile::reader r(t, key); CHECK(r.verify().empty()); }   // the rewrite itself is harmless
+    { auto m = A; m["data"][chunk * 3 + 17] ^= 0x01; CHECK(rejected(m, "bit flip in a ciphertext chunk")); }
+    { auto m = A; m["data"].back() ^= 0x80; CHECK(rejected(m, "bit flip in the last (short) chunk")); }
+    { auto m = A; m["enc_macs"][16 * 2 + 5] ^= 0x10; CHECK(rejected(m, "bit flip in a tag")); }
+    {   // reorder: chunks 1 and 2 swapped together with their tags
+        auto m = A; auto& d = m["data"]; auto& mc = m["enc_macs"];
+        std::swap_ranges(d.begin() + chunk, d.begin() + 2 * chunk, d.begin() + 2 * chunk);
+        std::swap_ranges(mc.begin() + 16, mc.begin() + 32, mc.begin() + 32);
+        CHECK(rejected(m, "two chunks reordered"));
+    }
+    {   // truncate: the last chunk and its tag dropped, header untouched / header adjusted / header and index adjusted
+        auto m = A; auto last = (n_chunks - 1) * chunk;
+        m["data"].resize(last); m["enc_macs"].resize(16 * (n_chunks - 1));
+        CHECK(rejected(m, "truncated, header untouched"));
+        auto ho = json::parse(A.at("encryption")).obj();
+        set(ho, "chunks", double(n_chunks - 1)); set(ho, "data_bytes", double(last));
+        m["encryption"] = json::dump(json::value(ho));
+        CHECK(rejected(m, "truncated, header adjusted"));
+        json::array keep;   // drop the tensors that reached into the removed chunk, so every bounds check passes
+        for (auto& e : json::parse(A.at("tensors")).arr()) if (e["offset"].num() + e["bytes"].num() <= double(last)) keep.push_back(e);
+        CHECK(!keep.empty() && keep.size() < json::parse(A.at("tensors")).arr().size());
+        m["tensors"] = json::dump(json::value(keep));
+        CHECK(rejected(m, "truncated, header and index adjusted"));
+    }
+    {   // splice: a chunk (with its tag) of another file sealed with the same key
+        auto m = A; m["data"].replace(chunk * 4, chunk, B.at("data"), chunk * 4, chunk); m["enc_macs"].replace(16 * 4, 16, B.at("enc_macs"), 16 * 4, 16);
+        CHECK(rejected(m, "chunk spliced from the same model sealed again"));
+        m = A; m["data"].replace(chunk * 4, chunk, C.at("data"), chunk * 4, chunk); m["enc_macs"].replace(16 * 4, 16, C.at("enc_macs"), 16 * 4, 16);
+        CHECK(rejected(m, "chunk spliced from another model"));
+        m = A; m["data"] = B.at("data"); m["enc_macs"] = B.at("enc_macs");
+        CHECK(rejected(m, "all ciphertext of another sealing under this header"));
+        m = A; m["data"] = C.at("data"); m["enc_macs"] = C.at("enc_macs"); m["encryption"] = C.at("encryption");
+        CHECK(rejected(m, "another model's sealed data under this index"));   // the index (tensor hashes) is bound into every chunk
+    }
+    {   // header edits
+        auto ho = json::parse(A.at("encryption")).obj(); auto m = A;
+        set(ho, "chunk_bytes", double(chunk * 2)); m["encryption"] = json::dump(json::value(ho));
+        CHECK(rejected(m, "chunk size altered"));
+        ho = json::parse(A.at("encryption")).obj(); auto nn = get(ho, "nonce").str(); nn[47] = nn[47] == '0' ? '1' : '0'; set(ho, "nonce", nn);
+        m = A; m["encryption"] = json::dump(json::value(ho));
+        CHECK(rejected(m, "nonce altered"));
+    }
+    {   // index edit: two tensors of the same shape exchange their offsets
+        auto idx = json::parse(A.at("tensors")).arr(); json::object* p0 = nullptr; json::object* p1 = nullptr;
+        for (auto& e : idx) { if (e["name"].str() == "layer.0.wq") p0 = &e.obj_mut(); if (e["name"].str() == "layer.1.wq") p1 = &e.obj_mut(); }
+        CHECK(p0 && p1);
+        if (p0 && p1) { auto o0 = get(*p0, "offset"), o1 = get(*p1, "offset"); set(*p0, "offset", o1); set(*p1, "offset", o0); }
+        auto m = A; m["tensors"] = json::dump(json::value(idx));
+        CHECK(rejected(m, "index offsets exchanged"));
+    }
+    // a session on the sealed file: same logits as the plain file, and only tensor-sized plaintext is held
+    forge_test::set_env("FORGE_MODEL_KEY", modelfile::detail::hex(key.data(), 32).c_str());
+    {
+        inference::session s(a), p(src);
+        CHECK(s.forward(std::vector<int>{1, 2, 3}) == p.forward(std::vector<int>{1, 2, 3}));
+        CHECK(s.file().chunked_encryption() && s.file().plaintext_resident() > 0 && s.file().plaintext_resident() <= s.file().data_size());
+    }
+    forge_test::set_env("FORGE_MODEL_KEY", nullptr);
+}
+
 TEST(fpk_encryption_hook) {
     auto src = forge_test::make_tiny_model(tmp("enc_src.fpk")), dst = tmp("enc.fpk");
-    auto key = modelfile::generate_model_key(); modelfile::encrypt_file(src, dst, key);
+    // the single-AEAD scheme (what files sealed before the chunked scheme carry): still written on request, still read
+    auto key = modelfile::generate_model_key(); modelfile::encrypt_file(src, dst, key, {.single_aead = true});
     {   // readers map the file; Windows cannot replace a mapped file, so they close before dst is rewritten
     modelfile::reader plain(src), locked(dst);
+    CHECK(json::parse(locked.section_text("encryption")).str_or("alg", "") == "xchacha20-poly1305" && !locked.has_section("enc_macs"));
     CHECK(locked.locked()); CHECK(locked.verify().empty()); CHECK_THROWS(locked.load("lm_head"));
     CHECK(locked.manifest().str_or("format", "") == "fpk");                  // metadata stays readable
-    modelfile::reader open(dst, key); CHECK(open.encrypted()); CHECK(open.verify().empty());
+    modelfile::reader open(dst, key); CHECK(open.encrypted() && !open.chunked_encryption()); CHECK(open.verify().empty());
     for (auto& [n, e] : plain.tensors()) CHECK(open.load(n).data == plain.load(n).data);
     { auto raw = open.raw_section_bytes("data"), pd = plain.section_bytes("data"); CHECK(raw.size() == pd.size() && std::memcmp(raw.data(), pd.data(), pd.size()) != 0); }
     auto bad = key; bad[0] ^= 1; CHECK_THROWS(modelfile::reader(dst, bad));

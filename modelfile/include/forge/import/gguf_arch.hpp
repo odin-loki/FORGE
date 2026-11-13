@@ -65,6 +65,7 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     auto bp = modelfile::parse_blueprint(bp_text);
 
     modelfile::stream_writer w(out);
+    w.set_alignment(import_alignment(opt, path));
     import_report rep{arch, tname, 0, 0};
     std::set<std::string> used;
     auto put = [&](const std::string& dst, const std::string& src) {
@@ -139,6 +140,7 @@ inline std::optional<import_report> import_gguf_extra(const gguf_file& g, const 
     }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
+    add_state_section(w, bp);
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

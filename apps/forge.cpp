@@ -5,6 +5,9 @@
 #include <sys/stat.h>
 #include <forge/import/gguf.hpp>
 #include <forge/import/onnx.hpp>
+#include <forge/import/requant.hpp>
+#include <forge/import/blueprint_dir.hpp>
+#include <forge/modelfile/shard.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
 #include <forge/inference/aot_build.hpp>
@@ -58,6 +61,7 @@ int usage() {
     std::puts(
         "usage: forge <command> [options]\n"
         "  info                                   CPU features, lane target, grid backends, memory budget\n"
+        "  import <dir with blueprint.fbp + *.safetensors> -o <out.fpk>   a model described by its own blueprint (any session kind)\n"
         "  import <hf_dir|model.gguf> -o <out.fpk> [--codec f32|f16|bf16|fp8_e4m3|fp8_e5m2|q8_0|q4_k|q4_g32|q8_g32|mxfp8|mxfp6|mxfp4|mxint8|nvfp4|tq2] [--template llama] [--emb-codec q8_0|q4_k|f32]\n"
         "      more codecs (GGUF block layouts): q5_k q6_k q4_0 q4_1 q5_0 q5_1 q2_k q3_k iq4_nl iq4_xs tq1_0 tq2_0\n"
         "      --codec keep (default for .gguf and AWQ/GPTQ checkpoints): tensors stay in their stored quantisation; another codec re-quantises them\n"
@@ -65,16 +69,33 @@ int usage() {
         "      [--tensor-type REGEX=TYPE[,..]] [--pure] [--bf16-head]   (llama.cpp llama-quant.cpp rules; forge adds q6_k DeltaNet/attn_output, q8_0 head)\n"
         "      [--allow-unused] import although source tensors are left over (default: error listing them)\n"
         "      [--ignore-tensor NAME[,NAME..]] leftovers known to be harmless (NAME, prefix* or *suffix)\n"
-        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]\n"
+        "      [--align 64|4096|65536] file alignment of every tensor (default: 4096 when the source weights are >= 64 MiB, else 64)\n"
+        "      [--calib] record statistics of the full-precision weights (\"calib\" section) for a later forge requant\n"
+        "      [--shard-size SIZE [--blob-dir DIR]] write a sharded model: tensors in content-addressed blobs (0 = one per tensor)\n"
+        "  shard split <in.fpk> -o <out.fpk> [--shard-size 2G] [--blob-dir DIR]   tensors into blobs named by their BLAKE3 hash\n"
+        "      (default one blob per tensor: models that share tensors store them once); blobs go to DIR, $FORGE_BLOB_DIR or ./blobs next to out\n"
+        "  shard join <in.fpk> -o <out.fpk>  |  shard list <model.fpk>             back to one file; which blobs are present\n"
+        "  requant <in.fpk> -o <out.fpk> --codec C   re-encode the float weights of a model file (codecs and the mixed-precision\n"
+        "      options of import); reads the calib section, or measures f32 weights [--no-calib] [--calib-crest 12] [--align A]\n"
+        "  adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]\n"
+        "      LoRA adapters carried in the model file; select one with run --adapter N\n"
+        "  blueprint <model.fpk> --to binary|text [-o out.fpk]     store the model's blueprint in the binary or the text form\n"
+        "  blueprint <file.fbp|file.fbpb> --to binary|text|canonical -o <out>   convert a bare blueprint file\n"
+        "  inspect <model.fpk> [--verify] [--tensors] [--blueprint [text|binary|canonical] [-o FILE]] [--license] [--state]\n"
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
-        "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1]] [--spec-k 0 (0 = planner)]\n"
+        "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1] | --self-spec [--exit-layer K]] [--spec-k 0 (0 = planner)]\n"
         "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
+        "      one-shot graphs (imported ONNX): --input name=file.f32 ... [--dim name=N ...] [--out prefix]; integer inputs take file.i64 / file.i32\n"
         "  embed <model.fpk> (--text TEXT [--text-pair TEXT] [--ids] | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
         "      [--out file.f32] [--device D]     embedding models (BERT family, ViT / CLIP / SigLIP, Whisper encoder):\n"
         "      prints the vector, or writes it as raw f32; --input feeds a declared input (an image, mel frames)\n"
         "      --text: the model's tokenizer adds its special tokens ([CLS] .. [SEP]) and token types; --ids prints the ids to stderr\n"
+        "  denoise <model.fpk> [--steps N] [--sampler ddim|ddpm|euler] [--guidance G] [--eta E] [--seed S | --init latent.f32]\n"
+        "      [--input name=file ...] [--uncond name=file ...] [--dim name=N] [--out latent.f32]   models with `session diffusion_loop`\n"
+        "  stream <model.fpk> --input samples.f32 [--chunk N] [--out frames.f32]    models with `session streaming`: framing from the file,\n"
+        "      one run per frame with the model's state carried over\n"
         "  aot <model.fpk> [-o out] [--aot-mode plan|native]   compile the model's plans ahead of time (docs/aot-models.md)\n"
         "      [--shapes 1,8,16 (sequence lengths; default 1,2,4,...,64)] [--all-rows] [--kv-codec f32,int8] [--ctx N]\n"
         "      plan:   plans go into the .fpk's \"aot\" section (-o out.fpk, default in place) [--sidecar] [--key name.key | --drop-signature]\n"
@@ -91,6 +112,8 @@ int usage() {
         "  verify <file> [--sig file.sig] [--pubkey <name.pub>]...   check a detached signature (exit 1 on failure)\n"
         "  encrypt <in.fpk> -o <out.fpk> --key k.mkey | --new-key k.mkey   seal tensor data (XChaCha20-Poly1305);\n"
         "      load with FORGE_MODEL_KEY_FILE=k.mkey (or FORGE_MODEL_KEY=<hex>)\n"
+        "      [--chunk 1M] sealed chunk size: tensors are decrypted one at a time when first used (FORGE_LOCK_WEIGHTS=1: into locked memory)\n"
+        "      [--single-aead] the older scheme (one AEAD over all tensor data, decrypted whole at load)\n"
         "  script <file.cpp> [args...]            run a FORGE script (interpreted, memory-safe C++23 subset)\n"
         "  script -e '<code>' [args...]          run a snippet;  script (no file): interactive REPL\n"
         "      [--tree] tree-walker only  [--debug] race/deadlock checks  [--timeout MS]  [--max-steps N]  [--heap BYTES]  [--no-proc] [--no-fs] [--no-net]\n"
@@ -131,7 +154,8 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt,
         import::import_options o; o.codec = codec; if (requant) o.requant = codec;
         o.allow_unused = allow_unused;
         auto tmp = out.string() + ".partial";
-        auto r = path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
+        auto r = import::is_blueprint_dir(path) ? import::import_blueprint_dir(path, tmp, o)
+               : path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
         fs::rename(tmp, out);
         std::fprintf(stderr, "[imported %s (%s, %zu tensors) -> %s]\n", path.c_str(), r.template_name.c_str(), r.tensors, out.c_str());
         for (auto& n : r.notes) std::fprintf(stderr, "[import] %s\n", n.c_str());
@@ -187,6 +211,7 @@ int cmd_info() {
     return 0;
 }
 
+std::uint64_t parse_size_arg(const std::string& v, const char* what);
 int cmd_import(const args& a) {
     if (a.pos.empty() || a.get("o").empty()) return usage();
     import::import_options o; o.codec = a.get("codec", "f32"); o.template_name = a.get("template"); o.emb_codec = a.get("emb-codec");
@@ -206,8 +231,25 @@ int cmd_import(const args& a) {
         auto c = it.find(','); o.ignore_tensors.push_back(it.substr(0, c));
         it = c == std::string::npos ? "" : it.substr(c + 1);
     }
+    // --align 64|4096|65536 (4k, 64k): tensor alignment of the output; default by size (import::import_alignment)
+    if (!a.get("align").empty()) o.align = std::size_t(parse_size_arg(a.get("align"), "--align"));
+    o.calib = a.has("calib");   // record weight statistics for a later `forge requant` ("calib" section)
     activate_policy(a.get("policy"));   // FSS: importers check fs_read (input) / fs_write (output) under an active policy
-    auto r = a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], a.get("o"), o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], a.get("o"), o) : import::import_hf(a.pos[0], a.get("o"), o);
+    // --shard-size SIZE (0 = one blob per tensor) [--blob-dir DIR]: write a sharded model. The import goes to a
+    // single file next to the output first, which is then split (modelfile/shard.hpp) and removed.
+    const bool shard = a.kv.count("shard-size") != 0;
+    const std::string final_out = a.get("o"), import_out = shard ? final_out + ".unsharded" : final_out;
+    // a directory with a blueprint.fbp is a model described by its blueprint (import/blueprint_dir.hpp)
+    auto r = import::is_blueprint_dir(a.pos[0]) ? import::import_blueprint_dir(a.pos[0], import_out, o)
+           : a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], import_out, o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], import_out, o) : import::import_hf(a.pos[0], import_out, o);
+    if (shard) {
+        modelfile::shard_options so; so.shard_bytes = parse_size_arg(a.get("shard-size"), "--shard-size"); so.blob_dir = a.get("blob-dir");
+        modelfile::shard_report sr;
+        try { sr = modelfile::shard_split(import_out, final_out, so); } catch (...) { os::remove(import_out); throw; }
+        os::remove(import_out);
+        r.bytes = std::filesystem::file_size(final_out);
+        std::printf("sharded   %zu tensors in %zu blobs under %s (%zu written, %zu already there: %llu bytes not stored again)\n", sr.tensors, sr.shards, sr.blob_dir.c_str(), sr.written, sr.reused, (unsigned long long)sr.bytes_reused);
+    }
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     for (auto& n : r.notes) std::fprintf(stderr, "forge import: %s\n", n.c_str());
     std::printf("license   %s\n", r.license.empty() ? "(none found in the source)" : r.license.c_str());
@@ -224,9 +266,10 @@ int cmd_inspect(const args& a) {
     std::printf("file      %s (%zu bytes)\nmanifest  %s\n", a.pos[0].c_str(), r.file_size(), json::dump(r.manifest()).c_str());
     for (auto& [n, s] : r.sections()) std::printf("section   %-10s offset %10llu size %10llu blake3 %s\n", n.c_str(),
                                                    (unsigned long long)s.offset, (unsigned long long)s.size, hash::blake3::hex(s.hash).substr(0, 16).c_str());
-    auto bp = modelfile::parse_blueprint(r.section_text("blueprint"));
-    std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors\n", bp.name.c_str(), bp.opset,
-                bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size());
+    auto bp = modelfile::load_blueprint(r);
+    std::printf("blueprint \"%s\" opset %d session %s, %zu params, %zu states, %zu tensors%s\n", bp.name.c_str(), bp.opset,
+                bp.session.c_str(), bp.params.size(), bp.states.size(), r.tensors().size(),
+                modelfile::is_binary_blueprint(r.section_text("blueprint")) ? " (stored in the binary form)" : "");
     if (bp.opset < modelfile::opset_min || bp.opset > modelfile::opset_max)
         std::printf("          opset %d is outside this engine's range %d..%d: the model will not run here\n", bp.opset, modelfile::opset_min, modelfile::opset_max);
     {   // the model's licence as recorded at import (manifest fields + the optional `license` section)
@@ -239,14 +282,188 @@ int cmd_inspect(const args& a) {
         if (r.has_section("license")) line += std::format("{}text: {} bytes (--license prints it)", line.empty() ? "" : ", ", r.section_text("license").size());
         std::printf("license   %s\n", line.empty() ? "(not recorded)" : line.c_str());
     }
+    if (r.sharded()) {   // where the tensor bytes are, and how much of them is here
+        auto miss = r.missing_shards(); std::string dirs; for (auto& d : r.blob_dirs()) dirs += (dirs.empty() ? "" : ", ") + d;
+        std::printf("shards    %zu content-addressed blobs, %llu bytes; %zu present, %zu missing; searched: %s\n", r.shards().size(), (unsigned long long)r.data_size(),
+                    r.shards().size() - miss.size(), miss.size(), dirs.c_str());
+    }
+    {   // tensor alignment: the recorded value and what the offsets actually are
+        std::size_t al = r.tensor_alignment(); auto off = r.misaligned_tensors();
+        bool recorded = r.manifest().find("tensor_alignment") != nullptr;
+        std::printf("alignment %zu bytes%s: %zu of %zu tensors start on a multiple of it in the file%s\n", al, recorded ? "" : " (not recorded: file written before the option)",
+                    r.tensors().size() - off.size(), r.tensors().size(), off.empty() ? "" : " (file rewritten by a tool that does not keep the alignment?)");
+    }
+    {   // optional sections: declared state, embedded adapters, calibration statistics
+        if (r.has_section(modelfile::state_section)) {
+            auto sc = modelfile::state_schema::parse(r.section_text(modelfile::state_section));
+            std::size_t rec = 0; for (auto& sl : sc.slots) rec += sl.recurrent;
+            std::printf("state     %zu slots declared (%zu appended rows, %zu recurrent)%s\n", sc.slots.size(), sc.slots.size() - rec, rec, a.has("state") ? ":" : " (--state lists them)");
+            if (a.has("state")) for (auto& sl : sc.slots) std::printf("  %-28s %-9s %-12s %s %s\n", sl.name.c_str(), sl.recurrent ? "recurrent" : "append", sl.op.c_str(), sl.dtype.c_str(), shape_str(sl.shape).c_str());
+        } else if (!bp.states.empty()) std::printf("state     not declared in the file (derived from the blueprint when needed)\n");
+        for (auto& ad : modelfile::read_adapters(r))
+            std::printf("adapter   %-16s rank %lld alpha %g, %zu target weights (forge run --adapter %s)\n", ad.name.c_str(), (long long)ad.rank, ad.alpha, ad.targets.size(), ad.name.c_str());
+        if (r.has_section(modelfile::calib_section)) {
+            auto ct = modelfile::calib_table::parse(r.section_text(modelfile::calib_section));
+            double worst = 0; std::string wn;
+            for (auto& [n, st] : ct.tensors) if (st.crest() > worst) { worst = st.crest(); wn = n; }
+            std::printf("calib     statistics of %zu tensors (source: %s); largest crest factor %.1f (%s)\n", ct.tensors.size(), ct.source.c_str(), worst, wn.c_str());
+        }
+    }
+    if (r.has_section("encryption")) {   // which sealing scheme, and whether this process holds the key
+        json::value e; try { e = json::parse(r.section_text("encryption")); } catch (const std::exception&) {}
+        auto alg = e.str_or("alg", "?");
+        std::string how = alg == "xchacha20-poly1305-chunked" ? std::format("{} chunks of {} bytes, decrypted per tensor on use", (unsigned long long)e.num_or("chunks", 0), (unsigned long long)e.num_or("chunk_bytes", 0))
+                        : alg == "xchacha20-poly1305" ? std::string("one AEAD over the data section, decrypted whole at load") : std::string("unknown scheme");
+        std::printf("encrypted %s, key id %s (%s); %s\n", alg.c_str(), e.str_or("key_id", "?").c_str(), how.c_str(), r.locked() ? "no key given: tensors unreadable" : "key accepted");
+    }
     if (a.has("tensors")) for (auto& [n, e] : r.tensors()) std::printf("  %-28s %-9s %s\n", n.c_str(), e.codec.c_str(), shape_str(e.shape).c_str());
-    if (a.has("blueprint")) std::printf("%.*s\n", int(r.section_text("blueprint").size()), r.section_text("blueprint").data());
+    if (a.has("blueprint")) {
+        // --blueprint [text|binary|canonical] [-o FILE]: the stored text (or, for a binary section, its canonical text);
+        // the binary form (a summary on the terminal, the bytes with -o); the canonical text of either.
+        std::string form = a.get("blueprint");
+        if (form.empty() && a.pos.size() > 1) form = a.pos[1];
+        if (form.empty()) form = "text";
+        auto stored = r.section_text("blueprint");
+        if (form == "binary") {
+            std::vector<std::uint8_t> bin = modelfile::is_binary_blueprint(stored) ? std::vector<std::uint8_t>(stored.begin(), stored.end()) : modelfile::encode_blueprint(stored);
+            modelfile::binary_blueprint_info bi; (void)modelfile::decode_blueprint(bin, &bi);
+            std::string ops; for (auto& c : bi.calls) ops += (ops.empty() ? "" : " ") + c;
+            std::printf("binary blueprint: version %u, %zu bytes (text form: %zu bytes), opset %u, \"%s\", session %s, %zu strings, %zu tokens\ncalls: %s\n",
+                        bi.version, bin.size(), modelfile::blueprint_text(stored).size(), bi.opset, bi.name.c_str(), bi.session.c_str(), bi.strings, bi.tokens, ops.c_str());
+            if (!a.get("o").empty()) { std::ofstream f(a.get("o"), std::ios::binary); f.write(reinterpret_cast<const char*>(bin.data()), std::streamsize(bin.size())); if (!f) throw std::runtime_error("cannot write " + a.get("o")); }
+        } else if (form == "text" || form == "canonical") {
+            std::string text = form == "canonical" ? modelfile::canonical_blueprint_text(modelfile::blueprint_text(stored)) : modelfile::blueprint_text(stored);
+            if (!a.get("o").empty()) { std::ofstream f(a.get("o"), std::ios::binary); f << text; if (!f) throw std::runtime_error("cannot write " + a.get("o")); }
+            else std::printf("%s\n", text.c_str());
+        } else throw std::runtime_error("--blueprint takes text, binary or canonical, not '" + form + "'");
+    }
     if (a.has("license") && r.has_section("license")) std::printf("%.*s\n", int(r.section_text("license").size()), r.section_text("license").data());
     if (a.has("verify")) {
         auto bad = r.verify();
         if (bad.empty()) std::puts("verify    ok (all sections and tensors match BLAKE3)");
         else { for (auto& b : bad) std::printf("verify    MISMATCH %s\n", b.c_str()); return 1; }
     }
+    return 0;
+}
+
+// forge adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]
+int cmd_adapter(const args& a) {
+    if (a.pos.size() < 2) return usage();
+    const std::string& verb = a.pos[0]; const std::string& f = a.pos[1];
+    auto out = a.get("o").empty() ? f : a.get("o");
+    if (verb == "list") {
+        modelfile::reader r(f); auto all = modelfile::read_adapters(r);
+        if (all.empty()) std::puts("no adapters in this file");
+        for (auto& ad : all) {
+            std::printf("%-16s rank %lld alpha %g\n", ad.name.c_str(), (long long)ad.rank, ad.alpha);
+            for (auto& w : ad.targets) std::printf("  %s\n", w.c_str());
+        }
+        return 0;
+    }
+    activate_policy(a.get("policy"));
+    if (verb == "add") {
+        if (a.get("name").empty() || a.get("from").empty()) return usage();
+        import::check_write(out);
+        auto ad = modelfile::embed_adapter(f, out, a.get("name"), a.get("from"));
+        std::printf("added adapter '%s' (rank %lld, alpha %g, %zu target weights) -> %s\n", ad.name.c_str(), (long long)ad.rank, ad.alpha, ad.targets.size(), out.c_str());
+        std::puts("note: a signature and precompiled plans do not survive this; sign / run forge aot again");
+        return 0;
+    }
+    if (verb == "remove") {
+        if (a.get("name").empty()) return usage();
+        import::check_write(out);
+        modelfile::remove_adapter(f, out, a.get("name"));
+        std::printf("removed adapter '%s' -> %s\n", a.get("name").c_str(), out.c_str());
+        return 0;
+    }
+    return usage();
+}
+
+// forge shard split <in.fpk> -o <out.fpk> [--shard-size SIZE] [--blob-dir DIR] | join <in.fpk> -o <out.fpk> | list <model.fpk>
+int cmd_shard(const args& a) {
+    if (a.pos.size() < 2) return usage();
+    const std::string& verb = a.pos[0]; const std::string& f = a.pos[1];
+    if (verb == "list") {
+        modelfile::reader r(f);
+        if (!r.sharded()) { std::puts("not a sharded file (its tensors are in the data section)"); return 0; }
+        std::map<int, std::size_t> count; for (auto& [n, e] : r.tensors()) ++count[e.shard];
+        for (std::size_t i = 0; i < r.shards().size(); ++i) {
+            auto p = r.find_shard(i);
+            std::printf("%s%s  %12llu bytes  %4zu tensors  %s\n", r.shards()[i].blake3.c_str(), std::string(modelfile::blob_ext).c_str(), (unsigned long long)r.shards()[i].bytes, count[int(i)], p.empty() ? "MISSING" : p.c_str());
+        }
+        return 0;
+    }
+    if (a.get("o").empty()) return usage();
+    activate_policy(a.get("policy"));
+    import::check_write(a.get("o"));
+    modelfile::shard_report sr;
+    if (verb == "split") {
+        modelfile::shard_options so; so.blob_dir = a.get("blob-dir");
+        if (!a.get("shard-size").empty()) so.shard_bytes = parse_size_arg(a.get("shard-size"), "--shard-size");
+        sr = modelfile::shard_split(f, a.get("o"), so);
+        std::printf("split %s -> %s: %zu tensors in %zu blobs under %s\n  %zu blobs written (%llu bytes), %zu already in the store (%llu bytes not stored again)\n", f.c_str(), a.get("o").c_str(), sr.tensors, sr.shards,
+                    sr.blob_dir.c_str(), sr.written, (unsigned long long)sr.bytes_written, sr.reused, (unsigned long long)sr.bytes_reused);
+    } else if (verb == "join") {
+        sr = modelfile::shard_join(f, a.get("o"));
+        std::printf("joined %s -> %s: %zu tensors from %zu blobs, %llu bytes\n", f.c_str(), a.get("o").c_str(), sr.tensors, sr.shards, (unsigned long long)sr.bytes);
+    } else return usage();
+    for (auto& n : sr.notes) std::fprintf(stderr, "forge shard: %s\n", n.c_str());
+    return 0;
+}
+
+// forge blueprint <model.fpk | file.fbp | file.fbpb> --to binary|text|canonical [-o out]
+// A model file: its blueprint section is rewritten in that form. A bare blueprint file: converted to -o.
+bool is_fpk(const std::string& f);
+int cmd_blueprint(const args& a) {
+    if (a.pos.empty() || a.get("to").empty()) return usage();
+    const std::string to = a.get("to");
+    if (to != "binary" && to != "text" && to != "canonical") throw std::runtime_error("--to takes binary, text or canonical");
+    activate_policy(a.get("policy"));
+    if (is_fpk(a.pos[0])) {
+        if (to == "canonical") throw std::runtime_error("--to canonical is for bare blueprint files; a model file stores text or binary");
+        auto out = a.get("o").empty() ? a.pos[0] : a.get("o");
+        import::check_write(out);
+        bool changed = modelfile::convert_blueprint_section(a.pos[0], out, to == "binary");
+        if (!changed) { std::printf("%s: the blueprint is already in the %s form\n", a.pos[0].c_str(), to.c_str()); return 0; }
+        modelfile::reader r(out);
+        std::printf("%s: blueprint now %s (%zu bytes) -> %s\n", a.pos[0].c_str(), to.c_str(), r.section_text("blueprint").size(), out.c_str());
+        std::puts("note: a signature and precompiled plans do not survive this; sign / run forge aot again");
+        return 0;
+    }
+    if (a.get("o").empty()) return usage();
+    auto src = import::read_file(a.pos[0]);
+    std::string text = modelfile::blueprint_text(src), res;
+    if (to == "binary") { auto b = modelfile::encode_blueprint(text); res.assign(reinterpret_cast<const char*>(b.data()), b.size()); }
+    else res = to == "canonical" ? modelfile::canonical_blueprint_text(text) : text;
+    import::check_write(a.get("o"));
+    std::ofstream f(a.get("o"), std::ios::binary); f << res;
+    if (!f) throw std::runtime_error("cannot write " + a.get("o"));
+    std::printf("%s (%zu bytes) -> %s (%s, %zu bytes)\n", a.pos[0].c_str(), src.size(), a.get("o").c_str(), to.c_str(), res.size());
+    return 0;
+}
+
+// forge requant <in.fpk> -o <out.fpk> --codec C [mixed-precision options of import] [--no-calib] [--calib-crest X] [--align A]
+int cmd_requant(const args& a) {
+    if (a.pos.empty() || a.get("o").empty() || a.get("codec").empty()) return usage();
+    import::requant_options ro; auto& o = ro.base;
+    o.codec = a.get("codec"); o.emb_codec = a.get("emb-codec");
+    o.recipe.recipe = a.get("recipe", "forge");
+    o.recipe.output_type = a.get("output-tensor-type");
+    o.recipe.token_embedding_type = a.get("token-embedding-type");
+    o.recipe.pure = a.has("pure");
+    o.recipe.head_bf16 = a.has("bf16-head");
+    o.recipe.calib_crest = a.num("calib-crest", o.recipe.calib_crest);
+    for (std::string tt = a.get("tensor-type"); !tt.empty();) {
+        auto c = tt.find(','); o.recipe.tensor_types.push_back(import::parse_tensor_type(tt.substr(0, c)));
+        tt = c == std::string::npos ? "" : tt.substr(c + 1);
+    }
+    if (!a.get("align").empty()) o.align = std::size_t(parse_size_arg(a.get("align"), "--align"));
+    ro.use_calib = !a.has("no-calib");
+    activate_policy(a.get("policy"));
+    auto r = import::requantise(a.pos[0], a.get("o"), ro);
+    std::printf("requantised %s -> %s: %zu tensors (%zu re-encoded as %s, %zu copied), %llu bytes\n", a.pos[0].c_str(), a.get("o").c_str(), r.tensors, r.requantised, o.codec.c_str(), r.kept, (unsigned long long)r.bytes);
+    if (ro.use_calib) std::printf("calib     %s; it changed the type of %zu tensor(s)\n", r.calib_from_file ? "statistics read from the input's calib section" : "no calib section: statistics computed from the f32 weights", r.calib_moved);
+    for (auto& n : r.notes) std::fprintf(stderr, "forge requant: %s\n", n.c_str());
     return 0;
 }
 
@@ -301,6 +518,16 @@ int cmd_sign(const args& a) {
     std::printf("signed %s with key %s -> %s\n", a.pos[0].c_str(), modelfile::key_id(k.pub).c_str(), out.c_str());
     return 0;
 }
+// "4096", "64k", "1M", "2G" -> bytes (binary multiples)
+std::uint64_t parse_size_arg(const std::string& v, const char* what) {
+    std::size_t used = 0; double n = 0;
+    try { n = std::stod(v, &used); } catch (const std::exception&) { throw std::runtime_error(std::string(what) + ": bad size '" + v + "'"); }
+    std::string unit = v.substr(used); for (auto& c : unit) c = char(std::tolower(static_cast<unsigned char>(c)));
+    double mul = unit.empty() || unit == "b" ? 1 : unit == "k" || unit == "kb" || unit == "kib" ? 1024.0 : unit == "m" || unit == "mb" || unit == "mib" ? 1048576.0
+               : unit == "g" || unit == "gb" || unit == "gib" ? 1073741824.0 : -1;
+    if (mul < 0 || n < 0 || n * mul > 9e15) throw std::runtime_error(std::string(what) + ": bad size '" + v + "'");
+    return std::uint64_t(n * mul);
+}
 int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key k.mkey | --new-key k.mkey]
     if (a.pos.empty() || a.get("o").empty() || (a.get("key").empty() && a.get("new-key").empty())) return usage();
     modelfile::model_key k;
@@ -316,8 +543,13 @@ int cmd_encrypt(const args& a) {   // forge encrypt <in.fpk> -o <out.fpk> [--key
         auto b = modelfile::detail::unhex(h); if (b.size() != 32) throw std::runtime_error("model key must be 64 hex chars");
         std::memcpy(k.data(), b.data(), 32);
     }
-    modelfile::encrypt_file(a.pos[0], a.get("o"), k);
-    std::printf("encrypted %s -> %s (key id %s)\n", a.pos[0].c_str(), a.get("o").c_str(), modelfile::detail::enc_key_id(k).c_str());
+    // --chunk SIZE: plaintext bytes per sealed chunk (default 1M); --single-aead: the old one-AEAD scheme
+    modelfile::encrypt_options eo;
+    if (!a.get("chunk").empty()) eo.chunk_bytes = std::size_t(parse_size_arg(a.get("chunk"), "--chunk"));
+    eo.single_aead = a.has("single-aead");
+    modelfile::encrypt_file(a.pos[0], a.get("o"), k, eo);
+    std::printf("encrypted %s -> %s (key id %s, %s)\n", a.pos[0].c_str(), a.get("o").c_str(), modelfile::detail::enc_key_id(k).c_str(),
+                eo.single_aead ? "single AEAD" : std::format("{}-byte chunks", eo.chunk_bytes).c_str());
     return 0;
 }
 int cmd_verify(const args& a) {
@@ -345,27 +577,139 @@ int cmd_verify(const args& a) {
 int run_one_shot(inference::session& s, const args& a) {
     std::map<std::string, std::vector<float>> in; i64 seq = 1;
     const json::value* decl = s.manifest().find("onnx_inputs");
+    // symbolic dimensions: --dim name=N binds one; the rest are worked out from the input sizes where an input has
+    // exactly one unbound dimension
+    std::map<std::string, i64> dims;
+    for (auto& spec : a.all("dim")) {
+        auto eq = spec.find('=');
+        if (eq == std::string::npos || eq == 0) raise(errc::invalid_argument, "--dim expects name=N, got '{}'", spec);
+        dims[spec.substr(0, eq)] = i64(std::stoll(spec.substr(eq + 1)));
+    }
     for (auto& spec : a.all("input")) {
         auto eq = spec.find('=');
         if (eq == std::string::npos) raise(errc::invalid_argument, "--input expects name=file, got '{}'", spec);
-        auto name = spec.substr(0, eq); auto bytes = import::read_file(spec.substr(eq + 1));
-        if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", spec.substr(eq + 1));
-        std::vector<float> v(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        auto name = spec.substr(0, eq); auto file = spec.substr(eq + 1); auto bytes = import::read_file(file);
+        // raw little-endian f32, or integers for integer inputs: file.i64 / file.i32 (token ids, masks)
+        std::vector<float> v;
+        if (file.ends_with(".i64") || file.ends_with(".i32")) {
+            const std::size_t w = file.ends_with(".i64") ? 8 : 4;
+            if (bytes.size() % w) raise(errc::invalid_argument, "input file {} is not raw {}", file, w == 8 ? "int64" : "int32");
+            v.resize(bytes.size() / w);
+            for (std::size_t i = 0; i < v.size(); ++i) { if (w == 8) { std::int64_t x; std::memcpy(&x, bytes.data() + 8 * i, 8); v[i] = float(x); } else { std::int32_t x; std::memcpy(&x, bytes.data() + 4 * i, 4); v[i] = float(x); } }
+        } else {
+            if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", file);
+            v.resize(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        }
         if (decl) for (auto& d : decl->arr()) {
             if (d["onnx"].str() != name && d["name"].str() != name) continue;
-            name = d["name"].str(); i64 k = 1; bool sym = false;
-            for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= i64(x.num()); }
-            if (sym && k) seq = i64(v.size()) / k;
+            name = d["name"].str();
+            if (auto* dt = d.find("dims"); dt && dt->is_arr()) {   // dimension names: solve the one that is not bound yet
+                i64 k = 1; std::string unknown; int n_unknown = 0;
+                for (auto& x : dt->arr()) {
+                    const std::string t = x.str();
+                    if (!t.empty() && std::isdigit(static_cast<unsigned char>(t[0]))) k *= i64(std::stoll(t));
+                    else if (auto it = dims.find(t); it != dims.end()) k *= it->second;
+                    else { if (unknown != t) ++n_unknown; unknown = t; }
+                }
+                if (n_unknown == 1 && k > 0) {
+                    if (i64(v.size()) % k) raise(errc::invalid_argument, "input {} has {} values, which is not a multiple of {}", name, v.size(), k);
+                    dims[unknown] = i64(v.size()) / k;
+                } else if (n_unknown > 1) raise(errc::invalid_argument, "input {} has {} unbound dimensions; give them with --dim name=N", name, n_unknown);
+            } else {   // files imported before dimension names were recorded: one symbolic dimension, `seq`
+                i64 k = 1; bool sym = false;
+                for (auto& x : d["shape"].arr()) { if (x.num() < 0) sym = true; else k *= i64(x.num()); }
+                if (sym && k) dims["seq"] = i64(v.size()) / k;
+            }
         }
         in[name] = std::move(v);
     }
-    auto out = s.infer(in, seq);
+    if (auto it = dims.find("seq"); it != dims.end()) seq = it->second;
+    auto out = s.infer(in, seq, dims);
     auto prefix = a.get("out");
     for (auto& [k, v] : out) {
         if (prefix.empty()) { std::printf("%s:", k.c_str()); for (auto x : v) std::printf(" %.6g", x); std::printf("\n"); continue; }
         std::ofstream f(prefix + "." + k + ".f32", std::ios::binary);
         f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
     }
+    return 0;
+}
+
+// name=file arguments -> {name: values}; files are raw f32, or .i64 / .i32 integers
+inference::tensor_map read_named_inputs(const std::vector<std::string>& specs, const char* opt) {
+    inference::tensor_map m;
+    for (auto& spec : specs) {
+        auto eq = spec.find('=');
+        if (eq == std::string::npos || eq == 0) raise(errc::invalid_argument, "{} expects name=file, got '{}'", opt, spec);
+        auto file = spec.substr(eq + 1); auto bytes = import::read_file(file);
+        std::vector<float> v;
+        if (file.ends_with(".i64") || file.ends_with(".i32")) {
+            const std::size_t w = file.ends_with(".i64") ? 8 : 4;
+            if (bytes.size() % w) raise(errc::invalid_argument, "input file {} is not raw {}", file, w == 8 ? "int64" : "int32");
+            v.resize(bytes.size() / w);
+            for (std::size_t i = 0; i < v.size(); ++i) { if (w == 8) { std::int64_t x; std::memcpy(&x, bytes.data() + 8 * i, 8); v[i] = float(x); } else { std::int32_t x; std::memcpy(&x, bytes.data() + 4 * i, 4); v[i] = float(x); } }
+        } else {
+            if (bytes.size() % 4) raise(errc::invalid_argument, "input file {} is not raw f32", file);
+            v.resize(bytes.size() / 4); std::memcpy(v.data(), bytes.data(), bytes.size());
+        }
+        m[spec.substr(0, eq)] = std::move(v);
+    }
+    return m;
+}
+void write_f32(const std::string& path, const std::vector<float>& v) {
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+    if (!f) throw std::runtime_error("cannot write " + path);
+}
+
+// `forge denoise`: a model whose blueprint declares `session diffusion_loop`: scheduler, step plan and guidance from
+// the file (overridable), the model's graph as the denoiser. Writes or prints the final latent.
+int cmd_denoise(const args& a) {
+    if (a.pos.empty()) return usage();
+    activate_policy(a.get("policy"));
+    inference::session_options so; so.verify = a.has("verify");
+    inference::session s(a.pos[0], so);
+    if (!a.get("device").empty()) s.shared_model()->set_device(a.get("device"));
+    std::map<std::string, i64> dims;
+    for (auto& spec : a.all("dim")) { auto eq = spec.find('='); if (eq == std::string::npos || eq == 0) raise(errc::invalid_argument, "--dim expects name=N, got '{}'", spec); dims[spec.substr(0, eq)] = i64(std::stoll(spec.substr(eq + 1))); }
+    inference::diffusion_runner d(s, dims);
+    auto o = d.defaults();
+    o.steps = int(a.num("steps", o.steps)); o.guidance = float(a.num("guidance", o.guidance)); o.eta = a.num("eta", o.eta); o.seed = std::uint64_t(a.num("seed", 0));
+    if (auto k = a.get("sampler"); !k.empty()) {
+        if (k == "ddim") o.kind = inference::diffusion::sampler_kind::ddim; else if (k == "ddpm") o.kind = inference::diffusion::sampler_kind::ddpm;
+        else if (k == "euler" || k == "euler_flow") o.kind = inference::diffusion::sampler_kind::euler_flow; else raise(errc::invalid_argument, "--sampler takes ddim, ddpm or euler, not '{}'", k);
+    }
+    auto cond = read_named_inputs(a.all("input"), "--input"), uncond = read_named_inputs(a.all("uncond"), "--uncond");
+    inference::diffusion::latent x;
+    if (!a.get("init").empty()) { auto m = read_named_inputs({"x=" + a.get("init")}, "--init"); x = std::move(m.at("x")); }   // start from a given latent instead of seeded noise
+    else x = d.initial_noise(o.seed);
+    auto t0 = std::chrono::steady_clock::now();
+    auto y = d.run(std::move(x), o, cond, uncond);
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr, "[diffusion: %d steps, %zu denoiser calls, latent of %zu values, %.3fs]\n", o.steps, d.model_calls(), y.size(), sec);
+    if (!a.get("out").empty()) write_f32(a.get("out"), y);
+    else { for (auto v : y) std::printf("%.6g ", v); std::printf("\n"); }
+    return 0;
+}
+
+// `forge stream`: a model whose blueprint declares `session streaming`: samples from --input are fed in chunks of
+// --chunk, framed by the file's window / hop, and the model runs once per frame with its state carried over.
+int cmd_stream(const args& a) {
+    if (a.pos.empty() || a.get("input").empty()) return usage();
+    activate_policy(a.get("policy"));
+    inference::session_options so; so.verify = a.has("verify");
+    inference::session s(a.pos[0], so);
+    if (!a.get("device").empty()) s.shared_model()->set_device(a.get("device"));
+    inference::stream_runner r(s);
+    auto samples = read_named_inputs({"x=" + a.get("input")}, "--input").at("x");
+    std::size_t chunk = std::size_t(std::max(1.0, a.num("chunk", double(r.options().hop))));
+    auto t0 = std::chrono::steady_clock::now();
+    for (std::size_t at = 0; at < samples.size(); at += chunk) r.feed({samples.data() + at, std::min(chunk, samples.size() - at)});
+    double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const auto& st = r.stat();
+    std::fprintf(stderr, "[stream: %zu samples in chunks of %zu, window %zu hop %zu: %zu frames, %zu dropped, %zu values per frame, worst frame %.3f ms, %.3fs]\n",
+                 st.samples_in, chunk, r.options().window, r.options().hop, st.frames, st.dropped, r.frame_size(), st.worst_ms, sec);
+    if (!a.get("out").empty()) write_f32(a.get("out"), r.output());
+    else { for (auto v : r.output()) std::printf("%.6g ", v); std::printf("\n"); }
     return 0;
 }
 
@@ -419,6 +763,7 @@ int cmd_run(const args& a) {
     activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
     inference::session s(resolve_model(a.pos[0], a.get("codec"), a.has("allow-unused")), so);
+    if (!a.get("adapter").empty()) s.set_adapter(a.get("adapter"));   // a LoRA adapter carried in the model file, by name
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
     if (a.kv.count("tokens")) prompt = parse_ids(a.get("tokens"));
@@ -465,10 +810,14 @@ int cmd_run(const args& a) {
     // Speculative decoding: --draft model.fpk or --lookup (n-gram drafts from the prompt and output).
     // --spec-k N: N drafts per pass; 0 (default) = chosen per pass by the planner from measured costs.
     // Not with --grammar: the constraint advances one token at a time.
-    if ((a.kv.count("draft") || a.has("lookup")) && !gc) {
+    // --self-spec [--exit-layer K]: drafts from the model's own early exit (its first K layers and the LM head);
+    // K defaults to the blueprint's `early_exit`, else half the depth. The output is that of plain decoding.
+    if ((a.kv.count("draft") || a.has("lookup") || a.has("self-spec")) && !gc) {
         inference::speculative_stats sst;
         int k = int(a.num("spec-k", 0)), n = int(a.num("n", 32));
-        if (a.kv.count("draft")) {
+        if (a.has("self-spec")) {
+            inference::self_speculative_generate(s, prompt, n, smp, i64(a.num("exit-layer", 0)), k, show, &sst);
+        } else if (a.kv.count("draft")) {
             inference::session d(resolve_model(a.get("draft"), a.get("codec")), so);
             inference::speculative_generate(s, d, prompt, n, smp, k, show, &sst);
         } else {
@@ -1024,19 +1373,25 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "self-spec", "single-aead", "state", "calib", "no-calib", "pure", "bf16-head"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);
         if (c == "inspect") return cmd_inspect(a);
         if (c == "run") return cmd_run(a);
         if (c == "embed") return cmd_embed(a);
+        if (c == "denoise") return cmd_denoise(a);
+        if (c == "stream") return cmd_stream(a);
         if (c == "bench") return cmd_bench(a);
         if (c == "dump") return cmd_dump(a);
         if (c == "keygen") return cmd_keygen(a);
         if (c == "sign") { activate_policy(a.get("policy")); return cmd_sign(a); }   // FIO-2 on the secret key under a policy
         if (c == "verify") return cmd_verify(a);
         if (c == "encrypt") return cmd_encrypt(a);
+        if (c == "adapter") return cmd_adapter(a);
+        if (c == "shard") return cmd_shard(a);
+        if (c == "blueprint") return cmd_blueprint(a);
+        if (c == "requant") return cmd_requant(a);
         if (c == "rpc-serve") return cmd_rpc_serve(a);
         if (c == "security") return cmd_security(a);
         return usage();

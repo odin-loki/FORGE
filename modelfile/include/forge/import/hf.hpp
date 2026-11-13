@@ -3,6 +3,8 @@
 #include <forge/import/safetensors.hpp>
 #include <forge/import/hf_quant.hpp>
 #include <forge/import/quant_recipe.hpp>
+#include <forge/modelfile/calib.hpp>
+#include <forge/modelfile/state_schema.hpp>
 #include <forge/import/tokenizer_import.hpp>
 #include <forge/modelfile/blueprint.hpp>
 #include <forge/modelfile/fpk.hpp>
@@ -97,7 +99,40 @@ struct import_options {
     // Source tensors that are known not to matter, on top of the built-in buffers (ignored_tensor below). An entry is a
     // whole name, `prefix*` or `*suffix`.
     std::vector<std::string> ignore_tensors;
+    // Tensor alignment of the output (64, 4096 or 65536). 0 = by size: 4096 when the source weights are at least
+    // 64 MiB, else 64 (modelfile::default_tensor_alignment).
+    std::size_t align = 0;
+    // Record per-tensor statistics of the full-precision weights in a "calib" section (modelfile/calib.hpp), for a
+    // later `forge requant`. Hugging Face (safetensors) sources only: a GGUF's weights are already quantised.
+    bool calib = false;
 };
+// The "state" section of an import: the state slots the blueprint builds (modelfile/state_schema.hpp). A model without
+// state gets no section. W: modelfile::writer or stream_writer, after its tensors were added.
+template <class W> void add_state_section(W& w, const modelfile::blueprint& bp) {
+    if (bp.states.empty()) return;
+    std::map<std::string, shape_t> shapes;
+    for (auto& e : w.entries()) shapes[e.name] = e.shape;
+    auto sc = modelfile::derive_state_schema(bp, [&](const std::string& n) -> shape_t {
+        auto it = shapes.find(n);
+        if (it == shapes.end()) raise(errc::not_found, "state schema: the blueprint reads tensor {}, which was not written", n);
+        return it->second;
+    });
+    if (!sc.slots.empty()) w.set_section(modelfile::state_section, sc.dump());
+}
+// The alignment an import of `source` (a checkpoint directory or a model file) writes with.
+inline std::size_t import_alignment(const import_options& opt, const std::filesystem::path& source) {
+    if (opt.align) {
+        if (opt.align != modelfile::alignment && opt.align != modelfile::page_alignment && opt.align != modelfile::large_alignment)
+            raise(errc::invalid_argument, "tensor alignment must be 64, 4096 or 65536, not {}", opt.align);
+        return opt.align;
+    }
+    std::error_code ec; std::uint64_t n = 0;
+    if (std::filesystem::is_directory(source, ec)) {
+        for (auto it = std::filesystem::directory_iterator(source, ec); !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+            if (it->is_regular_file(ec)) { auto x = it->path().extension().string(); if (x == ".safetensors" || x == ".bin" || x == ".gguf" || x == ".onnx") n += std::uint64_t(it->file_size(ec)); }
+    } else if (auto sz = std::filesystem::file_size(source, ec); !ec) n = std::uint64_t(sz);
+    return modelfile::default_tensor_alignment(n);
+}
 
 struct import_report {
     std::string arch, template_name; std::size_t tensors = 0, bytes = 0;
@@ -308,7 +343,7 @@ struct expert_index {
     json::array ents;
     void add(const modelfile::tensor_entry& e, i64 layer, const char* proj) {
         if (e.shape.size() != 3 || e.shape[0] < 1) raise(errc::shape_mismatch, "expert tensor {} has shape {}", e.name, shape_str(e.shape));
-        std::uint64_t ne = std::uint64_t(e.shape[0]), per = e.bytes / ne, foff = 64 + e.offset;
+        std::uint64_t ne = std::uint64_t(e.shape[0]), per = e.bytes / ne, foff = 64 + e.offset;   // stream_writer::data_offset()
         ents.push_back(json::object{{"layer", double(layer)}, {"proj", std::string(proj)}, {"name", e.name}, {"codec", e.codec},
                                     {"n_experts", double(ne)}, {"offset", double(e.offset)}, {"file_offset", double(foff)},
                                     {"expert_bytes", double(per)}, {"aligned", foff % modelfile::expert_alignment == 0 && per % modelfile::expert_alignment == 0}});
@@ -510,6 +545,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     std::string mp = has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
 
     modelfile::stream_writer w(out);   // each tensor is encoded, written and freed before the next is loaded
+    w.set_alignment(import_alignment(opt, dir));
     import_report rep{arch, tname, 0, 0};
     i64 L = i64(bp.param("n_layers"));
     quant_recipe rc = opt.recipe;
@@ -520,9 +556,11 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         if (has(std::format("{}layers.{}.self_attn.v_proj.weight", mp, l))) v_index[std::size_t(l)] = rc.n_attn_v++;
     bool in_deltanet = false;
     expert_index xi;
+    modelfile::calib_table calib;   // --calib: statistics of the f32 weights that get quantised
     auto put = [&](const std::string& n, const tensor& t, bool quantisable, std::size_t align = modelfile::alignment) {
         // an AWQ / GPTQ Linear that fits the grouped codec keeps its codes (the tensor just read by find)
         if (auto nat = qck.take(); nat && qkeep && quantisable && nat->shape == t.shape) { w.add_raw(n, t.shape, nat->codec, nat->blocks, align); ++rep.tensors; ++qck.n_native; return; }
+        if (opt.calib && quantisable) calib.tensors[n] = modelfile::tensor_stats::of(t.data);
         std::string c = "f32";
         if (quantisable) {
             if (opt.mixed()) {
@@ -559,6 +597,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         std::string ec = opt.emb_codec.empty() ? (opt.codec == "f32" || opt.codec == "f16" || opt.codec == "bf16" ? opt.codec : std::string("q8_0")) : opt.emb_codec;
         auto t = find(mp + "embed_tokens.weight");
         if (opt.mixed() && opt.emb_codec.empty()) ec = recipe_type(rc, "tok_emb", t.shape.back());
+        if (opt.calib) calib.tensors["tok_emb"] = modelfile::tensor_stats::of(t.data);
         w.add_tensor("tok_emb", t.shape, t.data, ec); ++rep.tensors;
     }
     auto mlp = [&](const std::string& P, const std::string& Q, const char* g, const char* u, const char* d) {
@@ -669,6 +708,8 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     store_hf_tokenizer(dir, man, w, rep);
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
+    add_state_section(w, bp);
+    if (!calib.empty()) w.set_section(modelfile::calib_section, calib.dump());
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

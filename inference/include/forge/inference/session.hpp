@@ -9,8 +9,11 @@
 #include <forge/inference/aot.hpp>
 #include <forge/inference/sampler.hpp>
 #include <forge/modelfile/blueprint.hpp>
+#include <forge/modelfile/blueprint_bin.hpp>
 #include <forge/modelfile/fpk.hpp>
 #include <forge/modelfile/sign.hpp>
+#include <forge/modelfile/adapters.hpp>
+#include <forge/modelfile/state_schema.hpp>
 #include <forge/modelfile/tokenizer.hpp>
 #include <algorithm>
 #include <forge/security/enforce.hpp>
@@ -35,6 +38,12 @@ struct session_options {
     // Determinism mode (gpu/determinism.hpp): 1 = order-stable device paths only (same device + same build -> bit-identical
     // results), 0 = off, -1 = $FORGE_DETERMINISTIC. Process-wide: it applies to every runtime in the process.
     int deterministic = -1;
+    // Early exit: > 0 runs only the first `exit_layer` layers and applies the model's final norm and LM head to that
+    // hidden state (the draft of self-speculative decoding, speculative.hpp). The blueprint is built with its depth
+    // param (`n_layers`, or the one named by `session generative_sequence(depth_param: "n_blocks")`: quoted, since a
+    // bare param name in a session parameter stands for the param's value) set to this value.
+    // Such a session has its own state and shares the model's weights. 0 = the whole model.
+    i64 exit_layer = 0;
 };
 
 struct generate_stats { std::size_t prompt_tokens = 0, new_tokens = 0; double prefill_s = 0, decode_s = 0; };
@@ -99,7 +108,7 @@ public:
             if (!rep.trusted && (strict || rep.signed_)) raise(errc::integrity_error, "{}: signature check failed: {}", fpk_path, rep.message);
         }
         man_ = r_.manifest();
-        bp_ = modelfile::parse_blueprint(r_.section_text("blueprint"));
+        bp_ = modelfile::load_blueprint(r_);   // text, or the binary form (modelfile/blueprint_bin.hpp)
         try { modelfile::check_opset(bp_); }   // before any plan is built: an opset this engine does not run
         catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
         // Files imported before the runtime had WordPiece / Unigram tokenizers keep such a tokenizer.json in a
@@ -119,6 +128,17 @@ public:
         }
         if (r_.has_section("chat_template")) chat_template_ = std::string(r_.section_text("chat_template"));
         vocab_ = i64(bp_.param_or("vocab", 0));
+        // Optional sections (docs/format.md): adapters carried in the file, and the declared state schema. Both are
+        // checked here, before anything runs: a section that does not fit the file is a format error, not a surprise
+        // at the first request. Files without them open exactly as before.
+        try {
+            embedded_ = modelfile::read_adapters(r_);
+            if (r_.has_section(modelfile::state_section)) {
+                declared_state_ = modelfile::state_schema::parse(r_.section_text(modelfile::state_section));
+                if (!(*declared_state_ == derive_state_()))
+                    raise(errc::format_error, "the state section does not describe the state its blueprint builds");
+            }
+        } catch (const forge_exception& e) { throw forge_exception(e.code, fpk_path + ": " + e.what()); }
         if (lib_ && (strict || r_.has_section("signature")))   // compiled code is not covered by the model's signature
             raise(errc::integrity_error, "{}: a compiled model library cannot be loaded for a signed model or under strict loading", path);
         aot_.attach(r_, fpk_path, strict, lib_);
@@ -136,7 +156,7 @@ public:
         std::lock_guard lk(run_mu_);
         std::string why, use = dev;
         if (dev == "auto") {   // score every device that opens for this model (gpu/select.hpp)
-            gpu::select_request rq; rq.model_bytes = r_.section_bytes("data").size();
+            gpu::select_request rq; rq.model_bytes = std::size_t(r_.data_size());
             for (auto& [nm, e] : r_.tensors()) if (std::find(rq.codecs.begin(), rq.codecs.end(), e.codec) == rq.codecs.end()) rq.codecs.push_back(e.codec);
             std::string table; use = graph::auto_device(rq, &table);
             log::info("FORGE_DEVICE=auto -> {}\n{}", use, table);
@@ -211,14 +231,76 @@ public:
         }
         add_adapter(name, d, float(ar.manifest().num_or("lora_alpha", 1)));
     }
-    bool has_adapter(const std::string& n) const { if (n.empty()) return true; std::lock_guard lk(w_mu_); return adapters_.count(n) != 0; }
-    std::vector<std::string> adapter_names() const { std::lock_guard lk(w_mu_); std::vector<std::string> v; for (auto& [k, a] : adapters_) v.push_back(k); return v; }
+    bool has_adapter(const std::string& n) const {
+        if (n.empty()) return true;
+        { std::lock_guard lk(w_mu_); if (adapters_.count(n)) return true; }
+        return std::any_of(embedded_.begin(), embedded_.end(), [&](auto& a) { return a.name == n; });
+    }
+    // Adapters carried in the model file's "adapters" section (modelfile/adapters.hpp). They are selected by name like
+    // registered ones (session::set_adapter); the factors are read and merged the first time a name is used.
+    const std::vector<modelfile::adapter_info>& embedded_adapters() const { return embedded_; }
+    // Makes adapter `n` usable: nothing for "" and for registered adapters, a load for an embedded one not used yet.
+    void ensure_adapter(const std::string& n) {
+        if (n.empty()) return;
+        { std::lock_guard lk(w_mu_); if (adapters_.count(n)) return; }
+        auto it = std::find_if(embedded_.begin(), embedded_.end(), [&](auto& a) { return a.name == n; });
+        if (it == embedded_.end()) raise(errc::not_found, "adapter '{}' not loaded", n);
+        std::map<std::string, lora> d;
+        for (auto& w : it->targets) d[w] = lora{r_.load(modelfile::adapter_info::tensor_a(n, w)), r_.load(modelfile::adapter_info::tensor_b(n, w))};
+        try { add_adapter(n, d, float(it->alpha)); }
+        catch (const forge_exception&) { std::lock_guard lk(w_mu_); if (!adapters_.count(n)) throw; }   // another thread loaded it first
+    }
+    // Depth of the model in the unit early exit counts in: the value of its depth param (0 when it has none).
+    std::string depth_param() const { return bp_.session_str("depth_param", "n_layers"); }
+    i64 depth() const { return i64(bp_.param_or(depth_param(), 0)); }
+    // The exit layer the file suggests for self-speculative decoding: `session generative_sequence(early_exit: K)`
+    // (opset 4), 0 when it names none.
+    i64 early_exit_default() const { return i64(bp_.session_arg("early_exit", 0)); }
+    // The blueprint cut at `exit_layer`: the same program with the depth param set to it, so its layer loop stops
+    // there and the final norm and head read that hidden state. Raises when the model cannot be cut there.
+    modelfile::blueprint early_exit_blueprint(i64 exit_layer) const {
+        const auto name = depth_param(); const i64 full = depth();
+        if (!bp_.params.count(name)) raise(errc::unsupported, "{}: early exit needs the blueprint's depth param '{}' (name another with `session generative_sequence(depth_param: \"name\")`)", fpk_path_, name);
+        if (exit_layer < 1 || exit_layer >= full) raise(errc::invalid_argument, "{}: exit layer {} is outside 1 .. {} ({} = {})", fpk_path_, exit_layer, full - 1, name, full);
+        modelfile::blueprint cut = bp_;
+        cut.params[name] = double(exit_layer);
+        // the cut must be a smaller graph: a blueprint whose layer loop runs on another param would give a "draft"
+        // that is the whole model
+        if (modelfile::blueprint_weights(cut).size() >= modelfile::blueprint_weights(bp_).size())
+            raise(errc::unsupported, "{}: setting '{}' to {} does not shorten the graph; name the param that sets the depth with `session generative_sequence(depth_param: \"name\")`", fpk_path_, name, exit_layer);
+        return cut;
+    }
+    // The model's state schema: the file's "state" section when it has one (checked against the blueprint at open),
+    // else derived from the blueprint on first use. Null when it cannot be derived (the old behaviour then applies:
+    // nothing is checked against it).
+    const modelfile::state_schema* state_schema() const {
+        if (declared_state_) return &*declared_state_;
+        std::call_once(state_once_, [&] { try { derived_state_ = derive_state_(); } catch (const std::exception&) {} });
+        return derived_state_ ? &*derived_state_ : nullptr;
+    }
+    // The adapters that can be selected by name, sorted: the registered ones and the ones carried in the model file.
+    std::vector<std::string> adapter_names() const {
+        std::vector<std::string> v;
+        { std::lock_guard lk(w_mu_); for (auto& [k, a] : adapters_) v.push_back(k); }
+        for (auto& a : embedded_) v.push_back(a.name);
+        std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end());
+        return v;
+    }
     std::size_t loaded_weights() const { return weights_.size(); }
 
     // plan for `n` new tokens; all_rows keeps logits for every position
-    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}) {
-        return cache_.get(std::format("{}:{}:{}:{}", all_rows ? "all" : "seq", n, adapter, st ? graph::kv_codec_pair_name({st->codec, st->codec_v == graph::kv_codec::f32 ? st->codec : st->codec_v}) : "f32"), [&] {
+    // `dims` binds symbolic dimensions other than `seq` (graphs imported from ONNX may have several); such plans are
+    // compiled here, never taken from precompiled ones (those are keyed on `seq` alone).
+    // `entry` names an entry point of the blueprint (`entry name { ... }`, opset 4) to build instead of the main graph.
+    // `exit_layer` > 0 builds the early-exit graph (session_options::exit_layer).
+    graph::plan& plan_for(i64 n, bool all_rows, graph::state_store* st, const std::string& adapter = {}, const std::map<std::string, i64>* dims = nullptr, const std::string& entry = {}, i64 exit_layer = 0) {
+        std::string dk;
+        if (dims) for (auto& [k, v] : *dims) if (k != "seq") dk += std::format(";{}={}", k, v);
+        if (!entry.empty() && entry != "main") dk += ";entry=" + entry;
+        if (exit_layer > 0) dk += std::format(";exit={}", exit_layer);
+        return cache_.get(std::format("{}:{}:{}:{}{}", all_rows ? "all" : "seq", n, adapter, st ? graph::kv_codec_pair_name({st->codec, st->codec_v == graph::kv_codec::f32 ? st->codec : st->codec_v}) : "f32", dk), [&] {
             modelfile::build_options bo;
+            if (dims) for (auto& [k, v] : *dims) bo.dims[k] = v;
             bo.dims["seq"] = n;
             bo.all_rows = all_rows;
             bo.weight = [&](const std::string& name) -> std::pair<shape_t, const float*> {
@@ -239,22 +321,26 @@ public:
                 if (!adapter.empty() && adapters_.at(adapter).count(name)) return {};
                 const auto& e = r_.entry(name);
                 if (e.codec == "f32") return {};  // handled by `weight` (zero-copy below)
-                return {e.shape, r_.section_bytes("data").data() + e.offset, e.codec};
+                return {e.shape, r_.tensor_bytes(name).data(), e.codec};
             };
             if (!decode_all) bo.weight = [&, inner = bo.weight](const std::string& name) -> std::pair<shape_t, const float*> {
                 const auto& e = r_.entry(name);
                 bool adapted = !adapter.empty() && adapters_.at(adapter).count(name);
-                const auto* base = r_.section_bytes("data").data() + e.offset;
-                if (!adapted && e.codec == "f32" && reinterpret_cast<std::uintptr_t>(base) % alignof(float) == 0)
-                    return {e.shape, reinterpret_cast<const float*>(base)};
+                if (!adapted && e.codec == "f32")
+                    if (const auto* base = r_.tensor_bytes(name).data(); reinterpret_cast<std::uintptr_t>(base) % alignof(float) == 0)
+                        return {e.shape, reinterpret_cast<const float*>(base)};
                 return inner(name);
             };
             graph::pass_options po; po.lowerings = reg_.get();
-            if (!decode_all) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
-            return graph::compile(modelfile::build_graph(bp_, bo), st, po);
+            if (!decode_all && dk.empty()) if (auto ap = aot_.try_plan(n, all_rows, st, bo, po, adapter)) return ap;   // precompiled
+            if (exit_layer > 0) return graph::compile(modelfile::build_graph(early_exit_blueprint(exit_layer), bo, entry), st, po);
+            return graph::compile(modelfile::build_graph(bp_, bo, entry), st, po);
         });
     }
 private:
+    modelfile::state_schema derive_state_() const {
+        return modelfile::derive_state_schema(bp_, [&](const std::string& n) { return r_.entry(n).shape; });
+    }
     static std::shared_ptr<aot_native::library> open_native(const std::string& path, std::shared_ptr<aot_native::library> lib) {
         if (lib || !aot_native::library::is_library(path)) return lib;
         admit(path);
@@ -271,6 +357,10 @@ private:
     graph::plan_cache cache_;
     std::map<std::string, tensor> weights_;
     std::map<std::string, std::map<std::string, tensor>> adapters_;
+    std::vector<modelfile::adapter_info> embedded_;
+    std::optional<modelfile::state_schema> declared_state_;
+    mutable std::optional<modelfile::state_schema> derived_state_;
+    mutable std::once_flag state_once_;
     mutable std::mutex w_mu_; std::mutex run_mu_;
     std::unique_ptr<graph::registry> reg_;
     std::string device_ = "cpu";
@@ -297,6 +387,7 @@ public:
         st_.offload = off != 0;
     }
     const std::shared_ptr<model>& shared_model() const { return m_; }
+    const session_options& options() const { return opt_; }
     const modelfile::blueprint& blueprint() const { return m_->blueprint(); }
     const json::value& manifest() const { return m_->manifest(); }
     const modelfile::reader& file() const { return m_->file(); }
@@ -310,6 +401,7 @@ public:
     // keys/values were computed with the previous weights.
     void set_adapter(const std::string& a) {
         if (!m_->has_adapter(a)) raise(errc::not_found, "adapter '{}' not loaded", a);
+        m_->ensure_adapter(a);   // an adapter embedded in the model file is read on first use
         if (a != adapter_) { adapter_ = a; execs_.clear(); reset(); }
     }
     const std::string& adapter() const { return adapter_; }
@@ -421,12 +513,18 @@ public:
         if (std::memcmp(magic, kv_blob_magic, 8)) raise(errc::parse_error, "load_prefix: not a KV blob");
         i64 n = i64(u64());
         if (graph::kv_codec(u64()) != st_.codec) raise(errc::invalid_argument, "load_prefix: the blob uses a different KV codec");
-        if (n > st_.capacity) raise(errc::out_of_memory, "load_prefix: {} tokens exceed the context {}", n, st_.capacity);
+        if (n < 0 || n > st_.capacity) raise(errc::out_of_memory, "load_prefix: {} tokens exceed the context {}", n, st_.capacity);
+        // The blob is checked against the model's state schema before anything is restored: every slot must be one
+        // the model declares, of the declared kind and row shape (in this session's KV codec), and appear once.
+        const modelfile::state_schema* schema = m_->state_schema();
+        if (schema) check_prefix_blob_(b.subspan(at), n, *schema);
         st_.forget(); st_.reset();
         for (std::uint64_t i = 0, ns = u64(); i < ns; ++i) {
-            std::string k(u64(), '\0'); get(k.data(), k.size());
+            std::uint64_t kl = u64(); if (kl > b.size() - at) raise(errc::parse_error, "load_prefix: truncated KV blob");
+            std::string k(std::size_t(kl), '\0'); get(k.data(), k.size());
             bool fixed = u64() != 0; auto codec = graph::kv_codec(u64()); i64 len = i64(u64()), cap = i64(u64());
-            shape_t sh(u64()); for (auto& d : sh) d = i64(u64());
+            std::uint64_t rank = u64(); if (rank > 8) raise(errc::parse_error, "load_prefix: slot '{}' has rank {}", k, rank);
+            shape_t sh(static_cast<std::size_t>(rank)); for (auto& d : sh) d = i64(u64());
             std::size_t nf = u64();
             auto& d = st_.slots[k];
             if (fixed) { d = {}; d.buf = tensor(sh); d.len = len; d.capacity = cap; d.codec = codec; d.fixed = true; }
@@ -437,6 +535,41 @@ public:
         pos_ = n;
     }
     graph::plan_cache& plans() { return m_->plans(); }
+private:
+    // Walks a prefix blob's slot table (after its header) without restoring anything and raises on the first slot
+    // the schema does not allow. Sizes are checked against the bytes present before they are used.
+    void check_prefix_blob_(std::span<const std::byte> b, i64 n, const modelfile::state_schema& schema) const {
+        std::size_t at = 0;
+        auto need = [&](std::uint64_t k) { if (k > b.size() - at) raise(errc::parse_error, "load_prefix: truncated KV blob"); };
+        auto u64 = [&] { need(8); std::uint64_t v; std::memcpy(&v, b.data() + at, 8); at += 8; return v; };
+        std::set<std::string> seen;
+        for (std::uint64_t i = 0, ns = u64(); i < ns; ++i) {
+            std::uint64_t kl = u64(); need(kl);
+            std::string k(reinterpret_cast<const char*>(b.data() + at), std::size_t(kl)); at += std::size_t(kl);
+            bool fixed = u64() != 0; auto codec = graph::kv_codec(u64()); i64 len = i64(u64()); (void)u64();
+            std::uint64_t rank = u64();
+            if (rank < 1 || rank > 8) raise(errc::format_error, "load_prefix: slot '{}' has rank {}", k, rank);
+            shape_t sh(static_cast<std::size_t>(rank)); for (auto& d : sh) d = i64(u64());
+            std::uint64_t nf = u64(); need(nf * sizeof(float) < nf ? ~std::uint64_t(0) : nf * sizeof(float)); at += std::size_t(nf * sizeof(float));
+            const auto* decl = schema.find(k);
+            if (!decl) raise(errc::format_error, "load_prefix: the blob holds state slot '{}', which this model does not declare", k);
+            if (!seen.insert(k).second) raise(errc::format_error, "load_prefix: state slot '{}' appears twice", k);
+            if (decl->recurrent != fixed) raise(errc::format_error, "load_prefix: state slot '{}' is {} in the model and {} in the blob", k, decl->recurrent ? "recurrent" : "appended rows", fixed ? "recurrent" : "appended rows");
+            if (fixed) {
+                if (sh != decl->shape || len < 0 || nf != std::uint64_t(numel(decl->shape)))
+                    raise(errc::format_error, "load_prefix: recurrent slot '{}' has shape {}, the model declares {}", k, shape_str(sh), shape_str(decl->shape));
+            } else {
+                shape_t logical{1}; logical.insert(logical.end(), decl->shape.begin(), decl->shape.end());
+                if (codec != graph::kv_codec::f32 && logical.size() != 3) raise(errc::format_error, "load_prefix: slot '{}' cannot be stored in a KV codec", k);
+                shape_t phys = graph::state_store::physical(logical, codec);
+                bool ok = sh.size() == phys.size() && sh[0] >= 0 && std::equal(sh.begin() + 1, sh.end(), phys.begin() + 1);
+                std::uint64_t row = 1; for (std::size_t j = 1; j < phys.size(); ++j) row *= std::uint64_t(phys[j]);
+                if (!ok || nf != row * std::uint64_t(n))
+                    raise(errc::format_error, "load_prefix: slot '{}' holds rows of shape {}, the model declares {}", k, shape_str(sh), shape_str(decl->shape));
+            }
+        }
+    }
+public:
 
     // Runs the graph on `ids` continuing from the current position; returns logits of the last position.
     std::vector<float> forward(std::span<const int> ids) { return run(ids, false); }
@@ -473,9 +606,10 @@ public:
     }
 
     // one_shot graphs (e.g. imported ONNX): bind named f32 inputs, run once, return every declared output.
-    std::map<std::string, std::vector<float>> infer(const std::map<std::string, std::vector<float>>& in, i64 seq = 1) {
+    // `dims` binds further symbolic dimensions by name (a graph with more than one; see model::plan_for).
+    std::map<std::string, std::vector<float>> infer(const std::map<std::string, std::vector<float>>& in, i64 seq = 1, const std::map<std::string, i64>& dims = {}) {
         std::lock_guard lk(m_->run_mutex());
-        auto& p = m_->plan_for(seq, false, &st_);
+        auto& p = m_->plan_for(seq, false, &st_, {}, dims.empty() ? nullptr : &dims);
         auto it = execs_.find(&p);
         if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<graph::executor>(p, &st_)).first;
         auto& ex = *it->second;
@@ -485,6 +619,26 @@ public:
         ex.run();
         std::map<std::string, std::vector<float>> out;
         for (auto& o : blueprint().outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
+        return out;
+    }
+
+    // A named entry point of the blueprint (opset 4): binds its inputs, runs it once, returns its outputs.
+    std::map<std::string, std::vector<float>> infer_entry(const std::string& entry, const std::map<std::string, std::vector<float>>& in, i64 seq = 1, const std::map<std::string, i64>& dims = {}) {
+        if (entry.empty() || entry == "main") return infer(in, seq, dims);
+        const auto& e = blueprint().entry_at(entry);
+        std::lock_guard lk(m_->run_mutex());
+        auto& p = m_->plan_for(seq, false, &st_, {}, dims.empty() ? nullptr : &dims, entry);
+        auto it = execs_.find(&p);
+        if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<graph::executor>(p, &st_)).first;
+        auto& ex = *it->second;
+        for (auto& d : e.inputs) {
+            auto f = in.find(d.name);
+            if (f == in.end()) raise(errc::invalid_argument, "infer: entry '{}' is missing input '{}'", entry, d.name);
+            ex.set_input(d.name, f->second);
+        }
+        ex.run();
+        std::map<std::string, std::vector<float>> out;
+        for (auto& o : e.outputs) { auto v = ex.output_view(o.name); out[o.name].assign(v.data, v.data + v.size()); }
         return out;
     }
 
@@ -581,7 +735,7 @@ private:
         if (pos_ + i64(ids.size()) > st_.capacity) raise(errc::out_of_memory, "context {} exceeded", st_.capacity);
         i64 n = i64(ids.size());
         std::lock_guard lk(m_->run_mutex());
-        auto& p = m_->plan_for(n, all, &st_, adapter_);
+        auto& p = m_->plan_for(n, all, &st_, adapter_, nullptr, {}, opt_.exit_layer);
         auto it = execs_.find(&p);
         if (it == execs_.end()) it = execs_.emplace(&p, std::make_unique<graph::executor>(p, &st_)).first;
         auto& ex = *it->second;

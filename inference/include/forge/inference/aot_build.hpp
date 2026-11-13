@@ -190,6 +190,7 @@ inline aot_native_result aot_build_native(const std::string& fpk_path, const aot
     {
         model m(fpk_path);
         if (m.file().has_section("encryption") && o.embed_weights) raise(errc::unsupported, "aot: an encrypted model cannot be embedded");
+        if (m.file().sharded() && o.embed_weights) raise(errc::unsupported, "aot: a sharded model cannot be embedded (its tensors are in blob files); join it first (forge shard join)");
         res.plans = aot_compile_plans(m, bo, [&](std::size_t, const graph::aot::target& t, graph::plan& p) { gen.add(t, p); });
     }
     std::vector<std::string> cmd = {cxx};

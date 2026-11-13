@@ -261,6 +261,7 @@ inline import_report import_gguf(const std::string& path, const std::string& out
 
     // streamed: tensors go straight from the mapped GGUF to disk, so a 20 GB model never sits in memory twice
     modelfile::stream_writer w(out);
+    w.set_alignment(import_alignment(opt, path));
     expert_index xi;
     import_report rep{arch, tname, 0, 0};
     std::set<std::string> used;
@@ -470,6 +471,8 @@ inline import_report import_gguf(const std::string& path, const std::string& out
     }
     w.set_manifest(json::value(man));
     w.set_section("blueprint", bp_text);
+    add_state_section(w, bp);
+    if (opt.calib) rep.notes.push_back("--calib: not recorded for a GGUF source (its weights are already quantised)");
     w.finish();
     rep.bytes = std::filesystem::file_size(out);
     return rep;

@@ -130,6 +130,102 @@ TEST(lookup_speculation_exact) {
     double tv = 0; for (std::size_t i = 0; i < pw.size(); ++i) tv += std::abs(cnt[i] / N - pw[i]);
     CHECK_MSG(tv / 2 < 0.08, "lookup tv %.3f", tv / 2);
 }
+// Self-speculative decoding (early exit): the draft is the model's own first layers + LM head; the output must be
+// the target's own for greedy decoding and for sampling with a fixed seed.
+TEST(self_speculative_early_exit_is_exact) {
+    // a 4-layer model, and a copy whose last two layers write almost nothing to the residual stream, so that the exit
+    // after layer 2 usually agrees with the full model (a random model's early exit rarely does)
+    auto base = forge_test::make_tiny_model(tmp("ee_base.fpk"), {.layers = 4, .seed = 21}), damped = tmp("ee_damped.fpk");
+    {
+        modelfile::reader r(base); modelfile::writer w;
+        std::vector<const modelfile::tensor_entry*> order; for (auto& [n, e] : r.tensors()) order.push_back(&e);
+        std::sort(order.begin(), order.end(), [](auto* x, auto* y) { return x->offset < y->offset; });
+        for (auto* e : order) {
+            auto t = r.load(e->name);
+            bool late = e->name.starts_with("layer.2.") || e->name.starts_with("layer.3.");
+            if (late && (e->name.ends_with(".wo") || e->name.ends_with(".w_down"))) for (auto& v : t.data) v *= 0.02f;
+            w.add_tensor(e->name, e->shape, t.data);
+        }
+        for (auto& [n, sc] : r.sections()) if (n != "data" && n != "tensors") w.set_section(n, std::string(r.section_text(n)));
+        w.write(damped);
+    }
+    std::vector<int> p = {256, 72, 101, 108, 108, 111, 32, 119};
+    for (auto* path : {&base, &damped}) {
+        auto tm = model::open(*path);
+        CHECK(tm->depth() == 4 && tm->depth_param() == "n_layers" && tm->early_exit_default() == 0);
+        inference::session ref(tm); auto want = greedy(ref, p, 48);
+        for (i64 exit : {i64(1), i64(2), i64(3), i64(0)}) for (int k : {1, 3, 6, 0}) {
+            inference::session t(tm); sampler g; speculative_stats st;
+            auto got = self_speculative_generate(t, p, 48, g, exit, k, {}, &st);
+            CHECK_MSG(got == want, "%s exit %lld k %d: greedy output differs", path == &base ? "base" : "damped", (long long)exit, k);
+            CHECK(st.new_tokens == want.size() && (k == 0 || st.drafted > 0));
+            if (k == 3 && exit == 2) std::printf("  %s: exit 2/4, k 3: %zu passes for %zu tokens, acceptance %.2f\n", path == &base ? "random model" : "late layers damped", st.passes, st.new_tokens, st.acceptance());
+            if (path == &damped && exit == 2 && k == 3) CHECK_MSG(st.acceptance() > 0.5 && st.passes < want.size(), "acceptance %.2f, %zu passes", st.acceptance(), st.passes);
+        }
+        // sampling: the same seed gives the same tokens as plain decoding, draw for draw
+        for (auto sc : {sampler_config{.temperature = 0.8f, .seed = 11}, sampler_config{.temperature = 1.2f, .top_k = 20, .top_p = 0.9f, .seed = 5},
+                        sampler_config{.temperature = 0.7f, .repetition_penalty = 1.2f, .seed = 3}}) {
+            inference::session r2(tm); sampler s1(sc); auto plain = r2.generate(p, 40, s1);
+            for (i64 exit : {i64(1), i64(2)}) for (int k : {2, 5, 0}) {
+                inference::session t(tm); sampler s2(sc); speculative_stats st;
+                auto got = self_speculative_generate(t, p, 40, s2, exit, k, {}, &st);
+                CHECK_MSG(got == plain, "%s exit %lld k %d temp %.1f: sampled output differs from plain decoding with the same seed", path == &base ? "base" : "damped", (long long)exit, k, double(sc.temperature));
+            }
+        }
+        // stops like plain decoding: on_token, max_new, a short context
+        { inference::session t(tm); sampler g; int n = 0; auto got = self_speculative_generate(t, p, 48, g, 2, 4, [&](int) { return ++n < 5; }); CHECK(got.size() == 5 && std::equal(got.begin(), got.end(), want.begin())); }
+        { inference::session_options so; so.context = i64(p.size()) + 9; inference::session t(tm, so), r3(tm, so); sampler g, g2; CHECK(self_speculative_generate(t, p, 48, g, 2, 4) == r3.generate(p, 48, g2)); }
+        // an early-exit session is an ordinary session over fewer layers: its logits are the final norm + head of that layer
+        {
+            inference::session_options so; so.exit_layer = 2; inference::session e(tm, so), full(tm);
+            auto le = e.forward(p), lf = full.forward(p);
+            CHECK(le.size() == lf.size() && le != lf && e.state().slots.size() == 4 && full.state().slots.size() == 8);   // kv.{0,1}.{k,v} only
+        }
+        inference::session t(tm); sampler g;
+        CHECK_THROWS(self_speculative_generate(t, p, 8, g, 4)); CHECK_THROWS(self_speculative_generate(t, p, 8, g, 9));   // not below the depth
+        { inference::session_options so; so.exit_layer = 4; inference::session bad(tm, so); CHECK_THROWS(bad.forward(p)); }
+    }
+    {   // the file can name the exit layer: session generative_sequence(early_exit: 3) (opset 4)
+        auto f = tmp("ee_decl.fpk");
+        modelfile::reader r(base); modelfile::writer w;
+        for (auto& [n, e] : r.tensors()) w.add_raw(n, e.shape, e.codec, r.tensor_bytes(n));
+        for (auto& [n, sc] : r.sections()) if (n != "data" && n != "tensors" && n != "blueprint") w.set_section(n, std::string(r.section_text(n)));
+        std::string bp(r.section_text("blueprint"));
+        auto at = bp.find("opset 1"); CHECK(at != std::string::npos); bp.replace(at, 7, "opset 4");
+        at = bp.find("session generative_sequence"); CHECK(at != std::string::npos); bp.replace(at, 27, "session generative_sequence(early_exit: 3)");
+        w.set_section("blueprint", bp); w.write(f);
+        auto tm = model::open(f); CHECK(tm->early_exit_default() == 3);
+        inference::session ref(tm), t(tm); sampler g, g2; speculative_stats st;
+        CHECK(self_speculative_generate(t, p, 32, g, 0, 4, {}, &st) == ref.generate(p, 32, g2) && st.drafted > 0);
+    }
+    {   // a model whose depth is not the default param says how to name it, instead of drafting with the whole model
+        auto q = forge_test::make_tiny_qwen35_model(tmp("ee_qwen.fpk")); auto tm = model::open(q);
+        inference::session t(tm); sampler g; std::string msg;
+        try { self_speculative_generate(t, p, 8, g, 1); } catch (const forge_exception& e) { msg = e.what(); }
+        CHECK_MSG(msg.find("depth_param") != std::string::npos, "message: %s", msg.c_str());
+    }
+    {   // ... and with the param named, a hybrid with recurrent state (DeltaNet layers, conv windows) exits after its first block
+        auto q = forge_test::make_tiny_qwen35_model(tmp("ee_qwen_src.fpk")); auto f = tmp("ee_qwen_decl.fpk");
+        {
+            modelfile::reader r(q); modelfile::writer w;
+            for (auto& [n, e] : r.tensors()) w.add_raw(n, e.shape, e.codec, r.tensor_bytes(n));
+            for (auto& [n, sc] : r.sections()) if (n != "data" && n != "tensors" && n != "blueprint") w.set_section(n, std::string(r.section_text(n)));
+            std::string bp(r.section_text("blueprint"));
+            auto at = bp.find("opset "); CHECK(at != std::string::npos); bp.replace(at, 7, "opset 4");
+            at = bp.find("session generative_sequence"); CHECK(at != std::string::npos); bp.replace(at, 27, "session generative_sequence(depth_param: \"n_blocks\", early_exit: 1)");
+            w.set_section("blueprint", bp); w.write(f);
+        }
+        auto tm = model::open(f); CHECK(tm->depth() == 2 && tm->depth_param() == "n_blocks" && tm->early_exit_default() == 1);
+        inference::session ref(tm); CHECK(ref.forward(std::vector<int>{1}).size() > 0 && ref.has_recurrent_state()); auto want = greedy(ref, p, 24);
+        for (int k : {2, 4, 0}) {
+            inference::session t(tm); sampler g; speculative_stats st;
+            CHECK_MSG(self_speculative_generate(t, p, 24, g, 0, k, {}, &st) == want, "recurrent model, k %d", k);
+        }
+        inference::session r2(tm), t(tm); sampler_config sc{.temperature = 0.9f, .seed = 4}; sampler s1(sc), s2(sc);
+        CHECK(self_speculative_generate(t, p, 24, s2, 1, 3) == r2.generate(p, 24, s1));
+    }
+}
+
 TEST(spec_planner_and_ngram_index) {
     // costs: 1 row 10 ms, each extra row +1 ms; acceptance ~0.9 -> drafts pay; acceptance ~0 -> none (plus probes)
     spec_planner pl;

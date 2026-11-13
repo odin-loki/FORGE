@@ -68,7 +68,8 @@ inline bool write_section(const std::string& in, const std::string& out, std::sp
             if (name == section) continue;
             secs.push_back({name, r.raw_section_bytes(name), s.hash, s.offset});
         }
-        std::sort(secs.begin(), secs.end(), [](const ent& a, const ent& b) { return a.off < b.off; });
+        // by offset; an empty section (the "data" of a sharded file) shares its offset with the one after it and goes first
+        std::sort(secs.begin(), secs.end(), [](const ent& a, const ent& b) { return a.off != b.off ? a.off < b.off : a.bytes.size() < b.bytes.size(); });
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         if (!f) raise(errc::io_error, "cannot write {}", tmp);
         std::uint64_t at = 0; bool ok = true;

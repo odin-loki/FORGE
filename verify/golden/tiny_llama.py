@@ -129,6 +129,13 @@ def forward(W, ids):
         x = x + ((gt / (1 + np.exp(-gt))) * (h @ W[p + "mlp.up_proj.weight"].T)) @ W[p + "mlp.down_proj.weight"].T
     return rms(x, W["model.norm.weight"], eps) @ W["lm_head.weight"].T
 
+def sections_of(path):   # .fpk section table -> {name: bytes}
+    import struct
+    b = open(path, "rb").read(); n, toff = struct.unpack_from("<IQ", b, 12); out = {}
+    for i in range(n):
+        r = b[toff + 96 * i: toff + 96 * (i + 1)]; off, size = struct.unpack_from("<QQ", r, 32)
+        out[r[:32].rstrip(b"\0").decode()] = b[off:off + size]
+    return out
 def run(cmd):
     runner = os.environ.get("FORGE_RUNNER", "").split()  # e.g. qemu-aarch64 for cross builds
     if runner and cmd and cmd[0].endswith("forge"): cmd = runner + list(cmd)
@@ -194,6 +201,90 @@ def main():
             d = np.abs(np.fromfile(pf, dtype=np.float32) - np.load(gp + ".probe.npy").reshape(-1)).max()
             print(f"[{'ok' if d == 0 else 'FAIL'}] gguf {qt}: block decoder matches gguf-py exactly (max diff {d:g})")
             fails += d != 0
+    # tensor alignment: --align 4096 / 65536 put every tensor on that file offset and change no value; a file this
+    # small defaults to 64
+    base = os.path.join(a.work, "tiny_f32.fpk"); lb = os.path.join(a.work, "logits_al_base.f32")
+    run([a.forge, "run", base, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lb])
+    ok = "alignment 64 bytes" in run([a.forge, "inspect", base])
+    for al in ("4096", "64k"):
+        fp = os.path.join(a.work, f"tiny_al{al}.fpk"); lf = os.path.join(a.work, f"logits_al{al}.f32")
+        run([a.forge, "import", hf, "-o", fp, "--align", al])
+        nb = 65536 if al == "64k" else int(al)
+        info = run([a.forge, "inspect", fp, "--verify"])
+        n = len(json.loads(sections_of(fp)["tensors"]))
+        ok = ok and f"alignment {nb} bytes: {n} of {n} tensors" in info and "verify    ok" in info
+        run([a.forge, "run", fp, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lf])
+        ok = ok and np.array_equal(np.fromfile(lf, dtype=np.float32), np.fromfile(lb, dtype=np.float32))
+        ok = ok and os.path.getsize(fp) > os.path.getsize(base)
+    r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "import", hf, "-o", os.path.join(a.work, "tiny_al_bad.fpk"), "--align", "100"], capture_output=True, text=True, errors="replace")
+    ok = ok and r.returncode != 0 and "64, 4096 or 65536" in r.stdout + r.stderr
+    print(f"[{'ok' if ok else 'FAIL'}] --align 4096 / 64k: every tensor aligned in the file, logits unchanged; default stays 64 for a small model"); fails += not ok
+    # optional sections: the state schema is written by every import of a model with state; --calib records weight
+    # statistics, and forge requant re-encodes the float weights from the .fpk alone
+    info = run([a.forge, "inspect", base, "--state"])
+    ok = "state     4 slots declared (4 appended rows, 0 recurrent)" in info and "kv.1.v" in info and "calib  " not in info
+    cf = os.path.join(a.work, "tiny_calib.fpk"); rq = os.path.join(a.work, "tiny_requant.fpk"); lq = os.path.join(a.work, "logits_requant.f32")
+    run([a.forge, "import", hf, "-o", cf, "--calib"])
+    cal = json.loads(sections_of(cf)["calib"])
+    ok = ok and cal["version"] == 1 and "layer.0.wq" in cal["tensors"] and "tok_emb" in cal["tensors"] and "layer.0.attn_norm" not in cal["tensors"]
+    st = cal["tensors"]["layer.1.w_up"]; wref = W["model.layers.1.mlp.up_proj.weight"]
+    ok = ok and st["n"] == wref.size and abs(st["absmax"] - np.abs(wref).max()) < 1e-6 and abs(st["rms"] - np.sqrt((wref.astype(np.float64) ** 2).mean())) < 1e-6 and sum(st["hist"]) == wref.size
+    ok = ok and "calib     statistics of" in run([a.forge, "inspect", cf])
+    out_rq = run([a.forge, "requant", cf, "-o", rq, "--codec", "q8_0"])
+    ok = ok and "statistics read from the input's calib section" in out_rq
+    run([a.forge, "run", rq, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", lq])
+    got = np.fromfile(lq, dtype=np.float32); cos = got @ ref / np.linalg.norm(got) / np.linalg.norm(ref)
+    idx = {t["name"]: t for t in json.loads(sections_of(rq)["tensors"])}
+    ok = ok and cos > 0.999 and idx["layer.0.wq"]["codec"] == "q8_0" and idx["layer.0.attn_norm"]["codec"] == "f32" and "calib" in sections_of(rq) and "state" in sections_of(rq)
+    direct = {t["name"]: t for t in json.loads(sections_of(os.path.join(a.work, "tiny_q8_0.fpk"))["tensors"])}
+    same = all(idx[n]["codec"] == direct[n]["codec"] and idx[n]["blake3"] == direct[n]["blake3"] for n in direct) and set(idx) == set(direct)
+    ok = ok and same   # requant from the f32 file == importing with that codec, tensor for tensor
+    ok = ok and "no adapters in this file" in run([a.forge, "adapter", "list", base])
+    print(f"[{'ok' if ok else 'FAIL'}] state section declared; --calib statistics match numpy; requant q8_0 from the .fpk: cosine {cos:.6f}"); fails += not ok
+    # sharded import: tensors in content-addressed blobs; a second model in the same store adds only what differs;
+    # precompiled plans and the binary blueprint work on the small main file; join gives the tensors back
+    import shutil
+    sd = os.path.join(a.work, "shards"); shutil.rmtree(sd, ignore_errors=True); os.makedirs(sd)
+    sh = os.path.join(sd, "m.fpk"); sh2 = os.path.join(sd, "m_q8.fpk"); ls = os.path.join(a.work, "logits_sharded.f32")
+    o1 = run([a.forge, "import", hf, "-o", sh, "--shard-size", "0"])
+    nt = len(json.loads(sections_of(sh)["tensors"]))
+    blobs = lambda: sum(len(f) for _, _, f in os.walk(os.path.join(sd, "blobs")))
+    ok = f"{nt} tensors in {nt} blobs" in o1 and blobs() == nt and os.path.getsize(sh) < 20000 and not os.path.exists(sh + ".unsharded")
+    o2 = run([a.forge, "import", hf, "-o", sh2, "--shard-size", "0", "--codec", "q8_0"])
+    f32_kept = sum(1 for t in json.loads(sections_of(sh2)["tensors"]) if t["codec"] == "f32")   # norms stay f32: shared with the first model
+    ok = ok and blobs() == 2 * nt - f32_kept and f"{f32_kept} already there" in o2 and f32_kept > 0
+    info = run([a.forge, "inspect", sh, "--verify"])
+    ok = ok and f"shards    {nt} content-addressed blobs" in info and f"{nt} present, 0 missing" in info and "verify    ok" in info
+    run([a.forge, "run", sh, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", ls])
+    ok = ok and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32))
+    cpu = os.environ.get("FORGE_DEVICE", "cpu") in ("", "cpu")   # plans are precompiled for the CPU only
+    if cpu: run([a.forge, "aot", sh])
+    run([a.forge, "blueprint", sh, "--to", "binary"])
+    if cpu: run([a.forge, "aot", sh])
+    r3 = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "run", sh, "--tokens", ",".join(map(str, prompt)), "-n", "3", "--ids", "--logits", ls], capture_output=True, text=True, errors="replace")
+    ok = ok and r3.returncode == 0 and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32)) and (not cpu or "precompiled" in r3.stdout + r3.stderr)
+    jn = os.path.join(a.work, "tiny_joined.fpk"); run([a.forge, "shard", "join", sh, "-o", jn])
+    bi = {t["name"]: t["blake3"] for t in json.loads(sections_of(base)["tensors"])}
+    ok = ok and {t["name"]: t["blake3"] for t in json.loads(sections_of(jn)["tensors"])} == bi and "verify    ok" in run([a.forge, "inspect", jn, "--verify"])
+    victim = next(l.split()[-1] for l in run([a.forge, "shard", "list", sh]).splitlines() if int(l.split()[1]) > 1000)   # a blob of this model
+    b = bytearray(open(victim, "rb").read()); b[500] ^= 1; open(victim, "wb").write(b)
+    r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "inspect", sh, "--verify"], capture_output=True, text=True, errors="replace")
+    ok = ok and r.returncode != 0 and "MISMATCH shard" in r.stdout
+    b[500] ^= 1; open(victim, "wb").write(b)
+    pk = os.path.join(sd, "packed.fpk"); o4 = run([a.forge, "shard", "split", base, "-o", pk, "--shard-size", "128k", "--blob-dir", os.path.join(sd, "packs")])
+    lst = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "shard", "list", pk], capture_output=True, text=True, env={**os.environ, "FORGE_BLOB_DIR": os.path.join(sd, "packs")}).stdout
+    ok = ok and "MISSING" not in lst and 1 < len(lst.strip().splitlines()) < nt
+    print(f"[{'ok' if ok else 'FAIL'}] sharded import: {nt} blobs, second model shares {f32_kept}; logits unchanged (also with aot + binary blueprint); join restores every tensor; a flipped blob byte fails verify"); fails += not ok
+    # self-speculative decoding (early exit after layer 1): the same tokens as plain decoding, greedy and seeded sampling
+    toks = ",".join(map(str, prompt)); ok = True
+    for extra in ([], ["--temp", "0.9", "--seed", "3"], ["--temp", "1.1", "--top-k", "30", "--seed", "8"]):
+        plain = run([a.forge, "run", base, "--tokens", toks, "-n", "24", "--ids", *extra]).split()
+        for k in ("2", "0"):
+            spec = run([a.forge, "run", base, "--tokens", toks, "-n", "24", "--ids", "--self-spec", "--exit-layer", "1", "--spec-k", k, *extra]).split()
+            ok = ok and spec == plain and len(plain) > 0
+    r = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "run", base, "--tokens", toks, "-n", "4", "--self-spec", "--exit-layer", "9"], capture_output=True, text=True, errors="replace")
+    ok = ok and r.returncode != 0 and "exit layer 9" in r.stdout + r.stderr
+    print(f"[{'ok' if ok else 'FAIL'}] --self-spec (early exit) gives the tokens of plain decoding: greedy and two seeded samplers"); fails += not ok
     # tokenizer + text path
     out = os.path.join(a.work, "tiny_f32.fpk")
     txt = run([a.forge, "run", out, "--prompt", "the theory of things", "-n", "4"])

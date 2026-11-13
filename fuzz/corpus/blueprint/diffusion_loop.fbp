@@ -1,0 +1,18 @@
+blueprint "tiny-denoiser" opset 4
+params { n: 8  h: 16  classes: 5  e: 4 }
+input x : f32[n]
+input t : f32[1]
+input cond : f32[e]
+graph {
+  xr = reshape(x, shape: [1, n])
+  hid = tanh(linear(xr, W.w1) + scale(t, alpha: 0.001) * W.wt + linear(reshape(cond, shape: [1, e]), W.wc) + W.b1)
+  eps = reshape(linear(hid, W.w2) + W.b2, shape: [n])
+}
+output eps : f32[n]
+entry encode {
+  input label : f32[1]
+  output cond : f32[e]
+  graph { cond = reshape(embed(W.emb, label), shape: [e]) }
+}
+session diffusion_loop(steps: 1000, schedule: scaled_linear, beta_start: 0.00085, beta_end: 0.012, prediction: epsilon,
+                       sampler: ddim, inference_steps: 12, guidance: 1, latent: x, timestep: t, encoder: encode)

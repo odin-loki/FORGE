@@ -169,10 +169,46 @@ struct spec_run {
 };
 } // namespace detail
 
+namespace detail {
+// Draft-session speculation (the loop behind speculative_generate and self_speculative_generate).
+// exact = false: a greedy sampler verifies one-hot drafts by sample-and-compare, a sampling one by modified rejection
+//                sampling against the draft's distribution (same distribution as plain decoding, other draws).
+// exact = true:  the draft always proposes its argmax and every draft is verified by sample-and-compare with the
+//                caller's sampler, so the output is the target's own: the tokens plain decoding gives for that seed.
+inline std::vector<int> draft_generate(session& target, session& draft, std::span<const int> prompt, int max_new, sampler& s, int k,
+                                       const std::function<bool(int)>& on_token, speculative_stats* stats, spec_planner* planner, bool exact);
+} // namespace detail
+
 // Draft-model speculation. k > 0: fixed draft length; k = 0: chosen by `planner` (a fresh one when null).
 inline std::vector<int> speculative_generate(session& target, session& draft, std::span<const int> prompt, int max_new,
                                              sampler& s, int k = 4, const std::function<bool(int)>& on_token = {},
                                              speculative_stats* stats = nullptr, spec_planner* planner = nullptr) {
+    return detail::draft_generate(target, draft, prompt, max_new, s, k, on_token, stats, planner, false);
+}
+
+// Self-speculative decoding (early exit, FORGE_PLAN E.4): the draft is the target model itself cut at `exit_layer`
+// (its first layers, then the final norm and LM head on that hidden state; session_options::exit_layer), so no
+// second model is needed. Drafts are the early exit's argmax; the full model scores the current token and every
+// draft in one pass and each row is sampled exactly as plain decoding would sample it, so the output is identical
+// to session::generate with the same sampler state: for greedy decoding, and for sampling with a fixed seed.
+// exit_layer 0 = what the file suggests (`session generative_sequence(early_exit: K)`), else half the depth.
+// The draft session has its own state: the early layers are computed once by the draft and again by the verify
+// pass (their KV is not shared).
+inline std::vector<int> self_speculative_generate(session& target, std::span<const int> prompt, int max_new, sampler& s, i64 exit_layer = 0, int k = 4,
+                                                  const std::function<bool(int)>& on_token = {}, speculative_stats* stats = nullptr, spec_planner* planner = nullptr) {
+    target.check_generative();
+    auto& m = *target.shared_model();
+    if (exit_layer <= 0) exit_layer = m.early_exit_default();
+    if (exit_layer <= 0) exit_layer = std::max<i64>(1, m.depth() / 2);
+    session_options o = target.options(); o.exit_layer = exit_layer; o.context = target.context();
+    (void)m.early_exit_blueprint(exit_layer);   // refuse a model or a layer that cannot be cut before anything runs
+    session draft(target.shared_model(), o);
+    draft.set_adapter(target.adapter());
+    return detail::draft_generate(target, draft, prompt, max_new, s, k, on_token, stats, planner, true);
+}
+
+inline std::vector<int> detail::draft_generate(session& target, session& draft, std::span<const int> prompt, int max_new, sampler& s, int k,
+                                               const std::function<bool(int)>& on_token, speculative_stats* stats, spec_planner* planner, bool exact) {
     target.check_generative(); draft.check_generative();
     if (prompt.empty()) raise(errc::invalid_argument, "speculative_generate: empty prompt");
     if (target.vocab() != draft.vocab()) raise(errc::invalid_argument, "draft vocab {} != target vocab {}", draft.vocab(), target.vocab());
@@ -187,7 +223,7 @@ inline std::vector<int> speculative_generate(session& target, session& draft, st
     if (prompt.size() > 1) draft.forward(prompt.subspan(0, prompt.size() - 1));   // (a recurrent draft needs state to checkpoint)
     st.prefill_seconds = std::chrono::duration<double>(clk::now() - t0).count();
     std::vector<int> dpend;   // kept tokens the draft has not been fed yet
-    const bool greedy = s.config().temperature <= 0.f, onehot = greedy && s.plain_greedy();
+    const bool greedy = exact || s.config().temperature <= 0.f, onehot = exact || (greedy && s.plain_greedy());
     auto emit = [&](int t) { return run.emit(t); };
     while (!run.done && max_new > 0) {
         if (target.position() + i64(T.pending.size()) + 1 > target.context()) break;

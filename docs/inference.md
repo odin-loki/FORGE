@@ -25,8 +25,12 @@ Architectures come from the import templates (Hugging Face: Llama/Mistral/Qwen2,
 | `vocab()`, `max_context()` | `max_context` is manifest `max_position_embeddings`, 2048 if absent |
 | `add_adapter(name, {weight → {a, b}}, alpha)` | LoRA: `W' = W + (alpha / r) · B·A` (PEFT layout, A `[r, in]`, B `[out, r]`). Only targeted matrices are copied; names are immutable once added |
 | `add_adapter_file(name, path)` | Loads `<weight>.lora_a` / `<weight>.lora_b` tensors from an `.fpk` (alpha from manifest `lora_alpha`, default 1) or from a `.safetensors` (alpha from a one-element tensor `lora_alpha`) |
-| `adapter_names()` | The loaded adapters, sorted |
-| `has_adapter(name)` | `""` (base) is always present |
+| `adapter_names()` | The adapters that can be selected by name, sorted: the loaded ones and the ones carried in the model file |
+| `plan_for(n, all_rows, state, adapter, dims)` | The plan for `n` rows; `dims` binds symbolic dimensions other than `seq` (graphs imported from ONNX may have several) |
+| `has_adapter(name)` | `""` (base) is always present; true for registered adapters and for the ones carried in the model file |
+| `embedded_adapters()`, `ensure_adapter(name)` | Adapters of the file's `adapters` section ([format.md](format.md#adapters-section)): listed at open, read and merged the first time a name is selected (`session::set_adapter` calls `ensure_adapter`) |
+| `depth()`, `depth_param()`, `early_exit_default()`, `early_exit_blueprint(k)` | Early exit: the depth param and its value, the exit layer the file suggests, and the blueprint cut at layer `k` (raises when the model cannot be cut there) |
+| `state_schema()` | The model's state slots: the file's `state` section, else derived from the blueprint on first use (null if that fails) |
 
 Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>...]` make `model` refuse files without a valid (trusted) signature, whatever `verify` says.
 
@@ -37,6 +41,7 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 | `context` | 0 | KV capacity in tokens; 0 = `model::max_context()` |
 | `verify` | false | Check hashes when the session opens the model by path |
 | `page_rows` | 256 | KV page size in rows; 0 = reserve the whole context up front |
+| `exit_layer` | 0 | Early exit: > 0 runs the first `exit_layer` layers and the LM head (the draft of `self_speculative_generate`); 0 = the whole model |
 | `kv_codec` | `""` | `f32`, `int8`, `fp8`, `tbq4`, `tbq3`, `tbq4p`, `tbq3p`, `k8v4` (int8 keys, tbq4 values). Empty = `$FORGE_KV_CACHE_TYPE`, then `$FORGE_KV_CODEC`, then f32 |
 | `kv_offload` | -1 | 1 = keep KV on the host and drop device copies after each attention; -1 = `$FORGE_KV_OFFLOAD` |
 
@@ -50,9 +55,9 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 | `forward_all(ids)` | Same; returns `[ids.size(), vocab]` logits |
 | `position()`, `context()`, `reset()`, `rewind(pos)` | `rewind` only moves backwards |
 | `copy_prefix(other, n)` | Copies the first `n` tokens of another session's KV (same model and KV codec) |
-| `save_prefix(n = -1)` / `load_prefix(blob)` | Serialise / restore KV state of a prefix (`FORGEKV1` blob). Restoring gives the same logits as `copy_prefix` |
-| `set_adapter(name)` | Select a LoRA adapter (`""` = base). Clears the KV cache when it changes |
-| `infer({name → data}, seq = 1)` | One-shot graphs: binds every declared input, runs once, returns every output |
+| `save_prefix(n = -1)` / `load_prefix(blob)` | Serialise / restore KV state of a prefix (`FORGEKV1` blob). Restoring gives the same logits as `copy_prefix`. `load_prefix` first checks the blob against the model's state schema: a slot the model does not declare, a slot twice, another kind or row shape, or sizes that do not fit the blob raise `format_error` and leave the session untouched |
+| `set_adapter(name)` | Select a LoRA adapter by name (`""` = base): one registered with `add_adapter*` or one carried in the model file. Clears the KV cache when it changes |
+| `infer({name → data}, seq = 1, dims = {})` | One-shot graphs: binds every declared input, runs once, returns every output. `dims` binds symbolic dimensions other than `seq` by name |
 | `tokenizer()` | `encode`, `decode`, `decode_one`, `bos()`, `eos()` |
 
 `generate_stats` has `prompt_tokens`, `new_tokens`, `prefill_s`, `decode_s`.
@@ -75,6 +80,7 @@ Strict loading: `FORGE_REQUIRE_SIGNED=1` and/or `FORGE_TRUSTED_KEYS=<hex>[,<hex>
 
 ### Speculative decoding (`speculative.hpp`)
 - `speculative_generate(target, draft, prompt, max_new, sampler&, k = 4, on_token = {}, stats = nullptr, spec_planner* = nullptr)`: a draft model proposes tokens, the target scores the current token and all drafts in one pass. Greedy (and greedy-with-penalties) drafts are verified by sample-and-compare, sampled drafts by modified rejection sampling; either way the output keeps the target's distribution, and greedy output equals target greedy output. The draft keeps its own KV and only catches up on kept tokens it has not seen. Vocab sizes must match. Resets both sessions first.
+- `self_speculative_generate(target, prompt, max_new, sampler&, exit_layer = 0, k = 4, on_token = {}, stats = nullptr, spec_planner* = nullptr)`: self-speculation (early exit). The draft is the target model cut at `exit_layer`: its first layers, then the final norm and LM head on that hidden state (a session with `session_options::exit_layer`, built from the same blueprint with its depth param set to the exit layer; no second model, the weights are shared). The draft proposes its argmax; the full model scores the current token and all drafts in one pass and every row is sampled as plain decoding would sample it. The output is therefore the same tokens `session::generate` gives: for greedy decoding, and for sampling with the same seed (same draws in the same order). `exit_layer = 0` takes the blueprint's `session generative_sequence(early_exit: K)` (opset 4) if it has one, else half the depth. The depth is the param `n_layers`; a blueprint whose layer loop runs on another param names it with `depth_param: "n_blocks"` (the exit is then counted in that unit), and a model that cannot be cut is refused instead of drafting with the whole model. Cost: the draft session has its own KV state, so the layers below the exit are computed by the draft and again by the verify pass; KV sharing between the two (as in LayerSkip) is not implemented. How often drafts are accepted depends on the model: 2 % on a random 4-layer test model, 97 % on the same model with its last two layers damped (`tests/test_inference.cpp`); it has not been measured on a trained model.
 - `lookup_generate(target, prompt, max_new, sampler&, k = 4, ngram = 3, on_token = {}, stats = nullptr, spec_planner* = nullptr, ngram_min = 1)`: prompt-lookup (n-gram) speculation from the prompt and output (`ngram_index`: hashed n-grams, O(ngram) per lookup; a match that runs into the tail repeats with its period). Verified by sample-and-compare, so with a fixed seed the text is the same as plain decoding whenever the pass logits equal the single-token ones (always on the CPU).
 - `k = 0` (the CLI default): `spec_planner` (`spec_planner.hpp`) chooses the drafts per pass to maximise (1 + sum of acceptance chances) / (pass time + draft time), from moving-average pass times by row count (first pass of each size skipped: plan compile) and per-position acceptance counts (prior 1/2, halved at 192 trials). It picks 0 drafts when no draft count beats a plain pass, and forces a 1-draft probe after 16 draft-less passes in a row. `kmax` = 8.
 - Recurrent models (Qwen3.5 DeltaNet / conv state): `session::forward_spec(ids, keep)` runs the verify pass and sets the recurrent state aside after the first `keep` rows inside that pass (the executor splits the state op there; on CUDA/HIP a device-to-device copy, no host transfer). `spec_rewind(pos)` restores it and returns how many accepted drafts must be fed again; the generators put them at the head of the next pass (replay rows) instead of running an extra pass. `make_checkpoint` / `rewind(pos, ck, since)` still exist and are used only for recurrent *draft* models.
@@ -158,6 +164,47 @@ std::vector<float> t = s.embed_text("hello world");     // the same through the 
 ```
 
 `generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per call: there is no batch axis, so padding only matters when the caller pads. Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).
+
+### Session kinds chosen by the file: `diffusion_loop` and `streaming` (`file_sessions.hpp`)
+A blueprint of opset 4 can declare `session diffusion_loop(...)` or `session streaming(...)` with the parameters of the kind ([modelfile.md](modelfile.md#opsets)). Such a model is opened like every other (`inference::model`, `inference::session`); a runner attaches the service the kind names to the session's graph.
+
+```cpp
+inference::session s("denoiser.fpk");                    // blueprint: session diffusion_loop(steps: 1000, schedule: scaled_linear, ...)
+inference::diffusion_runner d(s);
+auto o = d.defaults();                                   // steps, sampler, prediction, guidance, eta as the file declares them
+o.guidance = 3.5f; o.seed = 7;
+auto latent = d.sample(o, {{"label", {3.f}}}, {{"label", {0.f}}});   // conditional and unconditional inputs
+
+inference::session a("encoder.fpk");                     // blueprint: session streaming(window: 400, hop: 160, max_lag: 8)
+inference::stream_runner r(a);
+while (auto chunk = next_samples()) r.feed(*chunk);      // any chunk size; one model run per frame
+use(r.output(), r.frame_size());
+```
+
+| `session diffusion_loop(...)` parameter | Default | Meaning |
+|---|---|---|
+| `steps`, `schedule`, `beta_start`, `beta_end` | 1000, `scaled_linear`, 0.00085, 0.012 | The noise schedule (`linear`, `scaled_linear`, `cosine`) |
+| `prediction` | `epsilon` | What the graph outputs: `epsilon`, `v` or `sample` |
+| `sampler`, `inference_steps`, `guidance`, `eta` | `ddim`, 20, 1, 0 | Defaults of a run (`ddim`, `ddpm`, `euler_flow`); `diffusion_runner::defaults()` returns them and a caller may change them per run |
+| `latent`, `timestep` | the first input, `t` | Names of the graph inputs that take the latent and the timestep. Every other input is conditioning: fed from the caller's maps by name, zeros when absent |
+| `encoder` | none | An entry point (`entry name { ... }`) run once before the loop: the caller's maps then hold its inputs, and its outputs are fed to the denoiser inputs of the same names |
+
+| `diffusion_runner` | |
+|---|---|
+| `diffusion_runner(session, dims = {})` | Reads the parameters; raises `unsupported` for another session kind and `format_error` for bad parameters |
+| `run(x, options, cond = {}, uncond = {})`, `sample(options, cond, uncond)` | Denoise `x` (or noise drawn with `options.seed`). With `guidance != 1` the graph runs twice per step |
+| `defaults()`, `scheduler()`, `latent_size()`, `initial_noise(seed)`, `cache()`, `model_calls()` | |
+
+| `session streaming(...)` parameter | Default | Meaning |
+|---|---|---|
+| `window`, `hop` | 400, 160 | Frame length and stride in samples; `window` must be the size of the frame input |
+| `max_lag` | 8 | Frames allowed to be pending; beyond it the oldest are dropped (counted in `stat().dropped`) |
+| `capacity`, `deadline_us` | max(65536, 4 windows), 0 | Ring size in samples; per-frame processing budget (overruns are counted) |
+| `input` | the first input | The graph input that takes a frame |
+
+`stream_runner(session)` (or `(session, streaming::options)` to override the framing): `feed(span)` pushes samples and runs every frame that is ready, `output()` / `take_output()` return the first graph output of each frame concatenated, `frame_size()`, `frame_indices()`, `stat()`. The model's state between frames is whatever the graph declares (`state conv[1] : conv_window` and `conv[0].conv(x, w)`, recurrent state, appended rows): it lives in the session's state store, so `session::reset()` starts a new stream. The output does not depend on how the input was cut into chunks.
+
+Limits: the diffusion loop runs one latent at a time on the host (the graph runs on the session's device, the scheduler arithmetic on the CPU); there is no VAE, text encoder or image I/O, and no UNet / DiT template: a denoiser is imported as a blueprint directory ([modelfile.md](modelfile.md#blueprint-directories)). The streaming runner is single-threaded: `feed` both queues and processes. `forge-serve` and the C ABI do not expose either kind. CLI: `forge denoise`, `forge stream` ([cli.md](cli.md)). Tests: `tests/test_sessions.cpp` (against the graph computed by hand) and `verify/golden/tiny_sessions.py` (ctest `golden_tiny_sessions`: numpy references for five scheduler / prediction / sampler combinations, guidance, and the streaming encoder).
 
 ### Other session kinds
 - `diffusion.hpp` (`forge::inference::diffusion`): `noise_scheduler::make(T, beta_schedule, b0, b1)` (linear, scaled_linear, cosine), `options` (`steps`, `kind` = ddim / ddpm / euler_flow, `pred` = epsilon / v / sample, `guidance` (classifier-free, 1 = off), `eta`, `seed`, `cache_at`, `start_step`), `session(scheduler, denoiser).run(x, opt)`. The denoiser is any callable `(x, t, cond) → prediction`. Noise is Philox, so a seed gives the same trajectory on every backend. `cache()` holds latents for `cache_at` steps; resume with `start_step`.

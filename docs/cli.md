@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `inspect`, `run`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `shard`, `adapter`, `blueprint`, `inspect`, `run`, `denoise`, `stream`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -15,7 +15,7 @@ Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage t
 Prints the CPU name and feature flags (`cpu`, `features`), the simd kernel table in use (line `lane`), every kernel table this CPU can run, preferred first (line `targets`; pass one to `FORGE_SIMD_TARGET`), and one `grid` line per GPU runtime: `cpu`, `cuda`, `hip`, `level_zero` and `vulkan` show whether the runtime library could be loaded (not whether a device works); `metal` always shows `no`. It ends with physical and available RAM, any cgroup or `RLIMIT_AS` limit, and the host memory budget with its source (see [memory.md](memory.md)).
 
 ### `forge import <hf_dir | model.gguf | model.onnx> -o out.fpk [options]`
-Converts a model to `.fpk`.
+Converts a model to `.fpk`. A directory that holds a `blueprint.fbp` is imported as a model described by its own blueprint ([modelfile.md](modelfile.md#blueprint-directories)); the template and mixed-precision options do not apply to it.
 
 | Option | Meaning |
 |--------|---------|
@@ -24,6 +24,9 @@ Converts a model to `.fpk`.
 | `--template NAME` | Blueprint template from `import/templates/`: `llama`, `qwen2`, `mixtral`, `deepseek_v2`, `qwen3`, `qwen3_5`, `qwen3_moe`, `qwen3_5_moe`. Normally chosen from the model's architecture |
 | `--allow-unused` | Import although the source has tensors the template does not use. Without it such an import fails and lists them (name and shape). Hugging Face leftovers are left out; GGUF leftovers are kept as `extra.<name>` |
 | `--ignore-tensor NAME[,NAME...]` | Source tensors known to be harmless: a whole name, `prefix*` or `*suffix`. `position_ids`, `masked_bias` and `inv_freq` buffers are always ignored |
+| `--align 64\|4096\|65536` | File alignment of every tensor (`4k`, `64k` also parse). Default: 4096 when the source weights are at least 64 MiB, else 64; see [format.md](format.md#tensor-alignment) |
+| `--shard-size SIZE [--blob-dir DIR]` | Write a sharded model ([format.md](format.md#shards)): the import goes to `out.fpk.unsharded`, is split and removed. `0` = one blob per tensor (models in one store share equal tensors); `2G`, `512M` = packed blobs of at most that size |
+| `--calib` | Record statistics of the full-precision weights in a `calib` section, for a later `forge requant` (Hugging Face sources; a GGUF's weights are already quantised, so nothing is recorded) |
 | `--recipe forge\|llama` | Mixed precision: `llama` is a port of llama.cpp's per-tensor rules; `forge` (default) adds rules for DeltaNet and attention-output projections |
 | `--output-tensor-type T`, `--token-embedding-type T` | Mixed precision: codec for the output head / token embedding |
 | `--tensor-type REGEX=TYPE[,REGEX=TYPE...]` | Mixed precision: per-tensor overrides |
@@ -32,8 +35,32 @@ Converts a model to `.fpk`.
 
 `forge import` prints the licence it recorded (`license   apache-2.0`, or `(none found in the source)`); see [modelfile.md](modelfile.md#what-an-import-checks-and-records). The mixed-precision options are documented for Hugging Face inputs. Templates are read from `FORGE_TEMPLATES` if set, else from `../share/forge/templates` relative to the executable (an installed binary), else from the source tree compiled into the binary.
 
-### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint] [--license]`
+### `forge blueprint <model.fpk> --to binary|text [-o out.fpk]` / `forge blueprint <file> --to binary|text|canonical -o <out>`
+Stores a model's blueprint in the binary form, or back as text ([format.md](format.md#binary-blueprint)). Without `-o` the model file is rewritten in place. A signature and precompiled plans are dropped. Given a bare blueprint file (`.fbp` text or `.fbpb` binary) it converts that file to `-o`; `canonical` is the fixed-layout text without comments.
+
+### `forge inspect <model.fpk> [--verify] [--tensors] [--blueprint [text|binary|canonical] [-o FILE]] [--license] [--state]`
+`--blueprint` (or `--blueprint text`) prints the blueprint as text: the stored text, or the canonical text of a binary section. `--blueprint binary` prints a summary of the binary form (version, size against the text, opset, name, session, the names it calls) and with `-o FILE` writes its bytes; `--blueprint canonical` prints the fixed-layout text.
+
 Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprint summary (with a note when its opset is outside the range this build runs) and a `license` line: the licence recorded at import, or `(not recorded)`. `--license` also prints the stored licence text. `--tensors` lists every tensor with its codec and shape, `--blueprint` prints the graph text, `--verify` checks every hash and exits 1 on a mismatch. Works on encrypted files without the key (metadata stays readable).
+It also prints the tensor alignment and how many tensors comply, the state slots the file declares (`--state` lists them), every embedded adapter (name, rank, alpha, number of target weights), a summary of the calibration section, and for an encrypted file the scheme, the key id and whether a key was accepted.
+
+### `forge requant <in.fpk> -o out.fpk --codec C [options]`
+Re-encodes the float weights of a model file in another codec, without the source checkpoint: rank-2 tensors stored as `f32`, `f16` or `bf16` that are not normalisation weights or LoRA factors. Every other tensor is copied byte for byte (a tensor that is already quantised is not decoded and quantised again). `--codec` and the mixed-precision options are those of `forge import`.
+
+| Option | Meaning |
+|--------|---------|
+| `--emb-codec C`, `--recipe`, `--output-tensor-type`, `--token-embedding-type`, `--tensor-type`, `--pure`, `--bf16-head` | As for `forge import` |
+| `--no-calib` | Do not use calibration statistics |
+| `--calib-crest X` | Crest factor (`absmax / rms`) at which the `forge` recipe gives a tensor one step more precision (default 12; two steps at twice that) |
+| `--align 64\|4096\|65536` | Tensor alignment of the output (default: the input's) |
+
+With calibration (the default) the statistics come from the input's `calib` section; without one they are computed from the input's `f32` weights. The output carries them. The other sections are copied; a signature and precompiled plans are dropped, an encrypted input needs its key and the output is plain. Files with an `experts` index (stacked MoE experts) are refused: import the source again. See [modelfile.md](modelfile.md#re-quantising-a-model-file).
+
+### `forge shard split <in.fpk> -o out.fpk [--shard-size SIZE] [--blob-dir DIR]` / `join <in.fpk> -o out.fpk` / `list <model.fpk>`
+`split` moves the tensors of a single-file model into content-addressed blobs and writes the small main file ([format.md](format.md#shards)); without `--shard-size` (or with `0`) every tensor is its own blob. It prints how many blobs it wrote and how many were already in the store. `join` writes one file again (every blob must be present; each tensor is checked against the index). `list` prints each blob with its size, tensor count and path, or `MISSING`. Both drop a signature and precompiled plans. Set `FORGE_BLOB_DIR` to share one store between models; otherwise blobs live in `blobs/` next to the model.
+
+### `forge adapter list <model.fpk>` / `add <model.fpk> --name N --from lora.fpk [-o out.fpk]` / `remove <model.fpk> --name N [-o out.fpk]`
+LoRA adapters carried in the model file. `add` copies the `<weight>.lora_a` / `<weight>.lora_b` tensors of `lora.fpk` (the layout `model::add_adapter_file` reads; `lora_alpha` from its manifest) into the model under the name `N`; `remove` takes one out; without `-o` the file is rewritten in place. Select one with `forge run --adapter N`. Both drop a signature and precompiled plans, refuse an encrypted file, and hold the whole file in memory while they work.
 
 ### `forge run <model> (--prompt TEXT | --tokens 1,2,3) [options]`
 
@@ -53,14 +80,16 @@ Prints the manifest, the section table (offset, size, BLAKE3 prefix), a blueprin
 | `--grammar FILE.gbnf` | | Constrain output with a GBNF grammar (needs a tokenizer) |
 | `--draft draft.fpk` | | Speculative decoding with a draft model |
 | `--lookup [--ngram 3] [--ngram-min 1]` | | Speculative decoding with n-gram (prompt-lookup) drafts |
+| `--self-spec [--exit-layer K]` | | Self-speculative decoding: drafts from the model's own early exit after layer `K` (default: the blueprint's `early_exit`, else half the depth). Same tokens as plain decoding, greedy or seeded |
 | `--spec-k N` | 0 | Drafts per pass; 0 = chosen per pass by the planner. Ignored with `--grammar` (plain decoding) |
 | `--codec C` | `f32`; `keep` for GGUF and AWQ / GPTQ inputs | Codec for on-the-fly import of non-`.fpk` inputs, as for `forge import` |
+| `--adapter NAME` | none | Run with a LoRA adapter carried in the model file (`forge adapter list` shows them) |
 | `--allow-unused` | off | On-the-fly import: accept source tensors the template does not use (as `forge import --allow-unused`) |
 | `--policy FILE` | | Security policy (see [Security policy](#security-policy)): the model must be readable under `fs.read` and pass `integrity.models` |
 
 Generated text goes to stdout; timing (prompt and new tokens, tok/s, plans compiled and reused) goes to stderr. When plans came precompiled ([`forge aot`](#forge-aot-modelfpk--o-out---aot-mode-plannative-options)) a second line says how many, how many of them ran as native code, and where they came from; `<model>` may also be a compiled model library (`model.so`).
 
-Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed.
+Models whose blueprint session is not `generative_sequence` (for example imported ONNX graphs) run as one-shot inference instead: pass `--input name=file.f32` (raw little-endian f32, repeatable) and optionally `--out PREFIX` to write `PREFIX.<output>.f32`. Without `--out` the outputs are printed. A file named `*.i64` or `*.i32` is read as integers (token ids, masks). A symbolic dimension is worked out from an input's size when it is that input's only unbound one; give the others with `--dim name=N` (the names are in the manifest's `onnx_inputs[].dims`, e.g. `seq`, `dim_batch`).
 
 ### `forge embed <model> (--text TEXT [--text-pair TEXT] | --tokens 1,2,3 | --input name=file.f32 ...) [options]`
 Runs an embedding model (blueprint `session embedding`: the `bert`, `vit` and `whisper_encoder` templates) once and prints the result vector, or writes it as raw little-endian f32 with `--out file.f32`.
@@ -83,6 +112,21 @@ forge embed bge.fpk --text "hello world"
 forge embed bge.fpk --tokens 101,7592,2088,102
 forge embed vit.fpk --input image=cat.f32 --out cat.emb.f32
 ```
+
+### `forge denoise <model.fpk> [options]`
+Runs a model whose blueprint declares `session diffusion_loop` ([inference.md](inference.md#session-kinds-chosen-by-the-file-diffusion_loop-and-streaming-file_sessionshpp)): the scheduler, sampler and step count come from the file.
+
+| Option | Meaning |
+|--------|---------|
+| `--steps N`, `--sampler ddim\|ddpm\|euler`, `--guidance G`, `--eta E` | Override what the file declares |
+| `--seed S` | Seed of the initial noise (and of DDPM's per-step noise); default 0 |
+| `--init latent.f32` | Start from this latent instead of seeded noise |
+| `--input name=file`, `--uncond name=file` | Conditioning inputs for the conditional and the unconditional branch (raw f32, or `.i64` / `.i32`); with an `encoder` entry point they are the encoder's inputs. Absent inputs are zeros |
+| `--dim name=N`, `--device D`, `--verify` | Symbolic dimensions of the graph; execution device; check hashes at open |
+| `--out latent.f32` | Write the final latent as raw f32 (default: print it) |
+
+### `forge stream <model.fpk> --input samples.f32 [--chunk N] [--out frames.f32]`
+Runs a model whose blueprint declares `session streaming`: the samples are fed in chunks of `--chunk` (default: the hop), framed by the file's window and hop, and the model runs once per frame with its state carried over. Writes (or prints) the first output of every frame, concatenated; a summary line on stderr gives the frames processed and dropped. The result does not depend on `--chunk`.
 
 ### `forge aot <model.fpk> [-o out] [--aot-mode plan|native] [options]`
 Compiles the model's plans ahead of time. The full description is in [aot-models.md](aot-models.md).
@@ -115,8 +159,13 @@ Checks every section hash and the signatures. Prints `VERIFIED` and exits 0, or 
 ### `forge verify <file> [--sig file.sig] [--pubkey NAME.pub]... [--detached]`
 Checks a detached signature: `<file>.sig` (or `--sig`) must name this file's base name and match its BLAKE3 digest and size, and carry a valid signature (from a listed key when `--pubkey` is given). Prints `signature ok key <id>` / `signature BAD key <id>` per signer and `<file>: VERIFIED`, or the reason (`unsigned`, `content does not match the signed digest`, `signature is for 'x', not 'y'`, `not by a trusted key`), exit 0 or 1.
 
-### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey)`
+### `forge encrypt <in.fpk> -o out.fpk (--key K.mkey | --new-key K.mkey) [--chunk SIZE] [--single-aead]`
 Seals the tensor data with XChaCha20-Poly1305. `--new-key` creates the key file (64 hex digits, mode 0600 where supported). Load encrypted models with `FORGE_MODEL_KEY_FILE=K.mkey` or `FORGE_MODEL_KEY=<hex>`.
+
+- The data is sealed in chunks of `--chunk` plaintext bytes (default `1M`; `4096`, `64k`, `2M`; 64 bytes to 1 GiB), each with its own tag. A model loaded from such a file decrypts a tensor when it is first used, not the file at load; `FORGE_LOCK_WEIGHTS=1` puts the decrypted tensors in locked, dump-excluded memory (best effort: `mlock` can be refused by `RLIMIT_MEMLOCK`).
+- `--single-aead` writes the older scheme (one AEAD over all tensor data, decrypted whole into memory at load), for FORGE builds that predate the chunked one.
+- `forge inspect` prints the scheme, the key id and whether a key was accepted.
+- `forge encrypt` itself holds the whole tensor data in memory while it works.
 
 ### `forge security check [--policy FILE] [--json]`
 Loads the security policy (`--policy`, `$FORGE_SECURITY_POLICY`, `./forge-security.json`, `<config dir>/forge/forge-security.json`; `$FORGE_SECURITY_PROFILE` picks a base profile) and prints, for each FORGE Security Standard control, its state (`active`, `available`, `emulated`, `missing`, `n/a`, `failed`), backend, level and verdict. It changes nothing. Exits 0 when every required control can be met, 1 when one cannot, 2 when the policy is invalid. With no policy and no profile it reports "no FSS profile active" and exits 0. Details: [security-api.md](security-api.md).

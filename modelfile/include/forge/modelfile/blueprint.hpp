@@ -84,10 +84,14 @@ inline std::vector<bp_token> bp_lex(std::string_view s) {
 //   3  the spatial and encoder op families (conv, pooling, resize, group / batch norm, pad, attention_bias, ...),
 //      composite-op defaults and keyword arguments, scalar() and the number helpers, and `session embedding`.
 //      An older engine would stop at the first of these with an unknown-op or parse error.
+//   4  session kinds chosen by the file with their parameters: `session diffusion_loop(steps: 1000, ...)`,
+//      `session streaming(window: 400, hop: 160, ...)` (any `session kind(key: value, ...)`), and named entry points
+//      `entry name { input ...  output ...  graph { ... } }` next to the main graph. An older engine stops at the
+//      parenthesis or at `entry` with a parse error.
 // A blueprint has to declare the opset of the newest thing it uses: the builder (and, for what the parser sees, the
 // parser) refuses a use below its opset with an error that names the feature and the opset it needs. Otherwise a file
 // that says "opset 1" could carry ops an opset-1 engine does not have, and the declaration would mean nothing.
-inline constexpr int opset_min = 1, opset_max = 3;
+inline constexpr int opset_min = 1, opset_max = 4;
 
 // The opset that introduced a spec op (1 for the first op set). New ops get a line here with the opset that adds them.
 inline int op_min_opset(std::string_view name) {
@@ -120,8 +124,24 @@ struct blueprint {
     std::vector<bp_state_decl> states;
     std::vector<bp_io_decl> inputs, outputs;
     std::string session = "one_shot";
+    // Parameters of the session kind (opset 4): `session diffusion_loop(steps: 1000, schedule: scaled_linear)`.
+    // Numbers (and true / false, and names of numeric params) land in session_args, names and strings in session_strs.
+    std::map<std::string, double> session_args;
+    std::map<std::string, std::string> session_strs;
+    double session_arg(const std::string& k, double d) const { auto it = session_args.find(k); return it == session_args.end() ? d : it->second; }
+    std::string session_str(const std::string& k, const std::string& d) const { auto it = session_strs.find(k); return it == session_strs.end() ? d : it->second; }
     std::vector<bp_token> toks;
     std::size_t graph_begin = 0, graph_end = 0;     // token range of the graph body
+    // Named entry points (opset 4): further graphs of the same model, each with its own inputs and outputs, sharing
+    // the params, composites, weights and state slots of the file. The top-level input / graph / output declarations
+    // are the main entry. build_graph(bp, options, "name") builds one.
+    struct entry { std::vector<bp_io_decl> inputs, outputs; std::size_t graph_begin = 0, graph_end = 0; };
+    std::map<std::string, entry> entries;
+    const entry& entry_at(const std::string& n) const {
+        auto it = entries.find(n);
+        if (it == entries.end()) raise(errc::not_found, "blueprint '{}': no entry '{}'", name, n);
+        return it->second;
+    }
     // Composite ops: `op name(a, b) { t = ...  return expr }`. A spec op of the same name wins when the
     // engine has one, so files keep working on old engines and pick up fused kernels on new ones.
     // Parameters may carry a numeric default (`op f(x, eps = 1e-6)`) and be passed by name (`f(x, eps: 1e-5)`).
@@ -182,16 +202,19 @@ private:
 
 class bp_builder {
 public:
-    bp_builder(const blueprint& bp, const build_options& o, graph::tensor_graph& g) : bp_(bp), o_(o), g_(g), ps_(bp.toks, bp.graph_begin) {}
+    // `e`: a named entry point to build instead of the main graph
+    bp_builder(const blueprint& bp, const build_options& o, graph::tensor_graph& g, const blueprint::entry* e = nullptr)
+        : bp_(bp), o_(o), g_(g), ps_(bp.toks, e ? e->graph_begin : bp.graph_begin), inputs_(e ? e->inputs : bp.inputs), outputs_(e ? e->outputs : bp.outputs),
+          graph_end_(e ? e->graph_end : bp.graph_end) {}
 
     void run() {
-        for (auto& in : bp_.inputs) {
+        for (auto& in : inputs_) {
             shape_t s; for (auto& d : in.dims) s.push_back(dim(d));
             bp_val v; v.k = bp_val::tensor; v.v = g_.input(in.name, s); env_[in.name] = v;
         }
         for (auto& st : bp_.states) { bp_val v; v.k = bp_val::state; v.path = st.name; env_[st.name] = v; }
-        while (ps_.pos() < bp_.graph_end) stmt();
-        for (auto& out : bp_.outputs) {
+        while (ps_.pos() < graph_end_) stmt();
+        for (auto& out : outputs_) {
             auto it = env_.find(out.name);
             if (it == env_.end() || it->second.k != bp_val::tensor) raise(errc::invalid_argument, "blueprint: output '{}' never assigned", out.name);
             g_.output(out.name, it->second.v);
@@ -464,6 +487,9 @@ private:
     const build_options& o_;
     graph::tensor_graph& g_;
     bp_parser ps_;
+    const std::vector<bp_io_decl>& inputs_;
+    const std::vector<bp_io_decl>& outputs_;
+    std::size_t graph_end_;
     std::map<std::string, bp_val> env_;
     std::map<std::string, graph::value_id> wcache_;
 };
@@ -539,6 +565,44 @@ inline blueprint parse_blueprint(std::string_view src) {
             int line = ps.cur().line;
             bp.session = ps.ident();
             if (bp.session == "embedding") bp.need_opset(3, line, "`session embedding`");
+            if (bp.session == "diffusion_loop" || bp.session == "streaming") bp.need_opset(4, line, "`session " + bp.session + "`");
+            if (ps.is("(")) {   // session parameters
+                bp.need_opset(4, line, "parameters of a session kind (`session " + bp.session + "(...)`)");
+                ps.next();
+                while (!ps.accept(")")) {
+                    auto k = ps.ident(); ps.expect(":");
+                    bool neg = ps.accept("-");
+                    const auto& t = ps.cur();
+                    if (t.kind == bp_token::k_num) { bp.session_args[k] = neg ? -t.num : t.num; ps.next(); }
+                    else if (t.kind == bp_token::k_str && !neg) { bp.session_strs[k] = t.text; ps.next(); }
+                    else if (t.kind == bp_token::k_ident && !neg) {
+                        auto v = ps.ident();
+                        if (v == "true" || v == "false") bp.session_args[k] = v == "true";
+                        else if (auto it = bp.params.find(v); it != bp.params.end()) bp.session_args[k] = it->second;   // a numeric param by name
+                        else bp.session_strs[k] = v;
+                    } else ps.fail("bad session parameter value");
+                    ps.accept(",");
+                }
+            }
+        }
+        else if (ps.accept("entry")) {
+            int line = ps.cur().line;
+            auto nm = ps.ident();
+            bp.need_opset(4, line, "the named entry point '" + nm + "'");
+            blueprint::entry e; bool have = false;
+            ps.expect("{");
+            while (!ps.accept("}")) {
+                if (ps.accept("input")) e.inputs.push_back(detail::parse_io(ps));
+                else if (ps.accept("output")) e.outputs.push_back(detail::parse_io(ps));
+                else if (ps.accept("graph")) {
+                    if (have) ps.fail("entry '" + nm + "' has two graph blocks");
+                    if (!ps.is("{")) ps.fail("expected '{'");
+                    e.graph_begin = ps.pos() + 1; ps.skip_block(); e.graph_end = ps.pos() - 1; have = true;
+                } else ps.fail("expected input/output/graph in entry '" + nm + "'");
+            }
+            if (!have) ps.fail("entry '" + nm + "' has no graph block");
+            if (e.outputs.empty()) ps.fail("entry '" + nm + "' declares no outputs");
+            if (nm == "main" || !bp.entries.emplace(nm, std::move(e)).second) ps.fail("entry '" + nm + "' defined twice (main is the top-level graph)");
         }
         else if (ps.accept("op")) {
             auto nm = ps.ident(); blueprint::composite c; ps.expect("(");
@@ -561,7 +625,7 @@ inline blueprint parse_blueprint(std::string_view src) {
             ps.skip_block();
             bp.graph_end = ps.pos() - 1;
             have_graph = true;
-        } else ps.fail("expected params/state/input/graph/output/session/op");
+        } else ps.fail("expected params/state/input/graph/output/session/op/entry");
     }
     // Recursion is forbidden: composites are inlined, so a cycle could never terminate. Calls are `name (` tokens in
     // a body that resolve to a composite (a built-in or spec op of the same name wins, exactly as in the builder).
@@ -611,16 +675,28 @@ inline graph::tensor_graph build_graph(const blueprint& bp, const build_options&
     b.run();
     return g;
 }
+// The graph of a named entry point ("" or "main": the main graph).
+inline graph::tensor_graph build_graph(const blueprint& bp, const build_options& o, const std::string& entry) {
+    if (entry.empty() || entry == "main") return build_graph(bp, o);
+    check_opset(bp);
+    graph::tensor_graph g;
+    detail::bp_builder b(bp, o, g, &bp.entry_at(entry));
+    b.run();
+    return g;
+}
 
 // The names of every weight the graph references (W.<path>), in first-use order, without touching any tensor data:
 // the graph is built with one-element placeholder shapes. Importers compare this list with the tensors they wrote.
 inline std::vector<std::string> blueprint_weights(const blueprint& bp) {
     std::vector<std::string> names;
     build_options o;
-    for (auto& in : bp.inputs) for (auto& d : in.dims)
-        if (!bp.params.count(d) && !(!d.empty() && std::isdigit((unsigned char)d[0]))) o.dims[d] = 2;   // symbolic lengths
-    o.weight = [&](const std::string& n) { names.push_back(n); return std::pair<shape_t, const float*>(shape_t{1}, nullptr); };
+    auto bind = [&](const std::vector<bp_io_decl>& ins) { for (auto& in : ins) for (auto& d : in.dims) if (!bp.params.count(d) && !(!d.empty() && std::isdigit((unsigned char)d[0]))) o.dims[d] = 2; };   // symbolic lengths
+    bind(bp.inputs);
+    for (auto& [en, e] : bp.entries) bind(e.inputs);
+    std::set<std::string> seen;
+    o.weight = [&](const std::string& n) { if (seen.insert(n).second) names.push_back(n); return std::pair<shape_t, const float*>(shape_t{1}, nullptr); };
     (void)build_graph(bp, o);
+    for (auto& [en, e] : bp.entries) (void)build_graph(bp, o, en);   // entry points read weights too
     return names;
 }
 

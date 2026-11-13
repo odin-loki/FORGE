@@ -1,0 +1,10 @@
+blueprint "tiny-stream" opset 4
+params { window: 16  hop: 8  d: 6  taps: 3 }
+state conv[1] : conv_window
+input frame : f32[window]
+graph {
+  f = linear(reshape(frame, shape: [1, window]), W.proj) + W.bias
+  y = tanh(conv[0].conv(f, W.cw))
+}
+output y : f32[1, d]
+session streaming(window: window, hop: hop, max_lag: 64)
