@@ -130,7 +130,8 @@ inline shard_report shard_split(const std::string& in, const std::string& out, c
             }
             flush();
         }
-        for (auto& t : json::parse(r.section_text("tensors")).arr()) {
+        const auto tensors = json::parse(r.section_text("tensors"));   // named: GCC 14 does not extend a range-for temporary (P2718)
+        for (auto& t : tensors.arr()) {
             json::object o;
             const auto& w = where.at(t["name"].str());
             for (auto& [k, v] : t.obj()) if (k != "offset" && k != "shard") o.emplace_back(k, v);

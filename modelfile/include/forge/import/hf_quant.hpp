@@ -135,7 +135,7 @@ private:
     const safetensors& need(const std::string& n) const { if (auto* s = shard(n)) return *s; raise(errc::not_found, "missing tensor {}", n); }
     static i64 dim(const shape_t& s, std::size_t i, const std::string& n) { if (s.size() != 2 || s[0] < 1 || s[1] < 1) raise(errc::shape_mismatch, "{} has shape {}", n, shape_str(s)); return s[i]; }
     void no_bias(const std::string& base) const {
-        if (auto* s = shard(base + ".bias")) for (float v : s->load(base + ".bias").data) if (v != 0) raise(errc::unsupported, "{}: quantised Linear layers with a bias are not supported", base);
+        if (auto* s = shard(base + ".bias")) { const auto bias = s->load(base + ".bias"); for (float v : bias.data) if (v != 0) raise(errc::unsupported, "{}: quantised Linear layers with a bias are not supported", base); }
     }
     // scales [groups][out] and unpacked zeros: `zw` is the int32 qzeros matrix [groups][out / per word]
     void scales_zeros(const std::string& base, qlinear& l, const std::vector<std::int32_t>& zw, const shape_t& zs, auto&& zpos) const {

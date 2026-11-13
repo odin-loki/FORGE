@@ -54,9 +54,9 @@ TEST(clipboard_x11_native) {
     if (!clip::x11::available()) { std::printf("  skip: libxcb is not installed\n"); return; }
     // nothing copied yet: an empty string, not an error
     { auto g = clip::x11::get(2000); CHECK_MSG(bool(g), "%s", g.err.what.c_str()); CHECK(g.value.empty()); CHECK(!clip::x11::owned()); }
-    const std::string small = "forge clipboard \xE2\x9C\x93 caf\xC3\xA9\nline two";
-    CHECK(clip::x11::set(small)); CHECK(clip::x11::owned());
-    { auto g = clip::x11::get(3000); CHECK_MSG(bool(g), "%s", g.err.what.c_str()); CHECK(g.value == small); }
+    const std::string small_ = "forge clipboard \xE2\x9C\x93 caf\xC3\xA9\nline two";
+    CHECK(clip::x11::set(small_)); CHECK(clip::x11::owned());
+    { auto g = clip::x11::get(3000); CHECK_MSG(bool(g), "%s", g.err.what.c_str()); CHECK(g.value == small_); }
     CHECK(clip::x11::set("second")); CHECK(clip::x11::get().value == "second");   // replacing while owning
     CHECK(clip::x11::set("")); { auto g = clip::x11::get(); CHECK(g); CHECK(g.value.empty()); }
     // a text far over one request: sent and received in INCR chunks

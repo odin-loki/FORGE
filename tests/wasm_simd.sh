@@ -50,26 +50,14 @@ if [ "${WASM_SIMD:-1}" = 1 ] && [ -f "$R/tests/simd_types_isa.cpp" ]; then   # v
   TESTS="$TESTS test_simd_types_simd128"
 fi
 rc=0
-run_one() {
-  if [ -n "$WASM_RUN" ]; then (cd "$R" && $WASM_RUN "$1"); else (cd "$R" && node --no-warnings "$R/tests/wasm_run.mjs" "$1"); fi
-}
-# node 22.23 (V8) itself segfaults part-way through test_simd_tiera when all of its tests run in one process
-# (at a different test each time; every test passes on its own, also with --liftoff-only). So that binary is
-# run one test at a time under node; another runner (WASM_RUN) gets it whole.
-if [ -z "$WASM_RUN" ]; then
-  TESTS=$(echo "$TESTS" | sed 's/ test_simd_tiera//')
-  for only in tiera_tables_present minmax generic_predicates prefix_sums histograms transpose blas1 bitsets byte_search \
-              sorting_networks sort_matches partial_sort utf8 hex_and_base64; do
-    FORGE_TEST_ONLY=$only run_one "$OUT/test_simd_tiera.wasm" > "$OUT/tiera.out" 2>&1 || { rc=1; echo "FAIL test_simd_tiera ($only)"; }
-    grep -v '^0 failure' "$OUT/tiera.out" || true
-  done
-  echo "test_simd_tiera: one test per process, rc=$rc"
-fi
+# --no-turbo-fast-api-calls: node 22.23's WASI fd_write runs as a V8 fast API call and allocates; once the module's
+# memory is large that reports external memory pressure, a GC starts inside the fast call and node segfaults
+# walking the stack (in a different test each run; test_simd_tiera's 1M-element sorts made it certain).
 for t in $TESTS; do
   if [ -n "$WASM_RUN" ]; then
     (cd "$R" && $WASM_RUN "$OUT/$t.wasm") || rc=1
   else
-    (cd "$R" && node --no-warnings "$R/tests/wasm_run.mjs" "$OUT/$t.wasm") || rc=1
+    (cd "$R" && node --no-warnings --no-turbo-fast-api-calls "$R/tests/wasm_run.mjs" "$OUT/$t.wasm") || rc=1
   fi
 done
 exit $rc

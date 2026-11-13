@@ -1,6 +1,6 @@
 """Shared pieces of the tiny-model golden tests (tiny_gpt2 / tiny_gemma / tiny_phi3 / tiny_bert / tiny_vit /
 tiny_whisper): writing a random HF checkpoint, float64 numpy building blocks, and the FORGE-vs-reference checks."""
-import json, math, os, sys
+import json, math, os, re, sys
 import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tiny_llama as tl
@@ -165,7 +165,7 @@ class Checker:
 
     def embed(self, fpk, args, ref, label, tol=1e-3, cosmin=None):
         """`forge embed <fpk> <args> --out` against the reference vector (any shape, compared flat)."""
-        of = fpk + "." + label.replace(" ", "_").replace("/", "_") + ".f32"
+        of = fpk + "." + re.sub(r"[^A-Za-z0-9._+-]", "_", label) + ".f32"   # labels hold < > : etc., not allowed in Windows names
         run([self.forge, "embed", fpk] + list(args) + ["--out", of])
         got = np.fromfile(of, dtype=np.float32).astype(np.float64); ref = np.asarray(ref, dtype=np.float64).reshape(-1)
         if got.shape != ref.shape: return self.ok(False, f"{label}: {got.shape[0]} values, expected {ref.shape[0]}")

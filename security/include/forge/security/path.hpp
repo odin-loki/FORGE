@@ -113,6 +113,30 @@ inline std::optional<std::string> canonical_within(std::string_view path, const 
     auto canon = [](std::string_view p) -> std::optional<sfs::path> {
         std::error_code ec;
         auto a = sfs::absolute(os::fs::u8path(std::string(p)), ec); if (ec) return std::nullopt;
+#if defined(_WIN32)
+        // MinGW's libstdc++ weakly_canonical does not follow symlinks or junctions on Windows, which would let a link
+        // inside a root lead out of it: the longest existing prefix is resolved by the OS (GetFinalPathNameByHandleW)
+        a = a.lexically_normal();
+        sfs::path head = a, tail;
+        while (!head.empty() && !sfs::exists(head, ec)) {
+            if (head == head.root_path()) break;
+            tail = tail.empty() ? head.filename() : head.filename() / tail; head = head.parent_path();
+        }
+        if (sfs::exists(head, ec)) {
+            HANDLE h = CreateFileW(head.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (h == INVALID_HANDLE_VALUE) return std::nullopt;
+            std::wstring buf(1024, L'\0');
+            DWORD n = GetFinalPathNameByHandleW(h, buf.data(), DWORD(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (n >= buf.size()) { buf.resize(n + 1); n = GetFinalPathNameByHandleW(h, buf.data(), DWORD(buf.size()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS); }
+            CloseHandle(h);
+            if (n == 0 || n >= buf.size()) return std::nullopt;
+            buf.resize(n);
+            if (buf.rfind(L"\\\\?\\UNC\\", 0) == 0) buf = L"\\\\" + buf.substr(8);          // \\?\UNC\server\share -> \\server\share
+            else if (buf.rfind(L"\\\\?\\", 0) == 0) buf = buf.substr(4);                       // \\?\C:\... -> C:\...
+            a = (tail.empty() ? sfs::path(buf) : sfs::path(buf) / tail).lexically_normal();   // `/ empty` would add a separator
+            return a;
+        }
+#endif
         auto c = sfs::weakly_canonical(a, ec); if (ec) return std::nullopt;
         return c.lexically_normal();
     };

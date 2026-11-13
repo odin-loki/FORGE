@@ -128,6 +128,8 @@ inline wait_result wait_on_address(const std::atomic<std::uint32_t>& a, std::uin
     if (w.wait(addr, &expected, sizeof expected, ms)) return wait_result::woken;
     return GetLastError() == ERROR_TIMEOUT ? wait_result::timed_out : wait_result::woken;
 #elif defined(FORGE_OS_FREEBSD)
+    // _umtx_op returns 0 at once when the word does not hold `expected`: tell that apart from a wake first
+    if (a.load(std::memory_order_seq_cst) != expected) return wait_result::mismatch;
     if (timeout_ns == ~0ull) {
         if (::_umtx_op(addr, UMTX_OP_WAIT_UINT_PRIVATE, expected, nullptr, nullptr) == 0 || errno == EINTR) return wait_result::woken;
     } else {
@@ -373,7 +375,8 @@ public:
         do n = ::kevent(fd_, nullptr, 0, &ev, 1, tp); while (n < 0 && errno == EINTR);
         if (n < 0) return {0, last_error("kevent")};
         if (n == 0) return {0, {}};
-        std::uint64_t count = ev.data > 0 ? std::uint64_t(ev.data) : 1;
+        // a one-shot entry fires once; macOS reports other numbers in its data for NOTE_NSECONDS one-shots (4 seen)
+        std::uint64_t count = oneshot_ ? 1 : ev.data > 0 ? std::uint64_t(ev.data) : 1;
         if (oneshot_) {   // the first interval differs from the period: continue with the period from here
             if (period_) { if (auto s = set_(period_, true); !s) return {count, s.err}; } else armed_ = false;
         }

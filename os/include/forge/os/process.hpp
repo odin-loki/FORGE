@@ -499,8 +499,11 @@ inline HANDLE win_job(const proc_limits& lim, bool kill_on_close) {
 }
 // Put a suspended process into its job; on failure (a parent job that forbids nesting or breakaway) it is
 // terminated: running it without its limits and tree kill would be silently weaker than asked.
+// With a limit group the group's job comes first: a process already in a job can only join a job that is empty or
+// in its own job hierarchy, so the fresh per-spawn job (empty) then nests under the group's. The other order works
+// for the group's first member only (its job is still empty) and is refused (access denied) from the second on.
 inline error win_assign(HANDLE job, const PROCESS_INFORMATION& pi, const spawn_attach* att = nullptr) {
-    if (AssignProcessToJobObject(job, pi.hProcess) && (!att || !att->job || AssignProcessToJobObject(att->job, pi.hProcess))) return {};
+    if ((!att || !att->job || AssignProcessToJobObject(att->job, pi.hProcess)) && AssignProcessToJobObject(job, pi.hProcess)) return {};
     error e = last_error("AssignProcessToJobObject");
     TerminateProcess(pi.hProcess, 1); WaitForSingleObject(pi.hProcess, 5000);
     return e;
@@ -782,7 +785,7 @@ inline result<proc_result> spawn_wait(const spawn_spec& sp) {
         if (ie >= 0 && fds[ie].revents) drain(perr[0], res.err);
         if (ii >= 0 && fds[ii].revents) {
             if (fds[ii].revents & (POLLERR | POLLHUP)) cl(pin[1]);
-            else { auto n = ::write(pin[1], in.data() + in_off, std::min<std::size_t>(in.size() - in_off, 65536));
+            else { auto n = detail::write_no_sigpipe(pin[1], in.data() + in_off, std::min<std::size_t>(in.size() - in_off, 65536));
                    if (n > 0) in_off += std::size_t(n); else if (n < 0 && errno != EAGAIN && errno != EINTR) cl(pin[1]);
                    if (in_off >= in.size()) cl(pin[1]); }
         }

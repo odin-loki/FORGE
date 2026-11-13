@@ -99,7 +99,15 @@ def guard_of(e, feats, cfg, ns, gcc_checked):
     elif gcc: g.append(f"(FORGE_RAW_CLANG || FORGE_RAW_GCC_GE({gmin}))" if gmin else "FORGE_RAW_CLANG")
     elif c18: g.append("(FORGE_RAW_CLANG_GE(23) || FORGE_RAW_GCC)" if gcc_checked else "FORGE_RAW_CLANG_GE(23)")
     elif cfg["msvc"] is not None and ns not in cfg["msvc"]: g.append("!FORGE_RAW_MSVC")
+    if cfg["msvc"] is not None and "!FORGE_RAW_MSVC" not in g and any(gnu_only_type(t) for t in [e.get("ret", "")] + e["params"]):
+        g.append("!FORGE_RAW_MSVC")
     return " && ".join(g)
+
+
+def gnu_only_type(t):
+    """GCC / clang vector typedefs (__v4hi, ...), __bf16 and MMX's __m64: MSVC's headers have none of them on x64."""
+    t = t.replace("const", "").replace("*", "").strip()
+    return bool(re.fullmatch(r"__v\d+[a-z]+", t)) or t in ("__bf16", "__m64")
 
 
 def main():

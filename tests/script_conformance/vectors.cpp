@@ -90,7 +90,7 @@ int main() {
     show("erase in loop", it_v);
     std::vector<bool> flags(3, false);
     flags[1] = true;
-    std::println("{} {} {}", flags[0], flags[1], flags.size());
+    std::println("{} {} {}", bool(flags[0]), bool(flags[1]), flags.size());   // bool(): libstdc++ 14 cannot format vector<bool>::reference
     std::vector<std::pair<int, std::string>> pairs;
     pairs.emplace_back(1, "one");
     pairs.push_back({2, "two"});

@@ -124,6 +124,7 @@ public:
 #if defined(TIOCSCTTY)
             (void)::ioctl(s, TIOCSCTTY, 0);   // BSD / macOS: opening is not enough to make it the controlling terminal
 #endif
+            (void)::ioctl(s, TIOCSWINSZ, &ws);   // again on the slave: macOS forgets a size set on the master before the first open
             ::dup2(s, 0); ::dup2(s, 1); ::dup2(s, 2); if (s > 2) ::close(s);
             ::signal(SIGPIPE, SIG_DFL);
             if (wd && ::chdir(wd) != 0) { int e = errno; (void)!::write(px[1], &e, sizeof e); ::_exit(127); }

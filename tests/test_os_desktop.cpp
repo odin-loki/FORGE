@@ -82,6 +82,7 @@ TEST(desktop_bus_against_mock) {
             CHECK(::poll(&p, 1, 2000) == 1);                                  // hang-up: the inhibitor is gone
         }
     }
+#if !defined(__APPLE__)   // macOS: notify / reveal_path use Notification Center and Finder, not the session bus
     // The public calls take the native path (no helper program is installed for them to find here).
     os::notification n; n.title = "Hello"; n.body = "from the mock"; n.app_name = "forge-test"; n.timeout_ms = 10;
     { auto r = os::notify(n); CHECK_MSG(bool(r), "%s", r.err.what.c_str()); CHECK(mock.calls.back().member == "Notify"); CHECK(mock.calls.back().body[0].s == "forge-test"); }
@@ -106,5 +107,6 @@ TEST(desktop_bus_against_mock) {
         }
         if (had_w) os::setenv("WAYLAND_DISPLAY", old_w); else os::unsetenv("WAYLAND_DISPLAY");
     }
+#endif
 }
 #endif

@@ -244,7 +244,9 @@ inline aot_native_result aot_build_native(const std::string& fpk_path, const aot
         if (o.emit == "shared") c.push_back("-shared");
         c.insert(c.end(), {"-o", out});
         for (auto& l : sdk.libs) c.push_back(l);
-        for (auto& l : sdk.syslibs) c.push_back(l);
+        for (auto& l : sdk.syslibs) {   // "-framework Metal" (macOS) is two arguments
+            if (l.rfind("-framework ", 0) == 0) { c.push_back("-framework"); c.push_back(l.substr(11)); } else c.push_back(l);
+        }
 #if !defined(__APPLE__) && !defined(_WIN32)
         if (o.emit == "shared" && o.target.empty()) c.push_back("-Wl,-Bsymbolic");   // the library calls its own copies of the header code
 #endif

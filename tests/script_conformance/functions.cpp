@@ -76,7 +76,8 @@ int main() {
     std::println("{} {} {}", square(7), square(1.5), make_adder(10)(5));
     std::println("{} {} {} {}", cube(4), kLimit, kTable[2], tagged(trailing(2)));
     counted(); counted();
-    std::println("{} {} {} {}", helper_calls, next_id(), next_id(), next_id());
+    const int id1 = next_id(), id2 = next_id(), id3 = next_id();   // sequenced: argument evaluation order is unspecified
+    std::println("{} {} {} {}", helper_calls, id1, id2, id3);
     early(1); early(-1); early(2);
     std::println("");
 

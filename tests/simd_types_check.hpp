@@ -18,6 +18,15 @@
 
 namespace forge_types {
 namespace {   // internal linkage: this header is compiled once per ISA with different flags
+// An optimisation barrier: the value is taken to have been read and changed through memory, so no fold can see
+// across it (GNU-style compilers; elsewhere a no-op).
+template <class X> inline void opaque(X& x) {
+#if defined(__GNUC__) || defined(__clang__)
+    asm volatile("" : : "r"(&x) : "memory");
+#else
+    (void)x;
+#endif
+}
 using namespace forge::simd;
 
 struct ctx {
@@ -162,7 +171,9 @@ template <class T, Target Tg> struct checker {
         compare("gt", a, b, [](V x, V y) { return gt(x, y); }, [](T x, T y) { return x > y; });
         compare("ge", a, b, [](V x, V y) { return ge(x, y); }, [](T x, T y) { return x >= y; });
         compare("lt&!eq|gt", a, b, [](V x, V y) { return (lt(x, y) & !eq(x, y)) | gt(x, y); }, [](T x, T y) { return x < y || x > y; });
-        compare("le^ge", a, b, [](V x, V y) { return le(x, y) ^ ge(x, y); }, [](T x, T y) { return (x <= y) != (x >= y); });
+        // le and ge each go through memory: msys2's GCC (15) folds (x <= y) ^ (x >= y) on double vectors into x != y,
+        // which is true for NaN lanes where the xor is false (MinGW only so far; le and ge on their own are right)
+        compare("le^ge", a, b, [](V x, V y) { auto l = le(x, y); auto g = ge(x, y); opaque(l); opaque(g); return l ^ g; }, [](T x, T y) { return (x <= y) != (x >= y); });
         binary("select", a, b, [](V x, V y) { return select(lt(x, y), y, x); }, [](T x, T y) { return x < y ? y : x; });
         unary("abs", a, [](V x) { return abs(x); }, [](T x) { return r_abs(x); });
         unary("neg", a, [](V x) { return -x; }, [](T x) { if constexpr (std::is_floating_point_v<T>) return T(-x); else return r_sub(T(0), x); });
@@ -359,7 +370,7 @@ template <Target Tg> void check_float_interop(ctx& c) {
     // int32 <-> float, bitcasts
     for (int rep = 0; rep < 4000; ++rep) {
         float f[N], of[N]; std::int32_t i32[N], oi[N];
-        for (int i = 0; i < N; ++i) { i32[i] = std::int32_t(r.next() >> (rep % 3 ? 33 : 44)) - (rep % 2 ? 1000 : 0); f[i] = float(double(std::int64_t(r.next() >> 20)) / 4096.0 - 1e6) * (rep % 7 ? 1.f : 1e-3f); }
+        for (int i = 0; i < N; ++i) { i32[i] = std::int32_t(r.next() >> (rep % 3 ? 33 : 44)) - (rep % 2 ? 1000 : 0); f[i] = float(double(std::int64_t(r.next() >> 23)) / 4096.0 - 1e6)   /* < 2^29: to_int stays in int32 range */ * (rep % 7 ? 1.f : 1e-3f); }
         store(oi, to_int(forge::simd::load<Tg>(f))); forge::simd::store(of, to_float(VI::load(i32)));
         for (int i = 0; i < N; ++i) { ++c.checks; if (oi[i] != std::int32_t(f[i]) || !same(of[i], float(i32[i]))) c.fail("to_int / to_float", "f32", rep); }
         std::uint32_t ob[N]; store(ob, bitcast<std::uint32_t>(forge::simd::load<Tg>(f)));

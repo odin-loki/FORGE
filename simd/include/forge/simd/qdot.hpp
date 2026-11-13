@@ -15,6 +15,10 @@ using qdecode_fn = void (*)(const std::uint8_t*, std::size_t, float*);  // the c
 
 namespace forge::simd::algo {
 namespace qd {
+// Internal linkage: kernels_avx2.cpp and kernels_avx512.cpp both see __AVX2__ and compile these with different ISA
+// flags; as plain inline functions the linker kept one copy for both, so a CPU without AVX-512 could run the
+// AVX-512 build of dec_q4_k (SIGILL in the FreeBSD job, whose VM has no AVX-512).
+namespace {
 using u8 = std::uint8_t;
 inline float h2f(const u8* p) { std::uint16_t b; std::memcpy(&b, p, 2); return float(f16::from_bits(b)); }
 inline void scale_min_k4(int j, const u8* q, u8& d, u8& m) {
@@ -95,6 +99,7 @@ template <Target Tg> constexpr bool simd_decoders() {
     return false;
 #endif
 }
+} // namespace (internal linkage)
 } // namespace qd
 
 // Decode n elements (a whole number of blocks) of a quantised row.

@@ -461,7 +461,7 @@ private:
         if (!has_in(n, i)) raise(errc::format_error, "onnx: {} node {} is missing input {}", n.op, n.name, i);
         return get(n.in[i]);
     }
-    val T(const node_t& n, std::size_t i) { return as_tensor(in(n, i), n.in[i]); }
+    val T(const node_t& n, std::size_t i) { const val& x = in(n, i); return as_tensor(x, n.in[i]); }   // in() first: it checks i (argument order is unspecified)
     // the integers of a constant operand (axes, pads, shapes, ...)
     std::vector<i64> ints(const node_t& n, std::size_t i, const char* what) {
         const val& c = in(n, i);
@@ -482,9 +482,9 @@ private:
         return r;
     }
     shape bcast(const node_t& n, const shape& a, const shape& b) {
-        shape big = a.size() >= b.size() ? a : b; const shape& small = a.size() >= b.size() ? b : a;
-        for (std::size_t i = 0; i < small.size(); ++i) {
-            auto& x = big[big.size() - small.size() + i]; const auto& y = small[i];
+        shape big = a.size() >= b.size() ? a : b; const shape& smaller = a.size() >= b.size() ? b : a;
+        for (std::size_t i = 0; i < smaller.size(); ++i) {
+            auto& x = big[big.size() - smaller.size() + i]; const auto& y = smaller[i];
             if (x == y || y.is(1)) continue;
             if (x.is(1)) { x = y; continue; }
             fail(n, "cannot broadcast " + onnx_detail::list_text(a) + " with " + onnx_detail::list_text(b));
@@ -549,7 +549,7 @@ private:
             else if (op != "Identity") { integer = false; for (auto& x : v) x = op == "Sqrt" ? std::sqrt(x) : op == "Exp" ? std::exp(x) : op == "Log" ? std::log(x) : 1.0 / x; }
             return out(a.const_dims(), std::move(v), integer);
         }
-        if (op == "Shape") { auto d = X(0).const_dims(); std::vector<double> v(d.begin(), d.end()); return out({i64(v.size())}, std::move(v), true); }
+        if (op == "Shape") { auto d = X(0).const_dims(); std::vector<double> v(d.begin(), d.end()); const i64 nv = i64(v.size()); return out({nv}, std::move(v), true); }
         if (op == "Size") { return out({}, {double(X(0).v.size())}, true); }
         if (op == "Unsqueeze" || op == "Squeeze" || op == "Reshape" || op == "Flatten") {
             const val& a = X(0); auto d = a.const_dims(); std::vector<i64> nd;
@@ -611,7 +611,8 @@ private:
             double s = X(0).v.at(0), l = X(1).v.at(0), d = X(2).v.at(0); if (d == 0) return false;
             double cnt = std::max(0.0, std::ceil((l - s) / d)); if (!(cnt <= double(onnx_detail::fold_limit))) return false;
             std::vector<double> v; for (i64 k = 0; k < i64(cnt); ++k) v.push_back(s + double(k) * d);
-            return out({i64(v.size())}, std::move(v), X(0).integer && X(1).integer && X(2).integer);
+            const i64 nv = i64(v.size());   // before the call: argument order is unspecified (GCC moves v first)
+            return out({nv}, std::move(v), X(0).integer && X(1).integer && X(2).integer);
         }
         if (op == "ConstantOfShape") {
             std::vector<i64> d; for (auto x : X(0).v) d.push_back(i64(x));
@@ -636,7 +637,7 @@ private:
     // ---------------------------------------------------------------- folding: shapes with symbolic dimensions
     val sym(std::vector<mono> elems, bool scalar_) {
         bool all_const = true; for (auto& e : elems) all_const = all_const && e.is_const();
-        if (all_const) { std::vector<double> v; for (auto& e : elems) v.push_back(double(e.k)); return folded(scalar_ ? std::vector<i64>{} : std::vector<i64>{i64(v.size())}, std::move(v), true); }
+        if (all_const) { std::vector<double> v; for (auto& e : elems) v.push_back(double(e.k)); const i64 nv = i64(v.size()); return folded(scalar_ ? std::vector<i64>{} : std::vector<i64>{nv}, std::move(v), true); }
         val s; s.kind = val::symbolic; s.integer = true; s.sv = std::move(elems);
         if (!scalar_) s.dims = {mono(i64(s.sv.size()))};
         return s;

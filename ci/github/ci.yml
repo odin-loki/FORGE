@@ -67,8 +67,8 @@ jobs:
           [ "$rc" = 0 ] || { echo "test_vulkan exited $rc (77 = no Vulkan device)"; exit 1; }
           grep -q "^vulkan device: llvmpipe" vk.log
       - run: ctest --test-dir build -R "vulkan" -j2 --timeout 600 --no-tests=error
-      - name: all fifteen Vulkan tests ran
-        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 15
+      - name: all sixteen Vulkan tests ran
+        run: test "$(ctest --test-dir build -N -R vulkan | grep -c 'Test *#')" = 16
   linux-tsan:
     # ThreadSanitizer over the suites that start threads: the worker pool, process pool, load balancer, the
     # inference scheduler and sessions, the memory governor, async I/O, logging, RPC, the OS layer and the
@@ -453,8 +453,12 @@ jobs:
             pkg install -y $py-numpy $py-cryptography || true
           run: |
             cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF
-            cmake --build build -j4
-            ctest --test-dir build -LE "slow|emu|gpu" -j2 --timeout 1200 --output-on-failure
+            cmake --build build -j2   # -j4 ran the 8 GB VM out of memory (forge_c.cpp killed, exit 137)
+            rc=0; ctest --test-dir build -LE "slow|emu|gpu" -j2 --timeout 1200 --output-on-failure || rc=$?
+            if [ $rc != 0 ] && [ -x /usr/bin/lldb ]; then   # a SIGILL in test_graph: show the instruction (diagnostic only)
+              FORGE_TEST_ONLY=qdot_matches_decode_exactly /usr/bin/lldb -b -o run -o bt -o 'disassemble --pc --count 3' -o 'register read' -- build/test_graph || true
+            fi
+            exit $rc
   android:
     runs-on: ubuntu-24.04
     steps:

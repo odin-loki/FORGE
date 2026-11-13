@@ -170,7 +170,8 @@ TEST(pp_windows_sandbox_appcontainer) {
         CHECK(pp.submit("probe_write", os::join(dir, "nofs.txt")).get() == "denied");
         CHECK(!os::exists(os::join(dir, "nofs.txt")));
         std::string mech = pp.submit("sb_mech", "").get();
-        CHECK_MSG(mech == "appcontainer+job-object", "%s", mech.c_str());
+        // "+low-integrity" follows on Windows itself (an AppContainer token is at Low integrity), not under wine
+        CHECK_MSG(mech == "appcontainer+job-object" || mech == "appcontainer+job-object+low-integrity", "%s", mech.c_str());
         std::vector<std::future<std::string>> fs; for (int i = 0; i < 8; ++i) fs.push_back(pp.submit("square", std::to_string(i)));
         for (int i = 0; i < 8; ++i) CHECK(fs[std::size_t(i)].get() == std::to_string(i * i));
         try { (void)pp.submit("fail", "").get(); CHECK(false); } catch (const os::os_exception& e) { CHECK(e.kind == os::os_errc::not_found); }

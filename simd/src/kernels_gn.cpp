@@ -42,5 +42,8 @@ using forge_gn_target = forge::simd::armv7_neon;
 #endif
 static_assert(forge::simd::vec<float, forge_gn_target>::K == 6 && forge::simd::vec<float, forge_gn_target>::N == forge::simd::gn::lanes,
               "this TU must build the native vec_gn.hpp kernels");
-#define FORGE_GN_EXPORT(...) FORGE_SIMD_EXPORT_TABLE(__VA_ARGS__)
+// FORGE_GN_EXPAND: MSVC's traditional preprocessor passes the expanded FORGE_GN_TABLE on as one argument unless
+// the call is rescanned.
+#define FORGE_GN_EXPAND(x) x
+#define FORGE_GN_EXPORT(...) FORGE_GN_EXPAND(FORGE_SIMD_EXPORT_TABLE(__VA_ARGS__))
 FORGE_GN_EXPORT(FORGE_GN_TABLE)

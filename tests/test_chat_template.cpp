@@ -59,27 +59,27 @@ TEST(chat_template_errors_and_limits) {
         CHECK_MSG(!error_of(bad).empty(), "%s", bad);
     CHECK(error_of("{{ raise_exception('boom ' ~ messages|length) }}") == "boom 2");
     // loops, output and data are bounded
-    chat_options small; small.limits.max_steps = 200000; small.limits.max_output = 1 << 16;
-    CHECK(!error_of("{% for a in range(1000000) %}{% for b in range(1000000) %}{% endfor %}{% endfor %}", small).empty());
-    CHECK(!error_of("{% for a in range(100000) %}0123456789{% endfor %}", small).empty());
-    CHECK(!error_of("{{ 'x' * 100000000 }}", small).empty());
-    CHECK(!error_of("{% set ns = namespace(s='ab') %}{% for i in range(64) %}{% set ns.s = ns.s + ns.s %}{% endfor %}{{ ns.s|length }}", small).empty());
-    CHECK(!error_of("{% set ns = namespace(l=[1, 2]) %}{% for i in range(64) %}{% set ns.l = ns.l + ns.l %}{% endfor %}", small).empty());
-    CHECK(!error_of("{{ range(100000000)|length }}", small).empty());
-    CHECK(!error_of("{% macro f(n) %}{{ f(n + 1) }}{% endmacro %}{{ f(0) }}", small).empty());
-    CHECK(!error_of("{% set ns = namespace() %}{% set ns.self = ns %}", small).empty());
-    CHECK(!error_of("{% set ns = namespace(v=[]) %}{% for i in range(1000) %}{% set ns.v = [ns.v] %}{% endfor %}", small).empty());
-    CHECK(!error_of("{% set v = [] %}{% set v = [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[v]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] %}", small).empty());
-    CHECK(!error_of(std::string(5000, '(') + "1" + std::string(5000, ')'), small).empty() || true);   // plain text: fine
-    CHECK(!error_of("{{ " + std::string(5000, '(') + "1" + std::string(5000, ')') + " }}", small).empty());
-    CHECK(!error_of("{{ " + std::string(5000, '-') + "1 }}", small).empty());
-    CHECK(!error_of("{{ 1" + std::string(20000, '+').append("1").insert(0, "").replace(0, 0, "") + " }}", small).empty());
-    { std::string chain = "{{ 1"; for (int i = 0; i < 5000; ++i) chain += " + 1"; CHECK(!error_of(chain + " }}", small).empty()); }
-    { std::string nest; for (int i = 0; i < 400; ++i) nest += "{% if true %}"; CHECK(!error_of(nest, small).empty()); }
+    chat_options small_; small_.limits.max_steps = 200000; small_.limits.max_output = 1 << 16;
+    CHECK(!error_of("{% for a in range(1000000) %}{% for b in range(1000000) %}{% endfor %}{% endfor %}", small_).empty());
+    CHECK(!error_of("{% for a in range(100000) %}0123456789{% endfor %}", small_).empty());
+    CHECK(!error_of("{{ 'x' * 100000000 }}", small_).empty());
+    CHECK(!error_of("{% set ns = namespace(s='ab') %}{% for i in range(64) %}{% set ns.s = ns.s + ns.s %}{% endfor %}{{ ns.s|length }}", small_).empty());
+    CHECK(!error_of("{% set ns = namespace(l=[1, 2]) %}{% for i in range(64) %}{% set ns.l = ns.l + ns.l %}{% endfor %}", small_).empty());
+    CHECK(!error_of("{{ range(100000000)|length }}", small_).empty());
+    CHECK(!error_of("{% macro f(n) %}{{ f(n + 1) }}{% endmacro %}{{ f(0) }}", small_).empty());
+    CHECK(!error_of("{% set ns = namespace() %}{% set ns.self = ns %}", small_).empty());
+    CHECK(!error_of("{% set ns = namespace(v=[]) %}{% for i in range(1000) %}{% set ns.v = [ns.v] %}{% endfor %}", small_).empty());
+    CHECK(!error_of("{% set v = [] %}{% set v = [[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[v]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]] %}", small_).empty());
+    CHECK(!error_of(std::string(5000, '(') + "1" + std::string(5000, ')'), small_).empty() || true);   // plain text: fine
+    CHECK(!error_of("{{ " + std::string(5000, '(') + "1" + std::string(5000, ')') + " }}", small_).empty());
+    CHECK(!error_of("{{ " + std::string(5000, '-') + "1 }}", small_).empty());
+    CHECK(!error_of("{{ 1" + std::string(20000, '+').append("1").insert(0, "").replace(0, 0, "") + " }}", small_).empty());
+    { std::string chain = "{{ 1"; for (int i = 0; i < 5000; ++i) chain += " + 1"; CHECK(!error_of(chain + " }}", small_).empty()); }
+    { std::string nest; for (int i = 0; i < 400; ++i) nest += "{% if true %}"; CHECK(!error_of(nest, small_).empty()); }
     { std::string deep = "[1]"; for (int i = 0; i < 300; ++i) deep = "[" + deep + "]"; CHECK_THROWS(render_chat_template("{{ messages }}", json::parse(deep))); }
     { chat_options o; o.limits.max_template = 16; CHECK(!error_of("{{ 'a template longer than that' }}", o).empty()); }
     // within the bounds, ordinary work is fine
-    CHECK(render("{% for i in range(1000) %}{{ i % 10 }}{% endfor %}", small).size() == 1000);
+    CHECK(render("{% for i in range(1000) %}{{ i % 10 }}{% endfor %}", small_).size() == 1000);
     // strftime_now uses the given clock
     { chat_options o; o.now = 86400 * 365; auto y = render("{{ strftime_now('%Y') }}", o); CHECK(y == "1971" || y == "1970"); }
     CHECK(render("{{ strftime_now('%Y')|int > 2024 }}") == "True");

@@ -40,7 +40,16 @@ struct value {
     bool is_obj() const { return v.index() == 5; }
     bool b() const { if (!is_bool()) raise(errc::parse_error, "json: expected bool"); return std::get<1>(v); }
     double num() const { if (!is_num()) raise(errc::parse_error, "json: expected number"); return std::get<2>(v); }
-    std::int64_t i() const { return std::int64_t(num()); }
+    std::int64_t i() const {   // range-checked: converting a NaN or out-of-range double is undefined
+        const double d = num();
+        if (!(d >= -9223372036854775808.0 && d < 9223372036854775808.0)) raise(errc::parse_error, "json: number {} is not a 64-bit integer", d);
+        return std::int64_t(d);
+    }
+    std::int32_t i32() const {
+        const std::int64_t x = i();
+        if (x < INT32_MIN || x > INT32_MAX) raise(errc::parse_error, "json: number {} is not a 32-bit integer", x);
+        return std::int32_t(x);
+    }
     const std::string& str() const { if (!is_str()) raise(errc::parse_error, "json: expected string"); return std::get<3>(v); }
     const array& arr() const { if (!is_arr()) raise(errc::parse_error, "json: expected array"); return *std::get<4>(v); }
     const object& obj() const { if (!is_obj()) raise(errc::parse_error, "json: expected object"); return *std::get<5>(v); }

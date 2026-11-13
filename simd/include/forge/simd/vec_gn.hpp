@@ -100,8 +100,8 @@ FORGE_GN_FN vf round_nearest(vf x) {
     // cvtps_epi32 rounds to nearest even (default MXCSR); |x| >= 2^23 and NaN are already integral / kept
     const __m128 sign = _mm_set1_ps(-0.0f);
     __m128 r = _mm_or_ps(_mm_cvtepi32_ps(_mm_cvtps_epi32(x)), _mm_and_ps(sign, x));
-    __m128 small = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(8388608.f));
-    return _mm_or_ps(_mm_and_ps(small, r), _mm_andnot_ps(small, x));
+    __m128 below_2p23 = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(8388608.f));
+    return _mm_or_ps(_mm_and_ps(below_2p23, r), _mm_andnot_ps(below_2p23, x));
 #endif
 }
 FORGE_GN_FN vf ldexp_int(vf x, vf n) {
@@ -292,7 +292,11 @@ FORGE_GN_FN vf mul(vf a, vf b) { return a * b; }
 FORGE_GN_FN vf splat(float s) { return vf{} + s; }
 FORGE_GN_FN vm lt(vf a, vf b) { return raw_lt(a, b); }
 #endif
+#if defined(__mips_msa)
+FORGE_GN_FN vm isnan(vf a) { return vm(__msa_fcun_w(v4f32(a), v4f32(a))); }   // GCC 14 lowers a != a to fcne, false for NaN
+#else
 FORGE_GN_FN vm isnan(vf a) { return vm(a != a); }
+#endif
 FORGE_GN_FN vm mor(vm a, vm b) { return a | b; }
 FORGE_GN_FN vm mand(vm a, vm b) { return a & b; }
 #if defined(__mips_msa)

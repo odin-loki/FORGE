@@ -447,7 +447,7 @@ private:
     int token_id(const json::value& x, std::string_view field) const {
         if (!x.is_num() || x.num() != std::floor(x.num()) || x.num() < 0 || x.num() >= double(m_->vocab() > 0 ? m_->vocab() : (i64(1) << 31) - 1))
             bad_request(field, "\"{}\": token ids must be integers in [0, {})", field, m_->vocab());
-        return int(x.num());
+        return x.i32();
     }
     // "model": "<anything>" serves the base weights (clients send their own names); "<name>:<adapter>" or a field
     // "adapter" (alias "lora") selects a LoRA adapter loaded with --lora.
@@ -877,7 +877,7 @@ private:
             for (auto& x : a.arr()) {
                 if (!x.is_num() || x.num() < 0 || x.num() >= double(m_->vocab() > 0 ? m_->vocab() : (i64(1) << 31) - 1) || x.num() != std::floor(x.num()))
                     raise(errc::invalid_argument, "\"input\": token ids must be integers in [0, {})", m_->vocab());
-                ids.push_back(int(x.num()));
+                ids.push_back(x.i32());
             }
             if (ids.empty()) raise(errc::invalid_argument, "\"input\": an empty token list");
             return ids;

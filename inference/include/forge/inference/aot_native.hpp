@@ -49,8 +49,8 @@ public:
         if (const char* e = std::getenv("FORGE_AOT_FPK"); e && *e) return e;
         std::string rec = d_->fpk_path ? d_->fpk_path : "";
         if (!rec.empty() && path_.front() != '<') {
-            auto near = forge::os::dirname(path_) + "/" + forge::os::basename(rec);
-            if (forge::os::exists(near)) return near;
+            auto beside = forge::os::dirname(path_) + "/" + forge::os::basename(rec);
+            if (forge::os::exists(beside)) return beside;   // not "near": <windows.h> defines near and far
         }
         if (rec.empty()) raise(errc::not_found, "{}: the library does not name its model file; set FORGE_AOT_FPK", path_);
         return rec;

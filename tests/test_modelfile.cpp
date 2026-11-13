@@ -855,7 +855,7 @@ TEST(fpk_chunked_encryption) {
         m["encryption"] = json::dump(json::value(ho));
         CHECK(rejected(m, "truncated, header adjusted"));
         json::array keep;   // drop the tensors that reached into the removed chunk, so every bounds check passes
-        for (auto& e : json::parse(A.at("tensors")).arr()) if (e["offset"].num() + e["bytes"].num() <= double(last)) keep.push_back(e);
+        const auto a_tensors = json::parse(A.at("tensors")); for (auto& e : a_tensors.arr()) if (e["offset"].num() + e["bytes"].num() <= double(last)) keep.push_back(e);
         CHECK(!keep.empty() && keep.size() < json::parse(A.at("tensors")).arr().size());
         m["tensors"] = json::dump(json::value(keep));
         CHECK(rejected(m, "truncated, header and index adjusted"));
@@ -1219,8 +1219,8 @@ TEST(licence_is_captured_and_kept) {
     {
         hf_opts l; l.readme = "---\nlicense:\n  - mit\n  - cc-by-4.0\n---\n";
         auto dir = make_hf_dir("hf_lic2", l);
-        { std::ofstream f(fs::path(dir) / "LICENSE.txt"); f << "MIT text\n"; }
-        { std::ofstream f(fs::path(dir) / "NOTICE"); f << "notice text\n"; }
+        { std::ofstream f(fs::path(dir) / "LICENSE.txt", std::ios::binary); f << "MIT text\n"; }
+        { std::ofstream f(fs::path(dir) / "NOTICE", std::ios::binary); f << "notice text\n"; }
         CHECK(import::import_hf(dir, out).license == "mit, cc-by-4.0");
         modelfile::reader r(out);
         CHECK(r.manifest()["license_files"].arr().size() == 2);

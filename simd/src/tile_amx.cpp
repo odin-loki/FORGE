@@ -30,6 +30,11 @@ bool amx_available() {
         if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
         bool hw = (d >> 24 & 1) && (d >> 22 & 1) && (d >> 25 & 1);   // AMX-TILE, AMX-BF16, AMX-INT8
         if (!hw) return false;
+        // the OS must have enabled the tile state in XCR0 (bits 17, 18): FreeBSD does not, and the instructions raise
+        // SIGILL there although CPUID reports AMX (test_graph died so on GitHub's Sapphire Rapids runners)
+        if (!__get_cpuid(1, &a, &b, &c, &d) || !(c >> 27 & 1)) return false;   // OSXSAVE
+        unsigned xlo, xhi; __asm__ volatile("xgetbv" : "=a"(xlo), "=d"(xhi) : "c"(0));
+        if ((xlo & 0x60000u) != 0x60000u) return false;
 #if defined(__linux__)
         constexpr long ARCH_REQ_XCOMP_PERM = 0x1023, XFEATURE_XTILEDATA = 18;
         if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) != 0) return false;

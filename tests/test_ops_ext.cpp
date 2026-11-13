@@ -241,15 +241,16 @@ TEST(attention_bias_masks_softcap_window) {
     tensor k3({3, hk, d}), v3({3, hk, dv});
     std::copy_n(k.data.begin(), 3 * hk * d, k3.data.begin()); std::copy_n(v.data.begin(), 3 * hk * dv, v3.data.begin());
     tensor q3({3, hq, d}); std::copy_n(q.data.begin(), 3 * hq * d, q3.data.begin());
-    auto small = ops::reference(ops::op::attention)({q3, k3, v3}, {{"causal", 0.0}});
-    for (std::size_t i = 0; i < small.size(); ++i) CHECK(std::fabs(masked.data[i] - small.data[i]) < 1e-5);
+    auto small_ = ops::reference(ops::op::attention)({q3, k3, v3}, {{"causal", 0.0}});
+    for (std::size_t i = 0; i < small_.size(); ++i) CHECK(std::fabs(masked.data[i] - small_.data[i]) < 1e-5);
     // a bidirectional window masks both sides: window 1 leaves only the key at the query's own position
     auto self = both(ops::op::attention_bias, {q, k, v, zero}, {{"window", 1.0}}, "window 1");
     for (i64 i = 0; i < s; ++i) for (i64 h = 0; h < hq; ++h) for (i64 e = 0; e < dv; ++e)
         CHECK(std::fabs(self.data[std::size_t((i * hq + h) * dv + e)] - v.data[std::size_t((i * hk + h / 2) * dv + e)]) < 1e-6);
     // every key masked: zeros, not NaN
     tensor all({1}, -INFINITY);
-    for (float x : both(ops::op::attention_bias, {q, k, v, all}, {}, "all masked").data) CHECK(x == 0.f);
+    const tensor all_masked = both(ops::op::attention_bias, {q, k, v, all}, {}, "all masked");
+    for (float x : all_masked.data) CHECK(x == 0.f);
     // per-head [hq, s, t] bias against an explicit softmax
     auto bias = rnd({hq, s, t}, rng, -3.f, 3.f);
     auto y = both(ops::op::attention_bias, {q, k, v, bias}, {{"softcap", 2.5}, {"scale", 0.3}}, "full bias + softcap");

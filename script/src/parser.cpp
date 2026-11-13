@@ -82,6 +82,7 @@ private:
     static bool idchar(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
     std::string word() { std::size_t b = p_; while (p_ < s_.size() && idchar(s_[p_])) ++p_; return std::string(s_.substr(b, p_ - b)); }
     std::string escape(int line) {
+        if (p_ >= s_.size()) throw syntax_error(line, where(line) + "unterminated escape at the end of the input");   // `'\` as the last bytes
         char e = s_[p_++];
         switch (e) {
         case 'n': return "\n"; case 't': return "\t"; case 'r': return "\r"; case '0': return std::string(1, '\0');
@@ -1800,7 +1801,16 @@ private:
     }
 
     // ---------------------------------------------------------------- expressions
-    NodeP expr() { return assign_expr(); }
+    // Expression nesting is bounded: each level (a parenthesis, an argument, a prefix operator) takes several stack
+    // frames, and a few thousand of them overflowed the stack (fuzz_script: "((((((...").
+    int expr_depth_ = 0;
+    struct ExprDepth {
+        Parser& p;
+        explicit ExprDepth(Parser& x) : p(x) { if (++p.expr_depth_ > 256) { --p.expr_depth_; p.fail("expression nested too deeply (more than 256 levels)"); } }
+        ~ExprDepth() { --p.expr_depth_; }
+        ExprDepth(const ExprDepth&) = delete; ExprDepth& operator=(const ExprDepth&) = delete;
+    };
+    NodeP expr() { ExprDepth g(*this); return assign_expr(); }
     // Assignments and ++ / -- are expressions, as in C++ (`f(i++)`, `while (--n > 0)`, `a = b = c`): an Assign node in
     // expression position is evaluated by Interp::assign_value.
     void no_assign(const NodeP&) const {}
@@ -1938,6 +1948,7 @@ private:
         return a;
     }
     NodeP unary() {
+        ExprDepth g(*this);
         int line = cur().line;
         if (is_op("!") || (at(T::Ident) && cur().s == "not")) { take(); auto n = mk(NK::Unary, line); n->s = "not"; n->kids.push_back(unary()); no_assign(n->kids[0]); return n; }
         if (accept_op("-")) {

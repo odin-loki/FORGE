@@ -597,7 +597,9 @@ inline status clone_file(const std::string& from, const std::string& to) {
     ::close(in); ::close(out);
     if (r == 0) return {};
     ::unlink(to.c_str());
-    if (detail::cannot_clone(en)) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
+    // EACCES although both files opened: a security module refuses the ioctl (Android's SELinux policy for app and shell
+    // domains), so cloning is not available here
+    if (detail::cannot_clone(en) || en == EACCES) return {{}, unsupported("clone_file (the file system cannot share blocks)")};
     errno = en; return {{}, last_error("clone " + from)};
 #elif defined(__APPLE__)
     if (::clonefile(from.c_str(), to.c_str(), 0) == 0) return {};
@@ -1109,9 +1111,19 @@ public:
         }
 #endif
         const std::size_t old = n_;
+#if defined(FORGE_OS_WINDOWS)
+        // The bytes that stay are carried across the remap by hand: on the GitHub Windows runners a view mapped after
+        // the file's end moved read zeros where the previous view had written (wine keeps them). Written back below,
+        // so the file has them too.
+        std::vector<std::uint8_t> keep;
+        if (p_) keep.assign(static_cast<const std::uint8_t*>(p_), static_cast<const std::uint8_t*>(p_) + std::min<std::uint64_t>(old, new_size));
+#endif
         unmap_();
         if (auto st = f_.resize(new_size); !st) { (void)map_(old); return st; }
         if (auto e = map_(std::size_t(new_size))) return {{}, e};
+#if defined(FORGE_OS_WINDOWS)
+        if (!keep.empty() && p_ && std::memcmp(p_, keep.data(), keep.size()) != 0) std::memcpy(p_, keep.data(), keep.size());
+#endif
         return {};
     }
     // Write dirty pages back (and wait for it).

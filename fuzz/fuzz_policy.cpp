@@ -12,7 +12,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     catch (const forge::forge_exception&) { return 0; }
     std::string j = sec::to_json(p);
     sec::policy q;
-    try { q = sec::parse_policy(j, "fuzz-roundtrip"); }
+    try { q = sec::parse_policy(j, "fuzz"); }   // the same origin: "source" in j is ignored, the origin becomes it
     catch (const std::exception& e) { throw std::logic_error(std::string("policy: to_json output does not parse: ") + e.what() + "\n" + j); }
     if (sec::to_json(q) != j) throw std::logic_error("policy: to_json/parse_policy round trip changed the policy\n" + j + "\n" + sec::to_json(q));
     return 0;

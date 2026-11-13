@@ -27,7 +27,7 @@ private:
 };
 
 class tlsf {
-    static constexpr std::size_t align = 16, sl_log = 4, sl_n = 1 << sl_log, small = 256, fl_n = 40;
+    static constexpr std::size_t align = 16, sl_log = 4, sl_n = 1 << sl_log, small_limit = 256, fl_n = 40;
     struct alignas(16) hdr { std::size_t size; hdr* prev_phys; hdr* nf; hdr* pf; std::size_t free; };
 public:
     struct stats { std::size_t live_bytes = 0, peak_bytes = 0, live_allocs = 0, free_bytes = 0, largest_free = 0; };
@@ -42,7 +42,7 @@ public:
     }
     void* malloc(std::size_t n) {
         n = n ? (n + align - 1) & ~(align - 1) : align;
-        std::size_t want = n >= small ? n + (std::size_t(1) << (log2(n) - sl_log)) - 1 : n;   // round up to the next class
+        std::size_t want = n >= small_limit ? n + (std::size_t(1) << (log2(n) - sl_log)) - 1 : n;   // round up to the next class
         std::size_t fl, sl; map(want, fl, sl);
         hdr* h = find(fl, sl);
         if (!h) { map(n, fl, sl); for (h = lists_[fl][sl]; h && h->size < n; h = h->nf) {} }   // exact class, first fit
@@ -97,8 +97,8 @@ public:
 private:
     static std::size_t log2(std::size_t v) { return std::size_t(std::bit_width(v) - 1); }
     static void map(std::size_t n, std::size_t& fl, std::size_t& sl) {
-        if (n < small) { fl = 0; sl = n / (small / sl_n); return; }
-        std::size_t l = log2(n); fl = l - log2(small) + 1; sl = (n >> (l - sl_log)) & (sl_n - 1);
+        if (n < small_limit) { fl = 0; sl = n / (small_limit / sl_n); return; }
+        std::size_t l = log2(n); fl = l - log2(small_limit) + 1; sl = (n >> (l - sl_log)) & (sl_n - 1);
         if (fl >= fl_n) { fl = fl_n - 1; sl = sl_n - 1; }
     }
     hdr* next(hdr* h) const { auto* p = reinterpret_cast<std::uint8_t*>(h + 1) + h->size; return p + sizeof(hdr) <= end_ ? reinterpret_cast<hdr*>(p) : nullptr; }

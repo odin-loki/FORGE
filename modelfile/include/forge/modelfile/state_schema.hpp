@@ -77,7 +77,7 @@ struct state_schema {
             std::uint64_t n = 1;
             for (auto& d : sh->arr()) {
                 if (!d.is_num() || !(d.num() >= 1 && d.num() <= 1e9) || d.num() != std::floor(d.num())) bad("bad slot dimension");
-                s.shape.push_back(i64(d.num())); n *= std::uint64_t(d.num());
+                s.shape.push_back(d.i()); n *= std::uint64_t(d.i());
                 if (n > (std::uint64_t(1) << 40)) bad("slot too large");
             }
             out.slots.push_back(std::move(s));

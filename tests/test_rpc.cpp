@@ -59,7 +59,7 @@ TEST(rpc_malformed_calls_are_refused) {
     graph::rpc::server srv(nullptr, 0); srv.start();
     auto c = graph::rpc::client::connect("127.0.0.1", std::to_string(srv.port()), nullptr);
     CHECK(c != nullptr);
-    tensor x({2, 4}), w({3, 4}), y({2, 4}), small({1}), w5({5});
+    tensor x({2, 4}), w({3, 4}), y({2, 4}), small_({1}), w5({5});
     tensor_view vx{x.data.data(), x.shape}, vw{w.data.data(), w.shape}, vw5{w5.data.data(), w5.shape};
     auto refused = [&](const char* op, std::vector<tensor_view> in, tensor& out, const ops::attrs& a = {}) {
         try { c->run(op, in, {out.data.data(), out.shape}, a); } catch (const forge_exception& e) { return std::string(e.what()).find("rpc server:") != std::string::npos; }
@@ -67,7 +67,7 @@ TEST(rpc_malformed_calls_are_refused) {
     };
     CHECK(refused("softmax", {}, y));                    // no inputs
     CHECK(refused("relu", {vx, vx}, y));                 // too many
-    CHECK(refused("relu", {vx}, small));                 // output smaller than the result
+    CHECK(refused("relu", {vx}, small_));                 // output smaller than the result
     CHECK(refused("matmul_t", {vx, vw}, y));             // [2,4] x [3,4]^T is [2,3], not [2,4]
     CHECK(refused("matmul_t", {vx, vw5}, y));            // weight of the wrong rank
     CHECK(refused("rms_norm", {vx, vw5}, y));            // weight longer than the last axis
@@ -1152,16 +1152,16 @@ TEST(rpc_weight_residency_untrusted_wire) {
         CHECK(rep.size() == 40 && u32_at(rep, 0) == 3);
     }
     {   // 44 bytes that name a 4 MiB weight: over this server's budget -> refused by size, the missing payload just ends the connection
-        graph::rpc::server small(nullptr, 0); small.weight_budget_bytes = 1 << 16; small.max_tensor_elems = 1u << 30; small.start();
+        graph::rpc::server small_(nullptr, 0); small_.weight_budget_bytes = 1 << 16; small_.max_tensor_elems = 1u << 30; small_.start();
         writer w; w.raw("FRPW", 4); w.raw(good.data(), 32); w.shape({i64(1) << 20});
-        CHECK(raw_talk(small.port(), w.b).empty() && small.weight_bytes() == 0 && small.weight_uploads() == 0);
+        CHECK(raw_talk(small_.port(), w.b).empty() && small_.weight_bytes() == 0 && small_.weight_uploads() == 0);
         writer w2; w2.raw("FRPW", 4); w2.raw(good.data(), 32); w2.shape({i64(1) << 40});      // more elements than any tensor may have: dropped
-        CHECK(raw_talk(small.port(), w2.b).empty());
+        CHECK(raw_talk(small_.port(), w2.b).empty());
         writer w3; w3.raw("FRPW", 4); w3.raw(good.data(), 32); w3.u32(99);                     // a rank no shape has
-        CHECK(raw_talk(small.port(), w3.b).empty());
+        CHECK(raw_talk(small_.port(), w3.b).empty());
         writer w4; put_upload(w4, hash_of({}), {0}, {});                                        // an empty weight
-        auto rep = raw_talk(small.port(), w4.b); CHECK(u32_at(rep, 0) == 1 && rep.find("empty weight") != std::string::npos);
-        small.stop();
+        auto rep = raw_talk(small_.port(), w4.b); CHECK(u32_at(rep, 0) == 1 && rep.find("empty weight") != std::string::npos);
+        small_.stop();
     }
     {   // an input kind that does not exist ends the connection; a truncated handle does too
         writer w; op_by_handle(w, good, {64}, 7); CHECK(raw_talk(srv.port(), w.b).empty());
