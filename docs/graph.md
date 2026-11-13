@@ -167,5 +167,5 @@ Optional TLS (mTLS too) and token or Ed25519 key authentication are available. T
 
 ## Platform notes and limits
 - Link `forge_graph`, `forge_verify` and `forge_simd_mv`.
-- Device lowerings have run on an NVIDIA RTX 3090 (CUDA), Mesa lavapipe and SwiftShader (Vulkan), and mock drivers (HIP, OpenCL, Level Zero). Metal has not been compiled. See [gpu.md](gpu.md).
-- Pipeline splits have only been run with CPU and lavapipe stages, not across real GPUs.
+- Device lowerings have run on an NVIDIA RTX 3090 (CUDA; not the kernels added on 2026-11-12), Mesa lavapipe and SwiftShader (Vulkan), mock drivers (CUDA, HIP, OpenCL, Level Zero) and, for the Metal lowerings that existed at PR #53, the GitHub macOS runner's GPU. The Metal ports added on 2026-11-12 have never been compiled by a Metal toolchain or executed. See [gpu.md](gpu.md) and [UNTESTED.md](UNTESTED.md#4-gpu-backends).
+- Pipeline splits have only been run with CPU and lavapipe stages and, for `pipe:auto`, two devices of a mock driver; never across real GPUs.

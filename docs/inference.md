@@ -163,7 +163,7 @@ std::vector<float> v = s.embed(ids);                    // pooled (and L2-normal
 std::vector<float> t = s.embed_text("hello world");     // the same through the model's WordPiece tokenizer
 ```
 
-`generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per call: there is no batch axis, so padding only matters when the caller pads. Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).
+`generate` / `forward` on an embedding model, and `embed` on a generative one, raise `unsupported`. One sequence per graph run: there is no batch axis, so padding only matters when the caller pads (`session::embed_batch` takes several inputs and runs them one after another with shared setup). Images and audio must already be preprocessed (resize + normalise; log-mel features): FORGE has no image or audio front end. A plan is compiled per sequence length and cached. CLI: `forge embed` ([cli.md](cli.md)).
 
 ### Session kinds chosen by the file: `diffusion_loop` and `streaming` (`file_sessions.hpp`)
 A blueprint of opset 4 can declare `session diffusion_loop(...)` or `session streaming(...)` with the parameters of the kind ([modelfile.md](modelfile.md#opsets)). Such a model is opened like every other (`inference::model`, `inference::session`); a runner attaches the service the kind names to the session's graph.

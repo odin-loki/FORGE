@@ -66,8 +66,8 @@ intrinsics. They are derived by the build scripts next to them (build_*_db.py), 
       LICENCE OF rvv-intrinsic-doc: NOT ESTABLISHED. Neither ops/intrinsics/build_riscv_db.py, ops/README.md nor the
       generated databases record it, the copy the databases were built from is not in this repository, and it could
       not be read from the project when this notice was written (2026-11-12: its README.md names no licence and no
-      LICENSE file was found at the root of its main branch). It has to be confirmed from the project and filled in
-      here before FORGE is distributed with these two files.
+      LICENSE file was found at the root of its main branch). This statement stands as written: the project's owner
+      decided on 2026-11-13 not to pursue the question for the time being.
 
 No header text is copied into the databases: what they hold is each intrinsic's name and prototype. The attribution
 is given because the lists as a whole are taken from those sources.
