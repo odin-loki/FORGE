@@ -56,4 +56,10 @@ raw_gguf(os.path.join(G, "types_cut.gguf"), [(f"t{ty}", ty, [256], None, blocks(
 raw_gguf(os.path.join(G, "bad_blocks.gguf"), [("a", 12, [300], None, blocks(12, 512)), ("b", 2, [31, 3], None, blocks(2, 96)), ("c", 10, [256, 3], None, blocks(10, 256))])
 raw_gguf(os.path.join(G, "overflow.gguf"), [("a", 2, [1 << 40, 1 << 40, 1 << 40], None, blocks(2, 32)), ("b", 14, [256], (1 << 64) - 64, b""),
                                             ("c", 27, [(1 << 63) + 5], None, b""), ("d", 16, [256], None, bytes(66)), ("e", 0, [1 << 61, 8], 1 << 62, b"")])
+
+# fuzz_aot: structure-aware plan-blob seeds derived from corpus/aot/seed.fplan (see aot_seeds.py, standard library only;
+# `python3 fuzz/aot_seeds.py` runs it alone). They are many; keep the ones libFuzzer's -merge=1 says add coverage.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import aot_seeds
+aot_seeds.main(["aot_seeds.py"])
 for k in os.listdir(here): print(k, os.listdir(os.path.join(here, k)))
