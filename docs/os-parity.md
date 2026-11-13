@@ -23,7 +23,7 @@ Headers: `os.hpp`, `oserror.hpp`, `fs.hpp`, `async_file.hpp`, `pipe.hpp`, `proce
 | Android | Linux headers with `__ANDROID__` forced (syntax of every header here); **not the NDK** | **never run** |
 
 CI (Windows MSVC and MinGW, macOS, iOS simulator, FreeBSD VM, Android NDK) is the first real compile and run
-for everything marked "never run" above.
+for everything marked "never run" above. As of 2026-11-13 no CI run has happened since these calls were added.
 
 ### Core (`os.hpp`)
 
