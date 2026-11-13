@@ -680,8 +680,9 @@ Options: `{"context", text}`, `{"shell", name}` (any backend in `forge::shells()
    decoding to a JSON value with the grammar sampler; a value cut off by the token cap raises `AIError`. No `net`
    capability is needed. If a model is configured but the host has no generator, the endpoint below is used if set,
    else `AIError`;
-3. `$FORGE_AI_ENDPOINT`: an OpenAI-compatible `/v1/chat/completions` server such as `forge-serve`
-   (`FORGE_AI_MODEL`, `FORGE_AI_KEY` optional). Needs the `net` capability.
+3. A remote AI ([inference.md](inference.md#remote-models-remotehpp), `FORGE_AI_PROVIDER` / `FORGE_AI_URL`, formerly
+   `$FORGE_AI_ENDPOINT`): `forge-serve` or any OpenAI-compatible server, the Anthropic API, or a command
+   (`FORGE_AI_CMD`). Servers need the `net` capability, a command the `proc` capability.
 
 **Confirmation**: `{"confirm", fn}` per call, else `options::confirm`. `forge script` asks `Run it? [y/N]` on the
 terminal. With no confirmer, `ran` is false and nothing runs (rpc-serve children never confirm). `ai_run` goes

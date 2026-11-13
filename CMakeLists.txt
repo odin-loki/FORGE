@@ -460,7 +460,7 @@ add_library(forge_script STATIC ${FORGE_SHELL_SRCS} ${PROJECT_BINARY_DIR}/genera
   script/src/vm.cpp script/src/builtins.cpp script/src/cppstd.cpp script/src/automation.cpp script/src/ai.cpp script/src/remote.cpp script/src/mobile.cpp script/src/text.cpp script/src/reflect.cpp script/src/emit.cpp script/src/debug.cpp script/src/engine.cpp script/src/fsc.cpp script/src/check.cpp
   script/src/aot_codegen.cpp script/src/aot_compile.cpp script/src/aot_rt.cpp)   # ahead-of-time compilation (docs/aot.md)
 forge_include_dirs(forge_script PUBLIC script/include)
-target_include_directories(forge_script PRIVATE script/src)
+target_include_directories(forge_script PRIVATE script/src inference/include)   # inference/include: remote.hpp only (header-only AI client, script/src/ai.cpp)
 target_link_libraries(forge_script PUBLIC forge_modelfile forge_mobile forge_text PRIVATE forge_verify forge_trust forge_security)
 if(TARGET forge_rpc_tls)
   target_link_libraries(forge_script PUBLIC forge_rpc_tls)
@@ -1780,6 +1780,10 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME serve_http COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/serve_test.py
                $<TARGET_FILE:forge-serve> $<TARGET_FILE:forge> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
       set_tests_properties(serve_http PROPERTIES DEPENDS golden_tiny_llama)
+      # inference/remote.hpp against forge-serve: chat, usage, a GBNF grammar and a JSON schema over real HTTP
+      add_test(NAME remote_ai_serve COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/remote_ai_serve_test.py
+               $<TARGET_FILE:forge-serve> $<TARGET_FILE:test_remote_ai> ${PROJECT_BINARY_DIR}/golden/tiny_f32.fpk)
+      set_tests_properties(remote_ai_serve PROPERTIES DEPENDS golden_tiny_llama TIMEOUT 300)
       # The JNI surface: the Kotlin externals, their Java mirror and forge_jni.c declare the same natives
       add_test(NAME jni_decl_matches COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/jni_decl_check.py ${PROJECT_SOURCE_DIR})
       # ... and the bridge runs on a host JVM (every native, -Xcheck:jni). Linux hosts with a JDK only: the one place
@@ -1839,7 +1843,7 @@ if(FORGE_BUILD_TESTS)
       golden_gguf_types golden_hf_quant
       golden_tiny_llama_vulkan golden_moe_mla_vulkan golden_tiny_llama_cuda_mock golden_tiny_llama_opencl_mock
       golden_tiny_llama_ze_mock golden_tiny_llama_hip_mock golden_moe_mla_cuda_mock golden_moe_mla_hip_mock golden_moe_mla_opencl_mock golden_moe_mla_ze_mock doc_example_inference_generate doc_example_capi_generate
-      capi_smoke python_bindings serve_http serve_api serve_auth security_cli modelfile_signing)
+      capi_smoke python_bindings serve_http remote_ai_serve serve_api serve_auth security_cli modelfile_signing)
     if(TEST jni_smoke)
       forge_py_needs("numpy;safetensors" jni_smoke)   # it runs on the golden models
     endif()

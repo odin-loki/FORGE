@@ -57,13 +57,13 @@ struct options {
     bool cancel_signals = true;
     std::vector<std::string> argv;      // visible to scripts as `args`
     std::function<void(std::string_view)> out;   // print(); default stdout
-    // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = use FORGE_AI_ENDPOINT
-    // (OpenAI-compatible /v1/chat/completions over http) if set. `confirm` is shown AI-drafted code and
+    // AI-assisted commands (ai.*). `ai` completes (system, prompt) -> text; null = a remote AI (forge/inference/remote.hpp: FORGE_AI_PROVIDER / FORGE_AI_URL, formerly FORGE_AI_ENDPOINT)
+    // if one is configured (docs/inference.md "Remote models"). `confirm` is shown AI-drafted code and
     // returns true to run it; null = AI code never runs (unless the script passes its own confirm callback).
     std::function<std::string(const std::string& system, const std::string& prompt)> ai;
     std::function<bool(const std::string& code)> confirm;
     // In-process model for the AI commands when `ai` is null: a .fpk path (empty = $FORGE_ASK_MODEL). Used only if
-    // the host registered set_local_ai() (the forge CLI does); otherwise FORGE_AI_ENDPOINT is used. ask_max_tokens
+    // the host registered set_local_ai() (the forge CLI does); otherwise the remote AI is used. ask_max_tokens
     // caps each reply (0 = $FORGE_ASK_MAX_TOKENS, else 256).
     std::string ask_model;
     int ask_max_tokens = 0;

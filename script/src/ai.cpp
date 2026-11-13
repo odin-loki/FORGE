@@ -7,13 +7,15 @@
 //   forge::ai_eval(task[, opts])           -> same, for drafted *script* code (runs via eval)
 // Backend: options::ai if the host set one; else an in-process model when options::ask_model / FORGE_ASK_MODEL names a
 // .fpk and the host registered set_local_ai() (the forge CLI does; forge_script itself does not link inference);
-// else FORGE_AI_ENDPOINT (an OpenAI-compatible server such as `forge-serve`; FORGE_AI_MODEL optional). Confirmation: opts {"confirm", fn} if given, else options::confirm;
+// else a remote AI (inference/remote.hpp; docs/inference.md "Remote models"): FORGE_AI_PROVIDER / FORGE_AI_URL (formerly
+// FORGE_AI_ENDPOINT) for forge-serve, any OpenAI-compatible server or the Anthropic API, or FORGE_AI_CMD. Confirmation: opts {"confirm", fn} if given, else options::confirm;
 // with neither, drafted code never runs ({ran:false}). Endpoint calls need the net capability; running needs proc.
 #include "interp.hpp"
 #include "shells/shell.hpp"
 #include <forge/script/script.hpp>
 #include <forge/json/json.hpp>
 #include <forge/os/net.hpp>
+#include <forge/inference/remote.hpp>
 #include <cstdlib>
 #include <mutex>
 
@@ -52,7 +54,6 @@ std::string complete(Interp& in, const std::string& system, const std::string& p
         catch (const ScriptError&) { throw; }
         catch (const std::exception& e) { in.raise("AIError", std::string("ai backend: ") + e.what()); }
     }
-    const char* ep = std::getenv("FORGE_AI_ENDPOINT");
     std::string fpk = in.sh->ask_model;
     if (fpk.empty()) if (const char* m = std::getenv("FORGE_ASK_MODEL")) fpk = m;
     if (!fpk.empty()) {
@@ -64,30 +65,34 @@ std::string complete(Interp& in, const std::string& system, const std::string& p
             catch (const ScriptError&) { throw; }
             catch (const std::exception& e) { in.raise("AIError", "local model " + fpk + ": " + e.what()); }
         }
-        if (!ep || !*ep) in.raise("AIError", "FORGE_ASK_MODEL is set, but this host has no in-process inference (run under `forge script`) and FORGE_AI_ENDPOINT is not set");
+        std::string why_cfg;
+        if (!inference::remote::config_from_env(&why_cfg) && why_cfg.empty())
+            in.raise("AIError", "FORGE_ASK_MODEL is set, but this host has no in-process inference (run under `forge script`) and no remote AI is configured (FORGE_AI_URL / FORGE_AI_PROVIDER)");
     }
-    if (!ep || !*ep) in.raise("AIError", "no AI backend: set FORGE_ASK_MODEL (a local .fpk), FORGE_AI_ENDPOINT (e.g. http://127.0.0.1:8080 from forge-serve) or options::ai");
-    if (!in.caps.net) in.raise("PermissionError", "AI endpoint access needs network access, which is disabled in this sandbox");
-    std::string url = ep; while (!url.empty() && url.back() == '/') url.pop_back();
-    if (auto u = os::net::parse_url(url)) enforce_scope(in, SecScope::net_connect, (u->host.find(':') != std::string::npos ? "[" + u->host + "]" : u->host) + ":" + std::to_string(u->port ? u->port : u->scheme == "https" ? 443 : 80));
-    if (!url.ends_with("/chat/completions")) url += url.ends_with("/v1") ? "/chat/completions" : "/v1/chat/completions";
-    const char* model = std::getenv("FORGE_AI_MODEL");
-    json::object body{{"model", std::string(model ? model : "default")}, {"temperature", 0.0},
-        {"messages", json::array{json::object{{"role", "system"}, {"content", system}}, json::object{{"role", "user"}, {"content", prompt}}}}};
-    os::net::http_request rq; rq.method = "POST"; rq.url = url; rq.body = json::dump(json::value(body)); rq.timeout_ms = 120000;
-    rq.headers["Content-Type"] = "application/json";
-    if (const char* k = std::getenv("FORGE_AI_KEY")) rq.headers["Authorization"] = std::string("Bearer ") + k;
-    auto r = os::net::http(rq);
-    if (!r) in.raise("AIError", "ai endpoint: " + r.err.what);
-    if (r.value.status != 200) in.raise("AIError", "ai endpoint returned HTTP " + std::to_string(r.value.status) + ": " + r.value.body.substr(0, 300));
-    try {
-        auto j = json::parse(r.value.body);
-        auto* ch = j.find("choices"); if (!ch || !ch->is_arr() || ch->arr().empty()) in.raise("AIError", "ai endpoint: no choices in reply");
-        auto& c0 = ch->arr()[0];
-        if (auto* m = c0.find("message")) return m->str_or("content", "");
-        return c0.str_or("text", "");
-    } catch (const ScriptError&) { throw; }
-    catch (const std::exception& e) { in.raise("AIError", std::string("ai endpoint: bad reply: ") + e.what()); }
+    // Remote AI (inference/remote.hpp): FORGE_AI_PROVIDER / FORGE_AI_URL (or FORGE_AI_ENDPOINT) / FORGE_AI_CMD.
+    std::string why;
+    auto cfg = inference::remote::config_from_env(&why);
+    if (!cfg) {
+        if (!why.empty()) in.raise("AIError", why);
+        in.raise("AIError", "no AI backend: set FORGE_ASK_MODEL (a local .fpk), FORGE_AI_URL (e.g. http://127.0.0.1:8080 from forge-serve), FORGE_AI_PROVIDER (openai, anthropic, ollama, command, ...) or options::ai");
+    }
+    if (cfg->kind == inference::remote::provider::command) {
+        if (!in.caps.proc) in.raise("PermissionError", "the AI command provider needs process access, which is disabled in this sandbox");
+        enforce_scope(in, SecScope::exec, "/bin/sh");
+        in.charge_process("ai command");
+    } else {
+        if (!in.caps.net) in.raise("PermissionError", "AI endpoint access needs network access, which is disabled in this sandbox");
+        if (auto u = os::net::parse_url(inference::remote::endpoint(*cfg))) enforce_scope(in, SecScope::net_connect, (u->host.find(':') != std::string::npos ? "[" + u->host + "]" : u->host) + ":" + std::to_string(u->port ? u->port : u->scheme == "https" ? 443 : 80));
+    }
+    inference::remote::request rq;
+    rq.messages = {{"system", system}, {"user", prompt}};
+    rq.temperature = 0.0; rq.json = want_json;
+    rq.max_tokens = in.sh->ask_max_tokens;
+    if (rq.max_tokens <= 0) if (const char* m = std::getenv("FORGE_ASK_MAX_TOKENS")) rq.max_tokens = std::atoi(m);
+    if (rq.max_tokens <= 0) rq.max_tokens = 256;
+    auto r = inference::remote::complete(*cfg, rq);
+    if (!r.ok()) in.raise("AIError", "ai " + cfg->name + ": " + r.error);
+    return r.text;
 }
 // Strip ``` fences / surrounding blank lines a model may add anyway.
 std::string clean_code(std::string s) {

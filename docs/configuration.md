@@ -150,9 +150,23 @@ Read by `rpc:host:port` devices and `forge::remote` (see [rpc.md](rpc.md)).
 | `FORGE_SHELL` | Shell used by `forge::host_shell()` and `forge script --emit auto` |
 | `FORGE_ASK_MODEL` | `.fpk` that `forge::ask` and related calls run in-process (unless `--ask-model` is given) |
 | `FORGE_ASK_MAX_TOKENS` | Reply cap for those calls (default 256) |
-| `FORGE_AI_ENDPOINT` | OpenAI-compatible endpoint used when no in-process model is set, e.g. `http://127.0.0.1:8080` from `forge-serve` |
-| `FORGE_AI_MODEL` | `model` field sent to that endpoint (default `default`) |
-| `FORGE_AI_KEY` | Sent as `Authorization: Bearer <key>` to that endpoint |
+
+## Remote AI
+
+Read by `forge::inference::remote::config_from_env()` ([inference.md](inference.md#remote-models-remotehpp)); the script AI commands use it when no in-process model is set.
+
+| Variable | Effect |
+|----------|--------|
+| `FORGE_AI_PROVIDER` | `openai`, `forge-serve`, `llamacpp`, `vllm`, `ollama`, `lmstudio`, `openrouter`, `anthropic` (`claude`) or `command` (`cmd`). Default: an OpenAI-compatible server when only a URL is set, `command` when only `FORGE_AI_CMD` is set |
+| `FORGE_AI_URL` | Base URL of the server, e.g. `http://127.0.0.1:8080/v1` from `forge-serve` (default: the provider's) |
+| `FORGE_AI_ENDPOINT` | Older name of `FORGE_AI_URL` (used when `FORGE_AI_URL` is unset) |
+| `FORGE_AI_MODEL` | `model` sent to the server (default `default`; `claude-opus-5-5` for `anthropic`) |
+| `FORGE_AI_KEY_ENV` | The **name** of the variable that holds the API key (default `OPENAI_API_KEY`, `OPENROUTER_API_KEY` or `ANTHROPIC_API_KEY` for those providers, none for local servers; `none` sends no key). The key itself is never a FORGE setting |
+| `FORGE_AI_KEY` | Older form: the key itself, sent as `Authorization: Bearer` when `FORGE_AI_KEY_ENV` is unset |
+| `FORGE_AI_CMD` | Command line of the `command` provider (conversation on stdin, reply on stdout) |
+| `FORGE_AI_GRAMMAR` | `1` / `0`: send GBNF grammars to the server (default on for `forge-serve` and `llamacpp`) |
+| `FORGE_AI_TIMEOUT_MS` | Timeout of a whole request (default 180000) |
+| `FORGE_AI_FALLBACKS` | `0`: no server-side refusal fallbacks on `anthropic` (default on) |
 
 ## Logging and console
 
