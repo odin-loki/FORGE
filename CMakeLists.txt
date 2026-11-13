@@ -551,7 +551,16 @@ endforeach()
 if(UNIX AND NOT APPLE AND NOT ANDROID)
   string(APPEND _aot_cfg "ldflag=-pthread\n")
 endif()
-set(_aot_cfg_build "${_aot_cfg}lib=$<TARGET_FILE:forge_script_rt>\nstub=$<TARGET_FILE:forge-script-run>\n")
+# A sanitizer build's runtime library is instrumented, so the link of an AOT binary needs the sanitizer runtime
+# (without it every native-mode compile in the build tree failed with undefined __asan_* / __ubsan_* symbols and
+# test_script_aot could not pass in the linux-asan job). Build-tree configuration only.
+set(_aot_cfg_san "")
+if(FORGE_SANITIZE)
+  set(_aot_cfg_san "ldflag=-fsanitize=address,undefined\n")
+elseif(FORGE_TSAN)
+  set(_aot_cfg_san "ldflag=-fsanitize=thread\n")
+endif()
+set(_aot_cfg_build "${_aot_cfg}${_aot_cfg_san}lib=$<TARGET_FILE:forge_script_rt>\nstub=$<TARGET_FILE:forge-script-run>\n")
 foreach(_i IN LISTS FORGE_AOT_INCLUDE_DIRS)
   string(APPEND _aot_cfg_build "include=${_i}\n")
 endforeach()
