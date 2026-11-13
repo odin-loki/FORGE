@@ -1,4 +1,5 @@
 build/
+build-*/
 *.fpk
 __pycache__/
 bindings/android/local.properties
