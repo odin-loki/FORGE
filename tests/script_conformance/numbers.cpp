@@ -82,7 +82,7 @@ int main() {
     std::println("{:.6f} {:.6f} {:.6f}", std::sin(1.0), std::cos(1.0), std::tan(1.0));
     std::println("{:.6f} {:.6f} {:.6f}", std::exp(1.0), std::log(10.0), std::log10(1000.0));
     std::println("{:.6f} {:.6f}", std::atan2(1.0, 1.0), std::log2(8.0));
-    std::println("{} {}", std::hypot(3.0, 4.0), std::cbrt(27.0));
+    std::println("{} {}", std::hypot(3.0, 4.0), std::cbrt(8.0));   // not 27: glibc's cbrt(27.0) is 3.0000000000000004 at run time, 3 when g++ folds it
     std::println("{} {} {}", std::min(3, 7), std::max(3, 7), std::max(2.5, 1.5));
     std::println("{} {}", std::lround(2.5), std::lround(-2.5));
 

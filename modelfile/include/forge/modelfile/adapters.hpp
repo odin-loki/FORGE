@@ -106,7 +106,8 @@ inline void rewrite_tensors(const std::string& in, const std::string& out, const
             if (name == "data") data.assign(reinterpret_cast<const char*>(b.data()), b.size());
             else secs.emplace_back(name, std::string(reinterpret_cast<const char*>(b.data()), b.size()));
         }
-        for (auto& t : json::parse(r.section_text("tensors")).arr()) if (!drop.count(t["name"].str())) idx.push_back(t);
+        const auto tensors = json::parse(r.section_text("tensors"));   // named: GCC 14 does not extend a range-for temporary (P2718)
+        for (auto& t : tensors.arr()) if (!drop.count(t["name"].str())) idx.push_back(t);
         for (auto& t : add) if (r.tensors().count(t.name) && !drop.count(t.name)) raise(errc::invalid_argument, "{}: tensor {} already exists", in, t.name);
     }
     for (auto& t : add) {

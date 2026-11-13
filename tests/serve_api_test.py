@@ -435,9 +435,18 @@ finally:
 p, port = start(fpk, "--cors", "off", "--max-connections", "2")
 try:
     r = urllib.request.urlopen(f"http://127.0.0.1:{port}/health"); assert r.headers["Access-Control-Allow-Origin"] is None
-    # the connection limit: two idle connections fill it, the third is turned away with 503
-    held = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(2)]
-    for sk in held: sk.sendall(b"GET /health HTTP/1.1\r\n\r\n"); assert sk.recv(4096).startswith(b"HTTP/1.1 200")
+    r.read(); r.close()
+    # the connection limit: two idle connections fill it, the third is turned away with 503. The server may not
+    # have noticed the connection above close yet (it still counts against the limit), so retry until both fit.
+    for attempt in range(50):
+        held = [socket.create_connection(("127.0.0.1", port), timeout=10) for _ in range(2)]
+        replies = []
+        for sk in held: sk.sendall(b"GET /health HTTP/1.1\r\n\r\n"); replies.append(sk.recv(4096))
+        if all(x.startswith(b"HTTP/1.1 200") for x in replies): break
+        for sk in held: sk.close()
+        time.sleep(0.1)
+    else:
+        raise AssertionError(replies)
     assert raw_http(port, b"GET /health HTTP/1.1\r\n\r\n").startswith(b"HTTP/1.1 503 ")
     for sk in held: sk.close()
     for _ in range(100):

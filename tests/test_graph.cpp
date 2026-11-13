@@ -1009,22 +1009,22 @@ TEST(fusion_conv_bn_folds) {
     auto pw = g.weight("p", {4}, P.data.data());
     g.output("y", g.apply(ops::op::batch_norm, {cv, pw, pw, pw, pw}));
     g.output("c", cv);
-    int bn = 0; for (auto& n : compile(g, nullptr, fusion_on())->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    int bn = 0; auto pl = compile(g, nullptr, fusion_on()); for (auto& n : pl->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
     CHECK(bn == 1);
     tensor_graph g2; auto x2 = g2.input("x", {3, 8, 8}); auto var_in = g2.input("var", {4});
     auto cv2 = g2.apply(ops::op::conv2d, {x2, g2.weight("W", W.shape, W.data.data()), g2.weight("B", B.shape, B.data.data())});
     auto pw2 = g2.weight("p", {4}, P.data.data());
     g2.output("y", g2.apply(ops::op::batch_norm, {cv2, pw2, pw2, pw2, var_in}));
-    bn = 0; for (auto& n : compile(g2, nullptr, fusion_on())->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    bn = 0; pl = compile(g2, nullptr, fusion_on()); for (auto& n : pl->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
     CHECK(bn == 1);
     forge_test::set_env("FORGE_FUSE_CONV_BN", "0");
     tensor_graph g3; auto x3 = g3.input("x", {3, 8, 8});
     auto cv3 = g3.apply(ops::op::conv2d, {x3, g3.weight("W", W.shape, W.data.data()), g3.weight("B", B.shape, B.data.data())});
     auto pw3 = g3.weight("p", {4}, P.data.data());
     g3.output("y", g3.apply(ops::op::batch_norm, {cv3, pw3, pw3, pw3, pw3}));
-    bn = 0; for (auto& n : compile(g3)->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    bn = 0; pl = compile(g3); for (auto& n : pl->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
     CHECK(bn == 1);
     forge_test::set_env("FORGE_FUSE_CONV_BN", nullptr);
-    bn = 0; for (auto& n : compile(g3)->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
+    bn = 0; pl = compile(g3); for (auto& n : pl->g.nodes()) bn += n.kind == node_kind::op && n.op == ops::op::batch_norm;
     CHECK(bn == 0);
 }

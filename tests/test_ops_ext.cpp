@@ -249,7 +249,8 @@ TEST(attention_bias_masks_softcap_window) {
         CHECK(std::fabs(self.data[std::size_t((i * hq + h) * dv + e)] - v.data[std::size_t((i * hk + h / 2) * dv + e)]) < 1e-6);
     // every key masked: zeros, not NaN
     tensor all({1}, -INFINITY);
-    for (float x : both(ops::op::attention_bias, {q, k, v, all}, {}, "all masked").data) CHECK(x == 0.f);
+    const tensor all_masked = both(ops::op::attention_bias, {q, k, v, all}, {}, "all masked");
+    for (float x : all_masked.data) CHECK(x == 0.f);
     // per-head [hq, s, t] bias against an explicit softmax
     auto bias = rnd({hq, s, t}, rng, -3.f, 3.f);
     auto y = both(ops::op::attention_bias, {q, k, v, bias}, {{"softcap", 2.5}, {"scale", 0.3}}, "full bias + softcap");

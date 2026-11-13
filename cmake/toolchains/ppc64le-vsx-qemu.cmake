@@ -7,4 +7,8 @@ set(FORGE_CROSS_CC powerpc64le-linux-gnu-gcc CACHE STRING "")
 set(FORGE_CROSS_CXX powerpc64le-linux-gnu-g++ CACHE STRING "")
 set(CMAKE_C_COMPILER ${FORGE_CROSS_CC})
 set(CMAKE_CXX_COMPILER ${FORGE_CROSS_CXX})
+# POWER8 baseline: Ubuntu 24.04's cross g++ defaults to -mcpu=power9, whose xsmaxcdp/xsmincdp qemu 8.2 gets wrong for
+# signed zeros (max(+0, -0) gives +0, hardware and C give -0), failing the bit-exact min/max/relu checks.
+set(CMAKE_C_FLAGS_INIT "-mcpu=power8")
+set(CMAKE_CXX_FLAGS_INIT "-mcpu=power8")
 set(CMAKE_CROSSCOMPILING_EMULATOR qemu-ppc64le;-cpu;power9)

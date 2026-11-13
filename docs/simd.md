@@ -293,7 +293,7 @@ The companion tables (Tier A, `seq`, int8) and `vec_types.hpp`, per ISA (2026-11
 | ppc64le `vsx` | zig 0.17 | `qemu-ppc64le -cpu power9` | 3/3 | 14/14 | 0 failed |
 | s390x `vxe` (big-endian) | zig 0.17 | `qemu-s390x -cpu max` | 3/3 (the little-endian reference hash is not compared) | 14/14 | 0 failed |
 | mips64el `msa` | zig 0.17 | `qemu-mips64el -cpu Loongson-3A4000` | 3/3 | 14/14 | 0 failed after the MSA workarounds; baseline mips64 uses the portable arrays |
-| wasm32 `simd128` | zig 0.17 `wasm32-wasi`, `tests/wasm_simd.sh` | node 22 | 3/3 | 14/14, one test per process (node itself segfaults part-way when all 14 run in one process; each passes alone, also with `--liftoff-only`) | 0 failed |
+| wasm32 `simd128` | zig 0.17 `wasm32-wasi`, `tests/wasm_simd.sh` | node 22 | 3/3 | 14/14 (under `node --no-turbo-fast-api-calls`: node 22's WASI fd_write fast API call can start a GC once wasm memory is large, and node segfaults) | 0 failed |
 | 32-bit Arm `neon` (2026-11-13) | zig 0.17; g++ 13 | `qemu-arm -cpu cortex-a7` and `-cpu cortex-a15` | 3/3 each (`seq` and int8 bit-identical to scalar) | 14/14 each | 0 failed, and 0 of 13.5 million lane results differ from VFP arithmetic (`tests/simd_arm32_ieee.hpp`) |
 | 32-bit x86 | — | — | not built, not run | not built | not built |
 

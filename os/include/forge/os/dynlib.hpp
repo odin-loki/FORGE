@@ -3,7 +3,7 @@
 //
 //   auto m = os::dynlib::open("forge_plugin", {.search_dirs = {plugin_dir}});   // plugin_dir/libforge_plugin.so, then the system loader
 //   auto add = m->get<int (*)(int, int)>("add");                                 // nullptr when missing
-//   for (auto& s : m->symbols().value) std::printf("%s %p\n", s.name.c_str(), s.address);
+//   auto syms = m->symbols(); for (auto& s : syms.value) std::printf("%s %p\n", s.name.c_str(), s.address);
 //   auto syms = os::file_symbols("/usr/lib/x86_64-linux-gnu/libm.so.6");          // without loading it
 //
 // Built on os::library (os.hpp), which stays the plain open/symbol/close wrapper; dynlib::adopt() wraps an existing one.

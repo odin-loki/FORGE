@@ -359,7 +359,7 @@ template <Target Tg> void check_float_interop(ctx& c) {
     // int32 <-> float, bitcasts
     for (int rep = 0; rep < 4000; ++rep) {
         float f[N], of[N]; std::int32_t i32[N], oi[N];
-        for (int i = 0; i < N; ++i) { i32[i] = std::int32_t(r.next() >> (rep % 3 ? 33 : 44)) - (rep % 2 ? 1000 : 0); f[i] = float(double(std::int64_t(r.next() >> 20)) / 4096.0 - 1e6) * (rep % 7 ? 1.f : 1e-3f); }
+        for (int i = 0; i < N; ++i) { i32[i] = std::int32_t(r.next() >> (rep % 3 ? 33 : 44)) - (rep % 2 ? 1000 : 0); f[i] = float(double(std::int64_t(r.next() >> 23)) / 4096.0 - 1e6)   /* < 2^29: to_int stays in int32 range */ * (rep % 7 ? 1.f : 1e-3f); }
         store(oi, to_int(forge::simd::load<Tg>(f))); forge::simd::store(of, to_float(VI::load(i32)));
         for (int i = 0; i < N; ++i) { ++c.checks; if (oi[i] != std::int32_t(f[i]) || !same(of[i], float(i32[i]))) c.fail("to_int / to_float", "f32", rep); }
         std::uint32_t ob[N]; store(ob, bitcast<std::uint32_t>(forge::simd::load<Tg>(f)));

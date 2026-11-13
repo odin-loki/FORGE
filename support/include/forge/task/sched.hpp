@@ -253,7 +253,7 @@ public:
         mixed_ = p && e;
         for (unsigned i = 0; i < n; ++i) workers_.push_back(std::make_unique<worker>());
         for (unsigned i = 0; i < n; ++i) {   // victims: same node first
-            for (unsigned j = 0; j < n; ++j) if (j != i) (slots_[j].node == slots_[i].node ? workers_[i]->near : workers_[i]->far).push_back(j);
+            for (unsigned j = 0; j < n; ++j) if (j != i) (slots_[j].node == slots_[i].node ? workers_[i]->near_ws : workers_[i]->far_ws).push_back(j);
             workers_[i]->rng = 0x9E3779B97F4A7C15ull * (i + 1);
         }
         for (unsigned i = 0; i < n; ++i) workers_[i]->th = std::thread([this, i, nodes] { loop_(i, nodes); });
@@ -365,7 +365,7 @@ private:
     using node = detail::node;
     struct worker {
         detail::ws_deque<node> dq[2][3];   // [0 = any, 1 = performance-only][priority]
-        std::vector<unsigned> near, far; std::uint64_t rng = 1;
+        std::vector<unsigned> near_ws, far_ws; std::uint64_t rng = 1;   // not near/far: <windows.h> defines both as macros
         std::atomic<std::uint64_t> executed{0}, stolen{0}, parked{0};
         std::thread th;
     };
@@ -421,7 +421,7 @@ private:
                 return nullptr;
             };
             node* n = nullptr;
-            if (me) { n = sweep(me->near); if (!n) n = sweep(me->far); }
+            if (me) { n = sweep(me->near_ws); if (!n) n = sweep(me->far_ws); }
             else { for (std::size_t k = 0, m = workers_.size(); k < m && !n; ++k) { unsigned v = unsigned((k + r) % m); n = steal_from_(v, 1, up); if (!n) n = steal_from_(v, 0, up); } }
             if (n) { if (me) me->stolen.fetch_add(1, std::memory_order_relaxed); return n; }
         }

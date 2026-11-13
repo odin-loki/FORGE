@@ -142,7 +142,7 @@ TEST(numa) {
     std::thread t([&] { CHECK(os::bind_thread_to_node(ns[0].id)); int c = os::current_numa_node(); CHECK(c == -1 || c == int(ns[0].id)); }); t.join();
     CHECK(!os::bind_thread_to_node(9999));
     int cpu = os::current_cpu();   // numbered like cpu_topology (Windows: group * 64 + number)
-    if (cpu >= 0) { bool known = false; for (auto& c : os::cpu_topology_query().cpus) known |= int(c.id) == cpu; CHECK_MSG(known, "current_cpu %d not in the topology", cpu); }
+    if (cpu >= 0) { bool known = false; const auto topo = os::cpu_topology_query(); for (auto& c : topo.cpus) known |= int(c.id) == cpu; CHECK_MSG(known, "current_cpu %d not in the topology", cpu); }
 #if defined(__linux__) || defined(_WIN32) || defined(__FreeBSD__)
     CHECK(cpu >= 0);
 #endif

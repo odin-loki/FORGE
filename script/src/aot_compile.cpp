@@ -229,7 +229,7 @@ aot_result build_native(const aot::translated& tr, const std::string& out, const
             std::vector<std::string> stamped(cfg.libs); stamped.push_back(header);
             for (auto& f : stamped) {
                 std::error_code e5;
-                key_src += std::to_string(fs::file_size(f, e5)) + ":" + std::to_string(fs::last_write_time(f, e5).time_since_epoch().count()) + "\n";
+                key_src += std::to_string(fs::file_size(f, e5)) + ":" + std::to_string(static_cast<long long>(fs::last_write_time(f, e5).time_since_epoch().count())) + "\n";
             }
             const std::string key = hash::blake3::hex(hash::blake3::of(std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(key_src.data()), key_src.size()))).substr(0, 24);
             const fs::path dir = fs::path(pch_dir) / key;

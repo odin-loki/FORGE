@@ -855,7 +855,7 @@ TEST(fpk_chunked_encryption) {
         m["encryption"] = json::dump(json::value(ho));
         CHECK(rejected(m, "truncated, header adjusted"));
         json::array keep;   // drop the tensors that reached into the removed chunk, so every bounds check passes
-        for (auto& e : json::parse(A.at("tensors")).arr()) if (e["offset"].num() + e["bytes"].num() <= double(last)) keep.push_back(e);
+        const auto a_tensors = json::parse(A.at("tensors")); for (auto& e : a_tensors.arr()) if (e["offset"].num() + e["bytes"].num() <= double(last)) keep.push_back(e);
         CHECK(!keep.empty() && keep.size() < json::parse(A.at("tensors")).arr().size());
         m["tensors"] = json::dump(json::value(keep));
         CHECK(rejected(m, "truncated, header and index adjusted"));
