@@ -22,7 +22,28 @@ inline int pipe_cloexec(int fd[2]) noexcept {
     return ::pipe2(fd, O_CLOEXEC);
 #endif
 }
+// write() to a pipe or FIFO whose reader may be gone: EPIPE, not a SIGPIPE that kills the process. SIGPIPE is
+// blocked in this thread for the call and a SIGPIPE it raised is taken back; macOS has no sigtimedwait, so there
+// the descriptor is set F_SETNOSIGPIPE instead.
+inline ssize_t write_no_sigpipe(int fd, const void* p, std::size_t n) {
+#if defined(__APPLE__)
+    (void)::fcntl(fd, F_SETNOSIGPIPE, 1);
+    return ::write(fd, p, n);
+#else
+    sigset_t pipe_only, old, pending;
+    sigemptyset(&pipe_only); sigaddset(&pipe_only, SIGPIPE);
+    sigemptyset(&pending); (void)sigpending(&pending);
+    const bool already = sigismember(&pending, SIGPIPE) == 1;   // someone else's: leave it pending
+    pthread_sigmask(SIG_BLOCK, &pipe_only, &old);
+    const ssize_t r = ::write(fd, p, n); const int e = errno;
+    if (r < 0 && e == EPIPE && !already) { const timespec zero{0, 0}; while (sigtimedwait(&pipe_only, nullptr, &zero) < 0 && errno == EINTR) {} }
+    pthread_sigmask(SIG_SETMASK, &old, nullptr);
+    errno = e; return r;
+#endif
 }
+}
+#endif
+#if defined(FORGE_OS_POSIX)
 class pipe_end {
 public:
     pipe_end() = default;
@@ -36,7 +57,7 @@ public:
     explicit operator bool() const { return fd_ >= 0; }
     status write_all(std::string_view s) {
         std::size_t off = 0;
-        while (off < s.size()) { auto n = ::write(fd_, s.data() + off, s.size() - off); if (n < 0) { if (errno == EINTR) continue; return {{}, last_error("write")}; } off += std::size_t(n); }
+        while (off < s.size()) { auto n = detail::write_no_sigpipe(fd_, s.data() + off, s.size() - off); if (n < 0) { if (errno == EINTR) continue; return {{}, last_error("write")}; } off += std::size_t(n); }
         return {};
     }
     // Read what is available within timeout_ms (0 = block until data or EOF). Empty = EOF or timeout.

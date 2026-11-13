@@ -2077,7 +2077,13 @@ if(FORGE_BUILD_TESTS)
       target_link_libraries(fuzz_${ft} PRIVATE forge_rpc_tls)
     endif()
     if(NOT FORGE_LIBFUZZER)
-      add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${FORGE_FUZZ_ITERS} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
+      set(_fz_iters ${FORGE_FUZZ_ITERS})
+      if(ft STREQUAL "rpc" AND APPLE)
+        # one loopback connection per input is far slower on the macOS runners (test_rpc 78 s there, 1 s on Linux;
+        # cause not found yet): 4000 inputs ran past the 600 s limit, so fewer here
+        math(EXPR _fz_iters "${FORGE_FUZZ_ITERS} / 8")
+      endif()
+      add_test(NAME fuzz_${ft} COMMAND fuzz_${ft} --iters ${_fz_iters} ${PROJECT_SOURCE_DIR}/fuzz/corpus/${ft}
                WORKING_DIRECTORY ${PROJECT_BINARY_DIR})
       set_tests_properties(fuzz_${ft} PROPERTIES TIMEOUT 600 LABELS fuzz)
     endif()

@@ -12,6 +12,7 @@
 #include <cstdint>
 
 using namespace forge;
+TEST_PROCESS_WORKER(script::run_process_worker_if_requested);   // ProcessPool workers re-run this program on Windows (mem_limit_children)
 
 namespace {
 struct Out { std::string text; script::result r; };

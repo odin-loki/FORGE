@@ -120,7 +120,7 @@ inline std::optional<std::string> canonical_within(std::string_view path, const 
         sfs::path head = a, tail;
         while (!head.empty() && !sfs::exists(head, ec)) {
             if (head == head.root_path()) break;
-            tail = head.filename() / tail; head = head.parent_path();
+            tail = tail.empty() ? head.filename() : head.filename() / tail; head = head.parent_path();
         }
         if (sfs::exists(head, ec)) {
             HANDLE h = CreateFileW(head.wstring().c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
@@ -133,7 +133,7 @@ inline std::optional<std::string> canonical_within(std::string_view path, const 
             buf.resize(n);
             if (buf.rfind(L"\\\\?\\UNC\\", 0) == 0) buf = L"\\\\" + buf.substr(8);          // \\?\UNC\server\share -> \\server\share
             else if (buf.rfind(L"\\\\?\\", 0) == 0) buf = buf.substr(4);                       // \\?\C:\... -> C:\...
-            a = (sfs::path(buf) / tail).lexically_normal();
+            a = (tail.empty() ? sfs::path(buf) : sfs::path(buf) / tail).lexically_normal();   // `/ empty` would add a separator
             return a;
         }
 #endif
