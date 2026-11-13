@@ -69,7 +69,7 @@ found and tested. The other shells in the job's install list were not present in
 | Backend | Real hardware | Mock / software | CI (PR #53) |
 |---|---|---|---|
 | CPU | every platform above | — | all jobs |
-| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31, 2026-11-05) and native Windows 11, CUDA 13.2 driver (2026-11-04). None of the CUDA code of 2026-11-12/13 has run on it | mock driver (`test_gpu_*cuda_mock`, `golden_*_cuda_mock`; defined only when configure finds a clang with the NVPTX backend) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
+| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31, 2026-11-05) and native Windows 11, CUDA 13.2 driver (2026-11-04). None of the CUDA code of 2026-11-12/13 has run on it | mock driver (`test_gpu_*cuda_mock`, `golden_*_cuda_mock`; they skip when configure found no clang with the NVPTX backend) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
 | HIP | **never** | mock driver | mocks pass on Linux |
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
@@ -201,9 +201,8 @@ Integration branch `ccr-54bb5525-7f3iii` at c452a61: about 27 feature branches m
 - **One integration bug found at the very end**, fixed in c452a61: the CUDA test mock sized captured kernel
   arguments from a hand table that did not know the generated conv / pool / norm / `attention_bias` kernels, so a
   graph replay launched them with truncated pointers (crash in `test_gpu_cuda_mock` and five `*_cuda_mock` goldens).
-  The generated trampoline table now carries each kernel's pointer-argument mask. Those mock tests only exist when
-  configure finds a clang with the NVPTX backend; with none they are not defined, which is how the defect stayed
-  hidden in builds without one.
+  The generated trampoline table now carries each kernel's pointer-argument mask. Those mock tests only run when
+  configure found a clang with the NVPTX backend; with none they skip.
 - **Written from memory and never diffed against the source** (so a test passing does not show agreement with the
   original): the AutoAWQ / AutoGPTQ packing layouts (verified only against a self-written packer); the llama.cpp
   pre-tokenizer regex table and `ignore_merges` list; the vendor chat-template texts in `tests/data/chat_template`;

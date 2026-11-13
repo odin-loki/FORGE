@@ -36,7 +36,7 @@ phrases can remain; `scripting.md`, `security*.md`, `os.md`, `os-audit.md`, `mob
 | building.md: Android "needs NDK r26 or newer" | Configure refuses clang older than 19; r27c is clang 18 | States the conflict; no CMake NDK build of this tree has been run |
 | testing.md: `linux-vulkan` runs "the two Vulkan goldens" | The Vulkan golden list grew to thirteen | Corrected |
 | testing.md: "`test_rpc_tls` skips on Windows CI (its `openssl` probe redirects to `/dev/null`)" | The probe no longer redirects; the fixed form has not run on Windows | Corrected |
-| testing.md: mock and compile-check rows | Missing the determinism, kernel-cache, select, stale and `metal_host_syntax` tests; did not say the CUDA / HIP mocks need a clang with NVPTX / AMDGPU | Added |
+| testing.md: mock and compile-check rows | Missing the determinism, kernel-cache, select, stale and `metal_host_syntax` tests; did not say the CUDA / HIP mock tests skip without a clang that has the NVPTX / AMDGPU backends | Added |
 | testing.md CI table read as results | The workflow has not run in this form | A sentence before the table |
 | capi.md: "other compilers see ABI 4 for the first time in CI" | Reads as if CI had run | "no other compiler has built ABI 4" with the date |
 | os-wrapper.md: "All of these passed in CI ... on 2026-11-04" under a table that includes the wave 4 tests | Seven of the listed tests were added on 2026-11-12 | Split by date |

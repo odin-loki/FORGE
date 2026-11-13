@@ -41,10 +41,10 @@ ctest --test-dir build/dev -j4 -LE "slow|emu"
 ctest --test-dir build/dev -L slow        # not run on the final tree
 ```
 
-Python packages the run had: numpy, safetensors, onnx, cryptography, gguf, tokenizers, sentencepiece (STATUS
-2026-11-12). Without torch and transformers 5 `golden_tiny_qwen3_5` skips its reference check. The CUDA / HIP mock
-tests (`test_gpu_*_cuda_mock`, `golden_*_cuda_mock`, ...) are only defined when configure finds a clang with the
-NVPTX / AMDGPU backends; with none they are absent from the count.
+Python packages the 2026-11-12 run had: numpy, safetensors, onnx, cryptography, gguf, tokenizers, sentencepiece
+(STATUS); the package set of the final run is not recorded separately. The CUDA / HIP mock tests
+(`test_gpu_*_cuda_mock`, `golden_*_cuda_mock`, ...) only run when configure found a clang with the NVPTX / AMDGPU
+backends (the kernel images are built with it); with none they skip.
 
 ## 2. Platforms and compilers
 
@@ -57,8 +57,8 @@ lines added after it.
 | Linux x86_64, clang 23 | native, see section 1 | above |
 | Linux x86_64, GCC 14 | **never** compiled the final tree. g++ 13 compiled parts by hand: `-fsyntax-only` on the model-container headers, the `sse2` / `sse4.2` companion tables and three `vec_types` checks, script AOT output, cross builds of the simd tests (STATUS 2026-11-12) | `cmake --preset dev -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_C_COMPILER=gcc-14 && cmake --build --preset dev -j4 && ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200` |
 | Linux, clang 19 to 22 | configure accepts them with a note (zig cc, the NDK, FreeBSD base clang); none has built the whole tree. zig 0.17 (clang 22) built the simd tests and the OS cross-link checks only | — |
-| Windows, MSVC `cl.exe` | **never**. clang-cl 23 against the MSVC STL and Windows SDK 10.0.22621 compiled every os header and linked every `test_os*`, run under wine 9 (os-parity.md). Nothing outside the OS layer was compiled for the MSVC ABI since PR #53 | `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl -DCMAKE_C_COMPILER=cl -DFORGE_BUILD_EXAMPLES=OFF && cmake --build build -j4 && ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200`, then `set FORGE_TEST_ONLY=emit&& build\test_script.exe` |
-| Windows, MinGW on real Windows | **never** since PR #53. MinGW-w64 g++ 13 cross builds of the `test_os*` suites ran under wine 9; the rest of the new code was not built with MinGW (not recorded otherwise) | MSYS2 UCRT64: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF && cmake --build build -j4 && ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200` |
+| Windows, MSVC `cl.exe` | **never**. clang-cl 23 against the MSVC STL and Windows SDK 10.0.22621 compiled every os header and linked every `test_os*`, run under wine 9 (os-parity.md). Whether anything outside the OS layer was compiled for the MSVC ABI since PR #53 is not recorded | `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=cl -DCMAKE_C_COMPILER=cl -DFORGE_BUILD_EXAMPLES=OFF && cmake --build build -j4 && ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200`, then `set FORGE_TEST_ONLY=emit&& build\test_script.exe` |
+| Windows, MinGW on real Windows | **never** since PR #53. MinGW-w64 g++ 13 cross builds of the `test_os*` suites ran under wine 9; whether the rest of the new code was built with MinGW is not recorded | MSYS2 UCRT64: `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DFORGE_BUILD_EXAMPLES=OFF && cmake --build build -j4 && ctest --test-dir build -LE "slow|emu" -j2 --timeout 1200` |
 | Windows under wine | OS-layer tests of waves 3 and 4 only (`tests/wine_run.sh`); full-suite wine passes are from 2026-10-29/31 and predate this work | `tests/wine_run.sh` (see [building.md](building.md)) |
 | macOS, Apple clang | **never** compiled the final tree. zig 0.17 cross-compiled and linked the OS tests (`aarch64-macos`, `x86_64-macos`); nothing ran | `cmake --preset dev && cmake --build --preset dev -j4 && ctest --test-dir build/dev -LE "slow|emu" -j2 --timeout 1200` |
 | iOS | **never**: the iOS SDK has not compiled the wave 3 / 4 OS branches or anything else since PR #53; nothing has ever run on a device; the Swift package and XCTest have never run | the `ios` job of `.github/workflows/ci.yml` (Xcode device build of `forge_c`, `forge_mobile`, `forge_text`; five tests in the simulator through `.github/ios_sim_check.sh`) |
@@ -139,8 +139,8 @@ algorithm, not the PTX; the mocks report equal device priors, so only the 50 / 5
 
 The late fix in c452a61 belongs here: the CUDA mock sized captured kernel arguments from a hand table that did not
 know the generated conv / pool / norm / `attention_bias` kernels, so a graph replay truncated pointers
-(`test_gpu_cuda_mock` and five `*_cuda_mock` goldens crashed). It was found only on the final tree because those mock
-tests exist only when configure finds a clang with the NVPTX backend.
+(`test_gpu_cuda_mock` and five `*_cuda_mock` goldens crashed). It was found only at the very end. Those mock tests only
+run when configure found a clang with the NVPTX backend; with none they skip.
 
 Commands. The STATUS entries of the GPU work name tests, not a command list for the RTX 3090; these are the ctest
 names and tools they and [gpu.md](gpu.md) / [testing.md](testing.md) give:
@@ -148,9 +148,8 @@ names and tools they and [gpu.md](gpu.md) / [testing.md](testing.md) give:
 ```sh
 # CUDA on the RTX 3090 (WSL2 or Linux; clang with NVPTX at configure time)
 ctest --test-dir build/dev -L gpu                                   # real-device tests run instead of skipping
-ctest --test-dir build/dev -R "test_gpu_cuda|test_gpu_features_cuda" --output-on-failure
-./build/dev/test_cuda_hip cuda                                      # oracle + attention, quantised, state-op, MoE, nn_ops, prims checks
-./build/dev/test_cuda_hip determinism cuda && ./build/dev/test_cuda_hip memory cuda && ./build/dev/test_cuda_hip select cuda
+ctest --test-dir build/dev -R "^test_gpu_(features_)?cuda$" --output-on-failure
+./build/dev/test_cuda_hip cuda                                      # the same binary directly: prints each check
 FORGE_DEVICE=cuda ./build/dev/forge run model.fpk --prompt "Hello" -n 32      # compare ids with FORGE_GRAPHS=0 and with the CPU
 ./build/dev/test_cuda_hip bench q4_k 512 25600 5120                 # one quantised matmul, timed
 tools/bench_llm.sh --gguf model.gguf --device cuda -p 512 -n 128    # against llama-bench
@@ -166,8 +165,8 @@ ctest --test-dir build/dev -R vulkan --output-on-failure
 ctest --test-dir build/dev -R "gpu_compile_metal|test_gpu_metal" --output-on-failure
 ```
 
-Whether `test_cuda_hip determinism|memory|select <api>` are meant to run against a real driver is not recorded; they
-are registered in ctest only for the mocks.
+The determinism, memory, stale-plan, kernel-cache and device-selection checks (`test_cuda_hip determinism|memory|stale|cache|select <api>`)
+are registered in ctest only against the mocks; whether they can run against a real driver is not recorded.
 
 ## 5. Features
 
