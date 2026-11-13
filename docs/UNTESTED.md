@@ -187,7 +187,7 @@ any family has been imported or run** during this work. (Before it, Qwen3.5 9B a
 | Tokenizers (BPE, SentencePiece BPE, Unigram, WordPiece, WordLevel; the HF pipeline) | `tokenizer.json`, `tokenizer.model`, `vocab.txt`, GGUF | `test_tokenizer` against `tokenizers` 0.23 and `sentencepiece` 0.2 on small trained fixtures; text → ids → output in four family goldens | the tokenizer of any full-size published model; llama.cpp's per-token `lstrip` / `rstrip` attributes are not carried over | `forge run m.fpk --prompt "..." --ids` against `AutoTokenizer` ids |
 | Chat templates (Jinja subset) | `forge run --chat`, forge-serve | `test_chat_template` against jinja2 3.1 for 13 template families; `chat_template_http` | the vendors' actual template files (section 8) | render a real `tokenizer_config.json` template and diff with transformers |
 | ONNX importer | CNN, shape, reduction and movement operators; external data | `onnx_import`: 78 outputs of 10 graphs against the ONNX reference evaluator and onnxruntime 1.29 | any published ONNX model; convolution family only at batch 1 | `forge run model.onnx --input name=file.f32` against onnxruntime |
-| Unicode conformance | `forge_text` | passed 100 % on 8 suites before this work (STATUS 2026-10-29) | `test_text_conformance` skipped on the final tree (files not downloaded) | configure with the UCD files fetched (`cmake/fetch_ucd.cmake`), `ctest -R test_text_conformance` |
+| Unicode conformance | `forge_text` | passed 100 % on 8 suites before this work (STATUS 2026-10-29) | `test_text_conformance` skipped on the final tree (files not downloaded) | configure with `-DFORGE_FETCH_UCD=ON` (downloads the files), then `ctest --test-dir build/dev -R test_text_conformance` |
 
 ### Model container
 
