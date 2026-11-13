@@ -257,9 +257,12 @@ def main():
     ok = ok and f"shards    {nt} content-addressed blobs" in info and f"{nt} present, 0 missing" in info and "verify    ok" in info
     run([a.forge, "run", sh, "--tokens", ",".join(map(str, prompt)), "-n", "1", "--ids", "--logits", ls])
     ok = ok and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32))
-    run([a.forge, "aot", sh]); run([a.forge, "blueprint", sh, "--to", "binary"]); run([a.forge, "aot", sh])
+    cpu = os.environ.get("FORGE_DEVICE", "cpu") in ("", "cpu")   # plans are precompiled for the CPU only
+    if cpu: run([a.forge, "aot", sh])
+    run([a.forge, "blueprint", sh, "--to", "binary"])
+    if cpu: run([a.forge, "aot", sh])
     r3 = subprocess.run(os.environ.get("FORGE_RUNNER", "").split() + [a.forge, "run", sh, "--tokens", ",".join(map(str, prompt)), "-n", "3", "--ids", "--logits", ls], capture_output=True, text=True, errors="replace")
-    ok = ok and r3.returncode == 0 and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32)) and "precompiled" in r3.stdout + r3.stderr
+    ok = ok and r3.returncode == 0 and np.array_equal(np.fromfile(ls, dtype=np.float32), np.fromfile(lb, dtype=np.float32)) and (not cpu or "precompiled" in r3.stdout + r3.stderr)
     jn = os.path.join(a.work, "tiny_joined.fpk"); run([a.forge, "shard", "join", sh, "-o", jn])
     bi = {t["name"]: t["blake3"] for t in json.loads(sections_of(base)["tensors"])}
     ok = ok and {t["name"]: t["blake3"] for t in json.loads(sections_of(jn)["tensors"])} == bi and "verify    ok" in run([a.forge, "inspect", jn, "--verify"])

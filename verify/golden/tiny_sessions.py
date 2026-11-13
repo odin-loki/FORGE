@@ -94,6 +94,7 @@ def sample(W, x, cfg, label, ulabel, steps=None, guidance=None):
 
 def main():
     a = gu.args(); fails = 0
+    os.makedirs(a.work, exist_ok=True)
     rng = np.random.default_rng(2024)
     W = {"w1": rng.normal(0, 0.4, (16, 8)), "wt": rng.normal(0, 0.4, 16), "wc": rng.normal(0, 0.4, (16, 4)), "b1": rng.normal(0, 0.2, 16),
          "w2": rng.normal(0, 0.4, (8, 16)), "b2": rng.normal(0, 0.2, 8), "emb": rng.normal(0, 1.0, (5, 4))}
