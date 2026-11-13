@@ -202,7 +202,7 @@ forge_close(m);
 ```
 
 ## Platform notes and limits
-- Built and run with clang 23 on Linux x86_64 only (`capi_smoke`, `doc_example_capi_generate`, `python_bindings`). The header is plain C99; other compilers see ABI 4 for the first time in CI.
+- Built and run with clang 23 on Linux x86_64 only (`capi_smoke`, `doc_example_capi_generate`, `python_bindings`). The header is plain C99; no other compiler has built ABI 4 (no CI run has happened since it was added, as of 2026-11-13).
 - Cross builds (`CMAKE_CROSSCOMPILING`) do not build `capi_smoke` or this example; the ctests also need `FORGE_BUILD_APPS` (they use the golden models).
 - C consumers link with the C++ driver (`LINKER_LANGUAGE CXX`) because the library needs the C++ runtime.
 - Not in the C ABI: log-probabilities, tool-call grammars and parsing (forge-serve has them, [serve.md](serve.md)), speculative lookup decoding, diffusion and streaming sessions, vision / audio embedding inputs, unloading an adapter, a background batch worker.

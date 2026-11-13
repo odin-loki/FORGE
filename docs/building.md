@@ -8,7 +8,7 @@
 
 ## Requirements
 - CMake **3.25+**. The presets use Ninja; `ios` uses Xcode.
-- A **C++23** compiler and a C compiler. CI builds with g++-14, clang-23 (apt.llvm.org), AppleClang (macos-latest), MSVC (windows-latest), MinGW-w64 GCC (MSYS2 UCRT64) and FreeBSD 14.3's base clang. Clang 18 and older are refused at configure time; clang 19 to 22 (zig cc, the NDK, FreeBSD's base clang) configure with a note that 23 is the tested version. libc++ older than 20 gets `-fexperimental-library`.
+- A **C++23** compiler and a C compiler. **clang 23 is the project compiler and, as of 2026-11-13, the only one that has built the current tree** (Linux x86_64). The CI workflow builds with g++-14, clang-23 (apt.llvm.org), AppleClang (macos-latest), MSVC (windows-latest), MinGW-w64 GCC (MSYS2 UCRT64) and FreeBSD 14.3's base clang, but has not run since PR #53 (2026-11-04), before the 2026-11-12/13 work; see [UNTESTED.md](UNTESTED.md#2-platforms-and-compilers). Clang 18 and older are refused at configure time; clang 19 to 22 (zig cc, the NDK, FreeBSD's base clang) configure with a note that 23 is the tested version. libc++ older than 20 gets `-fexperimental-library`.
 - **Python 3** at configure time (required).
 - Optional, each enabling more:
 
@@ -22,6 +22,7 @@
 | `nvcuvid.h` (NVIDIA Video Codec SDK) | NVDEC in `forge_video` (`FORGE_NVCUVID_INCLUDE`) |
 | Python `numpy`, `safetensors` | Golden-model tests and the tests that use the golden model |
 | Python `onnx`, `cryptography` | `onnx_import`, `modelfile_signing` |
+| Python `gguf`, `tokenizers`, `sentencepiece` | `golden_gguf_types` and the GGUF sub-checks; the tokenizer goldens of the family models |
 
 Without a CUDA/HIP clang the CUDA/HIP runtimes have no kernels; the tests that need them skip. OpenCL C and Metal source are always generated and compiled by the driver at run time. CUDA/HIP images are not built for Android or iOS.
 
@@ -165,21 +166,22 @@ cmake -S . -B build/android-x86_64 -G Ninja -DCMAKE_TOOLCHAIN_FILE=cmake/toolcha
 cmake --build build/android-x86_64 -j4
 ANDROID_HOME=/path/to/sdk tests/android_emulator.sh native build/android-x86_64
 ```
-- The toolchain defaults to `arm64-v8a`, API 26, and needs NDK r26 or newer.
+- The toolchain defaults to `arm64-v8a`, API 26. Its comment says NDK r26 or newer, but since 2026-11-12 configure refuses a clang older than 19, and NDK r27c, the one used for the compile checks in [os-parity.md](os-parity.md), ships clang 18: a CMake build needs an NDK whose clang is 19 or newer. No NDK build of the current tree through CMake has been run ([UNTESTED.md](UNTESTED.md#2-platforms-and-compilers)).
 - `tests/mobile_build.sh android <abi>` cross-builds and checks the JNI exports (ctest `mobile_android_<abi>`).
 - `android_emulator.sh native` pushes every `test_*`/`example_*` binary, the shared libraries, `libc++_shared.so` and the import templates, runs each with `FORGE_THREADS=2` and `FORGE_TEMPLATES` set, retries when adb drops, and exits 77 when no device is attached. `FORGE_TEST_TIMEOUT` sets the per-test limit (default 600 s). `android_emulator.sh apk` builds and installs the example APK without gradle.
 - The `android` CI job cross-builds arm64-v8a and x86_64, then on an API 34 x86_64 emulator runs the `--emit android` goldens with `/system/bin/sh` and the native `test_script` (`.github/android_check.sh`).
 
 ## qemu, SDE and cross-link checks
-- `cmake/toolchains/loongarch64-lasx-qemu.cmake`, `ppc64le-vsx-qemu.cmake`, `s390x-vxe-qemu.cmake` and `mips64el-msa-qemu.cmake` cross-build for those architectures and run tests under qemu-user (`-cpu la464`, `power9`, `max`, `Loongson-3A4000`); `lane_<table>` runs `test_simd` with each kernel table forced. Only `test_simd` has been built and run this way; commands and results are in [simd.md](simd.md), which also covers `tests/wasm_simd.sh` for `wasm32-wasi`.
+- `cmake/toolchains/loongarch64-lasx-qemu.cmake`, `ppc64le-vsx-qemu.cmake`, `s390x-vxe-qemu.cmake` and `mips64el-msa-qemu.cmake` cross-build for those architectures and run tests under qemu-user (`-cpu la464`, `power9`, `max`, `Loongson-3A4000`); `lane_<table>` runs `test_simd` with each kernel table forced, and `tables_*`, `tiera_*` and `types_*` run the companion-table and `vec_types.hpp` checks. Only those simd tests have been built and run this way; commands and results are in [simd.md](simd.md), which also covers `tests/wasm_simd.sh` for `wasm32-wasi`.
 - `cmake/toolchains/aarch64-sve-qemu.cmake` and `riscv64-rvv-qemu.cmake` cross-build and run ctest under qemu-user. Extra `lane_sve_vl<N>` / `lane_rvv_vl<N>` tests run `test_simd` at several vector lengths and check that the scalable table is active; `tile_sme_svl<N>` does the same for SME when the compiler supports it.
 - With `zig` on `PATH` (or `ZIG_PATH`), the `xos_*` tests (labels `cross;slow`) compile and link the OS-layer tests for x86_64-freebsd, aarch64-macos, x86_64-macos, x86_64-windows-gnu and aarch64-linux-musl, and compile the script emitter, mobile and text sources for most of those targets. They are compile/link checks only.
 - With Intel SDE (`sde64`, or `SDE_PATH`) and a compiler that supports AMX, `tile_amx_sde_{spr,gnr,icl}` run the AMX tile kernels under emulation (label `emu`).
 
 ## GPU hardware notes
-- CUDA has run on one real GPU: an RTX 3090 on Windows 11 with the CUDA 13.2 toolkit installed, using a mingw-w64 cross build of `test_cuda_hip`. Results are in [STATUS.md](STATUS.md).
-- HIP, OpenCL and Level Zero have only run against the mock drivers in `tests/`. Metal's `test_gpu_metal` passes on the GitHub macOS runner's GPU.
-- The CI runners have no `glslangValidator`, so Vulkan is compiled out in every CI job. Vulkan has run only on software devices, locally.
+- CUDA has run on one real GPU: an RTX 3090, under WSL2 and on Windows 11 with the CUDA 13.2 toolkit installed (there with a mingw-w64 cross build of `test_cuda_hip`). Results are in [STATUS.md](STATUS.md). None of the GPU code added on 2026-11-12/13 has run on it.
+- HIP, OpenCL and Level Zero have only run against the mock drivers in `tests/`. Metal's `test_gpu_metal` passed on the GitHub macOS runner's GPU at PR #53; the Metal ports added since have never been compiled by a Metal toolchain.
+- Only the `linux-vulkan` CI job installs `glslangValidator`; Vulkan is compiled out in every other job. Vulkan has run only on software devices (lavapipe, SwiftShader).
+- What to run on hardware: [UNTESTED.md](UNTESTED.md#4-gpu-backends).
 
 ## Building with zig as the compiler
 When no system compiler is available, `pip install ziglang` and point CMake at wrapper scripts that run `python -m ziglang c++ "$@"` / `cc "$@"` (`CC=... CXX=... cmake --preset dev`). The CUDA/HIP image build looks for a binary named `clang`, so with zig alone there are no CUDA/HIP images and the tests that need them skip.

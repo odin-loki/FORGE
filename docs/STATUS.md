@@ -1,22 +1,44 @@
 # FORGE test status
 
-What has been built and tested where. The platform and GPU tables are CI results as of 2026-11-04, main at ccc0a7d
-(PR #53), with later local results marked by their date. A large amount of code merged on 2026-11-12 has **not** been
-through CI: it was built and tested with clang 23 on one Linux x86_64 machine, and the other platforms saw it under
-emulators, wine, mock drivers or a cross compiler only. The first changelog entry below says, part by part, which.
+Current as of 2026-11-13, integration branch at c452a61. What has been built and tested where.
+
+- **The final tree was verified in one configuration only**: Linux x86_64 (4-core VM), clang 23.1.6, `dev` preset,
+  `ctest -LE "slow|emu"`: 247 tests, 237 passed, 10 skipped, 0 failed. Labels `slow` and `emu` were not run on it.
+- **No CI run has happened for the 2026-11-12/13 work** (about 191,000 lines since main at b135941). The CI results
+  in the tables below are from PR #53 (2026-11-04, main at ccc0a7d) and describe the tree before that work. GCC 14,
+  MSVC `cl.exe`, MinGW on real Windows, Apple clang (macOS, iOS), the Android NDK build in CI and FreeBSD have not
+  compiled the final tree.
+- The other platforms saw parts of the new code under emulators, wine, mock drivers or a cross compiler only. The
+  changelog entries say, part by part, which.
+- **What has not been tested, in one place, with the commands to test it: [UNTESTED.md](UNTESTED.md).**
+
 CI is `.github/workflows/ci.yml`; it runs on every pull request and every push to main. The workflow in the tree is
-newer than the last run: its emulation, wasm, cross-zig, perf, repro and fuzz jobs and the whole-suite sanitizer jobs
-have never run on GitHub, and it now uses clang 23 where the table below says Clang 18.
+newer than its last run: its emulation, wasm, cross-zig, perf, repro and fuzz jobs and the whole-suite sanitizer jobs
+have never run on GitHub, and `linux-clang` now uses clang 23 (clang 18 in the last run).
+The compiler baseline: clang 23 is the project compiler; configure refuses clang 18 and older; clang 19 to 22
+configure with a note (zig cc, the NDK, FreeBSD base clang).
 "Skip" means a test exited 77 because its device or tool was missing.
 
 ## Platforms
 
+### The final tree (local, 2026-11-13)
+
+| Platform | Built | Tested | How |
+|---|---|---|---|
+| Linux x86_64, clang 23.1.6 | locally, c452a61 | ctest `-LE "slow\|emu"`: 247 tests, 237 pass, 10 skip (`test_text_conformance`: Unicode files not downloaded; the nine real-device GPU tests: no device), 0 fail. Labels `slow`, `emu`: not run | 4-core VM, `cmake --preset dev` with `clang++-23` |
+
+### CI (last run PR #53, 2026-11-04) and local emulation
+
+The CI rows are results of the tree **before** the 2026-11-12/13 work; no CI job has built the tree since. The
+emulation rows are local and dated.
+
 | Platform | Built | Tested | How |
 |---|---|---|---|
 | Linux x86_64, GCC 14 | CI `linux-gcc` | ctest `-LE "slow\|emu"`: 111/111 pass (GPU device tests skip) | Ubuntu 24.04, `cmake --preset dev` |
-| Linux x86_64, Clang 18 | CI `linux-clang` | same, 111/111 | Ubuntu 24.04 |
-| Linux, ASan + UBSan | CI `linux-asan` | `test_script` only | Clang 18, `FORGE_SANITIZE=ON` |
-| Linux, TSan | CI `linux-tsan` | `test_script` only | Clang 18, `FORGE_TSAN=ON` |
+| Linux x86_64, Clang 18 | CI `linux-clang` | same, 111/111 | Ubuntu 24.04. The job now installs clang 23 from apt.llvm.org; that form has never run on GitHub |
+| Linux, ASan + UBSan | CI `linux-asan` | `test_script` only | Clang 18, `FORGE_SANITIZE=ON`. The job now runs the whole suite with clang 23: never run on GitHub |
+| Linux, TSan | CI `linux-tsan` | `test_script` only | Clang 18, `FORGE_TSAN=ON`. The job now runs 25 threaded suites with clang 23: never run on GitHub |
+| CI jobs `linux-fuzz`, `emu` (six rows), `wasm-simd`, `cross-zig`, `perf`, `repro` | never run on GitHub | — | added 2026-11-12; checked locally only for YAML syntax and that every ctest name, label and target they name exists |
 | Linux, Vulkan on lavapipe | CI `linux-vulkan` | `test_vulkan`, `test_vulkan_align256`, `golden_tiny_llama_vulkan`, `golden_moe_mla_vulkan` (added 2026-11-05; first CI run pending) | GCC 14, Ubuntu `glslang-tools` + `libvulkan-dev` + `mesa-vulkan-drivers`; loader pinned to the lavapipe ICD |
 | macOS | CI `macos` | ctest 111/111, including `test_gpu_metal` | `macos-latest` runner, Xcode toolchain |
 | iOS | CI `ios` | `test_os`, `test_text`, `test_locale`, `test_mobile`, `test_util` in an arm64 iPhone simulator via `xcrun simctl spawn` (added 2026-11-05; first CI run pending) | `forge_c`, `forge_mobile`, `forge_text` built with Xcode for device, signing off; tests built with Ninja for the simulator (`FORGE_IOS_SIMULATOR=ON`, arm64) |
@@ -44,15 +66,19 @@ found and tested. The other shells in the job's install list were not present in
 
 ## GPU backends
 
-| Backend | Real hardware | Mock / software | CI |
+| Backend | Real hardware | Mock / software | CI (PR #53) |
 |---|---|---|---|
 | CPU | every platform above | — | all jobs |
-| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31, 2026-11-05) and native Windows 11, CUDA 13.2 driver (2026-11-04) | mock driver (`test_gpu_*cuda_mock`) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
+| CUDA | NVIDIA GeForce RTX 3090: WSL2 (2026-10-31, 2026-11-05) and native Windows 11, CUDA 13.2 driver (2026-11-04). None of the CUDA code of 2026-11-12/13 has run on it | mock driver (`test_gpu_*cuda_mock`, `golden_*_cuda_mock`; they skip when configure found no clang with the NVPTX backend) | mocks pass on `linux-gcc`/`linux-clang`; skip on macOS and Windows |
 | HIP | **never** | mock driver | mocks pass on Linux |
 | OpenCL | **never** | mock driver runs the generated OpenCL C as C | mocks pass on Linux |
 | Level Zero | **never** | mock driver | mocks pass on Linux and `windows-msvc` |
-| Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering) | MSL host syntax check | `macos` |
+| Metal | GitHub `macos-latest` runner's Metal device: `test_gpu_metal` passes (oracle check of every `metal.*` lowering; PR #53). The Metal ports of 2026-11-12 have **never** been compiled by a Metal toolchain or executed | syntax checks on Linux: the MSL as C++, `metal.mm` against stub declarations | `macos` |
 | Vulkan | **never** on a GPU | Mesa lavapipe (local 2026-11-05: `test_vulkan` 33 kernels, 0 failures, both Vulkan goldens pass on llvmpipe; local 2026-11-12: 36 spec kernels, the 11 ported kernels and 13 Vulkan goldens, see the changelog); SwiftShader in the Android emulator (local, not since 2026-11-05) | `linux-vulkan` on lavapipe; compiled out in every other job |
+
+No GPU was available during the 2026-11-12/13 work: everything GPU-related in it is mock-verified (CUDA, HIP, OpenCL,
+Level Zero), lavapipe-verified (Vulkan) or syntax-checked only (Metal). Detail and the commands to run on hardware:
+[UNTESTED.md](UNTESTED.md#4-gpu-backends).
 
 `test_gpu_metal` passing means the runtime opened a device and all checks passed; the device name is not in the
 CI log because ctest only prints output on failure.
@@ -91,25 +117,111 @@ Greedy output is identical with CUDA graphs on and off.
 
 ## Known gaps
 
-- iOS: CI runs five test executables in the simulator only; never run on a device. The Swift package and XCTest have
-  not been run.
-- Android: never run on a physical device. CI runs `test_script` and eight other suites on the x86_64 emulator; the
-  rest of the suite (`test_inference` and other heavy tests) is not run there.
-- HIP, OpenCL and Level Zero have never run on real hardware. Vulkan has never run on a real GPU.
-- CUDA: one GPU model (RTX 3090). No multi-GPU or peer-copy test on hardware.
-- Vulkan is built and tested in CI only on lavapipe (`linux-vulkan`); every other job compiles it out.
+The full list, with commands, is [UNTESTED.md](UNTESTED.md). The headline items:
+
+- **No CI run and no second compiler for the 2026-11-12/13 work.** One machine, one compiler (Linux x86_64,
+  clang 23). GCC 14, MSVC, MinGW on Windows, Apple clang, the NDK in CI and FreeBSD have not compiled the final tree.
+- **No sanitizer run on the final tree.** The hardening pass was cut short; the code of the second round of merges
+  (forge-serve chat features and C ABI 4, simd companion tables and `vec_types.hpp`, fusion, the Vulkan / Metal ports
+  and RPC protocol 2, model-container sections and session kinds) has not been through ASan / UBSan, TSan or
+  libFuzzer as a whole. See the 2026-11-13 entry.
+- **No published model.** Every importer, tokenizer, chat template and model family is tested on tiny random-weight
+  models; several tables were written from memory and never diffed against their sources
+  ([UNTESTED.md](UNTESTED.md#8-written-from-memory-never-diffed-against-the-source)).
+- **No GPU for the new GPU code.** HIP, OpenCL and Level Zero have never run on real hardware; Vulkan never on a real
+  GPU (lavapipe only; CI builds it only in `linux-vulkan`); the Metal ports have never been compiled by a Metal
+  toolchain; the CUDA additions have not run on the RTX 3090. CUDA: one GPU model, no multi-GPU or peer-copy test on
+  hardware, no graphics-interop import.
+- **Kotlin and Swift bindings (ABI 4): never compiled.**
+- iOS: the last CI run only built the library; the simulator tests added 2026-11-05 have not had a CI run; never
+  run on a device. The Swift package and XCTest have not been run. The wave 3 / 4 OS branches have not been compiled by the iOS SDK.
+- Android: never run on a physical device. The new code was compiled with NDK r27c for the OS layer and never run.
+- macOS, FreeBSD: OS-layer waves 1 to 4 cross-compiled with zig, never run. Windows: waves 3 and 4 under wine only.
+- Non-x86 CPUs: emulation only (qemu-user, node); most architectures ran the simd tests only.
 - `test_rpc_tls` on Windows CI: the `openssl` CLI probe no longer uses a shell redirect, but it has not yet run there.
 - AMX/SME: AMX ran natively and under Intel SDE; SME only under qemu.
-- GPU memory: no eviction while a CUDA/HIP stream capture or an OpenCL/Level Zero graph recording is open;
-  graphs recorded before an eviction must not be replayed after it.
+- GPU memory: no eviction while a CUDA/HIP stream capture is open. Graphs recorded before an eviction are re-recorded
+  at launch (2026-11-12, mock-verified only); a stale CUDA/HIP capture that holds an evicted encoded weight or a
+  macro-stamped kernel throws instead ([gpu.md](gpu.md#eviction-and-recorded-graphs)).
 - RPC: revocation is by CRL file and fingerprint list (no OCSP, no CRL fetching); device ops have no per-model scope. The finer permissions, SAN rules and revocation (`test_rpc`, `test_rpc_tls`) have run on Linux x86-64 with OpenSSL 3.0 only.
-- Not tested anywhere: hybrid P/E cores, multi-node NUMA, batteries and thermal sensors, running under
-  systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox decode, CUDA graphics interop.
+- Not tested anywhere: hybrid P/E cores, multi-node NUMA, cgroup v2 limit groups on a v2 hierarchy, batteries and
+  thermal sensors, running under systemd or the Windows SCM, macOS kperf, VA-API/NVDEC/MediaCodec/VideoToolbox
+  decode, CUDA graphics interop.
+- Performance: everything timed in the 2026-11-12/13 work was timed on a loaded 4-core VM
+  ([UNTESTED.md](UNTESTED.md#7-performance)).
 - Security gaps: [security.md](security.md#known-gaps).
 
 ## Changelog of checks
 
 Newest first. Results are from the date given; later code may differ.
+
+### 2026-11-13 (final state of the integration branch; what was not run; owner decisions)
+Integration branch `ccr-54bb5525-7f3iii` at c452a61: about 27 feature branches merged over 2026-11-12/13, roughly
+191,000 lines added across about 1,030 files since main at b135941. This entry is the record of the final state; the
+2026-11-12 entries below are the per-topic records and were written before the last merges.
+
+- **Build and test.** Full build with clang 23.1.6 on Linux x86_64 (4-core VM). `ctest -LE "slow|emu"`: 247 tests,
+  237 passed, 10 skipped, 0 failed. Skipped: `test_text_conformance` (the Unicode conformance files are not
+  downloaded) and nine real-device GPU tests (`test_gpu_cuda`, `test_gpu_hip`, `test_gpu_features_cuda`,
+  `test_gpu_features_hip`, `test_gpu_metal`, `test_gpu_opencl`, `test_gpu_features_opencl`, `test_gpu_ze`,
+  `test_gpu_features_ze`: no device).
+- **Not run on the final tree.** Labels `slow` and `emu`. Any sanitizer build. Any libFuzzer build. Anything on a
+  GPU, on another CPU architecture, or on another operating system.
+- **No CI run has happened for any of this work.** GCC 14, MSVC `cl.exe`, MinGW on real Windows, Apple clang (macOS,
+  iOS), the Android NDK build in CI and FreeBSD have not compiled the final tree. The CI workflow gained many jobs
+  (emulation matrix, wasm, cross-zig, perf, repro, fuzz, whole-suite sanitizers) that have never executed on GitHub.
+- **Compiler baseline.** clang 23 is the project compiler. Configure refuses clang 18 and older; clang 19 to 22
+  configure with a note (zig cc, the NDK, FreeBSD base clang). Owner decision: this stays as it is.
+- **Hardening pass cut short.** The pass that was to run ASan / UBSan, TSan and libFuzzer over the newest code was
+  interrupted by machine restarts. Its eleven fix commits are merged:
+  - 0b50d40 script: the heap mutexes are taken around `fork()` (a forked ProcessPool worker could deadlock at start;
+    seen as `test_script` hanging in the whole-suite ASan run)
+  - 089a5c2 script: a container constructor that hits the heap cap left a dangling pointer in the cycle collector
+    (heap-use-after-free, found by ASan in `test_script_golden` / `test_script_security`)
+  - 97a391e script: references no longer copy or destroy the object; delegating and base constructors; typed members
+  - b4ec7e2 graph/codecs: f32 encode / decode of an empty tensor must not call `memcpy` with null pointers (UBSan,
+    through `fuzz_gguf` on its corpus)
+  - 86af32e gpu/cuda: the stream-K fix-up scratch and flag buffers are freed when the runtime is destroyed
+    (LeakSanitizer, through the CUDA mock)
+  - e5c73cc tests/mock_cuda: captured kernel arguments are copied by their own size; function handles interned
+    (stack-buffer-overflow and leaks in the 23 `*_cuda_mock` / `*_hip_mock` ctests under ASan)
+  - 18c559b `forge rpc-serve`: no address-space cap on the script child in ASan / TSan builds (`signing_cli` and
+    `security_cli` failed in the whole-suite ASan run)
+  - 1952e96 cmake: `python_bindings` is not registered in sanitizer builds
+  - a715424 tests: the script golden runners' 20 s whole-run timeout becomes 300 s (an ASan Debug build on a loaded
+    machine exceeded it)
+  - d540514 fuzz: a structure-aware seed generator for `fuzz_aot` (`fuzz/aot_seeds.py`)
+  - 4d01ea3 cmake: AOT binaries built in a sanitizer tree link the sanitizer runtime
+
+  Its planned full ASan / UBSan pass, its TSan pass and its libFuzzer campaigns over the second-round code (forge-serve
+  chat features and C ABI 4; the simd companion tables, `vec_types.hpp` and fusion; the Vulkan / Metal ports and RPC
+  protocol 2; the model-container sections and session kinds) **did not complete**, and it left no run table. Which
+  suites finished clean before the interruption is not recorded. Earlier sanitizer coverage is what the dated entries
+  below record; [UNTESTED.md](UNTESTED.md#6-sanitizers-and-fuzzing) lists it in one table.
+- **One integration bug found at the very end**, fixed in c452a61: the CUDA test mock sized captured kernel
+  arguments from a hand table that did not know the generated conv / pool / norm / `attention_bias` kernels, so a
+  graph replay launched them with truncated pointers (crash in `test_gpu_cuda_mock` and five `*_cuda_mock` goldens).
+  The generated trampoline table now carries each kernel's pointer-argument mask. Those mock tests only run when
+  configure found a clang with the NVPTX backend; with none they skip.
+- **Written from memory and never diffed against the source** (so a test passing does not show agreement with the
+  original): the AutoAWQ / AutoGPTQ packing layouts (verified only against a self-written packer); the llama.cpp
+  pre-tokenizer regex table and `ignore_merges` list; the vendor chat-template texts in `tests/data/chat_template`;
+  the GGUF tensor names and conventions for gemma / phi3 / bert / gpt2 and several Gemma specifics; the RoPE-scaling
+  reference (a transcription of transformers' `modeling_rope_utils.py`) and the GGUF YaRN attention-factor formula;
+  the per-family "leave-out" tensor lists. **No published checkpoint or tokenizer of any family has been imported or
+  run in this work**; all model tests use tiny random-weight models.
+- **Owner decisions (2026-11-13).**
+  1. The licence of the `riscv-non-isa/rvv-intrinsic-doc` prototype lists behind the RISC-V intrinsic databases stays
+     as recorded in [NOTICE](../NOTICE) ("not established"). It is not being pursued now and is no longer listed as
+     an open action item.
+  2. The seven grid-codebook GGUF types (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M) will not be supported:
+     FORGE is clean-room and the codebooks will not be copied. The importer keeps refusing them with an error that
+     names the type ([modelfile.md](modelfile.md#gguf-tensor-types)).
+  3. The 32-bit Arm NEON table is being fixed separately; see its own entry.
+  4. The clang floor stays as described above.
+- **Documentation.** [UNTESTED.md](UNTESTED.md) is the single list of what has not been tested, organised by
+  platform, CPU architecture, GPU backend and feature, with commands. README.md, TODO.md, docs/index.md and the
+  guides were brought in line with the final tree ([claims-audit.md](claims-audit.md), 2026-11-13).
 
 ### 2026-11-12 (model container, importer and session kinds: the plan-versus-code gaps of FORGE_PLAN Parts D and E)
 Same machine as below: Linux x86_64, **clang 23** (`-fsyntax-only` with g++ 13 on the new headers also passes). Nothing

@@ -3,6 +3,59 @@
 This is a record of past audits of documentation claims against the code. It is not a description of the
 current code. For current behaviour read the topic docs; for test results read [STATUS.md](STATUS.md).
 
+## 2026-11-13: documentation pass over the final integration tree (c452a61)
+
+About 27 branches were merged over 2026-11-12/13; several landed after the pass recorded below, and one (the
+hardening pass) was cut short. This pass added [UNTESTED.md](UNTESTED.md), a dated STATUS entry for the final state,
+and brought README.md, TODO.md, docs/index.md and the guides in line with the tree. Documentation only; nothing was
+built or re-run except the documentation checks (`docs_up_to_date`, `docs_links`, `ci_workflow_copies`, `sbom_spdx`).
+Method: README.md, TODO.md, STATUS.md, index.md and testing.md were read in full; of the other guides the
+"limits", "not verified" and "platform notes" sections were read, and all of docs/ was searched for the stale
+phrases listed under the table. No guide was re-read line by line, so a wrong sentence outside those sections and
+phrases can remain; `scripting.md`, `security*.md`, `os.md`, `os-audit.md`, `mobile.md`, `shells.md`,
+`loadbalancer.md`, `memory.md` and `configuration.md` were only searched. The 32-bit Arm lines of `simd.md`,
+`configuration.md` and `TODO.md` were left alone: they were being changed separately.
+
+| Claim found | Why it was wrong for the final tree | Now |
+|---|---|---|
+| README, STATUS header: "209 tests, 199 passed, 10 skipped" as the state of the tree | That was the count before the last merges | 247 tests, 237 passed, 10 skipped, 0 failed at c452a61, clang 23.1.6; `slow` and `emu` not run |
+| README status: two bullets presenting the PR #53 CI results first | CI has not run on any of the 2026-11-12/13 work; the older results describe another tree | One sentence on what was verified, one on what was not, link to UNTESTED.md; PR #53 is named as history |
+| README quick start: `cmake --preset dev` with "a C++23 compiler" | Only clang 23 has built the tree | The command names `clang++-23` / `clang-23` |
+| README "What is in the box" and program list | Missing: `denoise`, `stream`, `requant`, `adapter`, `blueprint`, `shard`; tool calling, API keys, TLS; session kinds; shards, chunked encryption, binary blueprint; the Vulkan / Metal ports; `vec<T>`; the security layer; `forge-script-run` | Listed, with how far the GPU ports were checked |
+| STATUS Platforms table: CI rows read as the state of the tree; "Clang 18" | CI rows are PR #53; the workflow now uses clang 23 and has never run in that form | A separate row for the final local result; CI rows labelled as the last run; the never-run jobs listed |
+| STATUS Known gaps: "graphs recorded before an eviction must not be replayed after it"; no eviction during an OpenCL / Level Zero recording | Buffer generations (2026-11-12): graphs are re-recorded; OpenCL / Level Zero evict during a recording | Rewritten; mock-verified only |
+| STATUS: no record of the hardening pass | Its fixes are merged, its full passes did not complete, it left no run table | 2026-11-13 entry lists the eleven fixes and says what did not run |
+| TODO "Licence and provenance": establish the `rvv-intrinsic-doc` licence, "must be done before a release"; RELEASING.md "only then ship those two files"; NOTICE "has to be confirmed ... before FORGE is distributed" | Owner decision 2026-11-13: not pursued now | The factual "not established" statement stays in NOTICE and the SBOM; the action wording is gone; TODO lists it under "Decided against" |
+| modelfile.md: the IQ grid GGUF types "not loadable" for want of tables, read as a gap | Owner decision 2026-11-13: will not be supported (clean-room; the codebooks will not be copied) | Documented as a deliberate non-goal; TODO "Decided against" |
+| TODO "Verification debt": seventeen items duplicating the guides, some overtaken (Vulkan / Metal ports "not done", sanitizers "see the STATUS entry") | Later branches landed after the list was written | A pointer to UNTESTED.md; open features kept with their guides; closed items listed as closed |
+| graph.md: "Metal has not been compiled" | The Metal backend is built and tested in the macOS CI job since PR #53; what has never been compiled is the 2026-11-12 ports | Says exactly that |
+| graph.md: pipelines "only been run with CPU and lavapipe stages" | `pipe:auto` ran on two devices of a mock driver | Added |
+| building.md: "CI builds with g++-14, clang-23, AppleClang, MSVC, MinGW, FreeBSD's clang" | True of the workflow file, but none of them except clang 23 has built the current tree | Says so |
+| building.md: "The CI runners have no `glslangValidator`, so Vulkan is compiled out in every CI job" | `linux-vulkan` installs it (since 2026-11-05) | Corrected |
+| building.md: "Only `test_simd` has been built and run" under the emulator toolchains | The companion-table and `vec_types.hpp` tests run there too | Corrected |
+| building.md: Android "needs NDK r26 or newer" | Configure refuses clang older than 19; r27c is clang 18 | States the conflict; no CMake NDK build of this tree has been run |
+| testing.md: `linux-vulkan` runs "the two Vulkan goldens" | The Vulkan golden list grew to thirteen | Corrected |
+| testing.md: "`test_rpc_tls` skips on Windows CI (its `openssl` probe redirects to `/dev/null`)" | The probe no longer redirects; the fixed form has not run on Windows | Corrected |
+| testing.md: mock and compile-check rows | Missing the determinism, kernel-cache, select, stale and `metal_host_syntax` tests; did not say the CUDA / HIP mock tests skip without a clang that has the NVPTX / AMDGPU backends | Added |
+| testing.md CI table read as results | The workflow has not run in this form | A sentence before the table |
+| capi.md: "other compilers see ABI 4 for the first time in CI" | Reads as if CI had run | "no other compiler has built ABI 4" with the date |
+| os-wrapper.md: "All of these passed in CI ... on 2026-11-04" under a table that includes the wave 4 tests | Seven of the listed tests were added on 2026-11-12 | Split by date |
+| inference.md: embeddings are "One sequence per call" | `session::embed_batch` takes several inputs (as a loop) | Corrected |
+| aot-models.md: "Not run: ... an ASan or UBSan build of the tests" | `test_aot` ran under ASan + UBSan on 2026-11-12 (STATUS) | Corrected; `test_aot_native` and `fuzz_aot` under a sanitizer are not recorded |
+| text-locale.md: `test_text` "pass in CI" | The regex additions of 2026-11-12 have not been through CI | Dated |
+| modelfile.md: lists two things as written from memory | The `ignore_merges` list, the GGUF conventions of gemma / phi3 / bert / gpt2, the YaRN attention-factor formula and the leave-out lists were too | Added, with a pointer to UNTESTED.md |
+| docs/index.md descriptions | Several predate the guides' new sections | Updated |
+
+Searched for and found nothing left to fix outside dated changelog entries: "clang-18" / "clang 18" as the current
+compiler, "ABI 3" as the current C ABI, "opset 1..", "62 ops" / "63 ops", "111/111" outside the PR #53 rows, "There
+is no chat template", "one handle owns both", "Tier P is f32 only".
+
+Could not be established from the record (written as "not recorded" in UNTESTED.md): which suites of the
+interrupted whole-suite ASan pass finished clean; the suite list and counts of the whole-suite ASan / TSan run that
+preceded the final merges; whether MinGW or the NDK built anything beyond the OS-layer tests; a command list for the
+RTX 3090 (the GPU entries name tests, not commands); any libFuzzer campaign; whether `perf/baseline-x86_64.json` was
+compared with this tree; which NDK the CI runner provides.
+
 ## 2026-11-12: pass over the tree after the day's merges
 
 About nineteen branches written in parallel were merged on this day. The guides were re-read against the merged code

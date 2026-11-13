@@ -48,7 +48,7 @@ Verification: the HIP, OpenCL and Level Zero columns by the mock drivers only (t
 | Backend | Header | Device string | Memory pool | Run on |
 |---------|--------|---------------|-------------|--------|
 | Vulkan | `gpu/vulkan.hpp` | `vulkan` (first compute device) | `vulkan:0` | Mesa lavapipe and SwiftShader (software) |
-| CUDA | `gpu/cuda.hpp` | `cuda[:N]` | `cuda:N` | NVIDIA RTX 3090 and mock driver |
+| CUDA | `gpu/cuda.hpp` | `cuda[:N]` | `cuda:N` | NVIDIA RTX 3090 (up to 2026-11-05) and mock driver; the code added on 2026-11-12 on the mock driver only |
 | HIP | `gpu/cuda.hpp` | `hip[:N]` | `hip:N` | mock driver only |
 | OpenCL | `gpu/opencl.hpp` | `opencl[:N]` (all platforms, GPUs first) | `opencl:N` | mock driver only |
 | Level Zero | `gpu/levelzero.hpp` | `ze[:N]` / `level_zero[:N]` | `level_zero:N` | mock driver only |
