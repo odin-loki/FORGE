@@ -645,6 +645,11 @@ function(forge_simd_gn_table name header cond)
       if(NOT (MSVC AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
         target_compile_options(forge_simd_${name} PRIVATE -ffp-contract=off)   # see vec_gn.hpp
       endif()
+      if(name STREQUAL "neon32")
+        # AArch32 NEON arithmetic flushes subnormals; vec_gn.hpp repairs its own operations, and the scalar code
+        # of these files must stay VFP instructions, so the compiler may not turn it into NEON ones.
+        target_compile_options(forge_simd_${name} PRIVATE -fno-tree-vectorize -fno-tree-slp-vectorize)
+      endif()
       set_target_properties(forge_simd_${name} PROPERTIES POSITION_INDEPENDENT_CODE ON)   # linked into libforge.so
       target_link_libraries(forge_simd_${name} PRIVATE forge_simd)
       target_sources(forge_simd_mv PRIVATE $<TARGET_OBJECTS:forge_simd_${name}>)

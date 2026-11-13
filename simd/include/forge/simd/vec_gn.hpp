@@ -10,7 +10,7 @@
 //   WebAssembly SIMD128      wasm_simd128   4      wasm_simd128.h    -msimd128
 //   MIPS MSA                 msa            4      msa.h             -mmsa
 //   Armv7 NEON + VFPv4       neon           4      arm_neon.h        32-bit Arm, -mfpu=neon-vfpv4
-//                                                                        (flushes subnormals to zero: opt-in only, see dispatch.cpp)
+//                                                                        (subnormal lanes go through VFP: see "Armv7" below)
 //
 // One backend per translation unit, chosen by the compile flags. vec.hpp maps a target onto it when the
 // target has the backend's tag and the same lane count. Every function has internal linkage, so two TUs
@@ -160,6 +160,7 @@ FORGE_GN_FN void mant_exp(vf x, vf& m, vf& e) {
 #define FORGE_GN_LANES 4
 #define FORGE_GN_TAG neon
 #define FORGE_GN_ISA "neon"
+#define FORGE_GN_ARM32 1
 #endif
 namespace forge::simd::gn {
 using tag = FORGE_GN_TAG;
@@ -171,14 +172,126 @@ typedef int vi __attribute__((vector_size(4 * FORGE_GN_LANES)));
 typedef unsigned vu __attribute__((vector_size(4 * FORGE_GN_LANES)));
 using vm = vi;   // all-ones / all-zeros per lane
 
+FORGE_GN_FN vm raw_lt(vf a, vf b) { return vm(a < b); }   // the ISA's compare instruction
+FORGE_GN_FN vf div(vf a, vf b) { return a / b; }
+FORGE_GN_FN vf load(const float* p) { vf v; std::memcpy(&v, p, sizeof v); return v; }
+FORGE_GN_FN void store(float* p, vf v) { std::memcpy(p, &v, sizeof v); }
+#if defined(FORGE_GN_ARM32)
+// ---- Armv7: IEEE 754 results from Advanced SIMD ----
+// On AArch32 every Advanced SIMD floating-point instruction runs with the "standard FPSCR value" whatever FPSCR
+// holds: flush-to-zero (a subnormal operand is read as zero, a result below FLT_MIN becomes zero) and default
+// NaN. VFP instructions on the same registers follow FPSCR, which Linux starts with FZ clear, so they are IEEE.
+// add / sub / mul / fma / lt below run the NEON instruction and one cheap test of its operands and result; the
+// lanes NEON may have got wrong (a subnormal operand that matters, a result it flushed, a NaN) are recomputed
+// one at a time by a VFP instruction, and those lanes then hold what the scalar code computes. Division and
+// square root have no NEON instruction (the compiler emits VFP ones), rounding and the conversions never see
+// or produce a subnormal that changes the result, and everything else is a bit operation.
+//
+// A translation unit using this backend should be compiled without auto-vectorisation of its scalar code
+// (clang: -fno-vectorize -fno-slp-vectorize; GCC does not vectorise floating point on NEON without
+// -funsafe-math-optimizations): a scalar loop turned into NEON instructions flushes as well.
+#if defined(__clang__)
+#define FORGE_GN_VFP [[maybe_unused]] __attribute__((noinline, target("no-neon")))
+#else
+#define FORGE_GN_VFP [[maybe_unused]] __attribute__((noinline, target("fpu=vfpv4")))
+#endif
+#define FORGE_GN_FIX [[maybe_unused]] __attribute__((noinline)) static
+namespace vfp {   // one lane, VFP instructions (compiled without NEON, never inlined into NEON code)
+FORGE_GN_VFP static float add(float a, float b) { return a + b; }
+FORGE_GN_VFP static float sub(float a, float b) { return a - b; }
+FORGE_GN_VFP static float mul(float a, float b) { return a * b; }
+FORGE_GN_VFP static float fma(float a, float b, float c) { return __builtin_fmaf(a, b, c); }   // vfma.f32
+FORGE_GN_VFP static int lt(float a, float b) { return a < b ? -1 : 0; }
+} // namespace vfp
+namespace a32 {
+using u4 = uint32x4_t;
+// The bit pattern, hidden from the optimiser: clang rewrites a test such as (bits & 0x7fffffff) != 0 as the
+// floating-point compare x != 0, which is a NEON compare here and reads a subnormal as zero.
+FORGE_GN_FN u4 bits(vf x) { u4 b = u4(x); __asm__("" : "+w"(b)); return b; }
+FORGE_GN_FN u4 normal(vf x) { return vtstq_u32(bits(x), vdupq_n_u32(0x7f800000u)); }    // exponent field not zero: normal, inf, NaN
+FORGE_GN_FN u4 nonzero(vf x) { return vtstq_u32(bits(x), vdupq_n_u32(0x7fffffffu)); }
+FORGE_GN_FN u4 subnormal(vf x) { return vbicq_u32(nonzero(x), normal(x)); }
+FORGE_GN_FN u4 nan(vf x) { return vmvnq_u32(vceqq_f32(float32x4_t(x), float32x4_t(x))); }
+// The first test of every operation is a NEON absolute compare, which reads a subnormal as zero by design:
+FORGE_GN_FN u4 mag_above(vf x, float t) { return vcagtq_f32(float32x4_t(x), vdupq_n_f32(t)); }   // |x| > t; false for NaN
+FORGE_GN_FN u4 mag_normal(vf x) { return vcageq_f32(float32x4_t(x), vdupq_n_f32(1.17549435e-38f)); }   // normal or inf; false for zero, subnormal, NaN
+FORGE_GN_FN bool any(u4 m) {
+    return vget_lane_u64(vreinterpret_u64_u32(vorr_u32(vget_low_u32(m), vget_high_u32(m))), 0) != 0;
+}
+FORGE_GN_FN bool all(u4 m) {
+    return vget_lane_u64(vreinterpret_u64_u32(vand_u32(vget_low_u32(m), vget_high_u32(m))), 0) == ~0ull;
+}
+// The second, exact test and the VFP lanes. r is the NEON result. A lane is redone when its result is NaN, an
+// operand is subnormal, or the result is zero although the operands do not make it zero (flushed, or an exact
+// cancellation, which VFP reproduces).
+FORGE_GN_FIX vf fix_add(vf a, vf b, vf r) {
+    u4 bad = vorrq_u32(vorrq_u32(nan(r), vorrq_u32(subnormal(a), subnormal(b))), vbicq_u32(vandq_u32(nonzero(a), nonzero(b)), normal(r)));
+    if (any(bad)) for (int i = 0; i < 4; ++i) if (bad[i]) r[i] = vfp::add(a[i], b[i]);
+    return r;
+}
+FORGE_GN_FIX vf fix_sub(vf a, vf b, vf r) {
+    u4 bad = vorrq_u32(vorrq_u32(nan(r), vorrq_u32(subnormal(a), subnormal(b))), vbicq_u32(vandq_u32(nonzero(a), nonzero(b)), normal(r)));
+    if (any(bad)) for (int i = 0; i < 4; ++i) if (bad[i]) r[i] = vfp::sub(a[i], b[i]);
+    return r;
+}
+FORGE_GN_FIX vf fix_mul(vf a, vf b, vf r) {   // a subnormal operand gives a zero or NaN result here, so the result alone tells
+    u4 bad = vorrq_u32(nan(r), vbicq_u32(vandq_u32(nonzero(a), nonzero(b)), normal(r)));
+    if (any(bad)) for (int i = 0; i < 4; ++i) if (bad[i]) r[i] = vfp::mul(a[i], b[i]);
+    return r;
+}
+FORGE_GN_FIX vf fix_fma(vf a, vf b, vf c, vf r) {
+    u4 sub3 = vorrq_u32(subnormal(a), vorrq_u32(subnormal(b), subnormal(c)));
+    u4 lost = vbicq_u32(vorrq_u32(vandq_u32(nonzero(a), nonzero(b)), nonzero(c)), normal(r));
+    u4 bad = vorrq_u32(nan(r), vorrq_u32(sub3, lost));
+    if (any(bad)) for (int i = 0; i < 4; ++i) if (bad[i]) r[i] = vfp::fma(a[i], b[i], c[i]);
+    return r;
+}
+FORGE_GN_FIX vm fix_lt(vf a, vf b, vm r) {
+    u4 bad = vorrq_u32(subnormal(a), subnormal(b));
+    if (any(bad)) for (int i = 0; i < 4; ++i) if (bad[i]) r[i] = vfp::lt(a[i], b[i]);
+    return r;
+}
+} // namespace a32
+// A sum or difference is wrong only when it is tiny: a subnormal operand changes a result above 2^-100 by less
+// than a quarter of its last place, and a sum of normal numbers that lands below FLT_MIN is flushed to zero.
+FORGE_GN_FN vf add(vf a, vf b) {
+    vf r = a + b;
+    if (__builtin_expect(!a32::all(a32::mag_above(r, 0x1p-100f)), 0)) r = a32::fix_add(a, b, r);
+    return r;
+}
+FORGE_GN_FN vf sub(vf a, vf b) {
+    vf r = a - b;
+    if (__builtin_expect(!a32::all(a32::mag_above(r, 0x1p-100f)), 0)) r = a32::fix_sub(a, b, r);
+    return r;
+}
+// A product NEON got wrong is zero (flushed, or a subnormal operand read as zero) or NaN (subnormal * inf).
+FORGE_GN_FN vf mul(vf a, vf b) {
+    vf r = a * b;
+    if (__builtin_expect(!a32::all(a32::mag_above(r, 0.f)), 0)) r = a32::fix_mul(a, b, r);
+    return r;
+}
+// A subnormal operand of a fused multiply-add can change any result (it breaks a tie of the exact product), so
+// all three operands are tested as well as the result.
+FORGE_GN_FN vf fma(vf a, vf b, vf c) {
+    vf r = vf(vfmaq_f32(float32x4_t(c), float32x4_t(a), float32x4_t(b)));
+    a32::u4 ok = vandq_u32(vandq_u32(a32::mag_above(r, 0.f), a32::mag_normal(a)), vandq_u32(a32::mag_normal(b), a32::mag_normal(c)));
+    if (__builtin_expect(!a32::all(ok), 0)) r = a32::fix_fma(a, b, c, r);
+    return r;
+}
+// A compare is wrong only between a subnormal and a zero or another subnormal.
+FORGE_GN_FN vm lt(vf a, vf b) {
+    vm r = raw_lt(a, b);
+    if (__builtin_expect(!a32::all(vorrq_u32(a32::mag_normal(a), a32::mag_normal(b))), 0)) r = a32::fix_lt(a, b, r);
+    return r;
+}
+FORGE_GN_FN vf splat(float s) { return vf(vdupq_n_f32(s)); }   // a move: `vf{} + s` would be a NEON addition
+#else
 FORGE_GN_FN vf add(vf a, vf b) { return a + b; }
 FORGE_GN_FN vf sub(vf a, vf b) { return a - b; }
 FORGE_GN_FN vf mul(vf a, vf b) { return a * b; }
-FORGE_GN_FN vf div(vf a, vf b) { return a / b; }
 FORGE_GN_FN vf splat(float s) { return vf{} + s; }
-FORGE_GN_FN vf load(const float* p) { vf v; std::memcpy(&v, p, sizeof v); return v; }
-FORGE_GN_FN void store(float* p, vf v) { std::memcpy(p, &v, sizeof v); }
-FORGE_GN_FN vm lt(vf a, vf b) { return vm(a < b); }
+FORGE_GN_FN vm lt(vf a, vf b) { return raw_lt(a, b); }
+#endif
 FORGE_GN_FN vm isnan(vf a) { return vm(a != a); }
 FORGE_GN_FN vm mor(vm a, vm b) { return a | b; }
 FORGE_GN_FN vm mand(vm a, vm b) { return a & b; }
@@ -204,8 +317,8 @@ FORGE_GN_FN vf round_magic(vf x) {   // nearest even through 2^23, for ISAs with
     const vi sign = vi{} + int(0x80000000u);
     vf ax = vf(vi(x) & ~sign);
     vf big = vf{} + 8388608.f;
-    vf r = (ax + big) - big;
-    return select(lt(ax, big), vf(vi(r) | (vi(x) & sign)), x);
+    vf r = (ax + big) - big;   // plain instructions: a subnormal gives zero here on every ISA
+    return select(raw_lt(ax, big), vf(vi(r) | (vi(x) & sign)), x);
 }
 
 #if defined(__loongarch_asx)
@@ -253,8 +366,7 @@ FORGE_GN_FN unsigned mask_bits(vm m) { return unsigned(wasm_i32x4_bitmask(v128_t
 FORGE_GN_FN vf fma(vf a, vf b, vf c) { return vf(__msa_fmadd_w(v4f32(c), v4f32(a), v4f32(b))); }
 FORGE_GN_FN vf sqrt(vf a) { return vf(__msa_fsqrt_w(v4f32(a))); }
 FORGE_GN_FN vf round_nearest(vf a) { return vf(__msa_frint_w(v4f32(a))); }   // MSACSR mode (nearest even)
-#else   // Armv7 NEON + VFPv4: no vector divide (the compiler emits scalar ones), square root or rounding
-FORGE_GN_FN vf fma(vf a, vf b, vf c) { return vf(vfmaq_f32(float32x4_t(c), float32x4_t(a), float32x4_t(b))); }
+#else   // Armv7 NEON + VFPv4: no vector divide (the compiler emits VFP ones), square root or rounding; fma is above
 FORGE_GN_FN vf sqrt(vf a) { vf o; for (int i = 0; i < lanes; ++i) o[i] = __builtin_sqrtf(a[i]); return o; }
 FORGE_GN_FN vf round_nearest(vf a) { return round_magic(a); }
 #endif
@@ -267,7 +379,10 @@ FORGE_GN_FN unsigned mask_bits(vm m) {
 }
 #endif
 FORGE_GN_FN float reduce_add(vf v) {
-#if FORGE_GN_LANES == 8
+#if defined(FORGE_GN_ARM32)   // the same tree with the checked add, then one VFP addition
+    vf t = add(v, vf(vcombine_f32(vget_high_f32(float32x4_t(v)), vget_low_f32(float32x4_t(v)))));
+    return vfp::add(t[0], t[1]);
+#elif FORGE_GN_LANES == 8
     return ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]));
 #else
     return (v[0] + v[2]) + (v[1] + v[3]);
@@ -275,9 +390,11 @@ FORGE_GN_FN float reduce_add(vf v) {
 }
 // n is integer valued; clamped first so the float -> int conversion is always in range
 FORGE_GN_FN vf ldexp_int(vf x, vf n) {
-    n = max(min(n, vf{} + 1024.f), vf{} - 1024.f);
+    const vf hi = vf{} + 1024.f, lo = vf{} - 1024.f;
+    n = select(raw_lt(n, hi), n, hi);   // min, max: n is no subnormal
+    n = select(raw_lt(lo, n), n, lo);
     vi e = vi(vu(__builtin_convertvector(n, vi) + 127) << 23);
-    return x * vf(e);
+    return mul(x, vf(e));
 }
 FORGE_GN_FN void mant_exp(vf x, vf& m, vf& e) {
     vu xi = vu(x);
