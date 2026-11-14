@@ -122,6 +122,53 @@ What a chat front end needs besides the template. forge-serve ([serve.md](serve.
 
 Tests: `tests/test_chat_tools.cpp` (all four formats, byte-by-byte parsing, grammar and parser agree, hostile inputs).
 
+### Remote models (`remote.hpp`)
+A chat completion on an AI server or a command, with the shape of a local chat: messages in; text, token usage and a finish reason out. A program can offer a local `.fpk` and any remote AI behind one call. Header-only, built on `forge::os::net::http` (HTTPS with the system trust store and host-name checks: OpenSSL on Linux/FreeBSD/Android, Schannel on Windows, Network.framework on Apple) and `forge::os::spawn_wait`; it does not need the rest of the inference module, so `forge_script` uses it without linking a model.
+
+```cpp
+#include <forge/inference/remote.hpp>
+namespace rm = forge::inference::remote;
+std::string why;
+auto cfg = rm::config_from_env(&why);            // FORGE_AI_PROVIDER / FORGE_AI_URL / ... (below)
+if (!cfg) { /* why = "" when nothing is configured, else the reason */ }
+rm::request rq;
+rq.messages = {{"system", "Reply in one word."}, {"user", "Is 7 prime?"}};
+rq.max_tokens = 16;
+rq.grammar = R"(root ::= "yes" | "no")";        // sent only to servers that take one (send_grammar)
+auto r = rm::complete(*cfg, rq);                 // never throws for a provider failure
+if (r.ok()) use(r.text, r.tokens.prompt_tokens, r.tokens.completion_tokens, r.finish_reason);
+else report(r.error);
+```
+
+- `config`: `kind` (`openai`, `anthropic`, `command`), `name` (the provider name as configured), `url` (base URL), `model`, `key_env` (the **name** of the environment variable that holds the API key), `command`, `send_grammar`, `max_tokens_field`, `timeout_ms` (whole exchange, default 180 s), `ca_file` (private CA), `anthropic_version` (`2026-10-21`), `anthropic_fallbacks`.
+- `request`: `messages` (`role` system / user / assistant, `content`), `max_tokens`, `temperature` (optional), `grammar` (GBNF), `json_schema` (a JSON Schema the reply must match), `json` (any JSON value), `timeout_ms`.
+- `reply`: `text`, `tokens` (`prompt_tokens`, `completion_tokens`), `finish_reason` (`stop`, `length`, ...), `error` (empty on success), `http_status`, `ok()`.
+- `provider_defaults(name)`, `config_from_env(&why)`, `endpoint(cfg)`, `request_body(cfg, rq)`, `http_request(cfg, rq, key)` and `parse_reply(cfg, status, body)` are the steps of `complete` and are public for tests. `complete(cfg, rq, transport)` takes an optional transport in place of `os::net::http`. `ask(cfg, system, prompt, max_tokens, json)` is the one-prompt form.
+
+Providers (`FORGE_AI_PROVIDER`):
+
+| Name | Kind | Default URL | Key variable | Grammar sent |
+|------|------|-------------|--------------|--------------|
+| `openai` | openai | `https://api.openai.com/v1` (sends `max_completion_tokens`) | `OPENAI_API_KEY` | no |
+| `forge-serve` | openai | `http://127.0.0.1:8080/v1` | none | yes |
+| `llamacpp` | openai | `http://127.0.0.1:8080/v1` (llama.cpp `llama-server`) | none | yes |
+| `vllm` | openai | `http://127.0.0.1:8000/v1` | none | no |
+| `ollama` | openai | `http://127.0.0.1:11434/v1` | none | no |
+| `lmstudio` | openai | `http://127.0.0.1:1234/v1` | none | no |
+| `openrouter` | openai | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | no |
+| `anthropic` (`claude`) | anthropic | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | never |
+| `command` (`cmd`) | command | — (`FORGE_AI_CMD`) | — | as `$FORGE_AI_GRAMMAR` |
+
+- **openai** — `POST {url}/chat/completions` (a URL ending in `/v1` gets `/chat/completions`, any other base `/v1/chat/completions`, a full `.../chat/completions` is used as is). Body: `model` (default `default`), `messages`, `max_tokens`, `temperature` when set, `stream: false`; then the grammar as `"grammar"` when `send_grammar`, else `json_schema` as `response_format: {type: json_schema, json_schema: {name, schema}}`, else `json` as `response_format: {type: json_object}`. Key: `Authorization: Bearer`. Reply: `choices[0].message.content` (a string or text parts), `finish_reason`, `usage`; a non-empty `message.refusal` is an error.
+- **anthropic** — `POST {url}/v1/messages` with `anthropic-version: 2026-10-21` and `x-api-key`. Default model `claude-opus-5-5`. System messages are joined into the top-level `system`; `temperature`, `top_p`, `top_k` and grammars are never sent (that API version rejects sampling parameters); `json_schema` becomes `output_config: {format: {type: json_schema, schema}}` (`json` alone adds nothing: say so in the prompt). By default the request opts into server-side refusal fallbacks (`fallbacks: "default"`, header `anthropic-beta: server-side-fallback-2026-07-01`): a request the model declines is re-run on a fallback model inside the same call; `FORGE_AI_FALLBACKS=0` turns that off. Reply: the `text` content blocks only, joined (thinking, tool and fallback blocks are skipped); `stop_reason` `end_turn` / `stop_sequence` → `stop`, `max_tokens` → `length`; `stop_reason: "refusal"` is an error naming the `stop_details` category; `usage.input_tokens` / `output_tokens`.
+- **command** — `/bin/sh -c "$FORGE_AI_CMD"` (`cmd.exe /d /c` on Windows) with the conversation on stdin (a single user message as its bare text, otherwise `role: content` lines and a closing `assistant:`), the reply read from stdout (trailing newlines removed). The environment adds `FORGE_AI_MAX_TOKENS`, `FORGE_AI_JSON=1`, `FORGE_AI_JSON_SCHEMA` and `FORGE_AI_GRAMMAR` when they apply. A non-zero exit code or the timeout is an error.
+
+Secrets: the key is read from the variable named by `key_env` at the time of the request and goes only into the request header — never into argv, a URL or a log. A server reply quoted in `reply::error` has the key replaced by `***`. Credentials are not forwarded when a redirect leaves the origin, and an https certificate failure is an error (no switch turns verification off outside tests). With a hosted provider the prompts leave the machine: configure one only for data that may.
+
+Model output from any provider, local or remote, is unverified text; check it before acting on it (the script `forge::ai_run` / `ai_eval` commands show drafted code to a confirm callback first).
+
+The script AI commands (`forge::ask`, `ask_json`, `suggest_cmd`, `ai_run`, ...; [scripting.md](scripting.md)) use this layer when no host callback and no in-process model is set. Tests: `tests/test_remote_ai.cpp` (configuration, request bodies and reply parsing for every provider, key handling, the command provider) and `remote_ai_serve` (`tests/remote_ai_serve_test.py`: the client against a real `forge-serve` on the tiny golden model — chat, usage, a GBNF grammar and a JSON schema).
+
 ### Continuous batching (`batch.hpp`)
 `batch_scheduler(shared_ptr<model>, batch_options)`. Each `step()` admits waiting requests up to `max_active`, prefills newcomers in chunks of `prefill_chunk` tokens and advances every active sequence by one token.
 

@@ -158,7 +158,7 @@ Differences from `forge script` that remain:
   enforced. The OS-level cap `forge script` also puts on its own process is CLI code and is **not** applied by an
   AOT binary.
 - `forge::ask` and related calls have no in-process model (`--ask-model`): the runtime library does not link the
-  inference module. An OpenAI-compatible endpoint in `$FORGE_AI_ENDPOINT` is used as in the interpreter.
+  inference module. A remote AI (`FORGE_AI_PROVIDER` / `FORGE_AI_URL`, [inference.md](inference.md#remote-models-remotehpp)) is used as in the interpreter.
 - Scripts cannot read stdin in any mode; a binary leaves stdin untouched, and children started by the script get
   what the interpreter gives them.
 
