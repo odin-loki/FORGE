@@ -178,7 +178,13 @@ inline LayerStats layer_pass(Model& m, i64 l, const Hidden& in, const StatsReq& 
     const std::string pre = std::format("layer.{}.", l);
     EmitOptions eo; eo.mode = EmitOptions::Mode::block; eo.block = l;
     Runner r(m.spec, m.w, T, eo, true, [&](const std::string& w) -> std::string {
-        if (layer_of(w) != l) return "";
+        // a block graph holds only this layer's tensors - plus tensors of other layers it reads through an alias
+        // (shared bases), whose statistics belong to this layer too
+        if (layer_of(w) != l && layer_of(w) >= 0) {
+            bool aliased = false;
+            for (auto& [k, v] : m.spec.alias) if (v == w && layer_of(k) == l) aliased = true;
+            if (!aliased) return "";
+        }
         auto g = weight_group(w);
         if (g == "ffn_x" && !req.sublayer && !req.ffn_io) return "";
         return g;

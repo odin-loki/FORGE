@@ -598,3 +598,24 @@ TEST(compress_generator_features_roundtrip) {
     CHECK(max_abs_diff(s.forward_all(c.seqs[0]), pruned) < 1e-4);
     std::filesystem::remove(p);
 }
+
+TEST(compress_remove_sublayer_keeps_shared_bases) {
+    // layer 0 holds a factor that layers 1 and 2 read through aliases; removing layer 0's attention must hand the
+    // tensor to a remaining reader and keep the model valid
+    Model m = tiny_dense(52, 3);
+    auto c = random_calib(m.spec.vocab, 1, 16, 22);
+    const i64 n = m.w.at("layer.0.wq").shape[0];
+    tensor I({n, n}); for (i64 i = 0; i < n; ++i) I.data[std::size_t(i * n + i)] = 1.f;
+    for (i64 l = 0; l < 3; ++l) {
+        const std::string p = std::format("layer.{}.", l);
+        m.w.t[p + "wq_a"] = m.w.at(p + "wq"); m.w.t.erase(p + "wq");
+        m.spec.lowrank.insert(p + "wq");
+        if (l == 0) m.w.t[p + "wq_b"] = I; else { m.spec.alias[p + "wq_b"] = "layer.0.wq_b"; m.w.t[p + "wq_b"] = I; }
+    }
+    auto before = count(m);
+    remove_sublayer(m, {0, true});
+    CHECK(!m.w.has("layer.0.wq_b") || m.spec.alias.count("layer.0.wq_b") == 0);
+    CHECK(m.spec.alias.count("layer.2.wq_b") && m.spec.alias.at("layer.2.wq_b") == "layer.1.wq_b");
+    CHECK(count(m).params < before.params);
+    check_saved_runs(m, c, "shared_removed");
+}

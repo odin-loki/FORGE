@@ -200,7 +200,20 @@ inline void remove_sublayer(Model& m, const Sublayer& s) {
     auto before = layer_tensors(m.spec, s.layer);
     if (s.attn) L.attn = false; else L.ffn = LayerSpec::Ffn::none;
     auto after = layer_tensors(m.spec, s.layer);
-    for (auto& n : before) if (std::find(after.begin(), after.end(), n) == after.end()) m.w.t.erase(n);
+    for (auto& n : before) {
+        if (std::find(after.begin(), after.end(), n) != after.end()) continue;
+        m.spec.alias.erase(n);
+        // a tensor other layers still read through an alias (a shared basis) moves to the first of them
+        std::vector<std::string> readers;
+        for (auto& [k, v] : m.spec.alias) if (v == n) readers.push_back(k);
+        if (!readers.empty() && m.w.has(n)) {
+            const std::string heir = readers.front();
+            m.w.t[heir] = m.w.at(n);
+            m.spec.alias.erase(heir);
+            for (auto& k : readers) if (k != heir) m.spec.alias[k] = heir;
+        }
+        m.w.t.erase(n);
+    }
 }
 
 // Replaces the FFN of layer l by the best rank-r linear map of its normalised input (ffn_norm kept).

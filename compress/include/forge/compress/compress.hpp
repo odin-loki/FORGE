@@ -73,7 +73,7 @@ struct Counts { i64 params = 0, nonzero = 0, body_params = 0, body_nonzero = 0; 
 inline Counts count(const Model& m) {
     Counts c;
     std::set<std::string> used;
-    for (i64 l = 0; l < m.spec.n_layers(); ++l) for (auto& n : layer_tensors(m.spec, l)) used.insert(n);
+    for (i64 l = 0; l < m.spec.n_layers(); ++l) for (auto& n : layer_tensors(m.spec, l)) { auto a = m.spec.alias.find(n); used.insert(a == m.spec.alias.end() ? n : a->second); }   // shared tensors once
     const bool tied = m.w.has("lm_head") && m.w.has("tok_emb") && m.w.at("lm_head").data == m.w.at("tok_emb").data;
     for (auto& n : used) {
         const auto& t = m.w.at(n);
@@ -821,3 +821,6 @@ inline value run_stage(Ctx& c, const Stage& st) {
 }
 
 }  // namespace forge::compress
+
+// Modules that register their stages (stage_registry / alloc_registry).
+#include <forge/compress/spectral.hpp>
