@@ -28,10 +28,11 @@ inline double dot(const double* a, const double* b, i64 n) {
     return n > 0 ? f(a, b, std::size_t(n)) : 0.0;
 }
 
-// Symmetric n x n matrix in f64, row-major (both triangles stored).
+// Symmetric n x n matrix in f64, row-major (both triangles stored). Up to 8192^2 x 8 B = 512 MiB: a mapped_vector
+// (scratch-file backed when large, mapped.hpp).
 struct Sym {
     i64 n = 0;
-    std::vector<double> a;
+    mapped_vector<double> a;
     Sym() = default;
     explicit Sym(i64 n_) : n(n_), a(static_cast<std::size_t>(n_ * n_), 0.0) {}
     double& operator()(i64 i, i64 j) { return a[std::size_t(i * n + j)]; }
@@ -46,7 +47,7 @@ struct Sym {
 struct Gram {
     i64 d = 0, count = 0;
     Sym H;
-    std::vector<float> xt, tmp;
+    fbuf xt, tmp;
     explicit Gram(i64 d_ = 0) : d(d_), H(d_) {}
     void add(const float* X, i64 rows) {
         constexpr i64 chunk = 4096;
@@ -231,7 +232,7 @@ inline std::vector<float> ls_refit_columns(const float* W, i64 rows, const Sym& 
 
 // Least squares with a separate target: M = argmin sum ||y - M x||^2 = (Y^T X)(X^T X)^-1, from accumulated
 // cross-moment C = Y^T X [dy, dx] and Gram G = X^T X. Returns M [dy, dx].
-inline std::vector<float> ls_solve(const std::vector<double>& C, i64 dy, const Sym& G, double rel_damp = 1e-4) {
+inline std::vector<float> ls_solve(std::span<const double> C, i64 dy, const Sym& G, double rel_damp = 1e-4) {
     std::vector<float> M(C.size());
     for (std::size_t i = 0; i < C.size(); ++i) M[i] = float(C[i]);
     spd_solve_rows(G, rel_damp, M.data(), dy);
@@ -241,8 +242,8 @@ inline std::vector<float> ls_solve(const std::vector<double>& C, i64 dy, const S
 // Cross moment accumulator C += Y^T X  (Y [rows, dy], X [rows, dx]).
 struct Cross {
     i64 dy = 0, dx = 0;
-    std::vector<double> C;
-    std::vector<float> yt, xt, tmp;
+    mapped_vector<double> C;
+    fbuf yt, xt, tmp;
     Cross(i64 dy_ = 0, i64 dx_ = 0) : dy(dy_), dx(dx_), C(static_cast<std::size_t>(dy_ * dx_), 0.0) {}
     void add(const float* Y, const float* X, i64 rows) {
         constexpr i64 chunk = 4096;

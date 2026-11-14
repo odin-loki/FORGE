@@ -8,6 +8,16 @@
 // Every job is `forge compress` (+ evaluation) or `forge eval`; its record is appended to results.jsonl and the
 // report is regenerated after each job, so the plan can be stopped and resumed (finished jobs are skipped).
 //
+// Supervision (long unattended runs; tools/compress_plan_supervise.sh / .ps1 restart the plan until it is done):
+//   - one plan at a time: an OS lock on COMPRESS_RUNS/plan.lock (a second instance exits with status 75)
+//   - COMPRESS_RUNS/plan.heartbeat: {pid, time, job} rewritten at least every 30 s while the plan runs;
+//     COMPRESS_RUNS/plan.done is written when every phase finished
+//   - jobs run with --checkpoint COMPRESS_RUNS/ckpt/<job> (forge compress resumes mid-job after a crash or a
+//     restart of the plan) and inherit FORGE_MEM_LIMIT (COMPRESS_MEM_LIMIT, else FORGE_MEM_LIMIT) when set
+//   - a failed job is retried COMPRESS_RETRIES times (default 3) with exponential backoff (COMPRESS_BACKOFF s,
+//     default 30); a job killed for memory (exit 137 / 9, std::bad_alloc, "out of memory") is retried at once
+//     with --nsamples and --probes halved, down to COMPRESS_NSAMPLES_FLOOR (4) and COMPRESS_PROBES_FLOOR (2)
+//
 // Budget for chained techniques: perplexity (WikiText-2) at most +5% and mean zero-shot accuracy at least 95% of
 // the uncompressed model. Chains are searched greedily stage by stage on the cheap perplexity check, each stage
 // limited to a share of the budget, then the final model gets the full evaluation; a chain that fails it falls
@@ -28,12 +38,81 @@ std::string PPL_WINDOWS = envor("COMPRESS_PPL_WINDOWS", "40");
 std::string LIMIT = envor("COMPRESS_LIMIT", "200");
 std::string PPL_WINDOW = envor("COMPRESS_PPL_WINDOW", "512");
 double BUDGET = 0.05;
+int RETRIES = std::stoi(envor("COMPRESS_RETRIES", "3"));
+int BACKOFF_S = std::stoi(envor("COMPRESS_BACKOFF", "30"));
+int NSAMPLES_FLOOR = std::stoi(envor("COMPRESS_NSAMPLES_FLOOR", "4"));
+std::string PROBES = envor("COMPRESS_PROBES", "8");
+int PROBES_FLOOR = std::stoi(envor("COMPRESS_PROBES_FLOOR", "2"));
+std::string CKPT_MINUTES = envor("COMPRESS_CHECKPOINT_MINUTES", "10");
+std::string MEM_LIMIT = envor("COMPRESS_MEM_LIMIT", envor("FORGE_MEM_LIMIT", ""));
 
 os.setenv("FORGE_CPU_INT8", "0");   // exact quantised matmuls in every evaluation (children inherit it)
+if (MEM_LIMIT != "") os.setenv("FORGE_MEM_LIMIT", MEM_LIMIT);   // the memory budget of every job
 fs.mkdir(RUNS + "/models");
 fs.mkdir(RUNS + "/reports");
 fs.mkdir(RUNS + "/logs");
+fs.mkdir(RUNS + "/ckpt");
 fs.mkdir(RES);
+
+// ------------------------------------------------------------------------------------------------ supervision
+// One plan at a time: the lock is the OS's, so it goes away with the process (no stale lock after a crash).
+auto plan_lock = fs.lock(RUNS + "/plan.lock", false);
+if (plan_lock == nullptr) {
+    std::println("plan: another instance holds {} (see {}); exiting", RUNS + "/plan.lock", RUNS + "/plan.heartbeat");
+    std::exit(75);
+}
+if (fs.exists(RUNS + "/plan.done")) fs.remove(RUNS + "/plan.done");
+std::string current_job = "";
+void heartbeat(std::string state) {
+    auto h = json.parse("{}");
+    h["pid"] = os.pid(); h["time"] = time.now(); h["iso"] = time.iso(time.now()); h["job"] = current_job; h["state"] = state;
+    fs.write_atomic(RUNS + "/plan.heartbeat", json.dump(h) + "\n");
+}
+heartbeat("starting");
+
+// Runs argv, streaming its output (stderr merged) to `log` and keeping the heartbeat fresh. Returns
+// {code, tail (the last 64 KB of output), seconds}.
+auto run_job(std::vector<std::string> argv, std::string log) {
+    std::string cmdline = "";
+    for (auto a : argv) cmdline += " " + a;
+    fs.append(log, "\n[" + time.iso(time.now()) + "] $" + cmdline + "\n");   // every attempt, appended
+    double t0 = time.ms();
+    auto p = forge::proc::start(argv);
+    std::string tail = "";
+    int code = -1;
+    heartbeat("running");
+    double last_hb = time.ms();
+    while (code == -1) {
+        std::string s = p.read(30000);
+        if (s != "") {
+            fs.append(log, s);
+            tail += s;
+            if (len(tail) > 65536) tail = tail.substr(len(tail) - 65536);
+        }
+        if (time.ms() - last_hb > 30000) { heartbeat("running"); last_hb = time.ms(); }
+        if (s == "") {
+            code = p.wait(1000);
+            // -1: still running
+        }
+    }
+    for (int i = 0; i < 100; ++i) { std::string s = p.read(100); if (s == "") break; fs.append(log, s); tail += s; }
+    auto r = json.parse("{}");
+    r["code"] = code; r["tail"] = tail; r["seconds"] = (time.ms() - t0) / 1000.0;
+    return r;
+}
+
+bool is_oom(auto r) {
+    int c = r["code"];
+    std::string t = r["tail"];
+    return c == 137 || c == 9 || t.contains("bad_alloc") || t.contains("out of memory") || t.contains("Out of memory") || t.contains("Cannot allocate memory") || t.contains("OutOfMemory");
+}
+bool is_busy(auto r) { std::string t = r["tail"]; return t.contains("is in use by another forge compress"); }   // an orphaned job of a killed plan
+void backoff(int attempt) {
+    int s = BACKOFF_S;
+    for (int i = 0; i < attempt; ++i) s = s * 2;
+    std::println("  retrying in {}s", s);
+    for (int w = 0; w < s; w += 30) { heartbeat("backoff"); sleep(1000 * std::min(30, s - w)); }
+}
 
 // ------------------------------------------------------------------------------------------------ records
 auto results = json.parse("{}");
@@ -100,23 +179,54 @@ auto compress_job(std::string id, std::string model, std::string parent, std::st
     std::string out = RUNS + "/models/" + safe(id) + ".fpk";
     if (results.contains(id) && (!keep || fs.exists(out))) return results[id];
     std::string rep = RUNS + "/reports/" + safe(id) + ".json";
-    auto argv = std::vector<std::string>{FORGE, "compress", input, "-o", out, "--recipe", recipe, "--calib-data", calib == "" ? CALIB : calib,
-                                         "--nsamples", NSAMPLES, "--seqlen", SEQLEN, "--codec", codec, "--report", rep};
-    for (auto x : eval_args(mode)) argv.push_back(x);
-    std::println("[{}] {} :: {} ({}, {})", time.iso(time.now()), id, recipe, codec, mode);
+    std::string ckpt = RUNS + "/ckpt/" + safe(id);
+    std::string logf = RUNS + "/logs/" + safe(id) + ".log";
+    int ns = std::stoi(NSAMPLES), pr = std::stoi(PROBES), attempt = 0, ooms = 0, waits = 0;
     double t0 = time.ms();
-    auto p = forge::run(argv, {{"merge", true}});
-    fs.write(RUNS + "/logs/" + safe(id) + ".log", p.out);
+    current_job = id;
+    auto p = json.parse("{}");
+    bool again = true;
+    while (again) {
+        again = false;
+        auto argv = std::vector<std::string>{FORGE, "compress", input, "-o", out, "--recipe", recipe, "--calib-data", calib == "" ? CALIB : calib,
+                                             "--nsamples", std::to_string(ns), "--probes", std::to_string(pr), "--seqlen", SEQLEN, "--codec", codec, "--report", rep,
+                                             "--checkpoint", ckpt, "--checkpoint-minutes", CKPT_MINUTES};
+        for (auto x : eval_args(mode)) argv.push_back(x);
+        std::println("[{}] {} :: {} ({}, {}, nsamples {}){}", time.iso(time.now()), id, recipe, codec, mode, ns, attempt + ooms > 0 ? std::format(" retry {}", attempt + ooms) : "");
+        if (fs.exists(rep)) fs.remove(rep);
+        p = run_job(argv, logf);
+        if (p["code"] == 0 && fs.exists(rep)) {
+            again = false;   // done
+        } else if (is_busy(p) && waits < 60) {   // the checkpoint is held by an orphaned job of a killed plan
+            ++waits; again = true;
+            std::println("  checkpoint in use by another process; waiting");
+            for (int w = 0; w < 2; ++w) { heartbeat("waiting"); sleep(30000); }
+        } else if (is_oom(p) && (ns > NSAMPLES_FLOOR || pr > PROBES_FLOOR)) {   // memory: retry at once with less calibration data
+            ++ooms; again = true;
+            ns = std::max(NSAMPLES_FLOOR, ns / 2); pr = std::max(PROBES_FLOOR, pr / 2);
+            std::println("  out of memory (exit {}): retrying with --nsamples {} --probes {}", p["code"], ns, pr);
+        } else if (attempt < RETRIES) {   // anything else: the same command again later (it resumes from its checkpoint)
+            ++attempt; again = true;
+            std::println("  failed (exit {}), attempt {}/{}: see {}", p["code"], attempt, RETRIES, logf);
+            backoff(attempt - 1);
+        }
+    }
+    current_job = "";
     double wall = (time.ms() - t0) / 1000.0;
-    if (p.code != 0 || !fs.exists(rep)) {
-        std::println("  FAILED (exit {}): see {}", p.code, RUNS + "/logs/" + safe(id) + ".log");
+    if (p["code"] != 0 || !fs.exists(rep)) {
+        std::println("  FAILED (exit {}): see {}", p["code"], logf);
         auto f = json.parse("{}");
         f["id"] = id; f["model"] = model; f["parent"] = parent; f["recipe"] = recipe; f["codec"] = codec; f["mode"] = mode; f["failed"] = true;
+        f["exit"] = p["code"]; f["oom"] = is_oom(p); f["nsamples"] = ns; f["attempts"] = attempt + ooms;
         record(f);
         if (fs.exists(out)) fs.remove(out);
+        if (fs.exists(ckpt)) fs.remove(ckpt);
         return f;
     }
     auto r = summarise(id, model, parent, recipe, codec, mode, json.parse(fs.read(rep)), wall);
+    r["nsamples"] = ns; r["probes"] = pr;
+    if (attempt + ooms > 0) { r["retries"] = attempt + ooms; r["oom_retries"] = ooms; }
+    if (MEM_LIMIT != "") r["mem_limit"] = MEM_LIMIT;
     record(r);
     if (!keep && fs.exists(out)) fs.remove(out);
     std::println("  ppl {:.3f}  mean_acc {}  params {}  nonzero {}  bytes {}  ({:.0f}s)", double(r["eval"]["ppl"]),
@@ -131,9 +241,21 @@ auto eval_job(std::string id, std::string model, std::string input, std::string 
     for (auto x : eval_args(mode)) argv.push_back(x);
     std::println("[{}] {} :: eval {} ({})", time.iso(time.now()), id, input, mode);
     double t0 = time.ms();
-    auto p = forge::run(argv, {{"merge", true}});
-    fs.write(RUNS + "/logs/" + safe(id) + ".log", p.out);
-    if (p.code != 0) { std::println("  FAILED (exit {})", p.code); auto f = json.parse("{}"); f["id"] = id; f["model"] = model; f["failed"] = true; return f; }
+    current_job = id;
+    auto p = json.parse("{}");
+    int attempt = 0;
+    bool again = true;
+    while (again) {
+        p = run_job(argv, RUNS + "/logs/" + safe(id) + ".log");
+        again = p["code"] != 0 && attempt < RETRIES;
+        if (again) {
+            std::println("  failed (exit {}{}), attempt {}/{}", p["code"], is_oom(p) ? ", out of memory" : "", attempt + 1, RETRIES);
+            backoff(attempt);
+            ++attempt;
+        }
+    }
+    current_job = "";
+    if (p["code"] != 0) { std::println("  FAILED (exit {})", p["code"]); auto f = json.parse("{}"); f["id"] = id; f["model"] = model; f["failed"] = true; return f; }
     auto r = summarise(id, model, "", "", "", mode, json.parse(fs.read(rep)), (time.ms() - t0) / 1000.0);
     record(r);
     std::println("  ppl {:.3f}  mean_acc {}", double(r["eval"]["ppl"]), r["eval"].contains("mean_acc") ? r["eval"]["mean_acc"] : 0);
@@ -362,4 +484,6 @@ if (phases.contains("sweeps")) {
 }
 
 write_report();
+heartbeat("done");
+fs.write_atomic(RUNS + "/plan.done", time.iso(time.now()) + "\n");   // the supervisor stops on this
 std::println("plan: done ({} jobs on record); report in {}", len(order), RES + "/REPORT.md");

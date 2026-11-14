@@ -95,6 +95,8 @@ int usage() {
         "  compress <model.fpk|hf_dir> -o <out.fpk> --recipe RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--seed 0]\n"
         "      [--codec C] [--report R.json] [--data DIR ...eval options]   prune / sparsify / shrink / convert a model (docs/compress.md)\n"
         "      RECIPE: stage(k=v,..)+stage(..); stages prune, width, depth, experts, merge, moe2dense\n"
+        "      [--checkpoint DIR|none (default OUT.ckpt)] [--checkpoint-every N] [--checkpoint-minutes 10] [--keep-checkpoint]\n"
+        "      progress is saved per stage and per layer; rerunning the same command resumes an interrupted job\n"
         "  eval <model.fpk> --data DIR [--ppl-windows 40] [--ppl-window 512] [--tasks arc_easy,hellaswag,..] [--limit 200] [--report R.json]\n"
         "      WikiText-2 perplexity and zero-shot accuracy on FORGE's inference engine (data: tools/compress_data.py)\n"
         "  shard split <in.fpk> -o <out.fpk> [--shard-size 2G] [--blob-dir DIR]   tensors into blobs named by their BLAKE3 hash\n"

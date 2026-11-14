@@ -84,7 +84,7 @@ inline Rw residual_tensors(const Model& m, i64 l) {
 }
 
 // rows of a reader tensor (2-D [r, d] or stacked [e, f, d]) as one [rows, d] matrix
-inline i64 reader_rows(const tensor& t) { i64 r = 1; for (std::size_t i = 0; i + 1 < t.shape.size(); ++i) r *= t.shape[i]; return r; }
+inline i64 reader_rows(const auto& t) { i64 r = 1; for (std::size_t i = 0; i + 1 < t.shape.size(); ++i) r *= t.shape[i]; return r; }
 
 inline void fold_norms(Model& m) {
     const i64 d = m.spec.d_model;

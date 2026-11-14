@@ -6,6 +6,7 @@
 // straight at the f32 buffers held in WeightStore, so pruning a tensor in place is seen by the next run without
 // recompiling (only shape changes need a new Runner).
 #pragma once
+#include <forge/compress/mapped.hpp>
 #include <forge/graph/graph.hpp>
 #include <forge/import/hf.hpp>
 #include <forge/modelfile/blueprint.hpp>
@@ -49,15 +50,31 @@ template <class... A> void say(std::format_string<A...> f, A&&... a) {
 [[noreturn]] inline void die(const std::string& m) { throw std::runtime_error(m); }
 
 // ---------------------------------------------------------------------------------------------------- weights
-// Every tensor of a model, decoded to f32 and owned here (mutable). Names are FORGE names ("layer.3.wq").
+// A mutable f32 tensor of a model being compressed. Like forge::tensor (shape, data), but `data` is a mapped_vector
+// (mapped.hpp): big tensors live in scratch-file mappings, and a tensor loaded from a .fpk stays in the file (read
+// in place for f32, decoded on first access otherwise) until it is first written. It converts to and from
+// forge::tensor where a FORGE API needs one (a copy).
+struct wtensor {
+    shape_t shape;
+    fbuf data = weights_buf();
+    wtensor() = default;
+    explicit wtensor(shape_t s, float fill = 0.f) : shape(std::move(s)) { data.assign(std::size_t(numel(shape)), fill); }
+    wtensor(const tensor& t) : shape(t.shape) { data = t.data; }   // NOLINT: implicit, so tensors are stored as before
+    static fbuf weights_buf() { fbuf b; b.set_use(scratch::use::weights); return b; }
+    operator tensor() const { tensor r; r.shape = shape; r.data = data; return r; }   // NOLINT
+    tensor_view view() { return {data.data(), shape}; }
+    std::size_t size() const { return data.size(); }
+};
+
+// Every tensor of a model, as f32 and owned here (mutable). Names are FORGE names ("layer.3.wq").
 struct WeightStore {
-    std::map<std::string, tensor> t;
-    tensor& at(const std::string& n) {
+    std::map<std::string, wtensor> t;
+    wtensor& at(const std::string& n) {
         auto it = t.find(n);
         if (it == t.end()) die("no tensor " + n);
         return it->second;
     }
-    const tensor& at(const std::string& n) const {
+    const wtensor& at(const std::string& n) const {
         auto it = t.find(n);
         if (it == t.end()) die("no tensor " + n);
         return it->second;
@@ -343,17 +360,39 @@ struct Model {
     std::optional<forge::modelfile::tokenizer> tok;
     std::map<std::string, std::string> codec;        // per-tensor storage codec chosen by a quant stage
 
+    // One tensor of a .fpk, lazily (FORGE_COMPRESS_LAZY=0: decoded now): an aligned f32 tensor is read in place in
+    // the reader's mapping until it is first written; other codecs are decoded on first access. Encrypted files are
+    // decoded now (their plaintext is not kept in the reader).
+    static wtensor load_tensor(const std::shared_ptr<forge::modelfile::reader>& rd, const std::string& name) {
+        const auto& e = rd->entry(name);
+        const auto* cd = forge::graph::codecs::find(e.codec);
+        if (!cd) die("tensor " + name + ": unknown codec " + e.codec);
+        wtensor t; t.shape = e.shape;
+        const std::size_t n = std::size_t(forge::numel(e.shape));
+        if (rd->encrypted() || rd->locked()) { auto x = rd->load(name); t.data = x.data; return t; }
+        auto b = rd->tensor_bytes(name);
+        if (os::getenv("FORGE_COMPRESS_LAZY", "1") == "0") { t.data.resize(n); cd->decode(b.data(), n, t.data.data()); return t; }
+        fbuf::lazy_source src;
+        src.owner = rd;
+        if (std::string_view(e.codec) == "f32" && reinterpret_cast<std::uintptr_t>(b.data()) % alignof(float) == 0) src.borrow = reinterpret_cast<const float*>(b.data());
+        const std::uint8_t* p = b.data();
+        src.fill = [cd, p, n](float* dst) { cd->decode(p, n, dst); };
+        t.data = fbuf::lazy(n, std::move(src));
+        return t;
+    }
+
     static Model load(const std::string& path) {
         Model m;
         m.src_path = path;
-        forge::modelfile::reader r(path);
+        auto rd = std::make_shared<forge::modelfile::reader>(path);   // kept alive by the lazy tensors that read it
+        const auto& r = *rd;
         m.manifest = r.manifest();
         std::string text = forge::modelfile::blueprint_text(r.section_text("blueprint"));
         auto bp = forge::modelfile::parse_blueprint(text);
         std::string tpl = m.manifest.find("template") && m.manifest["template"].is_str() ? m.manifest["template"].str() : "compressed";
         if (text.find("# compress-layers:") != std::string::npos) tpl = "compressed";
         m.spec = spec_from_blueprint(text, bp, tpl);
-        for (auto& [name, e] : r.tensors()) m.w.t.emplace(name, r.load(name));
+        for (auto& [name, e] : r.tensors()) m.w.t.emplace(name, load_tensor(rd, name));
         if (!m.w.has("lm_head") && m.w.has("tok_emb")) m.w.t["lm_head"] = m.w.at("tok_emb");   // tied head stored once
         for (auto& [name, sec] : r.sections()) {
             if (name == "tokenizer" || name == "chat_template" || name == "license" || name == "tokenizer_json")
@@ -366,7 +405,7 @@ struct Model {
 
     // Writes a .fpk FORGE can run: the regenerated blueprint, its state section, the source's tokenizer and manifest.
     // `codec_for(name, tensor)` picks each tensor's codec (default f32; norms, routers and 1-D tensors stay f32).
-    void save(const std::string& path, const std::function<std::string(const std::string&, const tensor&)>& codec_for = {}) const {
+    void save(const std::string& path, const std::function<std::string(const std::string&, const wtensor&)>& codec_for = {}) const {
         ModelSpec sp = spec;
         // identical LM head and embedding (tied models, also after rotation / quantisation): store one tensor
         sp.tied_head = w.has("lm_head") && w.has("tok_emb") && w.at("lm_head").shape == w.at("tok_emb").shape && w.at("lm_head").data == w.at("tok_emb").data
@@ -387,7 +426,7 @@ struct Model {
             const bool plain = t.shape.size() >= 2 && n.find("norm") == std::string::npos && n.find("router") == std::string::npos && n != "head_mix";
             if (auto it = codec.find(n); it != codec.end()) c = it->second;      // quantised by a stage: exact in that codec
             else if (codec_for && plain) c = codec_for(n, t);
-            wr.add_tensor(n, t.shape, t.data, c);
+            wr.add_tensor(n, t.shape, t.data.span(), c);
         }
         wr.set_section("blueprint", text);
         for (auto& [k, v] : passthrough) wr.set_section(k, v);
@@ -431,7 +470,9 @@ struct Runner {
         bo.all_rows = all_rows;
         // Block mode emits layer `eo.block` as slot 0 but keeps its tensor names (W.layer[l]).
         bo.weight = [&w](const std::string& name) -> std::pair<shape_t, const float*> {
-            auto& t = w.at(name);   // the blueprint already names the aliased (stored) tensor
+            // the blueprint already names the aliased (stored) tensor. Mutable access: a lazily loaded tensor gets
+            // its own storage now, so in-place edits made while this graph lives are seen by it
+            auto& t = w.at(name);
             return {t.shape, t.data.data()};
         };
         auto g = forge::modelfile::build_graph(bp, bo);

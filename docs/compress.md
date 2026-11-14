@@ -8,6 +8,7 @@ FORGE runs optimised models. `forge import` optimises a float Hugging Face check
 - evaluation uses `forge::inference::session`
 
 The code is in `compress/include/forge/compress/` (header-only, CMake target `forge_compress`). The tests are in
+`tests/test_compress_persist.cpp` (scratch buffers, checkpoints),
 `tests/test_compress.cpp` and `tests/compress_import.cmake`, and the experiment plan is `tools/compress_plan.cpp`
 (ForgeScript).
 
@@ -79,6 +80,48 @@ mixed:
 
 The mixing weights are learned online, one weight set per context (match-length bucket × bigram seen), with Bayesian
 updates and fixed-share smoothing. The mixer only uses past tokens, so it is a valid online predictor.
+
+## Long runs: memory and checkpoints
+
+Big buffers live in memory-mapped scratch files (`compress/include/forge/compress/mapped.hpp`), so under memory
+pressure the OS writes them back to the disk and drops them instead of killing the job. This covers the model's
+tensors, the calibration hidden states, the Gram / Hessian matrices and the reference log-probabilities.
+
+- **Lazy loading.** `Model::load` keeps every tensor in the mapped source file. An f32 tensor is read in place, and
+  other codecs are decoded on first access. A tensor gets its own (scratch-backed) copy only when it is first written.
+- **Scratch files.** They are named `forge-compress-<pid>-<n>.tmp`. They are created next to the output (or in
+  `FORGE_COMPRESS_SCRATCH`) and preallocated, so a full disk fails the allocation instead of crashing later. On POSIX
+  they are unlinked at once; on Windows they are deleted when freed or at exit.
+- **Thresholds.** `FORGE_COMPRESS_MMAP_MIN` (default 64 MiB; `off` = all in RAM) for compute buffers, and
+  `FORGE_COMPRESS_MMAP_WEIGHTS_MIN` (default 1 MiB) for model weights. `FORGE_COMPRESS_LAZY=0` decodes every tensor
+  at load.
+
+**Checkpoints.** `forge compress` saves its progress in `--checkpoint DIR` (default `<out>.ckpt/`, `none` = off),
+`compress/include/forge/compress/checkpoint.hpp`:
+
+- After every stage it writes the model (`stage<i>.fpk`, f32) and `state.json` (the finished stages and their
+  reports, the per-tensor codecs, and the calibration and reference data).
+- Inside the sequential stages (`prune`, `width`, `depth replace=linear`, `experts`, `merge`, `moe2dense`, `quant`
+  gptq, and the error-curve and GPTQ passes of `quant method=mixed`) it saves the finished layers. This happens every
+  `--checkpoint-every N` layers or `--checkpoint-minutes M` (default 10). It writes the layers' tensors, spec and
+  codecs, the loop's accumulators, and the hidden states entering the next layer.
+- Rerunning the same command resumes from the last checkpoint and writes the same file as an uninterrupted run. The
+  job is identified by the input file, the recipe and the calibration options; another job clears the directory.
+- The directory is removed when the job (including `--data` evaluation) is done, unless `--keep-checkpoint` is given.
+- New sequential stages opt in with `layer_resumed` / `layer_finished` (`compress.hpp`).
+- `FORGE_COMPRESS_ABORT_AFTER=<layer>|<phase>:<layer>|stage:<i>` aborts after that point is saved (tests and drills).
+  `FORGE_COMPRESS_ABORT_OOM=1` makes it a `std::bad_alloc`.
+
+**Supervision.** `tools/compress_plan_supervise.sh` (POSIX sh) and `.ps1` (Windows) keep the plan running until it
+writes `plan.done`. They restart it when it dies and kill it when its heartbeat goes stale. The plan
+(`tools/compress_plan.cpp`) does the rest:
+
+- It holds an OS lock (`plan.lock`), so a second instance exits with status 75.
+- It rewrites `plan.heartbeat` at least every 30 s.
+- It runs every job with `--checkpoint`, so a restarted job resumes mid-way.
+- It retries failed jobs with exponential backoff.
+- On an out-of-memory kill (exit 137, `std::bad_alloc`) it retries at once with `--nsamples` and `--probes` halved.
+- It passes `COMPRESS_MEM_LIMIT` / `FORGE_MEM_LIMIT` on to the jobs.
 
 ## Notes
 
