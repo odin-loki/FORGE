@@ -32,6 +32,8 @@ namespace forge::compress {
 using forge::i64;
 using forge::shape_t;
 using forge::tensor;
+using forge::json::value;
+using jobj = forge::json::object;
 
 // ---------------------------------------------------------------------------------------------------- logging
 inline double now_s() {
@@ -87,6 +89,9 @@ struct ModelSpec {
     double eps = 1e-6, rope_base = 10000;
     std::string rope_neox = "1", rope_args, attn_args;
     int opset = 1;
+    bool logit_bias = false;   // logits get + W.logit_bias (distribution correction)
+    bool tied_head = false;    // the LM head reads W.tok_emb (tied embeddings stored once)
+    bool head_mix = false;     // a d x d map before the head (a tied head's norm gain in a rotated basis)
     std::vector<LayerSpec> layers;
 
     i64 n_layers() const { return i64(layers.size()); }
@@ -117,6 +122,9 @@ inline ModelSpec spec_from_blueprint(const std::string& text, const forge::model
     s.qk_norm = text.find(".q_norm") != std::string::npos;
     s.qkv_bias = text.find(".bq") != std::string::npos;
     s.family = s.qk_norm ? "qwen3" : (s.qkv_bias ? "qwen2" : "llama");
+    s.logit_bias = text.find("W.logit_bias") != std::string::npos;
+    s.head_mix = text.find("W.head_mix") != std::string::npos;
+    s.tied_head = text.find("W.out_norm, eps), W.tok_emb)") != std::string::npos || text.find("W.head_mix), W.tok_emb)") != std::string::npos;
     if (std::regex_search(text, m, std::regex(R"(# compress-layers: ([^\n]*))"))) {
         std::string L = m[1];
         for (std::size_t p = 0; p < L.size();) {
@@ -231,7 +239,12 @@ inline std::string emit_blueprint(const ModelSpec& s, const EmitOptions& eo = {}
     if (block) emit_layer(eo.block, 0);
     else for (i64 l = 0; l < s.n_layers(); ++l) emit_layer(l, l);
     if (block) o += "  xout = x + 0\n}\n\noutput xout : f32[seq, d_model]\nsession one_shot\n";
-    else o += "  logits = linear(rms_norm(last(x, seq), W.out_norm, eps), W.lm_head)\n}\n\noutput logits : f32[1, vocab]\nsession generative_sequence\n";
+    else {
+        std::string hn = "rms_norm(last(x, seq), W.out_norm, eps)";
+        if (s.head_mix) hn = "linear(" + hn + ", W.head_mix)";
+        o += std::format("  logits = linear({}, W.{}){}\n}}\n\noutput logits : f32[1, vocab]\nsession generative_sequence\n",
+                         hn, s.tied_head ? "tok_emb" : "lm_head", s.logit_bias ? " + W.logit_bias" : "");
+    }
     return o;
 }
 
@@ -281,6 +294,7 @@ struct Model {
         if (text.find("# compress-layers:") != std::string::npos) tpl = "compressed";
         m.spec = spec_from_blueprint(text, bp, tpl);
         for (auto& [name, e] : r.tensors()) m.w.t.emplace(name, r.load(name));
+        if (!m.w.has("lm_head") && m.w.has("tok_emb")) m.w.t["lm_head"] = m.w.at("tok_emb");   // tied head stored once
         for (auto& [name, sec] : r.sections()) {
             if (name == "tokenizer" || name == "chat_template" || name == "license" || name == "tokenizer_json")
                 m.passthrough[name] = std::string(r.section_text(name));
@@ -293,17 +307,24 @@ struct Model {
     // Writes a .fpk FORGE can run: the regenerated blueprint, its state section, the source's tokenizer and manifest.
     // `codec_for(name, tensor)` picks each tensor's codec (default f32; norms, routers and 1-D tensors stay f32).
     void save(const std::string& path, const std::function<std::string(const std::string&, const tensor&)>& codec_for = {}) const {
-        std::string text = emit_blueprint(spec);
+        ModelSpec sp = spec;
+        // identical LM head and embedding (tied models, also after rotation / quantisation): store one tensor
+        sp.tied_head = w.has("lm_head") && w.has("tok_emb") && w.at("lm_head").shape == w.at("tok_emb").shape && w.at("lm_head").data == w.at("tok_emb").data
+                       && (codec.count("lm_head") ? codec.at("lm_head") : std::string()) == (codec.count("tok_emb") ? codec.at("tok_emb") : std::string());
+        std::string text = emit_blueprint(sp);
         auto bp = forge::modelfile::parse_blueprint(text);
         forge::modelfile::stream_writer wr(path);
         wr.set_alignment(4096);
         std::set<std::string> used;
         for (i64 l = 0; l < spec.n_layers(); ++l) for (auto& n : layer_tensors(spec, l)) used.insert(n);
-        used.insert("tok_emb"); used.insert("out_norm"); used.insert("lm_head");
+        used.insert("tok_emb"); used.insert("out_norm");
+        if (!sp.tied_head) used.insert("lm_head");
+        if (sp.logit_bias) used.insert("logit_bias");
+        if (sp.head_mix) used.insert("head_mix");
         for (auto& n : used) {
             const auto& t = w.at(n);
             std::string c = "f32";
-            const bool plain = t.shape.size() >= 2 && n.find("norm") == std::string::npos && n.find("router") == std::string::npos;
+            const bool plain = t.shape.size() >= 2 && n.find("norm") == std::string::npos && n.find("router") == std::string::npos && n != "head_mix";
             if (auto it = codec.find(n); it != codec.end()) c = it->second;      // quantised by a stage: exact in that codec
             else if (codec_for && plain) c = codec_for(n, t);
             wr.add_tensor(n, t.shape, t.data, c);

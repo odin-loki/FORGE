@@ -30,7 +30,7 @@ inline void write_json(const std::string& path, const value& v) {
 inline value eval_json(const EvalResult& r) {
     jobj acc; for (auto& [k, v] : r.acc) acc.push_back({k, value(v)});
     jobj n; for (auto& [k, v] : r.n) n.push_back({k, value(v)});
-    return value(jobj{{"ppl", value(r.ppl)}, {"nll", value(r.nll)}, {"ppl_tokens", value(r.ppl_tokens)}, {"acc", value(acc)}, {"n", value(n)},
+    return value(jobj{{"ppl", value(r.ppl)}, {"nll", value(r.nll)}, {"ppl_mix", value(r.ppl_mix)}, {"ppl_tokens", value(r.ppl_tokens)}, {"acc", value(acc)}, {"n", value(n)},
                       {"mean_acc", value(r.mean_acc)}, {"seconds", value(r.seconds)}});
 }
 
@@ -41,6 +41,7 @@ inline EvalCfg eval_cfg(const opts& a) {
     c.ppl_window = std::stoll(a.get("ppl-window", "512"));
     c.tasks = split(a.get("tasks", ""), ',');
     c.task_limit = std::stoll(a.get("limit", "200"));
+    c.mix = a.get("mix", "0") == "1";
     return c;
 }
 
@@ -73,11 +74,22 @@ inline value compress_file(const opts& a) {
     Model m = Model::load(a.in);
     auto before = count(m);
     const i64 n = std::stoll(a.get("nsamples", "64")), seq = std::stoll(a.get("seqlen", "512"));
-    const std::string src = a.get("calib-data");
-    if (src.empty()) die("--calib-data FILE is required (a .jsonl of {\"text\": ...} documents or a plain text file)");
-    auto calib = make_calib(m, src, n, seq, std::stoull(a.get("seed", "0")));
+    // calibration: a dataset, or "self" (text the model writes itself: no data needed)
+    const std::string src = a.get("calib-data", "self");
+    const std::uint64_t seed = std::stoull(a.get("seed", "0"));
+    CalibSet calib = src == "self" ? self_generate(a.in, m, n, seq, seed) : make_calib(m, src, n, seq, seed);
     say("calibration: {} x {} tokens from {}", calib.seqs.size(), calib.seq, src);
     Ctx c{m, calib, {}, std::stod(a.get("damp", "0.01"))};
+    // reference distributions of the uncompressed model for feedback / calibrate: self-generated probes held apart
+    // from the calibration text (different seed)
+    Reference ref;
+    if (recipe.find("calibrate") != std::string::npos || recipe.find("kl=") != std::string::npos || recipe.find("optimi") != std::string::npos) {
+        const i64 np = std::stoll(a.get("probes", "8")), pl = std::stoll(a.get("probe-len", "256"));
+        auto probes = self_generate(a.in, m, np, pl, seed + 7919);
+        ref = capture_reference(m, probes);
+        c.ref = &ref;
+        say("reference: {} x {} self-generated probe tokens", probes.seqs.size(), probes.seq);
+    }
     std::vector<value> stages;
     for (auto& st : parse_recipe(recipe)) stages.push_back(run_stage(c, st));
     auto after = count(m);

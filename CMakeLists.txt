@@ -2315,3 +2315,19 @@ else()
   endif()
 endif()
 include(CPack)
+
+# forge::compress: `forge import` optimises float checkpoints by default; the tests above check faithful imports, so
+# they run with FORGE_OPTIMISE=0, and compress_import checks the default path itself.
+if(TARGET forge AND TARGET test_compress)
+  add_test(NAME compress_import COMMAND ${CMAKE_COMMAND} -DFORGE=$<TARGET_FILE:forge> -DHF=${PROJECT_BINARY_DIR}/golden/hf
+           -DWORK=${PROJECT_BINARY_DIR}/compress_import -P ${PROJECT_SOURCE_DIR}/tests/compress_import.cmake)
+  if(TEST golden_tiny_llama)
+    set_tests_properties(compress_import PROPERTIES DEPENDS golden_tiny_llama)
+  endif()
+  get_property(_forge_all_tests DIRECTORY PROPERTY TESTS)
+  foreach(_t ${_forge_all_tests})
+    if(NOT _t STREQUAL "compress_import")
+      set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT FORGE_OPTIMISE=0)
+    endif()
+  endforeach()
+endif()

@@ -435,3 +435,121 @@ TEST(compress_bench_linalg) {
         std::printf("  n=%lld gram %.2fs cholesky %.2fs inverse %.2fs obs(25%%) %.2fs\n", (long long)n, t1 - t0, t2 - t1, t3 - t2, t4 - t3);
     }
 }
+
+// ------------------------------------------------------------------------------------------------ reparameterisation
+namespace {
+std::vector<float> logits_of(Model& m, const std::vector<int>& ids) {
+    Runner r(m.spec, m.w, i64(ids.size()), {}, true);
+    r.run_tokens(ids);
+    auto o = r.output();
+    return {o.begin(), o.end()};
+}
+Model tied_dense(unsigned seed) {
+    Model m = tiny_dense(seed);
+    m.w.t["lm_head"] = m.w.at("tok_emb");
+    return m;
+}
+}  // namespace
+
+TEST(compress_rotate_equalize_preserve_function) {
+    for (int kind = 0; kind < 3; ++kind) {
+        Model m = kind == 0 ? tiny_dense(41) : kind == 1 ? tied_dense(42) : tiny_moe(43);
+        auto c = random_calib(m.spec.vocab, 1, 24, 13);
+        auto ref = logits_of(m, c.seqs[0]);
+        Ctx ctx{m, c, {}, 0.01};
+        run_stage(ctx, parse_recipe("rotate(seed=3)")[0]);
+        auto rot = logits_of(m, c.seqs[0]);
+        CHECK_MSG(max_abs_diff(rot, ref) < 2e-4, "kind %d: rotate changed the function (%g)", kind, max_abs_diff(rot, ref));
+        run_stage(ctx, parse_recipe("equalize")[0]);
+        auto eq = logits_of(m, c.seqs[0]);
+        CHECK_MSG(max_abs_diff(eq, ref) < 2e-4, "kind %d: equalize changed the function (%g)", kind, max_abs_diff(eq, ref));
+        // saved and run by a FORGE session: same function; a tied head is stored once
+        std::string p = tmp("rot.fpk");
+        m.save(p);
+        modelfile::reader rd(p);
+        if (kind == 1) { CHECK(!rd.tensors().count("lm_head")); CHECK(rd.tensors().count("head_mix")); }
+        inference::session s(p);
+        CHECK_MSG(max_abs_diff(s.forward_all(c.seqs[0]), ref) < 2e-4, "kind %d: saved rotated model differs", kind);
+        Model back = Model::load(p);
+        CHECK(max_abs_diff(logits_of(back, c.seqs[0]), ref) < 2e-4);
+        std::filesystem::remove(p);
+    }
+}
+
+TEST(compress_rotation_helps_quantisation) {
+    // an outlier input channel (as in real LLM residual streams) ruins block quantisation; rotation spreads it
+    Model base = tiny_dense(44);
+    for (i64 l = 0; l < base.spec.n_layers(); ++l) for (const char* n : {"attn_norm", "ffn_norm"}) base.w.at(std::format("layer.{}.{}", l, n)).data[5] = 25.f;
+    auto c = random_calib(base.spec.vocab, 4, 32, 14);
+    Reference R = capture_reference(base, c);
+    double kl_plain = 0, kl_rot = 0;
+    for (int rot = 0; rot < 2; ++rot) {
+        Model m = base;
+        Ctx ctx{m, c, {}, 0.01};
+        if (rot) run_stage(ctx, parse_recipe("rotate(seed=1)")[0]);
+        run_stage(ctx, parse_recipe("quant(method=rtn,codec=q4_0)")[0]);
+        (rot ? kl_rot : kl_plain) = kl(m, R);
+    }
+    CHECK_MSG(kl_rot < kl_plain, "rotated q4_0 KL %g should beat plain %g", kl_rot, kl_plain);
+    std::printf("  q4_0 KL: plain %.5f, rotated %.5f\n", kl_plain, kl_rot);
+}
+
+TEST(compress_mixed_precision_and_calibration) {
+    Model m = tiny_dense(45, 4);
+    auto c = random_calib(m.spec.vocab, 4, 32, 15);
+    auto probes = random_calib(m.spec.vocab, 4, 32, 16);
+    Reference R = capture_reference(m, probes);
+    Ctx ctx{m, c, {}, 0.01, &R};
+    auto rep = run_stage(ctx, parse_recipe("quant(method=mixed,ladder=q4_0/q8_0/f16,ref=q8_0,head=none,kl=0.5)")[0]);
+    std::set<std::string> used; for (auto& [k, v] : m.codec) used.insert(v);
+    CHECK_MSG(!m.codec.empty(), "no tensor quantised");
+    const auto& r0 = rep["rounds"].arr().back();
+    CHECK(r0["predicted_err"].num() <= r0["ref_err"].num() * r0["slack"].num() + 1e-12);
+    std::printf("  mixed: %zu codecs used, %.2f bits/weight, KL %.5f\n", used.size(), r0["body_bits_per_weight"].num(), r0["kl"].num());
+    // a miscalibrated output temperature is found and corrected
+    Model t = tiny_dense(46);
+    auto pr = random_calib(t.spec.vocab, 6, 32, 17);
+    Reference Rt = capture_reference(t, pr);
+    for (auto& x : t.w.at("out_norm").data) x *= 1.25f;
+    const double before = kl(t, Rt);
+    Ctx ct{t, pr, {}, 0.01, &Rt};
+    auto cr = run_stage(ct, parse_recipe("calibrate")[0]);
+    const double after = kl(t, Rt);
+    CHECK_MSG(after < before * 0.5, "calibrate: KL %g -> %g", before, after);
+    CHECK_MSG(std::abs(cr["temperature"].num() - 0.8) < 0.05, "temperature %g (expected ~0.8)", cr["temperature"].num());
+    check_saved_runs(t, pr, "calibrated");
+}
+
+TEST(compress_self_generate_and_optimise) {
+    Model m = tiny_dense(47);
+    std::string p = tmp("self.fpk");
+    m.save(p);
+    m.src_path = p;
+    auto c = self_generate(p, m, 5, 40, 1, 4);
+    CHECK(c.seqs.size() == 5);
+    for (auto& s : c.seqs) CHECK(s.size() == 40);
+    auto probes = self_generate(p, m, 3, 32, 9, 4);
+    Reference R = capture_reference(m, probes);
+    Ctx ctx{m, c, {}, 0.01, &R};
+    auto rep = run_stage(ctx, parse_recipe("optimise(kl=1)")[0]);
+    CHECK(!m.codec.empty());
+    check_saved_runs(m, probes, "optimised");
+    std::filesystem::remove(p);
+}
+
+TEST(compress_context_mixer) {
+    // a network that knows nothing (uniform over 1000 tokens) on text that repeats: the mixer learns the repetition
+    const double lu = -std::log(1000.0);
+    const double net[3] = {lu, lu, lu};
+    std::vector<int> pat; std::mt19937 r(3); for (int i = 0; i < 40; ++i) pat.push_back(int(r() % 1000));
+    ContextMixer cm; double nll = 0; int n = 0;
+    cm.hist.push_back(pat[0]); cm.uni[pat[0]] = 1;
+    for (int rep = 0; rep < 6; ++rep) for (std::size_t i = rep == 0 ? 1 : 0; i < pat.size(); ++i) { nll -= cm.step(net, pat[i]); ++n; }
+    CHECK_MSG(nll / n < -lu * 0.4, "mixer nll %g vs uniform %g on repeated text", nll / n, -lu);
+    // on text without structure it costs little over the network
+    ContextMixer c2; double nll2 = 0; int n2 = 0;
+    c2.hist.push_back(1); c2.uni[1] = 1;
+    for (int i = 0; i < 400; ++i) { nll2 -= c2.step(net, int(r() % 1000)); ++n2; }
+    CHECK_MSG(nll2 / n2 < -lu + 0.1, "mixer overhead %g", nll2 / n2 + lu);
+    std::printf("  mixer: repeated text %.3f nats (uniform %.3f), random text overhead %.4f nats\n", nll / n, -lu, nll2 / n2 + lu);
+}

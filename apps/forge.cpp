@@ -88,6 +88,8 @@ int usage() {
         "      [--align 64|4096|65536] file alignment of every tensor (default: 4096 when the source weights are >= 64 MiB, else 64)\n"
         "      [--calib] record statistics of the full-precision weights (\"calib\" section) for a later forge requant\n"
         "      [--shard-size SIZE [--blob-dir DIR]] write a sharded model: tensors in content-addressed blobs (0 = one per tensor)\n"
+        "      (default for float Hugging Face checkpoints: optimised while imported - rotation, mixed-precision GPTQ checked\n"
+        "      against the model's own outputs, output calibration; --no-optimise / FORGE_OPTIMISE=0 / --codec f32|f16|bf16 import as stored)\n"
         "      [--compress RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--report R.json]] compress while importing: the\n"
         "      checkpoint is imported in f32, compressed (see compress below) and written with --codec\n"
         "  compress <model.fpk|hf_dir> -o <out.fpk> --recipe RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--seed 0]\n"
@@ -151,16 +153,31 @@ int usage() {
     return 2;
 }
 
+// FORGE runs optimised models: a plain (float) Hugging Face checkpoint is optimised while it is imported - the
+// data-free forge::compress pipeline `optimise` (rotation / equalisation, mixed-precision GPTQ checked against the
+// model's own outputs, output calibration; docs/compress.md). Off with --no-optimise, FORGE_OPTIMISE=0, or an
+// explicit lossless --codec (f32, f16, bf16, keep); --codec C optimises into C instead of a mixed allocation.
+bool auto_optimise(const std::string& path, const std::string& codec_opt, bool no_opt) {
+    namespace fs = std::filesystem;
+    if (no_opt) return false;
+    if (const char* e = std::getenv("FORGE_OPTIMISE"); e && std::string(e) == "0") return false;
+    if (!fs::is_directory(path) || import::is_blueprint_dir(path) || !fs::exists(fs::path(path) / "config.json")) return false;
+    if (import::read_file(fs::path(path) / "config.json").find("\"quantization_config\"") != std::string::npos) return false;   // AWQ / GPTQ: kept
+    return !(codec_opt == "f32" || codec_opt == "f16" || codec_opt == "bf16" || codec_opt == "keep");
+}
+std::string optimise_recipe(const std::string& codec_opt) { return "optimise(codec=" + (codec_opt.empty() ? std::string("mixed") : codec_opt) + ")"; }
+
 // `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
-std::string resolve_model(const std::string& path, const std::string& codec_opt, bool allow_unused = false) {
+std::string resolve_model(const std::string& path, const std::string& codec_opt, bool allow_unused = false, bool no_opt = false) {
     namespace fs = std::filesystem;
     if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
+    const bool optimise = auto_optimise(path, codec_opt, no_opt);
     // `codec_opt` is --codec as given (empty when absent): Hugging Face inputs default to f32, a GGUF keeps its stored
     // types unless a codec is asked for (then it is re-quantised, and cached under a separate key).
     const bool quantised_src = path.ends_with(".gguf") || (fs::is_directory(path) && fs::exists(fs::path(path) / "config.json") &&
                                import::read_file(fs::path(path) / "config.json").find("\"quantization_config\"") != std::string::npos);
     const bool requant = quantised_src && !codec_opt.empty() && codec_opt != "keep";
-    const std::string codec = codec_opt.empty() || codec_opt == "keep" ? "f32" : codec_opt;
+    const std::string codec = optimise ? "optimised-" + (codec_opt.empty() ? std::string("mixed") : codec_opt) : codec_opt.empty() || codec_opt == "keep" ? "f32" : codec_opt;
     std::string key = fs::absolute(path).string() + "|" + codec + "|" + std::to_string(int(modelfile::format_version)) + (requant ? "|requant" : "");
     if (allow_unused) key += "|allow-unused";
     auto stamp = [&](const fs::path& f) { key += std::format("|{}:{}:{}", f.filename().string(), (unsigned long long)fs::file_size(f),
@@ -174,11 +191,18 @@ std::string resolve_model(const std::string& path, const std::string& codec_opt,
     auto h = hash::blake3::hex(hash::blake3::of({reinterpret_cast<const std::uint8_t*>(key.data()), key.size()})).substr(0, 24);
     fs::path out = dir / (fs::path(path).filename().string() + "-" + codec + "-" + h + ".fpk");
     if (!fs::exists(out)) {
-        import::import_options o; o.codec = codec; if (requant) o.requant = codec;
+        import::import_options o; o.codec = optimise ? std::string("f32") : codec; if (requant) o.requant = codec;
         o.allow_unused = allow_unused;
         auto tmp = out.string() + ".partial";
         auto r = import::is_blueprint_dir(path) ? import::import_blueprint_dir(path, tmp, o)
                : path.ends_with(".gguf") ? import::import_gguf(path, tmp, o) : path.ends_with(".onnx") ? import::import_onnx(path, tmp, o) : import::import_hf(path, tmp, o);
+        if (optimise) {
+            std::fprintf(stderr, "[optimising %s: %s]\n", path.c_str(), optimise_recipe(codec_opt).c_str());
+            compress::cli::opts co; co.in = tmp; co.out = out.string() + ".opt.partial"; co.kv["recipe"] = optimise_recipe(codec_opt);
+            try { compress::cli::compress_file(co); } catch (...) { fs::remove(tmp); throw; }
+            fs::remove(tmp);
+            tmp = co.out;
+        }
         fs::rename(tmp, out);
         std::fprintf(stderr, "[imported %s (%s, %zu tensors) -> %s]\n", path.c_str(), r.template_name.c_str(), r.tensors, out.c_str());
         for (auto& n : r.notes) std::fprintf(stderr, "[import] %s\n", n.c_str());
@@ -261,7 +285,8 @@ int cmd_import(const args& a) {
     // --shard-size SIZE (0 = one blob per tensor) [--blob-dir DIR]: write a sharded model. The import goes to a
     // single file next to the output first, which is then split (modelfile/shard.hpp) and removed.
     const bool shard = a.kv.count("shard-size") != 0;
-    const bool squeeze = !a.get("compress").empty();   // --compress RECIPE: import in f32, compress, then encode
+    const bool optimise = a.get("compress").empty() && !shard && auto_optimise(a.pos[0], a.get("codec"), a.has("no-optimise"));
+    const bool squeeze = !a.get("compress").empty() || optimise;   // --compress RECIPE (or the default optimisation): import in f32, compress, encode
     const std::string out_codec = o.codec;
     if (squeeze) { o.codec = "f32"; o.emb_codec = "f32"; }
     const std::string final_out = a.get("o"), import_out = shard ? final_out + ".unsharded" : squeeze ? final_out + ".f32.tmp" : final_out;
@@ -278,7 +303,8 @@ int cmd_import(const args& a) {
     }
     if (squeeze) {
         compress::cli::opts co; co.in = import_out; co.out = final_out; co.kv = a.kv;
-        co.kv["recipe"] = a.get("compress"); co.kv["codec"] = out_codec;
+        co.kv["recipe"] = optimise ? optimise_recipe(a.get("codec")) : a.get("compress"); co.kv["codec"] = out_codec;
+        if (optimise) std::fprintf(stderr, "forge import: optimising (%s; --no-optimise to import as stored)\n", co.kv["recipe"].c_str());
         json::value rep;
         try { rep = compress::cli::compress_file(co); } catch (...) { os::remove(import_out); throw; }
         os::remove(import_out);
@@ -797,7 +823,7 @@ int cmd_run(const args& a) {
     if (a.pos.empty()) return usage();
     activate_policy(a.get("policy"));
     inference::session_options so; so.context = i64(a.num("ctx", 0)); so.verify = a.has("verify");
-    inference::session s(resolve_model(a.pos[0], a.get("codec"), a.has("allow-unused")), so);
+    inference::session s(resolve_model(a.pos[0], a.get("codec"), a.has("allow-unused"), a.has("no-optimise")), so);
     if (!a.get("adapter").empty()) s.set_adapter(a.get("adapter"));   // a LoRA adapter carried in the model file, by name
     if (s.blueprint().session != "generative_sequence") return run_one_shot(s, a);
     std::vector<int> prompt;
@@ -1410,7 +1436,7 @@ int main(int argc, char** argv) {
         catch (const std::exception& e) { std::fprintf(stderr, "forge script: %s\n", e.what()); return 2; }
     }
     try {
-        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "self-spec", "single-aead", "state", "calib", "no-calib", "pure", "bf16-head"});
+        auto a = parse(argc, argv, 2, {"verify", "tensors", "blueprint", "license", "allow-unused", "ids", "no-bos", "chat", "allow-scripts", "script-no-proc", "script-no-fs", "script-no-net", "quiet", "json", "detached", "lookup", "self-spec", "single-aead", "state", "calib", "no-calib", "pure", "bf16-head", "no-optimise"});
         if (c == "aot") return cmd_aot(parse(argc, argv, 2, {"all-rows", "sidecar", "strip", "list", "embed-weights", "drop-signature"}));
         if (c == "info") return cmd_info();
         if (c == "import") return cmd_import(a);

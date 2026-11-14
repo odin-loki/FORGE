@@ -13,14 +13,21 @@
 //   merge      drop=<experts per layer>  method=ls|avg  score=reap|freq|gate
 //   moe2dense  width=<fraction of E*f neurons kept>  max_err=<auto threshold, 1 = convert all>
 //   quant      method=gptq|rtn  codec=q8_0|q4_0|q4_k|...  scope=all|attn|ffn  head=none|rtn (also quantise tok_emb / lm_head)
+//              method=mixed: a codec per tensor from ladder=q4_k/q5_k/q6_k/q8_0 (low -> high), the fewest bytes whose
+//              predicted error stays within slack x the error of uniform ref=q8_0; round=gptq|rtn; head=<codec>|none;
+//              kl=<target>: measured KL feedback against the reference (halve the error budget until it holds)
+//   rotate     seed=<n> heads=1  randomised Hadamard rotation of the residual stream (+ value heads); exact, data-free
+//   equalize   alpha=1            SwiGLU up/down and V/O channel balancing; exact, data-free
+//   calibrate  bias=1             output temperature + logit bias fitted to the reference distributions
+//   optimise   codec=mixed|<codec> the default pipeline: rotate (dense models) + equalize + quant + calibrate
 #pragma once
 #include <forge/compress/moe.hpp>
 #include <forge/compress/quant.hpp>
+#include <forge/compress/reparam.hpp>
+#include <forge/compress/probes.hpp>
 
 namespace forge::compress {
 
-using forge::json::value;
-using jobj = forge::json::object;
 
 struct Stage {
     std::string name;
@@ -74,8 +81,9 @@ inline Counts count(const Model& m) {
         c.body_params += forge::numel(t.shape); c.body_nonzero += nz;
     }
     c.params = c.body_params; c.nonzero = c.body_nonzero;
-    for (const char* n : {"tok_emb", "out_norm", "lm_head"}) {
+    for (const char* n : {"tok_emb", "out_norm", "lm_head", "logit_bias", "head_mix"}) {
         if (std::string(n) == "lm_head" && tied) continue;
+        if (!m.w.has(n)) continue;
         const auto& t = m.w.at(n);
         i64 nz = 0; for (float x : t.data) nz += x != 0.f;
         c.params += forge::numel(t.shape); c.nonzero += nz;
@@ -92,6 +100,7 @@ struct Ctx {
     const CalibSet& calib;
     std::vector<value> reports;
     double damp = 0.01;
+    const Reference* ref = nullptr;   // the uncompressed model's distributions on probes (feedback / calibrate)
 };
 
 // A linear layer view: a dense matrix, or one expert's slice of a stacked tensor.
@@ -155,7 +164,7 @@ inline value stage_prune(Ctx& c, const Stage& st) {
             else rq.gram = false;
             auto S = layer_pass(m, l, h, rq, &nx);
             for (auto& lv : layer_linears(m, l, S, scope)) {
-                std::vector<double> dg = lv.diag && !lv.diag->empty() ? *lv.diag : (lv.H ? diag_of(*lv.H) : std::vector<double>(std::size_t(lv.cols), 1.0));
+                std::vector<double> dg = lv.diag && !lv.diag->empty() ? *lv.diag : (lv.H ? diag_of(*lv.H) : std::vector<double>(static_cast<std::size_t>(lv.cols), 1.0));
                 PruneCfg w = pc; if (w.crit == Criterion::sparsegpt) w.crit = Criterion::wanda;
                 auto sal = saliency(lv.W, lv.rows, lv.cols, dg, w);
                 auto mask = select_mask(sal, lv.W, lv.rows, lv.cols, w);
@@ -521,7 +530,182 @@ inline value stage_moe2dense(Ctx& c, const Stage& st) {
 }
 
 // ------------------------------------------------------------------------------------------------ quant stage
+inline double abs_error(const float* W, const float* W0, i64 rows, i64 cols, const std::vector<float>& Hf) {
+    std::vector<float> D(static_cast<std::size_t>(rows * cols)), DH(D.size());
+    for (std::size_t i = 0; i < D.size(); ++i) D[i] = W0[i] - W[i];
+    la::gemm_nt(D.data(), Hf.data(), DH.data(), rows, cols, cols);
+    double a = 0; for (std::size_t i = 0; i < D.size(); ++i) a += double(D[i]) * DH[i];
+    return a;
+}
+
+// Mixed precision: per tensor, the predicted residual-relative output error of every ladder codec (RTN), then the
+// cheapest assignment within the error budget; applied with GPTQ (or RTN); optionally checked against the
+// reference distributions and tightened until the measured KL meets its target.
+inline value stage_quant_mixed(Ctx& c, const Stage& st) {
+    Model& m = c.m;
+    std::vector<std::string> ladder;
+    { std::string l = st.str("ladder", "q4_k/q5_k/q6_k/q8_0"); for (std::size_t p = 0; p < l.size();) { auto q = l.find('/', p); if (q == std::string::npos) q = l.size(); ladder.push_back(l.substr(p, q - p)); p = q + 1; } }
+    const std::string refc = st.str("ref", "q8_0"), round = st.str("round", "gptq"), head = st.str("head", "q8_0"), scope = st.str("scope", "all");
+    double slack = st.num("slack", 1.0);
+    const double kl_target = st.num("kl", 0.0);
+    const int max_fb = int(st.num("feedback", 4));
+    const bool sparse = is_sparse_model(m);
+    auto eff = [&](std::string cn, const tensor& t) {   // block-32 sibling when rows do not fit a 256 block; 2:4 codecs on 2:4 tensors
+        if (t.shape.back() % 256 != 0) { if (cn == "q4_k") cn = "q4_0"; else if (cn == "q5_k") cn = "q5_0"; else if (cn == "q6_k" || cn == "q3_k" || cn == "q2_k") cn = cn == "q6_k" ? "q8_0" : "q4_0"; }
+        if (sparse && t.shape.back() % 32 == 0 && is_2of4(t.data.data(), t.data.size(), t.shape.back())) {
+            if (cn == "q8_0" || cn == "q6_k") return std::string("s24_q8");
+            if (cn == "q4_k" || cn == "q5_k" || cn == "q4_0") return std::string("s24_q4");
+            if (cn == "f16") return std::string("s24_f16");
+        }
+        return cn;
+    };
+    struct UnitQ { std::string name; std::vector<std::string> codec; std::vector<double> err; std::vector<double> bytes; std::size_t pick = 0; };
+    std::vector<UnitQ> units;
+    std::map<std::string, std::size_t> uidx;
+    // 1. predicted errors on the current model (one sequential pass, unquantised upstream)
+    {
+        Hidden h = Hidden::embed(m, c.calib), nx;
+        for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+            StatsReq rq; rq.gram = true; rq.moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
+            auto S = layer_pass(m, l, h, rq, &nx);
+            const double R = std::max(S.resid_out, 1e-30);
+            for (auto& lv : layer_linears(m, l, S, scope)) {
+                const std::string tname = lv.name.substr(0, lv.name.find('#'));
+                const auto& t = m.w.at(tname);
+                if (!uidx.count(tname)) {
+                    UnitQ u; u.name = tname;
+                    for (auto& cn : ladder) {
+                        auto e = eff(cn, t);
+                        if (!codec_fits(codec_of(e), t.shape.back())) continue;
+                        u.codec.push_back(e); u.err.push_back(0); u.bytes.push_back(double(codec_of(e).bytes(static_cast<std::size_t>(forge::numel(t.shape)))));
+                    }
+                    if (u.codec.empty()) continue;
+                    uidx[tname] = units.size(); units.push_back(u);
+                }
+                auto& u = units[uidx[tname]];
+                if (!lv.H || lv.H->count == 0) continue;
+                std::vector<float> Hf = la::to_f32(lv.H->H);
+                for (std::size_t k = 0; k < u.codec.size(); ++k) {
+                    std::vector<float> Wq(lv.W, lv.W + lv.rows * lv.cols);
+                    rtn_quantise(Wq.data(), lv.rows, lv.cols, codec_of(u.codec[k]), true);
+                    u.err[k] += abs_error(Wq.data(), lv.W, lv.rows, lv.cols, Hf) / R;
+                }
+            }
+            std::swap(h, nx);
+            say("mixed: error curves for layer {}/{}", l + 1, m.spec.n_layers());
+        }
+    }
+    double ref_err = 0;
+    for (auto& u : units) {
+        auto it = std::find(u.codec.begin(), u.codec.end(), eff(refc, m.w.at(u.name)));
+        ref_err += it != u.codec.end() ? u.err[std::size_t(it - u.codec.begin())] : u.err.back();
+    }
+    // keep the pre-quantisation weights for feedback rounds
+    std::map<std::string, std::vector<float>> orig;
+    for (auto& u : units) orig[u.name] = m.w.at(u.name).data;
+    for (const char* n : {"tok_emb", "lm_head"}) orig[n] = m.w.at(n).data;
+    std::vector<value> rounds;
+    // allocation (Lagrangian): every tensor picks argmin bytes + lambda * err on its own; lambda is bisected so the
+    // total predicted error meets the budget (the convex-hull optimum of the knapsack)
+    auto allocate = [&](double sl) {
+        const double budget = ref_err * sl;
+        auto assign = [&](double lam) {
+            double e = 0;
+            for (auto& u : units) {
+                std::size_t best = 0; double bc = INFINITY;
+                for (std::size_t k = 0; k < u.codec.size(); ++k) { const double cst = u.bytes[k] + lam * u.err[k]; if (cst < bc) { bc = cst; best = k; } }
+                u.pick = best; e += u.err[best];
+            }
+            return e;
+        };
+        double lo = 0, hi = 1;
+        while (assign(hi) > budget && hi < 1e30) hi *= 10;
+        for (int it = 0; it < 80; ++it) { const double mid = std::sqrt(std::max(lo, 1e-30) * hi); if (assign(mid) > budget) lo = mid; else hi = mid; }
+        return assign(hi);
+    };
+    auto restore = [&] {
+        for (auto& u : units) m.w.at(u.name).data = orig[u.name];
+        for (const char* n : {"tok_emb", "lm_head"}) m.w.at(n).data = orig[n];
+        m.codec.clear();
+    };
+    auto quant_head = [&] {
+        if (head == "none") return;
+        for (const char* n : {"tok_emb", "lm_head"}) {
+            auto& t = m.w.at(n);
+            const auto& cd = codec_of(head);
+            if (!codec_fits(cd, t.shape.back())) continue;
+            rtn_quantise(t.data.data(), t.shape[0], t.shape[1], cd, false);
+            m.codec[n] = head;
+        }
+    };
+    auto apply = [&](bool gptq) {
+        restore();
+        Hidden h = Hidden::embed(m, c.calib), nx;
+        for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+            StatsReq rq; rq.gram = gptq; rq.moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
+            if (rq.moe && gptq) rq.gram = true;
+            LayerStats S;
+            if (gptq) S = layer_pass(m, l, h, rq, nullptr);
+            for (auto& lv : layer_linears(m, l, S, scope)) {
+                const std::string tname = lv.name.substr(0, lv.name.find('#'));
+                if (!uidx.count(tname)) continue;
+                const auto& u = units[uidx[tname]];
+                if (u.codec[u.pick] == "f32") continue;
+                const auto& cd = codec_of(u.codec[u.pick]);
+                if (gptq && lv.H && lv.H->count > 0) gptq_quantise(lv.W, lv.rows, lv.cols, lv.H->H, cd, c.damp, true);
+                else rtn_quantise(lv.W, lv.rows, lv.cols, cd, true);
+                m.codec[tname] = u.codec[u.pick];
+            }
+            if (gptq) { layer_forward(m, l, h, nx); std::swap(h, nx); }
+        }
+        quant_head();
+    };
+    auto summary = [&](double sl, double tot, double klv) {
+        double bytes = 0, params = 0;
+        std::map<std::string, i64> hist;
+        for (auto& u : units) { bytes += u.bytes[u.pick]; params += double(forge::numel(m.w.at(u.name).shape)); hist[u.codec[u.pick]] += forge::numel(m.w.at(u.name).shape); }
+        jobj hj; for (auto& [k, v] : hist) hj.push_back({k, value(v)});
+        say("mixed: slack {:.3g}: {:.3f} bits/weight, predicted err {:.4g} (uniform {} {:.4g}), KL {:.5f}", sl, 8 * bytes / std::max(params, 1.0), tot, refc, ref_err, klv);
+        return value(jobj{{"slack", value(sl)}, {"predicted_err", value(tot)}, {"ref_err", value(ref_err)}, {"body_bits_per_weight", value(8 * bytes / std::max(params, 1.0))}, {"codecs", value(hj)}, {"kl", value(klv)}});
+    };
+    // feedback: with a measured KL target, search the largest error budget whose (RTN) model meets it
+    const bool fb = kl_target > 0 && c.ref && !c.ref->empty();
+    if (fb) {
+        double good = 0, bad = 0, prev_bpw = -1;
+        for (int it = 0; it < max_fb + 6; ++it) {
+            const double sl = good == 0 && bad == 0 ? slack : bad == 0 ? good * 4 : good == 0 ? bad / 4 : std::sqrt(good * bad);
+            const double tot = allocate(sl);
+            apply(false);
+            const double klv = kl(m, *c.ref);
+            rounds.push_back(summary(sl, tot, klv));
+            (klv <= kl_target ? good : bad) = sl;
+            const double bpw = rounds.back()["body_bits_per_weight"].num();
+            if (bad == 0 && it > 0 && std::abs(bpw - prev_bpw) < 1e-9) break;   // the cheapest allocation is reached
+            prev_bpw = bpw;
+            if (good > 0 && bad > 0 && bad / good < 1.5) break;
+            if (bad == 0 && good > 1e4) break;
+            if (good == 0 && bad < 1e-3) break;
+        }
+        slack = good > 0 ? good : (bad > 0 ? bad / 4 : slack);
+    }
+    const double tot = allocate(slack);
+    double klv = -1, kl_rtn = -1;
+    if (round == "gptq" && c.ref && !c.ref->empty()) { apply(false); kl_rtn = kl(m, *c.ref); }
+    apply(round == "gptq");
+    if (c.ref && !c.ref->empty()) klv = kl(m, *c.ref);
+    std::string rounding = round;
+    if (kl_rtn >= 0 && klv > kl_rtn) {   // feedback: GPTQ on scarce calibration statistics can overfit - keep the better
+        apply(false); klv = kl_rtn; rounding = "rtn (measured better than gptq)";
+    }
+    rounds.push_back(summary(slack, tot, klv));
+    say("mixed: final rounding {}", rounding);
+    std::vector<value> al;
+    for (auto& u : units) al.push_back(value(jobj{{"tensor", value(u.name)}, {"codec", value(u.codec[u.pick])}}));
+    return value(jobj{{"stage", value(st.text())}, {"rounds", value(rounds)}, {"allocation", value(al)}});
+}
+
 inline value stage_quant(Ctx& c, const Stage& st) {
+    if (st.str("method", "gptq") == "mixed") return stage_quant_mixed(c, st);
     Model& m = c.m;
     const std::string method = st.str("method", "gptq"), scope = st.str("scope", "all"), cname = st.str("codec", "q8_0");
     const auto& cd = codec_of(cname);
@@ -574,17 +758,43 @@ inline value stage_quant(Ctx& c, const Stage& st) {
     return value(rep);
 }
 
+inline value run_stage(Ctx& c, const Stage& st);
+
+inline value stage_optimise(Ctx& c, const Stage& st) {
+    Model& m = c.m;
+    std::vector<value> sub;
+    const bool sparse = is_sparse_model(m);
+    if (!sparse && is_pow2(m.spec.d_model) && st.str("rotate", "1") == "1") sub.push_back(run_stage(c, Stage{"rotate", {{"seed", st.str("seed", "0")}}}));
+    if (st.str("equalize", "1") == "1") sub.push_back(run_stage(c, Stage{"equalize", {}}));
+    const std::string codec = st.str("codec", "mixed");
+    if (codec == "mixed") sub.push_back(run_stage(c, Stage{"quant", {{"method", "mixed"}, {"kl", st.str("kl", "0.005")}, {"slack", st.str("slack", "1")}, {"head", st.str("head", "q8_0")}}}));
+    else if (codec != "f32") sub.push_back(run_stage(c, Stage{"quant", {{"method", "gptq"}, {"codec", codec}, {"head", "rtn"}}}));
+    if (c.ref && st.str("calibrate", "1") == "1") sub.push_back(run_stage(c, Stage{"calibrate", {}}));
+    return value(jobj{{"stage", value(st.text())}, {"sparse", value(sparse)}, {"stages", value(sub)}});
+}
+
 inline value run_stage(Ctx& c, const Stage& st) {
     const double t0 = now_s();
     say("stage {}", st.text());
     value r;
-    if (st.name == "prune") r = stage_prune(c, st);
+    if (st.name == "none") r = value(jobj{{"stage", value("none")}});   // storage only (e.g. a new codec)
+    else if (st.name == "prune") r = stage_prune(c, st);
     else if (st.name == "width") r = stage_width(c, st);
     else if (st.name == "depth") r = stage_depth(c, st);
     else if (st.name == "experts") r = stage_experts(c, st);
     else if (st.name == "merge") r = stage_merge(c, st);
     else if (st.name == "moe2dense") r = stage_moe2dense(c, st);
     else if (st.name == "quant") r = stage_quant(c, st);
+    else if (st.name == "rotate") {
+        if (is_sparse_model(c.m) && st.str("force", "0") != "1") r = value(jobj{{"stage", value(st.text())}, {"skipped", value("sparse model: rotation would densify it")}});
+        else r = rotate_model(c.m, std::uint64_t(st.num("seed", 0)), st.str("heads", "1") == "1");
+    }
+    else if (st.name == "equalize") r = equalize_model(c.m, st.num("alpha", 1.0));
+    else if (st.name == "calibrate") {
+        if (!c.ref || c.ref->empty()) die("calibrate needs reference probes (forge compress captures them when the recipe has calibrate / kl)");
+        r = calibrate_distribution(c.m, *c.ref, st.str("bias", "1") == "1");
+    }
+    else if (st.name == "optimise" || st.name == "optimize") r = stage_optimise(c, st);
     else die("unknown stage " + st.name);
     auto& o = r.obj_mut();
     o.push_back({"seconds", value(now_s() - t0)});
