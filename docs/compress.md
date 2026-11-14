@@ -8,7 +8,7 @@ FORGE runs optimised models. `forge import` optimises a float Hugging Face check
 - evaluation uses `forge::inference::session`
 
 The code is in `compress/include/forge/compress/` (header-only, CMake target `forge_compress`). The tests are in
-`tests/test_compress.cpp` and `tests/compress_import.cmake`, and the experiment plan is `tools/compress_plan.cpp`
+`tests/test_compress.cpp`, `tests/test_compress_runtime.cpp` and `tests/compress_import.cmake`, and the experiment plan is `tools/compress_plan.cpp`
 (ForgeScript).
 
 ## Commands
@@ -21,6 +21,8 @@ forge import <hf_dir> -o model.fpk --compress RECIPE [--calib-data FILE|self]
 forge compress model.fpk -o small.fpk --recipe RECIPE [--calib-data FILE|self] [--nsamples 64] [--seqlen 512]
                [--codec C] [--report r.json] [--data DIR --ppl-windows 40 --tasks arc_easy,... --limit 200 --mix 1]
 forge eval model.fpk --data DIR [--ppl-windows 40] [--tasks ...] [--limit 200] [--mix 1] [--report r.json]
+           [--kv-codec int8|fp8|tbq4|tbq3|k8v4] [--draft small.fpk --spec-tokens 64 --spec-prompts 8 --spec-prompt-len 128 --spec-k 4]
+forge run model.fpk --prompt TEXT --mix 1                # generation from the context-mixed distribution
 ```
 
 `forge run <hf_dir>` caches an optimised import in the same way.
@@ -29,6 +31,11 @@ Calibration data:
 
 - `--calib-data self` (the default) uses text the model writes itself. It is sampled with FORGE's continuous
   batching, so no dataset is needed.
+- `--self-mode jacobi [--jacobi-passes 6]` samples it with full-sequence prefills instead (`jacobi_generate`, a Jacobi
+  fixed-point iteration of autoregressive sampling with Gumbel-coupled per-position noise; its fixed point is exactly
+  the autoregressive sample). Prefill rows are cheaper than decode steps, but real models settle only about one
+  position per pass (qwen3-0.6b, 96 tokens: ~75 % of the positions change in every pass, NLL 8.1 nats/token after
+  6 passes against 1.8 for decoded text), so decoding stays the default.
 - A `.jsonl` file of `{"text": ...}` documents, or a plain text file, can be given instead.
 - `tools/compress_data.py` prepares WikiText-2, C4 and the zero-shot tasks for `forge eval`.
 
@@ -74,8 +81,22 @@ mixed:
 - a unigram cache and a bigram cache
 - a match model
 
-The mixing weights are learned online, one weight set per context (match-length bucket × bigram seen), with Bayesian
-updates and fixed-share smoothing. The mixer only uses past tokens, so it is a valid online predictor.
+The mixing weights are learned online, one weight set per context (match-length bucket × bigram seen; a set used for
+the first time starts from the nearest shorter-match set), with Bayesian updates and fixed-share smoothing. The mixer
+only uses past tokens, so it is a valid online predictor.
+
+The same models (`mixer.hpp`) also give the full mixed next-token distribution (`StreamMixer`: a dense part for the
+network's three components, sparse parts over the tokens the caches have seen). `forge run --mix 1` samples from it
+through the sampler's logit filter (temperature, top-k and top-p then apply to it); the prompt trains the weights.
+
+## KV-cache codecs and speculative decoding
+
+- `forge eval --kv-codec C` evaluates with a quantised KV cache (`session_options::kv_codec`); the report records it.
+- `forge eval --draft small.fpk` measures greedy speculative decoding (FORGE's `speculative_generate`, `--spec-k`
+  drafts per pass, 0 = planner) with that draft against plain greedy decoding of the model, on `--spec-prompts`
+  WikiText windows of `--spec-prompt-len` tokens, `--spec-tokens` new tokens each. The report's `speculative` entry
+  has the acceptance rate, tokens per pass, decode tokens/s of both and their ratio, and how many outputs were
+  identical (greedy verification is lossless).
 
 ## Notes
 

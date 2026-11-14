@@ -92,11 +92,15 @@ int usage() {
         "      against the model's own outputs, output calibration; --no-optimise / FORGE_OPTIMISE=0 / --codec f32|f16|bf16 import as stored)\n"
         "      [--compress RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--report R.json]] compress while importing: the\n"
         "      checkpoint is imported in f32, compressed (see compress below) and written with --codec\n"
-        "  compress <model.fpk|hf_dir> -o <out.fpk> --recipe RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--seed 0]\n"
+        "  compress <model.fpk|hf_dir> -o <out.fpk> --recipe RECIPE --calib-data FILE|self [--nsamples 64] [--seqlen 512] [--seed 0]\n"
+        "      [--self-mode decode|jacobi] [--jacobi-passes 6]   self: text the model writes (decoded, or Jacobi prefill sampling)\n"
         "      [--codec C] [--report R.json] [--data DIR ...eval options]   prune / sparsify / shrink / convert a model (docs/compress.md)\n"
         "      RECIPE: stage(k=v,..)+stage(..); stages prune, width, depth, experts, merge, moe2dense\n"
         "  eval <model.fpk> --data DIR [--ppl-windows 40] [--ppl-window 512] [--tasks arc_easy,hellaswag,..] [--limit 200] [--report R.json]\n"
         "      WikiText-2 perplexity and zero-shot accuracy on FORGE's inference engine (data: tools/compress_data.py)\n"
+        "      [--mix 1] context-mixed perplexity  [--kv-codec int8|fp8|tbq4|tbq3|k8v4] KV-cache codec of the evaluation\n"
+        "      [--draft small.fpk [--spec-tokens 64] [--spec-prompts 8] [--spec-prompt-len 128] [--spec-k 4]] greedy speculative decoding\n"
+        "      with that draft on WikiText prompts: acceptance, tokens/s vs plain greedy, identical outputs\n"
         "  shard split <in.fpk> -o <out.fpk> [--shard-size 2G] [--blob-dir DIR]   tensors into blobs named by their BLAKE3 hash\n"
         "      (default one blob per tensor: models that share tensors store them once); blobs go to DIR, $FORGE_BLOB_DIR or ./blobs next to out\n"
         "  shard join <in.fpk> -o <out.fpk>  |  shard list <model.fpk>             back to one file; which blobs are present\n"
@@ -110,7 +114,7 @@ int usage() {
         "  run <model.fpk> (--prompt TEXT | --tokens 1,2,3) [-n 32] [--temp 0] [--top-k 0] [--top-p 1]\n"
         "      [--min-p 0] [--repeat-penalty 1] [--seed 0] [--ctx N] [--ids] [--logits out.f32] [--verify]\n"
         "      [--grammar file.gbnf] [--draft draft.fpk | --lookup [--ngram 3] [--ngram-min 1] | --self-spec [--exit-layer K]] [--spec-k 0 (0 = planner)]\n"
-        "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)]\n"
+        "      [--codec C (for hf/gguf inputs)] [--allow-unused (for hf/gguf inputs)] [--mix 1 (online context mixing of the distribution)]\n"
         "      (<model> may also be a Hugging Face directory or a .gguf: imported once into ~/.cache/forge)\n"
         "      one-shot graphs (imported ONNX): --input name=file.f32 ... [--dim name=N ...] [--out prefix]; integer inputs take file.i64 / file.i32\n"
         "  embed <model.fpk> (--text TEXT [--text-pair TEXT] [--ids] | --tokens 1,2,3 [--token-types ..] [--mask 1,1,0] | --input name=file.f32 ...)\n"
@@ -873,7 +877,10 @@ int cmd_run(const args& a) {
     // Not with --grammar: the constraint advances one token at a time.
     // --self-spec [--exit-layer K]: drafts from the model's own early exit (its first K layers and the LM head);
     // K defaults to the blueprint's `early_exit`, else half the depth. The output is that of plain decoding.
-    if ((a.kv.count("draft") || a.has("lookup") || a.has("self-spec")) && !gc) {
+    // --mix 1: online context mixing (forge::compress::StreamMixer): tokens are drawn from the network's distribution
+    // mixed with unigram / bigram / match models of the prompt and output (docs/compress.md). Not with speculation.
+    const bool mix = a.get("mix", "0") == "1";
+    if ((a.kv.count("draft") || a.has("lookup") || a.has("self-spec")) && !gc && !mix) {
         inference::speculative_stats sst;
         int k = int(a.num("spec-k", 0)), n = int(a.num("n", 32));
         if (a.has("self-spec")) {
@@ -894,7 +901,9 @@ int cmd_run(const args& a) {
         return 0;
     }
     inference::generate_stats st;
-    std::vector<int> out = s.generate(prompt, int(a.num("n", 32)), smp, show, &st);
+    compress::StreamMixer mixer;
+    std::vector<int> out = mix ? compress::generate_mixed(s, prompt, int(a.num("n", 32)), smp, mixer, show, &st)
+                               : s.generate(prompt, int(a.num("n", 32)), smp, show, &st);
     std::printf("\n");
     std::fprintf(stderr, "[%zu prompt tokens in %.3fs, %zu new tokens in %.3fs = %.1f tok/s; plans %zu compiled, %zu reused]\n",
                  st.prompt_tokens, st.prefill_s, st.new_tokens, st.decode_s, st.new_tokens > 1 ? double(st.new_tokens - 1) / st.decode_s : 0.0,
