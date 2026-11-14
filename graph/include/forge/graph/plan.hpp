@@ -9,6 +9,7 @@
 #include <forge/simd/qdot.hpp>
 #include <forge/simd/qdot_i8.hpp>
 #include <forge/graph/kv_codec.hpp>
+#include <forge/graph/s24_gemm.hpp>
 #include <forge/graph/memplan.hpp>
 #include <forge/graph/passes.hpp>
 #include <forge/gpu/gpu.hpp>
@@ -243,6 +244,8 @@ inline void gemm_nt(std::span<const tensor_view> in, tensor_view out, const ops:
     const auto& x = in[0]; const auto& w = in[1];
     std::size_t k = std::size_t(x.shape.back()), m = x.size() / k, n = std::size_t(w.shape[0]);
     const auto* c = codec_of(w); std::size_t rb = c->bytes(k);
+    // 2:4 sparse rows: the kept values times the activations they sit over, no dense decode (graph/s24_gemm.hpp)
+    if (const int sb = s24::bits_of(c); sb && s24::enabled()) return s24::gemm_nt(sb, w.qdata, rb, n, x.data, m, k, out.data);
     if (const int f = fmt_of(c); int8_enabled() && simd::qi8::supported(f, k)) return gemm_nt_i8(f, w.qdata, rb, n, x.data, m, k, out.data);
     // FORGE_QDOT=0: plain scalar codec decode + dot (the pre-SIMD path; benchmarking and bisecting)
     static const bool native = [] { auto* e = std::getenv("FORGE_QDOT"); return !(e && std::string(e) == "0"); }();
