@@ -824,3 +824,4 @@ inline value run_stage(Ctx& c, const Stage& st) {
 
 // Modules that register their stages (stage_registry / alloc_registry).
 #include <forge/compress/spectral.hpp>
+#include <forge/compress/heads.hpp>
