@@ -126,7 +126,7 @@ inline tensor_t parse_tensor(std::string_view s, const external_loader* ext = nu
         case 14: if (f.v == 1) external = true; break;   // data_location = EXTERNAL
         }
     });
-    i64 n = 1; for (auto d : t.dims) { if (d < 0 || d > (i64(1) << 40)) raise(errc::format_error, "onnx: tensor {} has bad dims", t.name); n *= d; if (n > (i64(1) << 40)) raise(errc::format_error, "onnx: tensor {} too large", t.name); }
+    i64 n = 1; for (auto d : t.dims) { if (d < 0 || d > (i64(1) << 40)) raise(errc::format_error, "onnx: tensor {} has bad dims", t.name); if (d && n > (i64(1) << 40) / d) raise(errc::format_error, "onnx: tensor {} too large", t.name); n *= d; }   // checked first: n * d could overflow
     auto width = [&]() -> std::size_t {
         switch (t.dtype) { case 1: case 6: case 12: return 4; case 11: case 7: case 13: return 8; case 10: case 5: return 2; case 9: case 2: case 3: return 1; default: return 0; }
     };
