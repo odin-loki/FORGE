@@ -59,7 +59,7 @@ inline double row_lse(const float* z, i64 V, double t = 1.0) {
 struct Reference {
     CalibSet probes;
     i64 vocab = 0;
-    std::vector<std::vector<std::uint16_t>> logp;   // per sequence [seq, vocab] f16 log-probabilities
+    std::vector<mapped_vector<std::uint16_t>> logp;   // per sequence [seq, vocab] f16 log-probabilities (scratch-file backed when large)
     bool empty() const { return probes.seqs.empty(); }
     float at(std::size_t s, i64 t, i64 v) const { return float(f16::from_bits(logp[s][std::size_t(t * vocab + v)])); }
 };
@@ -70,7 +70,7 @@ inline Reference capture_reference(Model& m, const CalibSet& probes) {
     for (auto& ids : probes.seqs) {
         r.run_tokens(ids);
         auto z = r.output();
-        std::vector<std::uint16_t> lp(z.size());
+        mapped_vector<std::uint16_t> lp(z.size());
         la::parallel_for(static_cast<std::size_t>(probes.seq), 4, [&](std::size_t b, std::size_t e) {
             for (std::size_t t = b; t < e; ++t) {
                 const float* row = z.data() + i64(t) * R.vocab;

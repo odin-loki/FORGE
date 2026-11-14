@@ -106,13 +106,43 @@ using alloc_fn = std::map<std::string, double> (*)(Ctx&, const struct PruneCfg&,
 inline std::map<std::string, alloc_fn>& alloc_registry() { static std::map<std::string, alloc_fn> r; return r; }
 inline bool register_alloc(const std::string& n, alloc_fn f) { alloc_registry()[n] = f; return true; }
 
+// Per-layer progress of a sequential stage loop, for checkpoint / resume (checkpoint.hpp installs Ctx::on_layer).
+// `phase` names the loop within its stage; `h` is the hidden state entering layer+1 (after the layer) and `carry`
+// the loop's accumulators (its report entries), which a resumed run gets back.
+struct LayerEvent { const char* phase; i64 layer; bool done; bool modified; Hidden* h; value* carry; };
+
 struct Ctx {
     Model& m;
     const CalibSet& calib;
     std::vector<value> reports;
     double damp = 0.01;
     const Reference* ref = nullptr;   // the uncompressed model's distributions on probes (feedback / calibrate)
+    std::function<bool(const LayerEvent&)> on_layer;   // empty: no checkpointing
 };
+
+// Checkpoint hooks of a sequential loop (no-ops without Ctx::on_layer):
+//   for (i64 l = 0; l < n; ++l) {
+//       if (layer_resumed(c, "prune", l, h, carry)) { <read the accumulators back from carry>; continue; }
+//       ... compress layer l ...; layer_forward(m, l, h, nx); std::swap(h, nx);
+//       carry = <the accumulators>; layer_finished(c, "prune", l, h, carry);
+//   }
+// layer_resumed: true when an interrupted earlier run finished layer l; its tensors, spec and codecs, the carry and
+// (at the last finished layer) the hidden state have been restored, and the loop skips the layer.
+// layer_finished: may write a checkpoint (every N layers / M minutes). `modified`: the loop changed layer l's
+// tensors (else only the hidden state and carry are saved).
+inline bool layer_resumed(Ctx& c, const char* phase, i64 l, Hidden& h, value& carry) {
+    return c.on_layer && c.on_layer({phase, l, false, false, &h, &carry});
+}
+inline void layer_finished(Ctx& c, const char* phase, i64 l, Hidden& h, value& carry, bool modified = true) {
+    if (c.on_layer) c.on_layer({phase, l, true, modified, &h, &carry});
+}
+// Doubles that must survive a checkpoint exactly (the JSON writer prints 9 digits): stored as hex-float strings.
+inline value exact_num(double x) {
+    std::string s = std::format("{:a}", std::abs(x));
+    if (std::isfinite(x)) s = "0x" + s;
+    return value(std::signbit(x) ? "-" + s : s);
+}
+inline double exact_of(const value& v) { return v.is_num() ? v.num() : std::strtod(v.str().c_str(), nullptr); }
 
 // A linear layer view: a dense matrix, or one expert's slice of a stacked tensor.
 struct LinView { std::string name; float* W; i64 rows, cols; const la::Gram* H; const std::vector<double>* diag; };
@@ -229,7 +259,9 @@ inline value stage_prune(Ctx& c, const Stage& st) {
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> layers;
     double err_sum = 0; i64 err_n = 0;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+        if (layer_resumed(c, "prune", l, h, carry)) { layers = carry["layers"].arr(); err_sum = exact_of(carry["err_sum"]); err_n = carry["err_n"].i(); continue; }
         StatsReq rq; rq.gram = need_gram; rq.moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
         if (rq.moe) rq.gram = true;   // per-expert statistics need the routed Gram (diagonal at least)
         auto S = layer_pass(m, l, h, rq, nullptr);
@@ -266,6 +298,8 @@ inline value stage_prune(Ctx& c, const Stage& st) {
         std::swap(h, nx);
         layers.push_back(value(lr));
         say("prune layer {}/{} done", l + 1, m.spec.n_layers());
+        carry = value(jobj{{"layers", value(layers)}, {"err_sum", exact_num(err_sum)}, {"err_n", value(err_n)}});
+        layer_finished(c, "prune", l, h, carry);
     }
     rep.push_back({"layers", value(layers)});
     rep.push_back({"mean_rel_err", value(err_n ? err_sum / double(err_n) : 0.0)});
@@ -321,7 +355,9 @@ inline value stage_width(Ctx& c, const Stage& st) {
 
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> layers;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+        if (layer_resumed(c, "width", l, h, carry)) { layers = carry["layers"].arr(); continue; }
         if (m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::dense && !m.spec.factored(l, "w_down") && !m.spec.factored(l, "w_gate") && !m.spec.factored(l, "w_up")) {
             StatsReq rq; rq.gram = true; rq.only = {"down"};
             auto S = layer_pass(m, l, h, rq, nullptr);
@@ -337,6 +373,8 @@ inline value stage_width(Ctx& c, const Stage& st) {
         }
         layer_forward(m, l, h, nx);
         std::swap(h, nx);
+        carry = value(jobj{{"layers", value(layers)}});
+        layer_finished(c, "width", l, h, carry);
     }
     rep.push_back({"layers", value(layers)});
     return value(rep);
@@ -437,7 +475,9 @@ inline value stage_depth(Ctx& c, const Stage& st) {
     for (auto& k : chosen) for (auto& s : subs_of(k)) todo.push_back(s);
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> repl;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+        if (replace == "linear" && layer_resumed(c, "depth", l, h, carry)) { repl = carry["replaced"].arr(); continue; }
         bool attn_rm = false, ffn_rm = false;
         for (auto& s : todo) if (s.layer == l) (s.attn ? attn_rm : ffn_rm) = true;
         if (attn_rm) remove_sublayer(m, {l, true});
@@ -450,7 +490,11 @@ inline value stage_depth(Ctx& c, const Stage& st) {
                 say("depth: layer {} FFN -> rank-{} linear ({:.3f} of output energy)", l, rank, expl);
             } else remove_sublayer(m, {l, false});
         }
-        if (replace == "linear") { layer_forward(m, l, h, nx); std::swap(h, nx); }
+        if (replace == "linear") {
+            layer_forward(m, l, h, nx); std::swap(h, nx);
+            carry = value(jobj{{"replaced", value(repl)}});
+            layer_finished(c, "depth", l, h, carry);
+        }
     }
     std::vector<value> ch; for (auto& k : chosen) ch.push_back(value(k));
     rep.push_back({"removed", value(ch)});
@@ -467,8 +511,11 @@ inline value stage_experts(Ctx& c, const Stage& st) {
     jobj rep{{"stage", value(st.text())}};
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> layers;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
-        if (m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe) {
+        if (layer_resumed(c, "experts", l, h, carry)) { layers = carry["layers"].arr(); continue; }
+        const bool moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
+        if (moe) {
             StatsReq rq; rq.gram = false; rq.moe = true;
             auto S = layer_pass(m, l, h, rq, nullptr);
             auto scores = expert_scores(S, sc);
@@ -479,6 +526,8 @@ inline value stage_experts(Ctx& c, const Stage& st) {
         }
         layer_forward(m, l, h, nx);
         std::swap(h, nx);
+        carry = value(jobj{{"layers", value(layers)}});
+        layer_finished(c, "experts", l, h, carry, moe);
     }
     rep.push_back({"layers", value(layers)});
     return value(rep);
@@ -492,8 +541,11 @@ inline value stage_merge(Ctx& c, const Stage& st) {
     jobj rep{{"stage", value(st.text())}};
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> layers;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
-        if (m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe) {
+        if (layer_resumed(c, "merge", l, h, carry)) { layers = carry["layers"].arr(); continue; }
+        const bool moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
+        if (moe) {
             StatsReq rq; rq.gram = false; rq.moe = true; rq.moe_means = true;
             auto S = layer_pass(m, l, h, rq, nullptr);
             auto plan = plan_merges(S, drop, sc);
@@ -506,6 +558,8 @@ inline value stage_merge(Ctx& c, const Stage& st) {
         }
         layer_forward(m, l, h, nx);
         std::swap(h, nx);
+        carry = value(jobj{{"layers", value(layers)}});
+        layer_finished(c, "merge", l, h, carry, moe);
     }
     rep.push_back({"layers", value(layers)});
     return value(rep);
@@ -518,8 +572,11 @@ inline value stage_moe2dense(Ctx& c, const Stage& st) {
     jobj rep{{"stage", value(st.text())}};
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> layers;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
-        if (m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe) {
+        if (layer_resumed(c, "moe2dense", l, h, carry)) { layers = carry["layers"].arr(); continue; }
+        const bool moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
+        if (moe) {
             StatsReq rq; rq.gram = false; rq.moe_dense_acts = true;
             auto S = layer_pass(m, l, h, rq, nullptr);
             const auto& wg = m.w.at(std::format("layer.{}.experts.w_gate", l));
@@ -527,7 +584,7 @@ inline value stage_moe2dense(Ctx& c, const Stage& st) {
             const i64 keep = std::clamp<i64>(i64(std::llround(double(n) * width / double(round))) * round, round, n);
             // try, and keep the MoE layer if the dense fit is worse than max_err
             auto saved_spec = m.spec.layers[std::size_t(l)];
-            std::map<std::string, tensor> saved;
+            std::map<std::string, wtensor> saved;
             for (auto& nm : layer_tensors(m.spec, l)) saved[nm] = m.w.at(nm);
             const double err = moe_to_dense(m, l, S, keep);
             bool ok = err <= max_err;
@@ -541,6 +598,8 @@ inline value stage_moe2dense(Ctx& c, const Stage& st) {
         }
         layer_forward(m, l, h, nx);
         std::swap(h, nx);
+        carry = value(jobj{{"layers", value(layers)}});
+        layer_finished(c, "moe2dense", l, h, carry, moe);
     }
     rep.push_back({"layers", value(layers)});
     return value(rep);
@@ -567,7 +626,7 @@ inline value stage_quant_mixed(Ctx& c, const Stage& st) {
     const double kl_target = st.num("kl", 0.0);
     const int max_fb = int(st.num("feedback", 4));
     const bool sparse = is_sparse_model(m);
-    auto eff = [&](std::string cn, const tensor& t) {   // block-32 sibling when rows do not fit a 256 block; 2:4 codecs on 2:4 tensors
+    auto eff = [&](std::string cn, const wtensor& t) {   // block-32 sibling when rows do not fit a 256 block; 2:4 codecs on 2:4 tensors
         if (t.shape.back() % 256 != 0) { if (cn == "q4_k") cn = "q4_0"; else if (cn == "q5_k") cn = "q5_0"; else if (cn == "q6_k" || cn == "q3_k" || cn == "q2_k") cn = cn == "q6_k" ? "q8_0" : "q4_0"; }
         if (sparse && t.shape.back() % 32 == 0 && is_2of4(t.data.data(), t.data.size(), t.shape.back())) {
             if (cn == "q8_0" || cn == "q6_k") return std::string("s24_q8");
@@ -579,10 +638,30 @@ inline value stage_quant_mixed(Ctx& c, const Stage& st) {
     struct UnitQ { std::string name; std::vector<std::string> codec; std::vector<double> err; std::vector<double> bytes; std::size_t pick = 0; };
     std::vector<UnitQ> units;
     std::map<std::string, std::size_t> uidx;
+    // checkpoint carry of pass 1: the error curves so far
+    auto pack_units = [&] {
+        std::vector<value> us;
+        for (auto& u : units) {
+            std::vector<value> cs, es, bs;
+            for (std::size_t k = 0; k < u.codec.size(); ++k) { cs.push_back(value(u.codec[k])); es.push_back(exact_num(u.err[k])); bs.push_back(exact_num(u.bytes[k])); }
+            us.push_back(value(jobj{{"name", value(u.name)}, {"codec", value(cs)}, {"err", value(es)}, {"bytes", value(bs)}}));
+        }
+        return value(jobj{{"units", value(us)}});
+    };
+    auto unpack_units = [&](const value& v) {
+        units.clear(); uidx.clear();
+        for (auto& x : v["units"].arr()) {
+            UnitQ u; u.name = x["name"].str();
+            for (std::size_t k = 0; k < x["codec"].arr().size(); ++k) { u.codec.push_back(x["codec"][k].str()); u.err.push_back(exact_of(x["err"][k])); u.bytes.push_back(exact_of(x["bytes"][k])); }
+            uidx[u.name] = units.size(); units.push_back(u);
+        }
+    };
     // 1. predicted errors on the current model (one sequential pass, unquantised upstream)
     {
         Hidden h = Hidden::embed(m, c.calib), nx;
+        value carry;
         for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+            if (layer_resumed(c, "mixed.err", l, h, carry)) { unpack_units(carry); continue; }
             StatsReq rq; rq.gram = true; rq.moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
             auto S = layer_pass(m, l, h, rq, &nx);
             const double R = std::max(S.resid_out, 1e-30);
@@ -610,6 +689,8 @@ inline value stage_quant_mixed(Ctx& c, const Stage& st) {
             }
             std::swap(h, nx);
             say("mixed: error curves for layer {}/{}", l + 1, m.spec.n_layers());
+            carry = pack_units();
+            layer_finished(c, "mixed.err", l, h, carry, false);
         }
     }
     double ref_err = 0;
@@ -618,7 +699,7 @@ inline value stage_quant_mixed(Ctx& c, const Stage& st) {
         ref_err += it != u.codec.end() ? u.err[std::size_t(it - u.codec.begin())] : u.err.back();
     }
     // keep the pre-quantisation weights for feedback rounds
-    std::map<std::string, std::vector<float>> orig;
+    std::map<std::string, fbuf> orig;
     for (auto& u : units) orig[u.name] = m.w.at(u.name).data;
     for (const char* n : {"tok_emb", "lm_head"}) orig[n] = m.w.at(n).data;
     std::vector<value> rounds;
@@ -658,7 +739,9 @@ inline value stage_quant_mixed(Ctx& c, const Stage& st) {
     auto apply = [&](bool gptq) {
         restore();
         Hidden h = Hidden::embed(m, c.calib), nx;
+        value carry;
         for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+            if (gptq && layer_resumed(c, "mixed.apply", l, h, carry)) continue;
             StatsReq rq; rq.gram = gptq; rq.moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
             if (rq.moe && gptq) rq.gram = true;
             LayerStats S;
@@ -673,7 +756,7 @@ inline value stage_quant_mixed(Ctx& c, const Stage& st) {
                 else rtn_quantise(lv.W, lv.rows, lv.cols, cd, true);
                 m.codec[tname] = u.codec[u.pick];
             }
-            if (gptq) { layer_forward(m, l, h, nx); std::swap(h, nx); }
+            if (gptq) { layer_forward(m, l, h, nx); std::swap(h, nx); layer_finished(c, "mixed.apply", l, h, carry); }
         }
         quant_head();
     };
@@ -732,7 +815,12 @@ inline value stage_quant(Ctx& c, const Stage& st) {
     Hidden h = Hidden::embed(m, c.calib), nx;
     double err_sum = 0; i64 err_n = 0, quantised = 0, skipped = 0;
     std::set<std::string> done_stacked;
+    value carry;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
+        if (gptq && layer_resumed(c, "quant", l, h, carry)) {
+            err_sum = exact_of(carry["err_sum"]); err_n = carry["err_n"].i(); quantised = carry["quantised"].i(); skipped = carry["skipped"].i();
+            continue;
+        }
         StatsReq rq; rq.gram = gptq; rq.moe = m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::moe;
         if (rq.moe) rq.gram = true;
         LayerStats S;
@@ -756,7 +844,11 @@ inline value stage_quant(Ctx& c, const Stage& st) {
             ++quantised;
         }
         if (gptq) { layer_forward(m, l, h, nx); std::swap(h, nx); }
-        if (gptq) say("quant layer {}/{} done", l + 1, m.spec.n_layers());
+        if (gptq) {
+            say("quant layer {}/{} done", l + 1, m.spec.n_layers());
+            carry = value(jobj{{"err_sum", exact_num(err_sum)}, {"err_n", value(err_n)}, {"quantised", value(quantised)}, {"skipped", value(skipped)}});
+            layer_finished(c, "quant", l, h, carry);
+        }
     }
     if (st.str("head", "none") == "rtn") {
         for (const char* n : {"tok_emb", "lm_head"}) {

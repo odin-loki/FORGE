@@ -67,10 +67,11 @@ inline CalibSet make_calib(const Model& m, const std::string& source, i64 n, i64
 }
 
 // ---------------------------------------------------------------------------------------------------- hidden
-// The residual stream of every calibration sequence at one depth: [n_seq, seq, d].
+// The residual stream of every calibration sequence at one depth: [n_seq, seq, d] (a mapped_vector: scratch-file
+// backed when large, see mapped.hpp).
 struct Hidden {
     i64 n = 0, seq = 0, d = 0;
-    std::vector<float> x;
+    fbuf x;
     float* at(i64 i) { return x.data() + i * seq * d; }
     const float* at(i64 i) const { return x.data() + i * seq * d; }
     static Hidden embed(const Model& m, const CalibSet& c) {
