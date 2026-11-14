@@ -374,6 +374,30 @@ template <class W> void store_hf_tokenizer(const std::filesystem::path& dir, jso
         if (auto* ab = tok_cfg.find("add_bos_token"); ab && ab->is_bool() && !has("add_bos")) man.emplace_back("add_bos", ab->b());
         if (auto* ae = tok_cfg.find("add_eos_token"); ae && ae->is_bool() && !has("add_eos")) man.emplace_back("add_eos", ae->b());
         chat_tpl = chat_template_of(tok_cfg);
+        // config.json without bos/eos ids (e.g. TinyMixtral): resolve tokenizer_config.json's bos_token / eos_token
+        // through tokenizer.json's added tokens
+        auto missing = [&](const char* k) { for (auto& kv : man) if (kv.first == k) return !kv.second.is_num() || kv.second.num() < 0; return true; };
+        if ((missing("bos_token_id") || missing("eos_token_id")) && std::filesystem::exists(dir / "tokenizer.json")) {
+            try {
+                auto tj = json::parse(read_file(dir / "tokenizer.json"));
+                auto id_of = [&](const char* key) -> double {
+                    const json::value* t = tok_cfg.find(key);
+                    if (!t) return -1;
+                    std::string s = t->is_str() ? t->str() : t->is_obj() && t->find("content") ? (*t)["content"].str() : std::string();
+                    if (s.empty() || !tj.find("added_tokens") || !tj["added_tokens"].is_arr()) return -1;
+                    for (auto& a : tj["added_tokens"].arr()) if (a.find("content") && a["content"].str() == s && a.find("id")) return a["id"].num();
+                    return -1;
+                };
+                for (auto [field, key] : {std::pair{"bos_token_id", "bos_token"}, std::pair{"eos_token_id", "eos_token"}}) {
+                    if (!missing(field)) continue;
+                    const double id = id_of(key);
+                    if (id < 0) continue;
+                    bool set = false;
+                    for (auto& kv : man) if (kv.first == field) { kv.second = id; set = true; }
+                    if (!set) man.emplace_back(field, id);
+                }
+            } catch (const std::exception& e) { rep.notes.push_back(std::string("warning: tokenizer.json not readable for bos/eos ids (") + e.what() + ")"); }
+        }
     }
     {   // manifest "eos_token_ids": every id that ends generation. generation_config.json's eos_token_id (an id or a
         // list, e.g. Llama-3's <|end_of_text|>, <|eom_id|>, <|eot_id|>), else config.json's when that is a list.
@@ -443,6 +467,9 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         else if (arch == "MixtralForCausalLM" || cfg.str_or("model_type", "") == "mixtral") tname = "mixtral";
         else if (arch == "DeepseekV2ForCausalLM" || arch == "DeepseekV3ForCausalLM" || cfg.str_or("model_type", "") == "deepseek_v2") tname = "deepseek_v2";
         else if (arch == "Qwen3MoeForCausalLM" || cfg.str_or("model_type", "") == "qwen3_moe") tname = "qwen3_moe";
+        // TinyMixtral (mikecovlee/tinymixtral): Qwen3-MoE attention (GQA, QK-norm) with softmax -> top-k -> renormalised
+        // routing and the experts already stacked [E, F, D]; it runs on the qwen3_moe template.
+        else if (arch == "TinyMixtralForCausalLM" || cfg.str_or("model_type", "") == "tinymixtral") tname = "qwen3_moe";
         else raise(errc::unsupported, "no blueprint template for architecture {} (pass --template)", arch);
     }
     // normalise config with defaults the template needs
@@ -484,6 +511,14 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         set("norm_topk_prob", cfg.find("norm_topk_prob") && cfg["norm_topk_prob"].is_bool() ? json::value(cfg["norm_topk_prob"].b() ? 1.0 : 0.0) : json::value(0.0));
         set("routed_scaling_factor", num("routed_scaling_factor", 1.0));
         if (num("n_group", 1) > 1 && cfg.str_or("topk_method", "greedy") != "greedy") raise(errc::unsupported, "deepseek_v2: group-limited routing");
+    }
+    const bool tinymixtral = arch == "TinyMixtralForCausalLM" || cfg.str_or("model_type", "") == "tinymixtral";
+    if (tinymixtral) {
+        if (!(cfg.find("use_qk_norm") && cfg["use_qk_norm"].is_bool() && cfg["use_qk_norm"].b())) raise(errc::unsupported, "tinymixtral: use_qk_norm=false has no template");
+        set("num_experts", num("num_local_experts", 0));
+        set("moe_intermediate_size", num("expert_intermediate_size", 0));
+        set("norm_topk_prob", json::value(true));   // the modeling code always renormalises the top-k weights
+        cfg = json::value(c);
     }
     if (tname == "qwen3_moe") {
         if (num("decoder_sparse_step", 1) != 1) raise(errc::unsupported, "qwen3_moe: decoder_sparse_step != 1 (dense layers in between)");
@@ -542,7 +577,7 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
     };
     auto has = [&](const std::string& n) { if (skipped(n)) return false; for (auto& s : shards) if (s->has(n)) return true; return qck.has(n); };
     // Qwen3.5 multimodal checkpoints keep the text model under model.language_model.
-    std::string mp = has("model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
+    std::string mp = has("model.language_model.embed_tokens.weight") ? "model.language_model." : has("model.embed_tokens.weight") ? "model." : "";
 
     modelfile::stream_writer w(out);   // each tensor is encoded, written and freed before the next is loaded
     w.set_alignment(import_alignment(opt, dir));
@@ -674,6 +709,15 @@ inline import_report import_hf(const std::filesystem::path& dir, const std::stri
         if (tname == "mixtral") {
             put(Q + "router", find(P + "block_sparse_moe.gate.weight"), false);
             experts(l, P + "block_sparse_moe.experts.{}.", Q, "w1", "w3", "w2");
+        } else if (tname == "qwen3_moe" && tinymixtral) {   // stacked [E, F, D] / [E, D, F] already: moe_ffn's layout
+            put(Q + "router", find(P + "moe.router.weight"), false);
+            const char* src[3] = {"gate_proj", "up_proj", "down_proj"}; const char* proj[3] = {"gate", "up", "down"};
+            for (int j = 0; j < 3; ++j) {
+                auto t = find(P + "moe." + src[j]);
+                if (t.shape.size() != 3) raise(errc::shape_mismatch, "tinymixtral: moe.{} has shape {}", src[j], shape_str(t.shape));
+                put(Q + "experts.w_" + proj[j], t, true, modelfile::expert_alignment);
+                xi.add(w.last(), l, proj[j]);
+            }
         } else if (tname == "qwen3_moe") {
             put(Q + "router", find(P + "mlp.gate.weight"), false);
             experts(l, P + "mlp.experts.{}.", Q, "gate_proj", "up_proj", "down_proj");

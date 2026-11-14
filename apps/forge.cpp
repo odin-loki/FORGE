@@ -28,6 +28,7 @@
 #include <forge/script/local_ai.hpp>
 #include <forge/script/aot.hpp>
 #include <forge/security/security.hpp>
+#include <forge/compress/cli.hpp>
 
 // ASan and TSan reserve terabytes of address space for their shadow when a process starts, so an address-space cap
 // (RLIMIT_AS) put on a child that is this same sanitized binary stops it before main(): `forge rpc-serve` scripts
@@ -87,6 +88,13 @@ int usage() {
         "      [--align 64|4096|65536] file alignment of every tensor (default: 4096 when the source weights are >= 64 MiB, else 64)\n"
         "      [--calib] record statistics of the full-precision weights (\"calib\" section) for a later forge requant\n"
         "      [--shard-size SIZE [--blob-dir DIR]] write a sharded model: tensors in content-addressed blobs (0 = one per tensor)\n"
+        "      [--compress RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--report R.json]] compress while importing: the\n"
+        "      checkpoint is imported in f32, compressed (see compress below) and written with --codec\n"
+        "  compress <model.fpk|hf_dir> -o <out.fpk> --recipe RECIPE --calib-data FILE [--nsamples 64] [--seqlen 512] [--seed 0]\n"
+        "      [--codec C] [--report R.json] [--data DIR ...eval options]   prune / sparsify / shrink / convert a model (docs/compress.md)\n"
+        "      RECIPE: stage(k=v,..)+stage(..); stages prune, width, depth, experts, merge, moe2dense\n"
+        "  eval <model.fpk> --data DIR [--ppl-windows 40] [--ppl-window 512] [--tasks arc_easy,hellaswag,..] [--limit 200] [--report R.json]\n"
+        "      WikiText-2 perplexity and zero-shot accuracy on FORGE's inference engine (data: tools/compress_data.py)\n"
         "  shard split <in.fpk> -o <out.fpk> [--shard-size 2G] [--blob-dir DIR]   tensors into blobs named by their BLAKE3 hash\n"
         "      (default one blob per tensor: models that share tensors store them once); blobs go to DIR, $FORGE_BLOB_DIR or ./blobs next to out\n"
         "  shard join <in.fpk> -o <out.fpk>  |  shard list <model.fpk>             back to one file; which blobs are present\n"
@@ -253,7 +261,10 @@ int cmd_import(const args& a) {
     // --shard-size SIZE (0 = one blob per tensor) [--blob-dir DIR]: write a sharded model. The import goes to a
     // single file next to the output first, which is then split (modelfile/shard.hpp) and removed.
     const bool shard = a.kv.count("shard-size") != 0;
-    const std::string final_out = a.get("o"), import_out = shard ? final_out + ".unsharded" : final_out;
+    const bool squeeze = !a.get("compress").empty();   // --compress RECIPE: import in f32, compress, then encode
+    const std::string out_codec = o.codec;
+    if (squeeze) { o.codec = "f32"; o.emb_codec = "f32"; }
+    const std::string final_out = a.get("o"), import_out = shard ? final_out + ".unsharded" : squeeze ? final_out + ".f32.tmp" : final_out;
     // a directory with a blueprint.fbp is a model described by its blueprint (import/blueprint_dir.hpp)
     auto r = import::is_blueprint_dir(a.pos[0]) ? import::import_blueprint_dir(a.pos[0], import_out, o)
            : a.pos[0].ends_with(".gguf") ? import::import_gguf(a.pos[0], import_out, o) : a.pos[0].ends_with(".onnx") ? import::import_onnx(a.pos[0], import_out, o) : import::import_hf(a.pos[0], import_out, o);
@@ -264,6 +275,15 @@ int cmd_import(const args& a) {
         os::remove(import_out);
         r.bytes = std::filesystem::file_size(final_out);
         std::printf("sharded   %zu tensors in %zu blobs under %s (%zu written, %zu already there: %llu bytes not stored again)\n", sr.tensors, sr.shards, sr.blob_dir.c_str(), sr.written, sr.reused, (unsigned long long)sr.bytes_reused);
+    }
+    if (squeeze) {
+        compress::cli::opts co; co.in = import_out; co.out = final_out; co.kv = a.kv;
+        co.kv["recipe"] = a.get("compress"); co.kv["codec"] = out_codec;
+        json::value rep;
+        try { rep = compress::cli::compress_file(co); } catch (...) { os::remove(import_out); throw; }
+        os::remove(import_out);
+        compress::cli::write_json(a.get("report", final_out + ".compress.json"), rep);
+        r.bytes = std::filesystem::file_size(final_out);
     }
     std::printf("imported %s via template '%s': %zu tensors, %zu bytes -> %s\n", r.arch.c_str(), r.template_name.c_str(), r.tensors, r.bytes, a.get("o").c_str());
     for (auto& n : r.notes) std::fprintf(stderr, "forge import: %s\n", n.c_str());
@@ -1409,6 +1429,21 @@ int main(int argc, char** argv) {
         if (c == "shard") return cmd_shard(a);
         if (c == "blueprint") return cmd_blueprint(a);
         if (c == "requant") return cmd_requant(a);
+        if (c == "compress" || c == "eval") {
+            if (a.pos.empty()) return usage();
+            compress::cli::opts co; co.in = a.pos[0]; co.out = a.get("o"); co.kv = a.kv;
+            if (c == "eval") return compress::cli::eval(co);
+            const bool dir = std::filesystem::is_directory(co.in);
+            if (dir) {   // a checkpoint directory: import it in f32 first
+                import::import_options io; io.codec = "f32";
+                co.in = co.out + ".f32.tmp";
+                import::import_hf(a.pos[0], co.in, io);
+            }
+            int rc = 1;
+            try { rc = compress::cli::compress(co); } catch (...) { if (dir) os::remove(co.in); throw; }
+            if (dir) os::remove(co.in);
+            return rc;
+        }
         if (c == "rpc-serve") return cmd_rpc_serve(a);
         if (c == "security") return cmd_security(a);
         return usage();

@@ -445,6 +445,12 @@ target_link_libraries(forge_security INTERFACE forge_core forge_trust)   # forge
 add_library(forge_inference INTERFACE)
 forge_include_dirs(forge_inference INTERFACE inference/include)
 target_link_libraries(forge_inference INTERFACE forge_modelfile forge_security)   # FSS model integrity / fs scope at load
+# forge::compress: model compression at import time - pruning (magnitude / Wanda / RIA / SparseGPT, N:M), masked
+# refits, layer-wise allocation (OWL / EBA), structured width / depth pruning, MoE expert pruning / merging and
+# MoE -> dense conversion, calibrated on FORGE graphs; evaluation on FORGE sessions (docs/compress.md). Header-only.
+add_library(forge_compress INTERFACE)
+forge_include_dirs(forge_compress INTERFACE compress/include)
+target_link_libraries(forge_compress INTERFACE forge_inference)
 forge_include_dirs(forge_inference INTERFACE inference/include)
 # forge::script managed scripting runtime (docs/scripting.md). Safe C++23; libc++ hardening when available.
 # Shell backends: one file each in script/src/shells/ defining forge_shell_register_<stem>(); the registry TU is generated.
@@ -964,7 +970,7 @@ endif()
 
 if(FORGE_BUILD_APPS)
   add_executable(forge apps/forge.cpp)
-  target_link_libraries(forge PRIVATE forge_inference forge_verify forge_simd_mv forge_script)
+  target_link_libraries(forge PRIVATE forge_inference forge_compress forge_verify forge_simd_mv forge_script)
   target_link_libraries(forge PRIVATE forge_security)   # forge security check
   add_executable(forge-serve apps/forge_serve.cpp)
   target_link_libraries(forge-serve PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
@@ -1108,7 +1114,7 @@ if(FORGE_BUILD_TESTS)
       continue()
     endif()
     add_executable(${n} ${t})
-    target_link_libraries(${n} PRIVATE forge_inference forge_verify forge_simd_mv forge_loadbalancer)
+    target_link_libraries(${n} PRIVATE forge_inference forge_compress forge_verify forge_simd_mv forge_loadbalancer)
     if(n STREQUAL "test_video")
       target_link_libraries(${n} PRIVATE forge_video)
     endif()
@@ -2169,7 +2175,7 @@ include(CMakePackageConfigHelpers)
 add_custom_target(forge_gen_headers ALL)
 add_dependencies(forge_gen_headers forge_ops_gen forge_raw_gen forge_gpu_gen forge_gpu_images)
 
-install(DIRECTORY core/include/ os/include/ simd/include/ ops/include/ gpu/include/ graph/include/ modelfile/include/ inference/include/
+install(DIRECTORY core/include/ os/include/ simd/include/ ops/include/ gpu/include/ graph/include/ modelfile/include/ inference/include/ compress/include/
                   support/include/ verify/include/ security/include/ loadbalancer/include/ script/include/
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT dev)
 install(DIRECTORY ${FORGE_GEN_DIR}/forge/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/forge COMPONENT dev
@@ -2181,7 +2187,7 @@ install(FILES third_party/monocypher/LICENCE.md DESTINATION ${CMAKE_INSTALL_DOCD
 
 # Exported targets: forge_<name> here is forge::<name> in the package (and as an alias in this build).
 set(FORGE_EXPORT_TARGETS forge_core forge_os forge_ops forge_simd forge_verify forge_gpu forge_graph forge_modelfile forge_security
-    forge_inference forge_loadbalancer forge_simd_mv forge_trust forge_text forge_mobile forge_script forge_video forge_c)
+    forge_inference forge_compress forge_loadbalancer forge_simd_mv forge_trust forge_text forge_mobile forge_script forge_video forge_c)
 foreach(t forge_metal forge_rpc_tls)   # Apple only / OpenSSL found
   if(TARGET ${t})
     list(APPEND FORGE_EXPORT_TARGETS ${t})

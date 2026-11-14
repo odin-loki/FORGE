@@ -536,6 +536,23 @@ TEST(codecs_exact_and_layout) {
     for (auto& [n, b] : sizes) CHECK(codecs::find(n)->block == 32 && codecs::find(n)->block_bytes == b);
     const std::pair<const char*, std::size_t> sizes_k[] = {{"q2_k", 84}, {"q3_k", 110}, {"iq4_xs", 136}, {"tq1_0", 54}, {"tq2_0", 66}};
     for (auto& [n, b] : sizes_k) CHECK(codecs::find(n)->block == 256 && codecs::find(n)->block_bytes == b);
+    // 2:4 sparse codecs: 2:4-sparse data on the value grid round-trips exactly, dense data keeps the 2 largest of 4
+    std::vector<float> sp(64, 0.f), spq(64, 0.f), spq4(64, 0.f);
+    for (int g = 0; g < 16; ++g) {
+        const int a = g % 4, b = (g * 3 + 1) % 4 == a ? (a + 2) % 4 : (g * 3 + 1) % 4;
+        sp[4 * g + a] = 0.5f + float(g) * 0.25f; sp[4 * g + b] = -1.f - float(g) * 0.125f;
+        spq[4 * g + a] = float(g + 1) * 0.5f; spq[4 * g + b] = g % 8 == 0 ? -63.5f : -float(100 - g) * 0.5f;   // amax 63.5 = 127 * 0.5 per block
+        spq4[4 * g + a] = float(g % 7 + 1) * 0.25f; spq4[4 * g + b] = -1.75f;             // amax 1.75 = 7 * 0.25
+    }
+    rt("s24_f16", sp); rt("s24_q8", spq); rt("s24_q4", spq4);
+    {
+        std::vector<float> dn{1, -4, 3, 0.5f}; dn.resize(32, 0.f);
+        auto* c = codecs::find("s24_f16"); std::vector<u8> b(c->bytes(32)); std::vector<float> y(32);
+        c->encode(dn.data(), 32, b.data()); c->decode(b.data(), 32, y.data());
+        CHECK(y[0] == 0 && y[1] == -4 && y[2] == 3 && y[3] == 0);
+    }
+    const std::pair<const char*, std::size_t> sizes_s[] = {{"s24_f16", 36}, {"s24_q8", 22}, {"s24_q4", 14}};
+    for (auto& [n, b] : sizes_s) CHECK(codecs::find(n)->block == 32 && codecs::find(n)->block_bytes == b);
 }
 
 TEST(codecs_roundtrip) {
@@ -552,7 +569,8 @@ TEST(codecs_roundtrip) {
             {"q4_g32", 0.21}, {"q8_g32", 0.013}, {"mxfp8", 0.126}, {"mxfp6", 0.126}, {"mxfp4", 0.51}, {"mxint8", 0.016},
             {"nvfp4", 0.51}, {"tq2", 3.0}, {"q6_k", 0.07}, {"q5_k", 0.13},
             {"q4_0", 0.4}, {"q4_1", 0.21}, {"q5_0", 0.2}, {"q5_1", 0.11}, {"q2_k", 1.25}, {"q3_k", 0.9}, {"iq4_nl", 0.45}, {"iq4_xs", 0.5},
-            {"tq1_0", 3.0}, {"tq2_0", 3.0}};
+            {"tq1_0", 3.0}, {"tq2_0", 3.0},
+            {"s24_f16", 3.0}, {"s24_q8", 3.0}, {"s24_q4", 3.0}};   // 2:4 codecs prune dense input (half the values go)
         CHECK_MSG(bounds.count(c.name), "no bound for %s", std::string(c.name).c_str());
         double bound = bounds.count(c.name) ? bounds.at(c.name) : 0;
         std::printf("  %-9s %5zu bytes  max err %.5f\n", std::string(c.name).c_str(), buf.size(), maxe);
@@ -571,7 +589,7 @@ TEST(qdot_matches_decode_exactly) {
     for (const char* tgt : {"scalar", "avx2", "avx512"}) {
         const auto* ker = simd::by_name(tgt);
         if (!ker) { std::printf("  qdot: target %s not available\n", tgt); continue; }
-        for (const char* cn : {"q8_0", "q4_k", "q6_k", "q5_k", "f16", "q8_g32", "q4_0", "q5_1", "q2_k", "q3_k", "iq4_nl", "iq4_xs", "tq1_0", "tq2_0"}) {
+        for (const char* cn : {"q8_0", "q4_k", "q6_k", "q5_k", "f16", "q8_g32", "q4_0", "q5_1", "q2_k", "q3_k", "iq4_nl", "iq4_xs", "tq1_0", "tq2_0", "s24_f16", "s24_q8", "s24_q4"}) {
             const auto* c = codecs::find(cn);
             for (std::size_t k : {std::size_t(256), std::size_t(1024), std::size_t(768 + (c->block == 32 ? 96 : 0))}) {
                 auto w = verify::random_tensor({i64(k)}, r, -2, 2); auto x = verify::random_tensor({i64(k)}, r, -1, 1);
