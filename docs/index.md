@@ -24,6 +24,7 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 - [modelfile.md](modelfile.md): the `.fpk` container, signing, encryption, shards, adapters, blueprints and opsets, tokenizers, importing (Hugging Face, GGUF, AWQ / GPTQ, ONNX, blueprint directories) and the template families
 - [format.md](format.md): `.fpk` byte layout: sections, chunked encryption, tensor alignment, the binary blueprint, shards, the state / adapters / calib sections
 - [inference.md](inference.md): models, sessions (generative, embedding, diffusion loop, streaming), samplers, generation, speculative decoding, chat templates, tool calls
+- [compress.md](compress.md): model compression at import time (`forge compress`, `forge eval`, `forge import` optimising by default): pruning, sparsity, structured / depth / head / low-rank / MoE compression, mixed-precision quantisation, function-preserving rotations, calibration, context mixing, checkpoints and SSD-backed buffers
 - [aot-models.md](aot-models.md): `forge aot`: precompiled plans in the `.fpk`, and models compiled to native libraries and executables
 
 ## Serving, remote devices and embedding
