@@ -292,7 +292,7 @@ inline EvalResult evaluate(const std::string& fpk, const EvalCfg& c) {
             auto [nll, n] = ev.ppl(toks, c.ppl_window, c.ppl_windows);
             R.nll = nll; R.ppl = std::exp(nll); R.ppl_tokens = n;
         }
-        say("  ppl {:.4f} over {} tokens", R.ppl, n);
+        say("  ppl {:.4f} over {} tokens", R.ppl, R.ppl_tokens);
         if (c.mix) say("  ppl with context mixing {:.4f}", R.ppl_mix);
     }
     double sum = 0;
