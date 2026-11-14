@@ -7,9 +7,12 @@
 // KV cache is rewound past it), so FORGE compiles a handful of plans instead of one per length.
 #pragma once
 #include <forge/compress/calib.hpp>
+#include <forge/compress/mixer.hpp>
 #include <forge/inference/session.hpp>
+#include <forge/inference/speculative.hpp>
 
 #include <array>
+#include <optional>
 #include <unordered_map>
 
 namespace forge::compress {
@@ -21,6 +24,21 @@ struct EvalCfg {
     std::vector<std::string> tasks;
     i64 task_limit = 200;
     bool mix = false;
+    std::string kv_codec;    // session_options::kv_codec of the evaluation sessions ("" = f32 / $FORGE_KV_CODEC)
+    // speculative decoding with a (compressed) draft model: greedy, prompts = WikiText windows
+    std::string draft;
+    i64 spec_tokens = 64;    // new tokens per prompt
+    i64 spec_prompts = 8;    // prompts (evenly spaced windows of the test split)
+    i64 spec_prompt_len = 128;
+    int spec_k = 4;          // drafts per pass (0 = FORGE's planner)
+};
+
+struct SpecResult {
+    i64 prompts = 0, new_tokens = 0, identical = 0;   // identical: prompts whose speculative output equals plain greedy
+    double acceptance = 0, tokens_per_pass = 0;
+    double plain_tps = 0, spec_tps = 0, speedup = 0;  // decode tokens/s (prefill excluded) and spec / plain
+    double plain_seconds = 0, spec_seconds = 0;       // wall time, prefill included
+    bool lossless() const { return identical == prompts; }
 };
 
 struct EvalResult {
@@ -31,6 +49,8 @@ struct EvalResult {
     std::map<std::string, i64> n;
     double mean_acc = 0;
     double seconds = 0;
+    std::string kv_codec;
+    std::optional<SpecResult> spec;
 };
 
 inline const std::vector<i64>& buckets() { static const std::vector<i64> b{8, 16, 32, 48, 64, 96, 128, 192, 256, 384, 512}; return b; }
@@ -43,73 +63,23 @@ inline double logprob(const float* row, i64 vocab, int t) {
     return double(row[t]) - m - std::log(s);
 }
 
-// Online context mixing (in the spirit of PAQ / cmix): the network's next-token distribution is mixed with cheap
-// adaptive models of the text seen so far, with mixing weights learned online from each observed token. Components:
-//   0 the network          1 the network sharpened (logits x 1.25)     2 the network flattened (logits x 0.8)
-//   3 unigram cache        4 bigram cache                               5 match model (token after the longest
-//                                                                         earlier occurrence of the current context)
-// A component with nothing to say (empty cache, no match) falls back to the network, so the mixture is always a
-// proper distribution. Weight sets are selected by context (match-length bucket x bigram seen), as PAQ selects mixer
-// weights by context; updates are Bayesian (w_i <- w_i * p_i(y) / p(y), learning rate eta) with fixed-share
-// smoothing (alpha) so the mixer keeps adapting. Only past tokens are used: a valid online predictor.
-struct ContextMixer {
-    static constexpr int K = 6, SETS = 8;
-    double eta = 1.0, alpha = 0.002;
-    std::array<std::array<double, K>, SETS> w{};
-    std::unordered_map<int, int> uni;
-    std::unordered_map<std::uint64_t, std::pair<int, int>> bi;   // (prev,next) count, prev count under key prev<<32|~0
-    std::unordered_map<std::uint64_t, i64> ctx3;                  // hash of 3 tokens -> last position after them
-    std::vector<int> hist;
-    ContextMixer() { reset(); }
-    void reset() {
-        for (auto& ws : w) { ws = {0.94, 0.01, 0.01, 0.01, 0.01, 0.02}; }
-        uni.clear(); bi.clear(); ctx3.clear(); hist.clear();
-    }
-    static std::uint64_t key3(const int* p) { return (std::uint64_t(std::uint32_t(p[0])) * 0x9E3779B97F4A7C15ull) ^ (std::uint64_t(std::uint32_t(p[1])) << 21) ^ std::uint64_t(std::uint32_t(p[2])) * 0xC2B2AE3D27D4EB4Full; }
-    // lp_model[0..2]: log p of the observed token y under components 0..2; returns log p_mix(y) and learns from y
+// Online context mixing (mixer.hpp): the network's next-token distribution mixed with cheap adaptive models of the
+// text seen so far. ContextMixer scores observed tokens (evaluation: only log p_mix(y) is needed, from the network's
+// log-probabilities of y); StreamMixer (generation) gives the full mixed distribution with the same models and
+// updates. Only past tokens are used: a valid online predictor.
+struct ContextMixer : MixModels {
+    // lp_net[0..2]: log p of the observed token y under components 0..2; returns log p_mix(y) and learns from y
     double step(const double lp_net[3], int y) {
-        const i64 t = i64(hist.size());
+        const Query q = query();
+        select(q);
         double p[K];
         for (int i = 0; i < 3; ++i) p[i] = std::exp(lp_net[i]);
-        // unigram
-        if (t > 0) { auto it = uni.find(y); p[3] = it == uni.end() ? 0.0 : double(it->second) / double(t); } else p[3] = p[0];
-        // bigram
-        bool bseen = false;
-        if (t > 0) {
-            const std::uint64_t pk = (std::uint64_t(std::uint32_t(hist.back())) << 32) | 0xFFFFFFFFull;
-            auto pt = bi.find(pk);
-            if (pt != bi.end() && pt->second.first > 0) {
-                bseen = true;
-                auto it = bi.find((std::uint64_t(std::uint32_t(hist.back())) << 32) | std::uint32_t(y));
-                p[4] = it == bi.end() ? 0.0 : double(it->second.first) / double(pt->second.first);
-            } else p[4] = p[0];
-        } else p[4] = p[0];
-        // match model
-        int mlen = 0;
-        if (t >= 3) {
-            auto it = ctx3.find(key3(hist.data() + t - 3));
-            if (it != ctx3.end()) {
-                const i64 q = it->second;   // position whose 3 preceding tokens equal ours
-                while (mlen < 32 && q - 1 - mlen >= 0 && t - 1 - mlen >= 0 && hist[std::size_t(q - 1 - mlen)] == hist[std::size_t(t - 1 - mlen)]) ++mlen;
-                p[5] = q < t && hist[std::size_t(q)] == y ? 1.0 : 0.0;
-            } else p[5] = p[0];
-        } else p[5] = p[0];
-        const int mb = mlen == 0 ? 0 : mlen < 4 ? 1 : mlen < 16 ? 2 : 3;
-        auto& ws = w[std::size_t(mb * 2 + (bseen ? 1 : 0))];
+        text_probs(q, y, p[0], p + 3);
+        const auto& ws = w[std::size_t(q.set)];
         double pm = 0; for (int i = 0; i < K; ++i) pm += ws[std::size_t(i)] * p[i];
         pm = std::max(pm, 1e-300);
-        // learn
-        double sum = 0;
-        for (int i = 0; i < K; ++i) { ws[std::size_t(i)] *= std::pow(std::max(p[i], 1e-300) / pm, eta); sum += ws[std::size_t(i)]; }
-        for (int i = 0; i < K; ++i) ws[std::size_t(i)] = (1 - alpha) * ws[std::size_t(i)] / sum + alpha / K;
-        // update the text models
-        if (t >= 3) ctx3[key3(hist.data() + t - 3)] = t;
-        if (t > 0) {
-            ++bi[(std::uint64_t(std::uint32_t(hist.back())) << 32) | 0xFFFFFFFFull].first;
-            ++bi[(std::uint64_t(std::uint32_t(hist.back())) << 32) | std::uint32_t(y)].first;
-        }
-        ++uni[y];
-        hist.push_back(y);
+        learn(q, p, pm);
+        push(y);
         return std::log(pm);
     }
 };
@@ -122,7 +92,7 @@ inline double logprob_scaled(const float* row, i64 vocab, int t, double s) {
 
 class Evaluator {
 public:
-    Evaluator(const std::string& fpk, i64 context = 1024) : s_(fpk, session_opts(context)), vocab_(s_.vocab()) {
+    Evaluator(const std::string& fpk, i64 context = 1024, const std::string& kv_codec = "") : s_(fpk, session_opts(context, kv_codec)), vocab_(s_.vocab()) {
         const auto& man = s_.manifest();
         add_bos_ = man.find("add_bos") && man["add_bos"].is_bool() && man["add_bos"].b();
         bos_ = man.find("bos_token_id") && man["bos_token_id"].is_num() ? int(man["bos_token_id"].num()) : -1;
@@ -246,7 +216,7 @@ public:
     }
 
 private:
-    static forge::inference::session_options session_opts(i64 ctx) { forge::inference::session_options o; o.context = ctx; return o; }
+    static forge::inference::session_options session_opts(i64 ctx, const std::string& kv) { forge::inference::session_options o; o.context = ctx; o.kv_codec = kv; return o; }
     forge::inference::session s_;
     i64 vocab_;
     bool add_bos_ = false;
@@ -277,10 +247,60 @@ inline std::string tokenizer_key(const std::string& fpk) {
     return std::format("{:016x}", std::hash<std::string>{}(t));
 }
 
+// Greedy speculative decoding with `draft_fpk` as the draft (FORGE's speculative_generate) against plain greedy
+// decoding of the target, on the given prompts: acceptance, tokens/s, and whether the outputs are identical (greedy
+// verification is lossless: they should be, up to batched-vs-single-row rounding of near ties).
+inline SpecResult speculative_eval(const std::string& target_fpk, const std::string& draft_fpk, const std::vector<std::vector<int>>& prompts,
+                                   i64 n_new, int k, const std::string& kv_codec = "") {
+    namespace inf = forge::inference;
+    i64 longest = 0; for (auto& p : prompts) longest = std::max<i64>(longest, i64(p.size()));
+    inf::session_options o; o.context = longest + n_new + std::max(k, 16) + 8; o.kv_codec = kv_codec;
+    inf::session target(target_fpk, o), draft(draft_fpk, o);
+    SpecResult R;
+    double plain_decode = 0, spec_decode = 0;
+    std::size_t drafted = 0, accepted = 0, passes = 0, spec_new = 0;
+    for (auto& p : prompts) {
+        if (p.empty()) continue;
+        inf::sampler g1;   // greedy
+        inf::generate_stats gs;
+        target.reset();
+        double t0 = now_s();
+        auto plain = target.generate(p, int(n_new), g1, {}, &gs);
+        R.plain_seconds += now_s() - t0;
+        plain_decode += gs.decode_s;
+        inf::sampler g2;
+        inf::speculative_stats st;
+        t0 = now_s();
+        auto spec = inf::speculative_generate(target, draft, p, int(n_new), g2, k, {}, &st);
+        R.spec_seconds += now_s() - t0;
+        spec_decode += st.seconds - st.prefill_seconds;
+        drafted += st.drafted; accepted += st.accepted; passes += st.passes; spec_new += st.new_tokens;
+        R.new_tokens += i64(plain.size());
+        R.identical += plain == spec;
+        ++R.prompts;
+    }
+    R.acceptance = drafted ? double(accepted) / double(drafted) : 0;
+    R.tokens_per_pass = passes ? double(spec_new) / double(passes) : 0;
+    R.plain_tps = plain_decode > 0 ? double(R.new_tokens) / plain_decode : 0;
+    R.spec_tps = spec_decode > 0 ? double(spec_new) / spec_decode : 0;
+    R.speedup = R.plain_tps > 0 ? R.spec_tps / R.plain_tps : 0;
+    return R;
+}
+
+// `n` prompts of `len` tokens: windows evenly spaced over `toks`
+inline std::vector<std::vector<int>> spaced_windows(const std::vector<int>& toks, i64 n, i64 len) {
+    std::vector<std::vector<int>> out;
+    const i64 total = i64(toks.size()) / std::max<i64>(len, 1), m = std::min(n, total);
+    for (i64 i = 0; i < m; ++i) { const i64 w = i * total / m; out.emplace_back(toks.begin() + w * len, toks.begin() + (w + 1) * len); }
+    return out;
+}
+
 inline EvalResult evaluate(const std::string& fpk, const EvalCfg& c) {
     const double t0 = now_s();
     EvalResult R;
-    Evaluator ev(fpk);
+    R.kv_codec = c.kv_codec;
+    Evaluator ev(fpk, std::max<i64>(1024, c.ppl_window), c.kv_codec);
+    if (!c.kv_codec.empty()) say("  KV cache codec {}", c.kv_codec);
     if (c.ppl_windows >= 0) {
         auto toks = ppl_tokens(ev, c.data_dir, tokenizer_key(fpk));
         if (c.mix) {   // one pass: the plain and the context-mixed perplexity
@@ -303,6 +323,14 @@ inline EvalResult evaluate(const std::string& fpk, const EvalCfg& c) {
         say("  {} acc {:.4f} (n={})", t, a, n);
     }
     R.mean_acc = c.tasks.empty() ? 0 : sum / double(c.tasks.size());
+    if (!c.draft.empty()) {
+        auto toks = ppl_tokens(ev, c.data_dir, tokenizer_key(fpk));
+        auto prompts = spaced_windows(toks, c.spec_prompts, c.spec_prompt_len);
+        R.spec = speculative_eval(fpk, c.draft, prompts, c.spec_tokens, c.spec_k, c.kv_codec);
+        const auto& S = *R.spec;
+        say("  speculative ({} drafts / pass, draft {}): acceptance {:.3f}, {:.2f} tokens/pass, {:.1f} tok/s vs {:.1f} plain (x{:.2f}), identical {}/{}",
+            c.spec_k, c.draft, S.acceptance, S.tokens_per_pass, S.spec_tps, S.plain_tps, S.speedup, S.identical, S.prompts);
+    }
     R.seconds = now_s() - t0;
     return R;
 }

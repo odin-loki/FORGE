@@ -3,6 +3,7 @@
 #include <forge/compress/checkpoint.hpp>
 #include <forge/compress/compress.hpp>
 #include <forge/compress/eval.hpp>
+#include <forge/compress/probes.hpp>
 
 #include <fstream>
 #include <iostream>
@@ -31,8 +32,17 @@ inline void write_json(const std::string& path, const value& v) {
 inline value eval_json(const EvalResult& r) {
     jobj acc; for (auto& [k, v] : r.acc) acc.push_back({k, value(v)});
     jobj n; for (auto& [k, v] : r.n) n.push_back({k, value(v)});
-    return value(jobj{{"ppl", value(r.ppl)}, {"nll", value(r.nll)}, {"ppl_mix", value(r.ppl_mix)}, {"ppl_tokens", value(r.ppl_tokens)}, {"acc", value(acc)}, {"n", value(n)},
-                      {"mean_acc", value(r.mean_acc)}, {"seconds", value(r.seconds)}});
+    jobj o{{"ppl", value(r.ppl)}, {"nll", value(r.nll)}, {"ppl_mix", value(r.ppl_mix)}, {"ppl_tokens", value(r.ppl_tokens)}, {"acc", value(acc)}, {"n", value(n)},
+           {"mean_acc", value(r.mean_acc)}, {"seconds", value(r.seconds)}};
+    if (!r.kv_codec.empty()) o.push_back({"kv_codec", value(r.kv_codec)});
+    if (r.spec) {
+        const auto& S = *r.spec;
+        o.push_back({"speculative", value(jobj{{"prompts", value(S.prompts)}, {"new_tokens", value(S.new_tokens)}, {"acceptance", value(S.acceptance)},
+                                               {"tokens_per_pass", value(S.tokens_per_pass)}, {"plain_tps", value(S.plain_tps)}, {"spec_tps", value(S.spec_tps)},
+                                               {"speedup", value(S.speedup)}, {"plain_seconds", value(S.plain_seconds)}, {"spec_seconds", value(S.spec_seconds)},
+                                               {"identical", value(S.identical)}, {"lossless", value(S.lossless())}})});
+    }
+    return value(o);
 }
 
 inline EvalCfg eval_cfg(const opts& a) {
@@ -43,6 +53,12 @@ inline EvalCfg eval_cfg(const opts& a) {
     c.tasks = split(a.get("tasks", ""), ',');
     c.task_limit = std::stoll(a.get("limit", "200"));
     c.mix = a.get("mix", "0") == "1";
+    c.kv_codec = a.get("kv-codec");
+    c.draft = a.get("draft");
+    c.spec_tokens = std::stoll(a.get("spec-tokens", "64"));
+    c.spec_prompts = std::stoll(a.get("spec-prompts", "8"));
+    c.spec_prompt_len = std::stoll(a.get("spec-prompt-len", "128"));
+    c.spec_k = std::stoi(a.get("spec-k", "4"));
     return c;
 }
 
@@ -100,6 +116,9 @@ inline value compress_file(const opts& a) {
     // calibration: a dataset, or "self" (text the model writes itself: no data needed)
     const std::string src = a.get("calib-data", "self");
     const std::uint64_t seed = std::stoull(a.get("seed", "0"));
+    // self: decoded by default; --self-mode jacobi [--jacobi-passes 6]: Jacobi prefill sampling (probes.hpp)
+    const std::string self_mode = a.get("self-mode", "decode");
+    const i64 passes = std::stoll(a.get("jacobi-passes", "6"));
     const bool need_ref = recipe.find("calibrate") != std::string::npos || recipe.find("kl=") != std::string::npos || recipe.find("optimi") != std::string::npos;
     Model m;
     Counts before;
@@ -120,12 +139,12 @@ inline value compress_file(const opts& a) {
         say("loading {}", a.in);
         m = Model::load(a.in);
         before = count(m);
-        calib = src == "self" ? self_generate(a.in, m, n, seq, seed) : make_calib(m, src, n, seq, seed);
+        calib = src == "self" ? self_text(a.in, m, n, seq, seed, self_mode, passes) : make_calib(m, src, n, seq, seed);
         // reference distributions of the uncompressed model for feedback / calibrate: self-generated probes held
         // apart from the calibration text (different seed)
         if (need_ref) {
             const i64 np = std::stoll(a.get("probes", "8")), pl = std::stoll(a.get("probe-len", "256"));
-            auto probes = self_generate(a.in, m, np, pl, seed + 7919);
+            auto probes = self_text(a.in, m, np, pl, seed + 7919, self_mode, passes);
             ref = capture_reference(m, probes);
             say("reference: {} x {} self-generated probe tokens", probes.seqs.size(), probes.seq);
         }
@@ -146,7 +165,8 @@ inline value compress_file(const opts& a) {
     say("writing {} (codec {})", a.out, codec);
     m.save(a.out, codec_picker(codec));
     jobj rep{{"model", value(a.in)}, {"recipe", value(recipe)}, {"out", value(a.out)}, {"codec", value(codec)},
-             {"calib", value(jobj{{"source", value(src)}, {"nsamples", value(n)}, {"seqlen", value(seq)}})},
+             {"calib", value(jobj{{"source", value(src)}, {"nsamples", value(n)}, {"seqlen", value(seq)},
+                                  {"self_mode", value(src == "self" ? self_mode : std::string())}, {"jacobi_passes", value(passes)}})},
              {"before", counts_json(before)}, {"after", counts_json(after)},
              {"file_bytes", value(i64(std::filesystem::file_size(a.out)))}, {"stages", value(stages)},
              {"compress_seconds", value(now_s() - t0)}};
