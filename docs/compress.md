@@ -45,6 +45,9 @@ layer by layer, with the calibration hidden states propagated through the layers
 |---|---|
 | `prune` | unstructured or N:M sparsity. `method=magnitude\|wanda\|ria\|sparsegpt`, `s=`, `nm=2:4`. `refit=mcr`: masked conjugate-gradient least-squares refit. `alloc=owl\|eba`: per-layer / per-projection sparsity. `nm=2:4,alloc=eba,frac=F`: 2:4 only on the cheapest projections |
 | `width` | removes FFN neurons. `score=mag\|act\|obs` (structured OBS). Least-squares refit of `w_down`; on sparse models the refit keeps the mask. `alloc=eba` |
+| `heads` | removes attention query heads (`heads.hpp`). Every KV group keeps the same number (at least one). `score=mag\|act\|obs` (block OBS over whole heads, refined under the exact set cost). Least-squares refit of `wo`. `alloc=eba` |
+| `permute` | `nm=2:4`: reorders SwiGLU neurons (and value channels within each KV head, `values=1`) so the N:M groups keep more Wanda saliency. Exact; run before `prune(nm=...)` |
+| `actsparse` | `p=`: per-layer activation threshold of the dense FFN hidden at the calibrated p-quantile of \|silu(gate)·up\| (TEAL/CATS). `alloc=eba` spreads p by the output-error proxy. FORGE does not skip the zeroed work yet |
 | `depth` | removes attention / FFN sublayers or whole layers. `score=bi\|probe` (block influence or measured loss). `replace=linear,rank=r`: closed-form low-rank linear replacement of a removed FFN |
 | `experts` | drops MoE experts (`score=freq\|gate\|reap`) |
 | `merge` | merges experts. `method=avg`, or `method=ls`: concatenate both experts' neurons, select with OBS, least-squares refit to the pair's gated output |
