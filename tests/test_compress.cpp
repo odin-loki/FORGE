@@ -553,3 +553,48 @@ TEST(compress_context_mixer) {
     CHECK_MSG(nll2 / n2 < -lu + 0.1, "mixer overhead %g", nll2 / n2 + lu);
     std::printf("  mixer: repeated text %.3f nats (uniform %.3f), random text overhead %.4f nats\n", nll / n, -lu, nll2 / n2 + lu);
 }
+
+TEST(compress_generator_features_roundtrip) {
+    // a factored projection (exact SVD factors), an alias (two layers sharing one factor), a narrower head count
+    // and an activation threshold: valid blueprints, saved and reloaded with the same structure
+    Model m = tiny_dense(51, 3);
+    auto c = random_calib(m.spec.vocab, 1, 16, 21);
+    auto ref = logits_of(m, c.seqs[0]);
+    const i64 d = m.spec.d_model;
+    auto& wq = m.w.at("layer.0.wq");
+    tensor A = wq, B({wq.shape[0], wq.shape[0]});        // wq = I * wq: exact factorisation
+    for (i64 i = 0; i < wq.shape[0]; ++i) B.data[std::size_t(i * wq.shape[0] + i)] = 1.f;
+    m.w.t["layer.0.wq_a"] = A; m.w.t["layer.0.wq_b"] = B; m.w.t.erase("layer.0.wq");
+    m.spec.lowrank.insert("layer.0.wq");
+    CHECK(max_abs_diff(logits_of(m, c.seqs[0]), ref) < 1e-4);
+    // layer 1's wq shares layer 0's identity factor
+    auto& wq1 = m.w.at("layer.1.wq");
+    m.w.t["layer.1.wq_a"] = wq1; m.w.t.erase("layer.1.wq");
+    m.spec.lowrank.insert("layer.1.wq"); m.spec.alias["layer.1.wq_b"] = "layer.0.wq_b";
+    CHECK(max_abs_diff(logits_of(m, c.seqs[0]), ref) < 1e-4);
+    m.spec.layers[2].act_thresh = 1e-9;   // ~no-op threshold
+    CHECK(max_abs_diff(logits_of(m, c.seqs[0]), ref) < 1e-3);
+    // head count: layer 2 keeps 2 of 4 query heads (one per KV group)
+    {
+        const i64 hd = m.spec.head_dim;
+        auto& q = m.w.at("layer.2.wq"); auto& o = m.w.at("layer.2.wo");
+        std::vector<i64> keep{0, 2};   // heads 0 (group 0) and 2 (group 1)
+        tensor q2({2 * hd, d}), o2({d, 2 * hd});
+        for (std::size_t k = 0; k < keep.size(); ++k) {
+            std::copy_n(q.data.data() + keep[k] * hd * d, hd * d, q2.data.data() + i64(k) * hd * d);
+            for (i64 r = 0; r < d; ++r) std::copy_n(o.data.data() + r * o.shape[1] + keep[k] * hd, hd, o2.data.data() + r * 2 * hd + i64(k) * hd);
+        }
+        q = q2; o = o2; m.spec.heads[2] = 2;
+    }
+    auto pruned = logits_of(m, c.seqs[0]);
+    std::string p = tmp("gen.fpk");
+    m.save(p);
+    modelfile::reader rd(p);
+    CHECK(!rd.tensors().count("layer.1.wq_b"));   // stored once, through the alias
+    Model back = Model::load(p);
+    CHECK(back.spec.factored(0, "wq") && back.spec.factored(1, "wq") && back.spec.alias.count("layer.1.wq_b") && back.spec.heads_of(2) == 2);
+    CHECK(back.spec.layers[2].act_thresh > 0);
+    inference::session s(p);
+    CHECK(max_abs_diff(s.forward_all(c.seqs[0]), pruned) < 1e-4);
+    std::filesystem::remove(p);
+}

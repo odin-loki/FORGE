@@ -95,6 +95,17 @@ inline value counts_json(const Counts& c) {
     return value(jobj{{"params", value(c.params)}, {"nonzero", value(c.nonzero)}, {"body_params", value(c.body_params)}, {"body_nonzero", value(c.body_nonzero)}});
 }
 
+struct Ctx;
+// Stage registry: modules (spectral.hpp, heads.hpp, ...) register their stages with
+//   inline const bool reg_x = register_stage("name", fn);
+using stage_fn = value (*)(Ctx&, const struct Stage&);
+inline std::map<std::string, stage_fn>& stage_registry() { static std::map<std::string, stage_fn> r; return r; }
+inline bool register_stage(const std::string& n, stage_fn f) { stage_registry()[n] = f; return true; }
+// Allocation registry for prune(alloc=NAME): fn(model, calibration, criterion config, target sparsity, stage) -> unit -> sparsity
+using alloc_fn = std::map<std::string, double> (*)(Ctx&, const struct PruneCfg&, double, const struct Stage&);
+inline std::map<std::string, alloc_fn>& alloc_registry() { static std::map<std::string, alloc_fn> r; return r; }
+inline bool register_alloc(const std::string& n, alloc_fn f) { alloc_registry()[n] = f; return true; }
+
 struct Ctx {
     Model& m;
     const CalibSet& calib;
@@ -116,8 +127,13 @@ inline std::vector<LinView> layer_linears(Model& m, i64 l, LayerStats& S, const 
         v.push_back({p + leaf, t.data.data(), t.shape[0], t.shape[1], git == S.gram.end() ? nullptr : &git->second, &S.diag[grp]});
     };
     const bool attn_ok = scope == "all" || scope == "attn", ffn_ok = scope == "all" || scope == "ffn";
-    if (L.attn && attn_ok) { add("wq", "attn"); add("wk", "attn"); add("wv", "attn"); add("wo", "o"); }
-    if (L.ffn == LayerSpec::Ffn::dense && ffn_ok) { add("w_gate", "mlp"); add("w_up", "mlp"); add("w_down", "down"); }
+    auto addp = [&](const std::string& leaf, const std::string& grp) {   // a factored projection: its two factors
+        if (!m.spec.factored(l, leaf.c_str())) { add(leaf, grp); return; }
+        if (!m.spec.alias.count(p + leaf + "_a")) add(leaf + "_a", grp);
+        if (!m.spec.alias.count(p + leaf + "_b")) add(leaf + "_b", "lr:" + leaf);
+    };
+    if (L.attn && attn_ok) { addp("wq", "attn"); addp("wk", "attn"); addp("wv", "attn"); addp("wo", "o"); }
+    if (L.ffn == LayerSpec::Ffn::dense && ffn_ok) { addp("w_gate", "mlp"); addp("w_up", "mlp"); addp("w_down", "down"); }
     if (L.ffn == LayerSpec::Ffn::linear && ffn_ok) { add("lin_a", "lin"); }
     if (L.ffn == LayerSpec::Ffn::moe && ffn_ok) {
         for (const char* n : {"experts.w_gate", "experts.w_up", "experts.w_down"}) {
@@ -199,7 +215,8 @@ inline value stage_prune(Ctx& c, const Stage& st) {
             }
             std::swap(h, nx);
         }
-        if (alloc == "eba") unit_s = eba_allocate(units, grid, pc.sparsity, st.num("min_s", 0.0), st.num("max_s", 0.9));
+        if (auto it = alloc_registry().find(alloc); it != alloc_registry().end()) unit_s = it->second(c, pc, pc.sparsity, st);
+        else if (alloc == "eba") unit_s = eba_allocate(units, grid, pc.sparsity, st.num("min_s", 0.0), st.num("max_s", 0.9));
         else if (alloc == "owl") {
             auto ls = owl_allocate(units, pc.sparsity, st.num("lambda", 0.08));
             for (auto& u : units) unit_s[u.name] = ls[u.layer];
@@ -305,7 +322,7 @@ inline value stage_width(Ctx& c, const Stage& st) {
     Hidden h = Hidden::embed(m, c.calib), nx;
     std::vector<value> layers;
     for (i64 l = 0; l < m.spec.n_layers(); ++l) {
-        if (m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::dense) {
+        if (m.spec.layers[std::size_t(l)].ffn == LayerSpec::Ffn::dense && !m.spec.factored(l, "w_down") && !m.spec.factored(l, "w_gate") && !m.spec.factored(l, "w_up")) {
             StatsReq rq; rq.gram = true; rq.only = {"down"};
             auto S = layer_pass(m, l, h, rq, nullptr);
             const i64 f = m.w.at(std::format("layer.{}.w_down", l)).shape[1];
@@ -795,6 +812,7 @@ inline value run_stage(Ctx& c, const Stage& st) {
         r = calibrate_distribution(c.m, *c.ref, st.str("bias", "1") == "1");
     }
     else if (st.name == "optimise" || st.name == "optimize") r = stage_optimise(c, st);
+    else if (auto it = stage_registry().find(st.name); it != stage_registry().end()) r = it->second(c, st);
     else die("unknown stage " + st.name);
     auto& o = r.obj_mut();
     o.push_back({"seconds", value(now_s() - t0)});

@@ -127,6 +127,8 @@ struct LayerStats {
 // Group of a weight name in its layer: inputs shared by several projections share a Gram matrix.
 inline std::string weight_group(const std::string& w) {
     auto leaf = w.substr(w.find('.', 6) + 1);   // after "layer.N."
+    if (leaf.ends_with("_b") && leaf != "lin_b") return "lr:" + leaf.substr(0, leaf.size() - 2);   // input of a factor's 2nd half
+    if (leaf.ends_with("_a") && leaf != "lin_a") leaf = leaf.substr(0, leaf.size() - 2);           // same input as the full projection
     if (leaf == "wq" || leaf == "wk" || leaf == "wv") return "attn";
     if (leaf == "wo") return "o";
     if (leaf == "w_gate" || leaf == "w_up") return "mlp";

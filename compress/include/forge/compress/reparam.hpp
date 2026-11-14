@@ -70,9 +70,12 @@ inline Rw residual_tensors(const Model& m, i64 l) {
     Rw r;
     const auto& L = m.spec.layers[std::size_t(l)];
     const std::string p = std::format("layer.{}.", l);
-    if (L.attn) { r.readers_attn = {p + "wq", p + "wk", p + "wv"}; r.writers.push_back(p + "wo"); }
+    // a factored projection reads the residual through its first factor and writes it through its second
+    auto rd = [&](const char* n) { return m.spec.factored(l, n) ? p + n + "_a" : p + n; };
+    auto wr = [&](const char* n) { return m.spec.factored(l, n) ? p + n + "_b" : p + n; };
+    if (L.attn) { r.readers_attn = {rd("wq"), rd("wk"), rd("wv")}; r.writers.push_back(wr("wo")); }
     switch (L.ffn) {
-        case LayerSpec::Ffn::dense: r.readers_ffn = {p + "w_gate", p + "w_up"}; r.writers.push_back(p + "w_down"); break;
+        case LayerSpec::Ffn::dense: r.readers_ffn = {rd("w_gate"), rd("w_up")}; r.writers.push_back(wr("w_down")); break;
         case LayerSpec::Ffn::moe: r.readers_ffn = {p + "router", p + "experts.w_gate", p + "experts.w_up"}; r.writers.push_back(p + "experts.w_down"); break;
         case LayerSpec::Ffn::linear: r.readers_ffn = {p + "lin_a"}; r.writers.push_back(p + "lin_b"); break;
         case LayerSpec::Ffn::none: break;
@@ -135,7 +138,7 @@ inline value rotate_model(Model& m, std::uint64_t seed, bool heads) {
         for (auto& n : rw.readers_attn) { rot_reader(n); ++rotated; }
         for (auto& n : rw.readers_ffn) { rot_reader(n); ++rotated; }
         for (auto& n : rw.writers) { rot_writer(n); ++rotated; }
-        if (heads && m.spec.layers[std::size_t(l)].attn && is_pow2(m.spec.head_dim)) {
+        if (heads && m.spec.layers[std::size_t(l)].attn && is_pow2(m.spec.head_dim) && !m.spec.factored(l, "wv") && !m.spec.factored(l, "wo")) {
             // value channels of every KV head: v_h <- v_h R (R = Hadamard / sqrt(hd)); wv rows of a head <- R^T rows,
             // wo columns of every query head <- columns R
             const i64 hd = m.spec.head_dim;
@@ -176,7 +179,7 @@ inline value equalize_model(Model& m, double alpha = 1.0) {
             ++pairs;
         };
         const i64 d = m.spec.d_model;
-        if (L.ffn == LayerSpec::Ffn::dense) {
+        if (L.ffn == LayerSpec::Ffn::dense && !m.spec.factored(l, "w_up") && !m.spec.factored(l, "w_down") && L.act_thresh == 0) {
             auto& up = m.w.at(p + "w_up"); auto& dn = m.w.at(p + "w_down");
             eq(up.data.data(), dn.data.data(), up.shape[0], d, dn.shape[1], 0);
         } else if (L.ffn == LayerSpec::Ffn::moe) {
@@ -184,7 +187,7 @@ inline value equalize_model(Model& m, double alpha = 1.0) {
             const i64 E = up.shape[0], f = up.shape[1];
             for (i64 e = 0; e < E; ++e) eq(up.data.data() + e * f * d, dn.data.data() + e * d * f, f, d, f, 0);
         }
-        if (L.attn && !m.spec.qkv_bias) {
+        if (L.attn && !m.spec.qkv_bias && !m.spec.factored(l, "wv") && !m.spec.factored(l, "wo")) {
             // value channel c of KV head k feeds wo columns (h * hd + c) of the query heads h in k's group
             auto& wv = m.w.at(p + "wv"); auto& wo = m.w.at(p + "wo");
             const i64 hd = m.spec.head_dim, nkv = m.spec.n_kv, g = m.spec.n_heads / nkv, cols = wo.shape[1];
