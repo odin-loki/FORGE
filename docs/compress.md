@@ -73,6 +73,14 @@ layer by layer, with the calibration hidden states propagated through the layers
 They take 36, 22 and 14 bytes per block. The `--codec` picker and the quant stages use them only on tensors that
 really are 2:4 sparse; other tensors get the dense codec of the same value format.
 
+On the CPU a matmul with an s24 weight does not decode it (`graph/s24_gemm.hpp`): each block's 16 kept values are
+multiplied with the 16 activations at their positions (AVX-512: one two-source permute per block; AVX2: two permutes
+and a blend per 8; a scalar loop elsewhere), half the multiply-adds of the dense product, reading the weights at
+their stored size. A row's result does not depend on how many rows ran with it. TinyLlama-1.1B 2:4 on 4 cores:
+decode 38-41 tok/s for s24_q8 against 31-33 for q8_0 (int8 kernels) and 6.3 for the old decode + dense path; prefill
+(32 tokens) is behind q8_0 (52-59 against 87-94 tok/s), where the int8 kernels' 4x denser multiply-adds win.
+`FORGE_S24=0` goes back to decode + dot; `FORGE_S24_ISA=scalar|avx2` caps the kernel tier.
+
 Tied embeddings are stored once.
 
 ## Evaluation and the context mixer

@@ -8,6 +8,7 @@
 #include <forge/import/requant.hpp>
 #include <forge/import/blueprint_dir.hpp>
 #include <forge/modelfile/shard.hpp>
+#include <forge/modelfile/pack.hpp>
 #include <forge/simd/dispatch.hpp>
 #include <forge/inference/inference.hpp>
 #include <forge/inference/aot_build.hpp>
@@ -106,6 +107,8 @@ int usage() {
         "  shard split <in.fpk> -o <out.fpk> [--shard-size 2G] [--blob-dir DIR]   tensors into blobs named by their BLAKE3 hash\n"
         "      (default one blob per tensor: models that share tensors store them once); blobs go to DIR, $FORGE_BLOB_DIR or ./blobs next to out\n"
         "  shard join <in.fpk> -o <out.fpk>  |  shard list <model.fpk>             back to one file; which blobs are present\n"
+        "  pack <in.fpk> -o <out.fpkz>   lossless entropy-coded copy (context mixing / rANS per codec byte class; 1.1-4x smaller)\n"
+        "  unpack <in.fpkz> -o <out.fpk> the original file byte for byte (checked against its BLAKE3); run/bench accept .fpkz directly\n"
         "  requant <in.fpk> -o <out.fpk> --codec C   re-encode the float weights of a model file (codecs and the mixed-precision\n"
         "      options of import); reads the calib section, or measures f32 weights [--no-calib] [--calib-crest 12] [--align A]\n"
         "  adapter list <model.fpk> | add <model.fpk> --name N --from lora.fpk [-o out.fpk] | remove <model.fpk> --name N [-o out.fpk]\n"
@@ -173,9 +176,28 @@ bool auto_optimise(const std::string& path, const std::string& codec_opt, bool n
 }
 std::string optimise_recipe(const std::string& codec_opt) { return "optimise(codec=" + (codec_opt.empty() ? std::string("mixed") : codec_opt) + ")"; }
 
+// A packed model (.fpkz): unpacked once into the cache, under the BLAKE3 of the original it records (content-addressed:
+// the same model packed twice, or moved, unpacks to the same file).
+std::string unpack_cached(const std::string& path) {
+    namespace fs = std::filesystem;
+    const std::string h = modelfile::pack::recorded_blake3(path);
+    if (h.empty()) raise(errc::format_error, "{}: not a packed model (.fpkz)", path);
+    const char* home = std::getenv("HOME");
+    fs::path dir = std::getenv("FORGE_CACHE") ? fs::path(std::getenv("FORGE_CACHE")) : fs::path(home ? home : "/tmp") / ".cache" / "forge";
+    fs::create_directories(dir);
+    std::string stem = fs::path(path).filename().string();
+    if (stem.ends_with(modelfile::pack::ext)) stem.resize(stem.size() - modelfile::pack::ext.size());
+    fs::path out = dir / (stem + "-" + h.substr(0, 24) + ".fpk");
+    if (fs::exists(out)) { std::fprintf(stderr, "[using cached %s]\n", out.string().c_str()); return out.string(); }
+    auto st = modelfile::pack::unpack_file(path, out.string());
+    std::fprintf(stderr, "[unpacked %s -> %s (%.1f s)]\n", path.c_str(), out.string().c_str(), st.seconds);
+    return out.string();
+}
+
 // `forge run <hf-dir|model.gguf>`: import on the fly into a content-addressed cache and reuse it next time.
 std::string resolve_model(const std::string& path, const std::string& codec_opt, bool allow_unused = false, bool no_opt = false) {
     namespace fs = std::filesystem;
+    if (!fs::is_directory(path) && (path.ends_with(modelfile::pack::ext) || modelfile::pack::is_packed(path))) return unpack_cached(path);
     if (!fs::is_directory(path) && !path.ends_with(".gguf") && !path.ends_with(".onnx")) return path;
     const bool optimise = auto_optimise(path, codec_opt, no_opt);
     // `codec_opt` is --codec as given (empty when absent): Hugging Face inputs default to f32, a GGUF keeps its stored
@@ -475,6 +497,29 @@ int cmd_shard(const args& a) {
         std::printf("joined %s -> %s: %zu tensors from %zu blobs, %llu bytes\n", f.c_str(), a.get("o").c_str(), sr.tensors, sr.shards, (unsigned long long)sr.bytes);
     } else return usage();
     for (auto& n : sr.notes) std::fprintf(stderr, "forge shard: %s\n", n.c_str());
+    return 0;
+}
+
+// forge pack <in.fpk> -o <out.fpkz> [--segment-size 8M] | forge unpack <in.fpkz> -o <out.fpk>
+int cmd_pack(const args& a, bool unpack) {
+    if (a.pos.empty() || a.get("o").empty()) return usage();
+    activate_policy(a.get("policy"));
+    import::check_write(a.get("o"));
+    if (unpack) {
+        auto st = modelfile::pack::unpack_file(a.pos[0], a.get("o"));
+        std::printf("unpacked %s -> %s: %llu -> %llu bytes, %zu segments, %.2f s (%.1f MB/s), blake3 %s ok\n", a.pos[0].c_str(), a.get("o").c_str(),
+                    (unsigned long long)st.in, (unsigned long long)st.out, st.segments, st.seconds, double(st.out) / 1e6 / std::max(st.seconds, 1e-9), st.blake3.c_str());
+        return 0;
+    }
+    modelfile::pack::options po;
+    if (!a.get("segment-size").empty()) po.segment_bytes = std::size_t(std::max<std::uint64_t>(4096, parse_size_arg(a.get("segment-size"), "--segment-size")));
+    auto st = modelfile::pack::pack_file(a.pos[0], a.get("o"), po);
+    std::printf("packed %s -> %s: %llu -> %llu bytes (%.3fx), %zu segments, %.2f s (%.1f MB/s)\n", a.pos[0].c_str(), a.get("o").c_str(),
+                (unsigned long long)st.in, (unsigned long long)st.out, double(st.in) / double(std::max<std::uint64_t>(st.out, 1)), st.segments, st.seconds,
+                double(st.in) / 1e6 / std::max(st.seconds, 1e-9));
+    for (auto& [c, p] : st.by_codec)
+        std::printf("  %-10s %4zu tensors  %14llu -> %14llu bytes  %.3fx\n", c.c_str(), p.tensors, (unsigned long long)p.in, (unsigned long long)p.out,
+                    double(p.in) / double(std::max<std::uint64_t>(p.out, 1)));
     return 0;
 }
 
@@ -1464,6 +1509,7 @@ int main(int argc, char** argv) {
         if (c == "encrypt") return cmd_encrypt(a);
         if (c == "adapter") return cmd_adapter(a);
         if (c == "shard") return cmd_shard(a);
+        if (c == "pack" || c == "unpack") return cmd_pack(a, c == "unpack");
         if (c == "blueprint") return cmd_blueprint(a);
         if (c == "requant") return cmd_requant(a);
         if (c == "compress" || c == "eval") {

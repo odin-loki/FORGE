@@ -3,7 +3,7 @@
 Source: `apps/forge.cpp`. Run `forge` with no arguments for the built-in usage text. The usage text is shorter than this page; where they differ, this page follows the code.
 
 ## Concepts
-- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `shard`, `adapter`, `blueprint`, `inspect`, `run`, `denoise`, `stream`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
+- `forge <command> [arguments]`. Commands: `info`, `import`, `requant`, `shard`, `pack`, `unpack`, `adapter`, `blueprint`, `inspect`, `run`, `denoise`, `stream`, `aot`, `bench`, `dump`, `keygen`, `sign`, `verify`, `encrypt`, `rpc-serve`, `security`, `script`.
 - Options (all commands except `script`) are `--name value`, `--name=value` or `-x value`. Positional arguments can go anywhere.
 - These options are flags and never take a value: `--verify`, `--tensors`, `--blueprint`, `--license`, `--allow-unused`, `--ids`, `--no-bos`, `--chat`, `--allow-scripts`, `--script-no-proc`, `--script-no-fs`, `--script-no-net`, `--json`, `--detached`. Any other option takes the next argument as its value, so an option such as `--pure` must be last or written `--pure=1`.
 - Unknown options are ignored. An unknown command, or a missing required argument, prints the usage and exits 2. Errors print `forge: error: <message>` and exit 1.
@@ -58,6 +58,9 @@ With calibration (the default) the statistics come from the input's `calib` sect
 
 ### `forge shard split <in.fpk> -o out.fpk [--shard-size SIZE] [--blob-dir DIR]` / `join <in.fpk> -o out.fpk` / `list <model.fpk>`
 `split` moves the tensors of a single-file model into content-addressed blobs and writes the small main file ([format.md](format.md#shards)); without `--shard-size` (or with `0`) every tensor is its own blob. It prints how many blobs it wrote and how many were already in the store. `join` writes one file again (every blob must be present; each tensor is checked against the index). `list` prints each blob with its size, tensor count and path, or `MISSING`. Both drop a signature and precompiled plans. Set `FORGE_BLOB_DIR` to share one store between models; otherwise blobs live in `blobs/` next to the model.
+
+### `forge pack <in.fpk> -o out.fpkz [--segment-size 8M]` / `forge unpack <in.fpkz> -o out.fpk`
+Lossless entropy-coded copy of a model file ([format.md](format.md#packed-files-fpkz)) for storage and transfer; `unpack` gives back the original byte for byte and checks it against the BLAKE3 the packed file records (a damaged file fails and leaves no output). `pack` prints the size per codec. Both use every core (`FORGE_THREADS`). `forge run` / `bench` / `embed` take a `.fpkz` directly: it is unpacked once into the cache (`$FORGE_CACHE`, else `~/.cache/forge`) under the hash of the original, and reused after that. Typical ratios: 1.5x for bf16 / f16 weights, 1.08x q8_0, 1.12x q4_0, 1.15-1.6x for the 2:4 codecs, 3-4x for f32 files converted from bf16 (zero low halves); 2:4-pruned weights in dense codecs pack further (q8_0 1.55x).
 
 ### `forge adapter list <model.fpk>` / `add <model.fpk> --name N --from lora.fpk [-o out.fpk]` / `remove <model.fpk> --name N [-o out.fpk]`
 LoRA adapters carried in the model file. `add` copies the `<weight>.lora_a` / `<weight>.lora_b` tensors of `lora.fpk` (the layout `model::add_adapter_file` reads; `lora_alpha` from its manifest) into the model under the name `N`; `remove` takes one out; without `-o` the file is rewritten in place. Select one with `forge run --adapter N`. Both drop a signature and precompiled plans, refuse an encrypted file, and hold the whole file in memory while they work.
