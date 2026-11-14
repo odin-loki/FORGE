@@ -167,16 +167,17 @@ TEST(spectral_lowrank_stage_planted) {
 
 // ------------------------------------------------------------------------------------------------ exactness
 TEST(spectral_lowrank_full_rank_exact) {
-    for (const char* method : {"energy", "whiten", "mdl"}) {
+    // the exact (dense eigh) path and the fast path (blocked subspace iteration, forced with exact_max=0)
+    for (const char* solver : {"", ",exact_max=0,block0=8,block=8,over=4"}) for (const char* method : {"energy", "whiten", "mdl"}) {
         Model m = tiny_dense(5, 3);
         auto c = random_calib(m.spec.vocab, 2, 24, 8);
         auto ref = logits_of(m, c.seqs[0]);
         Ctx ctx{m, c, {}, 0.01};
-        auto rep = run_stage(ctx, parse_recipe(std::format("lowrank(method={},rank=100000,min_save=-10)", method))[0]);
+        auto rep = run_stage(ctx, parse_recipe(std::format("lowrank(method={},rank=100000,min_save=-10{})", method, solver))[0]);
         for (i64 l = 0; l < 3; ++l) for (const char* n : {"wq", "wk", "wv", "wo", "w_gate", "w_up", "w_down"}) CHECK(m.spec.factored(l, n));
         const double e = max_abs_diff(logits_of(m, c.seqs[0]), ref);
-        CHECK_MSG(e < 2e-3 * std::max(1.0, max_abs(ref)), "%s full rank: logits differ by %g", method, e);
-        if (std::string(method) == "whiten") check_saved_runs(m, c, "lr_full");
+        CHECK_MSG(e < 2e-3 * std::max(1.0, max_abs(ref)), "%s%s full rank: logits differ by %g", method, solver, e);
+        if (std::string(method) == "whiten" && !*solver) check_saved_runs(m, c, "lr_full");
     }
 }
 
@@ -201,8 +202,8 @@ TEST(spectral_whiten_beats_plain_svd) {
             CHECK_MSG(ew <= ep * (1 + 1e-5), "%lldx%lld r=%lld: whitened %g > plain %g", (long long)out, (long long)in, (long long)r, ew, ep);
             CHECK_MSG(ew < 0.95 * ep, "%lldx%lld r=%lld: whitening should help on correlated inputs (%g vs %g)", (long long)out, (long long)in, (long long)r, ew, ep);
             // the spectrum predicts the H-weighted error
-            double tot = 0; for (double x : Fw.ev) tot += x;
-            CHECK_MSG(std::abs(spectral::rel_residual(Fw.ev, r) * tot - ew) <= 1e-3 * tot, "predicted %g measured %g", spectral::rel_residual(Fw.ev, r) * tot, ew);
+            const double tot = Fw.eig.trace;
+            CHECK_MSG(std::abs(spectral::rel_residual(Fw.eig, r) * tot - ew) <= 1e-3 * tot, "predicted %g measured %g", spectral::rel_residual(Fw.eig, r) * tot, ew);
         }
     }
 }
@@ -303,12 +304,12 @@ TEST(spectral_alpha_allocation) {
 
 // ------------------------------------------------------------------------------------------------ basis sharing
 TEST(spectral_share_basis) {
-    {   // full rank: exact
+    for (const char* solver : {"", ",exact_max=0,block0=8,block=8,over=4"}) {   // full rank: exact (both solvers)
         Model m = tiny_dense(17, 4);
         auto c = random_calib(m.spec.vocab, 2, 16, 6);
         auto ref = logits_of(m, c.seqs[0]);
         Ctx ctx{m, c, {}, 0.01};
-        run_stage(ctx, parse_recipe("share(group=2,rank=1000,min_save=-10)")[0]);
+        run_stage(ctx, parse_recipe(std::format("share(group=2,rank=1000,min_save=-10{})", solver))[0]);
         CHECK(m.spec.factored(3, "w_down") && m.spec.alias.count("layer.3.w_down_b"));
         const double e = max_abs_diff(logits_of(m, c.seqs[0]), ref);
         CHECK_MSG(e < 2e-3 * std::max(1.0, max_abs(ref)), "full-rank share differs by %g", e);
@@ -366,4 +367,90 @@ TEST(spectral_report_stage) {
     auto r = run_stage(ctx, parse_recipe("spectra")[0]);
     CHECK(r["matrices"].arr().size() == 14);
     for (auto& x : r["matrices"].arr()) CHECK(x["alpha"].num() > 1 && x["lambda_plus"].num() > 0);
+}
+
+// ------------------------------------------------------------------------------------------------ fast solver
+namespace {
+// A decaying spectrum (like trained weights: power-law singular values over a noise floor): A diag(d) B + noise.
+std::vector<float> decaying(i64 out, i64 in, double pw, float noise, unsigned seed) {
+    const i64 p = std::min(out, in);
+    auto A = randn(out * p, seed), B = randn(p * in, seed + 1), E = randn(out * in, seed + 2, noise);
+    for (i64 i = 0; i < out; ++i) for (i64 j = 0; j < p; ++j) A[std::size_t(i * p + j)] *= float(std::pow(double(j + 1), -pw) / std::sqrt(double(p)));
+    std::vector<float> Bt(static_cast<std::size_t>(in * p)), W(static_cast<std::size_t>(out * in));
+    la::transpose(B.data(), Bt.data(), p, in);
+    la::gemm_nt(A.data(), Bt.data(), W.data(), out, in, p);
+    for (std::size_t i = 0; i < W.size(); ++i) W[i] += E[i];
+    return W;
+}
+}  // namespace
+
+TEST(spectral_fast_matches_exact) {
+    spectral::SpecOpts fast; fast.exact_max = 0;
+    struct Case { const char* what; i64 out, in; std::vector<float> W; };
+    std::vector<Case> cases;
+    cases.push_back({"planted", 400, 700, planted(400, 700, 8, 0.08f, 1.0f, 31)});
+    cases.push_back({"decaying", 600, 450, decaying(600, 450, 0.8, 0.02f, 32)});
+    for (auto& cs : cases) {
+        const i64 out = cs.out, in = cs.in, p = std::min(out, in);
+        const bool planted_case = std::string(cs.what) == "planted";
+        auto G = spectral::small_gram(cs.W.data(), out, in);
+        double t0 = now_s();
+        auto E = spectral::eig_desc(G.data(), p);   // reference: dense eigh
+        const double te = now_s() - t0;
+        t0 = now_s();
+        spectral::TopEig T(G, p, fast);
+        T.grow(160);
+        const double tf = now_s() - t0;
+        CHECK(T.k() >= 160 && !T.exact());
+        double worst = 0;
+        for (i64 i = 0; i < 160; ++i) worst = std::max(worst, std::abs(T.w[std::size_t(i)] - E.w[std::size_t(i)]) / E.w[std::size_t(i)]);
+        CHECK_MSG(worst < 1e-3, "%s: top-160 eigenvalues rel err %g", cs.what, worst);
+        double tr = 0; for (double x : E.w) tr += x;
+        CHECK(std::abs(T.trace - tr) <= 1e-4 * tr);
+        for (i64 i = 0; i < 8; ++i) {   // leading eigenvectors
+            double d = 0; for (i64 j = 0; j < p; ++j) d += double(T.Ut[std::size_t(i * p + j)]) * E.V(std::size_t(j), std::size_t(i));
+            CHECK_MSG(std::abs(d) > 0.999, "%s: eigenvector %lld overlap %g", cs.what, (long long)i, d);
+        }
+        std::printf("  %s %lldx%lld: top-160 rel err %.2e, %d subspace iterations, %.2fs (dense eigh %.2fs)\n", cs.what, (long long)out, (long long)in, worst, T.iters, tf, te);
+        // ranks: energy (with and without a cap), MDL, MP signal rank, Hill alpha and sigma^2
+        for (double keep : {0.5, 0.9, 0.99}) {
+            spectral::TopEig F(G, p, fast);
+            const i64 re = spectral::energy_rank(E.w, keep), rf = spectral::energy_rank(F, keep, p);
+            if (planted_case) CHECK_MSG(rf == re, "planted keep %g: fast rank %lld exact %lld", keep, (long long)rf, (long long)re);
+            else CHECK_MSG(std::abs(rf - re) <= 1, "decaying keep %g: fast rank %lld exact %lld", keep, (long long)rf, (long long)re);
+            spectral::TopEig Fc(G, p, fast);
+            const i64 rc = spectral::energy_rank(Fc, keep, 20);
+            CHECK(re > 20 ? rc == 21 && Fc.k() <= 20 + fast.over + fast.block0 : rc == re);
+        }
+        {
+            spectral::TopEig F(G, p, fast);
+            const i64 me = spectral::mdl_rank(E.w, out, in, 16), mf = spectral::mdl_rank(F, out, in, 16, p);
+            if (planted_case) CHECK_MSG(me == mf, "%s: mdl fast %lld exact %lld", cs.what, (long long)mf, (long long)me);
+            else CHECK_MSG(std::abs(me - mf) <= 1, "%s: mdl fast %lld exact %lld", cs.what, (long long)mf, (long long)me);
+            std::printf("  %s: mdl rank %lld/%lld (fast/exact), eigenpairs computed %lld\n", cs.what, (long long)mf, (long long)me, (long long)F.k());
+        }
+        {
+            spectral::TopEig F(G, p, fast);
+            auto sf = spectral::analyse_spectrum(F, out, in);
+            auto se = spectral::analyse_esd(E.w, out, in);
+            CHECK(!sf.exact && se.exact);
+            if (planted_case) CHECK_MSG(sf.mp_rank == se.mp_rank && se.mp_rank == 8, "mp rank fast %lld exact %lld", (long long)sf.mp_rank, (long long)se.mp_rank);
+            CHECK_MSG(std::abs(sf.sigma2 / se.sigma2 - 1) < 0.05, "%s: sigma2 fast %g exact %g", cs.what, sf.sigma2, se.sigma2);
+            CHECK_MSG(std::abs(sf.alpha / se.alpha - 1) < 0.05, "%s: alpha fast %g exact %g", cs.what, sf.alpha, se.alpha);
+            CHECK(std::abs(sf.signal_frac - se.signal_frac) < 0.02);
+            std::printf("  %s: sigma2 %.4g/%.4g alpha %.4g/%.4g mp_rank %lld/%lld (fast/exact)\n", cs.what, sf.sigma2, se.sigma2, sf.alpha, se.alpha, (long long)sf.mp_rank, (long long)se.mp_rank);
+        }
+        // factors from the fast path: the same reconstruction error as the exact ones
+        {
+            auto Fe = spectral::analyse(cs.W.data(), out, in, nullptr);
+            auto Ff = spectral::analyse(cs.W.data(), out, in, nullptr, 1e-6, fast);
+            la::Sym I(in); for (i64 i = 0; i < in; ++i) I(i, i) = 1;
+            for (i64 r : {8, 40}) {
+                auto [Ae, Be] = spectral::factors(Fe, r);
+                auto [Af, Bf] = spectral::factors(Ff, r);
+                const double ee = h_err(cs.W, Ae, Be, out, in, I), ef = h_err(cs.W, Af, Bf, out, in, I);
+                CHECK_MSG(std::abs(ef - ee) <= 1e-3 * ee, "%s r=%lld: fast factor error %g exact %g", cs.what, (long long)r, ef, ee);
+            }
+        }
+    }
 }
