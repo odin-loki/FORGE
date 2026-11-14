@@ -432,6 +432,33 @@ if (phases.contains("runtime")) {
             std::string draft = RUNS + "/models/" + safe(std::string(results[fid]["parent"])) + ".fpk";
             if (fs.exists(draft)) eval_job(name + "/speculative_chain_draft", name, base_fpk(name), "ppl", {"--draft", draft, "--spec-tokens", "64", "--spec-prompts", "8"});
         }
+        // lossless packing (forge pack: context-mixing / rANS per byte lane, BLAKE3-verified unpack)
+        auto files = std::vector<std::vector<std::string>>{{"base", base_fpk(name)}};
+        if (results.contains(fid)) {
+            std::string cf = RUNS + "/models/" + safe(std::string(results[fid]["parent"])) + ".fpk";
+            if (fs.exists(cf)) files.push_back({"chain", cf});
+        }
+        for (auto f : files) {
+            std::string pid = name + "/pack_" + f[0];
+            if (results.contains(pid)) continue;
+            std::string z = RUNS + "/models/" + safe(pid) + ".fpkz", back = RUNS + "/models/" + safe(pid) + ".unpacked.fpk";
+            double t0 = time.ms();
+            auto pk = forge::run(std::vector<std::string>{FORGE, "pack", f[1], "-o", z}, {{"merge", true}});
+            double t1 = time.ms();
+            auto up = forge::run(std::vector<std::string>{FORGE, "unpack", z, "-o", back}, {{"merge", true}});
+            double t2 = time.ms();
+            auto r = json.parse("{}"); r["id"] = pid; r["model"] = name; r["mode"] = "pack";
+            r["file"] = f[1]; r["ok"] = pk.code == 0 && up.code == 0;
+            if (pk.code == 0) {
+                double a = fs.stat(f[1])["size"], b = fs.stat(z)["size"];
+                r["bytes"] = a; r["packed_bytes"] = b; r["ratio"] = a / b;
+            }
+            r["pack_seconds"] = (t1 - t0) / 1000.0; r["unpack_seconds"] = (t2 - t1) / 1000.0;
+            r["bench"] = std::format("pack {}: ratio {}, unpack {}", f[0], r.contains("ratio") ? std::format("{:.3f}", double(r["ratio"])) : "failed", up.code == 0 ? "verified" : "FAILED");
+            record(r);
+            if (fs.exists(z)) fs.remove(z);
+            if (fs.exists(back)) fs.remove(back);
+        }
         for (auto bm : std::vector<std::string>{base_fpk(name)}) {
             std::string bid = name + "/bench_base";
             if (!results.contains(bid)) {
