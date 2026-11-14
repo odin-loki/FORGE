@@ -906,7 +906,9 @@ inline value run_stage(Ctx& c, const Stage& st) {
     else if (st.name == "optimise" || st.name == "optimize") r = stage_optimise(c, st);
     else if (auto it = stage_registry().find(st.name); it != stage_registry().end()) r = it->second(c, st);
     else die("unknown stage " + st.name);
+    if (!r.is_obj()) r = value(jobj{});
     auto& o = r.obj_mut();
+    if (!r.find("stage")) o.insert(o.begin(), {"stage", value(st.text())});   // every report names its stage
     o.push_back({"seconds", value(now_s() - t0)});
     o.push_back({"counts", counts_json(count(c.m))});
     return r;

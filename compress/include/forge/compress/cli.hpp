@@ -112,7 +112,9 @@ inline value compress_file(const opts& a) {
     scratch::set_dir(os::dirname(os::absolute(a.out)));
     Checkpoint ck(checkpoint_cfg(a));
     if (ck.complete() && os::exists(a.out)) { say("checkpoint {}: {} is already done", ck.dir(), a.out); return ck.report(); }
-    const i64 n = std::stoll(a.get("nsamples", "64")), seq = std::stoll(a.get("seqlen", "512"));
+    // self-generated calibration costs a decode per token: smaller defaults when the model writes its own text
+    const bool self_src = a.get("calib-data", "self") == "self";
+    const i64 n = std::stoll(a.get("nsamples", self_src ? "16" : "64")), seq = std::stoll(a.get("seqlen", self_src ? "256" : "512"));
     // calibration: a dataset, or "self" (text the model writes itself: no data needed)
     const std::string src = a.get("calib-data", "self");
     const std::uint64_t seed = std::stoull(a.get("seed", "0"));
@@ -143,7 +145,7 @@ inline value compress_file(const opts& a) {
         // reference distributions of the uncompressed model for feedback / calibrate: self-generated probes held
         // apart from the calibration text (different seed)
         if (need_ref) {
-            const i64 np = std::stoll(a.get("probes", "8")), pl = std::stoll(a.get("probe-len", "256"));
+            const i64 np = std::stoll(a.get("probes", self_src ? "4" : "8")), pl = std::stoll(a.get("probe-len", self_src ? "128" : "256"));
             auto probes = self_text(a.in, m, np, pl, seed + 7919, self_mode, passes);
             ref = capture_reference(m, probes);
             say("reference: {} x {} self-generated probe tokens", probes.seqs.size(), probes.seq);

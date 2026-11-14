@@ -83,7 +83,7 @@ auto run_job(std::vector<std::string> argv, std::string log) {
     heartbeat("running");
     double last_hb = time.ms();
     while (code == -1) {
-        std::string s = p.read(30000);
+        std::string s = p.read(1000);   // short reads: a finished job is noticed within a second
         if (s != "") {
             fs.append(log, s);
             tail += s;
@@ -156,7 +156,8 @@ auto summarise(std::string id, std::string model, std::string parent, std::strin
         auto st = json.parse("[]");
         for (auto s : rep["stages"]) {
             auto o = json.parse("{}");
-            o["stage"] = s["stage"]; o["seconds"] = s["seconds"];
+            if (s.contains("stage")) o["stage"] = s["stage"];
+            if (s.contains("seconds")) o["seconds"] = s["seconds"];
             if (s.contains("mean_rel_err")) o["mean_rel_err"] = s["mean_rel_err"];
             if (s.contains("removed")) o["removed"] = s["removed"];
             if (s.contains("nm_fraction")) o["nm_fraction"] = s["nm_fraction"];
@@ -234,11 +235,12 @@ auto compress_job(std::string id, std::string model, std::string parent, std::st
     return r;
 }
 
-auto eval_job(std::string id, std::string model, std::string input, std::string mode) {
+auto eval_job(std::string id, std::string model, std::string input, std::string mode, std::vector<std::string> extra = {}) {
     if (results.contains(id)) return results[id];
     std::string rep = RUNS + "/reports/" + safe(id) + ".json";
     auto argv = std::vector<std::string>{FORGE, "eval", input, "--report", rep};
     for (auto x : eval_args(mode)) argv.push_back(x);
+    for (auto x : extra) argv.push_back(x);
     std::println("[{}] {} :: eval {} ({})", time.iso(time.now()), id, input, mode);
     double t0 = time.ms();
     current_job = id;
@@ -328,6 +330,7 @@ void write_report() {
         for (auto id : order) {
             auto r = results[id];
             if (r["model"] != name || id == bid) continue;
+            if (r.contains("bench")) { o += "| " + id + " | `forge bench` | | " + std::string(r["bench"]).replace("\n", " ") + " | | | | | | |\n"; continue; }
             if (!ok(r)) { o += "| " + id + " | `" + std::string(r["recipe"]) + "` | " + std::string(r["codec"]) + " | failed | | | | | | |\n"; continue; }
             double p = r["eval"]["ppl"];
             std::string acc = r["eval"].contains("mean_acc") && double(r["eval"]["mean_acc"]) > 0 ? std::format("{:.4f}", double(r["eval"]["mean_acc"])) : "";
@@ -342,7 +345,7 @@ void write_report() {
 }
 
 // ------------------------------------------------------------------------------------------------ phases
-std::string phases = len(args) > 0 ? args[len(args) - 1] : "base,chains,sweeps";
+std::string phases = len(args) > 0 ? args[len(args) - 1] : "base,chains,runtime,sweeps";
 
 if (phases.contains("base")) {
     for (auto& m : models) eval_job(std::string(m["name"]) + "/base", m["name"], base_fpk(m["name"]), "full");
@@ -398,15 +401,17 @@ if (phases.contains("chains")) {
     run_chain("qwen3-0.6b", {
         {"depth(n=4,score=probe,shortlist=6,probe=4)", "depth(n=2,score=probe,shortlist=6,probe=4)", "depth(n=1,score=probe,shortlist=6,probe=4)"},
         {"width(s=0.2,score=obs,alloc=eba)", "width(s=0.1,score=obs,alloc=eba)", "width(s=0.05,score=obs,alloc=eba)"},
-        {"prune(method=sparsegpt,nm=2:4,alloc=eba,frac=0.3,refit=mcr,iters=15)", "prune(method=sparsegpt,nm=2:4,alloc=eba,frac=0.15,refit=mcr,iters=15)", "prune(method=sparsegpt,nm=2:4,alloc=eba,frac=0.08,refit=mcr,iters=15)"},
+        {"heads(s=0.25,score=obs,alloc=eba)", "heads(s=0.125,score=obs)"},
+        {"permute+prune(method=sparsegpt,nm=2:4,alloc=eba,frac=0.3,refit=mcr,iters=15)", "prune(method=sparsegpt,nm=2:4,alloc=eba,frac=0.15,refit=mcr,iters=15)", "prune(method=sparsegpt,nm=2:4,alloc=eba,frac=0.08,refit=mcr,iters=15)"},
         {"optimise(kl=0.02)", "optimise(kl=0.008)", "optimise(kl=0.003)"}},
-        {0.25, 0.5, 0.75, 0.92}, {"f32", "f32", "f32", "f32"});
+        {0.2, 0.4, 0.55, 0.75, 0.92}, {"f32", "f32", "f32", "f32", "f32"});
     // sparse (2:4 already): drop sublayers -> narrow FFNs keeping the 2:4 masks -> GPTQ into the 2:4 codecs
     run_chain("tinyllama-sparse24", {
         {"depth(n=4,score=probe,shortlist=6,probe=4)", "depth(n=2,score=probe,shortlist=6,probe=4)", "depth(n=1,score=probe,shortlist=6,probe=4)"},
         {"width(s=0.15,score=obs)", "width(s=0.08,score=obs)", "width(s=0.04,score=obs)"},
+        {"heads(s=0.25,score=obs)", "heads(s=0.125,score=obs)"},
         {"optimise(kl=0.02)", "optimise(kl=0.008)", "optimise(kl=0.003)"}},
-        {0.3, 0.6, 0.92}, {"f32", "f32", "f32"});
+        {0.3, 0.55, 0.7, 0.92}, {"f32", "f32", "f32", "f32"});
     // MoE: smaller MoE or dense conversion -> drop sublayers -> GPTQ
     run_chain("tinymixtral", {
         {"moe2dense(width=0.5)", "merge(drop=1,method=ls)", "experts(drop=1,score=reap)", "moe2dense(width=0.75)"},
@@ -415,8 +420,50 @@ if (phases.contains("chains")) {
         {0.5, 0.7, 0.92}, {"f32", "f32", "f32"});
 }
 
+// runtime: KV-cache codecs on the baselines; speculative decoding with each chain's final model as the draft of its
+// original (lossless check + acceptance); forge bench speed of the baselines and the chain models
+if (phases.contains("runtime")) {
+    for (auto& m : models) {
+        std::string name = m["name"];
+        for (auto kv : std::vector<std::string>{"int8", "fp8", "tbq4", "tbq3", "k8v4"})
+            eval_job(name + "/kv_" + kv, name, base_fpk(name), "ppl", {"--kv-codec", kv});
+        std::string fid = name + "/chain/final";
+        if (results.contains(fid)) {
+            std::string draft = RUNS + "/models/" + safe(std::string(results[fid]["parent"])) + ".fpk";
+            if (fs.exists(draft)) eval_job(name + "/speculative_chain_draft", name, base_fpk(name), "ppl", {"--draft", draft, "--spec-tokens", "64", "--spec-prompts", "8"});
+        }
+        for (auto bm : std::vector<std::string>{base_fpk(name)}) {
+            std::string bid = name + "/bench_base";
+            if (!results.contains(bid)) {
+                auto p = forge::run(std::vector<std::string>{FORGE, "bench", bm, "-p", "512", "-n", "64"}, {{"merge", true}});
+                auto r = json.parse("{}"); r["id"] = bid; r["model"] = name; r["bench"] = p.out; r["mode"] = "bench";
+                record(r);
+            }
+        }
+    }
+    write_report();
+}
+
 if (phases.contains("sweeps")) {
     auto sweep = std::vector<std::vector<std::string>>{
+        // Ideas / NN Shortcuts: spectral structure (algebraic autopsy, NMP), symmetry, idempotent sparsification
+        {"qwen3-0.6b", "spectra", "spectra", "f32"},
+        {"qwen3-0.6b", "wanda50_alpha", "prune(method=wanda,s=0.5,alloc=alpha)", "f32"},
+        {"tinymixtral", "wanda50_alpha", "prune(method=wanda,s=0.5,alloc=alpha)", "f32"},
+        {"qwen3-0.6b", "lowrank_mp", "lowrank(method=mp,scope=all)", "f32"},
+        {"qwen3-0.6b", "lowrank_energy95", "lowrank(method=energy,keep=0.95,scope=all)", "f32"},
+        {"qwen3-0.6b", "lowrank_whiten90", "lowrank(method=whiten,keep=0.9,scope=attn)", "f32"},
+        {"qwen3-0.6b", "lowrank_mdl", "lowrank(method=mdl,scope=all)", "f32"},
+        {"tinymixtral", "lowrank_whiten90", "lowrank(method=whiten,keep=0.9,scope=attn)", "f32"},
+        {"qwen3-0.6b", "share2", "share(group=2,keep=0.95,scope=attn,data=1)", "f32"},
+        {"qwen3-0.6b", "heads25_obs", "heads(s=0.25,score=obs)", "f32"},
+        {"qwen3-0.6b", "heads25_mag", "heads(s=0.25,score=mag)", "f32"},
+        {"tinyllama-sparse24", "heads25_obs", "heads(s=0.25,score=obs)", "f32"},
+        {"qwen3-0.6b", "permute_sgpt24", "permute+prune(method=sparsegpt,nm=2:4)", "f32"},
+        {"qwen3-0.6b", "actsparse40", "actsparse(p=0.4)", "f32"},
+        {"qwen3-0.6b", "actsparse40_eba", "actsparse(p=0.4,alloc=eba)", "f32"},
+        {"tinyllama-sparse24", "actsparse40", "actsparse(p=0.4)", "f32"},
+        {"qwen3-0.6b", "optimise_jacobi", "optimise", "f32", "self"},
         // data-free optimisation: function-preserving transforms, mixed precision, distribution calibration
         {"qwen3-0.6b", "optimise", "optimise", "f32", "self"},
         {"qwen3-0.6b", "optimise_c4", "optimise", "f32"},
