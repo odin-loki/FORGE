@@ -447,6 +447,7 @@ jobs:
           release: "14.3"
           usesh: true
           mem: 8192
+          copyback: false   # nothing is needed back; copying the 2.7 GB build tree out broke rsync
           prepare: |
             pkg install -y cmake ninja python3 bash zsh mksh fish
             py=$(python3 -c 'import sys; print("py%d%d" % sys.version_info[:2])')
