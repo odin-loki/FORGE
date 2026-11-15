@@ -1139,6 +1139,10 @@ public:
                 if (!mma_attr_.count(fn) && f_.func_attr) { ck(f_.func_attr(fn, 8 /* MAX_DYNAMIC_SHARED_SIZE_BYTES */, int(smem)), "cuFuncSetAttribute"); mma_attr_.insert(fn); }
                 grid = ((rows + bq - 1) / bq) * cols; ++dispatches_["attention_fa2"]; }
             if (s == sig::rms && has_fn_locked("forge_rms_norm_b")) { fn = function("forge_rms_norm_b"); block = 256; grid = rows; }
+            // f32 matmul_t: 64x64 shared-memory tiles, bit-identical to forge_matmul_t ($FORGE_GPU_MM_NAIVE keeps the latter)
+            static const bool mm_naive = std::getenv("FORGE_GPU_MM_NAIVE") != nullptr;
+            if (s == sig::matmul && !mm_naive && has_fn_locked("forge_matmul_t_tiled")) {
+                fn = function("forge_matmul_t_tiled"); block = 256; grid = ((cols + 63) / 64) * ((rows + 63) / 64); ++dispatches_["matmul_tiled"]; }
             std::uint32_t fnb = 0; std::uint64_t qx = 0;
             if (in_run_ && fuse_q81() && use_mmvq() && rows < mmq_min_rows()) {
                 if (s == sig::rms && cols % 32 == 0 && has_fn_locked("forge_rms_norm_q81")) {

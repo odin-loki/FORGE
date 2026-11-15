@@ -227,6 +227,9 @@ Generated from `graph/codecs.hpp` (codec list), `qweights::fmt_of` in `graph/pla
 | `iq4_xs` | 256 / 136 | decode + f32 dot |  |  |
 | `tq1_0` | 256 / 54 | decode + f32 dot |  |  |
 | `tq2_0` | 256 / 66 | decode + f32 dot |  |  |
+| `s24_f16` | 32 / 36 | decode + f32 dot |  |  |
+| `s24_q8` | 32 / 22 | decode + f32 dot |  |  |
+| `s24_q4` | 32 / 14 | decode + f32 dot |  |  |
 
 ## C ABI (version 4, `inference/include/forge.h`)
 

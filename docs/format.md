@@ -200,10 +200,21 @@ Compatibility:
 - A reader that predates the chunked scheme opens a chunked file without a key as any locked file (`inspect`, hashes, signature); with a key it stops with `unknown encryption xchacha20-poly1305-chunked`. It ignores `enc_macs`.
 - `enc_macs` and `encryption` are covered by the signature like every section; `forge sign` and `forge aot` copy them unchanged.
 
+## Packed files (.fpkz)
+`forge pack` stores a `.fpk` losslessly in fewer bytes (`modelfile/pack.hpp`); `forge unpack` (or `forge run x.fpkz`) restores the original file exactly. A packed file is not a model file: it must be unpacked before it is opened.
+
+    header (96 B) : "FORGEPKZ" | u32 version 1 | u32 layouts | u32 segments | u32 0 | u64 original size
+                    | u64 index offset | u64 index bytes | 32 B BLAKE3 of the original | 8 B 0
+    payloads      : one per segment
+    index         : layouts { u16 period, u8 classes, u8 0, u8 order[period], u8 class[period] }
+                    segments { u64 offset, u64 bytes, u64 payload offset, u64 payload bytes, u32 layout, u32 row bytes, u8 method, 7 B 0 }
+
+Segments tile the original file in order: each tensor's bytes (in pieces of whole rows, ~8 MiB) with the layout of its codec, and the bytes between tensors (header, sections, padding, table) with the plain layout. A layout is the codec's byte structure: a period (4 for f32, 2 for f16 / bf16, the block size of block codecs), the order its bytes are coded in (multi-byte fields most significant byte first) and a class per byte (exponent byte, mantissa bytes, block scale, values, 2:4 positions). Method 0 stores the bytes; method 1 is a payload where each class has its own coding, picked by the packer by code length: context mixing (an adaptive binary arithmetic coder fed by up to four models - order 0, previous byte, the same byte one period back, the same byte one row back - and a logistic mixer), static rANS of order 0 or of order 1 on the previous byte (frequency tables stored), stored bytes, or a single value. The decoder rebuilds the adaptive models exactly as the encoder ran them; nothing about them is stored. Unpacking validates the index (segments must tile the file, every size in bounds), decodes, and compares the BLAKE3 of the result with the recorded one before the output file is renamed into place. Encrypted and sharded files pack as plain bytes.
+
 ## Tools
 - `forge blueprint` converts a model's blueprint (or a bare `.fbp` / `.fbpb` file) between the forms; `forge inspect --blueprint text|binary|canonical [-o FILE]` shows or extracts one.
 - `forge inspect <file> [--tensors] [--blueprint] [--verify] [--state]` shows the layout, the alignment, the declared state, embedded adapters and calibration data.
-- `forge adapter list|add|remove`, `forge requant`, `forge shard split|join|list`: see [cli.md](cli.md).
+- `forge adapter list|add|remove`, `forge requant`, `forge shard split|join|list`, `forge pack` / `unpack`: see [cli.md](cli.md).
 - `forge aot <file> --list` shows the precompiled plans and whether they would be used; `--strip` removes them.
 - `forge dump <file> <tensor> out.f32` extracts one tensor as raw f32.
 - `forge keygen`, `forge sign`, `forge verify`, `forge encrypt`: see [modelfile.md](modelfile.md#examples).

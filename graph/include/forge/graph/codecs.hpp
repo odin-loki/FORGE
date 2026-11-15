@@ -594,6 +594,69 @@ inline void enc_tq1_0(const float* x, std::size_t n, u8* o) {
         for (int i = 0; i < 52; ++i) o[i] = u8((acc[i] * 256 + 242) / 243);
     }
 }
+// 2:4 semi-structured sparse codecs (forge::compress N:M pruning): every group of 4 consecutive weights keeps its 2
+// largest-magnitude entries, stored with their two 2-bit positions (4 bits per group: pos0 | pos1 << 2).
+// A 32-element block = 8 groups: 16 kept values and 8 x 4-bit position pairs (4 bytes).
+// Dense input is pruned to 2:4 by magnitude on encode; a 2:4-sparse input round-trips (up to the value format).
+//   s24_f16  16 x f16                              36 bytes / 32 weights (1.125 B/weight vs 2 for f16)
+//   s24_q8   f16 scale + 16 x int8 (x = d * q)     22 bytes / 32 weights (0.6875 vs 1.0625 for q8_0)
+//   s24_q4   f16 scale + 16 x int4 (x = d * q, q in [-7, 7])   14 bytes / 32 weights (0.4375 vs 0.5625 for q4_0)
+template <int Bits> inline void enc_s24(const float* x, std::size_t n, u8* o) {
+    constexpr std::size_t bytes = Bits == 16 ? 36 : Bits == 8 ? 22 : 14;
+    for (std::size_t b = 0; b < n; b += 32, o += bytes) {
+        float blk[32] = {}; std::copy_n(x + b, std::min<std::size_t>(32, n - b), blk);
+        float kept[16]; u8 pos[8];
+        for (int g = 0; g < 8; ++g) {
+            const float* q = blk + 4 * g;
+            int i0 = 0, i1 = 1;   // the two largest |x| (ties: lower index), kept in index order
+            for (int i = 0; i < 4; ++i) if (std::fabs(q[i]) > std::fabs(q[i0])) i0 = i;
+            i1 = i0 == 0 ? 1 : 0;
+            for (int i = 0; i < 4; ++i) if (i != i0 && std::fabs(q[i]) > std::fabs(q[i1])) i1 = i;
+            if (i1 < i0) std::swap(i0, i1);
+            kept[2 * g] = q[i0]; kept[2 * g + 1] = q[i1];
+            pos[g] = u8(i0 | (i1 << 2));
+        }
+        u8* p = o;
+        if constexpr (Bits == 16) {
+            for (int i = 0; i < 16; ++i) { u16 hb = f16(kept[i]).bits; std::memcpy(p + 2 * i, &hb, 2); }
+            p += 32;
+        } else {
+            float amax = 0; for (float v : kept) amax = std::max(amax, std::fabs(v));
+            constexpr float qmax = Bits == 8 ? 127.f : 7.f;
+            float d = amax / qmax, id = d ? 1.f / d : 0.f;
+            u16 hb = f16(d).bits; std::memcpy(p, &hb, 2); p += 2;
+            if constexpr (Bits == 8) { for (int i = 0; i < 16; ++i) p[i] = u8(i8(std::clamp<long>(std::lround(kept[i] * id), -127, 127))); p += 16; }
+            else {
+                for (int i = 0; i < 8; ++i) {
+                    int a = int(std::clamp<long>(std::lround(kept[2 * i] * id), -7, 7)) + 8, c = int(std::clamp<long>(std::lround(kept[2 * i + 1] * id), -7, 7)) + 8;
+                    p[i] = u8(a | (c << 4));
+                }
+                p += 8;
+            }
+        }
+        for (int i = 0; i < 4; ++i) p[i] = u8(pos[2 * i] | (pos[2 * i + 1] << 4));
+    }
+}
+template <int Bits> inline void dec_s24(const u8* in, std::size_t n, float* x) {
+    constexpr std::size_t bytes = Bits == 16 ? 36 : Bits == 8 ? 22 : 14;
+    for (std::size_t b = 0; b < n; b += 32, in += bytes) {
+        float kept[16]; const u8* p = in;
+        if constexpr (Bits == 16) { for (int i = 0; i < 16; ++i) { u16 hb; std::memcpy(&hb, p + 2 * i, 2); kept[i] = float(f16::from_bits(hb)); } p += 32; }
+        else {
+            u16 hb; std::memcpy(&hb, p, 2); const float d = float(f16::from_bits(hb)); p += 2;
+            if constexpr (Bits == 8) { for (int i = 0; i < 16; ++i) kept[i] = d * float(i8(p[i])); p += 16; }
+            else { for (int i = 0; i < 8; ++i) { kept[2 * i] = d * float(int(p[i] & 15) - 8); kept[2 * i + 1] = d * float(int(p[i] >> 4) - 8); } p += 8; }
+        }
+        float blk[32] = {};
+        for (int g = 0; g < 8; ++g) {
+            const u8 ps = u8((p[g / 2] >> (4 * (g % 2))) & 15);
+            blk[4 * g + (ps & 3)] = kept[2 * g];
+            blk[4 * g + (ps >> 2)] = kept[2 * g + 1];
+        }
+        std::copy_n(blk, std::min<std::size_t>(32, n - b), x + b);
+    }
+}
+
 } // namespace detail
 
 inline const std::vector<codec>& all() {
@@ -625,6 +688,9 @@ inline const std::vector<codec>& all() {
         {"iq4_xs", dtype::iq4_xs, 256, 136, detail::enc_iq4_xs, detail::dec_iq4_xs},
         {"tq1_0", dtype::tq1_0, 256, 54, detail::enc_tq1_0, detail::dec_tq1_0},
         {"tq2_0", dtype::tq2_0, 256, 66, detail::enc_tq2_0, detail::dec_tq2_0},
+        {"s24_f16", dtype::s24_f16, 32, 36, detail::enc_s24<16>, detail::dec_s24<16>},
+        {"s24_q8", dtype::s24_q8, 32, 22, detail::enc_s24<8>, detail::dec_s24<8>},
+        {"s24_q4", dtype::s24_q4, 32, 14, detail::enc_s24<4>, detail::dec_s24<4>},
     };
     return c;
 }
