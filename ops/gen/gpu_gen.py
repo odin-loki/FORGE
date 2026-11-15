@@ -1410,6 +1410,32 @@ FORGE_GLOBAL void forge_qmatmul_mmq(const float* a, const unsigned char* w, floa
   for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) {
     unsigned r = r0 + ty + 16u * i, c = c0 + tx + 16u * j;
     if (r < rows && c < cols) y[(unsigned long long)r * cols + c] = acc[i * 4u + j]; } }
+// f32 matmul_t, y[r, c] = sum_t a[r, t] * b[c, t]: a 64x64 output tile per 256-thread block, 32-wide k slices of a and
+// b staged in shared memory with coalesced loads. Every output accumulates fma(a, b, acc) over t in index order, the
+// same sequence as forge_matmul_t (one thread per output), so the result is bit-identical to it.
+// Grid: ceil(cols/64) * ceil(rows/64) blocks. $FORGE_GPU_MM_NAIVE (any value) keeps forge_matmul_t.
+FORGE_GLOBAL void forge_matmul_t_tiled(const float* a, const float* b, float* y, unsigned rows, unsigned cols, unsigned k) {
+  __attribute__((shared)) float As[64u * 33u];
+  __attribute__((shared)) float Bs[64u * 33u];
+  unsigned t = tid_(), ncb = (cols + 63u) / 64u, bi = bid_(), c0 = (bi % ncb) * 64u, r0 = (bi / ncb) * 64u;
+  unsigned tx = t & 15u, ty = t >> 4;
+  float acc[16];
+  for (unsigned i = 0; i < 16u; ++i) acc[i] = 0.0f;
+  for (unsigned kb = 0; kb < k; kb += 32u) {
+    for (unsigned i = t; i < 2048u; i += 256u) {
+      unsigned rr = i >> 5, kk = i & 31u, r = r0 + rr, c = c0 + rr;
+      As[rr * 33u + kk] = (r < rows && kb + kk < k) ? a[(unsigned long long)r * k + kb + kk] : 0.0f;
+      Bs[rr * 33u + kk] = (c < cols && kb + kk < k) ? b[(unsigned long long)c * k + kb + kk] : 0.0f; }
+    bar_();
+    unsigned ke = k - kb < 32u ? k - kb : 32u;
+    for (unsigned kk = 0; kk < ke; ++kk) {
+      float av[4], bv[4];
+      for (unsigned i = 0; i < 4u; ++i) { av[i] = As[(ty + 16u * i) * 33u + kk]; bv[i] = Bs[(tx + 16u * i) * 33u + kk]; }
+      for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) acc[i * 4u + j] = fma_(av[i], bv[j], acc[i * 4u + j]); }
+    bar_(); }
+  for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) {
+    unsigned r = r0 + ty + 16u * i, c = c0 + tx + 16u * j;
+    if (r < rows && c < cols) y[(unsigned long long)r * cols + c] = acc[i * 4u + j]; } }
 // Gated DeltaNet state ops on the device (flow/state_ops.hpp semantics; the state slot stays resident).
 // delta_rule: one 128-thread block per value head; each thread owns whole columns j of S[h] (dk x dv), so the
 // recurrence S *= exp(g); delta = (v - S^T k) * beta; S += k delta^T; out = S^T q needs no cross-thread sync

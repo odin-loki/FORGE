@@ -31,6 +31,20 @@ struct EvalCfg {
     i64 spec_prompts = 8;    // prompts (evenly spaced windows of the test split)
     i64 spec_prompt_len = 128;
     int spec_k = 4;          // drafts per pass (0 = FORGE's planner)
+    // KL(reference || model) per token, over full vocabularies, on WikiText-2 train windows (held out from the test
+    // split that perplexity is reported on): the search metric of the fast plan (EvoPress; Dutta et al. 2024: KL
+    // tracks answer flips). The reference model runs in the same process on the same device.
+    std::string kl_ref;
+    i64 kl_windows = 16;
+    i64 kl_window = 512;
+};
+
+struct KlResult {
+    double kl = 0;         // mean KL(ref || model), nats per token
+    double kl_p95 = 0;     // 95th percentile of the per-token KL
+    double top1 = 0;       // fraction of positions where both models' argmax agree
+    double nll = 0, nll_ref = 0;   // cross-entropy of the model and of the reference on the same tokens
+    i64 tokens = 0;
 };
 
 struct SpecResult {
@@ -47,6 +61,8 @@ struct EvalResult {
     i64 ppl_tokens = 0;
     std::map<std::string, double> acc;
     std::map<std::string, i64> n;
+    std::map<std::string, std::string> preds;   // per task: the chosen answer index of every item, one digit each
+    std::optional<KlResult> kl;
     double mean_acc = 0;
     double seconds = 0;
     std::string kv_codec;
@@ -115,6 +131,16 @@ public:
         return {out_.data(), std::size_t(n * vocab_)};
     }
 
+    // Runs `ids` into the KV cache without copying their logits to the host (only the last, padded row comes back).
+    void run_prefix(std::span<const int> ids) {
+        if (ids.empty()) return;
+        const i64 n = i64(ids.size()), pos = s_.position();
+        buf_.assign(ids.begin(), ids.end());
+        buf_.resize(static_cast<std::size_t>(bucket_of(n)), ids.back());
+        (void)s_.forward(buf_);
+        s_.rewind(pos + n);
+    }
+
     void reset() { s_.reset(); }
     i64 vocab() const { return vocab_; }
 
@@ -177,8 +203,24 @@ public:
         return lp;
     }
 
-    double task(const std::string& path, i64 limit, i64* n_out) {
+    // Sum log p(cont | ctx) with the context [0, n-1) already in the KV cache: one short pass over the last context
+    // token and the continuation (its rows give the log-probabilities of every continuation token). Same values as
+    // score(), without the [context, vocab] logits of the context pass ($FORGE_EVAL_FULL_CTX=1: the old path).
+    double score_cached(const std::vector<int>& ctx_ids, const std::vector<int>& cont_ids) {
+        s_.rewind(i64(ctx_ids.size()) - 1);
+        std::vector<int> seq;
+        seq.reserve(cont_ids.size());
+        seq.push_back(ctx_ids.back());
+        seq.insert(seq.end(), cont_ids.begin(), cont_ids.end() - 1);
+        auto lg = run(seq);
+        double lp = 0;
+        for (std::size_t t = 0; t < cont_ids.size(); ++t) lp += logprob(lg.data() + i64(t) * vocab_, vocab_, cont_ids[t]);
+        return lp;
+    }
+
+    double task(const std::string& path, i64 limit, i64* n_out, std::string* preds = nullptr) {
         auto items = read_jsonl(path, std::size_t(limit));
+        static const bool full_ctx = [] { const char* e = std::getenv("FORGE_EVAL_FULL_CTX"); return e && std::string(e) == "1"; }();
         i64 correct = 0;
         for (auto& it : items) {
             const auto& ctxs = it["ctxs"].arr();
@@ -201,15 +243,20 @@ public:
                 if (cont_ids.empty()) { sc.push_back(-INFINITY); continue; }
                 if (ctx != cached_ctx || ctx_ids != cenc) {
                     reset();
-                    auto lg = run(cenc);
-                    last.assign(lg.end() - vocab_, lg.end());
+                    if (full_ctx) {
+                        auto lg = run(cenc);
+                        last.assign(lg.end() - vocab_, lg.end());
+                    } else {
+                        run_prefix(std::span<const int>(cenc.data(), cenc.size() - 1));
+                    }
                     ctx_ids = cenc; cached_ctx = ctx;
                 }
-                double lp = score(ctx_ids, cont_ids, last);
+                double lp = full_ctx ? score(ctx_ids, cont_ids, last) : score_cached(ctx_ids, cont_ids);
                 sc.push_back(norm ? lp / double(std::max<std::size_t>(1, cont.size())) : lp);
             }
             const i64 best = i64(std::max_element(sc.begin(), sc.end()) - sc.begin());
             correct += best == label;
+            if (preds) preds->push_back(char('0' + std::min<i64>(best, 9)));
         }
         if (n_out) *n_out = i64(items.size());
         return items.empty() ? 0.0 : double(correct) / double(items.size());
@@ -239,6 +286,68 @@ inline std::vector<int> ppl_tokens(Evaluator& ev, const std::string& data_dir, c
     std::ofstream f(cache, std::ios::binary);
     f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
     return v;
+}
+
+// Tokenised WikiText-2 train split (the KL windows: held out from the test split), cached per tokenizer.
+inline std::vector<int> train_tokens(Evaluator& ev, const std::string& data_dir, const std::string& tok_key) {
+    const std::string cache = data_dir + "/cache/wt2_train_" + tok_key + ".i32";
+    if (std::filesystem::exists(cache)) {
+        auto raw = read_file(cache);
+        std::vector<int> v(raw.size() / 4);
+        std::memcpy(v.data(), raw.data(), v.size() * 4);
+        return v;
+    }
+    auto v = ev.encode(read_file(data_dir + "/wikitext2_train.txt"), true);
+    std::filesystem::create_directories(data_dir + "/cache");
+    std::ofstream f(cache, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+    return v;
+}
+
+// KL(ref || model) per token over full vocabularies on `n_windows` evenly spaced windows of `toks`, plus top-1
+// agreement and both cross-entropies. Both evaluators must share the tokenizer.
+inline KlResult kl_vs_ref(Evaluator& model, Evaluator& ref, const std::vector<int>& toks, i64 window, i64 n_windows) {
+    const i64 total = i64(toks.size()) / window, V = model.vocab();
+    if (ref.vocab() != V) die("kl: the reference has a different vocabulary");
+    const i64 nw = std::min(std::max<i64>(n_windows, 1), total);
+    KlResult R;
+    std::vector<double> per;   // per-token KL
+    std::vector<float> mlog;
+    double top1 = 0, nll = 0, nll_ref = 0;
+    for (i64 w = 0; w < nw; ++w) {
+        const i64 start = (w * total / nw) * window;
+        std::span<const int> ids(toks.data() + start, std::size_t(window));
+        model.reset();
+        auto lm = model.run(ids);
+        mlog.assign(lm.begin(), lm.end());
+        ref.reset();
+        auto lr = ref.run(ids);
+        const std::size_t rows = std::size_t(window - 1);
+        std::vector<std::array<double, 4>> part(rows);
+        la::parallel_for(rows, 4, [&](std::size_t b, std::size_t e) {
+            for (std::size_t t = b; t < e; ++t) {
+                const float* a = lr.data() + i64(t) * V;   // reference
+                const float* c = mlog.data() + i64(t) * V; // model
+                double ma = -INFINITY, mc = -INFINITY; i64 aa = 0, ac = 0;
+                for (i64 j = 0; j < V; ++j) { if (a[j] > ma) { ma = a[j]; aa = j; } if (c[j] > mc) { mc = c[j]; ac = j; } }
+                double za = 0, zc = 0;
+                for (i64 j = 0; j < V; ++j) { za += std::exp(double(a[j]) - ma); zc += std::exp(double(c[j]) - mc); }
+                const double la = ma + std::log(za), lc = mc + std::log(zc);
+                double kl = 0;
+                for (i64 j = 0; j < V; ++j) { const double pa = double(a[j]) - la; kl += std::exp(pa) * (pa - (double(c[j]) - lc)); }
+                const int y = ids[t + 1];
+                part[t] = {std::max(kl, 0.0), aa == ac ? 1.0 : 0.0, lc - double(c[y]), la - double(a[y])};
+            }
+        });
+        for (auto& p : part) { per.push_back(p[0]); top1 += p[1]; nll += p[2]; nll_ref += p[3]; }
+    }
+    const double n = double(per.size());
+    double s = 0; for (double x : per) s += x;
+    R.tokens = i64(per.size());
+    R.kl = s / n; R.top1 = top1 / n; R.nll = nll / n; R.nll_ref = nll_ref / n;
+    std::sort(per.begin(), per.end());
+    R.kl_p95 = per[std::size_t(0.95 * double(per.size() - 1))];
+    return R;
 }
 
 inline std::string tokenizer_key(const std::string& fpk) {
@@ -318,11 +427,19 @@ inline EvalResult evaluate(const std::string& fpk, const EvalCfg& c) {
     double sum = 0;
     for (auto& t : c.tasks) {
         i64 n = 0;
-        double a = ev.task(c.data_dir + "/tasks/" + t + ".jsonl", c.task_limit, &n);
-        R.acc[t] = a; R.n[t] = n; sum += a;
+        std::string pr;
+        double a = ev.task(c.data_dir + "/tasks/" + t + ".jsonl", c.task_limit, &n, &pr);
+        R.acc[t] = a; R.n[t] = n; R.preds[t] = pr; sum += a;
         say("  {} acc {:.4f} (n={})", t, a, n);
     }
     R.mean_acc = c.tasks.empty() ? 0 : sum / double(c.tasks.size());
+    if (!c.kl_ref.empty() && c.kl_windows > 0) {
+        Evaluator ref(c.kl_ref, std::max<i64>(1024, c.kl_window), c.kv_codec);
+        auto toks = train_tokens(ev, c.data_dir, tokenizer_key(fpk));
+        R.kl = kl_vs_ref(ev, ref, toks, c.kl_window, c.kl_windows);
+        say("  KL(ref || model) {:.5f} nats/token (p95 {:.4f}), top-1 agreement {:.4f}, nll {:.4f} vs ref {:.4f} over {} train tokens",
+            R.kl->kl, R.kl->kl_p95, R.kl->top1, R.kl->nll, R.kl->nll_ref, R.kl->tokens);
+    }
     if (!c.draft.empty()) {
         auto toks = ppl_tokens(ev, c.data_dir, tokenizer_key(fpk));
         auto prompts = spaced_windows(toks, c.spec_prompts, c.spec_prompt_len);

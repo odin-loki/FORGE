@@ -35,6 +35,12 @@ inline value eval_json(const EvalResult& r) {
     jobj o{{"ppl", value(r.ppl)}, {"nll", value(r.nll)}, {"ppl_mix", value(r.ppl_mix)}, {"ppl_tokens", value(r.ppl_tokens)}, {"acc", value(acc)}, {"n", value(n)},
            {"mean_acc", value(r.mean_acc)}, {"seconds", value(r.seconds)}};
     if (!r.kv_codec.empty()) o.push_back({"kv_codec", value(r.kv_codec)});
+    if (!r.preds.empty()) { jobj p; for (auto& [k, v] : r.preds) p.push_back({k, value(v)}); o.push_back({"preds", value(p)}); }
+    if (r.kl) {
+        const auto& K = *r.kl;
+        o.push_back({"kl", value(jobj{{"kl", value(K.kl)}, {"kl_p95", value(K.kl_p95)}, {"top1", value(K.top1)}, {"nll", value(K.nll)},
+                                      {"nll_ref", value(K.nll_ref)}, {"tokens", value(K.tokens)}})});
+    }
     if (r.spec) {
         const auto& S = *r.spec;
         o.push_back({"speculative", value(jobj{{"prompts", value(S.prompts)}, {"new_tokens", value(S.new_tokens)}, {"acceptance", value(S.acceptance)},
@@ -59,6 +65,9 @@ inline EvalCfg eval_cfg(const opts& a) {
     c.spec_prompts = std::stoll(a.get("spec-prompts", "8"));
     c.spec_prompt_len = std::stoll(a.get("spec-prompt-len", "128"));
     c.spec_k = std::stoi(a.get("spec-k", "4"));
+    c.kl_ref = a.get("kl-ref");
+    c.kl_windows = std::stoll(a.get("kl-windows", "16"));
+    c.kl_window = std::stoll(a.get("kl-window", "512"));
     return c;
 }
 
