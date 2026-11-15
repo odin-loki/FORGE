@@ -58,11 +58,15 @@ double BUDGET = 0.05;
 double DNLL_BUDGET = std::log(1.0 + BUDGET);
 
 fs.mkdir(RUNS); fs.mkdir(RUNS + "/models"); fs.mkdir(RUNS + "/reports"); fs.mkdir(RUNS + "/logs"); fs.mkdir(RES);
-auto plan_lock = fs.lock(RUNS + "/plan.lock", false);
+// one lock per model set: the chains of different models may run as separate processes at the same time
+std::string LOCK_TAG = envor("FAST_MODELS", "") == "" ? "" : "_" + envor("FAST_MODELS", "").replace(",", "_");
+auto plan_lock = fs.lock(RUNS + "/plan" + LOCK_TAG + ".lock", false);
 if (plan_lock == nullptr) { std::println("fast plan: another instance holds {}; exiting", RUNS + "/plan.lock"); std::exit(75); }
 
 // device environments: exact kernels everywhere (no int8 activations, f32 SIMT attention on the GPU)
 std::vector<std::string> GPU_ENV = {"env", "FORGE_DEVICE=cuda", "FORGE_FA_TC=0", "FORGE_GPU_QMATMUL=0", "FORGE_CPU_INT8=0"};
+// FAST_GPU_WRAP: a command that runs the GPU job while holding a slot shared with other plan processes (device memory)
+if (envor("FAST_GPU_WRAP", "") != "") { auto g = std::vector<std::string>{envor("FAST_GPU_WRAP", "")}; for (auto x : GPU_ENV) g.push_back(x); GPU_ENV = g; }
 std::vector<std::string> CPU_ENV = {"env", "FORGE_DEVICE=cpu", "FORGE_CPU_INT8=0", "FORGE_THREADS=" + CPU_THREADS};
 
 std::string safe(std::string id) { std::string o = ""; for (auto c : id) { if (c == '/' || c == '@') o += "__"; else o += c; } return o; }
@@ -150,7 +154,7 @@ auto run_tasks(auto tasks) {
         }
         if (time.ms() - last_hb > 30000) {
             last_hb = time.ms();
-            fs.write_atomic(RUNS + "/plan.heartbeat", std::format("{{\"pid\":{},\"iso\":\"{}\",\"done\":{},\"total\":{}}}\n", os.pid(), time.iso(time.now()), len(done), total));
+            fs.write_atomic(RUNS + "/plan" + LOCK_TAG + ".heartbeat", std::format("{{\"pid\":{},\"iso\":\"{}\",\"done\":{},\"total\":{}}}\n", os.pid(), time.iso(time.now()), len(done), total));
         }
         if (!any) sleep(200);
     }
@@ -503,7 +507,7 @@ void write_report() {
         o += std::format("\nProxy check ({}): Spearman(KL, dppl) = **{:.3f}** over {} techniques; Spearman(KL, flips) = **{:.3f}** over {} anchor-evaluated techniques.\n\n",
                          name, spearman(xs, ys), len(xs), spearman(fx, fy), len(fx));
     }
-    fs.write(RES + "/REPORT_FAST.md", o);
+    fs.write(RES + "/REPORT_FAST" + LOCK_TAG + ".md", o);
 }
 
 // ------------------------------------------------------------------------------------------------ phase: base + sweeps
@@ -550,6 +554,62 @@ if (phases.contains("base") || phases.contains("sweeps")) {
     }
 }
 
+// ------------------------------------------------------------------------------------------------ table pruning
+// technique family for pruning: 2:4 (with or without a fraction) apart from unstructured pruning
+std::string prune_family(std::string r) { std::string f = family_of(r); if ((f == "prune" || f == "permute") && r.contains("nm=2:4")) return "prune24"; return f; }
+// value of `key` (e.g. "n") in a recipe, as "(key=" or ",key="; -1 when absent
+double param_of(std::string r, std::string key) {
+    for (auto pre : std::vector<std::string>{"(" + key + "=", "," + key + "="}) {
+        auto p = r.find(pre);
+        if (p == std::string::npos) continue;
+        std::string v = "";
+        for (int i = p + len(pre); i < len(r); ++i) { auto ch = r.substr(i, 1); if (ch == "," || ch == ")" || ch == "+") break; v += ch; }
+        if (v.contains(":")) return -1;
+        return std::stod(v);
+    }
+    return -1;
+}
+// string value of `key` in a recipe ("" when absent)
+std::string str_param(std::string r, std::string key) {
+    for (auto pre : std::vector<std::string>{"(" + key + "=", "," + key + "="}) {
+        auto p = r.find(pre);
+        if (p == std::string::npos) continue;
+        std::string v = "";
+        for (int i = p + len(pre); i < len(r); ++i) { auto ch = r.substr(i, 1); if (ch == "," || ch == ")") break; v += ch; }
+        return v;
+    }
+    return "";
+}
+// how much a recipe removes, comparable within one family (larger = more aggressive); -1 = unknown
+double level_of(std::string r) {
+    std::string f = prune_family(r);
+    if (f == "depth") return param_of(r, "n");
+    if (f == "width" || f == "heads") return param_of(r, "s");
+    if (f == "actsparse") return param_of(r, "p");
+    if (f == "experts" || f == "merge") return param_of(r, "drop");
+    if (f == "moe2dense") { double w = param_of(r, "width"); return w < 0 ? -1 : 1 - w; }
+    if (f == "optimise") { double kl = param_of(r, "kl"); return kl < 0 ? 0.005 : kl; }   // optimise's default KL target
+    if (f == "prune24") { double fr = param_of(r, "frac"); return fr < 0 ? 1.0 : fr; }
+    if (f == "prune") return param_of(r, "s");
+    return -1;
+}
+// why `opt` need not be tried at this cap ("" = try it)
+std::string prune_reason(std::string name, std::string opt, double cap) {
+    std::string f = prune_family(opt);
+    double lo = level_of(opt);
+    for (auto s : sweep) {
+        if (s[0] != name || !results.contains(ekey(name + "/" + s[1], "P"))) continue;
+        auto r = results[ekey(name + "/" + s[1], "P")];
+        if (!r.contains("dnll") || double(r["dnll"]) <= cap) continue;
+        if (s[2] == opt) return std::format("the same recipe alone: dnll {:.4f} > cap {:.4f}", double(r["dnll"]), cap);
+        double ls = level_of(s[2]);
+        if (str_param(s[2], "score") != str_param(opt, "score") || str_param(s[2], "method") != str_param(opt, "method")) continue;   // a different scoring rule or method says nothing
+        if (prune_family(s[2]) == f && lo >= 0 && ls >= 0 && ls <= lo)
+            return std::format("{} at level {} <= {} already: dnll {:.4f} > cap {:.4f}", s[1], ls, lo, double(r["dnll"]), cap);
+    }
+    return "";
+}
+
 // ------------------------------------------------------------------------------------------------ phase: chains
 // Beam search over the stages of compress_plan.cpp's chains. caps[k]: share of the dnll budget the chain may have
 // used after stage k (cumulative).
@@ -561,39 +621,43 @@ void beam_chain(std::string name, std::vector<std::vector<std::string>> stages, 
     beam.push_back(root);
     for (int k = 0; k < len(stages); ++k) {
         double cap = DNLL_BUDGET * caps[k];
-        auto tasks = json.parse("[]");
+        // First fit, in waves: wave j tries option j (options run from the most to the least aggressive) for every
+        // beam state that has no option within the cap yet; a state stops at its first fit. Table pruning skips an
+        // option when a sweep of the same family that is at most as aggressive already broke the cap on this model
+        // (damage is assumed to grow with the level; the sweep ran on the uncompressed model, a chain stage on an
+        // already compressed one, so the assumption errs towards trying).
         auto cands = std::vector<auto>{};
-        for (int bi = 0; bi < len(beam); ++bi) {
-            auto st = beam[bi];
-            for (int j = 0; j < len(stages[k]); ++j) {
-                std::string opt = stages[k][j];
-                // table pruning: the same technique alone on the uncompressed model already costs more than the cap
-                bool pruned = false;
-                for (auto s : sweep) if (s[0] == name && s[2] == opt && results.contains(ekey(name + "/" + s[1], "P"))) {
-                    auto r = results[ekey(name + "/" + s[1], "P")];
-                    if (r.contains("dnll") && double(r["dnll"]) > cap) { pruned = true; std::println("  chain {} s{}: {} pruned by the sweep table (dnll {:.4f} > cap {:.4f})", name, k + 1, opt, double(r["dnll"]), cap); }
-                }
-                if (pruned) continue;
+        auto pool = json.parse("[]");
+        for (auto st : beam) pool.push_back(st);   // "skip this stage"
+        std::vector<bool> fitted;
+        for (int bi = 0; bi < len(beam); ++bi) fitted.push_back(false);
+        for (int j = 0; j < len(stages[k]); ++j) {
+            std::string opt = stages[k][j];
+            std::string why = prune_reason(name, opt, cap);
+            if (why != "") { std::println("  chain {} s{}: {} pruned by the sweep table ({})", name, k + 1, opt, why); continue; }
+            auto tasks = json.parse("[]");
+            auto wave = std::vector<auto>{};
+            for (int bi = 0; bi < len(beam); ++bi) {
+                if (fitted[bi]) continue;
+                auto st = beam[bi];
                 auto c = json.parse("{}");
                 c["id"] = name + "/chain/s" + std::to_string(k + 1) + "_b" + std::to_string(bi) + "_o" + std::to_string(j + 1);
-                c["model"] = name; c["parent"] = st["file"]; c["recipe"] = opt; c["codec"] = "f32"; c["bpw_in"] = st["bpw"];
+                c["model"] = name; c["parent"] = st["file"]; c["recipe"] = opt; c["codec"] = "f32"; c["bpw_in"] = st["bpw"]; c["state"] = bi;
                 c["chain"] = std::string(st["chain"]) == "" ? opt : std::string(st["chain"]) + " + " + opt;
                 if (opt.contains("optimise")) c["calib"] = "self";
                 add_tasks(tasks, c, "S", true);
-                cands.push_back(c);
+                wave.push_back(c); cands.push_back(c);
             }
-        }
-        std::println("chain {} stage {}: {} candidates from {} beam states (cap dnll {:.4f})", name, k + 1, len(cands), len(beam), cap);
-        run_tasks(tasks);
-        // pool: the beam states themselves ("skip this stage") and every candidate within the cap
-        auto pool = json.parse("[]");
-        for (auto st : beam) pool.push_back(st);
-        for (auto c : cands) {
-            auto r = collect(c, "S");
-            if (r.contains("failed") || !r.contains("dnll")) continue;
-            auto s = json.parse("{}"); s["id"] = c["id"]; s["file"] = model_out(c["id"]); s["chain"] = c["chain"]; s["est_mb"] = r["est_mb"]; s["kl"] = r["eval"]["kl"]["kl"]; s["dnll"] = r["dnll"]; s["bpw"] = r["bpw"];
-            if (double(r["dnll"]) <= cap) pool.push_back(s);
-            else std::println("  {} over the cap: dnll {:.4f}", std::string(c["chain"]), double(r["dnll"]));
+            if (len(wave) == 0) break;   // every state has its fit
+            std::println("chain {} stage {} wave {}: {} for {} state(s) (cap dnll {:.4f})", name, k + 1, j + 1, opt, len(wave), cap);
+            run_tasks(tasks);
+            for (auto c : wave) {
+                auto r = collect(c, "S");
+                if (r.contains("failed") || !r.contains("dnll")) continue;
+                auto s = json.parse("{}"); s["id"] = c["id"]; s["file"] = model_out(c["id"]); s["chain"] = c["chain"]; s["est_mb"] = r["est_mb"]; s["kl"] = r["eval"]["kl"]["kl"]; s["dnll"] = r["dnll"]; s["bpw"] = r["bpw"];
+                if (double(r["dnll"]) <= cap) { pool.push_back(s); fitted[int(c["state"])] = true; std::println("  fits: {} (dnll {:+.4f})", std::string(c["chain"]), double(r["dnll"])); }
+                else std::println("  {} over the cap: dnll {:.4f}", std::string(c["chain"]), double(r["dnll"]));
+            }
         }
         // rank: estimated size, then KL; keep the best BEAM distinct chains
         std::vector<int> idx;
@@ -672,5 +736,5 @@ if (phases.contains("chains") && wanted("tinymixtral")) {
 }
 
 write_report();
-fs.write_atomic(RUNS + "/plan.done", time.iso(time.now()) + "\n");
-std::println("fast plan: done; report in {}", RES + "/REPORT_FAST.md");
+fs.write_atomic(RUNS + "/plan" + LOCK_TAG + ".done", time.iso(time.now()) + "\n");
+std::println("fast plan: done; report in {}", RES + "/REPORT_FAST" + LOCK_TAG + ".md");
