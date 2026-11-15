@@ -187,7 +187,7 @@ static int nargs_of(const char* op) {
     if (!strncmp(op, "delta_rule", 10)) return 14;   /* delta_rule, delta_rule_r8/16/32, _p8/16/32 */ if (!strncmp(op, "causal_conv", 11)) return 7;   /* causal_conv, causal_conv_t */
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13)) return 12; if (!strcmp(op, "attention_dec")) return 13;
     if (!strcmp(op, "attention_comb")) return 5; if (!strcmp(op, "attention_comb_q81")) return 6; if (!strcmp(op, "rope")) return 8; if (!strcmp(op, "slice")) return 7;
-    if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t")) return 6;
+    if (!strcmp(op, "gather")) return 6; if (!strcmp(op, "rms_norm") || !strcmp(op, "rms_norm_b") || !strcmp(op, "matmul_t") || !strcmp(op, "matmul_t_tiled")) return 6;
     if (!strcmp(op, "scale") || !strcmp(op, "softmax")) return 4;
     if (!strcmp(op, "qgather")) return 8; if (!strcmp(op, "bcast")) return 7; if (!strcmp(op, "copy2d")) return 5;
     if (!strcmp(op, "moe_hidden")) return 12; if (!strcmp(op, "moe_down")) return 10;
@@ -204,7 +204,7 @@ static unsigned ptr_args_of(const char* op, int n) {
     if (!strcmp(op, "rope")) return 0xfu;
     if (!strcmp(op, "attention_comb") || !strcmp(op, "attention_comb_q81")) return 0x23u;
     if (!strcmp(op, "attention") || !strcmp(op, "attention_fa") || !strncmp(op, "attention_fa2", 13) || !strcmp(op, "attention_dec")) return 0xfu;
-    if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq") || !strcmp(op, "qmatmul_q81") || !strcmp(op, "matmul_t")) return 0x7u;
+    if (!strcmp(op, "qmatmul_t") || !strcmp(op, "qmatmul_mmq") || !strcmp(op, "qmatmul_q81") || !strcmp(op, "matmul_t") || !strcmp(op, "matmul_t_tiled")) return 0x7u;
     if (!strcmp(op, "rms_norm_q81")) return 0x47u; if (!strcmp(op, "rms_norm_f")) return 0x61fu; if (!strcmp(op, "rms_rope")) return 0x1fu;
     if (!strcmp(op, "silu_mul_q81")) return 0x17u; if (!strcmp(op, "quant_q8r")) return 0x7u;
     if (!strncmp(op, "qmatmul_mma", 11)) return 0xc0fu; if (!strncmp(op, "qmatmul_glu", 11)) return 0x1e0fu;
@@ -436,6 +436,12 @@ static int run_kernel(void* f, unsigned gx, unsigned bx, void** args) {
     if (!strcmp(op, "matmul_t")) { float *a = P(ARG(0, dptr)), *b = P(ARG(1, dptr)), *y = P(ARG(2, dptr));
         unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned);
         for (i = 0; i < rows * cols && i < threads; ++i) { float s = 0; for (unsigned t = 0; t < k; ++t) s = fmaf(a[(i / cols) * k + t], b[(i % cols) * k + t], s); y[i] = s; } return 0; }
+    /* forge_matmul_t_tiled (cuda.hpp run_op): a 64x64 output tile per 256-thread block, the same fma sequence per output
+       as forge_matmul_t, so the same result */
+    if (!strcmp(op, "matmul_t_tiled")) { float *a = P(ARG(0, dptr)), *b = P(ARG(1, dptr)), *y = P(ARG(2, dptr));
+        unsigned rows = ARG(3, unsigned), cols = ARG(4, unsigned), k = ARG(5, unsigned);
+        if (bx != 256 || gx < ((cols + 63) / 64) * ((rows + 63) / 64)) return 1;   /* its launch shape */
+        for (i = 0; i < rows * cols; ++i) { float s = 0; for (unsigned t = 0; t < k; ++t) s = fmaf(a[(i / cols) * k + t], b[(i % cols) * k + t], s); y[i] = s; } return 0; }
     if (!isnan(bin(op, 1, 1)) || !strcmp(op, "div")) { float *a = P(ARG(0, dptr)), *b = P(ARG(1, dptr)), *y = P(ARG(2, dptr)); unsigned n = ARG(3, unsigned);
         for (i = 0; i < threads && i < n; ++i) y[i] = bin(op, a[i], b[i]); return 0; }
     { float *x = P(ARG(0, dptr)), *y = P(ARG(1, dptr)); unsigned n = ARG(2, unsigned);
