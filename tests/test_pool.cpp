@@ -112,6 +112,26 @@ TEST(parallel_for_wakes_sleeping_workers) {
     CHECK(ids.size() >= 2);
 }
 
+// A fresh pool's very first parallel_for must reach its workers, even ones that had not started running when
+// the job was published (they used to take the published ticket as already seen and sleep through the job).
+TEST(first_parallel_for_on_new_pool_uses_workers) {
+    int serial = 0;
+    for (int round = 0; round < 20; ++round) {
+        task::pool p(2);   // one worker; parallel_for is called at once, before it has (likely) started
+        std::mutex m; std::set<std::thread::id> ids;
+        p.parallel_for(2, 1, 1, [&](std::size_t, std::size_t) {
+            { std::lock_guard l(m); ids.insert(std::this_thread::get_id()); }
+            // Hold this claim until another thread has taken the other one (bounded, so a failure is not a hang).
+            for (auto t0 = std::chrono::steady_clock::now(); std::chrono::steady_clock::now() - t0 < 1s;) {
+                { std::lock_guard l(m); if (ids.size() >= 2) return; }
+                std::this_thread::sleep_for(50us);
+            }
+        });
+        if (ids.size() < 2) ++serial;
+    }
+    CHECK(serial == 0);
+}
+
 TEST(destructor_drains_queue) {
     std::atomic<int> n{0};
     { task::pool p(2); for (int i = 0; i < 20; ++i) (void)p.submit([&] { ++n; }); }

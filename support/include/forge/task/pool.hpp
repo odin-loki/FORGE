@@ -86,7 +86,11 @@ public:
         if (!n) n = std::max(1u, std::thread::hardware_concurrency());
         if (const char* e = std::getenv("FORGE_SPIN_US")) spin_us_ = std::strtol(e, nullptr, 10);
         size_ = n;
-        for (unsigned i = 1; i < n; ++i) workers_.emplace_back([this] { loop(); });
+        // Every worker starts from the ticket as it is now, before any worker exists: a worker that reads the
+        // ticket only once it runs could see a parallel_for already published and treat it as old, leaving
+        // that first job to the caller alone.
+        const std::uint64_t start = ticket_.load();
+        for (unsigned i = 1; i < n; ++i) workers_.emplace_back([this, start] { loop(start); });
     }
     ~pool() {   // queued tasks still run (or are skipped if cancelled) before the workers exit
         if (workers_.empty()) { std::unique_lock l(m_); drain_inline_(l); }
@@ -201,9 +205,8 @@ private:
             detail::cpu_relax();
         }
     }
-    void loop() {
+    void loop(std::uint64_t seen) {
         inside_ in(this);
-        std::uint64_t seen = ticket_.load();
         for (;;) {
             if (spin_(seen)) { join_(seen); continue; }
             std::unique_lock l(m_);
