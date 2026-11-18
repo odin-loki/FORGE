@@ -1436,6 +1436,80 @@ FORGE_GLOBAL void forge_matmul_t_tiled(const float* a, const float* b, float* y,
   for (unsigned i = 0; i < 4u; ++i) for (unsigned j = 0; j < 4u; ++j) {
     unsigned r = r0 + ty + 16u * i, c = c0 + tx + 16u * j;
     if (r < rows && c < cols) y[(unsigned long long)r * cols + c] = acc[i * 4u + j]; } }
+// Brute-force k nearest neighbours by squared l2 (forge::ann::gpu_knn_l2 through runtime::knn_l2_16): the 16 smallest
+// sum_j (q_j - x_j)^2 (fma in dimension order) of each query over the n rows of x (row-major, d <= 64 floats), as
+// (distance, row) pairs in ascending order; equal distances keep the lower row. NaN distances are never selected.
+// Pass 1, forge_knn_l2_part: block b scans rows [s * span, (s + 1) * span) of split s = b % nsplit for the 8 queries of
+// tile b / nsplit; 256 threads = 8 query groups of 32. 128-row tiles of x are staged in shared memory (rows padded to 65
+// floats, so the 32 threads of a group read 32 banks); each thread keeps a sorted private list of 16, then thread 0 of the
+// group merges the group's 32 lists into pd/pi[(query * nsplit + s) * 16 ..]. Pass 2, forge_knn_l2_merge: a 32-thread block
+// per query merges its nsplit lists the same way into od/oi[query * 16 ..]. Shared memory and barriers only (no warp
+// shuffles), so the kernels do not depend on the warp width.
+FORGE_DEV void knn_ins_(float* bd, unsigned* bi, float cd, unsigned ci) {
+  for (unsigned i = 0; i < 16u; ++i) if (cd < bd[i] || (cd == bd[i] && ci < bi[i])) { float td = bd[i]; unsigned ti = bi[i]; bd[i] = cd; bi[i] = ci; cd = td; ci = ti; } }
+FORGE_DEV void knn_merge32_(const float* md, const unsigned* mi, float* od, unsigned* oi) {   // 32 sorted lists of 16 -> the 16 best
+  unsigned head[32];
+  for (unsigned l = 0; l < 32u; ++l) head[l] = 0u;
+  for (unsigned o = 0; o < 16u; ++o) {
+    unsigned best = 32u; float bv = __builtin_inff(); unsigned bix = 0xFFFFFFFFu;
+    for (unsigned l = 0; l < 32u; ++l) {
+      if (head[l] >= 16u) continue;
+      float v = md[l * 16u + head[l]]; unsigned ix = mi[l * 16u + head[l]];
+      if (ix == 0xFFFFFFFFu) continue;
+      if (best == 32u || v < bv || (v == bv && ix < bix)) { best = l; bv = v; bix = ix; } }
+    if (best < 32u) ++head[best];
+    od[o] = bv; oi[o] = bix; } }
+FORGE_GLOBAL void forge_knn_l2_part(const float* x, const float* q, float* pd, unsigned* pi, unsigned n, unsigned d, unsigned nq, unsigned nsplit, unsigned span) {
+  __attribute__((shared)) float xs[128u * 65u];
+  __attribute__((shared)) float qs[8u * 64u];
+  unsigned t = tid_(), b = bid_(), sp = b % nsplit, qt = b / nsplit, g = t >> 5, l = t & 31u, qi = qt * 8u + g;
+  for (unsigned i = t; i < 8u * d; i += 256u) { unsigned gg = i / d, j = i - gg * d, qq = qt * 8u + gg; qs[gg * 64u + j] = qq < nq ? q[(unsigned long long)qq * d + j] : 0.0f; }
+  float bd[16]; unsigned bi[16];
+  for (unsigned i = 0; i < 16u; ++i) { bd[i] = __builtin_inff(); bi[i] = 0xFFFFFFFFu; }
+  unsigned long long lo = (unsigned long long)sp * span, hi = lo + span < n ? lo + span : n;
+  for (unsigned long long base = lo; base < hi; base += 128u) {
+    bar_();
+    for (unsigned i = t; i < 128u * d; i += 256u) { unsigned r = i / d, j = i - r * d; xs[r * 65u + j] = base + r < hi ? x[(base + r) * d + j] : 0.0f; }
+    bar_();
+    if (qi < nq) for (unsigned r = l; r < 128u && base + r < hi; r += 32u) {
+      float s = 0.0f;
+      for (unsigned j = 0; j < d; ++j) { float df = qs[g * 64u + j] - xs[r * 65u + j]; s = fma_(df, df, s); }
+      if (s < bd[15]) knn_ins_(bd, bi, s, (unsigned)(base + r)); } }
+  bar_();
+  float* md = xs; unsigned* mi = (unsigned*)(xs + 4096u);   // 8 groups x 32 threads x 16 entries, in the x tile
+  for (unsigned i = 0; i < 16u; ++i) { md[t * 16u + i] = bd[i]; mi[t * 16u + i] = bi[i]; }
+  bar_();
+  if (l == 0u && qi < nq) knn_merge32_(md + g * 512u, mi + g * 512u, pd + ((unsigned long long)qi * nsplit + sp) * 16u, pi + ((unsigned long long)qi * nsplit + sp) * 16u); }
+FORGE_GLOBAL void forge_knn_l2_merge(const float* pd, const unsigned* pi, float* od, unsigned* oi, unsigned nsplit) {
+  __attribute__((shared)) float md[512]; __attribute__((shared)) unsigned mi[512];
+  unsigned t = tid_(), qi = bid_();
+  float bd[16]; unsigned bi[16];
+  for (unsigned i = 0; i < 16u; ++i) { bd[i] = __builtin_inff(); bi[i] = 0xFFFFFFFFu; }
+  const float* p = pd + (unsigned long long)qi * nsplit * 16u; const unsigned* pix = pi + (unsigned long long)qi * nsplit * 16u;
+  for (unsigned s = t; s < nsplit; s += 32u)
+    for (unsigned i = 0; i < 16u; ++i) { unsigned ix = pix[s * 16u + i]; if (ix == 0xFFFFFFFFu) break; float v = p[s * 16u + i];
+      if (v < bd[15] || (v == bd[15] && ix < bi[15])) knn_ins_(bd, bi, v, ix); else break; }
+  for (unsigned i = 0; i < 16u; ++i) { md[t * 16u + i] = bd[i]; mi[t * 16u + i] = bi[i]; }
+  bar_();
+  if (t == 0u) knn_merge32_(md, mi, od + (unsigned long long)qi * 16u, oi + (unsigned long long)qi * 16u); }
+// IVF scan (forge::ann::ivf_flat::search_batch_device through runtime::ivf_l2_16): block b = (query b / nprobe, probe b % nprobe),
+// 32 threads, scans the rows [rng[2b], rng[2b + 1]) of x (row-major, d <= 64) for that query, keeping private sorted lists of 16;
+// thread 0 merges them into pd/pi[b * 16 ..]. forge_knn_l2_merge (nsplit = nprobe) then merges a query's nprobe lists.
+FORGE_GLOBAL void forge_ivf_l2_part(const float* x, const float* q, const unsigned* rng, float* pd, unsigned* pi, unsigned d, unsigned nprobe) {
+  __attribute__((shared)) float qs[64]; __attribute__((shared)) float md[512]; __attribute__((shared)) unsigned mi[512];
+  unsigned t = tid_(), b = bid_(), qi = b / nprobe;
+  for (unsigned j = t; j < d; j += 32u) qs[j] = q[(unsigned long long)qi * d + j];
+  float bd[16]; unsigned bi[16];
+  for (unsigned i = 0; i < 16u; ++i) { bd[i] = __builtin_inff(); bi[i] = 0xFFFFFFFFu; }
+  unsigned lo = rng[2u * b], hi = rng[2u * b + 1u];
+  bar_();
+  for (unsigned r = lo + t; r < hi; r += 32u) {
+    const float* xr = x + (unsigned long long)r * d; float s = 0.0f;
+    for (unsigned j = 0; j < d; ++j) { float df = qs[j] - xr[j]; s = fma_(df, df, s); }
+    if (s < bd[15]) knn_ins_(bd, bi, s, r); }
+  for (unsigned i = 0; i < 16u; ++i) { md[t * 16u + i] = bd[i]; mi[t * 16u + i] = bi[i]; }
+  bar_();
+  if (t == 0u) knn_merge32_(md, mi, pd + (unsigned long long)b * 16u, pi + (unsigned long long)b * 16u); }
 // Gated DeltaNet state ops on the device (flow/state_ops.hpp semantics; the state slot stays resident).
 // delta_rule: one 128-thread block per value head; each thread owns whole columns j of S[h] (dk x dv), so the
 // recurrence S *= exp(g); delta = (v - S^T k) * beta; S += k delta^T; out = S^T q needs no cross-thread sync

@@ -17,6 +17,7 @@
 //   * device memory accounting (gpu/device_memory.hpp): every allocation is charged to the pool "cuda:N" / "hip:N",
 //     and resident buffers are evicted least recently used first when an allocation would not fit.
 #include <cstdlib>
+#include <chrono>
 #include <forge/gpu/gpu_images.gen.hpp>
 #include <forge/core/tensor.hpp>
 #include <forge/ops/ops.gen.hpp>
@@ -245,7 +246,9 @@ public:
         try { std::lock_guard lk(mu_); for (auto& [k, e] : res_) f_.free_(e.d); res_.clear(); for (auto& [k, q] : qres_) if (q.d) f_.free_(q.d); qres_.clear();
             for (auto& [k, d] : pool_) f_.free_(d); pool_.clear(); for (auto& [k, d] : rope_) f_.free_(d); rope_.clear(); if (q81_) f_.free_(q81_); if (q8r_) f_.free_(q8r_); if (sk_) f_.free_(sk_); if (am_) f_.free_(am_); if (att_) f_.free_(att_);
             if (g8_) f_.free_(g8_); if (gs_) f_.free_(gs_);
-            if (skfx_) f_.free_(skfx_); if (skfl_) f_.free_(skfl_); } catch (...) {}   // stream-K fix-up scratch and flags (were leaked: device memory never returned)
+            if (skfx_) f_.free_(skfx_); if (skfl_) f_.free_(skfl_);
+            for (auto& [k, e] : knn_x_) if (e.d) f_.free_(e.d); knn_x_.clear();
+            for (auto* b : {&knn_q_, &knn_pd_, &knn_pi_, &knn_od_, &knn_oi_, &knn_r_}) if (b->d) f_.free_(b->d); } catch (...) {}   // stream-K fix-up scratch and flags (were leaked: device memory never returned)
         for (auto& c : segc_) drop_seg(c);
         for (auto& g : graphs_) { if (g.exec && f_.gexec_destroy) f_.gexec_destroy(g.exec); if (g.graph && f_.graph_destroy) f_.graph_destroy(g.graph); }
         if (stage_ && f_.host_free) f_.host_free(stage_);
@@ -408,6 +411,78 @@ public:
         ck(dtoh_s(pr ? pr : &r, am_, 4, stream_), "memcpy DtoH"); sync();
         if (pr) std::memcpy(&r, pr, 4);
         return r;
+    }
+    // ---- brute-force kNN (forge::ann::gpu_knn_l2) ----
+    // The 16 smallest squared l2 distances (f32, fma in dimension order) of each of the nq queries q[nq * d] over the n rows
+    // of x[n * d], as ascending (distance, row) in od/oi[query * 16 ..] (row 0xFFFFFFFF: fewer than 16 rows). x is uploaded
+    // on its first use and stays on the device, keyed by (pointer, n, d), until knn_forget(x); *upload_s gets the seconds
+    // of that upload (0 when x was already there). false: no kernel in the image, d == 0 or d > 64, n >= 2^31, or no memory.
+    bool knn_l2_16(const float* x, std::size_t n, std::size_t d, const float* q, std::size_t nq, float* od, std::uint32_t* oi, double* upload_s = nullptr) {
+        std::lock_guard lk(mu_); bind();
+        if (upload_s) *upload_s = 0;
+        if (!n || !nq || !d || d > 64 || n >= (1ull << 31) || nq >= (1ull << 31) || !has_fn_locked("forge_knn_l2_part") || !has_fn_locked("forge_knn_l2_merge")) return false;
+        try {
+            auto& xe = knn_x_[x];
+            if (!xe.d || xe.n != n || xe.dim != d) {
+                if (xe.d) { sync(); dfree(xe.d); }
+                xe = {};
+                const auto t0 = std::chrono::steady_clock::now();
+                xe.d = dmalloc(n * d * 4, "knn"); xe.n = n; xe.dim = d;
+                ck(htod_s(xe.d, x, n * d * 4, stream_), "memcpy HtoD"); sync();
+                if (upload_s) *upload_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+            const std::uint32_t nqt = std::uint32_t((nq + 7) / 8);
+            // splits: enough blocks to fill the device (about 1024 per launch), at least 2048 rows each
+            std::uint32_t nsplit = std::uint32_t(std::max<std::size_t>(1, std::min<std::size_t>((n + 2047) / 2048, std::max<std::size_t>(1, 1024 / nqt))));
+            std::uint32_t span = std::uint32_t((n + nsplit - 1) / nsplit);
+            nsplit = std::uint32_t((n + span - 1) / span);
+            auto need = [&](knn_buf& b, std::size_t bytes) { if (b.bytes < bytes) { if (b.d) { sync(); dfree(b.d); } b = {}; b.d = dmalloc(bytes, "knn"); b.bytes = bytes; } return b.d; };
+            std::uint64_t dq = need(knn_q_, nq * d * 4), dpd = need(knn_pd_, nq * nsplit * 64), dpi = need(knn_pi_, nq * nsplit * 64),
+                          dod = need(knn_od_, nq * 64), doi = need(knn_oi_, nq * 64);
+            ck(htod_s(dq, q, nq * d * 4, stream_), "memcpy HtoD");
+            std::uint64_t dx = xe.d; std::uint32_t n32 = std::uint32_t(n), d32 = std::uint32_t(d), nq32 = std::uint32_t(nq);
+            void* a1[] = {&dx, &dq, &dpd, &dpi, &n32, &d32, &nq32, &nsplit, &span};
+            ck(launch_s(function("forge_knn_l2_part"), nsplit * nqt, 1, 1, 256, 1, 1, 0, stream_, a1, nullptr), "launch");
+            void* a2[] = {&dpd, &dpi, &dod, &doi, &nsplit};
+            ck(launch_s(function("forge_knn_l2_merge"), nq32, 1, 1, 32, 1, 1, 0, stream_, a2, nullptr), "launch");
+            ++dispatches_["knn_l2_part"]; ++dispatches_["knn_l2_merge"];
+            ck(dtoh_s(od, dod, nq * 64, stream_), "memcpy DtoH"); ck(dtoh_s(oi, doi, nq * 64, stream_), "memcpy DtoH"); sync();
+            return true;
+        } catch (...) { return false; }
+    }
+    // IVF scan (forge::ann::ivf_flat::search_batch_device): like knn_l2_16, but query q scans only the row ranges
+    // rng[(q * nprobe + p) * 2 ..] = [begin, end) of x, p < nprobe. x is resident as in knn_l2_16 (the same knn_forget).
+    bool ivf_l2_16(const float* x, std::size_t n, std::size_t d, const float* q, std::size_t nq, const std::uint32_t* rng, std::size_t nprobe, float* od, std::uint32_t* oi, double* upload_s = nullptr) {
+        std::lock_guard lk(mu_); bind();
+        if (upload_s) *upload_s = 0;
+        if (!n || !nq || !d || d > 64 || !nprobe || n >= (1ull << 31) || nq * nprobe >= (1ull << 31) || !has_fn_locked("forge_ivf_l2_part") || !has_fn_locked("forge_knn_l2_merge")) return false;
+        try {
+            auto& xe = knn_x_[x];
+            if (!xe.d || xe.n != n || xe.dim != d) {
+                if (xe.d) { sync(); dfree(xe.d); }
+                xe = {};
+                const auto t0 = std::chrono::steady_clock::now();
+                xe.d = dmalloc(n * d * 4, "knn"); xe.n = n; xe.dim = d;
+                ck(htod_s(xe.d, x, n * d * 4, stream_), "memcpy HtoD"); sync();
+                if (upload_s) *upload_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+            auto need = [&](knn_buf& b, std::size_t bytes) { if (b.bytes < bytes) { if (b.d) { sync(); dfree(b.d); } b = {}; b.d = dmalloc(bytes, "knn"); b.bytes = bytes; } return b.d; };
+            std::uint64_t dq = need(knn_q_, nq * d * 4), dr = need(knn_r_, nq * nprobe * 8), dpd = need(knn_pd_, nq * nprobe * 64), dpi = need(knn_pi_, nq * nprobe * 64),
+                          dod = need(knn_od_, nq * 64), doi = need(knn_oi_, nq * 64);
+            ck(htod_s(dq, q, nq * d * 4, stream_), "memcpy HtoD"); ck(htod_s(dr, rng, nq * nprobe * 8, stream_), "memcpy HtoD");
+            std::uint64_t dx = xe.d; std::uint32_t d32 = std::uint32_t(d), np32 = std::uint32_t(nprobe);
+            void* a1[] = {&dx, &dq, &dr, &dpd, &dpi, &d32, &np32};
+            ck(launch_s(function("forge_ivf_l2_part"), std::uint32_t(nq * nprobe), 1, 1, 32, 1, 1, 0, stream_, a1, nullptr), "launch");
+            void* a2[] = {&dpd, &dpi, &dod, &doi, &np32};
+            ck(launch_s(function("forge_knn_l2_merge"), std::uint32_t(nq), 1, 1, 32, 1, 1, 0, stream_, a2, nullptr), "launch");
+            ++dispatches_["ivf_l2_part"]; ++dispatches_["knn_l2_merge"];
+            ck(dtoh_s(od, dod, nq * 64, stream_), "memcpy DtoH"); ck(dtoh_s(oi, doi, nq * 64, stream_), "memcpy DtoH"); sync();
+            return true;
+        } catch (...) { return false; }
+    }
+    void knn_forget(const float* x) {
+        std::lock_guard lk(mu_); bind();
+        if (auto it = knn_x_.find(x); it != knn_x_.end()) { if (it->second.d) { sync(); dfree(it->second.d); } knn_x_.erase(it); }
     }
     void host_wrote(const float* p, std::size_t n) {
         std::lock_guard lk(mu_); bind();
@@ -675,6 +750,8 @@ public:
         return true;
     }
     std::uint64_t am_ = 0;   // forge_argmax result (one int)
+    struct knn_buf { std::uint64_t d = 0; std::size_t bytes = 0, n = 0, dim = 0; };   // knn_l2_16: resident rows, scratch
+    std::map<const float*, knn_buf> knn_x_; knn_buf knn_q_, knn_pd_, knn_pi_, knn_od_, knn_oi_, knn_r_;
     std::uint64_t sk_ = 0; std::size_t sk_cap_ = 0;   // split-K partial products (stream-ordered reuse)
     void sk_reserve(std::size_t need) {
         if (sk_cap_ >= need) return;
