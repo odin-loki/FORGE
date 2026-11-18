@@ -34,6 +34,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -147,6 +148,7 @@ struct shard_options {
     bool presorted = false;                    // rows arrive in non-decreasing key order: streamed in waves of `wave_bytes`; else all are buffered and sorted
     std::uint64_t wave_bytes = 256ull << 20;
     std::filesystem::path blob_dir;            // optional content-addressed store: each shard is also kept as <blob_dir>/<sha256>.fdb
+    bool df_table = true;                      // with schema.fts_table: also store per-term document counts in the shard (table forge_df), so BM25 does not count by scanning
 };
 
 namespace detail {
@@ -238,6 +240,12 @@ private:
                     ins.step();
                 }
                 if (sc_.finalize) sc_.finalize(c);
+                if (opt_.df_table && !sc_.fts_table.empty()) {
+                    c.exec("CREATE VIRTUAL TABLE temp.forge_fv USING fts5vocab(main, " + quote_ident(sc_.fts_table) + ", 'row')");
+                    c.exec("CREATE TABLE forge_df(term TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID");
+                    c.exec("INSERT INTO forge_df SELECT term, doc FROM temp.forge_fv ORDER BY term");
+                    c.exec("DROP TABLE temp.forge_fv");
+                }
                 tx.commit();
             }
             c.exec("PRAGMA user_version=" + std::to_string(sc_.schema_version));
@@ -637,7 +645,16 @@ inline std::vector<shard_hit> shard_bm25_topk(shard_set& s, task::pool* tp, std:
         if (si.fts_rows >= 0) { r.rows = si.fts_rows; r.tokens = si.fts_tokens; } else { auto t = fts_totals(c, fts_table); r.rows = t.first; r.tokens = t.second; }
         if (r.rows == 0) return r;
         auto st = c.prepare("SELECT count(*) FROM " + quote_ident(fts_table) + " WHERE " + quote_ident(fts_table) + " MATCH ?1");
-        for (std::size_t t = 0; t < nt; ++t) { st.reset(); st.bind(1, fts5::quote_phrase(terms[t])); st.step(); r.df[t] = st.get<std::int64_t>(0); }
+        const bool have_df = c.table_exists("forge_df");   // per-term counts stored at build time (default tokenizer: ASCII words are lower-cased)
+        std::optional<statement> dfq; if (have_df) dfq = c.prepare("SELECT n FROM forge_df WHERE term = ?1");
+        for (std::size_t t = 0; t < nt; ++t) {
+            const auto& w = terms[t];
+            const bool plain = have_df && std::all_of(w.begin(), w.end(), [](unsigned char ch) { return std::isalnum(ch) && ch < 0x80; });
+            if (plain) {
+                std::string lw = w; for (auto& ch : lw) ch = char(std::tolower(static_cast<unsigned char>(ch)));
+                dfq->reset(); dfq->bind(1, lw); r.df[t] = dfq->step() ? dfq->get<std::int64_t>(0) : 0;
+            } else { st.reset(); st.bind(1, fts5::quote_phrase(w)); st.step(); r.df[t] = st.get<std::int64_t>(0); }
+        }
         return r;
     }, ro);
     std::int64_t N = 0, T = 0; std::vector<std::int64_t> df(nt, 0);

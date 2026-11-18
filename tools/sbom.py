@@ -10,6 +10,7 @@ import argparse, datetime, hashlib, json, os, re, subprocess, sys, uuid
 VENDORED = [  # name, version, path, licence (SPDX expression), supplier, download
     ("monocypher", "4.0.2", "third_party/monocypher", "BSD-2-Clause OR CC0-1.0", "Organization: Loup Vaillant", "https://monocypher.org"),
     ("level-zero", "1.20", "third_party/level-zero", "MIT", "Organization: Intel Corporation", "https://github.com/oneapi-src/level-zero"),
+    ("sqlite", "3.54.1", "third_party/sqlite", "blessing", "Organization: SQLite Consortium (D. Richard Hipp)", "https://www.sqlite.org"),
 ]
 FORGE_LICENCE = "AGPL-3.0-or-later OR LicenseRef-FORGE-Commercial"
 # Files of the FORGE tree whose content is derived from a third-party source (generated data, a ported routine):

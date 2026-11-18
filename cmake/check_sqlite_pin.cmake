@@ -3,6 +3,7 @@
 # PIN lines: "key=value" or "file <name> <sha256> <sha3_256>". Every `file` line must match both digests, the
 # version in PIN must equal SQLITE_VERSION / SQLITE_VERSION_NUMBER in sqlite3.h, and no other source file may sit
 # next to the pin unlisted.
+cmake_minimum_required(VERSION 3.20)   # policy CMP0057 (IN_LIST) in script mode
 if(NOT DEFINED DIR)
   message(FATAL_ERROR "usage: cmake -DDIR=<third_party/sqlite> -P check_sqlite_pin.cmake")
 endif()
