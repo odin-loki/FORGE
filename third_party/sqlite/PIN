@@ -1,0 +1,12 @@
+# Pinned SQLite amalgamation. Checked by the ctest sqlite_pin (cmake/check_sqlite_pin.cmake).
+# Lines: key=value, or 'file <name> <sha256> <sha3_256>'.
+version=3.54.1
+version_number=3540100
+url=https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip
+zip_size=2990966
+# SHA3-256 of the zip as published on https://www.sqlite.org/download.html (verified at vendoring time)
+zip_sha3_256=92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30
+zip_sha256=0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9
+file sqlite3.c 0c657666d819f261cc4007526ad57e1669de9949df7a8ea847aa284a2bf0ee52 e2b869d3003b33c942b7dd7063604fbc53553e1b66609570df39b9b7b558ee81
+file sqlite3.h d6c84557261893439b341d2e6c35187ae3ea24fbfd843ad94616f72d89242b8c 15ef3f5dbc4a7a980f828fa0d1e473cee5a124e7bb77e9bc70fc0bfa3f9a2af8
+file sqlite3ext.h 48963abfefb41ac329ef9d706acb5eadba952a99a748285c9ded6b5e0942721b 5e113c4c0442f2f1b3345d44cbe4b82fad45f2fc0c35f0ed4eef27fb8f1cb394

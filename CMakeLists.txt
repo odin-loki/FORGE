@@ -430,6 +430,34 @@ forge_include_dirs(forge_trust PUBLIC third_party/monocypher)
 target_include_directories(forge_trust PUBLIC $<INSTALL_INTERFACE:${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/monocypher>)
 set_target_properties(forge_trust PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
 
+# Vendored SQLite amalgamation (public domain), pinned by third_party/sqlite/PIN (ctest sqlite_pin checks the hashes).
+# forge::db (support/include/forge/db) is the C++ layer over it; forge::ann (support/include/forge/ann) builds on both.
+add_library(forge_sqlite STATIC third_party/sqlite/sqlite3.c)
+forge_include_dirs(forge_sqlite PUBLIC third_party/sqlite)
+target_include_directories(forge_sqlite PUBLIC $<INSTALL_INTERFACE:${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/sqlite>)
+target_compile_definitions(forge_sqlite PRIVATE
+  SQLITE_ENABLE_FTS5 SQLITE_ENABLE_RTREE SQLITE_ENABLE_JSON1 SQLITE_THREADSAFE=2 SQLITE_DQS=0
+  SQLITE_DEFAULT_FOREIGN_KEYS=1 SQLITE_OMIT_DEPRECATED SQLITE_DEFAULT_WAL_SYNCHRONOUS=1 SQLITE_USE_ALLOCA
+  SQLITE_MAX_ATTACHED=125 SQLITE_OMIT_LOAD_EXTENSION)
+set_target_properties(forge_sqlite PROPERTIES POSITION_INDEPENDENT_CODE ON C_STANDARD 99)
+if(MSVC AND NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+  target_compile_options(forge_sqlite PRIVATE /w)   # third-party code: silence its warnings on this target only
+else()
+  target_compile_options(forge_sqlite PRIVATE -w)
+endif()
+if(Threads_FOUND)
+  target_link_libraries(forge_sqlite PUBLIC Threads::Threads)
+endif()
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+  target_link_libraries(forge_sqlite PUBLIC m)
+endif()
+add_library(forge_db INTERFACE)   # forge::db: db/sqlite.hpp, db/parallel.hpp (header-only over forge_sqlite)
+forge_include_dirs(forge_db INTERFACE support/include)
+target_link_libraries(forge_db INTERFACE forge_core forge_sqlite)
+add_library(forge_ann INTERFACE)  # forge::ann: ann/*.hpp (flat and HNSW indexes, metrics; persistence through forge::db)
+forge_include_dirs(forge_ann INTERFACE support/include)
+target_link_libraries(forge_ann INTERFACE forge_db)
+
 add_library(forge_modelfile INTERFACE)
 forge_include_dirs(forge_modelfile INTERFACE modelfile/include)
 # forge_text: the tokenizer (modelfile/tokenizer.hpp) uses its Unicode tables, normalization forms and regex engine.
@@ -1107,6 +1135,18 @@ if(FORGE_BUILD_TESTS)
       add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
       continue()
     endif()
+    if(n MATCHES "^test_(db|ann|task_algorithms)")   # forge::db / forge::ann / task algorithms: header-only layers over forge_sqlite
+      add_executable(${n} ${t})
+      target_link_libraries(${n} PRIVATE forge_ann)
+      target_include_directories(${n} PRIVATE tests)
+      add_test(NAME ${n} COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+      set_tests_properties(${n} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      if(n STREQUAL "test_ann")   # the long cases (20k-vector recall, determinism over thread counts) run again under the label slow
+        add_test(NAME ${n}_slow COMMAND ${n} WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+        set_tests_properties(${n}_slow PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS slow ENVIRONMENT "FORGE_TEST_SLOW=1")
+      endif()
+      continue()
+    endif()
     if(n STREQUAL "test_mobile")   # only needs the device layer
       add_executable(${n} ${t})
       target_link_libraries(${n} PRIVATE forge_mobile)
@@ -1152,6 +1192,7 @@ if(FORGE_BUILD_TESTS)
       set_tests_properties(test_rpc_tls PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "FORGE_TEST_ONLY=rpc_tls")
     endif()
   endforeach()
+  add_test(NAME sqlite_pin COMMAND ${CMAKE_COMMAND} -DDIR=${PROJECT_SOURCE_DIR}/third_party/sqlite -P ${PROJECT_SOURCE_DIR}/cmake/check_sqlite_pin.cmake)
   if(TARGET test_security)   # forge::security (re-runs itself for the lockdown child cases)
     target_link_libraries(test_security PRIVATE forge_security)
     set_tests_properties(test_security PROPERTIES LABELS "security")
@@ -2186,12 +2227,14 @@ install(DIRECTORY ${FORGE_GEN_DIR}/forge/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR
         FILES_MATCHING PATTERN "*.gen.hpp")
 install(FILES third_party/monocypher/monocypher.h third_party/monocypher/monocypher-ed25519.h
         DESTINATION ${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/monocypher COMPONENT dev)
+install(FILES third_party/sqlite/sqlite3.h third_party/sqlite/sqlite3ext.h DESTINATION ${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/sqlite COMPONENT dev)
 install(FILES third_party/level-zero/ze_api.h DESTINATION ${FORGE_INSTALL_THIRD_PARTY_INCLUDEDIR}/level-zero COMPONENT dev)
 install(FILES third_party/monocypher/LICENCE.md DESTINATION ${CMAKE_INSTALL_DOCDIR}/third_party/monocypher COMPONENT runtime)
 
 # Exported targets: forge_<name> here is forge::<name> in the package (and as an alias in this build).
 set(FORGE_EXPORT_TARGETS forge_core forge_os forge_ops forge_simd forge_verify forge_gpu forge_graph forge_modelfile forge_security
-    forge_inference forge_compress forge_loadbalancer forge_simd_mv forge_trust forge_text forge_mobile forge_script forge_video forge_c)
+    forge_inference forge_compress forge_loadbalancer forge_simd_mv forge_trust forge_text forge_mobile forge_script forge_video forge_c
+    forge_sqlite forge_db forge_ann)
 foreach(t forge_metal forge_rpc_tls)   # Apple only / OpenSSL found
   if(TARGET ${t})
     list(APPEND FORGE_EXPORT_TARGETS ${t})
