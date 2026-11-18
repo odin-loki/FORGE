@@ -217,6 +217,7 @@ c.put(m, result); if (auto v = c.get(m)) use(*v);
 - `get()` verifies the hash and deletes a corrupt entry. It refreshes the entry's mtime.
 - Writes go through `os::fs::write_file_atomic`, so readers, including other processes, see a whole entry or none.
 - With `max_bytes` set, `put()` evicts least recently used entries until the store fits. `erase`, `clear`, `prune`, `stats()` (entries, bytes, hits, misses, evictions, corrupt). Thread-safe.
+- **Raw files** (no header; for files that other code must open itself, such as the SQLite shards of `forge::db`): `put_file(key, src_path, link = true)` keeps a hard link (else a copy) of a file under `<dir>/raw/<2 hex>/<62 hex>`, `get_path(key, verify = false)` returns the path and refreshes the LRU time (`verify` hashes the file and drops it when its BLAKE3 differs from the key, for keys that are content hashes), `contains_file`, `erase_file`, `raw_path_of`. Raw and headered entries share the byte budget and the LRU order, and `get(key)` never sees a raw entry (separate directory). `forge::db` uses it with `shard_options::cache` and `shard_open_options::cache` ([db.md](db.md)).
 
 ## Time and files
 - `os::stopwatch`: `elapsed_ns/ms/s`, `lap_ns`, `restart`.

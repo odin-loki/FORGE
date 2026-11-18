@@ -62,6 +62,37 @@ TEST(lru_eviction_keeps_recent) {
     fs::remove_all(d);
 }
 
+TEST(raw_files_are_kept_as_they_are) {
+    auto d = tmpdir("raw"); auto src = d.string() + "_src.bin";
+    const std::string content = std::string("SQLite format 3\0", 16) + std::string(5000, 'q');
+    { std::ofstream f(src, std::ios::binary); f.write(content.data(), std::streamsize(content.size())); }
+    cache::store c(d);
+    const auto k = cache::key_of(content);
+    CHECK(!c.get_path(k)); CHECK(!c.contains_file(k));
+    CHECK(c.put_file(k, src));
+    auto p = c.get_path(k, true);
+    CHECK(p.has_value());
+    { std::ifstream f(*p, std::ios::binary); std::string back((std::istreambuf_iterator<char>(f)), {}); CHECK(back == content); }   // no 32-byte header: byte for byte the same file
+    CHECK(c.stats().entries == 1); CHECK(c.stats().bytes == content.size());
+    CHECK(c.put_file(k, src)); CHECK(c.stats().entries == 1);                    // idempotent
+    CHECK(!c.get(k));                                                             // the headered namespace is separate
+    CHECK(c.put(k, "headered")); CHECK(c.get(k).value_or("") == "headered"); CHECK(c.get_path(k).has_value());
+    CHECK(c.stats().entries == 2);
+    // a copy instead of a link, then corruption: verify drops the entry
+    auto k2 = cache::key_of("other file"); { std::ofstream f(src + "2", std::ios::binary); f << "other file"; }
+    CHECK(c.put_file(k2, src + "2", false)); CHECK(c.get_path(k2, true).has_value());
+    { std::fstream f(c.raw_path_of(k2), std::ios::in | std::ios::out | std::ios::binary); f.seekp(2); f.put('Z'); }
+    CHECK(c.get_path(k2).has_value()); CHECK(!c.get_path(k2, true)); CHECK(!c.contains_file(k2)); CHECK(c.stats().corrupt == 1);
+    // raw files count against max_bytes: a new file pushes the store over its budget and the older entry goes
+    c.clear(); CHECK(c.stats().entries == 0);
+    cache::store small(d.string() + "_small", {.max_bytes = 6000});
+    const std::string c3(3000, 'r'); const auto k3 = cache::key_of(c3); { std::ofstream f(src + "3", std::ios::binary); f << c3; }
+    CHECK(small.put_file(k, src));
+    CHECK(small.put_file(k3, src + "3"));
+    CHECK(small.stats().bytes <= 6000); CHECK(small.contains_file(k3)); CHECK(!small.contains_file(k));
+    fs::remove_all(d); fs::remove_all(d.string() + "_small"); fs::remove(src); fs::remove(src + "2"); fs::remove(src + "3");
+}
+
 TEST(concurrent_writers) {
     auto d = tmpdir("mt"); cache::store c(d);
     std::vector<std::thread> ts;

@@ -24,6 +24,7 @@
 // (shard_set::id()); it keys cached query results in a forge::cache::store.
 #include <forge/cache/cache.hpp>
 #include <forge/db/parallel.hpp>
+#include <forge/db/shard_io.hpp>
 #include <forge/db/sqlite.hpp>
 #include <forge/hash/blake3.hpp>
 #include <forge/hash/sha256.hpp>
@@ -78,6 +79,7 @@ struct shard_info {
     std::uint64_t rows = 0, bytes = 0;
     std::string sha256, blake3;                // hex; empty for a single-file set
     std::int64_t fts_rows = -1, fts_tokens = -1;   // FTS5 table statistics (manifest of a set written with schema.fts_table); -1 unknown
+    std::uint32_t bloom_bytes = 0;             // size of this shard's term filter inside the set's bloom file (0: none)
 };
 struct shard_manifest {
     static constexpr const char* kFormat = "forge-shards-1";
@@ -85,6 +87,8 @@ struct shard_manifest {
     std::string table, fts_table;
     std::uint32_t page_size = 4096;
     std::uint64_t budget_bytes = 0, rows = 0, bytes = 0;
+    std::string bloom_file, bloom_sha256;      // term-presence filters of all shards (sidecar file); empty: none
+    std::uint32_t bloom_k = 0;
     json::object stats;                        // caller-registered global statistics
     std::vector<shard_info> shards;
 
@@ -93,12 +97,15 @@ struct shard_manifest {
                         ",\n\"table\": " + json::dump(json::value(table)) + ",\n\"fts_table\": " + json::dump(json::value(fts_table)) +
                         ",\n\"page_size\": " + std::to_string(page_size) + ",\n\"budget_bytes\": " + std::to_string(budget_bytes) +
                         ",\n\"rows\": " + std::to_string(rows) + ",\n\"bytes\": " + std::to_string(bytes) +
-                        ",\n\"stats\": " + json::dump(json::value(stats)) + ",\n\"shards\": [\n";
+                        ",\n\"stats\": " + json::dump(json::value(stats)) +
+                        (bloom_file.empty() ? std::string() : ",\n\"bloom\": {\"file\":" + json::dump(json::value(bloom_file)) + ",\"sha256\":\"" + bloom_sha256 + "\",\"k\":" + std::to_string(bloom_k) + "}") +
+                        ",\n\"shards\": [\n";
         for (std::size_t i = 0; i < shards.size(); ++i) {
             const auto& s = shards[i];
             o += "{\"file\":" + json::dump(json::value(s.file)) + ",\"min\":\"" + to_hex_(s.min_key) + "\",\"max\":\"" + to_hex_(s.max_key) + "\",\"rows\":" +
                  std::to_string(s.rows) + ",\"bytes\":" + std::to_string(s.bytes) + ",\"sha256\":\"" + s.sha256 + "\",\"blake3\":\"" + s.blake3 + "\"";
             if (s.fts_rows >= 0) o += ",\"fts_rows\":" + std::to_string(s.fts_rows) + ",\"fts_tokens\":" + std::to_string(s.fts_tokens);
+            if (s.bloom_bytes) o += ",\"bloom_bytes\":" + std::to_string(s.bloom_bytes);
             o += i + 1 < shards.size() ? "},\n" : "}\n";
         }
         return o + "]\n}\n";
@@ -111,10 +118,12 @@ struct shard_manifest {
         m.page_size = std::uint32_t(j.num_or("page_size", 4096)); m.budget_bytes = std::uint64_t(j.num_or("budget_bytes", 0));
         m.rows = std::uint64_t(j.num_or("rows", 0)); m.bytes = std::uint64_t(j.num_or("bytes", 0));
         if (auto* s = j.find("stats"); s && s->is_obj()) m.stats = s->obj();
+        if (auto* b = j.find("bloom"); b && b->is_obj()) { m.bloom_file = b->str_or("file", ""); m.bloom_sha256 = b->str_or("sha256", ""); m.bloom_k = std::uint32_t(b->num_or("k", 0)); }
         for (auto& e : j["shards"].arr()) {
             shard_info s; s.file = e["file"].str(); s.min_key = from_hex_(e["min"].str()); s.max_key = from_hex_(e["max"].str());
             s.rows = std::uint64_t(e["rows"].num()); s.bytes = std::uint64_t(e["bytes"].num()); s.sha256 = e["sha256"].str(); s.blake3 = e["blake3"].str();
             s.fts_rows = std::int64_t(e.num_or("fts_rows", -1)); s.fts_tokens = std::int64_t(e.num_or("fts_tokens", -1));
+            s.bloom_bytes = std::uint32_t(e.num_or("bloom_bytes", 0));
             m.shards.push_back(std::move(s));
         }
         return m;
@@ -149,10 +158,52 @@ struct shard_options {
     std::uint64_t wave_bytes = 256ull << 20;
     std::filesystem::path blob_dir;            // optional content-addressed store: each shard is also kept as <blob_dir>/<sha256>.fdb
     bool df_table = true;                      // with schema.fts_table: also store per-term document counts in the shard (table forge_df), so BM25 does not count by scanning
+    unsigned bloom_bits_per_term = 10;         // with df_table: a term-presence filter per shard (terms.fbl), ~1 % false positives; 0 = none. Assumes the default FTS5 tokenizer, like forge_df
+    cache::store* cache = nullptr;             // optional: every shard is also kept in this forge::cache::store as a raw file keyed by its BLAKE3 (shard_open_options::cache reads it back)
 };
 
+// ---- term-presence filters ----------------------------------------------------------------------------------------
+// One bloom filter per shard over the FTS5 tokens of the shard (the terms of its forge_df table), kept in a sidecar file of the set
+// (terms.fbl). A negative answer is exact (the term is in no row of the shard), so a BM25 query neither opens the shard nor counts
+// there; a positive answer only means "ask the shard". Hashing is fixed (FNV-1a, splitmix64, double hashing) so the file is
+// byte-identical for any thread count. Terms the filter cannot judge (non-ASCII, no token) are always "maybe".
 namespace detail {
-struct built_shard { std::filesystem::path tmp; shard_info info; };
+inline std::uint64_t bloom_mix_(std::uint64_t x) { x += 0x9e3779b97f4a7c15ull; x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull; x = (x ^ (x >> 27)) * 0x94d049bb133111ebull; return x ^ (x >> 31); }
+inline void bloom_hashes_(std::string_view t, std::uint64_t& h1, std::uint64_t& h2) {
+    std::uint64_t h = 1469598103934665603ull; for (unsigned char c : t) { h ^= c; h *= 1099511628211ull; }
+    h1 = bloom_mix_(h); h2 = bloom_mix_(h1) | 1;
+}
+inline unsigned bloom_k_for(unsigned bits_per_term) { return std::max(1u, unsigned(double(bits_per_term) * 0.6931 + 0.5)); }
+inline std::string bloom_build(const std::vector<std::string>& terms, unsigned bits_per_term, unsigned k) {
+    const std::size_t nbytes = std::max<std::size_t>(8, (terms.size() * bits_per_term + 7) / 8);
+    std::string bits(nbytes, '\0'); const std::uint64_t m = std::uint64_t(nbytes) * 8;
+    for (auto& t : terms) {
+        std::uint64_t h1, h2; bloom_hashes_(t, h1, h2);
+        for (unsigned i = 0; i < k; ++i) { const std::uint64_t b = (h1 + i * h2) % m; bits[std::size_t(b >> 3)] = char(static_cast<unsigned char>(bits[std::size_t(b >> 3)]) | (1u << (b & 7))); }
+    }
+    return bits;
+}
+inline bool bloom_test(const unsigned char* bits, std::size_t nbytes, unsigned k, std::string_view t) {
+    if (!nbytes) return true;
+    const std::uint64_t m = std::uint64_t(nbytes) * 8; std::uint64_t h1, h2; bloom_hashes_(t, h1, h2);
+    for (unsigned i = 0; i < k; ++i) { const std::uint64_t b = (h1 + i * h2) % m; if (!(bits[std::size_t(b >> 3)] & (1u << (b & 7)))) return false; }
+    return true;
+}
+// FTS5 tokens the default tokenizer would make of `s`: maximal ASCII alphanumeric runs, lower-cased. false when `s` has a byte >= 0x80
+// (the tokenizer folds those in ways this does not reproduce) or no token at all.
+inline bool ascii_tokens(std::string_view s, std::vector<std::string>& out) {
+    out.clear(); std::string cur;
+    for (unsigned char c : s) {
+        if (c >= 0x80) return false;
+        if (std::isalnum(c)) cur += char(std::tolower(c)); else if (!cur.empty()) { out.push_back(std::move(cur)); cur.clear(); }
+    }
+    if (!cur.empty()) out.push_back(std::move(cur));
+    return !out.empty();
+}
+} // namespace detail
+
+namespace detail {
+struct built_shard { std::filesystem::path tmp; shard_info info; std::string bloom; };
 inline std::uint64_t raw_bytes(const std::vector<value>& r) {
     std::uint64_t n = 0;
     for (auto& v : r) n += 8 + (std::holds_alternative<std::string>(v) ? std::get<std::string>(v).size() : std::holds_alternative<std::vector<std::byte>>(v) ? std::get<std::vector<std::byte>>(v).size() : 0);
@@ -212,6 +263,15 @@ public:
             if (fn.rfind("shard-", 0) == 0 && fn.size() > 4 && fn.substr(fn.size() - 4) == ".fdb" && std::none_of(m.shards.begin(), m.shards.end(), [&](const shard_info& s) { return s.file == fn; }))
                 std::filesystem::remove(de.path(), ec);
         }
+        {   // term filters of all shards in one sidecar file: "FBLOOM01" + the shard filters in manifest order
+            const auto bp = dir_ / "terms.fbl";
+            if (!bloom_data_.empty()) {
+                const std::string file = "FBLOOM01" + bloom_data_;
+                if (auto bs = os::fs::write_file_atomic(bp.string(), file); !bs) raise(errc::io_error, "shard_writer: cannot write terms.fbl: {}", bs.err.what);
+                m.bloom_file = "terms.fbl"; m.bloom_k = detail::bloom_k_for(opt_.bloom_bits_per_term);
+                m.bloom_sha256 = hash::sha256::of_hex(file);
+            } else { std::error_code ec2; std::filesystem::remove(bp, ec2); }
+        }
         auto st = os::fs::write_file_atomic((dir_ / "manifest.json").string(), m.to_text());
         if (!st) raise(errc::io_error, "shard_writer: cannot write manifest: {}", st.err.what);
         return m;
@@ -223,7 +283,7 @@ private:
 
     built build_range_one_(std::size_t b, std::size_t e, const std::filesystem::path& tmp) {
         std::error_code ec; std::filesystem::remove(tmp, ec);
-        std::int64_t frows = -1, ftok = -1;
+        std::int64_t frows = -1, ftok = -1; std::string bloom;
         {
             open_options o; o.foreign_keys = false; o.busy_timeout_ms = 0;
             o.pragmas = {"page_size=" + std::to_string(opt_.page_size), "journal_mode=OFF", "synchronous=OFF", "temp_store=MEMORY", "locking_mode=EXCLUSIVE", "auto_vacuum=NONE"};
@@ -245,6 +305,11 @@ private:
                     c.exec("CREATE TABLE forge_df(term TEXT PRIMARY KEY, n INTEGER NOT NULL) WITHOUT ROWID");
                     c.exec("INSERT INTO forge_df SELECT term, doc FROM temp.forge_fv ORDER BY term");
                     c.exec("DROP TABLE temp.forge_fv");
+                    if (opt_.bloom_bits_per_term) {
+                        std::vector<std::string> terms; auto q = c.prepare("SELECT term FROM forge_df ORDER BY term");
+                        for (auto& r : q.rows()) terms.emplace_back(r.get<std::string_view>(0));
+                        bloom = detail::bloom_build(terms, opt_.bloom_bits_per_term, detail::bloom_k_for(opt_.bloom_bits_per_term));
+                    }
                 }
                 tx.commit();
             }
@@ -256,6 +321,7 @@ private:
         built bs; bs.tmp = tmp;
         bs.info.rows = e - b; bs.info.bytes = std::filesystem::file_size(tmp);
         bs.info.min_key = rows_[b].key; bs.info.max_key = rows_[e - 1].key; bs.info.fts_rows = frows; bs.info.fts_tokens = ftok;
+        bs.info.bloom_bytes = std::uint32_t(bloom.size()); bs.bloom = std::move(bloom);
         return bs;
     }
     // Builds rows [b, e) as one shard; splits in halves while a file exceeds the budget.
@@ -305,6 +371,8 @@ private:
                 auto blob = opt_.blob_dir / (s2[i] + ".fdb");
                 if (!std::filesystem::exists(blob)) { std::filesystem::create_hard_link(fin, blob, ec); if (ec) std::filesystem::copy_file(fin, blob, ec); }
             }
+            if (opt_.cache) if (auto ck = cache::from_hex(b3[i])) opt_.cache->put_file(*ck, fin);
+            bloom_data_ += all[i].bloom;
             done_.push_back(std::move(all[i].info));
         }
         if (raw) ratio_ = std::max(0.2, double(fb) / double(raw));
@@ -314,7 +382,7 @@ private:
     std::filesystem::path dir_; shard_schema sc_; shard_options opt_; task::pool* tp_;
     std::vector<entry> rows_; std::uint64_t buf_bytes_ = 0;
     std::string last_key_; bool have_last_ = false;
-    std::vector<shard_info> done_; std::size_t next_name_ = 0, wave_ = 0; double ratio_ = 0;
+    std::vector<shard_info> done_; std::size_t next_name_ = 0, wave_ = 0; double ratio_ = 0; std::string bloom_data_;
     json::object stats_;
 };
 inline shard_writer create(std::filesystem::path dir, shard_schema schema, shard_options opt = {}, task::pool* tp = nullptr) { return shard_writer(std::move(dir), std::move(schema), opt, tp); }
@@ -358,19 +426,6 @@ inline void register_forge_bm25(connection& c) {
     const int rc = api->xCreateFunction(api, "forge_bm25", nullptr, &forge_bm25_fn, nullptr);
     if (rc != SQLITE_OK) throw_db(c.handle(), rc, "xCreateFunction forge_bm25");
 }
-inline void prefetch_file(const std::string& path) {
-#if defined(__unix__) || defined(__APPLE__)
-    int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-#if defined(POSIX_FADV_WILLNEED)
-        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
-#endif
-        ::close(fd);
-    }
-#else
-    (void)path;
-#endif
-}
 } // namespace detail
 
 inline std::span<const std::byte> static_span_(const std::string& s) { return {reinterpret_cast<const std::byte*>(s.data()), s.size()}; }
@@ -384,6 +439,7 @@ struct shard_open_options {
     bool mmap = true;                          // PRAGMA mmap_size = the shard's size
     bool immutable = true;                     // open read-only with immutable=1: no locking, no journal or WAL files
     std::filesystem::path blob_dir;            // content-addressed fallback: <blob_dir>/<sha256>.fdb when <dir>/<file> is missing
+    cache::store* cache = nullptr;             // second fallback: the shard kept as a raw file under its BLAKE3 in this forge::cache::store (shard_options::cache)
     std::function<void(connection&, std::size_t)> on_open;   // called for each new connection (shard index)
 };
 
@@ -423,6 +479,8 @@ public:
     std::filesystem::path path_of(std::size_t i) const {
         auto p = dir_ / m_.shards[i].file;
         if (!std::filesystem::exists(p) && !opt_.blob_dir.empty() && !m_.shards[i].sha256.empty()) p = opt_.blob_dir / (m_.shards[i].sha256 + ".fdb");
+        if (!std::filesystem::exists(p) && opt_.cache && !m_.shards[i].blake3.empty())
+            if (auto ck = cache::from_hex(m_.shards[i].blake3)) if (auto cp = opt_.cache->get_path(*ck)) p = *cp;
         return p;
     }
 
@@ -485,7 +543,20 @@ public:
         evict_();
         return lease(this, i, std::move(c));
     }
-    void prefetch(std::size_t i) const { detail::prefetch_file(path_of(i).string()); }
+    void prefetch(std::size_t i) const { detail::fadvise_file(path_of(i).string(), 1); }
+    // ---- term filters (shard_options::bloom_bits_per_term) ----
+    // True when the set has a term-filter file that matches the manifest (read and checked on first use).
+    bool has_bloom() { ensure_bloom_(); return bloom_ok_; }
+    // False only when shard `i` certainly holds no row containing `term` (all its FTS5 tokens must be present for a "maybe").
+    bool may_contain(std::size_t i, std::string_view term) {
+        ensure_bloom_();
+        if (!bloom_ok_ || m_.shards[i].bloom_bytes == 0) return true;
+        std::vector<std::string> toks;
+        if (!detail::ascii_tokens(term, toks)) return true;
+        const auto* bits = reinterpret_cast<const unsigned char*>(bloom_data_.data()) + 8 + bloom_off_[i];
+        for (auto& t : toks) if (!detail::bloom_test(bits, m_.shards[i].bloom_bytes, m_.bloom_k, t)) return false;
+        return true;
+    }
     // Checks every shard against the manifest now (in parallel when a pool is given). Throws errc::integrity_error.
     void verify_all(task::pool* tp = nullptr, verify_mode mode = verify_mode::sha256) {
         task::parallel_blocks(tp, size(), 1, [&](std::size_t i, std::size_t, std::size_t) { verify_shard_(i, mode); });
@@ -500,6 +571,20 @@ private:
     struct slot { std::mutex m; std::vector<std::unique_ptr<connection>> free; unsigned in_use = 0; bool verified = false, counted = false; std::uint64_t tick = 0; };
     shard_set() = default;
     void init_slots_() { for (std::size_t i = 0; i < m_.shards.size(); ++i) slots_.push_back(std::make_unique<slot>()); }
+    void ensure_bloom_() {
+        std::lock_guard g(*bloom_mu_);
+        if (bloom_loaded_) return;
+        bloom_loaded_ = true;
+        if (single_ || m_.bloom_file.empty() || m_.bloom_k == 0) return;
+        std::ifstream f(dir_ / m_.bloom_file, std::ios::binary);
+        std::string d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (d.size() < 8 || d.compare(0, 8, "FBLOOM01") != 0) return;
+        if (opt_.verify != verify_mode::none && hash::sha256::of_hex(d) != m_.bloom_sha256) raise(errc::integrity_error, "shard_set: {} does not match the manifest", m_.bloom_file);
+        std::size_t off = 0; std::vector<std::size_t> offs;
+        for (auto& s : m_.shards) { offs.push_back(off); off += s.bloom_bytes; }
+        if (d.size() != 8 + off) raise(errc::integrity_error, "shard_set: {} is {} bytes, the manifest's filters need {}", m_.bloom_file, d.size(), 8 + off);
+        bloom_data_ = std::move(d); bloom_off_ = std::move(offs); bloom_ok_ = true;
+    }
     void verify_shard_(std::size_t i, verify_mode mode) {
         if (mode == verify_mode::none || single_) return;
         const auto& s = m_.shards[i]; const auto p = path_of(i);
@@ -541,6 +626,7 @@ private:
     shard_manifest m_; std::filesystem::path dir_; shard_open_options opt_; std::string id_; bool single_ = false;
     std::vector<std::unique_ptr<slot>> slots_;
     std::unique_ptr<std::mutex> mup_ = std::make_unique<std::mutex>(); std::uint64_t clock_ = 0, open_bytes_ = 0;
+    std::unique_ptr<std::mutex> bloom_mu_ = std::make_unique<std::mutex>(); bool bloom_loaded_ = false, bloom_ok_ = false; std::string bloom_data_; std::vector<std::size_t> bloom_off_;
 };
 using database = shard_set;
 // The default way to open a database: a shard set (a directory with manifest.json), or a one-shard set for a plain file.
@@ -549,19 +635,51 @@ inline shard_set open(const std::filesystem::path& p, shard_open_options o = {})
 inline connection open_single(std::string_view path, const open_options& o = {}) { return connection::open(path, o); }
 
 // ---- parallel work over shards ---------------------------------------------------------------------------------
-enum class shard_schedule { dynamic, blocked };   // dynamic: each worker takes the next shard; blocked: each worker takes a contiguous run (page-cache and NUMA locality)
-struct run_options { bool prefetch = true; shard_schedule schedule = shard_schedule::dynamic; };
+// dynamic: each worker takes the next shard; blocked: each worker takes a contiguous run (page-cache locality); numa: shards are
+// split into one contiguous run per NUMA node, a worker takes from its own node's run and steals from the next node when it is empty
+// (shard_io.hpp). The schedule changes who runs a shard and when, never a result.
+enum class shard_schedule { dynamic, blocked, numa };
+struct run_options {
+    bool prefetch = true;
+    shard_schedule schedule = shard_schedule::dynamic;
+    prefetch_kind kind = prefetch_kind::automatic;      // how to prefetch when `prefetch` is on (shard_io.hpp)
+    const node_map* nodes = nullptr;                    // schedule numa: the node layout (default: the machine's; inject one to test)
+    std::function<std::size_t()> node_of_worker;        // schedule numa: node index of the calling worker (default: the node of its CPU)
+    placement_stats* placement = nullptr;               // schedule numa: counts shards taken from the worker's own node and stolen ones
+};
 
 // out[i] = fn(connection&, shard_index) for each shard in `shards`, results in the order of `shards`. Prefetches the files first.
 template <class R, class Fn>
 std::vector<R> shard_map(shard_set& s, task::pool* tp, const std::vector<std::size_t>& shards, Fn&& fn, run_options ro = {}) {
     std::vector<std::optional<R>> tmp(shards.size());
-    if (ro.prefetch) for (auto i : shards) s.prefetch(i);
+    std::unique_ptr<detail::aio_prefetcher> pf;
+    if (ro.prefetch && !shards.empty()) {
+        const prefetch_kind kind = ro.kind == prefetch_kind::automatic ? prefetch_kind::aio : ro.kind;
+        if (kind == prefetch_kind::fadvise) { for (auto i : shards) s.prefetch(i); }
+        else if (kind == prefetch_kind::aio) {   // files already in the page cache are left alone; the rest are read in order by a background thread
+            std::vector<std::string> cold;
+            for (auto i : shards) { auto p = s.path_of(i).string(); if (detail::resident_fraction(p) < 0.95) cold.push_back(std::move(p)); }
+            if (!cold.empty()) pf = std::make_unique<detail::aio_prefetcher>(std::move(cold), 32u, std::size_t(1) << 20, 0.0);
+        }
+    }
     auto one = [&](std::size_t k) { auto l = s.acquire(shards[k]); tmp[k].emplace(fn(*l, shards[k])); };
     if (ro.schedule == shard_schedule::blocked && tp && tp->size() > 1) {
         const std::size_t blk = (shards.size() + tp->size() - 1) / tp->size();
         task::parallel_blocks(tp, shards.size(), std::max<std::size_t>(blk, 1), [&](std::size_t, std::size_t b, std::size_t e) { for (std::size_t k = b; k < e; ++k) one(k); });
+    } else if (ro.schedule == shard_schedule::numa && tp && tp->size() > 1 && shards.size() > 1) {
+        const node_map& nm = ro.nodes ? *ro.nodes : system_node_map();
+        node_queues q(shards.size(), nm.count());
+        task::parallel_blocks(tp, tp->size(), 1, [&](std::size_t, std::size_t, std::size_t) {
+            const std::size_t node = ro.node_of_worker ? ro.node_of_worker() % nm.count() : nm.current();
+            for (;;) {
+                bool stolen = false; const long p = q.take(node, stolen);
+                if (p < 0) break;
+                if (ro.placement) (stolen ? ro.placement->stolen : ro.placement->local).fetch_add(1, std::memory_order_relaxed);
+                one(std::size_t(p));
+            }
+        });
     } else task::parallel_blocks(tp, shards.size(), 1, [&](std::size_t k, std::size_t, std::size_t) { one(k); });
+    if (pf) pf->stop();
     std::vector<R> out; out.reserve(tmp.size());
     for (auto& x : tmp) out.push_back(std::move(*x));
     return out;
@@ -619,8 +737,11 @@ struct bm25_options {
     std::string op = "OR";                  // "OR" or "AND" between the terms
     std::vector<double> weights;            // per-column weights (empty: all 1)
     bool prune = true;                      // skip shards whose best possible score cannot reach the current k-th
+    bool bloom = true;                      // use the set's term filters: a shard that cannot hold any query term is not opened for the counts
 };
-struct bm25_report { std::size_t shards = 0, with_hits = 0, scored = 0, skipped_bound = 0; std::int64_t rows = 0, tokens = 0; std::vector<std::int64_t> df; };
+// shards: all; counted: shards opened for the document counts (the others were ruled out by the manifest and the term filters); with_hits: shards holding a query term;
+// scored: shards whose rows were scored; skipped_bound: shards left out because their score bound was below the k-th best.
+struct bm25_report { std::size_t shards = 0, counted = 0, with_hits = 0, scored = 0, skipped_bound = 0; std::int64_t rows = 0, tokens = 0; std::vector<std::int64_t> df; };
 
 // The k best rows for `terms` (each one plain word, one phrase each) over all shards, scored with the global statistics
 // (total rows and tokens, and each term's document count summed over the shards), so the ranking and the scores equal
@@ -637,9 +758,26 @@ inline std::vector<shard_hit> shard_bm25_topk(shard_set& s, task::pool* tp, std:
     const std::size_t ns = s.size(), nt = terms.size();
     std::string expr;
     for (std::size_t i = 0; i < nt; ++i) { if (i) expr += " " + bo.op + " "; expr += fts5::quote_phrase(terms[i]); }
-    // phase 1: per-shard totals (manifest, or computed once for a single file) and document counts per term
+    // phase 1: per-shard totals (manifest, or computed once for a single file) and document counts per term. With term filters a shard
+    // that cannot hold any query term is not opened: its totals come from the manifest and its counts are zero (exactly, the filter has
+    // no false negatives); only the terms a shard may hold are counted there.
     struct counts { std::int64_t rows = 0, tokens = 0; std::vector<std::int64_t> df; };
-    auto cs = shard_map<counts>(s, tp, s.all_shards(), [&](connection& c, std::size_t i) {
+    const bool use_bloom = bo.bloom && s.has_bloom();
+    std::vector<counts> cs(ns);
+    std::vector<std::vector<char>> maybe(ns);
+    std::vector<std::size_t> to_count;
+    for (std::size_t i = 0; i < ns; ++i) {
+        const auto& si = s.info(i);
+        cs[i].df.assign(nt, 0); maybe[i].assign(nt, 1);
+        bool open = true;
+        if (use_bloom && si.fts_rows >= 0) {
+            cs[i].rows = si.fts_rows; cs[i].tokens = si.fts_tokens;
+            open = false;
+            for (std::size_t t = 0; t < nt; ++t) { maybe[i][t] = s.may_contain(i, terms[t]) ? 1 : 0; if (maybe[i][t]) open = true; }
+        }
+        if (open) to_count.push_back(i);
+    }
+    auto counted = shard_map<counts>(s, tp, to_count, [&](connection& c, std::size_t i) {
         counts r; r.df.assign(nt, 0);
         const auto& si = s.info(i);
         if (si.fts_rows >= 0) { r.rows = si.fts_rows; r.tokens = si.fts_tokens; } else { auto t = fts_totals(c, fts_table); r.rows = t.first; r.tokens = t.second; }
@@ -648,6 +786,7 @@ inline std::vector<shard_hit> shard_bm25_topk(shard_set& s, task::pool* tp, std:
         const bool have_df = c.table_exists("forge_df");   // per-term counts stored at build time (default tokenizer: ASCII words are lower-cased)
         std::optional<statement> dfq; if (have_df) dfq = c.prepare("SELECT n FROM forge_df WHERE term = ?1");
         for (std::size_t t = 0; t < nt; ++t) {
+            if (!maybe[i][t]) continue;
             const auto& w = terms[t];
             const bool plain = have_df && std::all_of(w.begin(), w.end(), [](unsigned char ch) { return std::isalnum(ch) && ch < 0x80; });
             if (plain) {
@@ -657,9 +796,10 @@ inline std::vector<shard_hit> shard_bm25_topk(shard_set& s, task::pool* tp, std:
         }
         return r;
     }, ro);
+    for (std::size_t j = 0; j < to_count.size(); ++j) cs[to_count[j]] = std::move(counted[j]);
     std::int64_t N = 0, T = 0; std::vector<std::int64_t> df(nt, 0);
     for (auto& c : cs) { N += c.rows; T += c.tokens; for (std::size_t t = 0; t < nt; ++t) df[t] += c.df[t]; }
-    if (rep) { rep->shards = ns; rep->rows = N; rep->tokens = T; rep->df = df; }
+    if (rep) { rep->shards = ns; rep->counted = to_count.size(); rep->rows = N; rep->tokens = T; rep->df = df; }
     if (N == 0) return {};
     const double avgdl = double(T) / double(N);
     std::vector<double> idf(nt);
@@ -680,9 +820,9 @@ inline std::vector<shard_hit> shard_bm25_topk(shard_set& s, task::pool* tp, std:
     std::string wsql; for (double w : bo.weights) wsql += ", " + std::to_string(w);
     const std::string ft = quote_ident(fts_table);
     const std::string sql = "SELECT rowid, -forge_bm25(" + ft + ", ?1, ?2" + wsql + ") FROM " + ft + " WHERE " + ft + " MATCH ?3";
-    std::vector<std::size_t> shard_ids; for (auto& c : order) shard_ids.push_back(c.shard);
+    std::vector<std::size_t> shard_ids; std::vector<double> bound_of(ns, 0.0); for (auto& c : order) { shard_ids.push_back(c.shard); bound_of[c.shard] = c.bound; }
     shard_map<int>(s, tp, shard_ids, [&](connection& c, std::size_t sh) {
-        double bound = 0; for (auto& cd : order) if (cd.shard == sh) { bound = cd.bound; break; }
+        const double bound = bound_of[sh];
         if (bo.prune) { std::lock_guard g(mu); if (heap.size() >= k && bound < heap.front().score) { ++skipped; return 0; } }
         std::vector<shard_hit> local; local.reserve(std::min<std::size_t>(k, 1024));
         auto st = c.prepare(sql); st.bind(1, avgdl).bind(2, std::span<const std::byte>(reinterpret_cast<const std::byte*>(idf_blob.data()), idf_blob.size())).bind(3, expr);
@@ -698,7 +838,7 @@ inline std::vector<shard_hit> shard_bm25_topk(shard_set& s, task::pool* tp, std:
             else if (shard_hit_before(h, heap.front())) { std::pop_heap(heap.begin(), heap.end(), shard_hit_before); heap.back() = h; std::push_heap(heap.begin(), heap.end(), shard_hit_before); }
         }
         return 0;
-    }, run_options{false, ro.schedule});
+    }, [&] { auto r2 = ro; r2.prefetch = false; return r2; }());
     if (rep) { rep->scored = scored_n; rep->skipped_bound = skipped; }
     std::sort(heap.begin(), heap.end(), shard_hit_before);
     return heap;

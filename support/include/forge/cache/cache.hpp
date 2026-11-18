@@ -10,6 +10,11 @@
 // the value; get() verifies it and deletes a corrupt entry. Writes go through os::fs::write_file_atomic, so
 // readers (also other processes) see a whole entry or none. get() refreshes the entry's mtime; with
 // max_bytes set, put() evicts the least recently used entries until the store fits. Thread-safe.
+//
+// Raw files (no header): put_file(key, src) keeps a whole file as it is under <dir>/raw/..., get_path(key) returns its path (and
+// refreshes its LRU time), so a file that other code must open itself (a SQLite shard, a model blob) can live in the store and be
+// shared by every user of the same key. They share the byte budget and the LRU order with the headered entries. With
+// verify = true get_path() hashes the file and drops it when BLAKE3 differs from the key (use it when the key is the content hash).
 #include <forge/hash/blake3.hpp>
 #include <forge/os/fs.hpp>
 #include <algorithm>
@@ -83,6 +88,47 @@ public:
         ++st_.hits;
         return blob.substr(32);
     }
+
+    // ---- raw files: kept as they are, no header ------------------------------------------------------------------
+    std::filesystem::path raw_path_of(const key& k) const { auto h = to_hex(k); return dir_ / "raw" / h.substr(0, 2) / h.substr(2); }
+    // Keeps a copy of the file `src` under `k` (a hard link when the store is on the same volume and `link` is true, else a copy
+    // written next to the entry and renamed into place, so readers see a whole file or none). An existing entry is only touched.
+    // Returns false if the file could not be stored.
+    bool put_file(const key& k, const std::filesystem::path& src, bool link = true) {
+        auto p = raw_path_of(k);
+        std::error_code ec; std::filesystem::create_directories(p.parent_path(), ec);
+        std::lock_guard g(m_);
+        if (std::filesystem::is_regular_file(p, ec)) { std::filesystem::last_write_time(p, std::filesystem::file_time_type::clock::now(), ec); return true; }
+        const auto tmp = p.parent_path() / (".tmp-" + p.filename().string() + "-" + std::to_string(++tmp_seq_));
+        std::filesystem::remove(tmp, ec);
+        bool ok = false;
+        if (link) { std::filesystem::create_hard_link(src, tmp, ec); ok = !ec; }
+        if (!ok) { ec.clear(); ok = std::filesystem::copy_file(src, tmp, std::filesystem::copy_options::overwrite_existing, ec) && !ec; }
+        if (!ok) { std::filesystem::remove(tmp, ec); return false; }
+        std::filesystem::rename(tmp, p, ec);
+        if (ec) { std::filesystem::remove(tmp, ec); return false; }
+        ++st_.entries; st_.bytes += file_size_(p);
+        if (opt_.max_bytes && st_.bytes > opt_.max_bytes) evict_to_(opt_.max_bytes, &p);
+        return true;
+    }
+    // The path of the raw file stored under `k`, or nothing. Refreshes the entry's LRU time. verify: BLAKE3 of the file must equal
+    // `k` (for keys that are content hashes); a mismatch removes the entry and counts as corrupt.
+    std::optional<std::filesystem::path> get_path(const key& k, bool verify = false) {
+        auto p = raw_path_of(k);
+        std::lock_guard g(m_);
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(p, ec)) { ++st_.misses; return std::nullopt; }
+        if (verify) {
+            std::ifstream f(p, std::ios::binary); hash::blake3 h; std::string buf(1 << 20, '\0');
+            while (f) { f.read(buf.data(), std::streamsize(buf.size())); auto n = std::size_t(f.gcount()); if (!n) break; h.update(buf.data(), n); }
+            if (h.final() != k) { ++st_.corrupt; ++st_.misses; remove_(p); return std::nullopt; }
+        }
+        std::filesystem::last_write_time(p, std::filesystem::file_time_type::clock::now(), ec);
+        ++st_.hits;
+        return p;
+    }
+    bool contains_file(const key& k) const { std::error_code ec; return std::filesystem::is_regular_file(raw_path_of(k), ec); }
+    bool erase_file(const key& k) { std::lock_guard g(m_); return remove_(raw_path_of(k)); }
     bool contains(const key& k) const { std::error_code ec; return std::filesystem::is_regular_file(path_of(k), ec); }
     bool erase(const key& k) { std::lock_guard g(m_); return remove_(path_of(k)); }
     // Evict least recently used entries until the store holds at most `bytes`. Returns bytes freed.
@@ -126,5 +172,6 @@ private:
     options opt_;
     mutable std::mutex m_;
     store_stats st_;
+    std::uint64_t tmp_seq_ = 0;
 };
 } // namespace forge::cache

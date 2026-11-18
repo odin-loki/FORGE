@@ -100,28 +100,29 @@ static double recall_at(std::size_t k, const std::vector<std::vector<ann::hit>>&
 }
 
 TEST(hnsw_recall_random_64d) {
-    const std::size_t n = slow() ? 20000 : 5000, nq = 200;
+    const std::size_t n = 20000, nq = 200;
     auto vs = random_vectors(n + nq, 64, 42);
-    ann::hnsw<fvec, ann::l2> ix;           // default parameters: M=16, efConstruction=200, ef_search=64
+    ann::hnsw<fvec, ann::l2> ix;           // default parameters: M=16, efConstruction=200, ef_search=160
     ann::flat_index<fvec, ann::l2> exact;
     for (std::size_t i = 0; i < n; ++i) { ix.add(i, vs[i]); exact.add(i, vs[i]); }
     task::pool p(8);
     const double t0 = now_s(); ix.build(&p); const double t1 = now_s();
     std::vector<std::vector<ann::hit>> want;
     for (std::size_t i = 0; i < nq; ++i) want.push_back(exact.search(vs[n + i], 10, &p));
-    // Uniform Gaussian vectors in 64 dimensions are about the hardest case for a graph index. Recall is recorded at the default
-    // ef (64) and at ef 128 and 256; the gate (>= 0.95) is at ef = 256 (see docs/ann.md for the measured curve).
-    double r64 = 0, r256 = 0;
-    for (std::size_t ef : {std::size_t(0), std::size_t(128), std::size_t(256)}) {
+    // Uniform Gaussian vectors in 64 dimensions are about the hardest case for a graph index. Recall is recorded at ef 64 (the old default),
+    // at the default ef (ef = 0) and at ef 256; the gate (>= 0.95) is at the default (see docs/ann.md for the measured curve).
+    double rdef = 0, r256 = 0;
+    for (std::size_t ef : {std::size_t(64), std::size_t(0), std::size_t(256)}) {
         std::vector<std::vector<ann::hit>> got;
         for (std::size_t i = 0; i < nq; ++i) got.push_back(ix.search(vs[n + i], 10, ef));
         const double r = recall_at(10, got, want);
-        if (ef == 0) r64 = r; if (ef == 256) r256 = r;
+        if (ef == 0) rdef = r; if (ef == 256) r256 = r;
         std::printf("  hnsw random 64-d n=%zu: build %.2f s (8 threads), recall@10 = %.4f at ef=%zu, edges=%zu\n", n, t1 - t0, r, ef ? ef : ix.params().ef_search, ix.edges());
         for (auto& h : got) { CHECK(h.size() == 10); CHECK(std::is_sorted(h.begin(), h.end(), ann::hit_before)); }
     }
-    CHECK_MSG(r256 >= 0.95, "recall at ef=256: %.4f", r256);
-    CHECK_MSG(r64 >= 0.8, "recall at default ef: %.4f", r64);
+    CHECK(ix.params().ef_search >= 128);
+    CHECK_MSG(rdef >= 0.95, "recall at the default ef (%zu): %.4f", ix.params().ef_search, rdef);
+    CHECK_MSG(r256 >= rdef, "recall at ef=256: %.4f", r256);
 }
 
 TEST(hnsw_recall_hamming) {

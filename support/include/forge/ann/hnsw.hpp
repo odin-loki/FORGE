@@ -1,7 +1,7 @@
 #pragma once
 // forge::ann::hnsw: Hierarchical Navigable Small World graph (Malkov & Yashunin) with a deterministic parallel build.
 //
-//   hnsw<std::vector<float>, ann::l2> ix({.M = 16, .ef_construction = 200, .ef_search = 64, .seed = 7});
+//   hnsw<std::vector<float>, ann::l2> ix({.M = 16, .ef_construction = 200, .ef_search = 160, .seed = 7});
 //   for (...) ix.add(id, vec);          // queued; searchable after build()
 //   ix.build(&pool);                    // may be called again after more add()s (incremental)
 //   auto hits = ix.search(q, 10);       // ordered by (dist, id); const, thread-safe
@@ -35,7 +35,7 @@
 namespace forge::ann {
 
 struct hnsw_params {
-    std::size_t M = 16, ef_construction = 200, ef_search = 64;
+    std::size_t M = 16, ef_construction = 200, ef_search = 160;   // ef_search 160: recall@10 0.9695 on 20000 random 64-d vectors (64 gave 0.858; docs/ann.md)
     std::uint64_t seed = 0x5eed;
 };
 

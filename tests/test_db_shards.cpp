@@ -292,3 +292,156 @@ TEST(lru_budget_limits_open_shards) {
     auto single = db::open_single(F.single.string(), {.read_only = true});
     CHECK(single.scalar<std::int64_t>("SELECT count(*) FROM t") == 9000);
 }
+
+// ---- term filters, phrases, prefetch, NUMA placement, shards in forge::cache --------------------------------------------------------
+static std::vector<db::shard_hit> ref_bm25(db::connection& ref, const std::vector<std::string>& terms, const char* op, std::size_t k) {
+    std::string expr; for (std::size_t i = 0; i < terms.size(); ++i) { if (i) expr += std::string(" ") + op + " "; expr += db::fts5::quote_phrase(terms[i]); }
+    std::vector<db::shard_hit> want;
+    auto st = ref.prepare("SELECT rowid, -bm25(fts) AS s FROM fts WHERE fts MATCH ?1 ORDER BY s DESC, rowid ASC LIMIT ?2"); st.bind(1, expr).bind(2, std::int64_t(k));
+    for (auto& r : st.rows()) want.push_back({0, r.get<std::int64_t>(0), r.get<double>(1)});
+    return want;
+}
+static bool same_hits(const std::vector<db::shard_hit>& a, const std::vector<db::shard_hit>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) if (a[i].id != b[i].id || a[i].score != b[i].score) return false;
+    return true;
+}
+
+TEST(bloom_filters_are_exact_and_skip_counts) {
+    auto& F = fx();
+    auto set = db::open(F.dir);
+    CHECK(set.has_bloom()); CHECK(!set.manifest().bloom_file.empty());
+    // no false negative: every term of every shard's forge_df passes its filter
+    std::size_t terms_seen = 0, fp = 0, probes = 0;
+    for (std::size_t i = 0; i < set.size(); ++i) {
+        CHECK(set.info(i).bloom_bytes > 0);
+        auto l = set.acquire(i);
+        auto st = l->prepare("SELECT term FROM forge_df");
+        for (auto& r : st.rows()) { CHECK(set.may_contain(i, std::string(r.get<std::string_view>(0)))); ++terms_seen; }
+        for (int j = 0; j < 200; ++j) { ++probes; fp += set.may_contain(i, "zzabsent" + std::to_string(j)) ? 1 : 0; }   // absent terms: a few false positives are allowed
+    }
+    std::printf("  bloom: %zu terms in %zu shards, false positives %zu of %zu absent probes (%.2f %%)\n", terms_seen, set.size(), fp, probes, 100.0 * double(fp) / double(probes));
+    CHECK(double(fp) / double(probes) < 0.05);
+    CHECK(set.may_contain(0, "caf\xc3\xa9"));   // non-ASCII: not judged
+    auto ref = db::connection::open(F.single.string(), {.read_only = true});
+    const std::vector<std::vector<std::string>> queries = {{"needle"}, {"needle", "w0"}, {"nosuchterm"}, {"nosuchterm", "w2"}, {"w199", "needle"}, {"w0", "w1"}, {"needle", "nosuchterm", "w7x"}};
+    std::size_t counted_rare = 0; const std::size_t shards = set.size();
+    for (auto& q : queries) for (const char* op : {"OR", "AND"}) for (std::size_t k : {1u, 10u, 100u}) {
+        auto want = ref_bm25(ref, q, op, k);
+        for (unsigned th : {1u, 8u}) {
+            task::pool tp(th); db::bm25_report on, off;
+            auto a = db::shard_bm25_topk(set, &tp, "fts", q, k, {.op = op, .bloom = true}, &on);
+            auto b = db::shard_bm25_topk(set, &tp, "fts", q, k, {.op = op, .bloom = false}, &off);
+            CHECK_MSG(same_hits(a, want), "bloom on: mismatch op=%s k=%zu first=%s", op, std::size_t(k), q[0].c_str());
+            CHECK_MSG(same_hits(b, want), "bloom off: mismatch op=%s k=%zu first=%s", op, std::size_t(k), q[0].c_str());
+            CHECK(on.df == off.df); CHECK(on.rows == off.rows); CHECK(on.tokens == off.tokens);
+            CHECK(off.counted == shards); CHECK(on.counted <= off.counted);
+            if (q.size() == 1 && q[0] == "needle" && th == 1 && std::string(op) == "OR" && k == 10) { counted_rare = on.counted; CHECK(on.counted < shards); }
+        }
+    }
+    std::printf("  bloom: a rare-term query opened %zu of %zu shards for the counts\n", counted_rare, shards);
+    // a damaged filter file is caught; a missing one means the exact path
+    auto dir = scratch("bl"); auto docs = make_docs(1200, 21);
+    { db::shard_writer w(dir, make_schema(false), {.budget = 128 << 10}); for (auto& d : docs) w.add(row_of(d)); w.finish(); }
+    { std::fstream f(dir / "terms.fbl", std::ios::in | std::ios::out | std::ios::binary); f.seekp(40); char c = 0; f.read(&c, 1); f.seekp(40); c = char(c ^ 0x33); f.write(&c, 1); }
+    { auto s2 = db::open(dir); try { (void)db::shard_bm25_topk(s2, nullptr, "fts", {"w0"}, 5); CHECK(false); } catch (const forge_exception& e) { CHECK(e.code == errc::integrity_error); } }
+    fs::remove(dir / "terms.fbl");
+    { auto s2 = db::open(dir); db::bm25_report rep; auto h = db::shard_bm25_topk(s2, nullptr, "fts", {"w0", "w1"}, 5, {}, &rep); CHECK(h.size() == 5); CHECK(rep.counted == rep.shards); }
+    std::error_code ec; fs::remove_all(dir, ec);
+}
+
+TEST(phrases_over_shards_equal_unsharded) {
+    auto& F = fx();
+    auto set = db::open(F.dir);
+    auto ref = db::connection::open(F.single.string(), {.read_only = true});
+    auto words = [](const std::string& s, std::size_t a, std::size_t n) {
+        std::vector<std::string> w; std::string cur;
+        for (char c : s + ' ') { if (c == ' ') { if (!cur.empty()) w.push_back(cur); cur.clear(); } else cur += c; }
+        std::string o; for (std::size_t i = a; i < a + n && i < w.size(); ++i) o += (i > a ? " " : "") + w[i];
+        return o;
+    };
+    std::vector<std::vector<std::string>> queries;
+    for (std::size_t di : {2u, 77u, 500u, 4000u, 8000u}) {
+        queries.push_back({words(F.docs[di].body, 0, 2)});
+        queries.push_back({words(F.docs[di].body, 1, 3), "w0"});
+        queries.push_back({words(F.docs[di].body, 0, 2), "needle", "w1"});
+    }
+    queries.push_back({"w1 w2 w3 w4"});   // a phrase that matches almost nothing
+    queries.push_back({"W0 W1"});          // case folded by the tokenizer
+    queries.push_back({"w0, w1"});         // punctuation between the words
+    std::size_t nonempty = 0;
+    for (auto& q : queries) for (const char* op : {"OR", "AND"}) for (std::size_t k : {1u, 10u, 100u}) {
+        auto want = ref_bm25(ref, q, op, k); nonempty += want.empty() ? 0 : 1;
+        for (unsigned th : {1u, 8u}) for (bool bloom : {true, false}) {
+            task::pool tp(th);
+            auto got = db::shard_bm25_topk(set, &tp, "fts", q, k, {.op = op, .bloom = bloom});
+            CHECK_MSG(same_hits(got, want), "phrase mismatch op=%s k=%zu bloom=%d q0='%s'", op, std::size_t(k), int(bloom), q[0].c_str());
+        }
+    }
+    CHECK(nonempty > 20);
+}
+
+TEST(prefetch_kinds_and_numa_schedule_return_the_plain_result) {
+    auto& F = fx();
+    auto set = db::open(F.dir);
+    auto sum_fn = [](db::connection& c, std::size_t) { return c.scalar<std::int64_t>("SELECT coalesce(sum(id), 0) FROM t"); };
+    const auto all = set.all_shards();
+    const auto want = db::shard_map<std::int64_t>(set, nullptr, all, sum_fn, {.prefetch = false});
+    const db::prefetch_kind kinds[] = {db::prefetch_kind::none, db::prefetch_kind::fadvise, db::prefetch_kind::aio, db::prefetch_kind::automatic};
+    for (auto kind : kinds) for (unsigned th : kThreads) for (bool cold : {false, true}) {
+        if (cold) for (auto i : all) db::drop_page_cache(set.path_of(i).string());
+        task::pool tp(th);
+        auto got = db::shard_map<std::int64_t>(set, &tp, all, sum_fn, {.prefetch = true, .schedule = db::shard_schedule::dynamic, .kind = kind});
+        CHECK_MSG(got == want, "prefetch kind %s threads %u cold %d", db::prefetch_kind_name(kind), th, int(cold));
+    }
+    // the aio prefetcher itself: reads whole files through forge::io, skips files that are already in the page cache
+    auto dir = scratch("pf"); const auto p = (dir / "blob.bin").string();
+    { std::ofstream f(p, std::ios::binary); std::string s(3 * 1024 * 1024 + 123, 'x'); f.write(s.data(), std::streamsize(s.size())); }
+    db::drop_page_cache(p);
+    { db::detail::aio_prefetcher pf({p, p + ".missing"}, 8, 256 << 10, 0.95); pf.wait(); auto st = pf.stats();
+      CHECK(st.bytes == 3 * 1024 * 1024 + 123 || st.skipped_resident == 1); CHECK(st.files <= 1); }
+    if (db::detail::resident_fraction(p) >= 0.95) { db::detail::aio_prefetcher pf({p}, 8, 256 << 10, 0.95); pf.wait(); CHECK(pf.stats().skipped_resident == 1); }
+    std::error_code ec; fs::remove_all(dir, ec);
+    // NUMA placement over a fake two-node layout: the node of a worker is decided by a hook; results are the plain ones
+    std::vector<os::numa_node> fake(2); fake[0].id = 0; fake[1].id = 1;
+    for (unsigned c = 0; c < 64; ++c) fake[c < 32 ? 0 : 1].cpus.push_back(c);
+    db::node_map nm(fake);
+    CHECK(nm.count() == 2);
+    for (unsigned th : kThreads) {
+        task::pool tp(th); db::placement_stats ps; std::atomic<int> tid{0};
+        auto got = db::shard_map<std::int64_t>(set, &tp, all, sum_fn, {.prefetch = false, .schedule = db::shard_schedule::numa, .nodes = &nm,
+                                                                          .node_of_worker = [&] { thread_local int mine = tid.fetch_add(1); return std::size_t(mine); }, .placement = &ps});
+        CHECK_MSG(got == want, "numa schedule threads %u", th);
+        if (th > 1) CHECK(ps.local + ps.stolen == all.size());
+    }
+    // node_queues: a worker on node 1 takes node 1's run first, then steals node 0's, in order
+    { db::node_queues q(10, 2); bool st = false; std::vector<long> seq; long p2;
+      while ((p2 = q.take(1, st)) >= 0) seq.push_back(p2);
+      CHECK((seq == std::vector<long>{5, 6, 7, 8, 9, 0, 1, 2, 3, 4})); }
+    { db::node_queues q(7, 3); bool st = false; std::vector<long> a; long p2; while ((p2 = q.take(0, st)) >= 0) a.push_back(p2); CHECK(a.size() == 7); std::sort(a.begin(), a.end()); for (long i = 0; i < 7; ++i) CHECK(a[std::size_t(i)] == i); }
+    // the machine's own layout also works
+    { task::pool tp(8); auto got = db::shard_map<std::int64_t>(set, &tp, all, sum_fn, {.schedule = db::shard_schedule::numa}); CHECK(got == want); }
+}
+
+TEST(shards_live_in_forge_cache) {
+    auto docs = make_docs(1500, 33);
+    auto dir = scratch("cs"), cdir = scratch("csc");
+    cache::store store(cdir);
+    { db::shard_writer w(dir, make_schema(false), {.budget = 128 << 10, .cache = &store}); for (auto& d : docs) w.add(row_of(d)); w.finish(); }
+    auto m = db::open(dir).manifest();
+    CHECK(m.shards.size() >= 2);
+    for (auto& s : m.shards) { auto k = cache::from_hex(s.blake3); CHECK(k && store.contains_file(*k)); CHECK(store.get_path(*k, true).has_value()); }
+    CHECK(store.stats().entries == m.shards.size());
+    // delete the shard files: an opened set reads them from the cache (and still verifies them)
+    std::vector<std::int64_t> before, after;
+    { auto s = db::open(dir); for (std::size_t i = 0; i < s.size(); ++i) { auto l = s.acquire(i); before.push_back(l->scalar<std::int64_t>("SELECT count(*) FROM t")); } }
+    for (auto& s : m.shards) fs::remove(dir / s.file);
+    { auto s = db::open(dir, {.cache = &store}); for (std::size_t i = 0; i < s.size(); ++i) { auto l = s.acquire(i); after.push_back(l->scalar<std::int64_t>("SELECT count(*) FROM t")); } }
+    CHECK(before == after);
+    { auto s = db::open(dir); CHECK_THROWS(s.acquire(0)); }   // without the cache the file is simply missing
+    // a second database with the same shards (same rows) shares the cache entries instead of adding new ones
+    auto dir2 = scratch("cs2");
+    { db::shard_writer w(dir2, make_schema(false), {.budget = 128 << 10, .cache = &store}); for (auto& d : docs) w.add(row_of(d)); w.finish(); }
+    CHECK(store.stats().entries == m.shards.size());
+    std::error_code ec; fs::remove_all(dir, ec); fs::remove_all(dir2, ec); fs::remove_all(cdir, ec);
+}
