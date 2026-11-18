@@ -85,11 +85,11 @@ TEST(raw_files_are_kept_as_they_are) {
     CHECK(c.get_path(k2).has_value()); CHECK(!c.get_path(k2, true)); CHECK(!c.contains_file(k2)); CHECK(c.stats().corrupt == 1);
     // raw files count against max_bytes: a new file pushes the store over its budget and the older entry goes
     c.clear(); CHECK(c.stats().entries == 0);
-    cache::store small(d.string() + "_small", {.max_bytes = 6000});
+    cache::store tight(d.string() + "_small", {.max_bytes = 6000});
     const std::string c3(3000, 'r'); const auto k3 = cache::key_of(c3); { std::ofstream f(src + "3", std::ios::binary); f << c3; }
-    CHECK(small.put_file(k, src));
-    CHECK(small.put_file(k3, src + "3"));
-    CHECK(small.stats().bytes <= 6000); CHECK(small.contains_file(k3)); CHECK(!small.contains_file(k));
+    CHECK(tight.put_file(k, src));
+    CHECK(tight.put_file(k3, src + "3"));
+    CHECK(tight.stats().bytes <= 6000); CHECK(tight.contains_file(k3)); CHECK(!tight.contains_file(k));
     fs::remove_all(d); fs::remove_all(d.string() + "_small"); fs::remove(src); fs::remove(src + "2"); fs::remove(src + "3");
 }
 

@@ -119,8 +119,9 @@ public:
         std::error_code ec;
         if (!std::filesystem::is_regular_file(p, ec)) { ++st_.misses; return std::nullopt; }
         if (verify) {
-            std::ifstream f(p, std::ios::binary); hash::blake3 h; std::string buf(1 << 20, '\0');
-            while (f) { f.read(buf.data(), std::streamsize(buf.size())); auto n = std::size_t(f.gcount()); if (!n) break; h.update(buf.data(), n); }
+            hash::blake3 h; std::string buf(1 << 20, '0');
+            { std::ifstream f(p, std::ios::binary);   // closed before a possible delete (Windows)
+              while (f) { f.read(buf.data(), std::streamsize(buf.size())); auto n = std::size_t(f.gcount()); if (!n) break; h.update(buf.data(), n); } }
             if (h.final() != k) { ++st_.corrupt; ++st_.misses; remove_(p); return std::nullopt; }
         }
         std::filesystem::last_write_time(p, std::filesystem::file_time_type::clock::now(), ec);
