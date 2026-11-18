@@ -108,16 +108,18 @@ inline bool gguf_pre_regexes(std::string_view pre, std::vector<std::string>& re,
     static const char* const gpt2 = R"('s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S))";
     static const char* const contr = "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])";
     ignore_merges = false; re.clear();
-    if (is({"llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2", "dbrx", "smaug-bpe", "chatglm-bpe", "glm4"})) {
+    if (is({"llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "midm-2.0", "lfm2", "dbrx", "smaug-bpe", "chatglm-bpe", "glm4", "glm5", "jina-v5-nano"})) {
         re = {std::string(contr) + R"(|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"};
-        ignore_merges = is({"llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2"});
-    } else if (is({"qwen2", "deepseek-r1-qwen", "stablelm2", "hunyuan", "megrez", "kormo"})) {
+        ignore_merges = is({"llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "midm-2.0", "lfm2", "glm4", "glm5", "jina-v5-nano"});
+    } else if (is({"qwen2", "deepseek-r1-qwen", "stablelm2", "hunyuan", "megrez", "kormo", "f2llmv2"})) {
         re = {std::string(contr) + R"(|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"};
     } else if (is({"default", "gpt-2", "gpt2", "phi-2", "jina-es", "jina-de", "jina-v1-en", "jina-v2-es", "jina-v2-de", "jina-v2-code", "roberta-bpe",
-                   "mpt", "olmo", "jais", "trillion", "granite-docling", "gigachat", "bailingmoe", "llada-moe", "minerva-7b", "exaone4"})) {
+                   "mpt", "olmo", "jais", "trillion", "granite-docling", "gigachat", "exaone4", "a.x-4.0", "mellum", "modern-bert"})) {
         re = {};   // the ByteLevel pre-tokenizer's own regex
-    } else if (is({"starcoder", "refact", "command-r", "smollm", "codeshell", "exaone", "minerva"})) {
+    } else if (is({"starcoder", "refact", "command-r", "smollm", "codeshell", "exaone", "minerva-7b"})) {
         re = {R"(\p{N})", gpt2};
+    } else if (is({"bailingmoe", "bailingmoe2", "llada-moe"})) {
+        re = {R"re('(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+)re"};
     } else if (pre == "falcon") {
         re = {R"([\p{P}\$\+<=>\^~\|`]+)", gpt2, "[0-9][0-9][0-9]"};
     } else if (pre == "deepseek-llm") {
@@ -136,13 +138,12 @@ inline bool gguf_pre_regexes(std::string_view pre, std::vector<std::string>& re,
     } else if (is({"deepseek-v3", "hunyuan-dense"})) {
         re = {R"(\p{N}{1,3})", "[\\x{4e00}-\\x{9fa5}\\x{3040}-\\x{309f}\\x{30a0}-\\x{30ff}]+",
               R"([!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)"};
-    } else if (pre == "tekken") {
-        re = {R"([^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)"};
+    } else if (is({"tekken", "pixtral"})) {
+        re = {R"re([^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)re"};
         ignore_merges = true;
-    } else if (is({"gpt-4o", "llama4"})) {
-        re = {std::string(R"([^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+)") + contr + R"(?|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*)" + contr
-              + R"(?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)"};
-        ignore_merges = pre == "llama4";
+    } else if (is({"gpt-4o", "llama4", "kanana2", "inkling2", "talkie"})) {
+        re = {std::string(R"re([^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+)re") + contr + R"re(?|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*)re" + contr
+              + R"re(?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+)re"};
     } else if (is({"viking"})) {
         re = {" ?[^(\\s|.,!?\\x{2026}\\x{3002}\\x{ff0c}\\x{3001}\\x{0964}\\x{06d4}\\x{060c})]+", R"(\p{N})"};
     } else if (is({"poro-chat", "bloom", "gpt3-finnish"})) {
