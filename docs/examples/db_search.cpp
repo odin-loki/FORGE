@@ -36,6 +36,8 @@ int main() {
         w.finish();   // writes manifest.json: shard names, key ranges, row counts, sizes, SHA-256 and BLAKE3
     }
 
+    int rc = 1;
+    {   // 2. to 5. in a scope: the set must be closed before the directory is deleted (Windows cannot delete files that are still open)
     // 2. Open: the manifest is read, each shard's SHA-256 is checked the first time it is opened.
     auto set = db::open(dir);
     std::printf("%zu shards, %llu rows, %llu bytes\n", set.size(), (unsigned long long)set.manifest().rows, (unsigned long long)set.manifest().bytes);
@@ -59,7 +61,8 @@ int main() {
     auto approx = index.search(q, 5, &pool), truth = exact.search(q, 5, &pool);
     std::size_t same = 0; for (auto& a : approx) for (auto& t : truth) same += a.id == t.id;
     std::printf("ann top-5 overlap with exact: %zu/5, nearest id %llu\n", same, (unsigned long long)approx[0].id);
-
-    fs::remove_all(dir);
-    return (hits.size() == 5 && approx[0].id == 42 && same >= 4) ? 0 : 1;
+        rc = (hits.size() == 5 && approx[0].id == 42 && same >= 4) ? 0 : 1;
+    }
+    std::error_code ec; fs::remove_all(dir, ec);
+    return rc;
 }
