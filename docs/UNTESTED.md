@@ -391,6 +391,33 @@ reference built from the same recollection.
 The last four rows and the `ignore_merges` list are recorded in the 2026-11-13 STATUS entry; the guides do not carry
 a note for them.
 
+### Diffed against the upstream sources, 2026-11-19 (branch `untested-s8-diffs`)
+
+Each row was compared mechanically with a script in `verify/golden/` against the upstream text fetched that day
+(llama.cpp master `src/llama-vocab.cpp`, `gguf-py/gguf/constants.py` and the Gemma converters; AutoAWQ and AutoGPTQ
+master; huggingface.co `tokenizer_config.json`; transformers 5.23.0). This is a diff of text and tables, not a run of
+a published model, so the "To close" column above still applies where it names an end-to-end check.
+
+| Row | Script | Result |
+|---|---|---|
+| Pre-tokenizer table and `ignore_merges` | `diff_llamacpp_pretok.py` + `dump_pretok.cpp` | **Data mismatches found and fixed** (below). Now every name FORGE accepts (67 incl. the alias `gpt2`) equals llama.cpp's regex list and `ignore_merges`; `gpt2` is a FORGE-only alias (llama.cpp's name is `gpt-2`). llama.cpp has about 35 newer pre-tokenizer names (afmoe, chameleon, flint, gemma4, grok-2, kimi-k2, laguna, minimax-m2, qwen35, superbpe, youtu, zonos3 ...) that FORGE does not have: they fall back to the default with a warning. Not added: each needs its own regex. |
+| Chat templates | `diff_chat_templates.py` | 13 templates fetched (llama2 and llama3.1 from ungated mirrors, gemma and mistral v0.3 from unsloth mirrors). Byte-identical: qwen2_5, llama2, llama3_1. chatml, llama3, mistral_v3, gemma, phi3, deepseek and zephyr differ only in `\n` escapes versus real newlines inside string literals (the JSON parse of `tokenizer_config.json` gives real newlines; the goldens write `\\n`) or in indentation, and render identically on 12 scenarios (no tools). **Real differences, not fixed (templates are revisioned on the Hub, so which text is the intended one is not unambiguous):** `qwen3` (FORGE's is 2.2 kB without the tools branch; Hub 4.2 kB), `mistral_v1` (the Hub text now has system-message handling and renders `<s> [INST]` with a space; FORGE renders `<s>[INST]`), `deepseek_r1` (Hub's Distill-Qwen-7B text is 2.1 kB with no `is_first_sp`; FORGE's is 1.1 kB). Tool-calling paths were not rendered for any template. |
+| AWQ and GPTQ layouts | read against AutoAWQ `gemm.py`, `packing_utils.py` and AutoGPTQ `qlinear_cuda.py` | No mismatch: AWQ order `[0,2,4,6,1,3,5,7]`, `qweight [in, out/8]`, `qzeros [in/g, out/8]`, `scales [in/g, out]`, `W = s*(q - z)`; GPTQ `qweight [in*bits/32, out]` packed sequentially down the input axis, `qzeros` stores z-1 (`zeros -= 1` in `pack`), `g_idx`. 3-bit GPTQ uses a different packing upstream and FORGE refuses it. Still no real exported checkpoint. |
+| GGUF tensor names and metadata keys, Gemma specifics | `diff_gguf_tensor_names.py` | No mismatch in the names or keys FORGE reads for gemma, gemma2, gemma3, phi3, gpt2 and bert against `MODEL_TENSORS` / `Keys`. Confirmed in the converters: Gemma norm weights are stored +1, GPT-2 Conv1D weights are transposed. Confirmed in `gemma2.cpp` / `gemma3.cpp`: 27B detection (46 / 62 layers) and the `1/sqrt(n_embd/n_head)` scale. Differences that are code behaviour, not fixed: FORGE defaults the Gemma-3 sliding window to 1024 when the key is absent, llama.cpp then uses no sliding window; FORGE reads `output.weight` for gemma/gemma2, which llama.cpp's tensor list does not have (falls back to the tied embedding, harmless); llama.cpp's phi3 list also allows split `attn_q/k/v`, FORGE reads only fused `attn_qkv`; bert `cls` / `cls.output` classifier heads are not read (reported as unused). |
+| RoPE-scaling reference | `diff_rope_transformers.py` (needs torch and transformers) | **PASS.** transformers 5.23.0's own initialisers (default, linear, dynamic at four lengths, YaRN with beta, mscale, explicit attention factor and `truncate=False`, llama3) at theta 1e4 and 5e5: inverse frequencies equal `tiny_rope.py` to 3e-7 relative (float32 in transformers), attention factors equal to 1e-12. |
+| GGUF YaRN attention factor | read against `deepseek2.cpp` and `ggml-cpu/ops.cpp` | **Not closed.** llama.cpp scales cos/sin by `attn_factor * (1 + 0.1 ln(1/freq_scale))` in the rope kernel and, for DeepSeek-2, pre-scales `kq_scale` by `mscale^2` with `mscale = attn_factor_org * (1 + yarn_log_multiplier * ln(1/freq_scale))`, the multiplier divided by 0.1 at load. FORGE's formula in `gguf.hpp` has the same ingredients but a division, and reading alone does not settle that they agree. Needs a YaRN GGUF run against llama.cpp. |
+| Leave-out tensor lists | not diffed | Unchanged. |
+
+Fixed in `tokenizer_import.hpp` (data only): `bailingmoe`, `bailingmoe2` and `llada-moe` now use llama.cpp's BAILINGMOE
+regex (they used the GPT-2 default); `pixtral` and `tekken` use llama.cpp's TEKKEN regex with `ignore_merges`
+(`pixtral` was on the llama3 regex without it; `tekken` moves from the `\p{Lu}...` form to llama.cpp's lookahead form,
+since the GGUF path is defined by llama.cpp); `gpt-4o` and `llama4` regexes gain `\p{M}` as in llama.cpp's GPT4O, and
+`llama4` no longer sets `ignore_merges`; `glm4` sets `ignore_merges`; `minerva-7b` uses `[\p{N}]` + GPT-2 (the table had a
+name `minerva`, which llama.cpp does not have, and put `minerva-7b` on the default). Names added that map to a type
+FORGE already had: `glm5`, `jina-v5-nano`, `f2llmv2`, `a.x-4.0`, `mellum`, `modern-bert`, `kanana2`, `inkling2`, `talkie`.
+No test pins these names; the regexes were compiled only by the dump program (`test_tokenizer` was not rebuilt or run:
+no FORGE build was made).
+
 ## 9. Licence and provenance facts
 
 Not test debt, listed so that it is in one place: the licence of the `riscv-non-isa/rvv-intrinsic-doc` prototype
