@@ -210,8 +210,7 @@ int main(int argc, char** argv) {
                     for (std::size_t b : {std::size_t(64), std::size_t(1024)}) {
                         std::size_t calls = 0;
                         bench("GPU " + tag + ", gpu_flat_l2's matmul_t over the probed lists (one product per touched list)", b, [&](std::span<const fvec> qs) { return gx.search_batch_matmul(qs, K, np, graph::ann_matmul(reg.get()), &tp, &calls); }, b == 64 ? 256 : nq);
-                        std::printf("|   (device matmul products over the calls of the row above, warm-up included: %zu) | | | | | | | |
-", calls);
+                        std::printf("|   (device matmul products over the calls of the row above, warm-up included: %zu) | | | | | | | |\n", calls);
                     }
                 }
             }
@@ -219,8 +218,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
     }
 
-    if (sections.count("cluster") && mixture) std::printf("cluster section skipped with --mixture (it re-shards the stored vectors)
-");
+    if (sections.count("cluster") && mixture) std::printf("cluster section skipped with --mixture (it re-shards the stored vectors)\n");
     if (sections.count("cluster") && !mixture) {
         if (cents_sqrt.empty()) cents_sqrt = ann::kmeans(sample.data(), S, D, nl1, 20, 7, &tp);
         const std::size_t NL = cents_sqrt.size() / D;
