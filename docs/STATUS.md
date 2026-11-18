@@ -156,6 +156,15 @@ The full list, with commands, is [UNTESTED.md](UNTESTED.md). The headline items:
 
 Newest first. Results are from the date given; later code may differ.
 
+### 2026-11-18 (forge::db, forge::ann, vendored SQLite; branch `leandb-ann`; Linux x86_64, GCC 13.3, one machine)
+New: `third_party/sqlite` (SQLite 3.54.1, hash-pinned), `forge::db` (wrapper, parallel layer, shard sets), `forge::task` algorithms, `forge::hash::sha256`, `forge::ann` ([db.md](db.md), [ann.md](ann.md)). Run:
+- Full build (`cmake --preset dev -DFORGE_BUILD_DB_BENCH=ON`, 470 steps, GCC 13.3, niced on a loaded 64-CPU host): succeeded.
+- New tests, all passing: `test_task_algorithms`, `test_db`, `test_db_parallel`, `test_db_shards`, `test_ann`, `test_ann_slow` (label `slow`, run once), `sqlite_pin`, `doc_example_db_search`; `docs_up_to_date`, `docs_links`, `sbom_spdx` pass. What they compare is in [db.md](db.md) and [ann.md](ann.md): parallel against serial for 1, 2, 3, 8 and 16 threads, byte-identical shard builds, sharded BM25 against one unsharded table (exact doubles), HNSW determinism, recall.
+- HNSW recall@10 on 20000 random 64-d vectors with the default `ef_search = 64`: 0.858 (0.9555 at ef 128, 0.989 at ef 256); the >= 0.95 gate in `test_ann` is at ef 256. The brief's gate at the default ef is not met by the default parameters.
+- `ctest -LE "slow|emu"` on this tree: 261 tests registered, 206 run, the rest skipped or disabled (no GPU devices, no numpy or safetensors in the Python, so the golden-model tests are disabled). 36 failed in the full run: 34 of them are outside this change (test_cache, test_mobile, test_os*, test_script*, test_security, the GPU mock and Vulkan golden tests, `gpu_compile_metal_host_syntax`, `compress_import`); the other 2 (`sqlite_pin`, `sbom_spdx`) were bugs of this change and are fixed and passing. Re-running seven of the 34 (test_cache, test_os_limits, test_os_sys, test_os_net, test_os_ext, test_mobile, test_os_dbus) with `TMPDIR` on tmpfs instead of the Windows drive mounted in WSL made them pass; `test_os` and `test_os_process` still failed (thread and I/O priority checks under `nice`). The others were not examined and the same tests were not run on `main`, so "outside this change" is an inference from what they test, not a measurement.
+- `perf/bench_db.cpp` on 1,000,000 synthetic rows (0.56 GB, not the 1 to 3 GB asked): numbers and caveats in [db.md](db.md#measured). Not run: 16 threads, a quiet machine, repeated runs.
+- Not built or run: MSVC, MinGW, macOS, iOS, FreeBSD, Android; any sanitizer; the install-consumer check passed in the full run but nothing links `forge::db` from an installed package.
+
 ### 2026-11-13 (simd: the 32-bit Arm `neon` table gives IEEE results and is selected automatically; emulation only)
 Advanced SIMD on AArch32 runs flush-to-zero whatever `FPSCR` says, so the `neon` table failed `exp-sub`, `cbrt-sub`
 and `erfc` and was opt-in. The Armv7 backend of `vec_gn.hpp` now tests each `add` / `sub` / `mul` / `fma` / `lt` and

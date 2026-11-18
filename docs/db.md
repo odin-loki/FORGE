@@ -51,7 +51,7 @@ lean.db/shard-000001.fdb   ...
 
 **Content-addressed storage and cache.** `shard_options::blob_dir` additionally keeps each shard as `<blob_dir>/<sha256>.fdb` (hard link, else copy), and `shard_open_options::blob_dir` falls back to it when `<dir>/<file>` is missing: a shard built or fetched once is reused by every database and version that lists the same hash (`test_db_shards`, `verification_and_content_addressed_store`). Query results can be kept in a `forge::cache::store` (its `max_bytes` gives the LRU budget, its atomic writes and locking apply) with `cached_result(store, set, {query parts}, compute)`, keyed by `set.id()` plus the query, so a rebuilt database never serves a stale answer; `encode_hits/decode_hits` serialise `shard_hit` lists. The cache store cannot hold the shards themselves: its entries carry a 32-byte hash header, so a cached file is not a SQLite file.
 
-**Exact BM25 over shards.** FTS5's `bm25()` takes its statistics from the table it runs on, so a shard alone scores differently from the whole. `shard_bm25_topk(set, pool, "fts", terms, k)` scores every shard with the global statistics through a registered FTS5 auxiliary function `forge_bm25(fts, avgdl, idf_blob, weights...)`, which is FTS5's own formula (k1 = 1.2, b = 0.75, same arithmetic, same order) with the average document length and per-term IDF passed in: `N` (rows) and total tokens come from the manifest (`shard_info::fts_rows/fts_tokens`, written when `shard_schema::fts_table` is set), each term's document count is the sum of per-shard `count(*) ... MATCH` queries. The ranking and the scores are bit-identical to `bm25()` on one table holding all the rows (`test_db_shards`, `bm25_over_shards_equals_unsharded`: 6 queries x OR/AND x k in {1, 10, 100} x 5 thread counts x pruning on/off against the unsharded table, comparing ids and exact doubles; also weights, and a one-shard set). Limits: each term must be one plain word (one phrase per term; `fts5::words` splits text that way), and the `fts` table's rowid must carry the global id. Not done: a precomputed per-term document-frequency table. Per-term counts come from the shards at query time (a stored table keyed by FTS5 tokens would need the tokenizer's normalisation and does not handle multi-token phrases), and per-shard bloom filters are not stored either.
+**Exact BM25 over shards.** FTS5's `bm25()` takes its statistics from the table it runs on, so a shard alone scores differently from the whole. `shard_bm25_topk(set, pool, "fts", terms, k)` scores every shard with the global statistics through a registered FTS5 auxiliary function `forge_bm25(fts, avgdl, idf_blob, weights...)`, which is FTS5's own formula (k1 = 1.2, b = 0.75, same arithmetic, same order) with the average document length and per-term IDF passed in: `N` (rows) and total tokens come from the manifest (`shard_info::fts_rows/fts_tokens`, written when `shard_schema::fts_table` is set), each term's document count is the sum of per-shard `count(*) ... MATCH` queries. The ranking and the scores are bit-identical to `bm25()` on one table holding all the rows (`test_db_shards`, `bm25_over_shards_equals_unsharded`: 6 queries x OR/AND x k in {1, 10, 100} x 5 thread counts x pruning on/off against the unsharded table, comparing ids and exact doubles; also weights, and a one-shard set). Limits: each term must be one plain word (one phrase per term; `fts5::words` splits text that way), and the `fts` table's rowid must carry the global id. Each shard also stores its per-term document counts (`forge_df`, from `fts5vocab`, written when `shard_schema::fts_table` is set and `shard_options::df_table` is true), which the query reads by primary key for plain ASCII words (lower-cased, as the default tokenizer does); any other term falls back to a `count(*) ... MATCH` query on the shard, and so does a shard written without the table. The global document count is the sum over the shards at query time (a single table keyed by FTS5 tokens would need the tokenizer's normalisation and does not handle multi-token phrases). Per-shard bloom filters are not stored: the per-term hit counts above give the same early-stop information.
 
 **Early stop.** A term adds less than `(k1 + 1) * idf` to a row, so a shard whose matching terms sum below the current k-th best score cannot contribute. Shards are scored in descending order of that bound and skipped when it is strictly below the k-th score (the shard's per-term hit counts, from the same count queries, decide which terms count). The result never changes (`prune` on and off are compared in the test); `bm25_report` says how many shards were skipped.
 
@@ -61,4 +61,41 @@ Not done: NUMA binding and topology-aware worker placement (`os/numa.hpp`, `os/c
 
 ## Measured
 
-BENCH_PLACEHOLDER
+All numbers are from one machine and one run each (not repeated), on a shared host: 64 CPUs with a load average of 47 to 65 from unrelated prover jobs, my own full build running during part of the first run, the data on a Windows drive mounted into WSL2 (9p, slower than a native disk), GCC 13, `-O2` (`RelWithDebInfo`), everything niced to 19. Treat differences under about 1.5x as noise.
+
+**Data.** `perf/bench_db.cpp`, synthetic: 1,000,000 rows, a 12 to 35 word text body from a skewed 4000-word vocabulary (`w<r*r/40000>`), a 32-d Gaussian float vector, key = 8-byte big-endian id. Each shard holds the rows, an FTS5 index (contentless), the per-term counts and an HNSW graph (`M = 8`, efConstruction 64). The single file holds the same rows and FTS5 index and one global graph (same parameters, built on 8 threads). **This is 0.56 GB, not the 1 to 3 GB asked for**: bigger runs were not made (time on the shared machine).
+
+| | sharded (10 MiB budget) | single file |
+|---|---|---|
+| build | 179.6 s (8 threads; 227.8 s in the first run, before the per-term count table) | 762.6 s (serial insert, graph on 8 threads) |
+| output | 64 shards, 556.8 MiB (556.0 MiB without the count table) | 1 file, 554.7 MiB |
+
+Per operation, mean over the batch (2000 point lookups, 50 prefix scans of about 256 keys each, 30 BM25 queries of 2 to 3 terms, 30 ANN queries, one full scan). "Cold": files evicted from the page cache with `posix_fadvise(DONTNEED)` and fresh handles; "warm": the next pass. `sha256`: each shard is verified (SHA-256 and BLAKE3) the first time it is opened, which is the default; `none`: `verify_mode::none`.
+
+| op | layout | cold 1 / 4 / 8 threads | warm 1 / 4 / 8 threads |
+|---|---|---|---|
+| point lookup (us) | sharded, sha256 | 7557 / 2945 / 2128 | 7353 / 2855 / 1980 |
+| | sharded, none | 1465 / 539 / 498 | 1279 / 537 / 435 |
+| | single file | 18521 / 773 / 546 | 13206 / 935 / 522 |
+| prefix scan (us) | sharded, sha256 | 2796 / 3956 / 3287 | 3045 / 4765 / 3494 |
+| | sharded, none | 4032 / 3365 / 3803 | 3359 / 3692 / 3338 |
+| | single file | 26240 / 24828 / 22176 | 21438 / 22902 / 20884 |
+| BM25 top-10 (ms) | sharded, sha256 | 358 / 192 / 137 | 372 / 202 / 142 |
+| | sharded, none | 418 / 175 / 128 | 396 / 184 / 138 |
+| | single file, rowid partitions | 2722 / 362 / 230 | 2741 / 370 / 219 |
+| ANN top-10 (ms, the graphs are loaded in the batch) | sharded, sha256 | 147.5 / 55.6 / 47.6 | 144.9 / 64.4 / 41.9 |
+| | sharded, none | 162 / 57 / 41 | 169 / 52 / 43 |
+| | single file, one global graph | 227 / 159 / 154 | 164 / 150 / 157 |
+| full scan, `sum(length(body))` (s) | sharded, sha256 | 2.01 / 0.92 / 0.73 | 2.40 / 1.09 / 0.72 |
+| | sharded, none | 2.66 / 0.95 / 0.70 | 2.73 / 1.00 / 0.84 |
+| | single file, 64 key ranges | 9.92 / 1.43 / 0.99 | 8.62 / 1.42 / 1.04 |
+
+What the numbers say, and what they do not:
+
+- Results were checked equal between the layouts inside the benchmark: point lookups, prefix scan row counts (12800 = 12800), the BM25 top-10 of every query (ids and exact scores), and the scan total. The ANN results differ by design.
+- The first access to a shard dominates point lookups when verification is on: a lookup in a cold set opens, and so hashes, up to 64 x 10 MiB before the answer. With `verify_mode::none` the sharded point lookup is about 1.1 to 1.2 times faster than the single file at 8 threads (0.44 to 0.50 ms against 0.52 to 0.55 ms) and 9 to 14 times faster at one thread (an unexplained outlier of the single-file run: 13 to 18 ms per lookup at one thread against 0.5 to 0.9 ms at four).
+- Range-limited and full scans are where the layout pays on this machine: a prefix scan is 5 to 9 times faster (a 10 MiB shard is opened instead of a 555 MB file's B-tree being walked), the one-thread full scan 3 to 5 times faster, and at 8 threads the full scan is 1.2 to 1.5 times faster.
+- BM25: the sharded search is 6.5 to 7.6 times faster than the partitioned single file at one thread (an outlier of the single-file side again), 1.8 to 2.1 times faster at 4 threads and 1.6 to 1.8 times at 8. Early stop skipped no shard in this benchmark: the queries use frequent words, every shard has hits, so the bounds never separated (it did skip shards in `test_db_shards`: 185 shard scorings over its queries with a rare term). The per-term count table did not change the BM25 time measurably (358 to 372 ms per query at one thread in the run without the table, 396 to 418 ms in the run with it; different runs, same noise level): the time goes into scoring the matching rows, not into counting.
+- ANN: per-shard graphs reached recall@10 = 0.937 against brute force (30 queries, ef = 64); the single global graph with the same `M` and efConstruction reached 0.390, so the comparison says that this global graph was poorly tuned for 1M vectors, not that sharding is better. Query time is 3.3 to 3.8 times lower for the sharded layout at 8 threads, with graph load included in both.
+- Not measured: a quiet machine, a native disk, repeated runs (no spread is available), 1 to 3 GB, 16 threads (the load did not allow it), `shard_schedule::blocked`, NUMA effects, the `max_open_bytes` limit, query-result caching, `verify_mode::blake3` only. The numbers for 16 threads asked for in the brief were not collected.
+
