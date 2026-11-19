@@ -544,6 +544,9 @@ public:
         return lease(this, i, std::move(c));
     }
     void prefetch(std::size_t i) const { detail::fadvise_file(path_of(i).string(), 1); }
+    // True if shard i was already read by an aio prefetch of this set (and marks it): a file system whose page cache cannot be asked
+    // (mincore says 0 on 9p) would otherwise be re-read on every query. close_all() forgets the marks.
+    bool mark_prefetched(std::size_t i) { return slots_[i]->warmed.exchange(true); }
     // ---- term filters (shard_options::bloom_bits_per_term) ----
     // True when the set has a term-filter file that matches the manifest (read and checked on first use).
     bool has_bloom() { ensure_bloom_(); return bloom_ok_; }
@@ -563,12 +566,12 @@ public:
     }
     std::size_t open_shards() { std::lock_guard g(*mup_); std::size_t n = 0; for (auto& s : slots_) n += s->counted ? 1 : 0; return n; }
     // Drops every pooled connection (e.g. before replacing files).
-    void close_all() { std::lock_guard g(*mup_); for (auto& s : slots_) { std::lock_guard gs(s->m); s->free.clear(); if (s->counted && s->in_use == 0) { s->counted = false; } } open_bytes_ = 0; for (auto& s : slots_) if (s->counted) open_bytes_ += m_.shards[std::size_t(&s - slots_.data())].bytes; }
+    void close_all() { for (auto& s : slots_) s->warmed = false; std::lock_guard g(*mup_); for (auto& s : slots_) { std::lock_guard gs(s->m); s->free.clear(); if (s->counted && s->in_use == 0) { s->counted = false; } } open_bytes_ = 0; for (auto& s : slots_) if (s->counted) open_bytes_ += m_.shards[std::size_t(&s - slots_.data())].bytes; }
     const shard_open_options& options() const { return opt_; }
     bool is_single_file() const { return single_; }
 
 private:
-    struct slot { std::mutex m; std::vector<std::unique_ptr<connection>> free; unsigned in_use = 0; bool verified = false, counted = false; std::uint64_t tick = 0; };
+    struct slot { std::mutex m; std::vector<std::unique_ptr<connection>> free; unsigned in_use = 0; bool verified = false, counted = false; std::uint64_t tick = 0; std::atomic<bool> warmed{false}; };
     shard_set() = default;
     void init_slots_() { for (std::size_t i = 0; i < m_.shards.size(); ++i) slots_.push_back(std::make_unique<slot>()); }
     void ensure_bloom_() {
@@ -654,11 +657,11 @@ std::vector<R> shard_map(shard_set& s, task::pool* tp, const std::vector<std::si
     std::vector<std::optional<R>> tmp(shards.size());
     std::unique_ptr<detail::aio_prefetcher> pf;
     if (ro.prefetch && !shards.empty()) {
-        const prefetch_kind kind = ro.kind == prefetch_kind::automatic ? prefetch_kind::aio : ro.kind;
+        const prefetch_kind kind = ro.kind == prefetch_kind::automatic ? prefetch_kind::fadvise : ro.kind;   // automatic: the cheap hint; aio is opt-in (measured, docs/db.md)
         if (kind == prefetch_kind::fadvise) { for (auto i : shards) s.prefetch(i); }
         else if (kind == prefetch_kind::aio) {   // files already in the page cache are left alone; the rest are read in order by a background thread
             std::vector<std::string> cold;
-            for (auto i : shards) { auto p = s.path_of(i).string(); if (detail::resident_fraction(p) < 0.95) cold.push_back(std::move(p)); }
+            for (auto i : shards) { if (s.mark_prefetched(i)) continue; auto p = s.path_of(i).string(); if (detail::resident_fraction(p) < 0.95) cold.push_back(std::move(p)); }
             if (!cold.empty()) pf = std::make_unique<detail::aio_prefetcher>(std::move(cold), 32u, std::size_t(1) << 20, 0.0);
         }
     }

@@ -7,8 +7,8 @@
 //             thread pool elsewhere) at queue depth 32 into scratch buffers and discards the bytes, so the page cache holds
 //             the shard before a worker maps it. Files already resident (Linux: mincore) are skipped, so a warm query costs
 //             one mincore per shard, not a read. Results never depend on it: it only changes what is cached.
-//   automatic fadvise where the backend ignores it cannot be known, so this is `aio` (it works wherever a file can be read) and
-//             falls back to fadvise only if no reader can be created.
+//   automatic = fadvise: the aio thread re-read every shard on every query on a 9p mount (no page cache to ask), so it is opt-in and
+//             reads each shard of a set once (shard_set::mark_prefetched).
 //
 // Placement (shard_schedule::numa): the shards of a query are split into contiguous runs, one per NUMA node (os::numa_nodes());
 // a worker takes the next shard of the node its CPU belongs to and steals from the next node when its own run is empty.
