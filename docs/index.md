@@ -17,6 +17,8 @@ Each guide follows the same shape: **concepts**, **API or command reference**, *
 - [os-wrapper.md](os-wrapper.md): the `forge::os` headers beyond the core layer: processes, pipes, signals, file-system extras, users, time, system information, console, networking, file watching, service control, Windows registry, devices, clipboard, dynamic libraries, process pools. Built; the missing parts are listed in the page
 - [text-locale.md](text-locale.md): `forge::os::text` and `forge::os::locale` (Unicode, encodings, locales; `forge_text`)
 - [mobile.md](mobile.md): `forge::os::mobile`, sensors, touch and device services (`forge_mobile`)
+- [db.md](db.md): vendored SQLite, `forge::db`, shard sets (sorted, byte-reproducible, at most 10 MiB per shard), parallel queries, exact BM25 over shards
+- [ann.md](ann.md): `forge::ann` metrics, exact and HNSW indexes, ANN over shards
 - [support.md](support.md): logger, process wait and leases, thread pool, work-stealing scheduler and the engine executor, cache, deadlines, settings registry, linear algebra, profiler, reflection, vision (image codecs, video bitstream parsing)
 - [simd.md](simd.md): CPU feature detection and SIMD kernel dispatch, the kernel tables per architecture, raw intrinsic wrappers, Tier A algorithms, `vec<T>` element types, std interop, and what ran under which emulator
 - [gpu.md](gpu.md): devices, graphs, parallel primitives, GPU runtimes, the kernel families per backend (and which were only mock-verified, lavapipe-verified or never executed), device memory and eviction, device selection, determinism mode

@@ -8,7 +8,7 @@ assert a == run("--format", "spdx"), "spdx is the default format"
 d = json.loads(a)
 assert d["spdxVersion"] == "SPDX-2.3" and d["dataLicense"] == "CC0-1.0"
 names = {p["name"]: p for p in d["packages"]}
-assert {"forge", "monocypher", "level-zero"} <= set(names), names.keys()
+assert {"forge", "monocypher", "level-zero", "sqlite"} <= set(names), names.keys()
 ids = {p["SPDXID"] for p in d["packages"]} | {f["SPDXID"] for f in d["files"]} | {"SPDXRef-DOCUMENT"}
 assert all(r["spdxElementId"] in ids and r["relatedSpdxElement"] in ids for r in d["relationships"])
 mono = [f for f in d["files"] if "third_party/monocypher/" in f["fileName"]]
@@ -38,7 +38,7 @@ dbs = {os.path.relpath(p, root).replace(os.sep, "/") for p in glob.glob(root + "
 assert dbs and all(by_file[f]["licenseConcluded"] != "AGPL-3.0-or-later" for f in dbs), "an intrinsic database without a source attribution"
 notice = open(root + "/NOTICE", encoding="utf-8").read()
 for needle in ("Unicode License V3", "UNICODE LICENSE V3", "Apache-2.0 WITH LLVM-exception", "rvv-intrinsic-doc", "NOT ESTABLISHED", "ucd_data.inc", "cldr_data.inc",
-               "encoding_data.inc", "quant_recipe.hpp", "tests/data/tokenizer", "tests/data/chat_template", "third_party/monocypher", "ze_api.h"):
+               "encoding_data.inc", "quant_recipe.hpp", "tests/data/tokenizer", "tests/data/chat_template", "third_party/monocypher", "third_party/sqlite", "ze_api.h"):
     assert needle in notice, f"NOTICE does not mention {needle}"
 
 # CycloneDX 1.5 JSON: the required properties and value formats of the 1.5 schema, checked by hand (no schema
@@ -53,7 +53,7 @@ main = c["metadata"]["component"]
 assert main["type"] == "application" and main["name"] == "forge" and re.fullmatch(r"\d+\.\d+\.\d+", main["version"])
 assert main["licenses"] == [{"expression": "AGPL-3.0-or-later OR LicenseRef-FORGE-Commercial"}]
 comps = {x["name"]: x for x in c["components"]}
-assert set(comps) == {"monocypher", "level-zero"} | set(derived), comps.keys()
+assert set(comps) == {"monocypher", "level-zero", "sqlite"} | set(derived), comps.keys()
 for n, (lic, fs) in derived.items():
     assert comps[n].get("licenses") == (None if lic == "NOASSERTION" else [{"expression": lic}]), n
     assert set(fs) <= {k["name"] for k in comps[n]["components"]} and comps[n]["description"], n

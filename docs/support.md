@@ -1,6 +1,6 @@
 # support: logger, pools, cache, settings and helper libraries
 
-Utilities used across FORGE. All are header-only.
+Utilities used across FORGE. All are header-only except `forge::db`, which links the vendored SQLite (`third_party/sqlite`, static library `forge_sqlite`).
 
 | Header | Namespace | What | Tests |
 |---|---|---|---|
@@ -11,6 +11,11 @@ Utilities used across FORGE. All are header-only.
 | `os/include/forge/os/process_pool.hpp` | `forge::os` | Process pool (see [os-wrapper.md](os-wrapper.md#process-pools-process_poolhpp)) | `test_process_pool` |
 | `os/include/forge/os/process.hpp`, `core/include/forge/core/memory.hpp` | `forge::os`, `forge::mem` | Waiting on processes, leased children | `test_os_process`, `test_memory` |
 | `support/include/forge/cache/cache.hpp` | `forge::cache` | Content-addressed disk cache | `test_cache` |
+| `support/include/forge/task/algorithms.hpp` | `forge::task` | Deterministic parallel sort, merge, top-k, reduce, prefix sums (same result for any thread count) | `test_task_algorithms` |
+| `support/include/forge/db/sqlite.hpp`, `third_party/sqlite/` | `forge::db` | RAII SQLite connection, statements, transactions, FTS5 helpers over the vendored, hash-pinned SQLite 3.54.1 ([db.md](db.md)) | `test_db`, `sqlite_pin` |
+| `support/include/forge/db/parallel.hpp` | `forge::db` | Read-only connection pool; partitioned query, scan, filter, reduce, sort, top-k, BM25 and bulk load on `forge::task` | `test_db_parallel` |
+| `support/include/forge/db/shards.hpp`, `support/include/forge/hash/sha256.hpp` | `forge::db`, `forge::hash` | Default storage: sorted, byte-reproducible shard files of at most 10 MiB with a manifest; key/prefix/range lookup, parallel queries, exact global BM25 ([db.md](db.md)) | `test_db_shards`, `doc_example_db_search` |
+| `support/include/forge/ann/*.hpp` | `forge::ann` | Metrics, exact `flat_index`, deterministic parallel `hnsw`, `rerank`, rank fusion, per-shard ANN ([ann.md](ann.md)) | `test_ann`, `test_ann_slow`, `test_db_shards` |
 | `os/include/forge/os/time.hpp`, `os/include/forge/os/fs.hpp` | `forge::os` | `stopwatch`, `deadline`, atomic writes | `test_util` |
 | `os/include/forge/os/settings.hpp` | `forge::os::settings` | Environment-variable registry | `test_util` |
 | `support/include/forge/...` (below) | various | Hashing, I/O, JSON, maths, allocators, profiling, RNG, reflection, signal, vision | various |
@@ -212,6 +217,7 @@ c.put(m, result); if (auto v = c.get(m)) use(*v);
 - `get()` verifies the hash and deletes a corrupt entry. It refreshes the entry's mtime.
 - Writes go through `os::fs::write_file_atomic`, so readers, including other processes, see a whole entry or none.
 - With `max_bytes` set, `put()` evicts least recently used entries until the store fits. `erase`, `clear`, `prune`, `stats()` (entries, bytes, hits, misses, evictions, corrupt). Thread-safe.
+- **Raw files** (no header; for files that other code must open itself, such as the SQLite shards of `forge::db`): `put_file(key, src_path, link = true)` keeps a hard link (else a copy) of a file under `<dir>/raw/<2 hex>/<62 hex>`, `get_path(key, verify = false)` returns the path and refreshes the LRU time (`verify` hashes the file and drops it when its BLAKE3 differs from the key, for keys that are content hashes), `contains_file`, `erase_file`, `raw_path_of`. Raw and headered entries share the byte budget and the LRU order, and `get(key)` never sees a raw entry (separate directory). `forge::db` uses it with `shard_options::cache` and `shard_open_options::cache` ([db.md](db.md)).
 
 ## Time and files
 - `os::stopwatch`: `elapsed_ns/ms/s`, `lap_ns`, `restart`.
