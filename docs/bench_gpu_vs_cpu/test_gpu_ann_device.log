@@ -1,0 +1,68 @@
+capacity: load 78 >= 76
+capacity: ok (mem 27G, load 74, C 10G, D 4100G)
+== gpu_flat_device  08:44:44 up 20:02,  1 user,  load average: 74.72, 77.18, 77.90
+  cuda flat: n=60000 d=37 k=1: device path 0.202 s, CPU flat_index (8 threads) 0.149 s, 300 candidates re-ranked (1.0 per query)
+  cuda flat: n=60000 d=37 k=10: device path 0.177 s, CPU flat_index (8 threads) 0.149 s, 3003 candidates re-ranked (10.0 per query)
+  cuda flat: n=60000 d=37 k=100: device path 0.171 s, CPU flat_index (8 threads) 0.373 s, 30010 candidates re-ranked (100.0 per query)
+  cuda flat: n=60000 d=64 k=1: device path 0.204 s, CPU flat_index (8 threads) 0.347 s, 300 candidates re-ranked (1.0 per query)
+  cuda flat: n=60000 d=64 k=10: device path 0.175 s, CPU flat_index (8 threads) 0.372 s, 3003 candidates re-ranked (10.0 per query)
+  cuda flat: n=60000 d=64 k=100: device path 0.191 s, CPU flat_index (8 threads) 0.520 s, 30025 candidates re-ranked (100.1 per query)
+  cuda flat: n=60000 d=128 k=1: device path 0.214 s, CPU flat_index (8 threads) 0.904 s, 300 candidates re-ranked (1.0 per query)
+  cuda flat: n=60000 d=128 k=10: device path 0.200 s, CPU flat_index (8 threads) 0.893 s, 3004 candidates re-ranked (10.0 per query)
+  cuda flat: n=60000 d=128 k=100: device path 0.190 s, CPU flat_index (8 threads) 0.987 s, 30043 candidates re-ranked (100.1 per query)
+  cuda flat: n=20000 d=37 k=1: device path 0.060 s, CPU flat_index (8 threads) 0.047 s, 338 candidates re-ranked (1.1 per query)
+  cuda flat: n=20000 d=37 k=10: device path 0.062 s, CPU flat_index (8 threads) 0.049 s, 3237 candidates re-ranked (10.8 per query)
+  cuda flat: n=20000 d=37 k=100: device path 0.063 s, CPU flat_index (8 threads) 0.096 s, 31676 candidates re-ranked (105.6 per query)
+  cuda flat: n=20000 d=64 k=1: device path 0.065 s, CPU flat_index (8 threads) 0.060 s, 331 candidates re-ranked (1.1 per query)
+  cuda flat: n=20000 d=64 k=10: device path 0.070 s, CPU flat_index (8 threads) 0.062 s, 3134 candidates re-ranked (10.4 per query)
+  cuda flat: n=20000 d=64 k=100: device path 0.071 s, CPU flat_index (8 threads) 0.112 s, 31174 candidates re-ranked (103.9 per query)
+  cuda flat: n=20000 d=128 k=1: device path 0.083 s, CPU flat_index (8 threads) 0.097 s, 313 candidates re-ranked (1.0 per query)
+  cuda flat: n=20000 d=128 k=10: device path 0.072 s, CPU flat_index (8 threads) 0.124 s, 3086 candidates re-ranked (10.3 per query)
+  cuda flat: n=20000 d=128 k=100: device path 0.074 s, CPU flat_index (8 threads) 0.203 s, 30635 candidates re-ranked (102.1 per query)
+[ ok ] gpu_flat_device
+0 failure(s)
+== gpu_flat_device exit=0
+== gpu_knn_logic  08:45:09 up 20:03,  1 user,  load average: 78.36, 77.83, 78.10
+[ ok ] gpu_knn_logic
+0 failure(s)
+== gpu_knn_logic exit=0
+== gpu_knn_device  08:45:17 up 20:03,  1 user,  load average: 77.06, 77.59, 78.01
+  cuda knn: n=200037 d=7 k=1: device path 0.015 s (upload 0.003 s), CPU flat_index (8 threads) 0.673 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=7 k=10: device path 0.010 s (upload 0.000 s), CPU flat_index (8 threads) 0.907 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=7 k=16: device path 0.575 s (upload 0.000 s), CPU flat_index (8 threads) 1.011 s, 1000 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=32 k=1: device path 0.026 s (upload 0.011 s), CPU flat_index (8 threads) 1.978 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=32 k=10: device path 0.015 s (upload 0.000 s), CPU flat_index (8 threads) 2.121 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=32 k=16: device path 1.149 s (upload 0.000 s), CPU flat_index (8 threads) 2.145 s, 1000 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=64 k=1: device path 0.173 s (upload 0.026 s), CPU flat_index (8 threads) 3.626 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=64 k=10: device path 0.158 s (upload 0.000 s), CPU flat_index (8 threads) 3.580 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=200037 d=64 k=16: device path 2.276 s (upload 0.000 s), CPU flat_index (8 threads) 3.692 s, 1000 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=7 k=1: device path 0.024 s (upload 0.002 s), CPU flat_index (8 threads) 0.112 s, 14 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=7 k=10: device path 0.071 s (upload 0.000 s), CPU flat_index (8 threads) 0.132 s, 572 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=7 k=16: device path 0.114 s (upload 0.000 s), CPU flat_index (8 threads) 0.138 s, 1000 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=32 k=1: device path 0.029 s (upload 0.003 s), CPU flat_index (8 threads) 0.148 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=32 k=10: device path 0.028 s (upload 0.000 s), CPU flat_index (8 threads) 0.156 s, 1 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=32 k=16: device path 0.127 s (upload 0.000 s), CPU flat_index (8 threads) 0.161 s, 1000 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=64 k=1: device path 0.040 s (upload 0.005 s), CPU flat_index (8 threads) 0.214 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=64 k=10: device path 0.035 s (upload 0.000 s), CPU flat_index (8 threads) 0.251 s, 0 of 1000 queries answered on the CPU
+  cuda knn: n=30000 d=64 k=16: device path 0.209 s (upload 0.000 s), CPU flat_index (8 threads) 0.242 s, 1000 of 1000 queries answered on the CPU
+[ ok ] gpu_knn_device
+0 failure(s)
+== gpu_knn_device exit=0
+== gpu_flat_logic  08:45:46 up 20:03,  1 user,  load average: 76.49, 77.49, 77.97
+[ ok ] gpu_flat_logic
+0 failure(s)
+== gpu_flat_logic exit=0
+== ivf_logic  08:45:50 up 20:04,  1 user,  load average: 76.49, 77.49, 77.97
+[ ok ] ivf_logic
+0 failure(s)
+== ivf_logic exit=0
+== ivf_device  08:45:51 up 20:04,  1 user,  load average: 76.37, 77.45, 77.96
+  cuda ivf: n=300000 nlist=548 nprobe=1: device 0.024 s (upload 0.018 s), CPU scan (1 thread) 0.057 s, equal on 1000 of 1000
+  cuda ivf: n=300000 nlist=548 nprobe=8: device 0.006 s (upload 0.000 s), CPU scan (1 thread) 0.215 s, equal on 1000 of 1000
+  cuda ivf: n=300000 nlist=548 nprobe=32: device 0.013 s (upload 0.000 s), CPU scan (1 thread) 0.846 s, equal on 1000 of 1000
+[ ok ] ivf_device
+0 failure(s)
+== ivf_device exit=0
+max GPU util / mem:
+52% 1482 MiB
+TESTS-DONE
