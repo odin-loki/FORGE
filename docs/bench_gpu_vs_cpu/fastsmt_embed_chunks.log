@@ -1,0 +1,35 @@
+chunk 0..500: 21.6 s with 16 workers, rss 3474 MiB, load 103, avail 20.6 GiB
+chunk 500 failed; retrying in sub-chunks of 50 with 8 workers
+sub-chunk 500 failed (left out)
+chunk 550..600: 1.1 s with 8 workers, rss 617 MiB, load 101, avail 32.6 GiB
+chunk 600..650: 0.3 s with 8 workers, rss 600 MiB, load 143, avail 34.6 GiB
+chunk 650..700: 1.2 s with 8 workers, rss 615 MiB, load 109, avail 29.4 GiB
+chunk 700..750: 3.0 s with 8 workers, rss 605 MiB, load 99, avail 27.5 GiB
+chunk 750..800: 1.5 s with 8 workers, rss 864 MiB, load 103, avail 27.4 GiB
+chunk 800..850: 2.0 s with 8 workers, rss 682 MiB, load 100, avail 31.6 GiB
+chunk 850..900: 3.1 s with 8 workers, rss 644 MiB, load 100, avail 26.2 GiB
+chunk 900..950: 4.9 s with 8 workers, rss 857 MiB, load 97, avail 25.2 GiB
+chunk 950..1000: 0.9 s with 8 workers, rss 642 MiB, load 98, avail 28.5 GiB
+chunk 1000 failed; retrying in sub-chunks of 50 with 8 workers
+chunk 1000..1050: 1.1 s with 8 workers, rss 639 MiB, load 97, avail 29.5 GiB
+chunk 1050..1100: 1.9 s with 8 workers, rss 654 MiB, load 100, avail 28.6 GiB
+chunk 1100..1150: 4.5 s with 8 workers, rss 648 MiB, load 112, avail 27.6 GiB
+chunk 1150..1200: 0.9 s with 8 workers, rss 605 MiB, load 111, avail 31.5 GiB
+chunk 1200..1250: 3.4 s with 8 workers, rss 788 MiB, load 96, avail 27.9 GiB
+chunk 1250..1300: 1.6 s with 8 workers, rss 640 MiB, load 101, avail 32.2 GiB
+chunk 1300..1350: 0.9 s with 8 workers, rss 622 MiB, load 98, avail 29.8 GiB
+chunk 1350..1400: 8.8 s with 8 workers, rss 4251 MiB, load 98, avail 23.3 GiB
+sub-chunk 1400 failed (left out)
+chunk 1450..1500: 3.9 s with 8 workers, rss 646 MiB, load 104, avail 28.9 GiB
+chunk 1500..2000: 14.7 s with 16 workers, rss 5147 MiB, load 102, avail 22.3 GiB
+chunk 2000..2500: 13.7 s with 16 workers, rss 5202 MiB, load 97, avail 22.4 GiB
+chunk 2500..3000: 6.2 s with 16 workers, rss 778 MiB, load 99, avail 26.6 GiB
+chunk 3000..3500: 1.4 s with 16 workers, rss 747 MiB, load 99, avail 28.1 GiB
+chunk 3500..4000: 38.9 s with 16 workers, rss 730 MiB, load 106, avail 28.7 GiB
+chunk 4000..4500: 60.0 s with 16 workers, rss 720 MiB, load 98, avail 27.1 GiB
+chunk 4500..5000: 53.1 s with 16 workers, rss 703 MiB, load 97, avail 28.9 GiB
+chunk 5000..5500: 74.5 s with 16 workers, rss 718 MiB, load 97, avail 29.8 GiB
+chunk 5500..6000: 68.5 s with 16 workers, rss 686 MiB, load 99, avail 32.8 GiB
+chunk 6000..6500: 77.4 s with 16 workers, rss 718 MiB, load 96, avail 26.2 GiB
+chunk 6500..7000: 62.0 s with 16 workers, rss 718 MiB, load 99, avail 29.3 GiB
+chunk 7000..7272: 26.1 s with 16 workers, rss 719 MiB, load 95, avail 29.5 GiB

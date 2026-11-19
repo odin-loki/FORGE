@@ -13,8 +13,8 @@ configuration and are in the raw rows.
 | exact kNN, top-10, 3.6M x 32-d | flat: 41.5 / 62.5 / 64.1 q/s at batch 1 / 64 / 1024 | `gpu_knn_l2` (new): 486 / 4279 / 6298 q/s | 11.7x / 68x / 98x | every batch size |
 | same, the shipped GPU path | (as above) | `gpu_flat_l2` as shipped: 2.3 / 48.2 / 65.1 q/s | 0.06x / 0.77x / 1.02x | nowhere: rows cross PCIe on every call |
 | approximate kNN at recall@10 0.99 | HNSW per shard ef 128: 108 / 210 / 250 q/s | `gpu_knn_l2`, exact (recall 1.0) | 4.5x / 20x / 25x | every batch size |
-| FastSMT hint kNN (prism::sim) | see the FastSMT section | none: the symbolic metric has no GPU kernel | n/a | n/a |
-| FastSMT solving (z3) | 0.048 to 0.067 s median per easy formula on one pinned core | CPU work, not a GPU candidate | n/a | n/a |
+| FastSMT hint kNN (prism::sim), 7007 formulas | 18,982 q/s (HNSW), 2,889 q/s (exact), 64 pinned workers | none: the symbolic metric has no GPU kernel | n/a | n/a |
+| FastSMT solving (z3) | 0.043 to 0.067 s median per easy formula on one pinned core | CPU work, not a GPU candidate | n/a | n/a |
 
 Training an IVF index and clustering the shards (Odin's extra question) bought no significant speedup at matched recall on these
 vectors, on any path. The bench vectors are i.i.d. N(0, 1), so they have no cluster structure for k-means to find. On a clustered copy
@@ -253,22 +253,49 @@ Not measured. I spent the time on the matched-recall runs above.
 Data: the M1-labelled set, read-only, joined with its formula text by `tools/fastsmt/bench/prep_m1_labelled.py` (in OS-Proving). It
 holds 7272 formulas with a labelled time for all 6 strategies. The scripts are `tools/fastsmt/bench/` in OS-Proving.
 
-Strategy-hint kNN (prism::sim `strategy_hint`, k = 15, regression) on the CPU: results follow in the next commit (the run was waiting for capacity when this was written).
+### Strategy-hint kNN (prism::sim, CPU only)
 
-Solver step, CPU only, for context: z3 4.8.12, the 6 M1 strategies, 20 formulas, 5 reps, pinned to CPU 63 with `taskset`. The sample
-is the first 20 formulas whose labelled times are all under 2 s, so it is biased to easy formulas.
+Each formula's signature is computed with `embed_smt2`, which parses it with Z3. Formulas average tens of KB, and Z3 keeps the memory it
+used, so the embeddings ran in separate processes of 500 formulas, 16 pinned workers each, to stay under the 8 GB RSS budget. Two
+500-formula chunks went over the budget and were retried in chunks of 50 with 8 workers; two of those still went over and were left out
+(100 formulas). In all, 7007 of 7272 formulas were embedded; the rest failed to parse or were left out.
 
-| strategy | median wall s | per-formula max/min over reps (median, worst) | answers |
-|---|---|---|---|
-| default | 0.0564 | 1.23, 1.51 | sat 70, unsat 30 |
-| qfbv | 0.0634 | 1.24, 1.42 | sat 70, unsat 30 |
-| simplify-bitblast-sat | 0.0626 | 1.22, 1.45 | sat 70, unsat 30 |
-| smt | 0.0480 | 1.19, 1.51 | sat 70, unsat 30 |
-| solveeqs-bitblast-sat | 0.0666 | 1.19, 1.48 | sat 70, unsat 30 |
-| propagate-smt | 0.0524 | 1.22, 1.41 | sat 70, unsat 30 |
+The index holds 7007 entries. Every entry is also a query, and it finds itself at distance 0, so this times the lookup; it does not
+measure hint quality. k = 15, regression hint. `strategy_hint` as shipped uses HNSW (ef 128) because the index has more than 2000
+entries.
 
-The labelling loop's own times over all 7272 formulas were measured by the loop, not here. Between 3736 (smt) and 4651
-(simplify-bitblast-sat) of the 7272 formulas hit the 10 s timeout for each strategy. The mean is 5.3 to 6.5 s per formula per strategy.
+| step | config | queries/s | p50 ms | p99 ms |
+|---|---|---|---|---|
+| `embed_smt2` (signature), one-off per formula | 16 pinned workers | 12.7 formulas/s | 29.5 | 12074 |
+| sym_index HNSW build, 7007 entries (one-off) | task::pool(64) | 2.0 s total | | |
+| `strategy_hint` as shipped (HNSW) | 1 thread, 2000 queries | 106.2 | 7.60 | 33.1 |
+| `strategy_hint` as shipped (HNSW) | 64 pinned workers, queries split | 18,982 | 0.444 | 13.2 |
+| exact kNN (`search_exact`) + regression | 1 thread, 300 queries | 26.7 | 34.6 | 80.7 |
+| exact kNN + regression | 64 pinned workers, queries split | 2,889 | 11.8 | 54.5 |
+| exact kNN over 64 index shards (one per pinned core, fan-out per query) + regression | 64 pinned workers | 172.2 | 4.34 | 9.04 |
+
+The sharded exact search returned the same neighbour distances as the unsharded one on all 300 checked queries. Each row ran 5 times
+except the two one-off rows; medians are shown, and the spread is in `bench_gpu_vs_cpu/fastsmt_hint_knn.md`.
+
+There is no GPU row because there is no GPU path for this metric. A lookup takes microseconds to milliseconds, against a z3 run of tens
+of milliseconds to 10 s, so this step is not where FastSMT spends its time.
+
+### Solver step (CPU only, for context)
+
+z3 4.8.12 ran the 6 M1 strategies on 20 formulas, 5 reps each, pinned to CPU 63 with `taskset`. The sample is the first 20 formulas whose
+labelled times are all under 2 s, so it is biased to easy formulas. It ran twice: run 1 at load 72 to 79, run 2 at load 91 to 112.
+
+| strategy | run 1: median wall s | run 1: per-formula max/min over reps (median, worst) | run 2: median wall s | run 2: max/min (median, worst) | answers (each run) |
+|---|---|---|---|---|---|
+| default | 0.0564 | 1.23, 1.51 | 0.0455 | 1.30, 2.14 | sat 70, unsat 30 |
+| qfbv | 0.0634 | 1.24, 1.42 | 0.0512 | 1.35, 1.79 | sat 70, unsat 30 |
+| simplify-bitblast-sat | 0.0626 | 1.22, 1.45 | 0.0582 | 1.30, 1.56 | sat 70, unsat 30 |
+| smt | 0.0480 | 1.19, 1.51 | 0.0428 | 1.30, 1.49 | sat 70, unsat 30 |
+| solveeqs-bitblast-sat | 0.0666 | 1.19, 1.48 | 0.0534 | 1.26, 2.33 | sat 70, unsat 30 |
+| propagate-smt | 0.0524 | 1.22, 1.41 | 0.0522 | 1.19, 1.45 | sat 70, unsat 30 |
+
+The labelling loop also recorded times over all 7272 formulas; the loop measured those, not this bench. For each strategy, between 3736
+(smt) and 4651 (simplify-bitblast-sat) of the 7272 formulas hit the 10 s timeout. The mean is 5.3 to 6.5 s per formula per strategy.
 
 There is no model-scoring step to put on a GPU. The hint is a kNN regression; there is no learned model.
 
